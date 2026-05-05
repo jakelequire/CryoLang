@@ -15,6 +15,7 @@
 namespace Compiler::Passes::Sema;
 
 import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
 import std::core::option;
 import Compiler::Diag::Snapshot;
 import Compiler::DeclIndex;
@@ -69,11 +70,14 @@ public:
 
     // -- Per-function state (reset via enter_function for each body) --
     locals:      HashMap<u32, TypeRef>;    // local variable scope (fast path)
+    local_muts:  HashMap<u32, boolean>;    // mutability flag for each local
     undo_keys:   u32[];                    // scope undo log: keys modified
     undo_prev:   TypeRef[];                // scope undo log: previous values
+    undo_muts:   boolean[];                // scope undo log: previous mut flags
     return_type: TypeRef;                  // current function return type
     this_type:   TypeRef;                  // current method receiver type
     this_sym:    SymbolStr;                // interned "this"
+    this_is_mut: boolean;                  // method has `mut &this`
     body_count:  i64;                      // counter for debug output
 
     // -- Expected type hint (set by DeclStmt for initializer resolution) --
@@ -91,11 +95,14 @@ public:
         this.intern         = intern;
         this.ctx            = ctx;
         this.locals         = HashMap<u32, TypeRef>::new();
+        this.local_muts     = HashMap<u32, boolean>::new();
         this.undo_keys      = [];
         this.undo_prev      = [];
+        this.undo_muts      = [];
         this.return_type    = TypeRef::invalid();
         this.this_type      = TypeRef::invalid();
         this.this_sym       = intern.intern("this");
+        this.this_is_mut    = false;
         this.body_count     = 0;
         this.expected_type  = TypeRef::invalid();
     }
@@ -270,10 +277,21 @@ public:
     }
 
     /// Register a local variable, recording the previous binding (if any)
-    /// in the undo log so it can be restored on scope exit.
+    /// in the undo log so it can be restored on scope exit.  Defaults to
+    /// immutable (`const`); call `register_local_mut` for `mut` bindings.
     register_local(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        this.register_local_with_mut(name, ty, false);
+    }
+
+    /// Register a `mut` local variable.
+    register_local_mut(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        this.register_local_with_mut(name, ty, true);
+    }
+
+    /// Internal: register a local with an explicit mutability flag.
+    register_local_with_mut(mut &this, name: SymbolStr, ty: TypeRef,
+                             is_mut: boolean) -> void {
         const key: u32 = name.id;
-        const h: u64 = hash_int(key as u64);
 
         // Save previous binding for undo
         this.undo_keys.push(key);
@@ -281,8 +299,23 @@ public:
             Option::Some(val) => { this.undo_prev.push(val); }
             Option::None      => { this.undo_prev.push(TypeRef::invalid()); }
         }
+        match (this.local_muts.get(&key)) {
+            Option::Some(prev) => { this.undo_muts.push(prev); }
+            Option::None       => { this.undo_muts.push(false); }
+        }
 
         this.locals.insert(key, ty);
+        this.local_muts.insert(key, is_mut);
+    }
+
+    /// Look up a local binding's mutability.  Returns true for unknown
+    /// names (so the caller doesn't false-positive on globals or
+    /// otherwise-tracked symbols).
+    local_is_mutable(&this, name: SymbolStr) -> boolean {
+        match (this.local_muts.get(&name.id)) {
+            Option::Some(v) => { return v; }
+            Option::None    => { return true; }
+        }
     }
 
     // NOTE: sync_to_resolver() was removed.  The DeclarationIndex is now the
@@ -297,11 +330,13 @@ public:
         for (mut i: i64 = this.undo_keys.length - 1; i >= save_point; i = i - 1) {
             const key: u32 = this.undo_keys[i];
             const prev: TypeRef = this.undo_prev[i];
-            const h: u64 = hash_int(key as u64);
+            const prev_mut: boolean = this.undo_muts[i];
             if (prev.is_valid()) {
                 this.locals.insert(key, prev);
+                this.local_muts.insert(key, prev_mut);
             } else {
                 this.locals.remove(&key);
+                this.local_muts.remove(&key);
             }
         }
 
@@ -309,12 +344,15 @@ public:
         if (save_point < this.undo_keys.length) {
             mut new_keys: u32[] = [];
             mut new_prev: TypeRef[] = [];
+            mut new_muts: boolean[] = [];
             for (mut i: i64 = 0; i < save_point; i++) {
                 new_keys.push(this.undo_keys[i]);
                 new_prev.push(this.undo_prev[i]);
+                new_muts.push(this.undo_muts[i]);
             }
             this.undo_keys = new_keys;
             this.undo_prev = new_prev;
+            this.undo_muts = new_muts;
         }
     }
 
@@ -492,29 +530,39 @@ public:
 
     /// Reset per-function state and register parameters + "this".
     enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
-        this.locals    = HashMap<u32, TypeRef>::new();
-        this.undo_keys = [];
-        this.undo_prev = [];
+        this.locals     = HashMap<u32, TypeRef>::new();
+        this.local_muts = HashMap<u32, boolean>::new();
+        this.undo_keys  = [];
+        this.undo_prev  = [];
+        this.undo_muts  = [];
         this.return_type = func.resolved_return_type;
         this.this_type   = fn_this_type;
+        this.this_is_mut = false;
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
-            if (param.resolved_type.is_valid()) {
-                this.register_local(param.name, param.resolved_type);
+            const ty: TypeRef = if (param.resolved_type.is_valid()) {
+                param.resolved_type
             } else {
-                // Register with void as fallback so the parameter is at
-                // least visible — prevents cascading "undefined variable"
-                // errors in the body when type resolution failed earlier
-                // (e.g., cross-module generics with unresolved annotations).
-                this.register_local(param.name, this.arena.get_void());
+                this.arena.get_void()
+            };
+            // The receiver param synthesised by the parser uses the
+            // interned name "&this"; its `is_mutable` flag tracks
+            // whether the user wrote `mut &this`.  We register `this`
+            // (without the leading `&`) below — pick up the receiver's
+            // mutability here so the assignment checker can validate
+            // `*this = ...` and `this.field = ...` later.
+            const param_name: string = this.intern.resolve(param.name);
+            if (strcmp(param_name, "&this") == 0) {
+                this.this_is_mut = param.is_mutable;
+            } else {
+                this.register_local_with_mut(param.name, ty, param.is_mutable);
             }
         }
 
         if (fn_this_type.is_valid()) {
-            this.register_local(this.this_sym, fn_this_type);
-            // "this" has no declaration span — locals HashMap is the only record
+            this.register_local_with_mut(this.this_sym, fn_this_type, this.this_is_mut);
         }
     }
 
@@ -579,12 +627,272 @@ public:
         }
     }
 
-    visit_function_decl(node: FunctionDeclNode*) -> void {
+    visit_function_decl(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null || node.is_generic()) { return; }
         const _fn_name: string = this.intern.resolve(node.name);
         this.enter_function(node, TypeRef::invalid());
         this.visit_block(node.body);
         this.body_count = this.body_count + 1;
+        this.check_function_returns(node);
+    }
+
+    /// All-paths-return check: when a function declares a non-trivial
+    /// return type, every control-flow path through its body must end
+    /// in a `return`, a divergent call (panic / `Never`-typed call), or
+    /// an infinite `loop` with no `break`.  Functions returning `void`,
+    /// `()`, or `Never` are exempt — falling off the end is fine.
+    check_function_returns(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.body == null) { return; }
+        if (!this.return_type_requires_return(func.resolved_return_type)) {
+            return;
+        }
+        if (this.block_always_returns(func.body)) { return; }
+        const fn_name: string = this.intern.resolve(func.name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0403_MISSING_RETURN,
+            format("function `%s` is declared to return a value but reaches the end of its body without returning",
+                fn_name));
+        diag = diag.at(func.span);
+        diag = diag.with_note("every control-flow path through the body must end in `return <expr>`, a divergent call (e.g. `panic(...)`), or an infinite `loop { ... }` with no `break`");
+        diag = diag.with_note("if a missing path is unreachable, end it with `return <default>` or `panic(\"unreachable\")`");
+        this.ctx.diagnostics.emit(diag);
+    }
+
+    /// Returns true if `ret` is a return type that demands an explicit
+    /// returned value (anything other than void / unit / never / invalid).
+    return_type_requires_return(&this, ret: TypeRef) -> boolean {
+        if (!ret.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ret.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::Void) { return false; }
+        if (t.kind == TypeKind::Unit) { return false; }
+        if (t.kind == TypeKind::Never) { return false; }
+        return true;
+    }
+
+    /// Recursive: does this block guarantee a return on every path?
+    block_always_returns(&this, block: BlockStmtNode*) -> boolean {
+        if (block == null) { return false; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            if (this.stmt_always_returns(block.statements[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Recursive: does this single statement guarantee that control
+    /// never falls through to a sibling statement that follows it?
+    stmt_always_returns(&this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        const node: ASTNode* = stmt as ASTNode*;
+        const kind: NodeKind = node.kind;
+
+        if (kind == NodeKind::ReturnStatement) { return true; }
+
+        if (kind == NodeKind::BlockStatement) {
+            return this.block_always_returns(stmt as BlockStmtNode*);
+        }
+
+        if (kind == NodeKind::UnsafeBlockStatement) {
+            const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+            return this.block_always_returns(ub.block);
+        }
+
+        if (kind == NodeKind::IfStatement) {
+            const ifs: IfStmtNode* = stmt as IfStmtNode*;
+            if (!ifs.has_else()) { return false; }
+            return this.stmt_always_returns(ifs.then_stmt)
+                && this.stmt_always_returns(ifs.else_stmt);
+        }
+
+        if (kind == NodeKind::MatchStatement) {
+            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            // Match returns iff every arm body returns AND the match
+            // is exhaustive (covers every variant) — exhaustiveness
+            // ensures no fall-through.  `check_match_exhaustive` has
+            // already emitted a diagnostic if the match isn't, so we
+            // only treat exhaustive matches as guaranteed-return here.
+            if (!this.match_is_exhaustive(ms.subject, ms.arms)) {
+                return false;
+            }
+            for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                const arm: MatchArmNode* = ms.arms[i];
+                if (arm == null || arm.body == null) { return false; }
+                if (!this.stmt_always_returns(arm.body)) { return false; }
+            }
+            return true;
+        }
+
+        if (kind == NodeKind::LoopStatement) {
+            // `loop { ... }` is divergent — control can only escape via
+            // `return`, `panic`, or `break`.  If the body contains no
+            // `break` anywhere, the loop runs forever as far as the
+            // caller is concerned, so the function path through the
+            // loop never falls past it.  This is the common shape
+            // (e.g. read-loops that return on EOF / error).
+            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+            if (!this.block_contains_break(ls.body)) { return true; }
+            return this.block_always_returns(ls.body);
+        }
+
+        if (kind == NodeKind::ExpressionStatement) {
+            const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            return this.expr_is_divergent(es.expression);
+        }
+
+        return false;
+    }
+
+    /// Walk a block (recursively) for any `break` statement, ignoring
+    /// `break`s inside nested `loop` / `while` / `for` / `match`
+    /// arms — those would break the inner construct, not the loop we
+    /// care about.  Used by the all-paths-return check to decide
+    /// whether a `loop` is divergent.
+    block_contains_break(&this, block: BlockStmtNode*) -> boolean {
+        if (block == null) { return false; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            if (this.stmt_contains_break(block.statements[i])) { return true; }
+        }
+        return false;
+    }
+
+    stmt_contains_break(&this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        const node: ASTNode* = stmt as ASTNode*;
+        const kind: NodeKind = node.kind;
+        if (kind == NodeKind::BreakStatement) { return true; }
+        if (kind == NodeKind::BlockStatement) {
+            return this.block_contains_break(stmt as BlockStmtNode*);
+        }
+        if (kind == NodeKind::UnsafeBlockStatement) {
+            const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+            return this.block_contains_break(ub.block);
+        }
+        if (kind == NodeKind::IfStatement) {
+            const ifs: IfStmtNode* = stmt as IfStmtNode*;
+            if (this.stmt_contains_break(ifs.then_stmt)) { return true; }
+            if (ifs.has_else()) {
+                if (this.stmt_contains_break(ifs.else_stmt)) { return true; }
+            }
+            return false;
+        }
+        if (kind == NodeKind::MatchStatement) {
+            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+            for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                const arm: MatchArmNode* = ms.arms[i];
+                if (arm != null && this.stmt_contains_break(arm.body)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // `break` inside a nested loop/while/for breaks that loop, not
+        // the outer one, so don't recurse into them.
+        return false;
+    }
+
+    /// Recognize calls to known divergent functions (`panic` and
+    /// friends) so callers in non-void slots are accepted as
+    /// guaranteed-returning by the all-paths check.  Also recognizes
+    /// any callee whose `resolved_type` is `Never` — that's the
+    /// long-term sound rule once the language gains `-> never`.
+    expr_is_divergent(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        if (expr.kind != NodeKind::CallExpression) { return false; }
+        const call: CallExprNode* = expr as CallExprNode*;
+        if (call.callee == null) { return false; }
+
+        // Type-driven path: callee whose resolved_type is `Never`.
+        if (call.resolved_type.is_valid()) {
+            const rt: Type* = this.arena.lookup(call.resolved_type.id);
+            if (rt != null && rt.kind == TypeKind::Never) { return true; }
+        }
+
+        if (call.callee.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = call.callee as IdentifierNode*;
+            const name: string = this.intern.resolve(id.name);
+            if (strcmp(name, "panic") == 0) { return true; }
+            return false;
+        }
+        if (call.callee.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            const member: string = this.intern.resolve(sr.member_name);
+            if (strcmp(member, "panic") != 0) { return false; }
+            const scope: string = this.intern.resolve(sr.scope_name);
+            const slen: i64 = strlen(scope) as i64;
+            // Anything that ends in `core::panic`, `prelude`, or
+            // `core::intrinsics`, and whose member is `panic`, is the
+            // standard library's panic plumbing.  All three forms
+            // resolve through the same divergent runtime entry.
+            if (slen >= 11) {
+                const tail11: string = (scope + (slen - 11)) as string;
+                if (strcmp(tail11, "core::panic") == 0) { return true; }
+            }
+            if (slen >= 7) {
+                const tail7: string = (scope + (slen - 7)) as string;
+                if (strcmp(tail7, "prelude") == 0) { return true; }
+            }
+            // `intrinsics::panic` and `core::intrinsics::panic`.
+            if (slen >= 10) {
+                const tail10: string = (scope + (slen - 10)) as string;
+                if (strcmp(tail10, "intrinsics") == 0) { return true; }
+            }
+            if (strcmp(scope, "intrinsics") == 0) { return true; }
+        }
+        return false;
+    }
+
+    /// Predicate form of `check_match_exhaustive` for the all-paths
+    /// check.  Any wildcard arm (`_ => ...`) or bare-identifier
+    /// catch-all (`x => ...`) makes the match exhaustive regardless
+    /// of subject type — that's the universal escape hatch.  For
+    /// enum subjects without a wildcard, every variant must appear
+    /// as an enum-pattern arm.  Non-enum subjects without a wildcard
+    /// are never considered exhaustive (their value space is open).
+    match_is_exhaustive(&this, subject: ExpressionNode*,
+                         arms: MatchArmNode*[]) -> boolean {
+        // Pass 1: any wildcard / identifier-binding arm short-circuits.
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
+                const pat: PatternNode* = arm.patterns[j];
+                if (pat == null) { continue; }
+                if (pat.pattern_kind == PatternKind::Wildcard
+                    || pat.pattern_kind == PatternKind::Identifier) {
+                    return true;
+                }
+            }
+        }
+        // Pass 2: enum-variant-by-variant check.
+        if (subject == null) { return false; }
+        const enum_ty: Type* = this.unwrap_to_enum(subject.resolved_type);
+        if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return false; }
+        const et: EnumType* = enum_ty as EnumType*;
+        if (et.variants.length == 0) { return false; }
+        mut covered_ids: u32[] = [];
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
+                const pat: PatternNode* = arm.patterns[j];
+                if (pat == null) { continue; }
+                if (pat.pattern_kind == PatternKind::Enum) {
+                    const ep: EnumPatternNode* = pat as EnumPatternNode*;
+                    covered_ids.push(ep.variant_name.id);
+                }
+            }
+        }
+        for (mut i: i64 = 0; i < et.variants.length; i++) {
+            const vid: u32 = et.variants[i].name.id;
+            mut found: boolean = false;
+            for (mut k: i64 = 0; k < covered_ids.length; k++) {
+                if (covered_ids[k] == vid) { found = true; break; }
+            }
+            if (!found) { return false; }
+        }
+        return true;
     }
 
     visit_struct_decl(node: StructDeclNode*) -> void {
@@ -676,6 +984,12 @@ public:
             }
             this.visit_block(method.func.body);
             this.body_count = this.body_count + 1;
+            // Constructors and destructors return the receiver / void
+            // by convention — no explicit return required.  Everyone
+            // else gets the all-paths check.
+            if (!method.is_constructor && !method.is_destructor) {
+                this.check_function_returns(method.func);
+            }
         }
     }
 
@@ -800,15 +1114,15 @@ public:
         // the arena) still get registered and don't cause cascading
         // "undefined variable" errors in downstream usage.
         if (var_node.resolved_type.is_valid()) {
-            this.register_local(var_node.name, var_node.resolved_type);
+            this.register_local_with_mut(var_node.name, var_node.resolved_type, var_node.is_mutable);
         } else if (var_node.has_initializer()) {
             const init_type: TypeRef = var_node.initializer.resolved_type;
             if (init_type.is_valid()) {
-                this.register_local(var_node.name, init_type);
+                this.register_local_with_mut(var_node.name, init_type, var_node.is_mutable);
             } else {
                 // Neither declared type nor initializer type resolved.
                 // Register with void to prevent cascading "undefined variable" errors.
-                this.register_local(var_node.name, this.arena.get_void());
+                this.register_local_with_mut(var_node.name, this.arena.get_void(), var_node.is_mutable);
             }
         } else {
             // No type annotation resolved and no initializer — register with void
@@ -885,11 +1199,11 @@ public:
                 // visit_decl_stmt: resolved type → initializer type → void.
                 // This ensures the variable is always visible in the loop body.
                 if (var_node.resolved_type.is_valid()) {
-                    this.register_local(var_node.name, var_node.resolved_type);
+                    this.register_local_with_mut(var_node.name, var_node.resolved_type, var_node.is_mutable);
                 } else if (var_node.has_initializer() && var_node.initializer.resolved_type.is_valid()) {
-                    this.register_local(var_node.name, var_node.initializer.resolved_type);
+                    this.register_local_with_mut(var_node.name, var_node.initializer.resolved_type, var_node.is_mutable);
                 } else {
-                    this.register_local(var_node.name, this.arena.get_i32());
+                    this.register_local_with_mut(var_node.name, this.arena.get_i32(), var_node.is_mutable);
                 }
             } else if (node.init.kind == NodeKind::ExpressionStatement) {
                 const es: ExprStmtNode* = node.init as ExprStmtNode*;
@@ -903,7 +1217,7 @@ public:
         this.restore_scope(save);
     }
 
-    visit_match_stmt(node: MatchStmtNode*) -> void {
+    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
@@ -916,6 +1230,96 @@ public:
             }
             this.restore_scope(save);
         }
+        this.check_match_exhaustive(node.subject, subject_type, node.arms,
+            node.span);
+    }
+
+    /// Check that a match expression / statement covers every variant of
+    /// its subject's enum type, or has a wildcard / identifier-binding
+    /// arm that catches anything left over.  Skipped for non-enum
+    /// subjects (literals, integers, structs etc.) — those have an
+    /// open universe of values, so exhaustiveness is structural rather
+    /// than enumerable.
+    check_match_exhaustive(mut &this, subject: ExpressionNode*,
+                            subject_type: TypeRef, arms: MatchArmNode*[],
+                            match_span: SourceSpan) -> void {
+        if (!subject_type.is_valid()) { return; }
+        const enum_ty: Type* = this.unwrap_to_enum(subject_type);
+        if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return; }
+        const et: EnumType* = enum_ty as EnumType*;
+        if (et.variants.length == 0) { return; }
+
+        // Walk arms.  Any wildcard or bare-identifier pattern catches
+        // every remaining variant; collect the explicit variant names
+        // covered otherwise.
+        mut has_wildcard: boolean = false;
+        mut covered_ids: u32[] = [];
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
+                const pat: PatternNode* = arm.patterns[j];
+                if (pat == null) { continue; }
+                if (pat.pattern_kind == PatternKind::Wildcard
+                    || pat.pattern_kind == PatternKind::Identifier) {
+                    has_wildcard = true;
+                    break;
+                }
+                if (pat.pattern_kind == PatternKind::Enum) {
+                    const ep: EnumPatternNode* = pat as EnumPatternNode*;
+                    covered_ids.push(ep.variant_name.id);
+                }
+            }
+            if (has_wildcard) { break; }
+        }
+        if (has_wildcard) { return; }
+
+        // Find variants not in covered_ids.
+        mut missing_names: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < et.variants.length; i++) {
+            const vn: SymbolStr = et.variants[i].name;
+            mut covered: boolean = false;
+            for (mut k: i64 = 0; k < covered_ids.length; k++) {
+                if (covered_ids[k] == vn.id) { covered = true; break; }
+            }
+            if (!covered) { missing_names.push(vn); }
+        }
+        if (missing_names.length == 0) { return; }
+
+        // Build a friendly "missing: A, B, C" list.  Cap at 4 names so
+        // an enum with many variants doesn't produce a 200-character
+        // diagnostic line.
+        const enum_name: string = this.intern.resolve(et.qualified_name);
+        mut names_str: string = "";
+        const cap: i64 = if (missing_names.length < 4) {
+            missing_names.length
+        } else { 4 };
+        for (mut i: i64 = 0; i < cap; i++) {
+            const n: string = this.intern.resolve(missing_names[i]);
+            if (i == 0) { names_str = format("`%s`", n); }
+            else { names_str = format("%s, `%s`", names_str, n); }
+        }
+        if (missing_names.length > cap) {
+            names_str = format("%s, and %lld more",
+                names_str, missing_names.length - cap);
+        }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0405_NON_EXHAUSTIVE_MATCH,
+            format("non-exhaustive match: not all variants of `%s` are covered",
+                enum_name));
+        diag = diag.at(match_span);
+        if (subject != null) {
+            diag = diag.also_at(subject.span,
+                "this subject's enum type has variants not handled below");
+        }
+        diag = diag.with_note(format("missing %s",
+            if (missing_names.length == 1) {
+                format("variant: %s", names_str)
+            } else {
+                format("variants: %s", names_str)
+            }));
+        diag = diag.with_note("add explicit arms for the missing variants, or use `_ => { ... }` to catch the rest");
+        this.ctx.diagnostics.emit(diag);
     }
 
     visit_loop_stmt(node: LoopStmtNode*) -> void {
@@ -1084,12 +1488,17 @@ public:
             rhs = this.resolve_expr(bin.right);
         }
 
-        if (bin.op.kind.is_assignment_op()) { return lhs; }
+        if (bin.op.kind.is_assignment_op()) {
+            this.check_assignment_lvalue(bin.left);
+            return lhs;
+        }
 
         if (lhs.is_valid() && rhs.is_valid()) {
             const result: TypeCheckResult = this.checker.check_binary_op(
                 bin.op.lexeme, lhs, rhs);
             if (result.success) { return result.result_type; }
+            this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
+                result.error_message, bin.span);
         }
 
         if (lhs.is_valid()) { return lhs; }
@@ -1097,13 +1506,103 @@ public:
         return TypeRef::invalid();
     }
 
+    /// Walk the LHS of an assignment and verify it's a mutable lvalue.
+    /// Emits a diagnostic on the first immutable target found and stops.
+    /// Coverage today (conservative; kept narrow for 0.1.0):
+    ///   • Identifier → local must be `mut`; constants and `const`
+    ///     locals are rejected.
+    ///   • MemberAccess (`obj.field`) → recurse on the receiver.  When
+    ///     the receiver is a value-type local, immutable receivers
+    ///     reject the assignment.  Pointer/reference receivers are
+    ///     conservatively accepted — fine-grained pointer-mutability
+    ///     tracking is post-0.1 work.
+    ///   • ArrayAccess (`arr[i]`) → recurse on the array.
+    ///   • Deref (`*x`) and `*this` → accepted; pointer-pointee
+    ///     mutability is not yet tracked.
+    /// Anything else is accepted as-is.
+    check_assignment_lvalue(mut &this, lhs: ExpressionNode*) -> void {
+        if (lhs == null) { return; }
+        if (lhs.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = lhs as IdentifierNode*;
+            // Skip `this` — its mutability is handled by the receiver
+            // logic in MemberAccess / *this; bare `this = X` is rare.
+            if (id.name.equals(this.this_sym)) { return; }
+            // Only check names that appear in our locals map; globals
+            // and pseudo-macros (FILE/LINE) aren't tracked here.
+            match (this.local_muts.get(&id.name.id)) {
+                Option::Some(is_mut) => {
+                    if (!is_mut) {
+                        const name_str: string = this.intern.resolve(id.name);
+                        mut diag: Diagnostic = Diagnostic::error(
+                            ErrorCode::E0200_TYPE_MISMATCH,
+                            format("cannot assign to immutable variable '%s'",
+                                name_str));
+                        diag = diag.at(lhs.span);
+                        diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
+                        this.ctx.diagnostics.emit(diag);
+                    }
+                }
+                Option::None => {}
+            }
+            return;
+        }
+        if (lhs.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = lhs as MemberAccessNode*;
+            if (ma.object == null) { return; }
+            // For value-type receivers, mutating a field requires a
+            // mutable receiver.  For pointer/reference receivers the
+            // receiver itself is the address, so its top-level
+            // mutability doesn't constrain field assignment.
+            const recv_t: Type* = this.arena.lookup(ma.object.resolved_type.id);
+            if (recv_t != null
+                && (recv_t.kind == TypeKind::Pointer
+                    || recv_t.kind == TypeKind::Reference)) {
+                return;
+            }
+            this.check_assignment_lvalue(ma.object);
+            return;
+        }
+        if (lhs.kind == NodeKind::ArrayAccess) {
+            const aa: ArrayAccessNode* = lhs as ArrayAccessNode*;
+            if (aa.array == null) { return; }
+            const arr_t: Type* = this.arena.lookup(aa.array.resolved_type.id);
+            if (arr_t != null
+                && (arr_t.kind == TypeKind::Pointer
+                    || arr_t.kind == TypeKind::Reference)) {
+                return;
+            }
+            this.check_assignment_lvalue(aa.array);
+            return;
+        }
+        // UnaryExpression (deref), CallExpression result, etc. — accept.
+    }
+
     resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
         const operand_type: TypeRef = this.resolve_expr(unary.operand);
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
 
+        // `*this` is transparent at the type level.  Receivers are tagged
+        // with the bare owner type (`Foo`, not `&Foo`) per the parser's
+        // `&this` synthesis, but codegen actually passes them as pointers.
+        // The stdlib uses `*this = newvalue` to overwrite the receiver
+        // in place — that pattern type-checks here without the deref
+        // failing on a non-pointer operand.
+        if (unary.op.lexeme == "*"
+            && unary.operand != null
+            && unary.operand.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = unary.operand as IdentifierNode*;
+            if (id.name.equals(this.this_sym)) {
+                return operand_type;
+            }
+        }
+
         const result: TypeCheckResult = this.checker.check_unary_op(
             unary.op.lexeme, operand_type);
-        if (!result.success) { return operand_type; }
+        if (!result.success) {
+            this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP,
+                result.error_message, unary.span);
+            return operand_type;
+        }
 
         // Address-of (&): if the target expects &mut T, promote to mutable reference.
         // The checker always produces &T (immutable); upgrade when the context demands it.
@@ -2490,6 +2989,12 @@ public:
         // Restore caller's expected_type and prefer its hint over our own
         // inference — a more specific context-driven type wins.
         this.expected_type = outer_expected;
+
+        // Exhaustiveness gate: same rule whether match is used as a
+        // statement or as an expression.
+        this.check_match_exhaustive(match_expr.subject, subject_type,
+            match_expr.arms, match_expr.span);
+
         if (outer_expected.is_valid()) {
             return outer_expected;
         }

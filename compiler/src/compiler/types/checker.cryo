@@ -579,10 +579,41 @@ type struct TypeChecker {
             return TypeCheckResult::fail("Type lookup failed");
         }
 
+        // Generic parameters are opaque to the pre-monomorphization
+        // checker.  After the monomorphizer specializes the call site,
+        // every `T` becomes a concrete type and re-runs through this
+        // checker — at that point any actual mismatch will surface.
+        // Accept GenericParam / BoundedParam against anything here so
+        // generic numeric helpers (`a + b` for `T: Numeric`) don't trip.
+        const lhs_generic: boolean = lhs_type.kind == TypeKind::GenericParam
+                                  || lhs_type.kind == TypeKind::BoundedParam;
+        const rhs_generic: boolean = rhs_type.kind == TypeKind::GenericParam
+                                  || rhs_type.kind == TypeKind::BoundedParam;
+        if (lhs_generic || rhs_generic) {
+            // Comparison ops produce bool; everything else passes the
+            // generic side through so substitution can resolve it.
+            if (op == "==" || op == "!=" || op == "<" || op == ">"
+                || op == "<=" || op == ">=") {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            return TypeCheckResult::ok(if (lhs_generic) { lhs } else { rhs });
+        }
+
         // Arithmetic: + - * / %
         if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
             if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
+            }
+            // `char` is a 1-byte integer; allow `c - '0'` and friends
+            // (digit-parsing code, char arithmetic in lexers).
+            if ((lhs_type.kind == TypeKind::Char || lhs_type.is_numeric())
+                && (rhs_type.kind == TypeKind::Char || rhs_type.is_numeric())) {
+                if (lhs_type.kind == TypeKind::Char && rhs_type.kind == TypeKind::Char) {
+                    // `c - c` produces an int (count of code units).
+                    return TypeCheckResult::ok(this.arena.get_i32());
+                }
+                if (lhs_type.kind == TypeKind::Char) { return TypeCheckResult::ok(rhs); }
+                if (rhs_type.kind == TypeKind::Char) { return TypeCheckResult::ok(lhs); }
             }
             // String concatenation
             if (op == "+" && lhs_type.kind == TypeKind::String && rhs_type.kind == TypeKind::String) {
@@ -603,6 +634,23 @@ type struct TypeChecker {
                     lhs_type.is_numeric() && rhs_type.kind == TypeKind::String) {
                 return TypeCheckResult::ok(this.arena.get_string());
             }
+            // Pointer / reference arithmetic: `p + offset`, `p - offset`
+            // are C-style byte-stepping operations that return a pointer
+            // of the same pointee type.  Stdlib uses these heavily in raw
+            // buffer code (`buffer.ptr() + length`, `cursor++`,
+            // `&scratch[0] + i`).  `p - q` where both sides are pointers
+            // (returning a count) is intentionally NOT accepted here —
+            // emit it explicitly with `as i64` casts.
+            const lhs_is_ptrlike: boolean = lhs_type.kind == TypeKind::Pointer
+                                         || lhs_type.kind == TypeKind::Reference;
+            const rhs_is_ptrlike: boolean = rhs_type.kind == TypeKind::Pointer
+                                         || rhs_type.kind == TypeKind::Reference;
+            if ((op == "+" || op == "-") && lhs_is_ptrlike && rhs_type.is_numeric()) {
+                return TypeCheckResult::ok(lhs);
+            }
+            if (op == "+" && lhs_type.is_numeric() && rhs_is_ptrlike) {
+                return TypeCheckResult::ok(rhs);
+            }
             return TypeCheckResult::fail(format("Cannot apply '%s' to %s and %s",
                 op, lhs_type.kind.to_string(), rhs_type.kind.to_string()));
         }
@@ -619,6 +667,15 @@ type struct TypeChecker {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
             if (lhs_type.kind == TypeKind::Char && rhs_type.kind == TypeKind::Char) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            // `char` is a 1-byte integer at the LLVM level; allow
+            // `c == 0`, `c != '\0'`, range checks (`c >= 'a' && c <= 'z'`)
+            // — the universal C-string scanning idiom — to type-check.
+            if (lhs_type.kind == TypeKind::Char && rhs_type.is_numeric()) {
+                return TypeCheckResult::ok(this.arena.get_bool());
+            }
+            if (lhs_type.is_numeric() && rhs_type.kind == TypeKind::Char) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
             // Pointer equality/inequality: ptr == null, ptr != null, ptr == ptr
@@ -658,8 +715,15 @@ type struct TypeChecker {
         }
 
         // Bitwise: & | ^ << >>
+        // `char` is a 1-byte integer at the LLVM level, so allow it
+        // alongside `Int` (the FNV hash and similar byte-folding code
+        // does `hash ^ s[i]` where `s[i]` is char).
         if (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
-            if (lhs_type.kind == TypeKind::Int && rhs_type.kind == TypeKind::Int) {
+            const lhs_intlike: boolean = lhs_type.kind == TypeKind::Int
+                                      || lhs_type.kind == TypeKind::Char;
+            const rhs_intlike: boolean = rhs_type.kind == TypeKind::Int
+                                      || rhs_type.kind == TypeKind::Char;
+            if (lhs_intlike && rhs_intlike) {
                 return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
             }
             return TypeCheckResult::fail(format("Bitwise '%s' requires integer operands", op));
@@ -678,6 +742,18 @@ type struct TypeChecker {
         if (op_type == null) {
             return TypeCheckResult::fail("Type lookup failed");
         }
+        // Unwrap InstantiatedType: a generic instantiation wraps the
+        // resolved type, but unary operator selection (deref, neg, etc.)
+        // needs the inner kind.  Without this, `*this` on a `&Option<T>`
+        // receiver fails because op_type.kind is InstantiatedType, not
+        // Reference.
+        if (op_type.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = op_type as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                const inner: Type* = this.arena.lookup(inst.resolved_type.id);
+                if (inner != null) { op_type = inner; }
+            }
+        }
 
         // Negation: -
         if (op == "-") {
@@ -685,6 +761,19 @@ type struct TypeChecker {
                 return TypeCheckResult::ok(operand);
             }
             return TypeCheckResult::fail("Negation requires numeric operand");
+        }
+
+        // Increment / decrement: produce the operand's type unchanged.
+        // Accept numeric and pointer operands (the pointer case covers
+        // C-style buffer walking like `p++` / `cursor++`).
+        if (op == "++" || op == "--") {
+            if (op_type.is_numeric()
+                || op_type.kind == TypeKind::Pointer
+                || op_type.kind == TypeKind::Char) {
+                return TypeCheckResult::ok(operand);
+            }
+            return TypeCheckResult::fail(format(
+                "operator '%s' requires numeric or pointer operand", op));
         }
 
         // Logical not: !

@@ -18,6 +18,7 @@ import core::option;
 import core::result;
 import core::cmp;
 import core::hash;
+import core::drop;
 import alloc::layout;
 import alloc::allocator;
 
@@ -185,10 +186,16 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         }
     }
 
-    /// Remove the entry with matching key. Returns the removed value,
-    /// or `None` if the key wasn't present.
-    remove(mut &this, key: &K) -> Option<V> 
-    where K: Hash + Eq {
+    /// Remove the entry with matching key. Returns the removed
+    /// value, or `None` if the key wasn't present.
+    ///
+    /// `K::drop()` is called on the stored key before the entry
+    /// node is freed; ownership of `V` is transferred to the
+    /// caller (who is responsible for dropping it when done).  The
+    /// `where K: Drop` bound makes the K-drop sound across owning
+    /// (`String`) and POD (`u32`, no-op) instantiations alike.
+    remove(mut &this, key: &K) -> Option<V>
+    where K: Hash + Eq + Drop {
         if (this.bucket_count == 0) {
             return Option::None;
         }
@@ -205,6 +212,7 @@ type struct HashMap<K, V, A = GlobalAlloc> {
                     previous.next = node.next;
                 }
                 const removed: V = node.value;
+                node.key.drop();
                 free_entry(this, node);
                 this.length = this.length - 1;
                 return Option::Some(removed);
@@ -215,9 +223,17 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         return Option::None;
     }
 
-    /// Drop every entry. Retains the bucket array so subsequent inserts
-    /// don't re-pay the allocation.
-    clear(mut &this) -> void {
+
+    /// Drop every entry. Retains the bucket array so subsequent
+    /// inserts don't re-pay the allocation.
+    ///
+    /// Calls `K::drop()` and `V::drop()` on each discarded entry
+    /// before freeing the entry node.  The `where K: Drop, V: Drop`
+    /// bound is what makes this sound: every K and V used in a
+    /// HashMap must have a `Drop` impl (primitives' impls are
+    /// no-ops, so `HashMap<u32, u64>` etc. still work).
+    clear(mut &this) -> void
+    where K: Drop, V: Drop {
         if (this.buckets == null) { return; }
         mut i: u64 = 0;
         while (i < this.bucket_count) {
@@ -225,6 +241,8 @@ type struct HashMap<K, V, A = GlobalAlloc> {
             loop {
                 if (node == null) { break; }
                 const next: Entry<K, V>* = node.next;
+                node.key.drop();
+                node.value.drop();
                 free_entry(this, node);
                 node = next;
             }
@@ -238,10 +256,13 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     // Teardown
     // ========================================================================
 
-    /// Release every entry and the bucket array. Ownership obligation:
-    /// every HashMap must have `drop` called before going out of scope.
-    /// If K or V own resources, drain entries manually before calling this.
-    drop(mut &this) -> void {
+    /// Release every entry and the bucket array.  Calls `K::drop()`
+    /// and `V::drop()` on every entry before reclaiming its node, so
+    /// `HashMap<String, String>` and similar owning shapes don't
+    /// leak.  Ownership obligation: every HashMap must have `drop`
+    /// called before going out of scope.
+    drop(mut &this) -> void
+    where K: Drop, V: Drop {
         this.clear();
         if (this.buckets != null) {
             this.alloc.deallocate(

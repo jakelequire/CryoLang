@@ -2066,22 +2066,38 @@ type struct Monomorphizer {
             }
             this.unify_for_inference(param.resolved_type, actual);
         }
-        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-            if (!this.inference_bindings[i].is_valid()) { return false; }
-        }
 
-        // Apply default type args (e.g. `Array<T, A = GlobalAlloc>`) so a
-        // partial inference fills in trailing defaults.  Skip when no
-        // res_ctx is available (we still need a fully-bound list to
-        // instantiate, so the validity check above handles that case
-        // already; this is for upgrading partial-but-valid inferences
-        // like inferring T but defaulting A).
+        // Apply default type args (e.g. `CString<A = GlobalAlloc>`,
+        // `Array<T, A = GlobalAlloc>`) BEFORE the validity check.  The
+        // canonical case is a static method whose params don't mention
+        // any of the owner's generic params at all (`CString::from_str(
+        // source: Str)` never references `A`); the inference loop above
+        // therefore leaves every binding invalid, but the owner's
+        // declared defaults can still pin every slot to a concrete type.
+        //
+        // `expand_default_type_args` only appends trailing defaults to
+        // a *short* args list (`args.length < entry.param_count`).  The
+        // pre-sized scratch buffer is already at full length, so we
+        // first truncate to the longest valid prefix; expansion then
+        // fills the trailing invalid slots from defaults.
         if (res_ctx != null && this.type_resolver != null) {
-            mut filled: TypeRef[] = this.inference_bindings;
-            filled = this.type_resolver.expand_default_type_args(entry, filled, res_ctx);
+            mut prefix_len: i64 = 0;
+            while (prefix_len < this.inference_bindings.length
+                   && this.inference_bindings[prefix_len].is_valid()) {
+                prefix_len = prefix_len + 1;
+            }
+            mut prefix: TypeRef[] = [];
+            for (mut i: i64 = 0; i < prefix_len; i++) {
+                prefix.push(this.inference_bindings[i]);
+            }
+            const filled: TypeRef[] = this.type_resolver.expand_default_type_args(
+                entry, prefix, res_ctx);
             if (filled.length == entry.param_type_ids.length) {
                 this.inference_bindings = filled;
             }
+        }
+        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+            if (!this.inference_bindings[i].is_valid()) { return false; }
         }
 
         // Instantiate the spec'd owner type and ENQUEUE it for the
@@ -2748,13 +2764,21 @@ type struct Monomorphizer {
             return false;
         }
 
-        // Reference: tolerate mismatched ref-ness.  `&T` vs `&T` peels both
-        // sides; `&T` vs `T` peels just the formal.
+        // Reference: tolerate mismatched ref-ness.  `&T` vs `&T` peels
+        // both sides; `&T` vs `T` peels just the formal so a `&T`
+        // formal absorbs a bare-value actual.  `&T` vs `*T` (sema's
+        // address-of returns Reference, but some inference paths still
+        // surface a Pointer for the same source-level `&x`) peels both
+        // and unifies the inner types.
         if (ft.kind == TypeKind::Reference) {
             const fr: ReferenceType* = ft as ReferenceType*;
             if (at.kind == TypeKind::Reference) {
                 const ar: ReferenceType* = at as ReferenceType*;
                 return this.unify_for_inference(fr.referent, ar.referent);
+            }
+            if (at.kind == TypeKind::Pointer) {
+                const ap2: PointerType* = at as PointerType*;
+                return this.unify_for_inference(fr.referent, ap2.pointee);
             }
             return this.unify_for_inference(fr.referent, actual);
         }
@@ -2763,11 +2787,22 @@ type struct Monomorphizer {
             return this.unify_for_inference(formal, ar.referent);
         }
 
-        // Pointer: structural.
-        if (ft.kind == TypeKind::Pointer && at.kind == TypeKind::Pointer) {
+        // Pointer: structural Pointer-vs-Pointer, plus a Pointer-vs-
+        // Reference cross-peel for the canonical case where the formal
+        // is declared `T*` and the caller wrote `&value` (sema's
+        // address-of produces a Reference).  Both sides are peeled to
+        // their pointee/referent so the recursive unifier sees the
+        // same type at the next level.
+        if (ft.kind == TypeKind::Pointer) {
             const fp: PointerType* = ft as PointerType*;
-            const ap: PointerType* = at as PointerType*;
-            return this.unify_for_inference(fp.pointee, ap.pointee);
+            if (at.kind == TypeKind::Pointer) {
+                const ap: PointerType* = at as PointerType*;
+                return this.unify_for_inference(fp.pointee, ap.pointee);
+            }
+            if (at.kind == TypeKind::Reference) {
+                const ar2: ReferenceType* = at as ReferenceType*;
+                return this.unify_for_inference(fp.pointee, ar2.referent);
+            }
         }
 
         // InstantiatedType vs InstantiatedType: same base + recursive args.

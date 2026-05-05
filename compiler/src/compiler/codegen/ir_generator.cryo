@@ -110,6 +110,60 @@ public:
         return ctx_ptr.decl_index.lookup_type(name);
     }
 
+    /// Determine whether an AST call callee resolves to a known
+    /// divergent (non-returning) function.  Drives the post-call
+    /// `unreachable` emission without relying on string-comparing the
+    /// emitted LLVM symbol name to a hard-coded mangle.
+    ///
+    /// Recognized:
+    ///   - bare `panic` (the intrinsic / legacy stdlib path)
+    ///   - any function `panic` whose containing namespace ends in
+    ///     `::core::panic` or `::prelude` (matches the new stdlib's
+    ///     `std::core::panic::panic` and the legacy `std::prelude::panic`)
+    ///
+    /// When the language gains `-> never` return-type syntax this is
+    /// the path that should subsume the special cases.
+    is_divergent_callee(mut &this, callee: ExpressionNode*) -> boolean {
+        if (callee == null) { return false; }
+        const intern: InternTable* = this.cg.get_intern();
+
+        if (callee.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = callee as IdentifierNode*;
+            const name_str: string = intern.resolve(id.name);
+            if (strcmp(name_str, "panic") == 0) { return true; }
+            return false;
+        }
+
+        if (callee.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
+            const member_str: string = intern.resolve(sr.member_name);
+            if (strcmp(member_str, "panic") != 0) { return false; }
+
+            const scope_str: string = intern.resolve(sr.scope_name);
+            const slen: i64 = strlen(scope_str) as i64;
+            // Match `<...>::core::panic`.
+            if (slen >= 11) {
+                const tail11: string = (scope_str + (slen - 11)) as string;
+                if (strcmp(tail11, "core::panic") == 0) { return true; }
+            }
+            // Match `<...>::prelude` and the bare `prelude` form.
+            if (slen >= 7) {
+                const tail7: string = (scope_str + (slen - 7)) as string;
+                if (strcmp(tail7, "prelude") == 0) { return true; }
+            }
+            // Match `intrinsics` / `core::intrinsics` (the stdlib's
+            // panic emerges through this layer too).
+            if (slen >= 10) {
+                const tail10: string = (scope_str + (slen - 10)) as string;
+                if (strcmp(tail10, "intrinsics") == 0) { return true; }
+            }
+            if (strcmp(scope_str, "intrinsics") == 0) { return true; }
+            return false;
+        }
+
+        return false;
+    }
+
     /// Resolve a sizeof/alignof operand TypeAnnotation to a concrete TypeRef
     /// at codegen time.  Drives the operand through the type_resolver so that
     /// generic args (e.g., `HashMapEntry<K, V>` after substitution by the
@@ -335,9 +389,6 @@ public:
         // Without this, every derived-class constructor returns immediately
         // after storing its params into locals, and downstream uses of inherited
         // fields read garbage.
-        const dbg_ic: i32 = node.is_constructor as i32;
-        const dbg_hb: i32 = node.has_base_ctor() as i32;
-        cdebug("[CTOR-CHECK] is_ctor=%d has_base=%d\n", dbg_ic, dbg_hb);
         if (node.is_constructor && node.has_base_ctor()) {
             this.emit_base_ctor_call(node, fn_val);
         }
@@ -364,7 +415,6 @@ public:
     /// param 0 of the enclosing constructor) is passed as the receiver, and
     /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
     emit_base_ctor_call(mut &this, node: MethodNode*, fn_val: LValue) -> void {
-        cdebug("[BCTOR-START]\n");
         const intern: InternTable* = this.cg.get_intern();
         const di: DeclarationIndex* = this.cg.get_decl_index();
         const ctx_ptr: CompilationContext* = this.cg.ctx;
@@ -382,9 +432,7 @@ public:
             base_qualified = node.base_ctor_name;
             base_type = di.lookup_type(base_qualified);
         }
-        cdebug("[BCTOR-T1]\n");
         if (base_type.is_invalid()) { cdebug("[BCTOR-BAIL] type invalid\n"); return; }
-        cdebug("[BCTOR-T2]\n");
 
         const base_qualified_str: string = intern.resolve(base_qualified);
         const base_bare_str: string = intern.resolve(node.base_ctor_name);
@@ -397,16 +445,13 @@ public:
         if (!ctor_fn.is_valid()) {
             ctor_fn = resolve_function(this.cg, ctor_sym);
         }
-        cdebug("[BCTOR-T3]\n");
         if (!ctor_fn.is_valid()) {
             cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
             return;
         }
-        cdebug("[BCTOR-T4]\n");
 
         const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
         if (!ctor_ty.is_valid()) { cdebug("[BCTOR-BAIL] ctor_ty invalid\n"); return; }
-        cdebug("[BCTOR-T5]\n");
 
         // `this` is LLVM param 0 of the enclosing constructor.
         const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
@@ -414,21 +459,9 @@ public:
         mut ctor_args: LValue[] = [];
         ctor_args.push(this_arg);
         mut any_arg_invalid: boolean = false;
-        const dbg_args_len: i64 = node.base_ctor_args.length;
-        cdebug("[BCTOR-ARGS-LEN] len=%lld\n", dbg_args_len);
         for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
             const arg_node: ExpressionNode* = node.base_ctor_args[i];
-            const dbg_arg_ptr: void* = arg_node as void*;
-            // Read the first 16 bytes raw to see what's actually at the pointer.
-            const dbg_raw_ptr: u64* = dbg_arg_ptr as u64*;
-            const dbg_w0: u64 = if (dbg_arg_ptr != null) { dbg_raw_ptr[0] } else { 0 };
-            const dbg_w1: u64 = if (dbg_arg_ptr != null) { dbg_raw_ptr[1] } else { 0 };
-            const dbg_arg_kind_chained: i32 = node.base_ctor_args[i].kind as i32;
-            const dbg_arg_kind_local: i32 = arg_node.kind as i32;
             mut arg: LValue = this.codegen_rvalue(arg_node);
-            const dbg_arg_valid: i32 = arg.is_valid() as i32;
-            cdebug("[BCTOR-ARG] i=%lld ptr=%p w0=0x%llx w1=0x%llx kind_chained=%d kind_local=%d valid=%d\n",
-                   i, dbg_arg_ptr, dbg_w0, dbg_w1, dbg_arg_kind_chained, dbg_arg_kind_local, dbg_arg_valid);
             if (!arg.is_valid()) {
                 any_arg_invalid = true;
                 break;
@@ -477,33 +510,9 @@ public:
             ctor_args.push(arg);
         }
         if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
-        cdebug("[BCTOR-T6]\n");
 
         mut ctor_result: LValue = LValue::null();
         codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
-
-        // Diagnostic: dump the enclosing function's blocks/instructions so
-        // we can see whether codegen_call's emitted call survived past this
-        // point.  Print one line per instruction with its opcode.
-        const dbg_fn: void* = fn_val.raw;
-        const dbg_fn_name_v: void* = llvm::LLVMGetValueName(dbg_fn);
-        const dbg_fn_name: string = dbg_fn_name_v as string;
-        cdebug("[BCTOR-DUMP] enclosing fn='%s' after codegen_call:\n", dbg_fn_name);
-        mut dbg_bb: void* = llvm::LLVMGetFirstBasicBlock(dbg_fn);
-        mut dbg_bb_idx: i32 = 0;
-        while (dbg_bb != null) {
-            cdebug("[BCTOR-DUMP]   bb#%d:\n", dbg_bb_idx);
-            mut dbg_inst: void* = llvm::LLVMGetFirstInstruction(dbg_bb);
-            mut dbg_inst_idx: i32 = 0;
-            while (dbg_inst != null) {
-                const dbg_op: i32 = llvm::LLVMGetInstructionOpcode(dbg_inst);
-                cdebug("[BCTOR-DUMP]     inst#%d opcode=%d\n", dbg_inst_idx, dbg_op);
-                dbg_inst = llvm::LLVMGetNextInstruction(dbg_inst);
-                dbg_inst_idx = dbg_inst_idx + 1;
-            }
-            dbg_bb = llvm::LLVMGetNextBasicBlock(dbg_bb);
-            dbg_bb_idx = dbg_bb_idx + 1;
-        }
     }
 
     /// Generate a block of statements directly (no virtual dispatch).
@@ -2183,6 +2192,26 @@ public:
                         } else if (t.kind == TypeKind::Class) {
                             const oct: ClassType* = t as ClassType*;
                             owner_str = intern.resolve(oct.qualified_name);
+                        } else if (t.kind == TypeKind::Enum) {
+                            const oet: EnumType* = t as EnumType*;
+                            owner_str = intern.resolve(oet.qualified_name);
+                        } else if (t.kind == TypeKind::Int
+                                || t.kind == TypeKind::Float
+                                || t.kind == TypeKind::Bool
+                                || t.kind == TypeKind::Char
+                                || t.kind == TypeKind::String) {
+                            // Primitives don't have a qualified_name; their
+                            // bare display name (`u64`, `i32`, `string`, ...)
+                            // is what `register_trait_impl` keys against and
+                            // what `MangledName::for_method` expects.  Without
+                            // this branch, generic trait methods on primitives
+                            // (e.g. `Display::fmt<W>` for `u64`) would fall
+                            // through to the name-based Strategy 1 lookup
+                            // and emit a call against the template's mangled
+                            // symbol with the generic param name still in the
+                            // signature (e.g. `Formatter<W>` instead of
+                            // `Formatter<LineBuf<Stdout>>`).
+                            owner_str = t.display_name();
                         }
                     }
                     if (strlen(owner_str) > 0) {
@@ -2390,13 +2419,12 @@ public:
 
         // Emit `unreachable` after calls to divergent functions.  Two
         // cases handled here:
-        //   1. The callee's resolved return type is `never` — works for
-        //      future `-> never` annotations once the bootstrap can grok
-        //      them.
-        //   2. The callee's LLVM name matches a known divergent function
-        //      from the stdlib runtime (`panic` intrinsic; `prelude::panic`
-        //      wrapper).  These are declared `-> void` in the source for
-        //      bootstrap compatibility but semantically diverge.
+        //   1. The callee's resolved return type is `never`.
+        //   2. The callee resolves to a known divergent function from
+        //      the stdlib (`panic` intrinsic; `core::panic::panic` and the
+        //      legacy `prelude::panic` wrapper).  These are declared
+        //      `-> void` in source for bootstrap compatibility but
+        //      semantically diverge.
         // Without this, calls in a non-void-returning context (e.g. the
         // `None` arm of `Option<T>::unwrap`) leave the block without a
         // terminator and the body-validator strips the entire function.
@@ -2407,29 +2435,8 @@ public:
                 should_unreachable = true;
             }
         }
-        if (!should_unreachable && callee_val.is_valid()) {
-            const _cn: string = llvm::LLVMGetValueName(callee_val.raw) as string;
-            if (_cn != null) {
-                // Bare `panic` — the LLVM-level intrinsic emitted by
-                // `emit_panic_runtime`, called directly by callers that
-                // hit the intrinsic dispatcher (legacy stdlib path).
-                if (strcmp(_cn, "panic") == 0) { should_unreachable = true; }
-                // Legacy prelude wrapper (old stdlib).
-                else if (strcmp(_cn, "C$3std.7prelude.5panic$FS_S_j$Rv") == 0) {
-                    should_unreachable = true;
-                }
-                // New stdlib's `core::panic::panic` wrapper.  `intrinsics::panic`
-                // calls in the new stdlib resolve through this wrapper rather
-                // than the bare `@panic` runtime.  Without recognition here,
-                // the void-epilogue's implicit `ret void` masks the missing
-                // terminator for void callers (e.g. `Array<T>::push`), but
-                // non-void callers (e.g. `HashMap::insert -> Option<V>`) end
-                // up with an unterminated merge block and the body validator
-                // strips them to a bare `declare`.
-                else if (strcmp(_cn, "C$3std.4core.5panic.5panic$FS_S_j$Rv") == 0) {
-                    should_unreachable = true;
-                }
-            }
+        if (!should_unreachable && this.is_divergent_callee(node.callee)) {
+            should_unreachable = true;
         }
         if (should_unreachable) {
             this.cg.builder.build_unreachable();

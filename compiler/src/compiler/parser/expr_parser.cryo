@@ -193,7 +193,7 @@ public:
     }
 
     /// Parse postfix operations: call, index, member access, ++/--.
-    parse_postfix(expr: ExpressionNode*) -> ExpressionNode* {
+    parse_postfix(mut expr: ExpressionNode*) -> ExpressionNode* {
         while (true) {
             if (this.panic_mode || this.is_at_end()) { break; }
 
@@ -1126,22 +1126,37 @@ public:
                     const pb: PatternBinding* = new PatternBinding { name: bn, span: bs };
                     pat.add_element(PatternElement::Binding(pb));
                     pat.add_binding(bn, bs, elem_pos);
-                } else if (this.check(TokenType::NumericConstant)) {
+                } else if (this.check(TokenType::NumericConstant)
+                        || (this.check(TokenType::Minus)
+                            && this.peek_at(1).kind == TokenType::NumericConstant)) {
+                    mut sign: i64 = 1;
+                    if (this.match_tok(TokenType::Minus)) { sign = -1; }
                     const num_tok: Token = this.advance();
                     const ns: SourceSpan = this.span_from_token(num_tok);
-                    // Check for integer vs float
+                    // Float vs int: presence of '.' / 'e' / 'E' decides.
                     mut is_float: boolean = false;
-                    for (mut i: int = 0; i < num_tok.lexeme.length(); i++) {
-                        if (num_tok.lexeme[i] == '.' || num_tok.lexeme[i] == 'e') {
+                    const llen: u32 = num_tok.lexeme.length();
+                    for (mut i: u32 = 0; i < llen; i++) {
+                        const c: char = num_tok.lexeme[i];
+                        if (c == '.' || c == 'e' || c == 'E') {
                             is_float = true;
                             break;
                         }
                     }
                     if (is_float) {
-                        const pf: PatternLiteralFloat* = new PatternLiteralFloat { value: 0.0, span: ns };
+                        const fv: f64 = ParserBase::parse_numeric_lexeme_f64(
+                            num_tok.lexeme);
+                        const signed_fv: f64 = if (sign < 0) { 0.0 - fv } else { fv };
+                        const pf: PatternLiteralFloat* = new PatternLiteralFloat {
+                            value: signed_fv, span: ns,
+                        };
                         pat.add_element(PatternElement::LiteralFloat(pf));
                     } else {
-                        const pi: PatternLiteralInt* = new PatternLiteralInt { value: 0, span: ns };
+                        const iv: i64 = ParserBase::parse_numeric_lexeme_i64(
+                            num_tok.lexeme);
+                        const pi: PatternLiteralInt* = new PatternLiteralInt {
+                            value: sign * iv, span: ns,
+                        };
                         pat.add_element(PatternElement::LiteralInt(pi));
                     }
                 } else {
