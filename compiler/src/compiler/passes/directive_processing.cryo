@@ -14,6 +14,12 @@
 ///   ![noinline]               — function: hint the inliner to skip
 ///   ![entry]                  — function: marker for "program entry"
 ///   ![test]                   — function: marker for unit-test runners
+///   ![ignore]                 — function (`![test]`-marked): skip this test
+///                                 unless `--ignored` is passed
+///   ![should_panic]           — function (`![test]`-marked): test passes
+///                                 only if it panics or returns Err
+///   ![config(testing)]        — namespace: marks the file as a testing
+///                                 module; only built under `cryo test`
 ///   ![deprecated]             — any decl: deprecation marker
 ///   ![deprecated("msg")]      — any decl: deprecation marker w/ msg
 ///   ![align(N)]               — struct/class: align bytes (N integer)
@@ -53,6 +59,13 @@ type struct DirectiveRecord {
     node:       DirectiveNode*;
     /// Owning declaration (null ⇒ standalone module-level directive).
     decl:       DeclarationNode*;
+    /// Fully-qualified name of the owning declaration, captured at
+    /// registration time when `ctx.namespace` is correct for the
+    /// current module.  Late-running passes (e.g. `TestMainCodegen`)
+    /// can't reproduce the qualifier from `decl.name` alone because by
+    /// then `ctx` may be in a different module's state.  Empty for
+    /// standalone module-level directives where `decl == null`.
+    qualified_name: SymbolStr;
     /// Source location of the directive.
     span:       SourceSpan;
 }
@@ -129,6 +142,9 @@ function is_known_builtin(name: string) -> boolean {
         || strcmp(name, "noinline") == 0
         || strcmp(name, "entry") == 0
         || strcmp(name, "test") == 0
+        || strcmp(name, "ignore") == 0
+        || strcmp(name, "should_panic") == 0
+        || strcmp(name, "config") == 0
         || strcmp(name, "deprecated") == 0
         || strcmp(name, "align") == 0
         || strcmp(name, "repr") == 0
@@ -226,6 +242,51 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
         }
         if (target != DirectiveTarget::Function) {
             emit_placement_error(ctx, dir, name, "function", target);
+        }
+        return;
+    }
+
+    // `![ignore]` and `![should_panic]` are siblings of `![test]`: zero
+    // args, function-target.  Cross-directive coupling (e.g. requiring
+    // `![test]` to be present alongside `![ignore]`) is enforced later
+    // by the test-mode validator pass — directive_processing only checks
+    // each directive's own shape and target.
+    if (strcmp(name, "ignore") == 0 || strcmp(name, "should_panic") == 0) {
+        if (argc != 0) {
+            emit_arity_error(ctx, dir, name, 0, argc);
+        }
+        if (target != DirectiveTarget::Function) {
+            emit_placement_error(ctx, dir, name, "function", target);
+        }
+        return;
+    }
+
+    // `![config(<flavor>)]` marks an entire file's namespace as a special
+    // build mode.  Today the only recognised flavor is `testing`, which
+    // gates the file in/out under `cryo test`.  Future flavors (e.g. a
+    // `bench` flavor for benchmarks) plug in here.
+    if (strcmp(name, "config") == 0) {
+        if (argc != 1) {
+            emit_arity_error(ctx, dir, name, 1, argc);
+            return;
+        }
+        const a: DirectiveArg = dir.args[0];
+        if (a.kind != DirectiveArgKind::Ident) {
+            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+            return;
+        }
+        if (strcmp(a.name, "testing") != 0) {
+            const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+            const msg: string = format(
+                "directive `![config]`: unknown flavor `%s` (expected `testing`)",
+                a.name);
+            mut diag: Diagnostic = Diagnostic::error(code, msg);
+            diag = diag.at(dir.span);
+            ctx.emit_diagnostic(diag);
+            return;
+        }
+        if (target != DirectiveTarget::Module) {
+            emit_placement_error(ctx, dir, name, "namespace", target);
         }
         return;
     }
@@ -430,6 +491,17 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
 
     mut count: i64 = 0;
 
+    // Cross-cutting tracking for the testing-mode validation below.
+    // `has_config_testing` records whether this module's namespace
+    // declaration carries `![config(testing)]`.  `first_test_dir` is
+    // the source span of the first `![test]`/`![ignore]`/`![should_panic]`
+    // directive seen, used to point the diagnostic at a real spot when
+    // a test directive lives in a non-testing module.
+    mut has_config_testing: boolean = false;
+    mut has_test_directive: boolean = false;
+    mut first_test_dir_span: SourceSpan = SourceSpan::none();
+    mut first_test_dir_name: string = "";
+
     for (mut i: i64 = 0; i < root.statements.length; i++) {
         const stmt: ASTNode* = root.statements[i];
         if (stmt == null) { continue; }
@@ -442,6 +514,7 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
                 kind: d.directive_kind,
                 node: d,
                 decl: null,
+                qualified_name: SymbolStr::empty(),
                 span: d.span,
             };
             registry.add(rec);
@@ -469,10 +542,38 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
             validate_builtin(ctx, d, t);
             apply_effects(d, decl);
 
+            // Cross-cutting flags for the test-mode validation below.
+            if (t == DirectiveTarget::Module
+                    && strcmp(d.directive_kind, "config") == 0
+                    && d.args.length == 1
+                    && d.args[0].kind == DirectiveArgKind::Ident
+                    && strcmp(d.args[0].name, "testing") == 0) {
+                has_config_testing = true;
+            }
+            if (t == DirectiveTarget::Function
+                    && (strcmp(d.directive_kind, "test")         == 0
+                     || strcmp(d.directive_kind, "ignore")       == 0
+                     || strcmp(d.directive_kind, "should_panic") == 0)) {
+                if (!has_test_directive) {
+                    first_test_dir_span = d.span;
+                    first_test_dir_name = d.directive_kind;
+                }
+                has_test_directive = true;
+            }
+
+            // Capture the qualified name now while ctx.namespace is
+            // correct for this module.  Late passes (TestMainCodegen)
+            // need the qualifier to look up DI mangled names.
+            mut qualified: SymbolStr = SymbolStr::empty();
+            if (decl.kind == NodeKind::FunctionDeclaration) {
+                const fn_decl: FunctionDeclNode* = decl as FunctionDeclNode*;
+                qualified = ctx.qualify_symbol_sym(fn_decl.name);
+            }
             const rec: DirectiveRecord = DirectiveRecord {
                 kind: d.directive_kind,
                 node: d,
                 decl: decl,
+                qualified_name: qualified,
                 span: d.span,
             };
             registry.add(rec);
@@ -488,12 +589,94 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
         }
     }
 
+    // Cross-cutting placement validation: enforce that `![config(testing)]`,
+    // `![test]`, `![ignore]`, and `![should_panic]` only appear in files
+    // under `<project_root>/tests/`, and that every file in `tests/` has
+    // `![config(testing)]` on its namespace.
+    validate_test_module_placement(ctx,
+        has_config_testing, has_test_directive,
+        first_test_dir_span, first_test_dir_name);
+
     if (ctx.debug_mode) {
         cdebug("[DirectiveProcessing] Processed %lld directives in this module (%lld cumulative)\n",
             count, registry.count());
     }
 
     return PassResult::from_snapshot(ctx.diagnostics, snap);
+}
+
+// ============================================================================
+// Test-module placement validation
+// ============================================================================
+
+/// True iff `path` lies under `<project_root>/tests/` (recursively).
+/// Computes the prefix once and does a byte-wise compare; matches the
+/// path style cryoc uses internally (always project-relative or absolute,
+/// never with `..`).
+function file_is_under_tests_dir(project_root: string, file_path: string) -> boolean {
+    if (strlen(project_root) == 0) { return false; }
+    const prefix: string = format("%s/tests/", project_root);
+    const plen: u64 = strlen(prefix);
+    const flen: u64 = strlen(file_path);
+    if (flen < plen) { return false; }
+    return strncmp(file_path, prefix, plen) == 0;
+}
+
+/// Enforce the locked design's three placement rules.  Run once per
+/// module after the walk has populated `has_config_testing` and
+/// `has_test_directive`.
+function validate_test_module_placement(ctx: CompilationContext*,
+                                        has_config_testing: boolean,
+                                        has_test_directive: boolean,
+                                        first_test_dir_span: SourceSpan,
+                                        first_test_dir_name: string) -> void {
+    if (ctx.project_config == null) { return; }
+    const project_root: string = ctx.project_config.project_root;
+    const file_path:    string = ctx.source_file;
+
+    // The stdlib lives outside the project tree but still parses through
+    // this pass — never apply test-mode rules to stdlib files.
+    if (strlen(ctx.stdlib_root) > 0
+            && strncmp(file_path, ctx.stdlib_root, strlen(ctx.stdlib_root)) == 0) {
+        return;
+    }
+
+    const in_tests_dir: boolean = file_is_under_tests_dir(project_root, file_path);
+
+    // Rule 1: `![config(testing)]` must live under `tests/`.
+    if (has_config_testing && !in_tests_dir) {
+        const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+        const msg: string = format(
+            "directive `![config(testing)]` may only appear on a namespace inside `tests/`; this file is at `%s`",
+            file_path);
+        mut diag: Diagnostic = Diagnostic::error(code, msg);
+        // Span the file's namespace decl if we can find it; otherwise
+        // fall back to a span-less error so the renderer still shows
+        // the file path from the message body.
+        ctx.emit_diagnostic(diag);
+    }
+
+    // Rule 2: every file in `tests/` must carry `![config(testing)]`.
+    if (in_tests_dir && !has_config_testing) {
+        const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+        const msg: string = format(
+            "file under `tests/` is missing the `![config(testing)]` namespace marker (`%s`)",
+            file_path);
+        mut diag: Diagnostic = Diagnostic::error(code, msg);
+        ctx.emit_diagnostic(diag);
+    }
+
+    // Rule 3: `![test]`/`![ignore]`/`![should_panic]` require an
+    // enclosing `![config(testing)]` namespace.
+    if (has_test_directive && !has_config_testing) {
+        const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+        const msg: string = format(
+            "directive `![%s]` is only allowed inside a namespace marked `![config(testing)]`",
+            first_test_dir_name);
+        mut diag: Diagnostic = Diagnostic::error(code, msg);
+        diag = diag.at(first_test_dir_span);
+        ctx.emit_diagnostic(diag);
+    }
 }
 
 /// classify_target by NodeKind alone (no DeclarationNode* needed).
@@ -509,6 +692,7 @@ function classify_target_from_kind(k: NodeKind) -> DirectiveTarget {
         NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
         NodeKind::ExternBlock           => { DirectiveTarget::Extern   }
         NodeKind::ImportDeclaration     => { DirectiveTarget::Import   }
+        NodeKind::ModuleDeclaration     => { DirectiveTarget::Module   }
         _                               => { DirectiveTarget::Other    }
     };
 }

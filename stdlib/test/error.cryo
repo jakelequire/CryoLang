@@ -1,0 +1,90 @@
+///! TestError — the failure value a `![test]` function returns.
+///!
+///! Tests have signature `![test] function name() -> Result<(), TestError>`.
+///! On success they return `Ok(())`; on failure they return `Err(...)` with
+///! one of the variants below. Tests that panic (via `assert`, `unwrap`,
+///! etc.) are also surfaced as failures by the runner — the child process
+///! aborts and the parent observes `WIFSIGNALED`.
+
+namespace std::test::error;
+
+import core::result;
+import core::slice;
+import collections::str;
+import collections::string;
+import io::error;
+import fmt::error;
+import fmt::display;
+import fmt::write;
+
+// ============================================================================
+// TestError
+// ============================================================================
+
+/// Why a test failed. The runner prints the variant's message verbatim
+/// to stderr from the child process before exiting non-zero, so the
+/// parent can show the failing message in the test summary.
+type enum TestError {
+    /// A user assertion failed. Carries the assertion message.
+    Failed(String);
+    /// Any other reason a test could not produce a definitive result —
+    /// I/O error during setup, environment problem, etc.
+    Other(String);
+}
+
+implement enum TestError {
+    /// Borrowed view into the variant's message. Cheap: no allocation,
+    /// no Drop interaction. Valid for the lifetime of the `TestError`.
+    /// Use this when you only need to display or compare the message.
+    message_str(&this) -> Str {
+        match (&this) {
+            TestError::Failed(msg) => { return msg.as_str(); }
+            TestError::Other(msg)  => { return msg.as_str(); }
+        }
+    }
+
+    /// Construct a `Failed` from a borrowed `Str`. Allocates an owned
+    /// copy of the message — the test function's source string can
+    /// safely outlive the resulting `TestError` value.
+    static failed(message: Str) -> TestError {
+        return TestError::Failed(String::from_str(message));
+    }
+
+    /// Construct an `Other` from a borrowed `Str`. Allocates an owned
+    /// copy of the message.
+    static other(message: Str) -> TestError {
+        return TestError::Other(String::from_str(message));
+    }
+
+    /// Release the owned message string. Tests almost never need to
+    /// call this — the runner consumes a `TestError` and drops it
+    /// after printing.
+    drop(mut &this) -> void {
+        match (&this) {
+            TestError::Failed(mut msg) => { msg.drop(); }
+            TestError::Other(mut msg)  => { msg.drop(); }
+        }
+    }
+}
+
+implement trait Display for enum TestError {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (&this) {
+            TestError::Failed(msg) => {
+                match (f.write_str(Str::from_raw("assertion failed: " as u8*, 18))) {
+                    Result::Ok(_) => { }
+                    Result::Err(err) => { return Result::Err(err); }
+                }
+                return f.write_str(msg.as_str());
+            }
+            TestError::Other(msg) => {
+                match (f.write_str(Str::from_raw("test error: " as u8*, 12))) {
+                    Result::Ok(_) => { }
+                    Result::Err(err) => { return Result::Err(err); }
+                }
+                return f.write_str(msg.as_str());
+            }
+        }
+    }
+}

@@ -17,6 +17,7 @@ type enum CommandKind {
     Init;
     Build;
     Run;
+    Test;
     Check;
     Raw;
     Project; // TODO: remove this and just use `build` with auto-detection of cryoconfig
@@ -32,6 +33,7 @@ implement enum CommandKind {
             CommandKind::Init    => { "init"    }
             CommandKind::Build   => { "build"   }
             CommandKind::Run     => { "run"     }
+            CommandKind::Test    => { "test"    }
             CommandKind::Check   => { "check"   }
             CommandKind::Raw     => { "raw"     }
             CommandKind::Project  => { "project"  }
@@ -47,6 +49,7 @@ implement enum CommandKind {
             CommandKind::Init     => { "Scaffold a new Cryo project (cryoconfig + main.cryo)" }
             CommandKind::Build    => { "Build a source file (single-file)"            }
             CommandKind::Run      => { "Build the project and run the resulting binary" }
+            CommandKind::Test     => { "Build and run the project's tests"             }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
             CommandKind::Raw      => { "Compile without stdlib or prelude"            }
             CommandKind::Project  => { "Build a multi-module project from cryoconfig" }
@@ -62,6 +65,7 @@ implement enum CommandKind {
             CommandKind::Init     => { "cryoc init [dir]"                  }
             CommandKind::Build    => { "cryoc build <file> [flags]"       }
             CommandKind::Run      => { "cryoc run [flags]"                 }
+            CommandKind::Test     => { "cryo test [pattern] [flags]"       }
             CommandKind::Check    => { "cryoc check <file> [flags]"       }
             CommandKind::Raw      => { "cryoc raw <file> [flags]"         }
             CommandKind::Project  => { "cryoc project [dir] [flags]"      }
@@ -93,6 +97,9 @@ type struct Executor {
         const run: CommandKind = CommandKind::Run;
         runner.add_command(Command::new(run.name(), run.description(), run.usage()));
 
+        const test_cmd: CommandKind = CommandKind::Test;
+        runner.add_command(Command::new(test_cmd.name(), test_cmd.description(), test_cmd.usage()));
+
         const check: CommandKind = CommandKind::Check;
         runner.add_command(Command::new(check.name(), check.description(), check.usage()));
 
@@ -113,6 +120,7 @@ type struct Executor {
         if (name == "init")     { return CommandKind::Init; }
         if (name == "build")    { return CommandKind::Build; }
         if (name == "run")      { return CommandKind::Run; }
+        if (name == "test")     { return CommandKind::Test; }
         if (name == "check")    { return CommandKind::Check; }
         if (name == "raw")      { return CommandKind::Raw; }
         if (name == "project")  { return CommandKind::Project; }
@@ -134,6 +142,7 @@ type struct Executor {
             CommandKind::Init    => { return Executor::cmd_init(args); }
             CommandKind::Build   => { return Executor::cmd_build(args); }
             CommandKind::Run     => { return Executor::cmd_run(args); }
+            CommandKind::Test    => { return Executor::cmd_test(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
             CommandKind::Raw     => { return Executor::cmd_raw(args); }
             CommandKind::Project  => { return Executor::cmd_project(args); }
@@ -400,6 +409,78 @@ type struct Executor {
         // exit code so the caller's $? matches what the inner binary
         // returned.
         const status: i32 = system(result.output_path);
+        if (status < 0) {
+            printf("Error: failed to spawn '%s'\n", result.output_path);
+            return 1;
+        }
+        return ((status >> 8) & 0xff) as int;
+    }
+
+    /// `cryo test [pattern] [flags]` — build the project's tests and
+    /// run them.  Behaves like `cryo run` but forces `CompileMode::Test`
+    /// so the user's `main` is suppressed and a synthesized test main
+    /// drives every `![test]` function.  Accepts the same surface flags
+    /// as `cryo run` (`--debug`, `--build-dir=...`, `--stdlib=...`)
+    /// plus the test-runner flags forwarded to the produced binary:
+    /// optional positional pattern, `--ignored`, `--list`, `--exact`,
+    /// `-q` / `--quiet`.
+    static cmd_test(args: ParsedArgs) -> int {
+        if (args.has_flag("debug")) {
+            Logger::enable_debug();
+        }
+
+        cdebug("[Test] Building test binary.\n");
+
+        const config_path: string = find_cryoconfig(".");
+        if (strcmp(config_path, "") == 0) {
+            printf("Error: No cryoconfig found in '.' or parent directories.\n");
+            printf("Usage: cryo test [pattern] [flags]   (run from a Cryo project)\n");
+            return 1;
+        }
+
+        mut config: CompilerConfig = CompilerConfig::default();
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
+        if (args.has_arg("build-dir")) {
+            config.output_dir_override = args.get_value("build-dir");
+        }
+        if (args.has_arg("stdlib")) {
+            config.stdlib_path_override = args.get_value("stdlib");
+        }
+        config.test_mode = true;
+
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        const result: CompilationResult = compiler.compile_project(config_path);
+
+        if (!result.success) {
+            printf("Test build failed (%u errors, %u warnings)\n",
+                result.error_count, result.warning_count);
+            return 1;
+        }
+        if (strlen(result.output_path) == 0) {
+            printf("Error: target produced no test executable — `cryo test` requires an executable project.\n");
+            return 1;
+        }
+
+        // Build the command for the produced test binary, forwarding the
+        // pattern (first positional) and the runner-side flags.
+        mut cmd: string = result.output_path;
+        if (args.positional_count() > 0) {
+            cmd = format("%s %s", cmd, args.input_file());
+        }
+        if (args.has_flag("ignored")) { cmd = format("%s --ignored", cmd); }
+        if (args.has_flag("list"))    { cmd = format("%s --list",    cmd); }
+        if (args.has_flag("exact"))   { cmd = format("%s --exact",   cmd); }
+        if (args.has_flag("quiet"))   { cmd = format("%s --quiet",   cmd); }
+        if (args.has_flag("q"))       { cmd = format("%s -q",        cmd); }
+
+        cdebug("[Test] %s\n", cmd);
+        // Flush parent stdio before spawning so the [Test] header lands
+        // before the child's output under --debug.  Same precaution as
+        // `cmd_run`.
+        fflush(null);
+        const status: i32 = system(cmd);
         if (status < 0) {
             printf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;

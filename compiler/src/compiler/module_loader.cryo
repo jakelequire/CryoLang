@@ -92,6 +92,54 @@ type struct ModuleLoader {
         return this.discover_module(intern, graph, sink, entry_path, debug);
     }
 
+    /// Recursively walk `dir`, calling `discover_module` on every `.cryo`
+    /// file. Used by `cryo test` to register every file under `tests/`
+    /// as a top-level module — test files are leaves in the import
+    /// graph (nothing imports them) so the entry-point-driven walk
+    /// would never reach them. Caller is responsible for having already
+    /// run `scan_all_project_files(dir, ...)` so namespaces in the
+    /// directory resolve through `ns_map`.
+    discover_tests_directory(mut &this, intern: InternTable*,
+                             graph: ModuleGraph*, sink: DiagnosticSink*,
+                             dir: string, debug: boolean) -> boolean {
+        const dp: void* = opendir(dir);
+        if (dp == null) { return true; }
+
+        mut overall_ok: boolean = true;
+        mut entry: void* = readdir(dp);
+        while (entry != null) {
+            const name: string = dirent_name(entry);
+            const dtype: i32 = dirent_type(entry);
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                entry = readdir(dp);
+                continue;
+            }
+            const full_path: string = format("%s/%s", dir, name);
+            if (dtype == 1) {
+                // Recurse into subdirectories.
+                if (!this.discover_tests_directory(
+                        intern, graph, sink, full_path, debug)) {
+                    overall_ok = false;
+                }
+            } else if (dtype == 0) {
+                const name_len: u64 = strlen(name);
+                if (name_len > 5) {
+                    const ext: string = ptr_add(name as void*,
+                        (name_len - 5) as i64) as string;
+                    if (strcmp(ext, ".cryo") == 0) {
+                        if (!this.discover_module(
+                                intern, graph, sink, full_path, debug)) {
+                            overall_ok = false;
+                        }
+                    }
+                }
+            }
+            entry = readdir(dp);
+        }
+        closedir(dp);
+        return overall_ok;
+    }
+
     /// Recursively walk a directory, lex every .cryo file to extract its
     /// namespace declaration, and register namespace → file_path in ns_map.
     scan_all_project_files(mut &this, dir: string, debug: boolean) -> void {
