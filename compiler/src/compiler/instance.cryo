@@ -22,6 +22,7 @@ import Compiler::ModuleLoader;
 import Compiler::ProjectConfig;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TestMainCodegen;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Compiler::AST::Node;
@@ -53,6 +54,12 @@ type struct CompilerConfig {
     /// `--stdlib=PATH`.  Takes priority over `$CRYO_STDLIB` and every
     /// implicit candidate path.
     stdlib_path_override: string;
+    /// `cryo test` build flag.  When true, `compile_project` runs in
+    /// `CompileMode::Test`: src/ + tests/ are both compiled, the user's
+    /// `main` is suppressed, and a synthesized test main drives every
+    /// `![test]` function through `std::test::runner::run_all`.  The
+    /// produced executable lands at `<output_dir>/bin/<name>-test`.
+    test_mode:           boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -62,6 +69,7 @@ type struct CompilerConfig {
             emit_llvm:           false,
             output_dir_override: "",
             stdlib_path_override: "",
+            test_mode:           false,
         };
     }
 
@@ -73,6 +81,7 @@ type struct CompilerConfig {
             emit_llvm:           false,
             output_dir_override: "",
             stdlib_path_override: "",
+            test_mode:           false,
         };
     }
 }
@@ -445,13 +454,25 @@ type struct CompilerInstance {
         }
 
         // Phase 1: Create context and discover modules
-        // Select compile mode based on target type:
-        //   Executable → MultiModule (auto-imports, stdlib linking, main transform)
-        //   Library    → MultiModule (auto-imports, stdlib linking, no main transform)
-        //   Stdlib     → StdlibBatch (no auto-imports, no stdlib linking, no main transform)
-        const mode: CompileMode = match (config.target_type) {
-            TargetType::Stdlib  => { CompileMode::StdlibBatch }
-            _                   => { CompileMode::MultiModule }
+        // Select compile mode based on target type, with a `cryo test`
+        // override:
+        //   --test (any executable) → Test         (suppresses user main,
+        //                                           synthesizes test main)
+        //   Executable              → MultiModule  (auto-imports, stdlib
+        //                                           linking, main transform)
+        //   Library                 → MultiModule  (auto-imports, stdlib
+        //                                           linking, no main transform)
+        //   Stdlib                  → StdlibBatch  (no auto-imports, no
+        //                                           stdlib linking, no main
+        //                                           transform)
+        const mode: CompileMode = if (this.config.test_mode
+                                       && config.requires_entry_point()) {
+            CompileMode::Test
+        } else {
+            match (config.target_type) {
+                TargetType::Stdlib  => { CompileMode::StdlibBatch }
+                _                   => { CompileMode::MultiModule }
+            }
         };
         // Heap-allocate CompilationContext to avoid stack overflow.
         // The struct is very large (InternTable, ModuleGraph, DiagnosticSink, etc.)
@@ -516,6 +537,42 @@ type struct CompilerInstance {
                 loader.discover_module(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
                     prelude_path, this.config.debug);
+            }
+        }
+
+        // `cryo test`: discover every `.cryo` file under `<project_root>/tests/`
+        // as a top-level module.  Test files are leaves in the import graph
+        // (nothing in `src/` imports them) so the entry-point-driven walk
+        // would never reach them.  We scan first to populate `ns_map`,
+        // then discover each file.  Also force-discover the runtime
+        // entry points (`std::env`, `std::test::runner`) so they reach the
+        // DI; the synthesized test main calls them by mangled name and
+        // `lookup_mangled_name` returns invalid otherwise.
+        if (ctx.mode.skip_user_main()) {
+            const tests_dir: string = format("%s/tests", config.project_root);
+            if (File::exists(tests_dir)) {
+                loader.scan_all_project_files(tests_dir, this.config.debug);
+                loader.discover_tests_directory(
+                    ctx.intern_table, ctx.module_graph, ctx.diagnostics,
+                    tests_dir, this.config.debug);
+                cdebug("[Compiler] tests/ discovery complete from %s\n", tests_dir);
+            } else {
+                cdebug("[Compiler] tests/ directory not found at %s — running with no tests\n",
+                    tests_dir);
+            }
+            if (!config.no_std && strlen(stdlib_root) > 0) {
+                const env_path: string = format("%s/env/_module.cryo", stdlib_root);
+                if (File::exists(env_path)) {
+                    loader.discover_module(
+                        ctx.intern_table, ctx.module_graph, ctx.diagnostics,
+                        env_path, this.config.debug);
+                }
+                const runner_path: string = format("%s/test/runner.cryo", stdlib_root);
+                if (File::exists(runner_path)) {
+                    loader.discover_module(
+                        ctx.intern_table, ctx.module_graph, ctx.diagnostics,
+                        runner_path, this.config.debug);
+                }
             }
         }
 
@@ -932,6 +989,18 @@ type struct CompilerInstance {
                 pipeline.reset();
             }
 
+            // Phase 7b: synthesize the test-runner main when in test mode.
+            // Walks the directive registry for `![test]` records, builds
+            // a fresh LLVM module containing the descriptor table + main,
+            // emits it to disk, and registers it with the linker artifacts.
+            if (!ctx.diagnostics.has_errors() && ctx.mode.skip_user_main()) {
+                cdebug("[Compiler] Phase 7b: Synthesizing test main\n");
+                const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
+                if (!test_result.success) {
+                    printf("[Compiler] Phase 7b: test-main synthesis FAILED\n");
+                }
+            }
+
             // Phase 8: link the per-module objects into the final binary.
             // Only runs when Phase 7 produced at least one object (executable
             // targets); library/stdlib builds short-circuit inside run_linking.
@@ -968,13 +1037,21 @@ type struct CompilerInstance {
         // (`<output_dir>/bin/<project_name>` — same shape as
         // CodegenPasses::run_linking) so `cryo run` knows where to
         // exec.  Library / stdlib targets have no entry point, so
-        // we leave output_path empty for those.
+        // we leave output_path empty for those.  Test-mode builds add
+        // a `-test` suffix to coexist with a regular build of the same
+        // project; `run_linking` applies the same suffix.
         mut exe_path: string = "";
         if (ctx.project_config != null
                 && ctx.project_config.requires_entry_point()) {
-            exe_path = format("%s/bin/%s",
-                ctx.project_config.output_dir,
-                ctx.project_config.project_name);
+            if (ctx.mode.skip_user_main()) {
+                exe_path = format("%s/bin/%s-test",
+                    ctx.project_config.output_dir,
+                    ctx.project_config.project_name);
+            } else {
+                exe_path = format("%s/bin/%s",
+                    ctx.project_config.output_dir,
+                    ctx.project_config.project_name);
+            }
         }
         return CompilationResult::ok(exe_path);
     }

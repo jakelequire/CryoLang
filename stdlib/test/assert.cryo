@@ -1,0 +1,133 @@
+///! Assertion helpers for `![test]` functions.
+///!
+///! Tests have signature `function name() -> Result<(), TestError>`. The
+///! helpers here return a `Result` matching that shape so a failing
+///! assertion can propagate by an explicit `match` (Cryo has no `?`
+///! operator yet).
+///!
+///! Two flavours:
+///!
+///! * `expect(condition, message)` and `bail(message)` — the no-format
+///!   path. Cheapest to call; the message is whatever the test author
+///!   wrote verbatim.
+///! * `expect_eq` / `expect_ne` — the comparison helpers. Build a
+///!   formatted "left vs. right" message via `Display`, so the failure
+///!   diagnostic shows the actual values that disagreed.
+///!
+///! Test code with no `?` operator looks like:
+///!
+///! ```cryo
+///! ![test] function add_works() -> Result<(), TestError> {
+///!     match (expect_eq(2 + 2, 4)) {
+///!         Result::Ok(_) => { }
+///!         Result::Err(e) => { return Result::Err(e); }
+///!     }
+///!     return Result::Ok(());
+///! }
+///! ```
+///!
+///! Verbose by design — explicit propagation will tighten up once Cryo
+///! grows a `?`-style operator.
+
+namespace std::test::assert;
+
+import core::result;
+import core::cmp;
+import core::option;
+import core::slice;
+import collections::str;
+import collections::string;
+import fmt::display;
+import fmt::error;
+import test::error;
+
+// ============================================================================
+// expect — boolean assertion
+// ============================================================================
+
+/// Return `Ok(())` if `condition` is true, `Err(TestError::Failed(msg))`
+/// otherwise. The cheap, no-format assertion.
+function expect(condition: boolean, message: Str) -> Result<(), TestError> {
+    if (condition) {
+        return Result::Ok(());
+    }
+    return Result::Err(TestError::failed(message));
+}
+
+// ============================================================================
+// bail — unconditional failure
+// ============================================================================
+
+/// Always return `Err(TestError::Failed(message))`. Use this when the
+/// failure condition is implicit in reaching this code path.
+function bail(message: Str) -> Result<(), TestError> {
+    return Result::Err(TestError::failed(message));
+}
+
+/// Same as `bail` but produces a `TestError::Other` — for non-assertion
+/// failures (I/O setup, environment problems, etc.) that the runner
+/// should display under "test error" rather than "assertion failed".
+function bail_other(message: Str) -> Result<(), TestError> {
+    return Result::Err(TestError::other(message));
+}
+
+// ============================================================================
+// expect_eq / expect_ne — comparison assertions
+// ============================================================================
+
+/// `Ok(())` if `a.equals(&b)`, otherwise `Err` carrying a multi-line
+/// "assertion `left == right` failed" message that Display-formats both
+/// values. Allocates the message on the heap; on allocation failure
+/// during message building, returns a generic fallback message.
+function expect_eq<T>(a: T, b: T) -> Result<(), TestError>
+where T: Eq + Display {
+    if (a.equals(&b)) {
+        return Result::Ok(());
+    }
+    return Result::Err(format_eq_error(&a, &b, "left == right"));
+}
+
+/// `Ok(())` if `!a.equals(&b)`, otherwise `Err` carrying a multi-line
+/// "assertion `left != right` failed" message that Display-formats both
+/// values. Allocates as `expect_eq` does.
+function expect_ne<T>(a: T, b: T) -> Result<(), TestError>
+where T: Eq + Display {
+    if (!a.equals(&b)) {
+        return Result::Ok(());
+    }
+    return Result::Err(format_eq_error(&a, &b, "left != right"));
+}
+
+/// Build the `assertion `<rel>` failed: left = X, right = Y` message
+/// shared by `expect_eq` / `expect_ne`. The relation label parameter
+/// is the user-facing rendering of the comparator (e.g. `left == right`).
+///
+/// Allocation failure during formatting falls back to a generic message
+/// so the test still surfaces a structured failure rather than aborting.
+function format_eq_error<T>(a: &T, b: &T, relation: string) -> TestError
+where T: Display {
+    mut buf: String = String::new();
+    buf.push_str(Str::from_raw("assertion `" as u8*, 11));
+    buf.push_str(Str::from_raw(relation, strlen(relation)));
+    buf.push_str(Str::from_raw("` failed\n  left:  " as u8*, 18));
+    match (format_to_string(a)) {
+        Result::Ok(mut left_str) => {
+            buf.push_str(left_str.as_str());
+            left_str.drop();
+        }
+        Result::Err(_) => {
+            buf.push_str(Str::from_raw("<format error>" as u8*, 14));
+        }
+    }
+    buf.push_str(Str::from_raw("\n  right: " as u8*, 10));
+    match (format_to_string(b)) {
+        Result::Ok(mut right_str) => {
+            buf.push_str(right_str.as_str());
+            right_str.drop();
+        }
+        Result::Err(_) => {
+            buf.push_str(Str::from_raw("<format error>" as u8*, 14));
+        }
+    }
+    return TestError::Failed(buf);
+}

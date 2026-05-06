@@ -1,0 +1,471 @@
+/// Test-main synthesis pass.
+///
+/// Runs once at the end of Phase 7 (per-module codegen) when the compile
+/// mode is `Test`. Walks `ctx.directive_registry` for `![test]` records,
+/// builds a fresh LLVM module containing:
+///
+///   * a private global string for each test's fully-qualified name,
+///   * an extern declaration for each test's mangled symbol,
+///   * a static `[N x %TestDescriptor]` global initialised with one
+///     entry per test (matching the layout of
+///     `stdlib/test/descriptor.cryo`'s `TestDescriptor` struct), and
+///   * a `define i32 @main(i32 argc, ptr argv)` that calls
+///     `std::env::set_args(argc, argv)` and then
+///     `std::test::runner::run_all(argc, argv, &descriptors[0], N)`,
+///     returning whatever the runner returned.
+///
+/// The synthesized module is emitted to
+/// `<output_dir>/obj/__cryo_test_main.o` and pushed onto
+/// `ctx.artifacts.object_files` so the existing linking pass picks it
+/// up automatically.
+///
+/// All cross-module symbol resolution goes through
+/// `ctx.decl_index.lookup_mangled_name(qualified_sym)` — the synthesizer
+/// does NOT compute mangled names itself.
+
+namespace Compiler::Codegen::TestMainCodegen;
+
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Passes::PassID;
+import Compiler::Passes::DirectiveProcessing;
+import Utils::Logger;
+
+
+// ============================================================================
+// TestEntry — one row collected from the registry
+// ============================================================================
+
+type struct TestEntry {
+    /// Cryo source-level fully-qualified name (e.g. `Tests::math::add_works`).
+    /// This is what the runner prints in `test NAME ... ` lines.
+    display_name: string;
+    /// Length of `display_name` in bytes (cached so we don't re-strlen).
+    display_len:  u64;
+    /// Linker-level mangled symbol (used to declare the extern).
+    mangled_name: string;
+    ignored:      boolean;
+    should_panic: boolean;
+}
+
+
+// ============================================================================
+// Phase entry point
+// ============================================================================
+
+/// Walk the directive registry for `![test]` records and emit a fresh
+/// LLVM module containing the test main + descriptor table. Pushes the
+/// resulting `.o` onto `ctx.artifacts.object_files`. No-op if not in
+/// test mode.
+function run_test_main_codegen(ctx: CompilationContext*) -> PassResult {
+    if (!ctx.mode.skip_user_main()) {
+        // Not test mode — nothing to synthesize.
+        return PassResult::ok();
+    }
+    if (ctx.project_config == null) {
+        return PassResult::ok();
+    }
+
+    mut tests: TestEntry[] = collect_tests(ctx);
+    const test_count: u64 = tests.length as u64;
+    cdebug("[TestMainCodegen] %llu tests discovered\n", test_count);
+
+    // Create the synthesized module.  Match target/data-layout to the
+    // rest of the build so the linker can splice the .o in cleanly.
+    mut test_mod: LModule = LModule::create("__cryo_test_main");
+    if (!test_mod.is_valid()) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            "test-main synthesis: could not create LLVM module");
+        return PassResult::failure(1);
+    }
+    const triple: string = get_default_triple();
+    test_mod.set_target_triple(triple);
+    mut tm: LTargetMachine = create_native_target_machine();
+    if (tm.is_valid()) {
+        test_mod.set_data_layout(tm.get_data_layout_string());
+    }
+
+    // Build the descriptor's LLVM type. Layout matches stdlib's
+    // `TestDescriptor` struct: { ptr, i64, ptr, i1, i1 }.
+    const ptr_ty:    LType = LType::pointer_to(LType::i8());
+    const i64_ty:    LType = LType::i64();
+    const i1_ty:     LType = LType::i1();
+    const desc_ty:   LType = make_descriptor_struct_type(ptr_ty, i64_ty, i1_ty);
+
+    // Build descriptor entries.  Each entry needs a private global
+    // holding the name string, plus an extern declaration of the test
+    // function's mangled symbol so the linker resolves it later.
+    mut entries_buf: void* = null;
+    if (test_count > 0) {
+        entries_buf = malloc(test_count * 8);
+    }
+    mut entries: void** = entries_buf as void**;
+    mut i: u64 = 0;
+    while (i < test_count) {
+        const t: TestEntry = tests[i];
+        const name_global: LValue = add_private_name_global(test_mod, i, t);
+        const fn_decl:     LValue = add_extern_test_function(test_mod, t.mangled_name);
+        const entry:       LValue = build_descriptor_const(
+            desc_ty, name_global, t.display_len, fn_decl,
+            t.ignored, t.should_panic);
+        entries[i] = entry.raw;
+        i = i + 1;
+    }
+
+    // Build [N x %TestDescriptor] global, initialised with the entries.
+    const arr_ty:     LType = LType::array_of(desc_ty, test_count as u32);
+    mut arr_init:     LValue = LValue::null();
+    if (test_count > 0) {
+        arr_init = LType::const_array(desc_ty, entries_buf, test_count as u32);
+    } else {
+        // Zero-length array: still emit a global, but the initializer
+        // is the canonical empty array constant via `LLVMConstArray` with
+        // a null buffer (the LLVM-C API accepts this for zero-length).
+        arr_init = LType::const_array(desc_ty, null, 0);
+    }
+    if (entries_buf != null) { free(entries_buf); }
+
+    const arr_global: LValue = test_mod.add_global(arr_ty, "__cryo_test_descriptors");
+    llvm::LLVMSetInitializer(arr_global.raw, arr_init.raw);
+    llvm::LLVMSetGlobalConstant(arr_global.raw, 1);
+
+    // Synthesize `int main(int argc, char** argv)`.
+    const built_ok: boolean = build_test_main(
+        ctx, test_mod, arr_global, arr_ty, desc_ty, test_count);
+    if (!built_ok) {
+        if (tm.is_valid()) { tm.dispose(); }
+        test_mod.dispose();
+        return PassResult::failure(1);
+    }
+
+    // Emit to disk and register with the linker artifacts.
+    const obj_path: string = emit_object(ctx, test_mod, tm);
+    if (strlen(obj_path) == 0) {
+        if (tm.is_valid()) { tm.dispose(); }
+        test_mod.dispose();
+        return PassResult::failure(1);
+    }
+    ctx.artifacts.register_object_file(obj_path);
+    if (ctx.debug_mode) {
+        cdebug("[TestMainCodegen] emitted %s (%llu tests)\n", obj_path, test_count);
+    }
+
+    if (tm.is_valid()) { tm.dispose(); }
+    test_mod.dispose();
+    return PassResult::ok();
+}
+
+
+// ============================================================================
+// Test collection from the directive registry
+// ============================================================================
+
+/// Walk `ctx.directive_registry` for records with `kind == "test"` and
+/// build a `TestEntry` for each.  Sibling directives (`![ignore]`,
+/// `![should_panic]`) on the same `FunctionDeclNode` are folded into
+/// the entry's flags via `decl.attached_directives`.
+function collect_tests(ctx: CompilationContext*) -> TestEntry[] {
+    mut out: TestEntry[] = [];
+    if (ctx.directive_registry == null) { return out; }
+    const reg: DirectiveRegistry* = ctx.directive_registry as DirectiveRegistry*;
+    const intern: InternTable* = ctx.intern_table;
+    const di: DeclarationIndex* = ctx.decl_index;
+
+    mut i: i64 = 0;
+    while (i < reg.records.length) {
+        const rec: DirectiveRecord = reg.records[i];
+        i = i + 1;
+        if (strcmp(rec.kind, "test") != 0) { continue; }
+        if (rec.decl == null) { continue; }
+        if (rec.decl.kind != NodeKind::FunctionDeclaration) { continue; }
+        const fn_decl: FunctionDeclNode* = rec.decl as FunctionDeclNode*;
+
+        // Resolve the function's qualified name.  The record captured it
+        // at directive-processing time when `ctx.namespace` was correct
+        // for the function's enclosing module — `ctx.qualify_symbol_sym`
+        // would not work here because Phase 7b runs after the per-module
+        // loop has moved `ctx` into a different module's state.
+        const qualified: SymbolStr = rec.qualified_name;
+        const mangled:   SymbolStr = di.lookup_mangled_name(qualified);
+        if (!mangled.is_valid()) {
+            // Test function never reached codegen — skip silently.  The
+            // user-facing diagnostic for "test function couldn't compile"
+            // already came out of sema/codegen for the underlying issue.
+            continue;
+        }
+
+        // Sibling directives: walk the function decl's own attached list
+        // rather than re-querying the registry.  Each decl is small
+        // (typically 1–3 directives) so the linear scan is cheap.
+        mut ignored:      boolean = false;
+        mut should_panic: boolean = false;
+        mut j: i64 = 0;
+        while (j < fn_decl.attached_directives.length) {
+            const d: DirectiveNode* = fn_decl.attached_directives[j];
+            j = j + 1;
+            if (d == null) { continue; }
+            if (strcmp(d.directive_kind, "ignore")       == 0) { ignored      = true; }
+            if (strcmp(d.directive_kind, "should_panic") == 0) { should_panic = true; }
+        }
+
+        const display: string = intern.resolve(qualified);
+        const mangled_str: string = intern.resolve(mangled);
+        out.push(TestEntry {
+            display_name: display,
+            display_len:  strlen(display),
+            mangled_name: mangled_str,
+            ignored:      ignored,
+            should_panic: should_panic,
+        });
+    }
+    return out;
+}
+
+
+// ============================================================================
+// LLVM construction helpers
+// ============================================================================
+
+/// Build the `{ ptr, i64, ptr, i1, i1 }` literal struct type that
+/// matches `stdlib/test/descriptor.cryo`'s `TestDescriptor`.
+function make_descriptor_struct_type(ptr_ty: LType, i64_ty: LType,
+                                      i1_ty: LType) -> LType {
+    const buf: void* = malloc(5 * 8);
+    const slots: void** = buf as void**;
+    slots[0] = ptr_ty.raw;
+    slots[1] = i64_ty.raw;
+    slots[2] = ptr_ty.raw;
+    slots[3] = i1_ty.raw;
+    slots[4] = i1_ty.raw;
+    const ty: LType = LType::literal_struct(buf, 5, false);
+    free(buf);
+    return ty;
+}
+
+/// Add a private `[N x i8]` global holding `entry.display_name` and
+/// return its `LValue`.  The runner reads this via the `Str.bytes` field
+/// of each descriptor.
+function add_private_name_global(test_mod: LModule, idx: u64,
+                                 entry: TestEntry) -> LValue {
+    const len: u64 = entry.display_len;
+    // [N x i8] type; we deliberately do NOT NUL-terminate — the runner
+    // works in length-typed `Str`, not C strings.
+    const arr_ty: LType = LType::array_of(LType::i8(), len as u32);
+    const sym: string = format("__cryo_test_name_%llu", idx);
+    const g: LValue = test_mod.add_global(arr_ty, sym);
+    const init: LValue = LValue {
+        raw: llvm::LLVMConstString(entry.display_name, len as u32, 1),
+    };
+    llvm::LLVMSetInitializer(g.raw, init.raw);
+    llvm::LLVMSetGlobalConstant(g.raw, 1);
+    // Linkage 9 = LLVMPrivateLinkage — the symbol is internal to this
+    // object file and won't pollute the link namespace.
+    llvm::LLVMSetLinkage(g.raw, 9);
+    return g;
+}
+
+/// Declare the test function as an extern in the synthesized module.
+/// The signature is opaque (`void()`) — under LLVM 15+ opaque-pointer
+/// rules, only the call-site type matters, and the runner module emits
+/// the correctly-typed call.  We just need the symbol to participate in
+/// the link.
+function add_extern_test_function(test_mod: LModule, mangled: string) -> LValue {
+    const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
+    return test_mod.add_function(mangled, fn_ty);
+}
+
+/// Build a constant `%TestDescriptor` value combining the given pieces.
+function build_descriptor_const(desc_ty: LType,
+                                 name_global: LValue, name_len: u64,
+                                 fn_decl: LValue,
+                                 ignored: boolean,
+                                 should_panic: boolean) -> LValue {
+    // The struct's first field is `ptr` to the name bytes.  An LLVM
+    // global of array type IS a ptr value at the constant level, so
+    // we can use `name_global` directly.  Same for `fn_decl` (function
+    // values are pointer-typed).
+    const buf: void* = malloc(5 * 8);
+    const slots: void** = buf as void**;
+    slots[0] = name_global.raw;
+    slots[1] = LType::const_int(LType::i64(), name_len, false).raw;
+    slots[2] = fn_decl.raw;
+    const ig_v: u64 = if (ignored)      { 1 } else { 0 };
+    const sp_v: u64 = if (should_panic) { 1 } else { 0 };
+    slots[3] = LType::const_int(LType::i1(), ig_v, false).raw;
+    slots[4] = LType::const_int(LType::i1(), sp_v, false).raw;
+    const v: LValue = LType::const_named_struct(desc_ty, buf, 5);
+    free(buf);
+    return v;
+}
+
+
+// ============================================================================
+// main() body
+// ============================================================================
+
+/// Synthesize `int main(int argc, char** argv)` in `test_mod`.  The body
+/// publishes argv to `std::env::set_args`, then tail-calls
+/// `std::test::runner::run_all(argc, argv, &descriptors[0], N)` and
+/// returns its result.
+///
+/// Returns `false` if either runner symbol couldn't be resolved through
+/// the DI — in that case the synthesized module is unusable and the
+/// caller should bail before emitting it.
+function build_test_main(ctx: CompilationContext*,
+                          test_mod: LModule,
+                          arr_global: LValue,
+                          arr_ty: LType,
+                          desc_ty: LType,
+                          test_count: u64) -> boolean {
+    const intern: InternTable* = ctx.intern_table;
+    const di:     DeclarationIndex* = ctx.decl_index;
+
+    // Look up mangled names of the runtime entry points through the DI.
+    const set_args_qualified: SymbolStr = intern.intern("std::env::set_args");
+    const run_all_qualified:  SymbolStr = intern.intern("std::test::runner::run_all");
+    const set_args_mangled:   SymbolStr = di.lookup_mangled_name(set_args_qualified);
+    const run_all_mangled:    SymbolStr = di.lookup_mangled_name(run_all_qualified);
+    if (!set_args_mangled.is_valid() || !run_all_mangled.is_valid()) {
+        // The stdlib's test/env modules weren't compiled into this build
+        // (probably a `--no-std` or stdlib-misconfiguration scenario).
+        // Surface a clear diagnostic instead of a confusing link failure.
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            "test-main synthesis: stdlib test runtime symbols not found in DI; ensure std::env and std::test are in the build");
+        return false;
+    }
+    const set_args_name: string = intern.resolve(set_args_mangled);
+    const run_all_name:  string = intern.resolve(run_all_mangled);
+
+    // Build the function signatures.
+    //   set_args : (i32 argc, ptr argv) -> void
+    //   run_all  : (i32 argc, ptr argv, ptr descriptors, i64 count) -> i32
+    const ptr_ty:  LType = LType::pointer_to(LType::i8());
+    const i32_ty:  LType = LType::i32();
+    const i64_ty:  LType = LType::i64();
+    const void_ty: LType = LType::void_type();
+
+    const set_args_ty: LType = make_function_type_2(void_ty, i32_ty, ptr_ty);
+    const run_all_ty:  LType = make_function_type_4(i32_ty, i32_ty, ptr_ty, ptr_ty, i64_ty);
+
+    // Declare the runner-side externs.
+    const set_args_fn: LValue = test_mod.add_function(set_args_name, set_args_ty);
+    const run_all_fn:  LValue = test_mod.add_function(run_all_name,  run_all_ty);
+
+    // Declare main(i32, ptr) -> i32.
+    const main_ty: LType = make_function_type_2(i32_ty, i32_ty, ptr_ty);
+    const main_fn: LValue = test_mod.add_function("main", main_ty);
+    const entry:   LBasicBlock = LBasicBlock::append(main_fn, "entry");
+    mut builder: LBuilder = LBuilder::create();
+    builder.position_at_end(entry);
+
+    // argc = LLVMGetParam(main_fn, 0); argv = LLVMGetParam(main_fn, 1).
+    const argc: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 0) };
+    const argv: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 1) };
+
+    // call set_args(argc, argv)
+    {
+        const args_buf: void* = malloc(2 * 8);
+        const slots: void** = args_buf as void**;
+        slots[0] = argc.raw;
+        slots[1] = argv.raw;
+        builder.build_call(set_args_ty, set_args_fn, args_buf, 2, "");
+        free(args_buf);
+    }
+
+    // ptr_to_first = getelementptr [N x %Desc], @descriptors, i64 0, i64 0
+    // → equivalent to bitcasting the array global to ptr-to-element-0.
+    mut first_ptr: LValue = arr_global;
+    if (test_count > 0) {
+        const idx_buf: void* = malloc(2 * 8);
+        const idx_slots: void** = idx_buf as void**;
+        const zero_64: LValue = LType::const_int(i64_ty, 0, false);
+        idx_slots[0] = zero_64.raw;
+        idx_slots[1] = zero_64.raw;
+        first_ptr = builder.build_gep(arr_ty, arr_global, idx_buf, 2, "test.first");
+        free(idx_buf);
+    }
+
+    // call run_all(argc, argv, first_ptr, count)
+    const count_const: LValue = LType::const_int(i64_ty, test_count, false);
+    const args_buf: void* = malloc(4 * 8);
+    const args_slots: void** = args_buf as void**;
+    args_slots[0] = argc.raw;
+    args_slots[1] = argv.raw;
+    args_slots[2] = first_ptr.raw;
+    args_slots[3] = count_const.raw;
+    const rc: LValue = builder.build_call(
+        run_all_ty, run_all_fn, args_buf, 4, "test.rc");
+    free(args_buf);
+
+    builder.build_ret(rc);
+    builder.dispose();
+    return true;
+}
+
+/// Helper: build a `(p1, p2) -> ret` LLVM function type.
+function make_function_type_2(ret: LType, p1: LType, p2: LType) -> LType {
+    const buf: void* = malloc(2 * 8);
+    const slots: void** = buf as void**;
+    slots[0] = p1.raw;
+    slots[1] = p2.raw;
+    const ty: LType = LType::function_type(ret, buf, 2, false);
+    free(buf);
+    return ty;
+}
+
+/// Helper: build a `(p1, p2, p3, p4) -> ret` LLVM function type.
+function make_function_type_4(ret: LType, p1: LType, p2: LType,
+                               p3: LType, p4: LType) -> LType {
+    const buf: void* = malloc(4 * 8);
+    const slots: void** = buf as void**;
+    slots[0] = p1.raw;
+    slots[1] = p2.raw;
+    slots[2] = p3.raw;
+    slots[3] = p4.raw;
+    const ty: LType = LType::function_type(ret, buf, 4, false);
+    free(buf);
+    return ty;
+}
+
+
+// ============================================================================
+// Object emission
+// ============================================================================
+
+/// Emit `test_mod` to `<output_dir>/obj/__cryo_test_main.o` and return
+/// the resulting path.  Returns `""` on emission failure (caller should
+/// have already emitted a diagnostic).
+function emit_object(ctx: CompilationContext*, test_mod: LModule,
+                     tm: LTargetMachine) -> string {
+    if (!tm.is_valid()) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            "test-main synthesis: native target machine unavailable");
+        return "";
+    }
+
+    // {output_dir}/obj/__cryo_test_main.o, mirroring run_object_emission.
+    const output_dir: string = ctx.project_config.output_dir;
+    mkdir(output_dir, 493);
+    const obj_dir: string = format("%s/obj", output_dir);
+    mkdir(obj_dir, 493);
+    const obj_path: string = format("%s/__cryo_test_main.o", obj_dir);
+
+    // LLVMObjectFile == 1
+    const ok: boolean = tm.emit_to_file(test_mod, obj_path, 1);
+    if (!ok) {
+        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            format("test-main synthesis: failed to emit %s", obj_path));
+        return "";
+    }
+    return obj_path;
+}
