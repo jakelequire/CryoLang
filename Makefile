@@ -28,7 +28,7 @@ LEGACY_BOOT := $(ROOT)/legacy/bootstrap/bin/cryo
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo selfhost-check pin-cryo install uninstall \
+.PHONY: help stdlib cryo selfhost-check test test-list pin-cryo install uninstall \
         clean distclean legacy-bootstrap
 
 help:
@@ -36,6 +36,8 @@ help:
 	@echo "  make stdlib            Build the standard library via bin/cryo"
 	@echo "  make cryo              Build the self-hosted compiler via bin/cryo"
 	@echo "  make selfhost-check    3-round chain (6 stages) + byte-identity gate"
+	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
+	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make pin-cryo          Refresh bin/cryo from compiler/build/bin/cryo"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
@@ -79,6 +81,18 @@ pin-cryo:
 # streaming subprocess output.
 selfhost-check: $(PIN)
 	@python3 scripts/selfhost-check.py
+
+# ---- test suite -------------------------------------------------------
+# Builds the stage-2 compiler if needed, then drives `cryo test` against
+# the tests/ project.  See tests/cryoconfig and docs/testing.md for the
+# project layout and the framework surface (`![test]`, `![ignore]`,
+# `![should_panic]`).  Pass arguments through with `make test ARGS=...`
+# (e.g. `make test ARGS="--ignored some_filter"`).
+test: cryo
+	@cd tests && "$(STAGE2)" test $(ARGS)
+
+test-list: cryo
+	@cd tests && "$(STAGE2)" test --list $(ARGS)
 
 # ---- system install via symlink ---------------------------------------
 install:

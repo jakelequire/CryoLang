@@ -1,0 +1,301 @@
+///! Generic types and functions — single + multi-param structs, generic
+///! free functions with where bounds, generic methods on generic types,
+///! generic functions called from non-generic carriers.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::Generics;
+
+import std::core::result;
+import std::core::cmp;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Single + multi-param generic structs
+// ============================================================================
+
+type struct Pair<A, B> {
+    first:  A;
+    second: B;
+
+    static of(first: A, second: B) -> Pair<A, B> {
+        return Pair<A, B> { first: first, second: second };
+    }
+}
+
+type struct Triple<A, B, C> {
+    a: A;
+    b: B;
+    c: C;
+
+    static of(a: A, b: B, c: C) -> Triple<A, B, C> {
+        return Triple<A, B, C> { a: a, b: b, c: c };
+    }
+}
+
+type struct Holder<T> {
+    value: T;
+
+    static wrap(value: T) -> Holder<T> {
+        return Holder<T> { value: value };
+    }
+
+    get(&this) -> T {
+        return this.value;
+    }
+
+    /// Method-level generic — converts the held value through a caller-
+    /// supplied projection.  Note: callback-style helpers are flaky in
+    /// the bootstrap (cf. memory) but a method-level <U> binding works.
+    static rebox<U>(other: U) -> Holder<U> {
+        return Holder<U>::wrap(other);
+    }
+}
+
+![test]
+function pair_holds_two_ints() -> Result<(), TestError> {
+    const p: Pair<i32, i32> = Pair::of(3, 5);
+    match (expect_eq(p.first, 3)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(p.second, 5)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function pair_mixed_types() -> Result<(), TestError> {
+    const want_first: i32 = 4;
+    const want_second: u64 = 200;
+    const p: Pair<i32, u64> = Pair::of(want_first, want_second);
+    match (expect_eq(p.first, want_first)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(p.second, want_second)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function triple_three_distinct_types() -> Result<(), TestError> {
+    const want_a: i32 = 1;
+    const want_b: u32 = 2;
+    const want_c: u64 = 3;
+    const t: Triple<i32, u32, u64> = Triple::of(want_a, want_b, want_c);
+    match (expect_eq(t.a, want_a)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(t.b, want_b)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(t.c, want_c)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function holder_round_trip() -> Result<(), TestError> {
+    const h: Holder<i32> = Holder::wrap(42);
+    match (expect_eq(h.get(), 42)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function holder_u64() -> Result<(), TestError> {
+    const v: u64 = 9000000000;
+    const h: Holder<u64> = Holder::wrap(v);
+    match (expect_eq(h.get(), v)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function holder_distinct_instantiations_are_independent() -> Result<(), TestError> {
+    // Holder<i32> and Holder<u64> are unrelated types post-monomorphization;
+    // each gets its own copy of `get`.
+    const a: Holder<i32> = Holder::wrap(7);
+    const b: Holder<u64> = Holder::wrap(700 as u64);
+    match (expect_eq(a.get(), 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.get(), 700 as u64)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Generic free functions
+// ============================================================================
+
+function identity<T>(value: T) -> T {
+    return value;
+}
+
+function pick_first<A, B>(a: A, _b: B) -> A {
+    return a;
+}
+
+![test]
+function identity_int() -> Result<(), TestError> {
+    match (expect_eq(identity(123), 123)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function identity_u64() -> Result<(), TestError> {
+    const v: u64 = 5000;
+    match (expect_eq(identity(v), v)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function pick_first_two_types() -> Result<(), TestError> {
+    const a: i32 = 11;
+    const b: u64 = 22;
+    match (expect_eq(pick_first(a, b), a)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Where bounds
+// ============================================================================
+
+function max_of<T>(a: T, b: T) -> T
+where T: Ord {
+    match (a.compare(&b)) {
+        Ordering::Less    => { return b; }
+        Ordering::Equal   => { return a; }
+        Ordering::Greater => { return a; }
+    }
+}
+
+function are_equal<T>(a: T, b: T) -> boolean
+where T: Eq {
+    return a.equals(&b);
+}
+
+![test]
+function max_int_picks_larger() -> Result<(), TestError> {
+    match (expect_eq(max_of(3, 9), 9)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function max_u64_picks_larger() -> Result<(), TestError> {
+    const a: u64 = 100;
+    const b: u64 = 50;
+    match (expect_eq(max_of(a, b), a)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function max_equal_picks_lhs() -> Result<(), TestError> {
+    match (expect_eq(max_of(7, 7), 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function eq_bound_dispatch() -> Result<(), TestError> {
+    match (expect(are_equal(5, 5),
+        Str::from_raw("are_equal(5,5) should be true" as u8*, 29))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!are_equal(5, 6),
+        Str::from_raw("are_equal(5,6) should be false" as u8*, 30))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Generic functions called from a generic carrier
+// ============================================================================
+
+/// Generic carrier — calls a generic helper internally.  This exercises
+/// the inferrer's ability to thread a binding through a non-trivial
+/// expression tree at mono time.
+function double_pick<A, B>(a: A, b: B) -> A
+where A: Ord {
+    return max_of(a, pick_first(a, b));
+}
+
+![test]
+function double_pick_threads_bindings() -> Result<(), TestError> {
+    const a: i32 = 17;
+    const b: u64 = 9;
+    match (expect_eq(double_pick(a, b), a)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Generic struct with non-generic method that uses the generic param
+// ============================================================================
+
+type struct Counter<T> {
+    value: T;
+    count: i32;
+
+    static start(value: T) -> Counter<T> {
+        return Counter<T> { value: value, count: 0 };
+    }
+
+    bump(mut &this) -> void {
+        this.count = this.count + 1;
+    }
+
+    times_run(&this) -> i32 { return this.count; }
+}
+
+![test]
+function generic_struct_non_generic_method() -> Result<(), TestError> {
+    mut c: Counter<u64> = Counter::start(1234 as u64);
+    c.bump();
+    c.bump();
+    c.bump();
+    match (expect_eq(c.times_run(), 3)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

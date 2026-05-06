@@ -1871,13 +1871,39 @@ type struct Monomorphizer {
             return TypeRef::invalid();
         }
         if (node.kind == NodeKind::Literal) {
-            // A literal's resolved_type is the only path to its type at
-            // mono time (sema hasn't run).  For numeric literals, the
-            // parser sets a default integer type — adequate for
-            // inferring an arg that pins a generic.
+            // Sema hasn't run yet at mono time, so a literal's
+            // `resolved_type` is rarely set.  Fall back to the literal's
+            // default type read straight off `literal_kind` — adequate
+            // for inferring a generic param from a literal arg
+            // (`expect_eq(2 + 2, 4)`, `Pair::new(0, "x")`, etc.).
             if (expr.resolved_type.is_valid()) {
                 return expr.resolved_type;
             }
+            const lit: LiteralNode* = expr as LiteralNode*;
+            return match (lit.literal_kind) {
+                LiteralKind::Integer => { this.arena.get_i32() }
+                LiteralKind::Float   => { this.arena.get_f64() }
+                LiteralKind::Boolean => { this.arena.get_bool() }
+                LiteralKind::Char    => { this.arena.get_char() }
+                LiteralKind::String  => { this.arena.get_string() }
+                LiteralKind::Null    => { TypeRef::invalid() }
+            };
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            // `a op b` — for arithmetic and comparison ops the result
+            // type tracks the operand type.  Recurse into the left
+            // operand and return its inferred type; the right operand
+            // would give the same answer for matched-type binops, and
+            // mono-time inference doesn't need full arithmetic-promotion
+            // semantics — sema will reject any genuine mismatch later.
+            // Without this arm, `expect_eq(2 + 2, 4)` can't pin T from
+            // arg[0] because the binop falls through to the
+            // `resolved_type.is_valid()` check, which is empty pre-sema.
+            const be: BinaryExprNode* = expr as BinaryExprNode*;
+            const lhs_t: TypeRef = this.resolve_arg_type_for_inference(
+                be.left, names, types);
+            if (lhs_t.is_valid()) { return lhs_t; }
+            return this.resolve_arg_type_for_inference(be.right, names, types);
         }
         if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
         return TypeRef::invalid();
