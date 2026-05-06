@@ -47,6 +47,7 @@ type enum PassID {
 
     // Stage 6: Semantic Analysis
     FunctionBodyTypeCheck;
+    MoveCheck;
 
     // Stage 7: Codegen Preparation (after sema validates everything)
     TypeLowering;
@@ -83,6 +84,7 @@ implement enum PassID {
             PassID::GenericExpressionResolution => { "GenericExpressionResolution" }
             PassID::GenericValidation           => { "GenericValidation"           }
             PassID::FunctionBodyTypeCheck       => { "FunctionBodyTypeCheck"       }
+            PassID::MoveCheck                   => { "MoveCheck"                   }
             PassID::TypeLowering                => { "TypeLowering"                }
             PassID::FunctionDeclaration         => { "FunctionDeclaration"         }
             PassID::IRGeneration                => { "IRGeneration"                }
@@ -113,6 +115,7 @@ implement enum PassID {
             PassID::GenericExpressionResolution => { PassStage::Specialization        }
             PassID::GenericValidation           => { PassStage::Specialization        }
             PassID::FunctionBodyTypeCheck       => { PassStage::SemanticAnalysis      }
+            PassID::MoveCheck                   => { PassStage::SemanticAnalysis      }
             PassID::TypeLowering                => { PassStage::CodegenPreparation    }
             PassID::FunctionDeclaration         => { PassStage::CodegenPreparation    }
             PassID::IRGeneration                => { PassStage::IRGeneration          }
@@ -143,12 +146,13 @@ implement enum PassID {
             PassID::GenericExpressionResolution => { 15 }
             PassID::GenericValidation           => { 16 }
             PassID::FunctionBodyTypeCheck       => { 17 }
-            PassID::TypeLowering                => { 18 }
-            PassID::FunctionDeclaration         => { 19 }
-            PassID::IRGeneration                => { 20 }
-            PassID::Optimization                => { 21 }
-            PassID::ObjectEmission              => { 22 }
-            PassID::Linking                     => { 23 }
+            PassID::MoveCheck                   => { 18 }
+            PassID::TypeLowering                => { 19 }
+            PassID::FunctionDeclaration         => { 20 }
+            PassID::IRGeneration                => { 21 }
+            PassID::Optimization                => { 22 }
+            PassID::ObjectEmission              => { 23 }
+            PassID::Linking                     => { 24 }
         };
     }
 
@@ -193,6 +197,7 @@ type enum Provision {
     StructFieldsSynced;
     DirectivesProcessed;
     BodiesTypeChecked;
+    OwnershipChecked;
     MonomorphizationComplete;
     GenericExpressionsResolved;
     GenericsValidated;
@@ -220,6 +225,7 @@ implement enum Provision {
             Provision::FunctionSignatures         => { 9  }
             Provision::TemplatesRegistered        => { 10 }
             Provision::DefaultsExpanded           => { 24 }
+            Provision::OwnershipChecked           => { 25 }
             Provision::TypesResolved              => { 11 }
             Provision::StructFieldsSynced         => { 12 }
             Provision::DirectivesProcessed        => { 13 }
@@ -254,6 +260,7 @@ implement enum Provision {
             Provision::StructFieldsSynced         => { "StructFieldsSynced"         }
             Provision::DirectivesProcessed        => { "DirectivesProcessed"        }
             Provision::BodiesTypeChecked          => { "BodiesTypeChecked"          }
+            Provision::OwnershipChecked           => { "OwnershipChecked"           }
             Provision::MonomorphizationComplete   => { "MonomorphizationComplete"   }
             Provision::GenericExpressionsResolved => { "GenericExpressionsResolved" }
             Provision::GenericsValidated          => { "GenericsValidated"          }
@@ -584,13 +591,24 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 provisions:       [Provision::BodiesTypeChecked],
             }
         }
+        PassID::MoveCheck => {
+            PassMetadata {
+                id:               PassID::MoveCheck,
+                name:             "MoveCheck",
+                stage:            PassStage::SemanticAnalysis,
+                order:            17,
+                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked)],
+                provisions:       [Provision::OwnershipChecked],
+            }
+        }
         PassID::TypeLowering => {
             PassMetadata {
                 id:               PassID::TypeLowering,
                 name:             "TypeLowering",
                 stage:            PassStage::CodegenPreparation,
-                order:            17,
-                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked)],
+                order:            18,
+                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked),
+                                   PassRequirement::optional(Provision::OwnershipChecked)],
                 provisions:       [Provision::TypesLowered],
             }
         }
@@ -599,7 +617,7 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 id:               PassID::FunctionDeclaration,
                 name:             "FunctionDeclaration",
                 stage:            PassStage::CodegenPreparation,
-                order:            18,
+                order:            19,
                 requirements:     [PassRequirement::required(Provision::TypesLowered)],
                 provisions:       [Provision::FunctionsDeclared],
             }
@@ -609,7 +627,7 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 id:               PassID::IRGeneration,
                 name:             "IRGeneration",
                 stage:            PassStage::IRGeneration,
-                order:            19,
+                order:            20,
                 requirements:     [PassRequirement::required(Provision::FunctionsDeclared)],
                 provisions:       [Provision::IRGenerated],
             }
@@ -619,7 +637,7 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 id:               PassID::Optimization,
                 name:             "Optimization",
                 stage:            PassStage::Output,
-                order:            20,
+                order:            21,
                 requirements:     [PassRequirement::required(Provision::IRGenerated)],
                 provisions:       [Provision::Optimized],
             }
@@ -629,7 +647,7 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 id:               PassID::ObjectEmission,
                 name:             "ObjectEmission",
                 stage:            PassStage::Output,
-                order:            21,
+                order:            22,
                 requirements:     [PassRequirement::required(Provision::IRGenerated),
                                    PassRequirement::optional(Provision::Optimized)],
                 provisions:       [Provision::ObjectsEmitted],
@@ -640,7 +658,7 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 id:               PassID::Linking,
                 name:             "Linking",
                 stage:            PassStage::Output,
-                order:            22,
+                order:            23,
                 requirements:     [PassRequirement::required(Provision::ObjectsEmitted)],
                 provisions:       [Provision::Linked],
             }

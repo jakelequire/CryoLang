@@ -31,6 +31,7 @@ import Compiler::AST::Pattern;
 import Compiler::Types::Substitution;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Resolver;
@@ -1208,6 +1209,18 @@ type struct Monomorphizer {
     /// body specialization.
     type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
         if (depth >= 16) { return false; }
+
+        // `Copy` is a structural marker: bound satisfaction is computed
+        // by walking the type rather than searching the trait-impl
+        // registry. The marker trait declared in core/marker.cryo
+        // intentionally has no impl blocks — the compiler is the single
+        // source of truth for "is this type bitwise-duplicable".
+        const copy_name: SymbolStr = this.intern_table.intern("Copy");
+        if (copy_name.is_valid() && trait_name.equals(copy_name)) {
+            return OwnershipQuery::is_copy(this.arena, this.generic_registry,
+                                            this.intern_table, ty);
+        }
+
         const target_name: SymbolStr = this.bare_name_of(ty);
         if (!target_name.is_valid()) { return false; }
         const impl_block: ImplBlockNode* =
