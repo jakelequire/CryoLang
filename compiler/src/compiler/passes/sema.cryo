@@ -2321,8 +2321,23 @@ public:
         const ret: TypeRef = this.lookup_method_with_inheritance(
             lookup_ref, type_sym, member.member);
         if (ret.is_valid()) {
-            member.set_resolved_type(ret);
-            return ret;
+            // When the call carries explicit method-level generic args
+            // (`obj.method<U>(...)`), the bare lookup has the receiver's
+            // type-level params substituted but knows nothing about the
+            // method's own generic params — so a `cast<U>(&this) -> NonNull<U>`
+            // looked up on `NonNull<u8>` comes back as `NonNull<u8>` instead
+            // of `NonNull<U>`-with-U-still-free.  Re-resolve from the
+            // method's template return annotation with both bindings
+            // (struct-level + method-level) in scope so the call's resolved
+            // type reflects the explicit args.
+            const refined: TypeRef = if (member.generic_args.length > 0) {
+                this.resolve_method_return_with_explicit_args(
+                    obj_type, member, ret)
+            } else {
+                ret
+            };
+            member.set_resolved_type(refined);
+            return refined;
         }
 
         // Bound-aware dispatch (B.4): when the receiver is a generic
@@ -2636,6 +2651,139 @@ public:
         }
 
         return TypeRef::invalid();
+    }
+
+    /// When `member.generic_args` carry explicit method-level generic args
+    /// (`obj.method<U>(...)`), re-resolve the method's *template* return-type
+    /// annotation with both the receiver's type-level args and the explicit
+    /// method-level args bound, so the call lands at the right concrete
+    /// type.  Falls back to `fallback` (the bare-lookup return) on any miss.
+    resolve_method_return_with_explicit_args(mut &this, recv_type: TypeRef,
+                                              member: MemberAccessNode*,
+                                              fallback: TypeRef) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return fallback; }
+        if (this.ctx.type_resolver == null)    { return fallback; }
+        if (member.generic_args.length == 0)   { return fallback; }
+
+        // Unwrap one layer of Pointer/Reference if present so we end up at
+        // the InstantiatedType (or template Struct/Class) that owns the
+        // method.  Method-call resolution already did this for the lookup
+        // path; mirror it here.
+        mut owner_ref: TypeRef = recv_type;
+        mut owner_t: Type* = this.arena.lookup(owner_ref.id);
+        mut depth: i32 = 0;
+        while (owner_t != null && depth < 5) {
+            if (owner_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = owner_t as PointerType*;
+                owner_ref = pt.pointee;
+                owner_t = this.arena.lookup(owner_ref.id);
+            } else if (owner_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = owner_t as ReferenceType*;
+                owner_ref = rt.referent;
+                owner_t = this.arena.lookup(owner_ref.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (owner_t == null) { return fallback; }
+
+        // Find the owner template's AST.  Two registries to consult:
+        //   • `get_template` — generic owners (e.g. `NonNull<T>`).
+        //     The InstantiatedType wrapper points at the template's
+        //     `generic_base`, so look that up first.
+        //   • `lookup_inherent_owner` — non-generic owners that carry
+        //     inline generic methods (e.g. `Request::parse<R>`).  Keyed
+        //     by qualified name.
+        mut owner_ast: ASTNode* = null;
+        if (owner_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = owner_t as InstantiatedType*;
+            const tmpl: TemplateEntry* =
+                this.ctx.generic_registry.get_template_by_type_id(
+                    inst.generic_base.id);
+            if (tmpl != null) {
+                owner_ast = tmpl.ast_node;
+            }
+        }
+        if (owner_ast == null) {
+            const recv_qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
+            if (recv_qname.is_valid()) {
+                owner_ast = this.ctx.generic_registry.lookup_inherent_owner(recv_qname);
+                if (owner_ast == null) {
+                    const tmpl: TemplateEntry* =
+                        this.ctx.generic_registry.get_template(recv_qname);
+                    if (tmpl != null) {
+                        owner_ast = tmpl.ast_node;
+                    }
+                }
+            }
+        }
+        if (owner_ast == null) { return fallback; }
+
+        // Pull the methods[] array off whichever owner shape we found.
+        mut owner_methods: MethodNode*[] = [];
+        mut owner_params:  GenericParamNode*[] = [];
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = owner_ast as StructDeclNode*;
+            owner_methods = sn.methods;
+            owner_params  = sn.generic_params;
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
+            owner_methods = cn.methods;
+            owner_params  = cn.generic_params;
+        } else {
+            return fallback;
+        }
+
+        // Find a method whose name + generic-param count matches the call.
+        mut found: MethodNode* = null;
+        for (mut k: i64 = 0; k < owner_methods.length; k++) {
+            const m: MethodNode* = owner_methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(member.member)) { continue; }
+            if (m.func.generic_params.length != member.generic_args.length) {
+                continue;
+            }
+            found = m;
+            break;
+        }
+        if (found == null) { return fallback; }
+        const ret_ann: TypeAnnotation* = found.func.return_type_annotation;
+        if (ret_ann == null) { return fallback; }
+
+        // Build a resolution context that binds every owner-level and
+        // method-level generic name to its concrete type, then resolve the
+        // template return annotation directly.  Sema runs before the
+        // monomorphizer, so the template annotations don't yet have
+        // `pre_resolved` populated — we need real bindings on the context
+        // for `resolve_named("T", ctx)` / `resolve_named("U", ctx)` to land
+        // on something concrete.
+        mut res_ctx: ResolutionContext = ResolutionContext::new(
+            this.ctx.source_file, "");
+        if (owner_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = owner_t as InstantiatedType*;
+            const n: i64 = if (owner_params.length < inst.type_args.length) {
+                owner_params.length
+            } else {
+                inst.type_args.length
+            };
+            for (mut i: i64 = 0; i < n; i++) {
+                const gp: GenericParamNode* = owner_params[i];
+                if (gp == null) { continue; }
+                res_ctx.add_binding(gp.name, inst.type_args[i]);
+            }
+        }
+        for (mut i: i64 = 0; i < found.func.generic_params.length; i++) {
+            const gp: GenericParamNode* = found.func.generic_params[i];
+            if (gp == null) { continue; }
+            const arg_ref: TypeRef = this.ctx.type_resolver.resolve(
+                member.generic_args[i], &res_ctx);
+            if (!arg_ref.is_valid()) { return fallback; }
+            res_ctx.add_binding(gp.name, arg_ref);
+        }
+        const refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &res_ctx);
+        if (!refined.is_valid()) { return fallback; }
+        return refined;
     }
 
     /// Dispatch: resolve `Scope::Member(args)` as one of three constructs:

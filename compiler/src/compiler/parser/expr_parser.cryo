@@ -1208,6 +1208,16 @@ public:
         this.advance(); // consume '('
         mut call: CallExprNode* = new CallExprNode(callee, callee.span);
 
+        // If the callee is a member access whose name carried explicit type
+        // arguments (`obj.method<T>`), promote those onto the call so the
+        // sema/mono layers see a generic call rather than a bare member ref.
+        if (callee.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = callee as MemberAccessNode*;
+            if (ma.generic_args.length > 0) {
+                call.set_generic_args(ma.generic_args);
+            }
+        }
+
         if (!this.check(TokenType::RParen)) {
             while (true) {
                 const arg: ExpressionNode* = this.parse_expression();
@@ -1234,14 +1244,26 @@ public:
         return new ArrayAccessNode(array, index, span);
     }
 
-    /// Parse member access: object.member
+    /// Parse member access: object.member or object.method<T, U>
     parse_member_access_expr(object: ExpressionNode*) -> MemberAccessNode* {
         this.advance(); // consume '.'
         const member_tok: Token = this.consume(TokenType::Identifier, "member name");
         const member: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
         const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
-        return new MemberAccessNode(object, member, member_span, span);
+        mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
+
+        // Pick up explicit type arguments on the member: `obj.method<T, U>(...)`.
+        // Mirrors the same lookahead that scope-resolution and primary
+        // identifiers already do; without it `obj.cast<T>()` parses as
+        // `(obj.cast) < T > ()` (comparison + shift) and the call
+        // disappears.
+        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+            const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
+            node.set_generic_args(member_gen_args);
+        }
+
+        return node;
     }
 
 
