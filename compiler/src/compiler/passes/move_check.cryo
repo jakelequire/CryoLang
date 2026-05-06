@@ -1,0 +1,456 @@
+///! Move Check Pass — Phase 1 minimal scaffold.
+///!
+///! Walks function bodies after sema and warns when a non-Copy local
+///! looks like it's being used after a `let`-RHS or call-arg move.
+///! Phase 1 is deliberately small: only bare-identifier moves at let
+///! initializers and function-call arguments are tracked, branches
+///! are walked sequentially without state-merge, and use-after-move
+///! emits a warning rather than an error so we can observe the
+///! surface area before tightening to fatal.
+
+namespace Compiler::Passes::MoveCheck;
+
+import Compiler::Diag;
+import Compiler::Diag::Snapshot;
+import Compiler::Diag::Sink;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Diagnostic;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::Passes::PassID;
+import Compiler::CompilationContext;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Types;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
+import std::core::option;
+import std::collections::hashmap;
+
+
+type enum MoveState {
+    Live;
+    Moved;
+}
+
+
+type struct MoveChecker {
+    ctx:      CompilationContext*;
+    arena:    TypeArena*;
+    registry: GenericRegistry*;
+    intern:   InternTable*;
+
+    /// Per-binding type info: name.id → resolved TypeRef. Reset on
+    /// enter_function. Identifier-uses on names absent from this map
+    /// are skipped — that's how globals, function names and other
+    /// non-local references avoid the move pipeline.
+    types: HashMap<u32, TypeRef>;
+
+    /// Set of bindings currently in the Moved state, encoded as a
+    /// (key, line) parallel-array stack rather than a HashMap so
+    /// snapshot/restore is just an array-length checkpoint. Keys not
+    /// in this list are Live by default.
+    moved_keys:  u32[];
+    moved_lines: i32[];
+
+    fired: i64;
+
+    static new(ctx: CompilationContext*) -> MoveChecker {
+        return MoveChecker {
+            ctx:      ctx,
+            arena:    ctx.type_arena,
+            registry: ctx.generic_registry,
+            intern:   ctx.get_intern_table(),
+            types:       HashMap<u32, TypeRef>::new(),
+            moved_keys:  [],
+            moved_lines: [],
+            fired: 0,
+        };
+    }
+
+    enter_function(mut &this, func: FunctionDeclNode*) -> void {
+        this.types       = HashMap<u32, TypeRef>::new();
+        this.moved_keys  = [];
+        this.moved_lines = [];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            this.register_binding(param.name, param.resolved_type);
+        }
+    }
+
+    register_binding(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        if (!name.is_valid()) { return; }
+        this.types.insert(name.id, ty);
+    }
+
+    is_moved(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    moved_at_line(&this, name: SymbolStr) -> i32 {
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == name.id) { return this.moved_lines[i]; }
+        }
+        return 0;
+    }
+
+    lookup_type(&this, name: SymbolStr) -> TypeRef {
+        match (this.types.get(&name.id)) {
+            Option::Some(t) => { return t; }
+            Option::None    => { return TypeRef::invalid(); }
+        }
+    }
+
+    is_copy(&this, ty: TypeRef) -> boolean {
+        return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
+    }
+
+    mark_moved(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+        if (!name.is_valid()) { return; }
+        if (this.is_moved(name)) { return; }
+        this.moved_keys.push(name.id);
+        this.moved_lines.push(span.start_line as i32);
+    }
+
+    /// Snapshot the moved-set as the current array length. Restore
+    /// truncates back to that length, dropping any moves recorded in
+    /// the bracketed region. Used to scope branch state: an if-body
+    /// that moves a binding shouldn't leak that move into post-if
+    /// code (Phase 1 doesn't yet model partial-move joins).
+    snapshot_moves(&this) -> i64 {
+        return this.moved_keys.length;
+    }
+
+    restore_moves(mut &this, checkpoint: i64) -> void {
+        while (this.moved_keys.length > checkpoint) {
+            this.moved_keys.pop();
+            this.moved_lines.pop();
+        }
+    }
+
+    emit_warn(mut &this, code: ErrorCode, message: string,
+              span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::warning(code, message);
+        diag = diag.at(span);
+        this.ctx.emit_diagnostic(diag);
+        this.fired = this.fired + 1;
+    }
+
+    walk_program(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            this.walk_top_level(stmt);
+        }
+    }
+
+    walk_top_level(mut &this, stmt: ASTNode*) -> void {
+        if (stmt.kind == NodeKind::FunctionDeclaration) {
+            this.walk_function(stmt as FunctionDeclNode*);
+            return;
+        }
+        if (stmt.kind == NodeKind::StructDeclaration) {
+            this.walk_methods((stmt as StructDeclNode*).methods);
+            return;
+        }
+        if (stmt.kind == NodeKind::ClassDeclaration) {
+            this.walk_methods((stmt as ClassDeclNode*).methods);
+            return;
+        }
+        if (stmt.kind == NodeKind::ImplementationBlock) {
+            this.walk_methods((stmt as ImplBlockNode*).methods);
+            return;
+        }
+        if (stmt.kind == NodeKind::TraitDeclaration) {
+            const td: TraitDeclNode* = stmt as TraitDeclNode*;
+            for (mut i: i64 = 0; i < td.methods.length; i++) {
+                const m: FunctionDeclNode* = td.methods[i];
+                if (m != null) { this.walk_function(m); }
+            }
+            return;
+        }
+    }
+
+    walk_methods(mut &this, methods: MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            this.walk_function(m.func);
+        }
+    }
+
+    walk_function(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.body == null) { return; }
+        if (func.is_generic()) { return; }
+        cdebug("[MoveCheck] === func '%s' ===\n", this.intern.resolve(func.name));
+        this.enter_function(func);
+        this.walk_block(func.body);
+    }
+
+    walk_block(mut &this, block: BlockStmtNode*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const stmt: StatementNode* = block.statements[i];
+            if (stmt == null) { continue; }
+            this.walk_stmt(stmt);
+        }
+    }
+
+    walk_stmt(mut &this, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        if (stmt.kind == NodeKind::BlockStatement) {
+            this.walk_block(stmt as BlockStmtNode*);
+            return;
+        }
+        if (stmt.kind == NodeKind::ReturnStatement) {
+            const r: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            if (r.expression != null) {
+                this.walk_expr_move(r.expression);
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::ExpressionStatement) {
+            const e: ExprStmtNode* = stmt as ExprStmtNode*;
+            if (e.expression != null) {
+                this.walk_expr_read(e.expression);
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null &&
+                ds.declaration.kind == NodeKind::VariableDeclaration) {
+                this.walk_var_decl(ds.declaration as VarDeclNode*);
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::IfStatement) {
+            const it: IfStmtNode* = stmt as IfStmtNode*;
+            if (it.condition != null) { this.walk_expr_read(it.condition); }
+            // Snapshot state, walk both branches, restore — Phase 1
+            // doesn't propagate moves out of branches. This sacrifices
+            // a class of true positives (moves common to every path)
+            // for zero false positives on early-return / early-break
+            // patterns.
+            const snap: i64 = this.snapshot_moves();
+            if (it.then_stmt != null) { this.walk_stmt(it.then_stmt); }
+            this.restore_moves(snap);
+            const snap2: i64 = this.snapshot_moves();
+            if (it.else_stmt != null) { this.walk_stmt(it.else_stmt); }
+            this.restore_moves(snap2);
+            return;
+        }
+        if (stmt.kind == NodeKind::WhileStatement) {
+            const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            if (w.condition != null) { this.walk_expr_read(w.condition); }
+            const snap: i64 = this.snapshot_moves();
+            if (w.body != null) { this.walk_stmt(w.body); }
+            this.restore_moves(snap);
+            return;
+        }
+        if (stmt.kind == NodeKind::ForStatement) {
+            const f: ForStmtNode* = stmt as ForStmtNode*;
+            if (f.condition != null) { this.walk_expr_read(f.condition); }
+            if (f.update != null)    { this.walk_expr_read(f.update); }
+            const snap: i64 = this.snapshot_moves();
+            if (f.body != null)      { this.walk_stmt(f.body); }
+            this.restore_moves(snap);
+            return;
+        }
+    }
+
+    walk_var_decl(mut &this, vd: VarDeclNode*) -> void {
+        if (vd == null) { return; }
+        if (vd.initializer != null) {
+            this.walk_expr_move(vd.initializer);
+        }
+        if (!vd.is_global) {
+            this.register_binding(vd.name, vd.resolved_type);
+        }
+    }
+
+    /// Walk an expression in "move" context: bare identifiers of
+    /// non-Copy types are marked Moved, sub-expressions descend in
+    /// "read" context.
+    walk_expr_move(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null) { return; }
+        if (expr.kind == NodeKind::Identifier) {
+            this.handle_ident(expr as IdentifierNode*, true);
+            return;
+        }
+        // For other shapes, descend in read mode by default; the
+        // child-as-move is only applied at known consume sites below.
+        this.walk_expr_read(expr);
+    }
+
+    /// Walk an expression in "read" context: sub-expressions don't
+    /// move bare bindings, but we still recurse for use-after-move
+    /// detection on already-moved identifiers. Split into small
+    /// per-kind helpers to keep individual functions short — the
+    /// bootstrap codegen chokes on functions with many basic blocks.
+    walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null) { return; }
+        const k: NodeKind = expr.kind;
+        if (k == NodeKind::Identifier) {
+            this.handle_ident(expr as IdentifierNode*, false);
+            return;
+        }
+        if (k == NodeKind::CallExpression)   { this.read_call(expr as CallExprNode*);    return; }
+        if (k == NodeKind::BinaryExpression) { this.read_binary(expr as BinaryExprNode*); return; }
+        if (k == NodeKind::UnaryExpression)  { this.read_unary(expr as UnaryExprNode*);   return; }
+        if (k == NodeKind::MemberAccess)     { this.read_member(expr as MemberAccessNode*); return; }
+        if (k == NodeKind::ArrayAccess)      { this.read_array_access(expr as ArrayAccessNode*); return; }
+        if (k == NodeKind::CastExpression)   { this.read_cast(expr as CastExprNode*);     return; }
+        if (k == NodeKind::StructLiteral)    { this.read_struct_lit(expr as StructLiteralNode*); return; }
+        if (k == NodeKind::TupleLiteral)     { this.read_tuple_lit(expr as TupleLiteralNode*); return; }
+        if (k == NodeKind::ArrayLiteral)     { this.read_array_lit(expr as ArrayLiteralNode*); return; }
+        if (k == NodeKind::TernaryExpression){ this.read_ternary(expr as TernaryExprNode*); return; }
+        if (k == NodeKind::IfExpression)     { this.read_if_expr(expr as IfExprNode*);    return; }
+        if (k == NodeKind::NewExpression)    { this.read_new(expr as NewExprNode*);       return; }
+    }
+
+    read_call(mut &this, c: CallExprNode*) -> void {
+        if (c == null) { return; }
+        if (c.callee != null) { this.walk_expr_read(c.callee); }
+        for (mut i: i64 = 0; i < c.arguments.length; i++) {
+            this.walk_expr_move(c.arguments[i]);
+        }
+        return;
+    }
+
+    read_binary(mut &this, b: BinaryExprNode*) -> void {
+        if (b == null) { return; }
+        if (b.left != null)  { this.walk_expr_read(b.left); }
+        if (b.right != null) { this.walk_expr_read(b.right); }
+        return;
+    }
+
+    read_unary(mut &this, u: UnaryExprNode*) -> void {
+        if (u == null) { return; }
+        if (u.operand != null) { this.walk_expr_read(u.operand); }
+        return;
+    }
+
+    read_member(mut &this, ma: MemberAccessNode*) -> void {
+        if (ma == null) { return; }
+        if (ma.object != null) { this.walk_expr_read(ma.object); }
+        return;
+    }
+
+    read_array_access(mut &this, aa: ArrayAccessNode*) -> void {
+        if (aa == null) { return; }
+        if (aa.array != null) { this.walk_expr_read(aa.array); }
+        if (aa.index != null) { this.walk_expr_read(aa.index); }
+        return;
+    }
+
+    read_cast(mut &this, cv: CastExprNode*) -> void {
+        if (cv == null) { return; }
+        if (cv.expression != null) { this.walk_expr_read(cv.expression); }
+        return;
+    }
+
+    read_struct_lit(mut &this, sl: StructLiteralNode*) -> void {
+        if (sl == null) { return; }
+        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+            this.walk_expr_move(sl.field_inits[i].value);
+        }
+        return;
+    }
+
+    read_tuple_lit(mut &this, tl: TupleLiteralNode*) -> void {
+        if (tl == null) { return; }
+        for (mut i: i64 = 0; i < tl.elements.length; i++) {
+            this.walk_expr_move(tl.elements[i]);
+        }
+        return;
+    }
+
+    read_array_lit(mut &this, al: ArrayLiteralNode*) -> void {
+        if (al == null) { return; }
+        for (mut i: i64 = 0; i < al.elements.length; i++) {
+            this.walk_expr_move(al.elements[i]);
+        }
+        return;
+    }
+
+    read_ternary(mut &this, t: TernaryExprNode*) -> void {
+        if (t == null) { return; }
+        if (t.condition != null)  { this.walk_expr_read(t.condition); }
+        if (t.true_expr != null)  { this.walk_expr_read(t.true_expr); }
+        if (t.false_expr != null) { this.walk_expr_read(t.false_expr); }
+        return;
+    }
+
+    read_if_expr(mut &this, ie: IfExprNode*) -> void {
+        if (ie == null) { return; }
+        if (ie.condition != null) { this.walk_expr_read(ie.condition); }
+        if (ie.then_expr != null) { this.walk_expr_read(ie.then_expr); }
+        if (ie.else_expr != null) { this.walk_expr_read(ie.else_expr); }
+        return;
+    }
+
+    read_new(mut &this, n: NewExprNode*) -> void {
+        if (n == null) { return; }
+        for (mut i: i64 = 0; i < n.arguments.length; i++) {
+            this.walk_expr_move(n.arguments[i]);
+        }
+        return;
+    }
+
+    handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean) -> void {
+        if (ident == null) { return; }
+        const name: SymbolStr = ident.name;
+        const ty: TypeRef = this.lookup_type(name);
+        if (!ty.is_valid()) { return; }
+        const _is_copy: boolean = this.is_copy(ty);
+        const _is_moved: boolean = this.is_moved(name);
+        cdebug("[MoveCheck:ident] '%s' ty.id=%llu is_copy=%d is_moved=%d in_move=%d\n",
+            this.intern.resolve(name), ty.id, _is_copy as i32,
+            _is_moved as i32, in_move_context as i32);
+        if (_is_copy) { return; }
+
+        if (this.is_moved(name)) {
+            const moved_at: i32 = this.moved_at_line(name);
+            const msg: string = if (moved_at > 0) {
+                format("use of moved value '%s' (moved at line %d)",
+                    this.intern.resolve(name), moved_at)
+            } else {
+                format("use of moved value '%s'", this.intern.resolve(name))
+            };
+            this.emit_warn(ErrorCode::E0452_USE_AFTER_MOVE, msg, ident.span);
+            return;
+        }
+        if (in_move_context) {
+            this.mark_moved(name, ident.span);
+        }
+    }
+}
+
+
+type struct MoveCheckPass {
+    static run(ctx: CompilationContext*) -> PassResult {
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return PassResult::ok(); }
+        mut checker: MoveChecker = MoveChecker::new(ctx);
+        checker.walk_program(root);
+        if (ctx.debug_mode) {
+            cdebug("[MoveCheck] %lld diagnostics emitted\n", checker.fired);
+        }
+        // Warn-only mode: never fail the pass.
+        return PassResult::ok();
+    }
+}
