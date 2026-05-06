@@ -851,6 +851,48 @@ type struct TypeResolutionPasses {
                 if (!node.qualified_target_name.is_valid()) {
                     node.qualified_target_name = canonical_target;
                 }
+                // Re-register the trait-impl entry under the canonical
+                // qualified target.  `register_impl_block` (Stage 3,
+                // DeclarationCollection) keys it under the parser-captured
+                // bare `node.target_type` because cross-module name
+                // resolution isn't available that early.  Sema's
+                // `traits_implemented_by` lookup uses the canonical
+                // qualified name (via `lookup_type_name`), so without
+                // this re-registration trait method dispatch on
+                // user-defined targets (e.g. `String::write_bytes` from
+                // `implement trait FmtWrite for struct String`) misses
+                // entirely — the bare-name key never lines up with the
+                // canonical receiver.
+                if (ctx.generic_registry != null && canonical_target.is_valid()) {
+                    // Attach this impl block to the template entry under
+                    // the canonical target.  Stage-3 registration uses
+                    // `ctx.qualify_symbol_sym(node.target_type)` which
+                    // qualifies with the impl's *own* namespace — wrong
+                    // for cross-module impls (e.g. `implement trait
+                    // FmtWrite for struct String` declared in
+                    // `std::fmt::write` qualifies as
+                    // `std::fmt::write::String`, no template by that
+                    // name, the impl is silently never attached).
+                    // Without the attachment, monomorphization doesn't
+                    // carry the impl into spec'd types, so the spec
+                    // misses the trait method entirely at sema time.
+                    const legacy_qual_for_attach: SymbolStr =
+                        ctx.qualify_symbol_sym(node.target_type);
+                    if (!canonical_target.equals(legacy_qual_for_attach)) {
+                        ctx.generic_registry.register_impl_block(
+                            canonical_target, node);
+                    }
+                    if (node.is_trait_impl()) {
+                        const trait_root: SymbolStr =
+                            TypeResolutionPasses::extract_trait_leaf(
+                                node.trait_annotation);
+                        if (trait_root.is_valid()
+                            && !canonical_target.equals(node.target_type)) {
+                            ctx.generic_registry.register_trait_impl(
+                                trait_root, canonical_target, node);
+                        }
+                    }
+                }
                 // Register methods under EVERY form a call site might use:
                 //   * canonical_target — what method dispatch resolves to
                 //     after going through the bare→qualified table.

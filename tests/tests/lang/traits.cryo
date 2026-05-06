@@ -1,0 +1,192 @@
+///! Trait declaration, impl, dispatch through generics, and `This` self type.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::Traits;
+
+import std::core::result;
+import std::core::cmp;
+import std::test::error;
+import std::test::assert;
+
+// User-declared trait — uses `This` for the self type (Cryo convention,
+// not `Self`).
+type trait Describe {
+    label(&this) -> i32;
+}
+
+type struct Tagged {
+    tag: i32;
+}
+
+implement trait Describe for struct Tagged {
+    label(&this) -> i32 { return this.tag; }
+}
+
+type struct OtherTagged {
+    base: i32;
+    bias: i32;
+}
+
+implement trait Describe for struct OtherTagged {
+    label(&this) -> i32 { return this.base + this.bias; }
+}
+
+/// Generic function constrained to types that implement `Describe`. The
+/// dispatch is monomorphized — each instantiation calls the impl's
+/// `label` directly with no virtual dispatch.
+function read_label<T>(value: &T) -> i32
+where T: Describe {
+    return value.label();
+}
+
+![test]
+function trait_impl_dispatches() -> Result<(), TestError> {
+    const t: Tagged = Tagged { tag: 7 };
+    match (expect_eq(read_label(&t), 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function trait_impl_dispatches_second_target() -> Result<(), TestError> {
+    const o: OtherTagged = OtherTagged { base: 10, bias: 5 };
+    match (expect_eq(read_label(&o), 15)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function eq_trait_on_primitive_int() -> Result<(), TestError> {
+    // `i32` impls `Eq` in stdlib's core::cmp. Method-call form is
+    // available on any value of type i32.
+    const a: i32 = 4;
+    const b: i32 = 4;
+    const c: i32 = 9;
+    match (expect(a.equals(&b),
+        Str::from_raw("4 should equal 4 via Eq" as u8*, 23))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!a.equals(&c),
+        Str::from_raw("4 should not equal 9 via Eq" as u8*, 27))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function eq_trait_on_primitive_u64() -> Result<(), TestError> {
+    const a: u64 = 1000;
+    const b: u64 = 1000;
+    match (expect(a.equals(&b),
+        Str::from_raw("u64 1000 should equal u64 1000 via Eq" as u8*, 37))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function ord_trait_on_primitive_int() -> Result<(), TestError> {
+    const a: i32 = 5;
+    const b: i32 = 9;
+    const cmp_ab: Ordering = a.compare(&b);
+    const cmp_aa: Ordering = a.compare(&a);
+    const cmp_ba: Ordering = b.compare(&a);
+    // Test by mapping Ordering -> int via match for round-trip checking.
+    const code_lt: i32 = match (cmp_ab) {
+        Ordering::Less    => { -1 }
+        Ordering::Equal   => { 0 }
+        Ordering::Greater => { 1 }
+    };
+    const code_eq: i32 = match (cmp_aa) {
+        Ordering::Less    => { -1 }
+        Ordering::Equal   => { 0 }
+        Ordering::Greater => { 1 }
+    };
+    const code_gt: i32 = match (cmp_ba) {
+        Ordering::Less    => { -1 }
+        Ordering::Equal   => { 0 }
+        Ordering::Greater => { 1 }
+    };
+    match (expect_eq(code_lt, -1)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(code_eq, 0)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(code_gt, 1)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Trait with two methods to test multi-method dispatch.
+type trait Pair2 {
+    first(&this) -> i32;
+    second(&this) -> i32;
+}
+
+type struct Coords {
+    x: i32;
+    y: i32;
+}
+
+implement trait Pair2 for struct Coords {
+    first(&this) -> i32  { return this.x; }
+    second(&this) -> i32 { return this.y; }
+}
+
+function sum_pair<T>(value: &T) -> i32
+where T: Pair2 {
+    return value.first() + value.second();
+}
+
+![test]
+function multi_method_trait_dispatch() -> Result<(), TestError> {
+    const c: Coords = Coords { x: 12, y: 30 };
+    match (expect_eq(sum_pair(&c), 42)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Trait with multiple bounds on the same generic.
+function compare_sum<T>(a: &T, b: &T) -> Ordering
+where T: Pair2 + Eq {
+    const sa: i32 = a.first() + a.second();
+    const sb: i32 = b.first() + b.second();
+    return sa.compare(&sb);
+}
+
+implement trait Eq for struct Coords {
+    equals(&this, other: &Coords) -> boolean {
+        return this.x == other.x && this.y == other.y;
+    }
+}
+
+![test]
+function multi_bound_generic() -> Result<(), TestError> {
+    const a: Coords = Coords { x: 1, y: 2 };
+    const b: Coords = Coords { x: 5, y: 5 };
+    const ord: Ordering = compare_sum(&a, &b);
+    const code: i32 = match (ord) {
+        Ordering::Less    => { -1 }
+        Ordering::Equal   => { 0 }
+        Ordering::Greater => { 1 }
+    };
+    match (expect_eq(code, -1)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
