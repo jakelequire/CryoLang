@@ -136,6 +136,17 @@ type struct Monomorphizer {
     current_spec_inst_id: u64;
     current_spec_struct:  StructDeclNode*;
 
+    // Per-walker scope stack for match-arm bindings.  Populated by
+    // `push_arm_bindings_to_scope` before walking an arm body and torn
+    // down by `pop_scope_bindings` afterwards.  `lookup_local_type` and
+    // `resolve_arg_type_for_inference` consult this stack so identifiers
+    // bound by patterns (e.g. `Result::Ok(raw) => raw.method<...>()`)
+    // resolve correctly inside generic-method bodies that sema skipped.
+    // Direct field access bypasses the array-by-value pitfall that bit
+    // the names/types parameter passing.
+    scope_names: SymbolStr[];
+    scope_types: TypeRef[];
+
 
     // ----------------------------------------------------------------
     // Construction
@@ -169,6 +180,8 @@ type struct Monomorphizer {
             inference_param_ids:   [],
             current_spec_inst_id:  0,
             current_spec_struct:   null,
+            scope_names:           [],
+            scope_types:           [],
         };
     }
 
@@ -1647,14 +1660,142 @@ type struct Monomorphizer {
         } else if (node.kind == NodeKind::MatchStatement) {
             const ms: MatchStmtNode* = stmt as MatchStmtNode*;
             this.discover_inferred_calls_in_expr(ms.subject, res_ctx, subst, names, types);
+            // Resolve subject's type and pre-register each arm's pattern
+            // bindings on a per-walker scratch stack so `try_infer_method_call`
+            // can look up match-arm bindings (e.g. `Result::Ok(raw) =>
+            // raw.method<...>()` inside a generic body that sema skipped).
+            // We can't push into `names`/`types` directly — those are
+            // pass-by-value arrays here, so pushes don't propagate to the
+            // caller's view but pops do (since pop is just a length tweak),
+            // and that mismatch corrupts the worklist for sibling arms.
+            mut subj_type: TypeRef = this.resolve_arg_type_for_inference(
+                ms.subject, names, types);
+            if (subj_type.is_valid() && subst != null) {
+                subj_type = subst.apply(subj_type, this.arena);
+            }
             for (mut i: i64 = 0; i < ms.arms.length; i++) {
                 const arm: MatchArmNode* = ms.arms[i];
-                if (arm != null && arm.body != null) {
+                if (arm == null) { continue; }
+                const pushed: i64 = this.push_arm_bindings_to_scope(arm, subj_type);
+                if (arm.body != null) {
                     this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
                 }
+                this.pop_scope_bindings(pushed);
             }
         }
     }
+
+    /// Push each pattern's bindings onto the walker's scope stack so
+    /// `lookup_local_type` resolves them when an arm's body references
+    /// them.  Returns the count to be popped after the arm is walked.
+    /// Direct mutation of `this.scope_names` / `this.scope_types`
+    /// avoids the by-value-array pitfall that breaks pushing into the
+    /// `names`/`types` parameters threaded through the walker.
+    push_arm_bindings_to_scope(mut &this, arm: MatchArmNode*,
+                                subject_type: TypeRef) -> i64 {
+        if (arm == null) { return 0; }
+        if (!subject_type.is_valid()) { return 0; }
+        mut added: i64 = 0;
+        for (mut i: i64 = 0; i < arm.patterns.length; i++) {
+            const pat: PatternNode* = arm.patterns[i];
+            if (pat == null) { continue; }
+
+            if (pat.pattern_kind == PatternKind::Identifier) {
+                this.scope_names.push(pat.binding_name);
+                this.scope_types.push(subject_type);
+                added = added + 1;
+                continue;
+            }
+            if (pat.pattern_kind != PatternKind::Enum) { continue; }
+
+            const enum_pat: EnumPatternNode* = pat as EnumPatternNode*;
+
+            // Walk to a concrete EnumType, falling through to the template
+            // when the InstantiatedType is still unresolved.
+            mut enum_ty: Type* = null;
+            mut t: Type* = this.arena.lookup(subject_type.id);
+            mut depth: i32 = 0;
+            while (t != null && depth < 5) {
+                if (t.kind == TypeKind::Enum) { enum_ty = t; break; }
+                if (t.kind == TypeKind::Pointer) {
+                    const pt: PointerType* = t as PointerType*;
+                    t = this.arena.lookup(pt.pointee.id);
+                } else if (t.kind == TypeKind::Reference) {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    t = this.arena.lookup(rt.referent.id);
+                } else if (t.kind == TypeKind::InstantiatedType) {
+                    const inst: InstantiatedType* = t as InstantiatedType*;
+                    if (inst.has_resolved_type()) {
+                        t = this.arena.lookup(inst.resolved_type.id);
+                    } else {
+                        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
+                        if (base_t != null && base_t.kind == TypeKind::Enum) {
+                            enum_ty = base_t;
+                        }
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                depth = depth + 1;
+            }
+            if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
+                for (mut j: i64 = 0; j < enum_pat.binding_names.length; j++) {
+                    this.scope_names.push(enum_pat.binding_names[j]);
+                    this.scope_types.push(subject_type);
+                    added = added + 1;
+                }
+                continue;
+            }
+            const et: EnumType* = enum_ty as EnumType*;
+            const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
+            if (variant == null) { continue; }
+            mut payload_types: TypeRef[] = variant.payload_types;
+            mut subj_t: Type* = this.arena.lookup(subject_type.id);
+            if (subj_t != null && subj_t.kind == TypeKind::InstantiatedType
+                    && this.generic_registry != null) {
+                const inst2: InstantiatedType* = subj_t as InstantiatedType*;
+                const tmpl: TemplateEntry* =
+                    this.generic_registry.get_template_by_type_id(
+                        inst2.generic_base.id);
+                if (tmpl != null
+                        && tmpl.param_type_ids.length == inst2.type_args.length) {
+                    mut sub: TypeSubstitution = TypeSubstitution::from_params(
+                        tmpl.param_type_ids, inst2.type_args);
+                    mut substituted: TypeRef[] = [];
+                    for (mut k: i64 = 0; k < payload_types.length; k++) {
+                        substituted.push(sub.apply(payload_types[k], this.arena));
+                    }
+                    payload_types = substituted;
+                }
+            }
+            for (mut j: i64 = 0; j < enum_pat.binding_names.length; j++) {
+                const pos: i64 = enum_pat.binding_positions[j];
+                mut bind_t: TypeRef = TypeRef::invalid();
+                if (pos < payload_types.length && payload_types[pos].is_valid()) {
+                    bind_t = payload_types[pos];
+                } else {
+                    bind_t = subject_type;
+                }
+                if (!bind_t.is_valid()) { continue; }
+                this.scope_names.push(enum_pat.binding_names[j]);
+                this.scope_types.push(bind_t);
+                added = added + 1;
+            }
+        }
+        return added;
+    }
+
+    /// Pop `count` entries off the walker's scope stack.  Symmetric to
+    /// `push_arm_bindings_to_scope`.
+    pop_scope_bindings(mut &this, count: i64) -> void {
+        for (mut k: i64 = 0; k < count; k++) {
+            if (this.scope_names.length == 0) { break; }
+            this.scope_names.pop();
+            this.scope_types.pop();
+        }
+    }
+
 
     discover_inferred_calls_in_expr(mut &this, expr: ExpressionNode*,
                                     res_ctx: ResolutionContext*,
@@ -1723,7 +1864,18 @@ type struct Monomorphizer {
         const node: ASTNode* = expr as ASTNode*;
         if (node.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = expr as IdentifierNode*;
-            return this.lookup_local_type(id.name, names, types);
+            const local: TypeRef = this.lookup_local_type(id.name, names, types);
+            if (local.is_valid()) { return local; }
+            // Fall back to the walker's match-arm scope stack: pattern
+            // bindings (e.g. `Result::Ok(raw)`) registered by
+            // `push_arm_bindings_to_scope` aren't in the by-value
+            // `names`/`types` worklist but live on `this.scope_names`.
+            for (mut si: i64 = this.scope_names.length - 1; si >= 0; si--) {
+                if (this.scope_names[si].equals(id.name)) {
+                    return this.scope_types[si];
+                }
+            }
+            return TypeRef::invalid();
         }
         if (node.kind == NodeKind::UnaryExpression) {
             // `&x` produces a pointer to x.  Wrap the operand's type
@@ -1761,6 +1913,61 @@ type struct Monomorphizer {
             }
             mut cast_ctx: ResolutionContext = ResolutionContext::new("", "");
             return this.type_resolver.resolve(ce.target_annotation, &cast_ctx);
+        }
+        if (node.kind == NodeKind::CallExpression) {
+            // Sema-resolved calls already carry their concrete return type
+            // on the node itself.  Trust that when set; falling back to
+            // decl_index for generic templates here returns an unsubstituted
+            // GenericParam type that downstream paths (e.g. `expect_eq<T>
+            // where T: Eq`) misinterpret as a missing trait bound.
+            if (expr.resolved_type.is_valid()) {
+                return expr.resolved_type;
+            }
+            // For calls inside a generic-method body that sema skipped, we
+            // still need a best-effort return type so downstream match
+            // subjects can be typed.  The receiver-driven path: when the
+            // callee is `obj.method(...)` and the receiver resolves to a
+            // concrete type, look up the method's return on that type.
+            // Restricted to method calls because free-function generics
+            // would yield unsubstituted GenericParams here, which break
+            // bound-checking elsewhere.
+            const ce_call: CallExprNode* = expr as CallExprNode*;
+            if (ce_call.callee == null) { return TypeRef::invalid(); }
+            const callee_node: ASTNode* = ce_call.callee as ASTNode*;
+            if (callee_node.kind != NodeKind::MemberAccess) {
+                return TypeRef::invalid();
+            }
+            if (this.decl_index == null) { return TypeRef::invalid(); }
+            const ma_call: MemberAccessNode* = ce_call.callee as MemberAccessNode*;
+            mut recv: TypeRef = this.resolve_arg_type_for_inference(
+                ma_call.object, names, types);
+            if (!recv.is_valid()) { return TypeRef::invalid(); }
+            // Unwrap one or two pointer/reference layers so the type-symbol
+            // reverse-lookup lands on the user-facing struct/class name.
+            mut t: Type* = this.arena.lookup(recv.id);
+            mut depth: i32 = 0;
+            while (t != null && depth < 5) {
+                if (t.kind == TypeKind::Pointer) {
+                    const pt: PointerType* = t as PointerType*;
+                    recv = pt.pointee;
+                    t = this.arena.lookup(recv.id);
+                } else if (t.kind == TypeKind::Reference) {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    recv = rt.referent;
+                    t = this.arena.lookup(recv.id);
+                } else if (t.kind == TypeKind::InstantiatedType) {
+                    const inst: InstantiatedType* = t as InstantiatedType*;
+                    if (!inst.has_resolved_type()) { break; }
+                    recv = inst.resolved_type;
+                    t = this.arena.lookup(recv.id);
+                } else {
+                    break;
+                }
+                depth = depth + 1;
+            }
+            const type_sym: SymbolStr = this.decl_index.lookup_type_name(recv);
+            if (!type_sym.is_valid()) { return TypeRef::invalid(); }
+            return this.decl_index.lookup_method_return(type_sym, ma_call.member);
         }
         if (node.kind == NodeKind::MemberAccess) {
             // `obj.field` — recursively resolve the receiver, walk through
@@ -2531,6 +2738,81 @@ type struct Monomorphizer {
     /// Returns null if no match.  Used by method-call inference to find
     /// the spec'd Hash impl on `String<GA>` (etc.) so `key.hash(&hasher)`
     /// can be monomorphized.
+    /// Walk the spec'd struct/class's own `methods[]` for a generic method
+    /// whose name matches.  Used for receivers like `NonNull<u8>` whose
+    /// owner template carries `cast<U>` inline (not in an impl block).
+    /// `out_owner_ast` receives the spec'd struct/class AST so the caller
+    /// can push the spec'd sibling onto the right `methods[]` array.
+    /// Returns null when no spec entry exists for the receiver yet — the
+    /// caller should enqueue the receiver and try again on a later mono
+    /// iteration, instead of pushing onto the template's `methods[]`
+    /// (which would leak across all instantiations).
+    find_spec_inline_method(mut &this, target_type: TypeRef, method_name: SymbolStr,
+                             out_owner_ast: ASTNode**) -> MethodNode* {
+        for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
+            const entry: SpecializationEntry = this.spec_entries[i];
+            if (entry.specialized_type.id != target_type.id) { continue; }
+            if (entry.ast_node == null) { continue; }
+            mut owner_methods: MethodNode*[] = [];
+            if (entry.ast_node.kind == NodeKind::StructDeclaration) {
+                const sn: StructDeclNode* = entry.ast_node as StructDeclNode*;
+                owner_methods = sn.methods;
+            } else if (entry.ast_node.kind == NodeKind::ClassDeclaration) {
+                const cn: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
+                owner_methods = cn.methods;
+            } else {
+                continue;
+            }
+            for (mut k: i64 = 0; k < owner_methods.length; k++) {
+                const m: MethodNode* = owner_methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length == 0) { continue; }
+                *out_owner_ast = entry.ast_node;
+                return m;
+            }
+        }
+
+        // No spec entry yet for this receiver.  Two-step recovery:
+        // (1) enqueue the receiver so the next mono iteration creates the
+        // spec entry; (2) return the template's method node so the caller
+        // can specialize it against the explicit/inferred type args.  The
+        // caller is responsible for routing the spec'd MethodNode to the
+        // RECEIVER'S spec entry once one exists — not onto the template's
+        // own `methods[]`, which would leak across every instantiation.
+        if (this.generic_registry == null) { return null; }
+        const recv_t: Type* = this.arena.lookup(target_type.id);
+        if (recv_t == null || recv_t.kind != TypeKind::InstantiatedType) {
+            return null;
+        }
+        this.enqueue_from_type_ref(target_type);
+        const inst: InstantiatedType* = recv_t as InstantiatedType*;
+        const tmpl: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return null; }
+        mut tmpl_methods: MethodNode*[] = [];
+        if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            tmpl_methods = sn.methods;
+        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            tmpl_methods = cn.methods;
+        } else {
+            return null;
+        }
+        for (mut k: i64 = 0; k < tmpl_methods.length; k++) {
+            const m: MethodNode* = tmpl_methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            if (m.func.generic_params.length == 0) { continue; }
+            // Caller distinguishes the template-found case from the
+            // spec'd-found case by `*out_owner_ast == tmpl.ast_node`.
+            *out_owner_ast = tmpl.ast_node;
+            return m;
+        }
+        return null;
+    }
+
     find_spec_impl_method(&this, target_type: TypeRef, method_name: SymbolStr,
                           out_impl: ImplBlockNode**) -> MethodNode* {
         for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
@@ -2653,7 +2935,6 @@ type struct Monomorphizer {
                           names: SymbolStr[], types: TypeRef[]) -> void {
         if (call == null) { return; }
         if (call.resolved_method != null) { return; }
-        if (call.generic_args.length > 0) { return; }
         if (call.callee == null) { return; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
         if (callee_node.kind != NodeKind::MemberAccess) { return; }
@@ -2708,7 +2989,11 @@ type struct Monomorphizer {
                                         || tk == TypeKind::Bool
                                         || tk == TypeKind::Char
                                         || tk == TypeKind::String;
-        if (!is_user_kind && !is_primitive_kind) { return; }
+        // An InstantiatedType whose concrete struct hasn't been resolved yet
+        // is also acceptable — `find_spec_inline_method`'s template-fallback
+        // path handles these directly via `generic_base`.
+        const is_unresolved_inst: boolean = tk == TypeKind::InstantiatedType;
+        if (!is_user_kind && !is_primitive_kind && !is_unresolved_inst) { return; }
 
         // Find the impl method.  Three lookup paths:
         //   1. spec_entries — generic types whose spec'd impl blocks
@@ -2729,10 +3014,22 @@ type struct Monomorphizer {
         mut impl_node: ImplBlockNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
         mut orig_method: MethodNode* = null;
-        if (is_user_kind) {
+        if (is_user_kind || is_unresolved_inst) {
             orig_method = this.find_spec_impl_method(recv_type, ma.member, &impl_node);
             if (orig_method == null) {
                 orig_method = this.find_inherent_method(
+                    recv_type, ma.member, &inherent_owner_ast);
+            }
+            if (orig_method == null) {
+                // Third path: a generic struct/class with an INLINE generic
+                // method (e.g. `NonNull<T>::cast<U>`).  The owner is itself
+                // generic, so it isn't in `inherent_owner_index`; the method
+                // isn't in an impl block, so `find_spec_impl_method` misses
+                // it.  But the spec'd type's own `ast_node` carries cloned
+                // copies of every inline method — search there, and fall
+                // back to the template's own AST when the receiver wasn't
+                // monomorphized directly.
+                orig_method = this.find_spec_inline_method(
                     recv_type, ma.member, &inherent_owner_ast);
             }
         } else {
@@ -2791,31 +3088,54 @@ type struct Monomorphizer {
             method_ctx.set_this_type(recv_type);
         }
 
-        // Unify each formal explicit param against the call's actual arg.
-        mut ok: boolean = true;
-        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = explicit_params[i];
-            if (param == null) { ok = false; break; }
-            mut formal: TypeRef = param.resolved_type;
-            if (!formal.is_valid() && param.type_annotation != null
-                    && this.type_resolver != null) {
-                formal = this.type_resolver.resolve(param.type_annotation, &method_ctx);
+        // Two paths to populate `inference_bindings`:
+        //   • Explicit method-level generic args at the call site
+        //     (`obj.method<U>(...)`) — resolve them in `method_ctx` and bind
+        //     directly.  Skips unification entirely; the args ARE the answer.
+        //   • Inference from formal/actual arg unification — used when the
+        //     user didn't write explicit args, so `U` has to fall out of the
+        //     pairing between each formal type and the call's actual.
+        if (call.generic_args.length > 0
+                && call.generic_args.length == n_method_params
+                && this.type_resolver != null) {
+            mut all_resolved: boolean = true;
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                const arg_ref: TypeRef = this.type_resolver.resolve(
+                    call.generic_args[i], &method_ctx);
+                if (!arg_ref.is_valid()) {
+                    all_resolved = false;
+                    break;
+                }
+                this.inference_bindings[i] = arg_ref;
             }
-            if (!formal.is_valid()) { ok = false; break; }
-            const arg: ExpressionNode* = call.arguments[i];
-            mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-            if (!actual.is_valid()) { ok = false; break; }
-            if (subst != null) {
-                actual = subst.apply(actual, this.arena);
+            if (!all_resolved) { return; }
+        } else {
+            // Unify each formal explicit param against the call's actual arg.
+            mut ok: boolean = true;
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = explicit_params[i];
+                if (param == null) { ok = false; break; }
+                mut formal: TypeRef = param.resolved_type;
+                if (!formal.is_valid() && param.type_annotation != null
+                        && this.type_resolver != null) {
+                    formal = this.type_resolver.resolve(param.type_annotation, &method_ctx);
+                }
+                if (!formal.is_valid()) { ok = false; break; }
+                const arg: ExpressionNode* = call.arguments[i];
+                mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+                if (!actual.is_valid()) { ok = false; break; }
+                if (subst != null) {
+                    actual = subst.apply(actual, this.arena);
+                }
+                if (!this.unify_for_inference(formal, actual)) {
+                    ok = false;
+                    break;
+                }
             }
-            if (!this.unify_for_inference(formal, actual)) {
-                ok = false;
-                break;
+            if (!ok) { return; }
+            for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+                if (!this.inference_bindings[i].is_valid()) { return; }
             }
-        }
-        if (!ok) { return; }
-        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-            if (!this.inference_bindings[i].is_valid()) { return; }
         }
 
         // Inferred all method-level params.  Specialize the method by
@@ -2830,11 +3150,46 @@ type struct Monomorphizer {
             // Push onto the inherent owner's own methods[] array so
             // `declare_struct_methods` / `declare_class_methods` picks
             // it up when codegen walks the (non-generic) owner.
-            if (inherent_owner_ast.kind == NodeKind::StructDeclaration) {
-                const sn: StructDeclNode* = inherent_owner_ast as StructDeclNode*;
+            //
+            // When `find_spec_inline_method` fell back to the receiver's
+            // template AST (because no spec entry existed for the
+            // receiver yet), routing the spec'd MethodNode there would
+            // leak it into every other instantiation that shares the
+            // template.  Detect that case and prefer the receiver's spec
+            // entry instead — `find_spec_inline_method` enqueued the
+            // receiver, and the spec entry exists by the time mono is
+            // emitting code.  If it still doesn't exist (e.g. enqueue
+            // happened too late in the pass), fall back to the template
+            // path; codegen's spec-lookup wins by symbol name.
+            mut target_ast: ASTNode* = inherent_owner_ast;
+            mut from_template: boolean = false;
+            if (this.generic_registry != null) {
+                const recv_t: Type* = this.arena.lookup(recv_type.id);
+                if (recv_t != null && recv_t.kind == TypeKind::InstantiatedType) {
+                    const inst_recv: InstantiatedType* = recv_t as InstantiatedType*;
+                    const tmpl_recv: TemplateEntry* =
+                        this.generic_registry.get_template_by_type_id(
+                            inst_recv.generic_base.id);
+                    if (tmpl_recv != null && tmpl_recv.ast_node == inherent_owner_ast) {
+                        from_template = true;
+                    }
+                }
+            }
+            if (from_template) {
+                // Look for a spec entry whose specialized_type matches recv.
+                for (mut si: i64 = 0; si < this.spec_entries.length; si++) {
+                    const e: SpecializationEntry = this.spec_entries[si];
+                    if (e.specialized_type.id == recv_type.id && e.ast_node != null) {
+                        target_ast = e.ast_node;
+                        break;
+                    }
+                }
+            }
+            if (target_ast.kind == NodeKind::StructDeclaration) {
+                const sn: StructDeclNode* = target_ast as StructDeclNode*;
                 sn.methods.push(spec_method);
-            } else if (inherent_owner_ast.kind == NodeKind::ClassDeclaration) {
-                const cn: ClassDeclNode* = inherent_owner_ast as ClassDeclNode*;
+            } else if (target_ast.kind == NodeKind::ClassDeclaration) {
+                const cn: ClassDeclNode* = target_ast as ClassDeclNode*;
                 cn.methods.push(spec_method);
             }
         } else {

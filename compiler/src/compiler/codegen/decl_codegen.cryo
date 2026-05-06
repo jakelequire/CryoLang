@@ -1101,9 +1101,21 @@ function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
     // anything more complex than a literal falls back to zeroinitializer
     // (more involved cases would need a runtime ctor, out of scope here).
     mut init: LValue = LValue::null();
-    if (node.has_initializer()
-            && node.initializer.kind == NodeKind::Literal) {
-        const lit: LiteralNode* = node.initializer as LiteralNode*;
+    // Peel one layer of cast so initializers like
+    // `const HEX_LOWER: u8* = "0123456789abcdef" as u8*` route to the
+    // string-literal branch below.  Without this, the cast wraps the
+    // literal and the global lands on the `null` fallback at the bottom
+    // of this function — leaving HEX_LOWER null at runtime, which
+    // segfaults the moment a downstream consumer indexes it.
+    mut init_expr: ExpressionNode* = node.initializer;
+    if (init_expr != null && init_expr.kind == NodeKind::CastExpression) {
+        const ce: CastExprNode* = init_expr as CastExprNode*;
+        if (ce.expression != null && ce.expression.kind == NodeKind::Literal) {
+            init_expr = ce.expression;
+        }
+    }
+    if (init_expr != null && init_expr.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = init_expr as LiteralNode*;
         const tk: i32 = llvm::LLVMGetTypeKind(ty.raw);
         if (lit.literal_kind == LiteralKind::Integer && tk == 8) {
             const ival: u64 = parse_int_lexeme(lit.value);
