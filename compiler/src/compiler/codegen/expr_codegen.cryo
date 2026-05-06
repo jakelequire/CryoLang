@@ -77,6 +77,23 @@ function parse_int_lexeme(s: string) -> u64 {
     return acc;
 }
 
+/// Parse a tuple-field member name (the SymbolStr behind `t.0`, `t.1`, ...)
+/// as a non-negative decimal index, or -1 when the name isn't a pure
+/// decimal. Sema validates the index against the tuple's element count;
+/// codegen trusts that and just uses this to recover the slot number.
+function parse_tuple_member_index(s: string) -> i64 {
+    if (s == null) { return -1; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return -1; }
+    mut acc: i64 = 0;
+    for (mut i: i64 = 0; i < len; i++) {
+        const c: char = s[i];
+        if (c < '0' || c > '9') { return -1; }
+        acc = acc * 10 + ((c - '0') as i64);
+    }
+    return acc;
+}
+
 /// Generate a constant value from a literal node.
 function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
                          out_value: LValue*, out_is_lvalue: boolean*) -> void {
@@ -993,7 +1010,19 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     const tk: TypeKind = t.kind;
     mut field_idx: i64 = -1;
 
-    if (tk == TypeKind::Struct) {
+    if (tk == TypeKind::Tuple) {
+        // Tuple positional access: parse member SymbolStr as decimal index.
+        // Sema already validated bounds; codegen trusts the resolved_type
+        // path and just GEPs slot N.
+        const member_str: string = cg.resolve(member);
+        const idx: i64 = parse_tuple_member_index(member_str);
+        if (idx >= 0) {
+            const tup: TupleType* = t as TupleType*;
+            if (idx < tup.elements.length) {
+                field_idx = idx;
+            }
+        }
+    } else if (tk == TypeKind::Struct) {
         const st: StructType* = t as StructType*;
         field_idx = st.field_index(member);
     } else if (tk == TypeKind::Class) {
@@ -1414,6 +1443,55 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                 }
                 cg.builder.build_store(val, gep);
             }
+        }
+    }
+
+    *out_value = alloca;
+    *out_is_lvalue = true;
+}
+
+
+/// Build a tuple value `(e0, e1, ...)` of type `tuple_type`. Mirrors
+/// the struct-literal path: alloca-by-element-stores-load-back. Tuples
+/// are positional, so element_values[i] goes to GEP slot i with no
+/// field-name lookup.
+function codegen_tuple_literal(cg: CodegenContext*, tuple_type: TypeRef,
+                                element_values: LValue[],
+                                out_value: LValue*, out_is_lvalue: boolean*,
+                                site_span: SourceSpan) -> void {
+    const ty: LType = cg.type_mapper.map_type(tuple_type);
+    if (!ty.is_valid()) {
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    const current_bb: LBasicBlock = cg.builder.get_insert_block();
+    if (!current_bb.is_valid()) {
+        cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            "codegen: tuple literal — builder has no insert block",
+            site_span);
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+    const current_fn: LValue = current_bb.get_parent();
+    if (!current_fn.is_valid()) {
+        cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            "codegen: tuple literal — insert block has no parent function",
+            site_span);
+        *out_value = LValue::null();
+        *out_is_lvalue = false;
+        return;
+    }
+
+    const alloca: LValue = cg.create_entry_alloca(current_fn, "tuplit", ty);
+
+    for (mut i: i64 = 0; i < element_values.length; i++) {
+        const gep: LValue = cg.builder.build_struct_gep(ty, alloca, i as u32, "elem");
+        const val: LValue = element_values[i];
+        if (val.is_valid()) {
+            cg.builder.build_store(val, gep);
         }
     }
 

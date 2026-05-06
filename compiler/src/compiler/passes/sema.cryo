@@ -3103,6 +3103,57 @@ public:
         // Input invalid → upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
 
+        // Tuple positional access: `t.0`, `t.1`. The parser interns the
+        // numeric token's lexeme as the member SymbolStr (same field as
+        // named members) — we branch on receiver kind here. Walks past
+        // pointer/reference/instantiation wrappers so `(&t).0` also works.
+        mut walk_ty: TypeRef = obj_type;
+        mut walk_t: Type* = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            if (walk_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = walk_t as PointerType*;
+                walk_ty = pt.pointee;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = walk_t as ReferenceType*;
+                walk_ty = rt.referent;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                if (!it.has_resolved_type()) { break; }
+                walk_ty = it.resolved_type;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (walk_t != null && walk_t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = walk_t as TupleType*;
+            const member_str: string = this.intern.resolve(member.member);
+            const idx: i64 = parse_tuple_index(member_str);
+            const m_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            if (idx < 0) {
+                this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                    format("expected a tuple index after `.`, got `%s`", member_str),
+                    m_span);
+                return TypeRef::invalid();
+            }
+            if (idx >= tup.elements.length) {
+                this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                    format("tuple index %lld is out of bounds for tuple with %lld elements",
+                           idx, tup.elements.length),
+                    m_span);
+                return TypeRef::invalid();
+            }
+            return tup.elements[idx];
+        }
+
         // Struct/class field access via TypeChecker
         const result: TypeCheckResult = this.checker.check_field_access(
             obj_type, member.member);
@@ -3136,6 +3187,51 @@ public:
         const index_type: TypeRef = this.resolve_expr(access.index);
         // Input invalid → upstream error already emitted, stay silent
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
+
+        // Tuple bracket indexing: `t[0]`, `t[1]`. Tuples have a fixed,
+        // statically-known shape, so the index MUST be an integer literal
+        // and we can bounds-check at compile time. Walks past pointer/
+        // reference/instantiation wrappers so `(&t)[0]` works too.
+        mut walk_ty: TypeRef = array_type;
+        mut walk_t: Type* = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            if (walk_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = walk_t as PointerType*;
+                walk_ty = pt.pointee;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = walk_t as ReferenceType*;
+                walk_ty = rt.referent;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                if (!it.has_resolved_type()) { break; }
+                walk_ty = it.resolved_type;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (walk_t != null && walk_t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = walk_t as TupleType*;
+            const idx: i64 = sema_const_int_index(access.index);
+            if (idx < 0) {
+                this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                    "tuple index must be a non-negative integer literal — runtime indices are not supported on tuples",
+                    access.span);
+                return TypeRef::invalid();
+            }
+            if (idx >= tup.elements.length) {
+                this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                    format("tuple index %lld is out of bounds for tuple with %lld elements",
+                           idx, tup.elements.length),
+                    access.span);
+                return TypeRef::invalid();
+            }
+            return tup.elements[idx];
+        }
 
         const result: TypeCheckResult = this.checker.check_index_access(
             array_type, index_type);
@@ -3450,6 +3546,38 @@ public:
         }
         return this.arena.get_tuple(elem_types);
     }
+}
+
+
+/// Read a tuple bracket index expression as a compile-time constant
+/// integer. Currently only accepts a bare integer literal — tuples have
+/// a fixed shape, so runtime indices can't be bounds-checked and aren't
+/// supported. Returns -1 for any non-literal or non-integer expression.
+function sema_const_int_index(expr: ExpressionNode*) -> i64 {
+    if (expr == null) { return -1; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::Literal) { return -1; }
+    const lit: LiteralNode* = expr as LiteralNode*;
+    if (lit.literal_kind != LiteralKind::Integer) { return -1; }
+    return parse_tuple_index(lit.value);
+}
+
+/// Parse a member-name SymbolStr as a non-negative tuple index. Returns
+/// -1 for any non-digit character or empty input — the caller distinguishes
+/// "not a tuple index" from "out of bounds" so the diagnostic can be more
+/// specific. Plain decimal only: tuple indices never appear with prefixes
+/// or signs in source.
+function parse_tuple_index(s: string) -> i64 {
+    if (s == null) { return -1; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return -1; }
+    mut acc: i64 = 0;
+    for (mut i: i64 = 0; i < len; i++) {
+        const c: char = s[i];
+        if (c < '0' || c > '9') { return -1; }
+        acc = acc * 10 + ((c - '0') as i64);
+    }
+    return acc;
 }
 
 

@@ -22,6 +22,20 @@ import Compiler::Parser::ParserBase;
 import Utils::Logger;
 
 
+// Find the first '.' in a numeric lexeme like "1.0" — returns its byte
+// index, or -1 if none. Used by `parse_member_access_expr` to split a
+// float-shaped token back into a chain of tuple indices when the lexer
+// has eaten the dot.
+function lexeme_first_dot(s: string) -> i64 {
+    if (s == null) { return -1; }
+    const len: i64 = strlen(s) as i64;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (s[i] == '.') { return i; }
+    }
+    return -1;
+}
+
+
 // ============================================================================
 // ExprParser — Expression + Type Annotation Parsing
 // ============================================================================
@@ -1247,7 +1261,47 @@ public:
     /// Parse member access: object.member or object.method<T, U>
     parse_member_access_expr(object: ExpressionNode*) -> MemberAccessNode* {
         this.advance(); // consume '.'
-        const member_tok: Token = this.consume(TokenType::Identifier, "member name");
+        // Tuple field access: `t.0`, `t.1`, ... — accept a numeric constant
+        // as the member name. The lexeme ("0", "1", ...) is interned as a
+        // SymbolStr exactly like a named field; sema branches on the
+        // receiver's TypeKind to interpret it as a positional index when
+        // the receiver is a TupleType.
+        //
+        // Chained tuple indices like `t.1.0` are tricky: the lexer eats
+        // `1.0` as a single float token. When we see a NumericConstant
+        // whose lexeme contains a `.`, split it back into a chain of
+        // member accesses (`(t.1).0`). The parser doesn't have to worry
+        // about three-part `1.2.3` — the lexer already breaks at the
+        // second dot, leaving `.3` as a separate Period+NumericConstant.
+        mut member_tok: Token = this.current();
+        if (member_tok.kind == TokenType::Identifier
+                || member_tok.kind == TokenType::NumericConstant) {
+            this.advance();
+        } else {
+            member_tok = this.consume(TokenType::Identifier, "member name");
+        }
+
+        if (member_tok.kind == TokenType::NumericConstant) {
+            const dot_pos: i64 = lexeme_first_dot(member_tok.lexeme);
+            if (dot_pos >= 0) {
+                const lex_len: i64 = strlen(member_tok.lexeme) as i64;
+                const first_str: string = substr(member_tok.lexeme, 0,
+                                                  dot_pos as u64);
+                const rest_str: string = substr(member_tok.lexeme,
+                                                  (dot_pos + 1) as u64,
+                                                  (lex_len - dot_pos - 1) as u64);
+                const first_sym: SymbolStr = this.ctx.intern(first_str);
+                const rest_sym: SymbolStr = this.ctx.intern(rest_str);
+                const tok_span: SourceSpan = this.span_from_token(member_tok);
+                const inner_span: SourceSpan = ParserBase::merge_spans(
+                    object.span, tok_span);
+                const inner: MemberAccessNode* = new MemberAccessNode(
+                    object, first_sym, tok_span, inner_span);
+                return new MemberAccessNode(
+                    inner as ExpressionNode*, rest_sym, tok_span, inner_span);
+            }
+        }
+
         const member: SymbolStr = this.intern_lexeme(member_tok);
         const member_span: SourceSpan = this.span_from_token(member_tok);
         const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
@@ -1425,9 +1479,20 @@ public:
             return this.parse_reference_type_with_mutability(true);
         }
 
-        // Function or tuple types: (T, U) -> R
+        // Function types or unit type: `(T, U) -> R` or `()`. Multi-element
+        // non-function `(T, U)` is NOT a tuple any more — tuples moved to
+        // bracket syntax to free `()` for the unit type alone.
         if (this.check(TokenType::LParen)) {
-            return this.parse_function_or_tuple_type();
+            return this.parse_function_or_unit_type();
+        }
+
+        // Bracket tuple types: `[T, U, V]`. The leading `[` is unambiguous
+        // in type position (array suffixes `T[]`/`T[N]` are postfix and run
+        // through `parse_type_suffixes`, not as a type-start).
+        if (this.check(TokenType::LSquare)) {
+            const tup: TypeAnnotation* = this.parse_bracket_tuple_type();
+            if (tup == null) { return null; }
+            return this.parse_type_suffixes(tup);
         }
 
         // Base type + optional suffixes
@@ -1646,8 +1711,11 @@ public:
         return new TypeAnnotation::Reference(ref_ann);
     }
 
-    /// Parse function type or tuple type: (T, U) -> R or (T, U)
-    parse_function_or_tuple_type() -> TypeAnnotation* {
+    /// Parse function type or unit type: `(T, U) -> R`, `() -> R`, or `()`.
+    /// Multi-element non-function form `(T, U)` is no longer a tuple type
+    /// — tuples now use bracket syntax `[T, U]` so `()` can mean only the
+    /// unit type. Single-element `(T)` is parens grouping (returns T).
+    parse_function_or_unit_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '('
 
         mut params: TypeAnnotation*[] = [];
@@ -1664,7 +1732,7 @@ public:
         }
         this.consume(TokenType::RParen, "')'");
 
-        // Check for function type: (params) -> return_type
+        // Function type: (params) -> return_type
         if (this.check(TokenType::Arrow)) {
             this.advance();
             const ret: TypeAnnotation* = this.parse_type_annotation();
@@ -1676,14 +1744,57 @@ public:
             return new TypeAnnotation::Function(fn_ann);
         }
 
-        // Tuple type: (T, U)
+        // `()` → unit type. The resolver canonicalizes empty TupleAnnotation
+        // to UnitType — kept as the existing path so unit's representation
+        // stays uniform across the pipeline.
+        if (params.length == 0) {
+            const tup_ann: TupleAnnotation* = new TupleAnnotation {
+                elements: params,
+                span:     this.span_from(start),
+            };
+            return new TypeAnnotation::Tuple(tup_ann);
+        }
+
+        // `(T)` → just T (parens grouping).
         if (params.length == 1) {
-            // Single-element tuple or parenthesized type
             return params[0];
         }
 
+        // `(T, U, ...)` without `->` is no longer a tuple type.
+        this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+            "tuple types now use bracket syntax: write '[T, U]' instead of '(T, U)'. Parens are reserved for unit '()' and function-parameter lists.");
+        return null;
+    }
+
+    /// Parse a bracket tuple type: `[T, U, V]`. Empty `[]` is invalid
+    /// (use `()` for unit). Single-element `[T]` is a 1-tuple — uncommon
+    /// but consistent. The resolver lowers TupleAnnotation through the
+    /// existing path; no new AST node needed.
+    parse_bracket_tuple_type() -> TypeAnnotation* {
+        const start: Token = this.advance(); // consume '['
+
+        mut elements: TypeAnnotation*[] = [];
+        if (!this.check(TokenType::RSquare)) {
+            while (true) {
+                const elem: TypeAnnotation* = this.parse_type_annotation();
+                if (elem != null) {
+                    elements.push(elem);
+                }
+                if (!this.match_tok(TokenType::Comma)) {
+                    break;
+                }
+            }
+        }
+        this.consume(TokenType::RSquare, "']'");
+
+        if (elements.length == 0) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "empty tuple type '[]' is not valid; use '()' for the unit type");
+            return null;
+        }
+
         const tup_ann: TupleAnnotation* = new TupleAnnotation {
-            elements: params,
+            elements: elements,
             span:     this.span_from(start),
         };
         return new TypeAnnotation::Tuple(tup_ann);

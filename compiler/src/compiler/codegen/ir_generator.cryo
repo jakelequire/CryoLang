@@ -1230,18 +1230,26 @@ public:
                                   expr.span);
         } else if (kind == NodeKind::ArrayAccess) {
             const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-            const arr: LValue = this.codegen_lvalue(aa.array);
-            // codegen_lvalue is misnamed — it doesn't enforce lvalue-ness,
-            // it just returns whatever generate_expression produced.  For
-            // `f()[i]` the call leaves last_is_lvalue=false, telling the
-            // array-access codegen to skip the lvalue load it would do
-            // for a stored pointer.
-            const arr_is_lvalue: boolean = this.last_is_lvalue;
-            const idx: LValue = this.codegen_rvalue(aa.index);
-            codegen_array_access(this.cg, arr, aa.array.resolved_type,
-                                 arr_is_lvalue, idx,
-                                 &this.last_value, &this.last_is_lvalue,
-                                 expr.span);
+            // Tuple bracket indexing is a struct GEP. Sema validated the
+            // index at compile time, so we can read the literal value
+            // here and skip codegen_array_access entirely (which is sized
+            // around dynamic-index arrays/strings/pointers).
+            if (this.try_codegen_tuple_index(aa)) {
+                /* last_value / last_is_lvalue set inside */
+            } else {
+                const arr: LValue = this.codegen_lvalue(aa.array);
+                // codegen_lvalue is misnamed — it doesn't enforce lvalue-ness,
+                // it just returns whatever generate_expression produced.  For
+                // `f()[i]` the call leaves last_is_lvalue=false, telling the
+                // array-access codegen to skip the lvalue load it would do
+                // for a stored pointer.
+                const arr_is_lvalue: boolean = this.last_is_lvalue;
+                const idx: LValue = this.codegen_rvalue(aa.index);
+                codegen_array_access(this.cg, arr, aa.array.resolved_type,
+                                     arr_is_lvalue, idx,
+                                     &this.last_value, &this.last_is_lvalue,
+                                     expr.span);
+            }
         } else if (kind == NodeKind::CastExpression) {
             const cast_node: CastExprNode* = expr as CastExprNode*;
             const src_t: Type* = this.cg.lookup_type_by_id(cast_node.expression.resolved_type.id);
@@ -1324,6 +1332,8 @@ public:
             this.visit_struct_literal(expr as StructLiteralNode*);
         } else if (kind == NodeKind::ArrayLiteral) {
             this.visit_array_literal(expr as ArrayLiteralNode*);
+        } else if (kind == NodeKind::TupleLiteral) {
+            this.visit_tuple_literal(expr as TupleLiteralNode*);
         } else if (kind == NodeKind::ScopeResolution) {
             this.visit_scope_resolution(expr as ScopeResolutionNode*);
         } else if (kind == NodeKind::LambdaExpression) {
@@ -2508,6 +2518,90 @@ public:
 
         this.last_value = result;
         this.last_is_lvalue = false;
+    }
+
+    /// `t[N]` on a tuple receiver. Returns true when handled; sets
+    /// `last_value` to the field GEP and `last_is_lvalue=true` so the
+    /// caller can use the result on either side of an assignment.
+    /// Returns false for non-tuple receivers — caller falls through to
+    /// the normal array-access path.
+    try_codegen_tuple_index(mut &this, aa: ArrayAccessNode*) -> boolean {
+        // Walk past pointer/reference/instantiation wrappers to find the
+        // underlying tuple kind. Mirrors the unwrap chain in
+        // codegen_member_access so `(&t)[0]` works the same as `t[0]`.
+        mut walk_ty: TypeRef = aa.array.resolved_type;
+        mut walk_t: Type* = this.cg.lookup_type_by_id(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            if (walk_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = walk_t as PointerType*;
+                walk_ty = pt.pointee;
+                walk_t = this.cg.lookup_type_by_id(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = walk_t as ReferenceType*;
+                walk_ty = rt.referent;
+                walk_t = this.cg.lookup_type_by_id(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                if (!it.has_resolved_type()) { break; }
+                walk_ty = it.resolved_type;
+                walk_t = this.cg.lookup_type_by_id(walk_ty.id);
+            } else {
+                break;
+            }
+            depth = depth + 1;
+        }
+        if (walk_t == null || walk_t.kind != TypeKind::Tuple) {
+            return false;
+        }
+
+        // Sema already validated this — the index is an integer literal
+        // in bounds. Read the literal value directly off the AST so we
+        // can pass it to build_struct_gep.
+        const idx_node: ASTNode* = aa.index as ASTNode*;
+        if (idx_node.kind != NodeKind::Literal) { return false; }
+        const lit: LiteralNode* = aa.index as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        const idx: u64 = parse_int_lexeme(lit.value);
+
+        const recv: LValue = this.codegen_lvalue(aa.array);
+        const recv_is_lvalue: boolean = this.last_is_lvalue;
+        // Auto-deref reference receivers so `&t[0]` GEPs the underlying
+        // tuple, not the reference slot.
+        mut obj_ptr: LValue = recv;
+        const obj_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
+        if (obj_t != null && (obj_t.kind == TypeKind::Pointer
+                            || obj_t.kind == TypeKind::Reference)
+                && recv_is_lvalue) {
+            obj_ptr = this.cg.builder.build_load(
+                LType::pointer_to(LType::i8()), recv, "autoderef");
+        }
+
+        const tup_ty: LType = this.cg.type_mapper.map_type(walk_ty);
+        if (!tup_ty.is_valid() || !obj_ptr.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return true;
+        }
+        const gep: LValue = this.cg.builder.build_struct_gep(
+            tup_ty, obj_ptr, idx as u32, "tupelem");
+        this.last_value = gep;
+        this.last_is_lvalue = true;
+        return true;
+    }
+
+    /// Tuple literal — direct dispatch. Sema tags `resolved_type` with the
+    /// arena's TupleType (deduped by element types), so the layout follows
+    /// `map_tuple` (anonymous LLVM struct of element types in order).
+    visit_tuple_literal(mut &this, node: TupleLiteralNode*) -> void {
+        const type_ref: TypeRef = node.resolved_type;
+        mut element_values: LValue[] = [];
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            element_values.push(this.codegen_rvalue(node.elements[i]));
+        }
+        codegen_tuple_literal(this.cg, type_ref, element_values,
+                              &this.last_value, &this.last_is_lvalue,
+                              node.span);
     }
 
     /// Struct literal — direct dispatch.
