@@ -318,32 +318,68 @@ public:
     }
 
     substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
-        // Check BEFORE substitution whether the base is our type being specialized.
-        mut is_self_type: boolean = this.is_named_matching_base(gen.base);
+        // A Generic is a self-reference to the outer type ONLY when its
+        // base name matches base_name AND its args (BEFORE substitution)
+        // are exactly the outer type's generic param names in declaration
+        // order. Without the args check, an inner generic-method's
+        // signature like `cast<U> -> NonNull<U>` (declared on `NonNull<T>`)
+        // would be misclassified as a self-reference: `is_named_matching_base`
+        // sees `NonNull` and collapses to the spec name, dropping U entirely.
+        // The spec'd cast then has return type `NonNull_<outer_T>` instead
+        // of being parameterized over U, and every later `cast<V>` request
+        // resolves to that wrong identity-cast sibling.
+        mut is_self_type: boolean = this.is_named_matching_base(gen.base)
+                                  && this.args_are_outer_param_refs(gen.args);
 
-        // Normal recursion: substitute base and args.
-        // For the base, this rewrites Named("Pair") → Named("Pair_string")
-        // via substitute_named_annotation.  Args get T → i32 etc.
-        this.substitute_annotation(gen.base);
-        for (mut i: i64 = 0; i < gen.args.length; i++) {
-            this.substitute_annotation(gen.args[i]);
-        }
-
-        // If the base was our type, collapse Generic(Named("Pair_string"), [string])
-        // down to just Named("Pair_string").  The type args are already baked into
-        // the specialized name, so keeping the Generic wrapper would cause the
-        // resolver to create a spurious Pair_string<string> instantiation.
-        //
-        // NOTE: Cannot use `*ann = *gen.base` here — the C++ compiler's codegen
-        // generates a 4-byte (tag-only) copy for enum dereference-assignment
-        // through pointers, leaving the 8-byte payload (the inner pointer)
-        // as stale data.  Use memcpy to guarantee a full copy.
         if (is_self_type) {
+            // Substitute the base (NonNull → NonNull_u8) and collapse to
+            // bare Named — the args are already encoded in the spec name,
+            // so keeping the Generic wrapper would cause the resolver to
+            // build a spurious `NonNull_u8<u8>` instantiation.
+            //
+            // NOTE: Cannot use `*ann = *gen.base` here — the C++ compiler's
+            // codegen generates a 4-byte (tag-only) copy for enum
+            // dereference-assignment through pointers, leaving the 8-byte
+            // payload (the inner pointer) as stale data. Use memcpy.
+            this.substitute_annotation(gen.base);
             memcpy(ann, gen.base, sizeof(TypeAnnotation));
             return ann;
         }
 
+        // Different instantiation of the same generic (e.g. `NonNull<U>`
+        // inside a `cast<U>` method on `NonNull<T>`, or an explicitly
+        // re-typed `NonNull<i32>` literal). Substitute the args so any
+        // references to outer params get rewritten, but leave the base
+        // name alone — rewriting it to the spec name would falsely encode
+        // the outer type's args.
+        for (mut i: i64 = 0; i < gen.args.length; i++) {
+            this.substitute_annotation(gen.args[i]);
+        }
         return ann;
+    }
+
+    /// True iff `args` is a leading prefix of the outer type's param
+    /// names (each `args[i]` is exactly `Named(param_names[i])`). Allows
+    /// shorter arg lists so generics with defaults like `RawBuffer<T,
+    /// A = GlobalAlloc>` recognise `RawBuffer<T>` (one arg) as a
+    /// self-reference — the trailing defaulted positions still resolve
+    /// to whatever the current spec used. Empty `args` is also a self-
+    /// reference (a bare unparameterized name).
+    args_are_outer_param_refs(&this, args: TypeAnnotation*[]) -> boolean {
+        if (args.length > this.param_names.length) { return false; }
+        for (mut i: i64 = 0; i < args.length; i++) {
+            const a: TypeAnnotation* = args[i];
+            if (a == null) { return false; }
+            mut matched: boolean = false;
+            match (*a) {
+                TypeAnnotation::Named(named) => {
+                    matched = named.name.equals(this.param_names[i]);
+                }
+                _ => { matched = false; }
+            }
+            if (!matched) { return false; }
+        }
+        return true;
     }
 
     /// Helper: returns true if the annotation is Named(base_name).
@@ -500,7 +536,10 @@ public:
     }
 
     override visit(node: NewExprNode*) -> void {
-        if (node.type_name.equals(this.base_name)) {
+        const is_self: boolean = node.type_name.equals(this.base_name)
+            && (node.generic_args.length == 0
+                || this.args_are_outer_param_refs(node.generic_args));
+        if (is_self) {
             node.type_name = this.spec_name;
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
@@ -515,7 +554,17 @@ public:
     }
 
     override visit(node: StructLiteralNode*) -> void {
-        if (node.struct_type.equals(this.base_name)) {
+        // Only collapse to the spec name when this literal is a true
+        // self-reference: same base, and either no generic args or args
+        // that exactly echo the outer type's params in order. An inner
+        // generic-method literal like `NonNull<U> { ... }` inside a
+        // `cast<U>` on `NonNull<T>` shares the base name but is a
+        // different instantiation — renaming `NonNull` to `NonNull_u8`
+        // would falsely freeze the literal at the outer spec's args.
+        const is_self: boolean = node.struct_type.equals(this.base_name)
+            && (node.generic_args.length == 0
+                || this.args_are_outer_param_refs(node.generic_args));
+        if (is_self) {
             node.struct_type = this.spec_name;
         }
         if (node.generic_args.length > 0) {
@@ -530,7 +579,14 @@ public:
     }
 
     override visit(node: ScopeResolutionNode*) -> void {
-        if (node.scope_name.equals(this.base_name)) {
+        // ScopeResolution carries TWO arg lists:
+        //   * scope_generic_args — args on the scope (`Pair<T>::method`)
+        //   * generic_args       — args on the method (`Pair::method<U>`)
+        // Only the scope args participate in the self-type collapse.
+        const is_self: boolean = node.scope_name.equals(this.base_name)
+            && (node.scope_generic_args.length == 0
+                || this.args_are_outer_param_refs(node.scope_generic_args));
+        if (is_self) {
             node.scope_name = this.spec_name;
         }
         if (node.generic_args.length > 0) {
