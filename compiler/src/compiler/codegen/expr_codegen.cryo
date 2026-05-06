@@ -920,7 +920,8 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
 /// of the access expression in the caller; used only to attach a source
 /// snippet to any diagnostic we emit.
 function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
-                               object_type: TypeRef, member: SymbolStr,
+                               object_type: TypeRef, object_is_lvalue: boolean,
+                               member: SymbolStr,
                                out_value: LValue*, out_is_lvalue: boolean*,
                                site_span: SourceSpan) -> void {
     // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
@@ -954,18 +955,17 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         }
         t = cg.lookup_type_by_id(obj_type.id);
 
-        // Load the pointer value through the alloca (if object_ptr is an lvalue
-        // pointing to a ptr slot).  Skip when object_ptr is already the ptr
-        // value — e.g., `&this` parameters are stored raw in named_values.
-        if (obj_ptr.is_valid()) {
-            const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
-            if (obj_llvm_ty != null && llvm::LLVMGetTypeKind(obj_llvm_ty) == 12) {
-                // LLVMPointerTypeKind = 12.  In practice all named_values are
-                // stored as pointer-typed LLVM values, so this always holds;
-                // the load is correct either way (load ptr from ptr-to-ptr).
-                obj_ptr = cg.builder.build_load(LType::pointer_to(LType::i8()),
-                                                obj_ptr, "autoderef");
-            }
+        // Load the pointer value through the alloca (only when `object_ptr`
+        // really is an lvalue pointing at a ptr slot). Under opaque pointers
+        // every value has LLVM type `ptr`, so the kind check alone can't
+        // distinguish a slot from a raw rvalue — the previous version
+        // ALWAYS loaded, which over-derefed any pointer rvalue (e.g. the
+        // result of `obj.as_ptr().count` where `as_ptr()` already returned
+        // the pointer value, not a slot containing it). Threading the
+        // semantic lvalue flag through is the only reliable signal.
+        if (object_is_lvalue && obj_ptr.is_valid()) {
+            obj_ptr = cg.builder.build_load(LType::pointer_to(LType::i8()),
+                                            obj_ptr, "autoderef");
         }
     }
 
