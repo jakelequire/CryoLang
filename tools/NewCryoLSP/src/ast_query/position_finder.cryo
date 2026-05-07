@@ -1,0 +1,232 @@
+///! NodeAtPositionVisitor — find the smallest AST node containing a
+///! cursor position.
+///!
+///! Overrides only the visit methods we care about for v1 (statements,
+///! expressions, declarations whose body or signature carries a span).
+///! For each visited node, if `node.span` contains `(target_line,
+///! target_col)`, the visitor records it as a candidate; only the
+///! smallest such span is kept.
+///!
+///! Walking is depth-first by `kind`. The default `BaseASTVisitor`
+///! supplies no-ops for everything else, which means uncommon node
+///! types simply don't refine the candidate — the parent's span is
+///! used. Acceptable for v1; a future revision can fill in the
+///! remaining node types for finer granularity.
+///!
+///! Position model: the visitor takes 1-indexed `(line, col)` (the
+///! same model the compiler's `SourceSpan` uses). Caller is
+///! responsible for translating LSP 0-indexed positions before
+///! invoking.
+
+namespace AstQuery::PositionFinder;
+
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::Diag::SourceSpan;
+
+type class NodeAtPositionVisitor : BaseASTVisitor {
+public:
+    target_line: u32;
+    target_col:  u32;
+    /// Smallest enclosing node found so far. May be null until the
+    /// first matching span is seen.
+    best:        ASTNode*;
+    /// Width (end_offset - start_offset proxy) of the best span. A
+    /// smaller span beats a larger one even when both contain the
+    /// target.
+    best_width:  u64;
+
+    NodeAtPositionVisitor(line: u32, col: u32) {
+        this.target_line = line;
+        this.target_col  = col;
+        this.best        = null;
+        this.best_width  = 0xFFFFFFFFFFFFFFFF;
+    }
+
+    /// Test whether the given span contains the target position. A
+    /// "contains" test treats the span as the half-open interval
+    /// `[start, end]` so cursors at the end-of-token boundary still
+    /// match.
+    contains(&this, span: SourceSpan*) -> boolean {
+        if (!span.has_location()) { return false; }
+        if (this.target_line < span.start_line) { return false; }
+        if (this.target_line > span.end_line)   { return false; }
+        if (this.target_line == span.start_line && this.target_col < span.start_col) { return false; }
+        if (this.target_line == span.end_line   && this.target_col > span.end_col)   { return false; }
+        return true;
+    }
+
+    /// Width proxy: a contiguous-line span uses (end_col - start_col),
+    /// multi-line uses 1_000_000 * (end_line - start_line). Cheap and
+    /// monotonic, which is all we need for "smaller wins".
+    width(&this, span: SourceSpan*) -> u64 {
+        if (span.start_line == span.end_line) {
+            if (span.end_col >= span.start_col) {
+                return (span.end_col - span.start_col) as u64;
+            }
+            return 0;
+        }
+        return ((span.end_line - span.start_line) as u64) * 1000000;
+    }
+
+    record(&this, node: ASTNode*) -> void {
+        if (node == null) { return; }
+        if (!this.contains(&node.span)) { return; }
+        const w: u64 = this.width(&node.span);
+        if (w < this.best_width) {
+            this.best       = node;
+            this.best_width = w;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Program — descend into every statement.
+    // -----------------------------------------------------------------
+    override visit(node: ProgramNode*) -> void {
+        this.record(node);
+        for (mut i: int = 0; i < node.statements.length; i++) {
+            const child: ASTNode* = node.statements[i];
+            if (child != null) { child.accept(this); }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Expressions — record + descend into operands.
+    // -----------------------------------------------------------------
+    override visit(node: ExpressionNode*) -> void { this.record(node); }
+    override visit(node: LiteralNode*)    -> void { this.record(node); }
+    override visit(node: IdentifierNode*) -> void { this.record(node); }
+
+    override visit(node: BinaryExprNode*) -> void {
+        this.record(node);
+        if (node.left  != null) { node.left.accept(this);  }
+        if (node.right != null) { node.right.accept(this); }
+    }
+
+    override visit(node: UnaryExprNode*) -> void {
+        this.record(node);
+        if (node.operand != null) { node.operand.accept(this); }
+    }
+
+    override visit(node: CallExprNode*) -> void {
+        this.record(node);
+        if (node.callee != null) { node.callee.accept(this); }
+        for (mut i: int = 0; i < node.arguments.length; i++) {
+            const arg: ASTNode* = node.arguments[i];
+            if (arg != null) { arg.accept(this); }
+        }
+    }
+
+    override visit(node: MemberAccessNode*) -> void {
+        this.record(node);
+        if (node.object != null) { node.object.accept(this); }
+    }
+
+    override visit(node: ScopeResolutionNode*) -> void {
+        this.record(node);
+    }
+
+    override visit(node: ArrayAccessNode*) -> void {
+        this.record(node);
+        if (node.array != null) { node.array.accept(this); }
+        if (node.index != null) { node.index.accept(this); }
+    }
+
+    override visit(node: CastExprNode*) -> void {
+        this.record(node);
+        if (node.expr != null) { node.expr.accept(this); }
+    }
+
+    override visit(node: StructLiteralNode*) -> void { this.record(node); }
+    override visit(node: ArrayLiteralNode*)  -> void { this.record(node); }
+    override visit(node: TupleLiteralNode*)  -> void { this.record(node); }
+    override visit(node: LambdaExprNode*)    -> void { this.record(node); }
+
+    // -----------------------------------------------------------------
+    // Statements
+    // -----------------------------------------------------------------
+    override visit(node: StatementNode*) -> void { this.record(node); }
+
+    override visit(node: BlockStmtNode*) -> void {
+        this.record(node);
+        for (mut i: int = 0; i < node.statements.length; i++) {
+            const stmt: ASTNode* = node.statements[i];
+            if (stmt != null) { stmt.accept(this); }
+        }
+    }
+
+    override visit(node: ReturnStmtNode*) -> void {
+        this.record(node);
+        if (node.value != null) { node.value.accept(this); }
+    }
+
+    override visit(node: IfStmtNode*) -> void {
+        this.record(node);
+        if (node.condition  != null) { node.condition.accept(this); }
+        if (node.then_block != null) { node.then_block.accept(this); }
+        if (node.else_block != null) { node.else_block.accept(this); }
+    }
+
+    override visit(node: WhileStmtNode*) -> void {
+        this.record(node);
+        if (node.condition != null) { node.condition.accept(this); }
+        if (node.body      != null) { node.body.accept(this); }
+    }
+
+    override visit(node: ForStmtNode*) -> void {
+        this.record(node);
+        if (node.body != null) { node.body.accept(this); }
+    }
+
+    override visit(node: ExprStmtNode*) -> void {
+        this.record(node);
+        if (node.expr != null) { node.expr.accept(this); }
+    }
+
+    override visit(node: DeclStmtNode*) -> void {
+        this.record(node);
+        if (node.decl != null) { node.decl.accept(this); }
+    }
+
+    // -----------------------------------------------------------------
+    // Declarations
+    // -----------------------------------------------------------------
+    override visit(node: VarDeclNode*) -> void {
+        this.record(node);
+        if (node.initializer != null) { node.initializer.accept(this); }
+    }
+
+    override visit(node: FunctionDeclNode*) -> void {
+        this.record(node);
+        if (node.body != null) { node.body.accept(this); }
+    }
+
+    override visit(node: MethodNode*) -> void {
+        this.record(node);
+        if (node.body != null) { node.body.accept(this); }
+    }
+
+    override visit(node: StructDeclNode*) -> void { this.record(node); }
+    override visit(node: ClassDeclNode*)  -> void { this.record(node); }
+    override visit(node: EnumDeclNode*)   -> void { this.record(node); }
+    override visit(node: ImplBlockNode*)  -> void {
+        this.record(node);
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            const m: ASTNode* = node.methods[i];
+            if (m != null) { m.accept(this); }
+        }
+    }
+}
+
+/// Convenience: walk the program for the smallest enclosing node at
+/// `(line, col)`. Returns `null` if the position falls outside every
+/// span (e.g. inside trailing whitespace).
+function find_node_at(program: ProgramNode*, line: u32, col: u32) -> ASTNode* {
+    if (program == null) { return null; }
+    mut visitor: NodeAtPositionVisitor = NodeAtPositionVisitor(line, col);
+    program.accept(&visitor);
+    return visitor.best;
+}

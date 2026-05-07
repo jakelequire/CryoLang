@@ -1,0 +1,115 @@
+///! Document and DocumentStore.
+///!
+///! `Document` owns the canonical text + version + line index for one
+///! open file. `DocumentStore` is the URI-keyed registry. v1 uses
+///! full-text replacement on `didChange`; incremental edits land in v1.1.
+
+namespace Server::Document;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::hashmap;
+
+import Server::LineIndex;
+import Util::Log;
+
+type struct Document {
+    uri:         String;
+    language_id: String;
+    version:     i32;
+    text:        String;
+    line_index:  LineIndex,
+
+    static new(uri: String, language_id: String, version: i32, text: String) -> Document {
+        const idx: LineIndex = LineIndex::build(text.as_str());
+        return Document {
+            uri:         uri,
+            language_id: language_id,
+            version:     version,
+            text:        text,
+            line_index:  idx,
+        };
+    }
+
+    /// Replace the entire text body (full-sync change handler). Drops
+    /// the previous text + line index and rebuilds.
+    replace_text(mut &this, new_text: String, new_version: i32) -> void {
+        this.text.drop();
+        this.line_index.drop();
+        this.text       = new_text;
+        this.version    = new_version;
+        this.line_index = LineIndex::build(this.text.as_str());
+    }
+
+    drop(mut &this) -> void {
+        this.uri.drop();
+        this.language_id.drop();
+        this.text.drop();
+        this.line_index.drop();
+    }
+}
+
+type struct DocumentStore {
+    docs: HashMap<String, Document>;
+
+    static new() -> DocumentStore {
+        return DocumentStore { docs: HashMap<String, Document>::new() };
+    }
+
+    open(mut &this, doc: Document) -> void {
+        // If a document is already tracked under this URI (rare —
+        // means the client sent didOpen twice), drop the previous
+        // entry to avoid leaking.
+        mut probe: String = String::from_str(doc.uri.as_str());
+        match (this.docs.get(&probe)) {
+            Option::Some(_) => {
+                Util::Log::warn(Str::from_raw("didOpen for already-open document" as u8*, 33));
+                this.docs.remove(&probe);
+            }
+            Option::None => { }
+        }
+        probe.drop();
+        mut key: String = String::from_str(doc.uri.as_str());
+        this.docs.insert(key, doc);
+    }
+
+    /// Replace body text with `new_text` (full-sync change). Caller
+    /// owns the temporary `String` we return on miss so they can drop
+    /// `new_text` cleanly.
+    replace(mut &this, uri: Str, new_version: i32, new_text: String) -> Result<(), String> {
+        mut probe: String = String::from_str(uri);
+        match (this.docs.get_mut(&probe)) {
+            Option::Some(doc) => {
+                doc.replace_text(new_text, new_version);
+                probe.drop();
+                return Result::Ok(());
+            }
+            Option::None => {
+                probe.drop();
+                mut tmp: String = new_text;
+                tmp.drop();
+                return Result::Err(String::from_str(Str::from_raw("document not open" as u8*, 17)));
+            }
+        }
+    }
+
+    close(mut &this, uri: Str) -> void {
+        mut probe: String = String::from_str(uri);
+        this.docs.remove(&probe);
+        probe.drop();
+    }
+
+    get(&this, uri: Str) -> Option<Document*> {
+        mut probe: String = String::from_str(uri);
+        const result: Option<Document*> = this.docs.get_ptr(&probe);
+        probe.drop();
+        return result;
+    }
+
+    drop(mut &this) -> void {
+        // HashMap drop calls element drops because Document is Drop.
+        this.docs.drop();
+    }
+}

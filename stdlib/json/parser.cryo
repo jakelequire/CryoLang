@@ -1,0 +1,750 @@
+///! Recursive-descent JSON parser.
+///!
+///! Single-pass over a borrowed `Str`. Tracks `(line, column, offset)`
+///! for error reporting. RFC 8259 strict — no trailing commas, no
+///! unquoted keys, no comments.
+///!
+///! `MAX_DEPTH` caps object/array nesting to prevent stack-blowup on
+///! adversarial inputs. The default is generous for hand-authored data
+///! and tight enough that a malicious 1 MB blob of `[[[…]]]` cannot
+///! exhaust the stack.
+
+namespace std::json::parser;
+
+import core::option;
+import core::result;
+import collections::array;
+import collections::string;
+import collections::str;
+import json::value;
+import json::error;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum nesting depth for arrays + objects, combined.
+const MAX_DEPTH: u64 = 256;
+
+/// ASCII code points used by the parser. Names beat magic numbers.
+const HT:   u8 = 9;     // tab
+const LF:   u8 = 10;    // \n
+const CR:   u8 = 13;    // \r
+const SPACE: u8 = 32;
+const QUOTE: u8 = 34;   // "
+const PLUS:  u8 = 43;   // +
+const COMMA: u8 = 44;   // ,
+const MINUS: u8 = 45;   // -
+const DOT:   u8 = 46;   // .
+const ZERO:  u8 = 48;   // 0
+const NINE:  u8 = 57;   // 9
+const COLON: u8 = 58;   // :
+const UPPER_A: u8 = 65; // A
+const UPPER_E: u8 = 69; // E
+const UPPER_F: u8 = 70; // F
+const LBRACK: u8 = 91;  // [
+const BACKSLASH: u8 = 92; // \
+const RBRACK: u8 = 93;  // ]
+const LOWER_A: u8 = 97; // a
+const LOWER_B: u8 = 98; // b
+const LOWER_E: u8 = 101; // e
+const LOWER_F: u8 = 102; // f
+const LOWER_L: u8 = 108; // l
+const LOWER_N: u8 = 110; // n
+const LOWER_R: u8 = 114; // r
+const LOWER_S: u8 = 115; // s
+const LOWER_T: u8 = 116; // t
+const LOWER_U: u8 = 117; // u
+const LBRACE: u8 = 123; // {
+const RBRACE: u8 = 125; // }
+
+// ============================================================================
+// Parser
+// ============================================================================
+
+type struct Parser {
+    src:    u8*;
+    len:    u64;
+    pos:    u64;
+    line:   u64;
+    column: u64;
+    depth:  u64;
+
+    static new(text: Str) -> Parser {
+        return Parser {
+            src:    text.as_ptr(),
+            len:    text.length(),
+            pos:    0,
+            line:   1,
+            column: 1,
+            depth:  0,
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Cursor primitives
+    // ------------------------------------------------------------------
+
+    eof(&this) -> boolean {
+        return this.pos >= this.len;
+    }
+
+    peek(&this) -> u8 {
+        if (this.pos >= this.len) { return 0; }
+        return this.src[this.pos];
+    }
+
+    /// Advance one byte, updating line/column tracking. Caller must
+    /// ensure `!eof()` first.
+    advance(mut &this) -> u8 {
+        const b: u8 = this.src[this.pos];
+        this.pos = this.pos + 1;
+        if (b == LF) {
+            this.line   = this.line + 1;
+            this.column = 1;
+        } else {
+            this.column = this.column + 1;
+        }
+        return b;
+    }
+
+    /// Skip ASCII whitespace per RFC 8259: SP, HT, LF, CR.
+    skip_ws(mut &this) -> void {
+        while (this.pos < this.len) {
+            const b: u8 = this.src[this.pos];
+            if (b == SPACE || b == HT || b == LF || b == CR) {
+                this.advance();
+            } else {
+                return;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Error helpers
+    // ------------------------------------------------------------------
+
+    err_eof(&this) -> JsonError {
+        return JsonError::new(
+            JsonErrorKind::UnexpectedEof,
+            this.line, this.column, this.pos,
+            String::from_str(Str::from_raw("unexpected end of input" as u8*, 23))
+        );
+    }
+
+    err_at(&this, kind: JsonErrorKind, msg: Str) -> JsonError {
+        return JsonError::new(kind, this.line, this.column, this.pos, String::from_str(msg));
+    }
+
+    err_unexpected(&this) -> JsonError {
+        return JsonError::new(
+            JsonErrorKind::UnexpectedChar,
+            this.line, this.column, this.pos,
+            String::from_str(Str::from_raw("unexpected character" as u8*, 20))
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Top-level
+    // ------------------------------------------------------------------
+
+    /// Parse a single value. Caller is responsible for the surrounding
+    /// `skip_ws` and trailing-data check; `parse(text)` is the public
+    /// entry point that handles those.
+    parse_value(mut &this) -> Result<JsonValue, JsonError> {
+        if (this.eof()) { return Result::Err(this.err_eof()); }
+        const b: u8 = this.peek();
+        if (b == LBRACE) { return this.parse_object(); }
+        if (b == LBRACK) { return this.parse_array();  }
+        if (b == QUOTE)  { return this.parse_string_value(); }
+        if (b == LOWER_T || b == LOWER_F) { return this.parse_bool(); }
+        if (b == LOWER_N) { return this.parse_null(); }
+        if (b == MINUS || (b >= ZERO && b <= NINE)) { return this.parse_number(); }
+        return Result::Err(this.err_unexpected());
+    }
+
+    // ------------------------------------------------------------------
+    // Keywords
+    // ------------------------------------------------------------------
+
+    parse_null(mut &this) -> Result<JsonValue, JsonError> {
+        if (this.match_literal("null", 4)) {
+            return Result::Ok(JsonValue::Null);
+        }
+        return Result::Err(this.err_at(
+            JsonErrorKind::UnexpectedChar,
+            Str::from_raw("expected 'null'" as u8*, 15)
+        ));
+    }
+
+    parse_bool(mut &this) -> Result<JsonValue, JsonError> {
+        if (this.peek() == LOWER_T) {
+            if (this.match_literal("true", 4)) {
+                return Result::Ok(JsonValue::Bool(true));
+            }
+            return Result::Err(this.err_at(
+                JsonErrorKind::UnexpectedChar,
+                Str::from_raw("expected 'true'" as u8*, 15)
+            ));
+        }
+        if (this.match_literal("false", 5)) {
+            return Result::Ok(JsonValue::Bool(false));
+        }
+        return Result::Err(this.err_at(
+            JsonErrorKind::UnexpectedChar,
+            Str::from_raw("expected 'false'" as u8*, 16)
+        ));
+    }
+
+    /// Match a literal byte sequence. Returns true and advances past
+    /// it on a match; returns false without advancing on a miss.
+    match_literal(mut &this, lit: string, lit_len: u64) -> boolean {
+        if (this.pos + lit_len > this.len) { return false; }
+        const lit_bytes: u8* = lit as u8*;
+        mut i: u64 = 0;
+        while (i < lit_len) {
+            if (this.src[this.pos + i] != lit_bytes[i]) { return false; }
+            i++;
+        }
+        i = 0;
+        while (i < lit_len) { this.advance(); i++; }
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Numbers
+    // ------------------------------------------------------------------
+
+    parse_number(mut &this) -> Result<JsonValue, JsonError> {
+        const start: u64 = this.pos;
+        mut negative: boolean = false;
+        mut has_fraction: boolean = false;
+        mut has_exponent: boolean = false;
+
+        if (this.peek() == MINUS) {
+            negative = true;
+            this.advance();
+            if (this.eof()) { return Result::Err(this.err_eof()); }
+        }
+
+        // Integer part
+        if (this.peek() == ZERO) {
+            this.advance();
+            // After '0', either '.' or exponent or end of number — no leading zeros.
+        } else {
+            const b0: u8 = this.peek();
+            if (b0 < ZERO || b0 > NINE) {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidNumber,
+                    Str::from_raw("expected digit" as u8*, 14)
+                ));
+            }
+            while (!this.eof()) {
+                const b: u8 = this.peek();
+                if (b >= ZERO && b <= NINE) { this.advance(); }
+                else                        { break; }
+            }
+        }
+
+        // Fraction
+        if (!this.eof() && this.peek() == DOT) {
+            has_fraction = true;
+            this.advance();
+            if (this.eof()) {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidNumber,
+                    Str::from_raw("expected digit after '.'" as u8*, 24)
+                ));
+            }
+            const f0: u8 = this.peek();
+            if (f0 < ZERO || f0 > NINE) {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidNumber,
+                    Str::from_raw("expected digit after '.'" as u8*, 24)
+                ));
+            }
+            while (!this.eof()) {
+                const b: u8 = this.peek();
+                if (b >= ZERO && b <= NINE) { this.advance(); }
+                else                        { break; }
+            }
+        }
+
+        // Exponent
+        if (!this.eof()) {
+            const e: u8 = this.peek();
+            if (e == LOWER_E || e == UPPER_E) {
+                has_exponent = true;
+                this.advance();
+                if (this.eof()) {
+                    return Result::Err(this.err_at(
+                        JsonErrorKind::InvalidNumber,
+                        Str::from_raw("expected exponent digits" as u8*, 24)
+                    ));
+                }
+                const sign: u8 = this.peek();
+                if (sign == PLUS || sign == MINUS) { this.advance(); }
+                if (this.eof()) {
+                    return Result::Err(this.err_at(
+                        JsonErrorKind::InvalidNumber,
+                        Str::from_raw("expected exponent digits" as u8*, 24)
+                    ));
+                }
+                const d0: u8 = this.peek();
+                if (d0 < ZERO || d0 > NINE) {
+                    return Result::Err(this.err_at(
+                        JsonErrorKind::InvalidNumber,
+                        Str::from_raw("expected exponent digits" as u8*, 24)
+                    ));
+                }
+                while (!this.eof()) {
+                    const b: u8 = this.peek();
+                    if (b >= ZERO && b <= NINE) { this.advance(); }
+                    else                        { break; }
+                }
+            }
+        }
+
+        const end: u64 = this.pos;
+        const literal_len: u64 = end - start;
+
+        if (has_fraction || has_exponent) {
+            // Float path. Build a NUL-terminated copy on the heap and
+            // hand it to libc strtod. Cryo doesn't expose a safe
+            // arbitrary-precision float parser today; strtod is the
+            // pragmatic choice for v1.
+            const buf: u8* = malloc(literal_len + 1);
+            intrinsics::memcpy(buf as void*, (this.src + start) as void*, literal_len);
+            buf[literal_len] = 0;
+            const v: f64 = libc_strtod(buf, null);
+            free(buf as void*);
+            return Result::Ok(JsonValue::Number(JsonNumber::Float(v)));
+        }
+
+        // Integer path — parse digits directly without going through libc.
+        // For the negative case we accumulate as u64 and negate at the end;
+        // i64::MIN is exactly -2^63, which fits as u64 magnitude 2^63.
+        mut acc: u64 = 0;
+        mut i: u64 = start;
+        if (negative) { i = i + 1; }
+        mut overflow: boolean = false;
+        while (i < end) {
+            const d: u64 = (this.src[i] - ZERO) as u64;
+            // Check for overflow: if acc would exceed (u64::MAX - d) / 10.
+            if (acc > 1844674407370955161) {
+                overflow = true;
+                break;
+            }
+            const next: u64 = acc * 10 + d;
+            if (next < acc) { overflow = true; break; }
+            acc = next;
+            i = i + 1;
+        }
+
+        if (overflow) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::InvalidNumber,
+                Str::from_raw("integer overflow" as u8*, 16)
+            ));
+        }
+
+        if (negative) {
+            // i64::MIN is -9223372036854775808; magnitude 9223372036854775808 (=1<<63).
+            if (acc > 9223372036854775808) {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidNumber,
+                    Str::from_raw("integer overflow" as u8*, 16)
+                ));
+            }
+            if (acc == 9223372036854775808) {
+                // i64::MIN
+                return Result::Ok(JsonValue::Number(JsonNumber::Int(-9223372036854775808)));
+            }
+            const v: i64 = -(acc as i64);
+            return Result::Ok(JsonValue::Number(JsonNumber::Int(v)));
+        }
+
+        if (acc <= 9223372036854775807) {
+            return Result::Ok(JsonValue::Number(JsonNumber::Int(acc as i64)));
+        }
+        return Result::Ok(JsonValue::Number(JsonNumber::UInt(acc)));
+    }
+
+    // ------------------------------------------------------------------
+    // Strings
+    // ------------------------------------------------------------------
+
+    parse_string_value(mut &this) -> Result<JsonValue, JsonError> {
+        match (this.parse_string_raw()) {
+            Result::Ok(s)  => { return Result::Ok(JsonValue::String(s)); }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+
+    /// Parse a JSON string literal into an owned `String`. Assumes the
+    /// cursor is on the opening quote; consumes through the closing
+    /// quote. Decodes `\X` and `\uXXXX` escapes; surrogate pairs are
+    /// recombined; invalid bytes inside `\u` produce InvalidUnicode.
+    parse_string_raw(mut &this) -> Result<String, JsonError> {
+        if (this.peek() != QUOTE) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::UnexpectedChar,
+                Str::from_raw("expected '\"'" as u8*, 12)
+            ));
+        }
+        this.advance();
+        mut out: String = String::new();
+        while (true) {
+            if (this.eof()) {
+                out.drop();
+                return Result::Err(this.err_eof());
+            }
+            const b: u8 = this.peek();
+            if (b == QUOTE) {
+                this.advance();
+                return Result::Ok(out);
+            }
+            if (b == BACKSLASH) {
+                this.advance();
+                if (this.eof()) {
+                    out.drop();
+                    return Result::Err(this.err_eof());
+                }
+                match (this.parse_escape(&out)) {
+                    Result::Ok(_)  => { }
+                    Result::Err(e) => { out.drop(); return Result::Err(e); }
+                }
+                continue;
+            }
+            // Reject unescaped control characters per RFC 8259 §7.
+            if (b < 0x20) {
+                out.drop();
+                return Result::Err(this.err_at(
+                    JsonErrorKind::UnexpectedChar,
+                    Str::from_raw("unescaped control character" as u8*, 27)
+                ));
+            }
+            out.push_byte(b);
+            this.advance();
+        }
+        // Unreachable
+        return Result::Ok(out);
+    }
+
+    /// Decode one escape sequence, starting on the byte after `\`.
+    /// Appends the decoded bytes to `out`.
+    parse_escape(mut &this, out: mut &String) -> Result<(), JsonError> {
+        const c: u8 = this.advance();
+        if (c == QUOTE)     { out.push_byte(QUOTE);     return Result::Ok(()); }
+        if (c == BACKSLASH) { out.push_byte(BACKSLASH); return Result::Ok(()); }
+        if (c == 47)        { out.push_byte(47);        return Result::Ok(()); }  // /
+        if (c == LOWER_B)   { out.push_byte(0x08);      return Result::Ok(()); }  // \b
+        if (c == LOWER_F)   { out.push_byte(0x0C);      return Result::Ok(()); }  // \f
+        if (c == LOWER_N)   { out.push_byte(LF);        return Result::Ok(()); }
+        if (c == LOWER_R)   { out.push_byte(CR);        return Result::Ok(()); }
+        if (c == LOWER_T)   { out.push_byte(HT);        return Result::Ok(()); }
+        if (c == LOWER_U)   { return this.parse_unicode_escape(out); }
+        return Result::Err(this.err_at(
+            JsonErrorKind::InvalidEscape,
+            Str::from_raw("unknown escape" as u8*, 14)
+        ));
+    }
+
+    /// Decode `\uXXXX[\uYYYY]?`. The opening `\u` has already been
+    /// consumed; we start on the first hex digit. UTF-16 surrogate
+    /// pairs are recombined into the corresponding scalar; lone
+    /// surrogates produce InvalidUnicode.
+    parse_unicode_escape(mut &this, out: mut &String) -> Result<(), JsonError> {
+        match (this.read_hex4()) {
+            Result::Ok(hi) => {
+                if (hi >= 0xD800 && hi <= 0xDBFF) {
+                    // High surrogate — must be followed by `\uYYYY`
+                    // with YYYY in the low surrogate range.
+                    if (this.pos + 1 >= this.len ||
+                        this.src[this.pos] != BACKSLASH ||
+                        this.src[this.pos + 1] != LOWER_U) {
+                        return Result::Err(this.err_at(
+                            JsonErrorKind::InvalidUnicode,
+                            Str::from_raw("lone high surrogate" as u8*, 19)
+                        ));
+                    }
+                    this.advance();
+                    this.advance();
+                    match (this.read_hex4()) {
+                        Result::Ok(lo) => {
+                            if (lo < 0xDC00 || lo > 0xDFFF) {
+                                return Result::Err(this.err_at(
+                                    JsonErrorKind::InvalidUnicode,
+                                    Str::from_raw("invalid low surrogate" as u8*, 21)
+                                ));
+                            }
+                            const cp: u32 = 0x10000 +
+                                (((hi - 0xD800) as u32) << 10) +
+                                ((lo - 0xDC00) as u32);
+                            return encode_utf8(out, cp);
+                        }
+                        Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+                if (hi >= 0xDC00 && hi <= 0xDFFF) {
+                    return Result::Err(this.err_at(
+                        JsonErrorKind::InvalidUnicode,
+                        Str::from_raw("lone low surrogate" as u8*, 18)
+                    ));
+                }
+                return encode_utf8(out, hi as u32);
+            }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+
+    /// Read exactly four hex digits and assemble them MSB-first.
+    read_hex4(mut &this) -> Result<u32, JsonError> {
+        if (this.pos + 4 > this.len) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::InvalidUnicode,
+                Str::from_raw("truncated \\u escape" as u8*, 19)
+            ));
+        }
+        mut v: u32 = 0;
+        mut i: u64 = 0;
+        while (i < 4) {
+            const b: u8 = this.src[this.pos];
+            mut nibble: u32 = 0;
+            if (b >= ZERO && b <= NINE) {
+                nibble = (b - ZERO) as u32;
+            } else if (b >= UPPER_A && b <= UPPER_F) {
+                nibble = ((b - UPPER_A) + 10) as u32;
+            } else if (b >= LOWER_A && b <= LOWER_F) {
+                nibble = ((b - LOWER_A) + 10) as u32;
+            } else {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidUnicode,
+                    Str::from_raw("non-hex digit in \\u escape" as u8*, 26)
+                ));
+            }
+            v = (v << 4) | nibble;
+            this.advance();
+            i = i + 1;
+        }
+        return Result::Ok(v);
+    }
+
+    // ------------------------------------------------------------------
+    // Arrays
+    // ------------------------------------------------------------------
+
+    parse_array(mut &this) -> Result<JsonValue, JsonError> {
+        this.depth = this.depth + 1;
+        if (this.depth > MAX_DEPTH) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::DepthExceeded,
+                Str::from_raw("nesting too deep" as u8*, 16)
+            ));
+        }
+        this.advance();   // consume '['
+        mut arr: Array<JsonValue> = Array<JsonValue>::new();
+        this.skip_ws();
+
+        // Empty array fast path.
+        if (!this.eof() && this.peek() == RBRACK) {
+            this.advance();
+            this.depth = this.depth - 1;
+            return Result::Ok(JsonValue::Array(arr));
+        }
+
+        while (true) {
+            this.skip_ws();
+            match (this.parse_value()) {
+                Result::Ok(v)  => { arr.push(v); }
+                Result::Err(e) => {
+                    drop_array(&mut arr);
+                    return Result::Err(e);
+                }
+            }
+            this.skip_ws();
+            if (this.eof()) {
+                drop_array(&mut arr);
+                return Result::Err(this.err_eof());
+            }
+            const b: u8 = this.peek();
+            if (b == COMMA) { this.advance(); continue; }
+            if (b == RBRACK) {
+                this.advance();
+                this.depth = this.depth - 1;
+                return Result::Ok(JsonValue::Array(arr));
+            }
+            drop_array(&mut arr);
+            return Result::Err(this.err_at(
+                JsonErrorKind::UnexpectedChar,
+                Str::from_raw("expected ',' or ']'" as u8*, 19)
+            ));
+        }
+        // Unreachable
+        return Result::Ok(JsonValue::Array(arr));
+    }
+
+    // ------------------------------------------------------------------
+    // Objects
+    // ------------------------------------------------------------------
+
+    parse_object(mut &this) -> Result<JsonValue, JsonError> {
+        this.depth = this.depth + 1;
+        if (this.depth > MAX_DEPTH) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::DepthExceeded,
+                Str::from_raw("nesting too deep" as u8*, 16)
+            ));
+        }
+        this.advance();   // consume '{'
+        mut obj: JsonObject = JsonObject::new();
+        this.skip_ws();
+
+        // Empty object fast path.
+        if (!this.eof() && this.peek() == RBRACE) {
+            this.advance();
+            this.depth = this.depth - 1;
+            return Result::Ok(JsonValue::Object(obj));
+        }
+
+        while (true) {
+            this.skip_ws();
+            if (this.eof()) {
+                obj.drop();
+                return Result::Err(this.err_eof());
+            }
+            if (this.peek() != QUOTE) {
+                obj.drop();
+                return Result::Err(this.err_at(
+                    JsonErrorKind::KeyNotString,
+                    Str::from_raw("expected string key" as u8*, 19)
+                ));
+            }
+            mut key: String = String::new();
+            match (this.parse_string_raw()) {
+                Result::Ok(k)  => { key = k; }
+                Result::Err(e) => { obj.drop(); return Result::Err(e); }
+            }
+            this.skip_ws();
+            if (this.eof() || this.peek() != COLON) {
+                key.drop();
+                obj.drop();
+                return Result::Err(this.err_at(
+                    JsonErrorKind::UnexpectedChar,
+                    Str::from_raw("expected ':'" as u8*, 12)
+                ));
+            }
+            this.advance();
+            this.skip_ws();
+            match (this.parse_value()) {
+                Result::Ok(v)  => { obj.insert(key, v); }
+                Result::Err(e) => { key.drop(); obj.drop(); return Result::Err(e); }
+            }
+            this.skip_ws();
+            if (this.eof()) {
+                obj.drop();
+                return Result::Err(this.err_eof());
+            }
+            const b: u8 = this.peek();
+            if (b == COMMA) { this.advance(); continue; }
+            if (b == RBRACE) {
+                this.advance();
+                this.depth = this.depth - 1;
+                return Result::Ok(JsonValue::Object(obj));
+            }
+            obj.drop();
+            return Result::Err(this.err_at(
+                JsonErrorKind::UnexpectedChar,
+                Str::from_raw("expected ',' or '}'" as u8*, 19)
+            ));
+        }
+        // Unreachable
+        return Result::Ok(JsonValue::Object(obj));
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Drop every element in an `Array<JsonValue>`, then drop the array
+/// itself. Used by error paths in `parse_array` to avoid leaking
+/// partially-constructed children.
+function drop_array(arr: mut &Array<JsonValue>) -> void {
+    mut i: u64 = 0;
+    while (i < arr.length()) {
+        arr.ptr[i].drop();
+        i++;
+    }
+    arr.drop();
+}
+
+/// Encode a Unicode scalar value into UTF-8 and append the bytes to
+/// `out`. Handles 1, 2, 3, and 4 byte sequences.
+function encode_utf8(out: mut &String, cp: u32) -> Result<(), JsonError> {
+    if (cp < 0x80) {
+        out.push_byte(cp as u8);
+        return Result::Ok(());
+    }
+    if (cp < 0x800) {
+        out.push_byte((0xC0 | (cp >> 6)) as u8);
+        out.push_byte((0x80 | (cp & 0x3F)) as u8);
+        return Result::Ok(());
+    }
+    if (cp < 0x10000) {
+        out.push_byte((0xE0 | (cp >> 12)) as u8);
+        out.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push_byte((0x80 | (cp & 0x3F)) as u8);
+        return Result::Ok(());
+    }
+    if (cp <= 0x10FFFF) {
+        out.push_byte((0xF0 | (cp >> 18)) as u8);
+        out.push_byte((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push_byte((0x80 | (cp & 0x3F)) as u8);
+        return Result::Ok(());
+    }
+    return Result::Err(JsonError::new(
+        JsonErrorKind::InvalidUnicode, 0, 0, 0,
+        String::from_str(Str::from_raw("code point out of range" as u8*, 23))
+    ));
+}
+
+// ============================================================================
+// libc bridge
+// ============================================================================
+
+/// strtod from libc — used to parse JSON floats. Cryo doesn't yet
+/// have a native arbitrary-precision float parser; strtod is well-
+/// specified for IEEE 754 round-trip on most platforms.
+extern function libc_strtod(nptr: u8*, endptr: u8**) -> f64
+    asm "strtod";
+
+// ============================================================================
+// Public entry point
+// ============================================================================
+
+/// Parse a complete JSON document. Returns the parsed value on success,
+/// or a `JsonError` pointing at the first byte that failed to parse.
+/// Trailing whitespace is allowed; trailing non-whitespace produces
+/// `JsonErrorKind::TrailingData`.
+function parse(text: Str) -> Result<JsonValue, JsonError> {
+    mut p: Parser = Parser::new(text);
+    p.skip_ws();
+    match (p.parse_value()) {
+        Result::Ok(v) => {
+            p.skip_ws();
+            if (p.pos < p.len) {
+                mut owned: JsonValue = v;
+                owned.drop();
+                return Result::Err(JsonError::new(
+                    JsonErrorKind::TrailingData,
+                    p.line, p.column, p.pos,
+                    String::from_str(Str::from_raw("trailing data after value" as u8*, 25))
+                ));
+            }
+            return Result::Ok(v);
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}

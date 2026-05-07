@@ -27,14 +27,19 @@ LEGACY_BOOT := $(ROOT)/legacy/bootstrap/bin/cryo
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
+LSP_BUILD_DIR := $(ROOT)/tools/NewCryoLSP/build
+LSP_BIN       := $(LSP_BUILD_DIR)/bin/cryolsp
+LSP_PIN       := $(ROOT)/bin/cryolsp
+
 .DEFAULT_GOAL := help
 .PHONY: help stdlib cryo selfhost-check test test-list pin-cryo install uninstall \
-        clean distclean legacy-bootstrap
+        clean distclean legacy-bootstrap lsp
 
 help:
 	@echo "Cryo build targets:"
 	@echo "  make stdlib            Build the standard library via bin/cryo"
 	@echo "  make cryo              Build the self-hosted compiler via bin/cryo"
+	@echo "  make lsp               Build the Cryo-language LSP server (bin/cryolsp)"
 	@echo "  make selfhost-check    3-round chain (6 stages) + byte-identity gate"
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
@@ -74,6 +79,16 @@ cryo: stdlib
 pin-cryo:
 	@python3 scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
 
+# ---- Cryo-language LSP server -----------------------------------------
+# Builds tools/NewCryoLSP/ (entirely Cryo source) into bin/cryolsp.
+# Depends on `cryo` because the LSP imports the self-hosted compiler
+# library + stdlib via include_paths.
+lsp: cryo
+	@echo "==> Building NewCryoLSP via bin/cryo"
+	@cd tools/NewCryoLSP && "$(PIN)" build
+	@cp "$(LSP_BIN)" "$(LSP_PIN)"
+	@echo "==> bin/cryolsp ready"
+
 # ---- selfhost byte-identity check -------------------------------------
 # Implementation lives in scripts/selfhost-check.py — that gives us
 # per-stage progress + timings, per-stage logs in build-logs/, and a
@@ -111,6 +126,8 @@ $(LEGACY_BOOT):
 clean:
 	@echo "==> Cleaning compiler + stdlib build outputs"
 	@rm -rf compiler/build stdlib/.bin
+	@rm -rf tools/NewCryoLSP/build
+	@rm -f bin/cryolsp
 
 distclean: clean
 	@echo "==> Cleaning legacy bootstrap"

@@ -1,0 +1,287 @@
+///! json — parser + serializer round-trip and error-kind tests.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::JsonT;
+
+import std::core::result;
+import std::core::option;
+import std::collections::string;
+import std::collections::str;
+import std::json::value;
+import std::json::parser;
+import std::json::serializer;
+import std::json::error;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Borrow a static-storage `Str` from a NUL-terminated string literal.
+function s(lit: string, len: u64) -> Str {
+    return Str::from_raw(lit as u8*, len);
+}
+
+// ============================================================================
+// Parse: scalars
+// ============================================================================
+
+![test]
+function parse_null() -> Result<(), TestError> {
+    match (parser::parse(s("null", 4))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            const ok: boolean = owned.is_null();
+            owned.drop();
+            return expect(ok, s("expected Null", 13));
+        }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            err.drop();
+            return bail(s("parse null failed", 17));
+        }
+    }
+}
+
+![test]
+function parse_true_false() -> Result<(), TestError> {
+    match (parser::parse(s("true", 4))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            match (owned.as_bool()) {
+                Option::Some(b) => {
+                    owned.drop();
+                    match (expect(b, s("expected true", 13))) {
+                        Result::Ok(_) => { }
+                        Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+                Option::None => { owned.drop(); return bail(s("not bool", 8)); }
+            }
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse true failed", 17)); }
+    }
+    match (parser::parse(s("false", 5))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            match (owned.as_bool()) {
+                Option::Some(b) => {
+                    owned.drop();
+                    return expect(!b, s("expected false", 14));
+                }
+                Option::None => { owned.drop(); return bail(s("not bool", 8)); }
+            }
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse false failed", 18)); }
+    }
+}
+
+![test]
+function parse_int() -> Result<(), TestError> {
+    match (parser::parse(s("42", 2))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            match (owned.as_i64()) {
+                Option::Some(n) => {
+                    owned.drop();
+                    return expect_eq(n, 42 as i64);
+                }
+                Option::None => { owned.drop(); return bail(s("not int", 7)); }
+            }
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse 42 failed", 15)); }
+    }
+}
+
+![test]
+function parse_negative_int() -> Result<(), TestError> {
+    match (parser::parse(s("-7", 2))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            match (owned.as_i64()) {
+                Option::Some(n) => {
+                    owned.drop();
+                    return expect_eq(n, -7 as i64);
+                }
+                Option::None => { owned.drop(); return bail(s("not int", 7)); }
+            }
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse -7 failed", 15)); }
+    }
+}
+
+![test]
+function parse_string_basic() -> Result<(), TestError> {
+    match (parser::parse(s("\"hello\"", 7))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            match (owned.as_str()) {
+                Option::Some(view) => {
+                    const ok: boolean = view.equals(&s("hello", 5));
+                    owned.drop();
+                    return expect(ok, s("expected hello", 14));
+                }
+                Option::None => { owned.drop(); return bail(s("not string", 10)); }
+            }
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse string failed", 19)); }
+    }
+}
+
+// ============================================================================
+// Parse: composites
+// ============================================================================
+
+![test]
+function parse_empty_array() -> Result<(), TestError> {
+    match (parser::parse(s("[]", 2))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            const ok: boolean = owned.is_array() && owned.length() == 0;
+            owned.drop();
+            return expect(ok, s("expected empty array", 20));
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse [] failed", 15)); }
+    }
+}
+
+![test]
+function parse_empty_object() -> Result<(), TestError> {
+    match (parser::parse(s("{}", 2))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            const ok: boolean = owned.is_object() && owned.length() == 0;
+            owned.drop();
+            return expect(ok, s("expected empty object", 21));
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse {} failed", 15)); }
+    }
+}
+
+![test]
+function parse_array_with_mixed_types() -> Result<(), TestError> {
+    match (parser::parse(s("[1, \"two\", null, true]", 22))) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            const ok: boolean = owned.is_array() && owned.length() == 4;
+            owned.drop();
+            return expect(ok, s("expected len 4 array", 20));
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse mixed array failed", 24)); }
+    }
+}
+
+![test]
+function parse_nested_object() -> Result<(), TestError> {
+    const src: Str = s("{\"a\": {\"b\": 1}}", 15);
+    match (parser::parse(src)) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            mut ok: boolean = false;
+            match (owned.get(s("a", 1))) {
+                Option::Some(inner) => {
+                    match (inner.get(s("b", 1))) {
+                        Option::Some(b) => {
+                            match (b.as_i64()) {
+                                Option::Some(n) => { ok = (n == 1); }
+                                Option::None    => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+            owned.drop();
+            return expect(ok, s("expected obj.a.b == 1", 21));
+        }
+        Result::Err(e) => { mut err: JsonError = e; err.drop(); return bail(s("parse nested failed", 19)); }
+    }
+}
+
+// ============================================================================
+// Parse: failures
+// ============================================================================
+
+![test]
+function parse_unexpected_eof() -> Result<(), TestError> {
+    match (parser::parse(s("[1,", 3))) {
+        Result::Ok(v) => { mut owned: JsonValue = v; owned.drop(); return bail(s("expected error", 14)); }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            const got_eof: boolean = match (err.kind) {
+                JsonErrorKind::UnexpectedEof => { true }
+                _                            => { false }
+            };
+            err.drop();
+            return expect(got_eof, s("expected UnexpectedEof", 22));
+        }
+    }
+}
+
+![test]
+function parse_trailing_data() -> Result<(), TestError> {
+    match (parser::parse(s("1 2", 3))) {
+        Result::Ok(v) => { mut owned: JsonValue = v; owned.drop(); return bail(s("expected error", 14)); }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            const got: boolean = match (err.kind) {
+                JsonErrorKind::TrailingData => { true }
+                _                           => { false }
+            };
+            err.drop();
+            return expect(got, s("expected TrailingData", 21));
+        }
+    }
+}
+
+![test]
+function parse_invalid_escape() -> Result<(), TestError> {
+    match (parser::parse(s("\"a\\xb\"", 6))) {
+        Result::Ok(v) => { mut owned: JsonValue = v; owned.drop(); return bail(s("expected error", 14)); }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            const got: boolean = match (err.kind) {
+                JsonErrorKind::InvalidEscape => { true }
+                _                            => { false }
+            };
+            err.drop();
+            return expect(got, s("expected InvalidEscape", 22));
+        }
+    }
+}
+
+// ============================================================================
+// Round-trip: stringify -> parse -> stringify yields the same bytes.
+// ============================================================================
+
+![test]
+function round_trip_object() -> Result<(), TestError> {
+    mut obj: JsonObject = JsonObject::new();
+    obj.insert(String::from_str(s("name", 4)),
+               JsonValue::String(String::from_str(s("Cryo", 4))));
+    obj.insert(String::from_str(s("count", 5)),
+               JsonValue::Number(JsonNumber::Int(7)));
+    mut v: JsonValue = JsonValue::Object(obj);
+    mut first: String = serializer::stringify(&v);
+    v.drop();
+
+    match (parser::parse(first.as_str())) {
+        Result::Ok(parsed) => {
+            mut p: JsonValue = parsed;
+            mut second: String = serializer::stringify(&p);
+            p.drop();
+            const same: boolean = first.as_str().equals(&second.as_str());
+            first.drop();
+            second.drop();
+            return expect(same, s("round-trip mismatch", 19));
+        }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            err.drop();
+            first.drop();
+            return bail(s("re-parse failed", 15));
+        }
+    }
+}

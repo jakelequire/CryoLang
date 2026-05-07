@@ -1,0 +1,380 @@
+///! JsonValue — tagged union over the six JSON types.
+///!
+///! `Null`, `Bool`, `Number`, `String`, `Array`, `Object`. The enum is
+///! recursive through `Array<JsonValue>` and `JsonObject` (whose value
+///! storage is also `Array<JsonValue>`). Each owning variant holds heap
+///! storage; `drop` recursively frees the tree.
+///!
+///! `JsonNumber` preserves the source kind (Int/UInt/Float) so an
+///! integer parsed from `42` round-trips as `42`, not `42.0`. Lossy
+///! conversion to `f64` is opt-in via `as_f64()`.
+///!
+///! Object access is O(1) average via a hash index; insertion order is
+///! preserved (parallel `keys` array) so serialization is deterministic.
+
+namespace std::json::value;
+
+import core::option;
+import core::result;
+import core::hash;
+import core::cmp;
+import collections::array;
+import collections::hashmap;
+import collections::string;
+import collections::str;
+
+// ============================================================================
+// JsonNumber
+// ============================================================================
+
+/// JSON's single number type, split by source representation so
+/// integers round-trip exactly. `Int` covers signed values that fit
+/// `i64`; `UInt` carries values in `(i64::MAX, u64::MAX]`; everything
+/// else (decimals, exponents, NaN-shaped inputs the parser accepts as
+/// floats) is `Float`.
+type enum JsonNumber {
+    Int(i64);
+    UInt(u64);
+    Float(f64);
+}
+
+implement enum JsonNumber {
+    /// Try to view as a signed 64-bit integer.
+    /// `UInt` values that exceed `i64::MAX` and any `Float` with a
+    /// fractional component return `None`.
+    as_i64(&this) -> Option<i64> {
+        return match (this) {
+            JsonNumber::Int(v)   => { Option::Some(v) }
+            JsonNumber::UInt(v)  => {
+                if (v <= 9223372036854775807) { Option::Some(v as i64) }
+                else                          { Option::None }
+            }
+            JsonNumber::Float(v) => {
+                const t: f64 = v as i64 as f64;
+                if (t == v && v >= -9223372036854775808.0 && v <= 9223372036854775807.0) {
+                    Option::Some(v as i64)
+                } else {
+                    Option::None
+                }
+            }
+        };
+    }
+
+    /// Try to view as an unsigned 64-bit integer.
+    as_u64(&this) -> Option<u64> {
+        return match (this) {
+            JsonNumber::Int(v)   => {
+                if (v >= 0) { Option::Some(v as u64) }
+                else        { Option::None }
+            }
+            JsonNumber::UInt(v)  => { Option::Some(v) }
+            JsonNumber::Float(v) => {
+                const t: f64 = v as u64 as f64;
+                if (t == v && v >= 0.0) { Option::Some(v as u64) }
+                else                    { Option::None }
+            }
+        };
+    }
+
+    /// Always-succeeds f64 view. `Int`/`UInt` values larger than 2^53
+    /// lose precision in the conversion.
+    as_f64(&this) -> f64 {
+        return match (this) {
+            JsonNumber::Int(v)   => { v as f64 }
+            JsonNumber::UInt(v)  => { v as f64 }
+            JsonNumber::Float(v) => { v }
+        };
+    }
+}
+
+// ============================================================================
+// JsonObject
+// ============================================================================
+
+/// JSON object. Insertion-ordered keys + parallel value array; a
+/// HashMap from `String` to slot index gives O(1) lookup. Owning —
+/// callers must `drop` before discarding.
+///
+/// The string keys are owned. The `index` HashMap stores `String`
+/// keys (cloned from the parallel `keys` array) so lookup is by
+/// caller-supplied `Str` without forcing an allocation per probe.
+type struct JsonObject {
+    keys:   Array<String>;
+    values: Array<JsonValue>;
+    index:  HashMap<String, u64>;
+
+    static new() -> JsonObject {
+        return JsonObject {
+            keys:   Array<String>::new(),
+            values: Array<JsonValue>::new(),
+            index:  HashMap<String, u64>::new(),
+        };
+    }
+
+    static with_capacity(capacity: u64) -> JsonObject {
+        return JsonObject {
+            keys:   Array<String>::with_capacity(capacity),
+            values: Array<JsonValue>::with_capacity(capacity),
+            index:  HashMap<String, u64>::with_capacity(capacity),
+        };
+    }
+
+    length(&this) -> u64 {
+        return this.keys.length();
+    }
+
+    is_empty(&this) -> boolean {
+        return this.keys.length() == 0;
+    }
+
+    /// Insert or overwrite the entry for `key`. Takes ownership of
+    /// both the key `String` and the `value`. If the key already
+    /// exists, the previous value is dropped and the slot reused.
+    insert(mut &this, key: String, value: JsonValue) -> void {
+        match (this.index.get(&key)) {
+            Option::Some(slot) => {
+                // Key already present — drop the old value, drop the
+                // duplicate key, overwrite in place.
+                mut old: JsonValue = this.values.get(slot).unwrap();
+                old.drop();
+                this.values.set(slot, value);
+                mut dup: String = key;
+                dup.drop();
+                return;
+            }
+            Option::None => { }
+        }
+        const slot: u64 = this.keys.length();
+        // The HashMap and the keys array each take ownership of their
+        // own copy of the string. Cloning here keeps the lifetimes
+        // independent — the index can outlive a value mutation.
+        mut key_for_index: String = String::from_str(key.as_str());
+        this.keys.push(key);
+        this.values.push(value);
+        this.index.insert(key_for_index, slot);
+    }
+
+    /// Look up a value by key. Returns a borrowed pointer that is
+    /// valid until the next mutating operation.
+    get(&this, key: Str) -> Option<JsonValue*> {
+        // The HashMap stores String keys; we wrap the borrowed Str in
+        // a temporary String for the lookup. `String::from_str` does
+        // copy — small price for the API ergonomics. A v1.x
+        // optimization is to teach HashMap to take borrowed keys.
+        mut probe: String = String::from_str(key);
+        const result: Option<u64> = this.index.get(&probe);
+        probe.drop();
+        return match (result) {
+            Option::Some(slot) => {
+                if (slot < this.values.length) {
+                    Option::Some(&this.values.ptr[slot])
+                } else {
+                    Option::None
+                }
+            }
+            Option::None => { Option::None }
+        };
+    }
+
+    /// Borrow the key at `index`. Returns `None` if `index` is out
+    /// of range.
+    key_at(&this, index: u64) -> Option<Str> {
+        if (index >= this.keys.length()) { return Option::None; }
+        return Option::Some(this.keys.ptr[index].as_str());
+    }
+
+    /// Borrow the value at `index`.
+    value_at(&this, index: u64) -> Option<JsonValue*> {
+        if (index >= this.values.length()) { return Option::None; }
+        return Option::Some(&this.values.ptr[index]);
+    }
+
+    contains(&this, key: Str) -> boolean {
+        return this.get(key).is_some();
+    }
+
+    /// Recursively drop every value, then the keys, then the index.
+    drop(mut &this) -> void {
+        mut i: u64 = 0;
+        while (i < this.values.length()) {
+            this.values.ptr[i].drop();
+            i++;
+        }
+        mut j: u64 = 0;
+        while (j < this.keys.length()) {
+            this.keys.ptr[j].drop();
+            j++;
+        }
+        this.values.drop();
+        this.keys.drop();
+        // The HashMap stores its own String copies; let it drop them.
+        this.index.drop();
+    }
+}
+
+// ============================================================================
+// JsonValue
+// ============================================================================
+
+/// One JSON value. Recursive through `Array` and `Object`.
+type enum JsonValue {
+    Null;
+    Bool(boolean);
+    Number(JsonNumber);
+    String(String);
+    Array(Array<JsonValue>);
+    Object(JsonObject);
+}
+
+implement enum JsonValue {
+    // ------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------
+
+    static null_value() -> JsonValue { return JsonValue::Null; }
+    static bool_value(b: boolean) -> JsonValue { return JsonValue::Bool(b); }
+    static int_value(n: i64) -> JsonValue { return JsonValue::Number(JsonNumber::Int(n)); }
+    static uint_value(n: u64) -> JsonValue { return JsonValue::Number(JsonNumber::UInt(n)); }
+    static float_value(n: f64) -> JsonValue { return JsonValue::Number(JsonNumber::Float(n)); }
+
+    /// Take ownership of `s`.
+    static string_value(s: String) -> JsonValue { return JsonValue::String(s); }
+
+    /// Construct an owned String from the borrowed Str, then wrap.
+    static from_str(s: Str) -> JsonValue {
+        return JsonValue::String(String::from_str(s));
+    }
+
+    static empty_array() -> JsonValue {
+        return JsonValue::Array(Array<JsonValue>::new());
+    }
+
+    static empty_object() -> JsonValue {
+        return JsonValue::Object(JsonObject::new());
+    }
+
+    // ------------------------------------------------------------------
+    // Variant queries
+    // ------------------------------------------------------------------
+
+    is_null(&this)   -> boolean { return match (this) { JsonValue::Null => { true } _ => { false } }; }
+    is_bool(&this)   -> boolean { return match (this) { JsonValue::Bool(_) => { true } _ => { false } }; }
+    is_number(&this) -> boolean { return match (this) { JsonValue::Number(_) => { true } _ => { false } }; }
+    is_string(&this) -> boolean { return match (this) { JsonValue::String(_) => { true } _ => { false } }; }
+    is_array(&this)  -> boolean { return match (this) { JsonValue::Array(_) => { true } _ => { false } }; }
+    is_object(&this) -> boolean { return match (this) { JsonValue::Object(_) => { true } _ => { false } }; }
+
+    // ------------------------------------------------------------------
+    // Typed accessors — return None when the variant doesn't match.
+    // ------------------------------------------------------------------
+
+    as_bool(&this) -> Option<boolean> {
+        return match (this) {
+            JsonValue::Bool(b) => { Option::Some(b) }
+            _                  => { Option::None }
+        };
+    }
+
+    as_i64(&this) -> Option<i64> {
+        return match (this) {
+            JsonValue::Number(n) => { n.as_i64() }
+            _                    => { Option::None }
+        };
+    }
+
+    as_u64(&this) -> Option<u64> {
+        return match (this) {
+            JsonValue::Number(n) => { n.as_u64() }
+            _                    => { Option::None }
+        };
+    }
+
+    as_f64(&this) -> Option<f64> {
+        return match (this) {
+            JsonValue::Number(n) => { Option::Some(n.as_f64()) }
+            _                    => { Option::None }
+        };
+    }
+
+    /// Borrow the inner string. Returns `None` for any other variant.
+    as_str(&this) -> Option<Str> {
+        return match (this) {
+            JsonValue::String(s) => { Option::Some(s.as_str()) }
+            _                    => { Option::None }
+        };
+    }
+
+    /// Borrow the inner array.
+    as_array(&this) -> Option<Array<JsonValue>*> {
+        return match (&this) {
+            JsonValue::Array(arr) => { Option::Some(arr) }
+            _                     => { Option::None }
+        };
+    }
+
+    /// Borrow the inner object.
+    as_object(&this) -> Option<JsonObject*> {
+        return match (&this) {
+            JsonValue::Object(obj) => { Option::Some(obj) }
+            _                      => { Option::None }
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Path access — chain through nested objects/arrays.
+    // ------------------------------------------------------------------
+
+    /// `obj.get("key")` for object variants; `None` for everything else.
+    get(&this, key: Str) -> Option<JsonValue*> {
+        return match (&this) {
+            JsonValue::Object(obj) => { obj.get(key) }
+            _                      => { Option::None }
+        };
+    }
+
+    /// Array index access.
+    at(&this, index: u64) -> Option<JsonValue*> {
+        return match (&this) {
+            JsonValue::Array(arr) => {
+                if (index < arr.length()) { Option::Some(&arr.ptr[index]) }
+                else                      { Option::None }
+            }
+            _ => { Option::None }
+        };
+    }
+
+    /// Number of children (object entries / array elements). 0 for
+    /// scalars.
+    length(&this) -> u64 {
+        return match (&this) {
+            JsonValue::Array(arr)  => { arr.length() }
+            JsonValue::Object(obj) => { obj.length() }
+            _                      => { 0 }
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Teardown
+    // ------------------------------------------------------------------
+
+    /// Recursively free heap storage. The `Null` / `Bool` / `Number`
+    /// variants are no-ops; `String` / `Array` / `Object` walk their
+    /// children.
+    drop(mut &this) -> void {
+        match (mut &this) {
+            JsonValue::Null       => { }
+            JsonValue::Bool(_)    => { }
+            JsonValue::Number(_)  => { }
+            JsonValue::String(s)  => { s.drop(); }
+            JsonValue::Array(arr) => {
+                mut i: u64 = 0;
+                while (i < arr.length()) {
+                    arr.ptr[i].drop();
+                    i++;
+                }
+                arr.drop();
+            }
+            JsonValue::Object(obj) => { obj.drop(); }
+        }
+    }
+}

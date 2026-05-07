@@ -1,0 +1,452 @@
+///! LSP-specific types layered over `JsonValue`.
+///!
+///! Strongly-typed structs for the bits of the LSP spec we touch in v1:
+///!   • `Position` / `Range` / `Location`
+///!   • `TextDocumentItem`, `VersionedTextDocumentIdentifier`,
+///!     `TextDocumentIdentifier`
+///!   • `Hover`, `MarkupContent`
+///!   • `CompletionItem`, `CompletionList`
+///!
+///! All conversion helpers live here. JSON-level serialization is
+///! delegated to `std::json::serializer` once we've built a
+///! `JsonValue`.
+///!
+///! `Position.character` is a UTF-16 code-unit count per the LSP spec.
+///! v1 treats it as a byte offset (assumes ASCII source) — see
+///! `protocol/conv.cryo` for the conversion that lives behind the API.
+
+namespace Protocol::LspTypes;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::json::value;
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+type enum LspParseError {
+    Missing(String);     // missing required field
+    WrongType(String);   // field exists but not the right shape
+}
+
+implement enum LspParseError {
+    drop(mut &this) -> void {
+        match (mut &this) {
+            LspParseError::Missing(s)   => { s.drop(); }
+            LspParseError::WrongType(s) => { s.drop(); }
+        }
+    }
+}
+
+// ============================================================================
+// Position / Range / Location
+// ============================================================================
+
+type struct Position {
+    line:      u32;
+    character: u32;
+
+    static new(line: u32, character: u32) -> Position {
+        return Position { line: line, character: character };
+    }
+
+    static from_json(v: &JsonValue) -> Result<Position, LspParseError> {
+        return match (v.as_object()) {
+            Option::Some(obj) => {
+                mut line: u32 = 0;
+                mut ch:   u32 = 0;
+                match (obj.get(Str::from_raw("line" as u8*, 4))) {
+                    Option::Some(jv) => {
+                        match (jv.as_u64()) {
+                            Option::Some(n) => { line = n as u32; }
+                            Option::None    => { return Result::Err(wrong_type("Position.line")); }
+                        }
+                    }
+                    Option::None => { return Result::Err(missing("Position.line")); }
+                }
+                match (obj.get(Str::from_raw("character" as u8*, 9))) {
+                    Option::Some(jv) => {
+                        match (jv.as_u64()) {
+                            Option::Some(n) => { ch = n as u32; }
+                            Option::None    => { return Result::Err(wrong_type("Position.character")); }
+                        }
+                    }
+                    Option::None => { return Result::Err(missing("Position.character")); }
+                }
+                Result::Ok(Position { line: line, character: ch })
+            }
+            Option::None => { Result::Err(wrong_type("Position")) }
+        };
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("line" as u8*, 4)),
+                 JsonValue::Number(JsonNumber::UInt(this.line as u64)));
+        o.insert(String::from_str(Str::from_raw("character" as u8*, 9)),
+                 JsonValue::Number(JsonNumber::UInt(this.character as u64)));
+        return JsonValue::Object(o);
+    }
+}
+
+type struct Range {
+    start: Position;
+    end:   Position;
+
+    static zero() -> Range {
+        return Range {
+            start: Position::new(0, 0),
+            end:   Position::new(0, 0),
+        };
+    }
+
+    static from_json(v: &JsonValue) -> Result<Range, LspParseError> {
+        return match (v.as_object()) {
+            Option::Some(obj) => {
+                mut start: Position = Position::new(0, 0);
+                mut end:   Position = Position::new(0, 0);
+                match (obj.get(Str::from_raw("start" as u8*, 5))) {
+                    Option::Some(jv) => {
+                        match (Position::from_json(jv)) {
+                            Result::Ok(p)  => { start = p; }
+                            Result::Err(e) => { return Result::Err(e); }
+                        }
+                    }
+                    Option::None => { return Result::Err(missing("Range.start")); }
+                }
+                match (obj.get(Str::from_raw("end" as u8*, 3))) {
+                    Option::Some(jv) => {
+                        match (Position::from_json(jv)) {
+                            Result::Ok(p)  => { end = p; }
+                            Result::Err(e) => { return Result::Err(e); }
+                        }
+                    }
+                    Option::None => { return Result::Err(missing("Range.end")); }
+                }
+                Result::Ok(Range { start: start, end: end })
+            }
+            Option::None => { Result::Err(wrong_type("Range")) }
+        };
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("start" as u8*, 5)), this.start.to_json());
+        o.insert(String::from_str(Str::from_raw("end" as u8*, 3)),   this.end.to_json());
+        return JsonValue::Object(o);
+    }
+}
+
+type struct Location {
+    uri:   String;
+    range: Range;
+
+    drop(mut &this) -> void {
+        this.uri.drop();
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("uri" as u8*, 3)),
+                 JsonValue::String(String::from_str(this.uri.as_str())));
+        o.insert(String::from_str(Str::from_raw("range" as u8*, 5)),
+                 this.range.to_json());
+        return JsonValue::Object(o);
+    }
+}
+
+// ============================================================================
+// Document identifiers
+// ============================================================================
+
+type struct TextDocumentIdentifier {
+    uri: String;
+
+    static from_json(v: &JsonValue) -> Result<TextDocumentIdentifier, LspParseError> {
+        return match (v.as_object()) {
+            Option::Some(obj) => {
+                match (obj.get(Str::from_raw("uri" as u8*, 3))) {
+                    Option::Some(jv) => {
+                        match (jv.as_str()) {
+                            Option::Some(s) => {
+                                Result::Ok(TextDocumentIdentifier { uri: String::from_str(s) })
+                            }
+                            Option::None => { Result::Err(wrong_type("TextDocumentIdentifier.uri")) }
+                        }
+                    }
+                    Option::None => { Result::Err(missing("TextDocumentIdentifier.uri")) }
+                }
+            }
+            Option::None => { Result::Err(wrong_type("TextDocumentIdentifier")) }
+        };
+    }
+
+    drop(mut &this) -> void { this.uri.drop(); }
+}
+
+type struct VersionedTextDocumentIdentifier {
+    uri:     String;
+    version: i32;
+
+    static from_json(v: &JsonValue) -> Result<VersionedTextDocumentIdentifier, LspParseError> {
+        return match (v.as_object()) {
+            Option::Some(obj) => {
+                mut uri_s: String = String::new();
+                mut ver:   i32    = 0;
+                match (obj.get(Str::from_raw("uri" as u8*, 3))) {
+                    Option::Some(jv) => {
+                        match (jv.as_str()) {
+                            Option::Some(s) => { uri_s = String::from_str(s); }
+                            Option::None    => { return Result::Err(wrong_type("VersionedTextDocumentIdentifier.uri")); }
+                        }
+                    }
+                    Option::None => { return Result::Err(missing("VersionedTextDocumentIdentifier.uri")); }
+                }
+                match (obj.get(Str::from_raw("version" as u8*, 7))) {
+                    Option::Some(jv) => {
+                        match (jv.as_i64()) {
+                            Option::Some(n) => { ver = n as i32; }
+                            Option::None    => { uri_s.drop(); return Result::Err(wrong_type("VersionedTextDocumentIdentifier.version")); }
+                        }
+                    }
+                    Option::None => { uri_s.drop(); return Result::Err(missing("VersionedTextDocumentIdentifier.version")); }
+                }
+                Result::Ok(VersionedTextDocumentIdentifier { uri: uri_s, version: ver })
+            }
+            Option::None => { Result::Err(wrong_type("VersionedTextDocumentIdentifier")) }
+        };
+    }
+
+    drop(mut &this) -> void { this.uri.drop(); }
+}
+
+type struct TextDocumentItem {
+    uri:         String;
+    language_id: String;
+    version:     i32;
+    text:        String;
+
+    static from_json(v: &JsonValue) -> Result<TextDocumentItem, LspParseError> {
+        return match (v.as_object()) {
+            Option::Some(obj) => {
+                mut uri_s: String = String::new();
+                mut lang:  String = String::new();
+                mut ver:   i32    = 0;
+                mut text:  String = String::new();
+                match (obj.get(Str::from_raw("uri" as u8*, 3))) {
+                    Option::Some(jv) => {
+                        match (jv.as_str()) {
+                            Option::Some(s) => { uri_s = String::from_str(s); }
+                            Option::None    => { return Result::Err(wrong_type("TextDocumentItem.uri")); }
+                        }
+                    }
+                    Option::None => { return Result::Err(missing("TextDocumentItem.uri")); }
+                }
+                match (obj.get(Str::from_raw("languageId" as u8*, 10))) {
+                    Option::Some(jv) => {
+                        match (jv.as_str()) {
+                            Option::Some(s) => { lang = String::from_str(s); }
+                            Option::None    => { uri_s.drop(); return Result::Err(wrong_type("TextDocumentItem.languageId")); }
+                        }
+                    }
+                    Option::None => {
+                        // Some clients omit; default to "cryo".
+                        lang = String::from_str(Str::from_raw("cryo" as u8*, 4));
+                    }
+                }
+                match (obj.get(Str::from_raw("version" as u8*, 7))) {
+                    Option::Some(jv) => {
+                        match (jv.as_i64()) {
+                            Option::Some(n) => { ver = n as i32; }
+                            Option::None    => { uri_s.drop(); lang.drop(); return Result::Err(wrong_type("TextDocumentItem.version")); }
+                        }
+                    }
+                    Option::None => { ver = 0; }
+                }
+                match (obj.get(Str::from_raw("text" as u8*, 4))) {
+                    Option::Some(jv) => {
+                        match (jv.as_str()) {
+                            Option::Some(s) => { text = String::from_str(s); }
+                            Option::None    => { uri_s.drop(); lang.drop(); return Result::Err(wrong_type("TextDocumentItem.text")); }
+                        }
+                    }
+                    Option::None => { uri_s.drop(); lang.drop(); return Result::Err(missing("TextDocumentItem.text")); }
+                }
+                Result::Ok(TextDocumentItem {
+                    uri: uri_s, language_id: lang, version: ver, text: text,
+                })
+            }
+            Option::None => { Result::Err(wrong_type("TextDocumentItem")) }
+        };
+    }
+
+    drop(mut &this) -> void {
+        this.uri.drop();
+        this.language_id.drop();
+        this.text.drop();
+    }
+}
+
+// ============================================================================
+// Hover / MarkupContent
+// ============================================================================
+
+type struct MarkupContent {
+    /// "plaintext" or "markdown".
+    kind:  String;
+    value: String;
+
+    static markdown(text: String) -> MarkupContent {
+        return MarkupContent {
+            kind:  String::from_str(Str::from_raw("markdown" as u8*, 8)),
+            value: text,
+        };
+    }
+
+    drop(mut &this) -> void {
+        this.kind.drop();
+        this.value.drop();
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("kind" as u8*, 4)),
+                 JsonValue::String(String::from_str(this.kind.as_str())));
+        o.insert(String::from_str(Str::from_raw("value" as u8*, 5)),
+                 JsonValue::String(String::from_str(this.value.as_str())));
+        return JsonValue::Object(o);
+    }
+}
+
+type struct Hover {
+    contents: MarkupContent;
+    range:    Option<Range>;
+
+    drop(mut &this) -> void {
+        this.contents.drop();
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("contents" as u8*, 8)),
+                 this.contents.to_json());
+        match (&this.range) {
+            Option::Some(r) => {
+                o.insert(String::from_str(Str::from_raw("range" as u8*, 5)),
+                         r.to_json());
+            }
+            Option::None => { }
+        }
+        return JsonValue::Object(o);
+    }
+}
+
+// ============================================================================
+// Completion
+// ============================================================================
+
+/// LSP CompletionItemKind. Only the kinds we map to are listed; any
+/// other value is permitted by the spec.
+const KIND_TEXT:          i32 = 1;
+const KIND_METHOD:        i32 = 2;
+const KIND_FUNCTION:      i32 = 3;
+const KIND_FIELD:         i32 = 5;
+const KIND_VARIABLE:      i32 = 6;
+const KIND_CLASS:         i32 = 7;
+const KIND_MODULE:        i32 = 9;
+const KIND_ENUM:          i32 = 13;
+const KIND_KEYWORD:       i32 = 14;
+const KIND_FILE:          i32 = 17;
+const KIND_ENUM_MEMBER:   i32 = 20;
+const KIND_CONSTANT:      i32 = 21;
+const KIND_OPERATOR:      i32 = 24;
+const KIND_TYPE_PARAM:    i32 = 25;
+
+type struct CompletionItem {
+    label:  String;
+    kind:   i32;
+    detail: Option<String>;
+
+    static plain(label: String, kind: i32) -> CompletionItem {
+        return CompletionItem {
+            label:  label,
+            kind:   kind,
+            detail: Option::None,
+        };
+    }
+
+    drop(mut &this) -> void {
+        this.label.drop();
+        match (mut &this.detail) {
+            Option::Some(s) => { s.drop(); }
+            Option::None    => { }
+        }
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("label" as u8*, 5)),
+                 JsonValue::String(String::from_str(this.label.as_str())));
+        o.insert(String::from_str(Str::from_raw("kind" as u8*, 4)),
+                 JsonValue::Number(JsonNumber::Int(this.kind as i64)));
+        match (&this.detail) {
+            Option::Some(d) => {
+                o.insert(String::from_str(Str::from_raw("detail" as u8*, 6)),
+                         JsonValue::String(String::from_str(d.as_str())));
+            }
+            Option::None => { }
+        }
+        return JsonValue::Object(o);
+    }
+}
+
+type struct CompletionList {
+    is_incomplete: boolean;
+    items:         Array<CompletionItem>;
+
+    drop(mut &this) -> void {
+        mut i: u64 = 0;
+        while (i < this.items.length()) {
+            this.items.ptr[i].drop();
+            i++;
+        }
+        this.items.drop();
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_raw("isIncomplete" as u8*, 12)),
+                 JsonValue::Bool(this.is_incomplete));
+        mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(this.items.length());
+        mut i: u64 = 0;
+        while (i < this.items.length()) {
+            arr.push(this.items.ptr[i].to_json());
+            i++;
+        }
+        o.insert(String::from_str(Str::from_raw("items" as u8*, 5)),
+                 JsonValue::Array(arr));
+        return JsonValue::Object(o);
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function missing(field: string) -> LspParseError {
+    return LspParseError::Missing(string_from_lit(field));
+}
+
+function wrong_type(field: string) -> LspParseError {
+    return LspParseError::WrongType(string_from_lit(field));
+}
+
+function string_from_lit(lit: string) -> String {
+    mut len: u64 = 0;
+    const ptr: u8* = lit as u8*;
+    while (ptr[len] != 0) { len = len + 1; }
+    return String::from_str(Str::from_raw(ptr, len));
+}
