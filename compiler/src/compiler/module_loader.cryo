@@ -32,6 +32,12 @@ type struct ModuleLoader {
     stdlib_root:  string;
     no_std:       boolean;
 
+    /// Extra source roots resolved relative to project_root.  Scanned
+    /// alongside entry_dir so that imports targeting siblings of the
+    /// entry point (e.g. a library entry at `src/compiler/_module.cryo`
+    /// whose source imports `Utils::*` from `src/utils`) resolve.
+    extra_roots: string[];
+
     // Circular dependency detection: parallel arrays
     // loading_paths[i] is currently being loaded if loading_flags[i] is true
     loading_paths: string[];
@@ -47,12 +53,14 @@ type struct ModuleLoader {
     ns_map: HashMap<string, string>;
 
     static new(project_root: string, entry_point: string,
-               stdlib_root: string, no_std: boolean) -> ModuleLoader {
+               stdlib_root: string, no_std: boolean,
+               extra_roots: string[]) -> ModuleLoader {
         return ModuleLoader {
             project_root:  project_root,
             entry_dir:     extract_directory(entry_point),
             stdlib_root:   stdlib_root,
             no_std:        no_std,
+            extra_roots:   extra_roots,
             loading_paths: [],
             loading_flags: [],
             loaded_paths:  [],
@@ -82,6 +90,22 @@ type struct ModuleLoader {
         this.scan_all_project_files(this.entry_dir, debug);
         if (!this.no_std && strlen(this.stdlib_root) > 0) {
             this.scan_all_project_files(this.stdlib_root, debug);
+        }
+        // include_paths from cryoconfig: each is resolved relative to
+        // project_root.  HashMap.insert is last-wins, so re-scanning a
+        // path already covered by entry_dir is harmless.
+        for (mut i: int = 0; i < this.extra_roots.length; i++) {
+            const rel: string = this.extra_roots[i];
+            const root: string = if (strlen(this.project_root) == 0
+                                     || strcmp(this.project_root, ".") == 0) {
+                rel
+            } else {
+                format("%s/%s", this.project_root, rel)
+            };
+            if (debug) {
+                cdebug("[ModuleLoader] Scanning extra root: %s\n", root);
+            }
+            this.scan_all_project_files(root, debug);
         }
 
         if (debug) {

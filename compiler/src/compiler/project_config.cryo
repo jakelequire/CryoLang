@@ -43,6 +43,37 @@ function parse_target_type(s: string) -> int {
 
 
 // ============================================================================
+// LibTarget / BinTarget — multi-target output declarations
+// ============================================================================
+
+/// One library output produced from a project.  Empty `name` means the
+/// project does not declare a `[lib]` section.
+type struct LibTarget {
+    name:       string;     // library archive name (libcompiler.a → "compiler")
+    source_dir: string;     // root of the library's source tree
+
+    static empty() -> LibTarget {
+        return LibTarget { name: "", source_dir: "" };
+    }
+
+    is_present(&this) -> boolean {
+        return strlen(this.name) > 0;
+    }
+}
+
+/// One executable output produced from a project.  Multi-target projects
+/// may declare any number via `[[bin]]` array-of-tables.
+type struct BinTarget {
+    name:        string;    // executable filename (bin/cryo → "cryo")
+    entry_point: string;    // path to the entry .cryo file
+
+    static empty() -> BinTarget {
+        return BinTarget { name: "", entry_point: "" };
+    }
+}
+
+
+// ============================================================================
 // ProjectConfig
 // ============================================================================
 
@@ -72,6 +103,14 @@ type struct ProjectConfig {
                                // "../../stdlib"] for tools that depend on
                                // the compiler library or stdlib sources.
 
+    /// `[lib]` target.  Empty (`lib.name == ""`) when the project does
+    /// not produce a library output.
+    lib:  LibTarget;
+    /// `[[bin]]` targets.  When non-empty, the project produces one
+    /// executable per entry; the legacy `[project] target_type = "executable"`
+    /// + `entry_point` are ignored in favour of these.
+    bins: BinTarget[];
+
     /// Create a default configuration.
     static default() -> ProjectConfig {
         return ProjectConfig {
@@ -89,7 +128,16 @@ type struct ProjectConfig {
             link_libs:    [],
             link_paths:   [],
             include_paths: [],
+            lib:          LibTarget::empty(),
+            bins:         [],
         };
+    }
+
+    /// True when the cryoconfig declares `[lib]` and/or one or more
+    /// `[[bin]]` blocks.  Multi-target projects bypass the legacy
+    /// single-target dispatch in `compile_project`.
+    is_multi_target(&this) -> boolean {
+        return this.lib.is_present() || this.bins.length > 0;
     }
 
     /// Whether this project requires an entry point (main function).
@@ -102,16 +150,24 @@ type struct ProjectConfig {
     }
 
     /// Get the root file for module discovery.
-    /// Executables use entry_point; libraries/stdlib use lib.cryo in source_dir.
+    /// Executables use entry_point; libraries/stdlib use lib.cryo in
+    /// source_dir, falling back to _module.cryo (the aggregator file
+    /// every Cryo source directory carries).
     discovery_root_path(&this) -> string {
         if (this.requires_entry_point()) {
             return this.entry_point_path();
         }
-        // Library/stdlib: look for lib.cryo in source_dir
-        if (this.project_root == "" || strcmp(this.project_root, ".") == 0) {
-            return format("%s/lib.cryo", this.source_dir);
+        const base: string = if (this.project_root == ""
+                                 || strcmp(this.project_root, ".") == 0) {
+            this.source_dir
+        } else {
+            format("%s/%s", this.project_root, this.source_dir)
+        };
+        const lib_path: string = format("%s/lib.cryo", base);
+        if (File::exists(lib_path)) {
+            return lib_path;
         }
-        return format("%s/%s/lib.cryo", this.project_root, this.source_dir);
+        return format("%s/_module.cryo", base);
     }
 
     /// Parse a cryoconfig file at the given path.
@@ -131,8 +187,15 @@ type struct ProjectConfig {
         mut config: ProjectConfig = ProjectConfig::default();
         config.project_root = project_root;
 
-        // Parse INI-like format line by line
+        // Parse INI-like format line by line.
+        // Section names use a small extended vocabulary:
+        //   "project" / "compiler" / "dependencies"   — legacy
+        //   "lib"                                     — [lib]
+        //   "bin"                                     — current [[bin]] entry
+        //                                               (use current_bin_idx for which one)
+        // current_bin_idx is -1 when not inside a [[bin]] block.
         mut current_section: string = "";
+        mut current_bin_idx:  i64    = -1;
         mut pos: i64 = 0;
         const len: i64 = strlen(content) as i64;
 
@@ -150,11 +213,28 @@ type struct ProjectConfig {
             if (strlen(trimmed) == 0) { continue; }
             if (trimmed[0] == 35) { continue; }  // 35 = '#'
 
-            // Check for section header [section]
+            // Check for section header [section] or array-of-tables [[name]].
             if (trimmed[0] == 91) {  // 91 = '['
-                const close: i64 = find_char(trimmed, 93);  // 93 = ']'
-                if (close > 1) {
-                    current_section = substr(trimmed, 1, close - 1);
+                const t_len: i64 = strlen(trimmed) as i64;
+                const is_array: boolean = t_len >= 4
+                    && trimmed[1] == 91                    // '[['
+                    && trimmed[t_len - 1] == 93            // ']'
+                    && trimmed[t_len - 2] == 93;           // ']]'
+                if (is_array) {
+                    // [[bin]] -> current_section = "bin", push fresh BinTarget.
+                    current_section = substr(trimmed, 2, t_len - 4);
+                    if (strcmp(current_section, "bin") == 0) {
+                        config.bins.push(BinTarget::empty());
+                        current_bin_idx = config.bins.length as i64 - 1;
+                    } else {
+                        current_bin_idx = -1;
+                    }
+                } else {
+                    const close: i64 = find_char(trimmed, 93);  // 93 = ']'
+                    if (close > 1) {
+                        current_section = substr(trimmed, 1, close - 1);
+                    }
+                    current_bin_idx = -1;
                 }
                 continue;
             }
@@ -198,6 +278,12 @@ type struct ProjectConfig {
                 else if (strcmp(key, "include_paths") == 0) {
                     config.include_paths = parse_string_array(raw_val);
                 }
+            } else if (strcmp(current_section, "lib") == 0) {
+                if (strcmp(key, "name") == 0)            { config.lib.name = val; }
+                else if (strcmp(key, "source_dir") == 0) { config.lib.source_dir = val; }
+            } else if (strcmp(current_section, "bin") == 0 && current_bin_idx >= 0) {
+                if (strcmp(key, "name") == 0)             { config.bins[current_bin_idx].name = val; }
+                else if (strcmp(key, "entry_point") == 0) { config.bins[current_bin_idx].entry_point = val; }
             }
         }
 
