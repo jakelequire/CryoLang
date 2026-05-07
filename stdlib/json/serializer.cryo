@@ -1,0 +1,235 @@
+///! JSON serializer.
+///!
+///! Two output shapes: compact (no whitespace) and pretty (2-space
+///! indent, newlines between elements). Both write into a caller-owned
+///! `String` so multiple values can be concatenated without
+///! intermediate allocation.
+///!
+///! `stringify` and `stringify_pretty` are the convenience entry
+///! points that allocate and return a fresh `String`.
+
+namespace std::json::serializer;
+
+import core::option;
+import core::result;
+import collections::array;
+import collections::string;
+import collections::str;
+import fmt::integer;
+import fmt::float;
+import json::value;
+
+// ============================================================================
+// Public entry points
+// ============================================================================
+
+/// Append a compact serialization of `v` to `out`. No whitespace
+/// between tokens.
+function write_value(out: mut &String, v: &JsonValue) -> void {
+    write_value_inner(out, v, false, 0);
+}
+
+/// Append a pretty-printed serialization of `v` to `out`. Two-space
+/// indent. Object entries and array elements appear one per line;
+/// empty objects / arrays stay on a single line.
+function write_pretty(out: mut &String, v: &JsonValue) -> void {
+    write_value_inner(out, v, true, 0);
+}
+
+/// Allocate a fresh `String` containing the compact serialization.
+function stringify(v: &JsonValue) -> String {
+    mut out: String = String::new();
+    write_value_inner(&mut out, v, false, 0);
+    return out;
+}
+
+/// Allocate a fresh `String` containing the pretty serialization.
+function stringify_pretty(v: &JsonValue) -> String {
+    mut out: String = String::new();
+    write_value_inner(&mut out, v, true, 0);
+    return out;
+}
+
+// ============================================================================
+// Recursive writer
+// ============================================================================
+
+function write_value_inner(out: mut &String, v: &JsonValue,
+                           pretty: boolean, depth: u64) -> void {
+    match (v) {
+        JsonValue::Null      => { write_lit(out, "null", 4); }
+        JsonValue::Bool(b)   => {
+            if (b) { write_lit(out, "true", 4); }
+            else   { write_lit(out, "false", 5); }
+        }
+        JsonValue::Number(n) => { write_number(out, &n); }
+        JsonValue::String(s) => { write_string(out, s.as_str()); }
+        JsonValue::Array(arr) => {
+            write_array(out, &arr, pretty, depth);
+        }
+        JsonValue::Object(obj) => {
+            write_object(out, &obj, pretty, depth);
+        }
+    }
+}
+
+function write_array(out: mut &String, arr: &Array<JsonValue>,
+                     pretty: boolean, depth: u64) -> void {
+    if (arr.length() == 0) {
+        out.push_byte(91);   // [
+        out.push_byte(93);   // ]
+        return;
+    }
+    out.push_byte(91);
+    if (pretty) { out.push_byte(10); }
+    mut i: u64 = 0;
+    while (i < arr.length()) {
+        if (pretty) { write_indent(out, depth + 1); }
+        write_value_inner(out, &arr.ptr[i], pretty, depth + 1);
+        if (i + 1 < arr.length()) {
+            out.push_byte(44);   // ,
+        }
+        if (pretty) { out.push_byte(10); }
+        i++;
+    }
+    if (pretty) { write_indent(out, depth); }
+    out.push_byte(93);
+}
+
+function write_object(out: mut &String, obj: &JsonObject,
+                      pretty: boolean, depth: u64) -> void {
+    if (obj.length() == 0) {
+        out.push_byte(123);  // {
+        out.push_byte(125);  // }
+        return;
+    }
+    out.push_byte(123);
+    if (pretty) { out.push_byte(10); }
+    mut i: u64 = 0;
+    while (i < obj.length()) {
+        if (pretty) { write_indent(out, depth + 1); }
+        match (obj.key_at(i)) {
+            Option::Some(k) => { write_string(out, k); }
+            Option::None    => { write_string(out, Str::from_raw("" as u8*, 0)); }
+        }
+        out.push_byte(58);   // :
+        if (pretty) { out.push_byte(32); }
+        match (obj.value_at(i)) {
+            Option::Some(vp) => {
+                write_value_inner(out, vp, pretty, depth + 1);
+            }
+            Option::None => { write_lit(out, "null", 4); }
+        }
+        if (i + 1 < obj.length()) {
+            out.push_byte(44);
+        }
+        if (pretty) { out.push_byte(10); }
+        i++;
+    }
+    if (pretty) { write_indent(out, depth); }
+    out.push_byte(125);
+}
+
+function write_indent(out: mut &String, depth: u64) -> void {
+    mut n: u64 = 0;
+    const total: u64 = depth * 2;
+    while (n < total) {
+        out.push_byte(32);   // space
+        n++;
+    }
+}
+
+function write_lit(out: mut &String, lit: string, lit_len: u64) -> void {
+    const bytes: u8* = lit as u8*;
+    mut i: u64 = 0;
+    while (i < lit_len) {
+        out.push_byte(bytes[i]);
+        i++;
+    }
+}
+
+// ============================================================================
+// Numbers
+// ============================================================================
+
+function write_number(out: mut &String, n: &JsonNumber) -> void {
+    match (n) {
+        JsonNumber::Int(v) => {
+            mut buf: u8[24];
+            const written: u64 = integer::write_i64_decimal(&buf[0], v);
+            mut i: u64 = 0;
+            while (i < written) {
+                out.push_byte(buf[i]);
+                i++;
+            }
+        }
+        JsonNumber::UInt(v) => {
+            mut buf: u8[24];
+            const written: u64 = integer::write_u64_decimal(&buf[0], v);
+            mut i: u64 = 0;
+            while (i < written) {
+                out.push_byte(buf[i]);
+                i++;
+            }
+        }
+        JsonNumber::Float(v) => {
+            // Defer to the stdlib float writer. It produces a shape
+            // round-trip-able through strtod; that's all we promise.
+            float::write_f64(out, v);
+        }
+    }
+}
+
+// ============================================================================
+// Strings
+// ============================================================================
+
+const QUOTE_BYTE: u8 = 34;
+const BSLASH:     u8 = 92;
+
+/// Write a JSON-escaped string literal: leading quote, escaped
+/// content, trailing quote. UTF-8 bytes outside the ASCII control
+/// range are passed through; bytes < 0x20 are emitted as `\uXXXX`.
+function write_string(out: mut &String, s: Str) -> void {
+    out.push_byte(QUOTE_BYTE);
+    const len: u64 = s.length();
+    const ptr: u8* = s.as_ptr();
+    mut i: u64 = 0;
+    while (i < len) {
+        const b: u8 = ptr[i];
+        if (b == QUOTE_BYTE) {
+            out.push_byte(BSLASH);
+            out.push_byte(QUOTE_BYTE);
+        } else if (b == BSLASH) {
+            out.push_byte(BSLASH);
+            out.push_byte(BSLASH);
+        } else if (b == 0x08) {
+            out.push_byte(BSLASH); out.push_byte(98);  // \b
+        } else if (b == 0x09) {
+            out.push_byte(BSLASH); out.push_byte(116); // \t
+        } else if (b == 0x0A) {
+            out.push_byte(BSLASH); out.push_byte(110); // \n
+        } else if (b == 0x0C) {
+            out.push_byte(BSLASH); out.push_byte(102); // \f
+        } else if (b == 0x0D) {
+            out.push_byte(BSLASH); out.push_byte(114); // \r
+        } else if (b < 0x20) {
+            // \u00XX for any other ASCII control character
+            out.push_byte(BSLASH);
+            out.push_byte(117);                        // u
+            out.push_byte(48);                         // 0
+            out.push_byte(48);                         // 0
+            out.push_byte(hex_nibble((b >> 4) & 0x0F));
+            out.push_byte(hex_nibble(b & 0x0F));
+        } else {
+            out.push_byte(b);
+        }
+        i++;
+    }
+    out.push_byte(QUOTE_BYTE);
+}
+
+function hex_nibble(n: u8) -> u8 {
+    if (n < 10) { return 48 + n; }     // '0'..'9'
+    return 87 + n;                       // 'a'..'f'  (97 - 10)
+}

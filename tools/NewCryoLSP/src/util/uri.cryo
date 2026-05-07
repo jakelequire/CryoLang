@@ -1,0 +1,150 @@
+///! file URI <-> filesystem path conversion.
+///!
+///! LSP carries every document location as a URI. Cryo's compiler
+///! works in plain filesystem paths. This module is the boundary.
+///!
+///! Behavior:
+///!   • POSIX:  `/foo/bar baz.cryo` → `file:///foo/bar%20baz.cryo`
+///!   • Windows:`C:\foo\bar.cryo`   → `file:///C:/foo/bar.cryo`
+///!
+///! Percent-encoding only applies to a small set of "must escape"
+///! bytes (space, `?`, `#`, `%`, control chars). Reserved characters
+///! that already work in URIs (`/`, `:`) pass through.
+
+namespace Util::Uri;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+
+const FILE_PREFIX:     string = "file:///";
+const FILE_PREFIX_LEN: u64    = 8;
+
+/// Convert a filesystem path to a `file://` URI. Always emits the
+/// triple-slash form (`file:///`) so VS Code, neovim, and Helix all
+/// accept the result.
+function path_to_uri(path: Str) -> String {
+    mut out: String = String::with_capacity(path.length() + FILE_PREFIX_LEN);
+    push_lit(&mut out, FILE_PREFIX, FILE_PREFIX_LEN);
+
+    const ptr: u8* = path.as_ptr();
+    const len: u64 = path.length();
+    mut i: u64 = 0;
+
+    // On Windows, path may begin with "C:\" — strip nothing (the
+    // triple-slash already counts as one "/"). Just normalize
+    // backslashes to forward slashes.
+    while (i < len) {
+        const b: u8 = ptr[i];
+        if (b == 92) {                       // backslash
+            out.push_byte(47);               // forward slash
+        } else if (must_percent_encode(b)) {
+            out.push_byte(37);               // %
+            out.push_byte(hex_nibble((b >> 4) & 0x0F));
+            out.push_byte(hex_nibble(b & 0x0F));
+        } else {
+            out.push_byte(b);
+        }
+        i++;
+    }
+    return out;
+}
+
+/// Convert a `file://` URI back to a filesystem path. Returns the
+/// trimmed path on success, or `None` for non-file URIs / malformed
+/// percent-escapes.
+function uri_to_path(uri: Str) -> Option<String> {
+    if (uri.length() < FILE_PREFIX_LEN) { return Option::None; }
+    if (!uri.sub_bytes(0, FILE_PREFIX_LEN).equals(&Str::from_raw(FILE_PREFIX as u8*, FILE_PREFIX_LEN))) {
+        return Option::None;
+    }
+    const body: Str = uri.sub_bytes(FILE_PREFIX_LEN, uri.length());
+    mut out: String = String::with_capacity(body.length());
+    const ptr: u8* = body.as_ptr();
+    const len: u64 = body.length();
+    mut i: u64 = 0;
+
+    // Detect Windows drive: "C:/..." — leave as-is.
+    // POSIX: prepend a leading slash since file:/// strips one.
+    const is_drive: boolean = (len >= 2 && is_ascii_letter(ptr[0]) && ptr[1] == 58);
+    if (!is_drive) {
+        out.push_byte(47);
+    }
+
+    while (i < len) {
+        const b: u8 = ptr[i];
+        if (b == 37) {                       // %
+            if (i + 2 >= len) { out.drop(); return Option::None; }
+            match (decode_hex2(ptr[i + 1], ptr[i + 2])) {
+                Option::Some(decoded) => { out.push_byte(decoded); }
+                Option::None          => { out.drop(); return Option::None; }
+            }
+            i = i + 3;
+            continue;
+        }
+        out.push_byte(b);
+        i = i + 1;
+    }
+    return Option::Some(out);
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function must_percent_encode(b: u8) -> boolean {
+    if (b < 0x20)   { return true; }
+    if (b == 32)    { return true; }     // space
+    if (b == 34)    { return true; }     // "
+    if (b == 35)    { return true; }     // #
+    if (b == 37)    { return true; }     // %
+    if (b == 60)    { return true; }     // <
+    if (b == 62)    { return true; }     // >
+    if (b == 63)    { return true; }     // ?
+    if (b == 91)    { return true; }     // [
+    if (b == 93)    { return true; }     // ]
+    if (b == 94)    { return true; }     // ^
+    if (b == 96)    { return true; }     // `
+    if (b == 123)   { return true; }     // {
+    if (b == 124)   { return true; }     // |
+    if (b == 125)   { return true; }     // }
+    if (b == 127)   { return true; }     // DEL
+    return false;
+}
+
+function hex_nibble(n: u8) -> u8 {
+    if (n < 10) { return 48 + n; }
+    return 87 + n;
+}
+
+function decode_hex2(hi: u8, lo: u8) -> Option<u8> {
+    match (hex_value(hi)) {
+        Option::Some(h) => {
+            match (hex_value(lo)) {
+                Option::Some(l) => { return Option::Some((h << 4) | l); }
+                Option::None    => { return Option::None; }
+            }
+        }
+        Option::None => { return Option::None; }
+    }
+}
+
+function hex_value(b: u8) -> Option<u8> {
+    if (b >= 48 && b <= 57)  { return Option::Some(b - 48); }
+    if (b >= 65 && b <= 70)  { return Option::Some(b - 65 + 10); }
+    if (b >= 97 && b <= 102) { return Option::Some(b - 97 + 10); }
+    return Option::None;
+}
+
+function is_ascii_letter(b: u8) -> boolean {
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+
+function push_lit(out: mut &String, lit: string, lit_len: u64) -> void {
+    const bytes: u8* = lit as u8*;
+    mut i: u64 = 0;
+    while (i < lit_len) {
+        out.push_byte(bytes[i]);
+        i++;
+    }
+}

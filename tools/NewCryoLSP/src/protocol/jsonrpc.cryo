@@ -1,0 +1,320 @@
+///! JSON-RPC 2.0 message types and dispatch helpers.
+///!
+///! Three message shapes per the spec:
+///!   • Request:      `{ jsonrpc, id, method, params }`
+///!   • Response:     `{ jsonrpc, id, result | error }`
+///!   • Notification: `{ jsonrpc, method, params }` — no id, no reply.
+///!
+///! Standard error codes plus the LSP-specific extensions are defined
+///! as constants. `parse_incoming` decodes a JSON body into one of:
+///!   • `IncomingMessage::Request(req)`
+///!   • `IncomingMessage::Notification(notif)`
+///!   • `IncomingMessage::Invalid(reason)` — could not decode
+
+namespace Protocol::JsonRpc;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::json::value;
+import std::json::parser;
+import std::json::serializer;
+import std::json::error;
+
+// ============================================================================
+// Standard JSON-RPC error codes
+// ============================================================================
+
+const PARSE_ERROR:            i32 = -32700;
+const INVALID_REQUEST:        i32 = -32600;
+const METHOD_NOT_FOUND:       i32 = -32601;
+const INVALID_PARAMS:         i32 = -32602;
+const INTERNAL_ERROR:         i32 = -32603;
+const SERVER_NOT_INITIALIZED: i32 = -32002;
+const REQUEST_CANCELLED:      i32 = -32800;
+const CONTENT_MODIFIED:       i32 = -32801;
+
+// ============================================================================
+// Message types
+// ============================================================================
+
+type struct RequestMessage {
+    /// `id` is opaque — JSON-RPC permits string OR number. Keeping it
+    /// as a `JsonValue` round-trips the original shape verbatim.
+    id:     JsonValue;
+    method: String;
+    params: JsonValue;
+
+    drop(mut &this) -> void {
+        this.id.drop();
+        this.method.drop();
+        this.params.drop();
+    }
+}
+
+type struct NotificationMessage {
+    method: String;
+    params: JsonValue;
+
+    drop(mut &this) -> void {
+        this.method.drop();
+        this.params.drop();
+    }
+}
+
+type struct ErrorObject {
+    code:    i32;
+    message: String;
+    data:    JsonValue;
+
+    static new(code: i32, message: String) -> ErrorObject {
+        return ErrorObject {
+            code:    code,
+            message: message,
+            data:    JsonValue::Null,
+        };
+    }
+
+    drop(mut &this) -> void {
+        this.message.drop();
+        this.data.drop();
+    }
+}
+
+type struct ResponseMessage {
+    id:     JsonValue;
+    result: JsonValue;
+    error:  Option<ErrorObject>;
+
+    static success(id: JsonValue, result: JsonValue) -> ResponseMessage {
+        return ResponseMessage {
+            id:     id,
+            result: result,
+            error:  Option::None,
+        };
+    }
+
+    static failure(id: JsonValue, err: ErrorObject) -> ResponseMessage {
+        return ResponseMessage {
+            id:     id,
+            result: JsonValue::Null,
+            error:  Option::Some(err),
+        };
+    }
+
+    drop(mut &this) -> void {
+        this.id.drop();
+        this.result.drop();
+        match (mut &this.error) {
+            Option::Some(e) => { e.drop(); }
+            Option::None    => { }
+        }
+    }
+}
+
+type enum IncomingMessage {
+    Request(RequestMessage);
+    Notification(NotificationMessage);
+    /// The body could not be decoded into a valid JSON-RPC message.
+    /// `reason` is owned; caller drops.
+    Invalid(String);
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+/// Decode the JSON body of one frame into an `IncomingMessage`.
+/// Garbage bytes, non-JSON, malformed JSON-RPC, or missing required
+/// fields all collapse into `Invalid(reason)`.
+function parse_incoming(body: Str) -> IncomingMessage {
+    match (parser::parse(body)) {
+        Result::Ok(v) => {
+            mut owned: JsonValue = v;
+            return classify(&mut owned);
+        }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            mut reason: String = String::from_str(Str::from_raw("json parse failed: " as u8*, 19));
+            mut suffix: String = err.msg;
+            // Move the error message into the reason string. err.msg
+            // was owned by err; we'll prevent the drop from freeing it
+            // by replacing it with an empty String.
+            err.msg = String::new();
+            err.drop();
+            reason.push_str(suffix.as_str());
+            suffix.drop();
+            return IncomingMessage::Invalid(reason);
+        }
+    }
+}
+
+function classify(v: mut &JsonValue) -> IncomingMessage {
+    match (v.as_object()) {
+        Option::Some(obj) => {
+            // Confirm `jsonrpc == "2.0"` — strict check prevents
+            // accidental dispatch on other RPC dialects.
+            match (obj.get(Str::from_raw("jsonrpc" as u8*, 7))) {
+                Option::Some(j) => {
+                    match (j.as_str()) {
+                        Option::Some(s) => {
+                            if (!s.equals(&Str::from_raw("2.0" as u8*, 3))) {
+                                return invalid("jsonrpc version mismatch", 24);
+                            }
+                        }
+                        Option::None => { return invalid("jsonrpc not a string", 20); }
+                    }
+                }
+                Option::None => { return invalid("missing jsonrpc field", 21); }
+            }
+
+            // method must be a string
+            mut method: String = String::new();
+            match (obj.get(Str::from_raw("method" as u8*, 6))) {
+                Option::Some(m) => {
+                    match (m.as_str()) {
+                        Option::Some(ms) => { method = String::from_str(ms); }
+                        Option::None     => { return invalid("method not a string", 19); }
+                    }
+                }
+                Option::None => { return invalid("missing method", 14); }
+            }
+
+            // params: optional, defaults to Null
+            mut params: JsonValue = JsonValue::Null;
+            match (obj.get(Str::from_raw("params" as u8*, 6))) {
+                Option::Some(p) => { params = clone_value(p); }
+                Option::None    => { }
+            }
+
+            // id absent ⇒ notification
+            match (obj.get(Str::from_raw("id" as u8*, 2))) {
+                Option::Some(id) => {
+                    return IncomingMessage::Request(RequestMessage {
+                        id:     clone_value(id),
+                        method: method,
+                        params: params,
+                    });
+                }
+                Option::None => {
+                    return IncomingMessage::Notification(NotificationMessage {
+                        method: method,
+                        params: params,
+                    });
+                }
+            }
+        }
+        Option::None => { return invalid("body not a JSON object", 22); }
+    }
+}
+
+function invalid(lit: string, lit_len: u64) -> IncomingMessage {
+    return IncomingMessage::Invalid(String::from_str(Str::from_raw(lit as u8*, lit_len)));
+}
+
+// ============================================================================
+// Cloning
+// ============================================================================
+
+/// Deep-clone a `JsonValue`. The classify path consumes `params` /
+/// `id` from the incoming object; cloning gives the caller an
+/// independently-droppable copy.
+function clone_value(v: &JsonValue) -> JsonValue {
+    return match (v) {
+        JsonValue::Null      => { JsonValue::Null }
+        JsonValue::Bool(b)   => { JsonValue::Bool(b) }
+        JsonValue::Number(n) => { clone_number(&n) }
+        JsonValue::String(s) => { JsonValue::String(String::from_str(s.as_str())) }
+        JsonValue::Array(arr) => {
+            mut out: Array<JsonValue> = Array<JsonValue>::with_capacity(arr.length());
+            mut i: u64 = 0;
+            while (i < arr.length()) {
+                out.push(clone_value(&arr.ptr[i]));
+                i++;
+            }
+            JsonValue::Array(out)
+        }
+        JsonValue::Object(obj) => {
+            mut out: JsonObject = JsonObject::with_capacity(obj.length());
+            mut i: u64 = 0;
+            while (i < obj.length()) {
+                match (obj.key_at(i)) {
+                    Option::Some(k) => {
+                        match (obj.value_at(i)) {
+                            Option::Some(vp) => {
+                                out.insert(String::from_str(k), clone_value(vp));
+                            }
+                            Option::None => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+                i++;
+            }
+            JsonValue::Object(out)
+        }
+    };
+}
+
+function clone_number(n: &JsonNumber) -> JsonValue {
+    return match (n) {
+        JsonNumber::Int(v)   => { JsonValue::Number(JsonNumber::Int(v)) }
+        JsonNumber::UInt(v)  => { JsonValue::Number(JsonNumber::UInt(v)) }
+        JsonNumber::Float(v) => { JsonValue::Number(JsonNumber::Float(v)) }
+    };
+}
+
+// ============================================================================
+// Encoding
+// ============================================================================
+
+/// Encode a response into a fresh `String`. Caller drops.
+function encode_response(resp: &ResponseMessage) -> String {
+    mut env: JsonObject = JsonObject::new();
+    env.insert(String::from_str(Str::from_raw("jsonrpc" as u8*, 7)),
+               JsonValue::String(String::from_str(Str::from_raw("2.0" as u8*, 3))));
+    env.insert(String::from_str(Str::from_raw("id" as u8*, 2)), clone_value(&resp.id));
+    match (&resp.error) {
+        Option::Some(e) => {
+            env.insert(String::from_str(Str::from_raw("error" as u8*, 5)),
+                       error_to_json(&e));
+        }
+        Option::None => {
+            env.insert(String::from_str(Str::from_raw("result" as u8*, 6)),
+                       clone_value(&resp.result));
+        }
+    }
+    mut wrapper: JsonValue = JsonValue::Object(env);
+    mut out: String = serializer::stringify(&wrapper);
+    wrapper.drop();
+    return out;
+}
+
+/// Encode a notification (server-to-client) into a fresh `String`.
+function encode_notification(method: Str, params: &JsonValue) -> String {
+    mut env: JsonObject = JsonObject::new();
+    env.insert(String::from_str(Str::from_raw("jsonrpc" as u8*, 7)),
+               JsonValue::String(String::from_str(Str::from_raw("2.0" as u8*, 3))));
+    env.insert(String::from_str(Str::from_raw("method" as u8*, 6)),
+               JsonValue::String(String::from_str(method)));
+    env.insert(String::from_str(Str::from_raw("params" as u8*, 6)),
+               clone_value(params));
+    mut wrapper: JsonValue = JsonValue::Object(env);
+    mut out: String = serializer::stringify(&wrapper);
+    wrapper.drop();
+    return out;
+}
+
+function error_to_json(e: &ErrorObject) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_raw("code" as u8*, 4)),
+             JsonValue::Number(JsonNumber::Int(e.code as i64)));
+    o.insert(String::from_str(Str::from_raw("message" as u8*, 7)),
+             JsonValue::String(String::from_str(e.message.as_str())));
+    if (!e.data.is_null()) {
+        o.insert(String::from_str(Str::from_raw("data" as u8*, 4)),
+                 clone_value(&e.data));
+    }
+    return JsonValue::Object(o);
+}

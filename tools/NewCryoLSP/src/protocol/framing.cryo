@@ -1,0 +1,220 @@
+///! Content-Length framing for LSP / JSON-RPC over stdio.
+///!
+///! Wire format:
+///!   ```
+///!   Content-Length: <decimal>\r\n
+///!   [Content-Type: ...\r\n]*
+///!   \r\n
+///!   <N raw bytes of UTF-8 JSON>
+///!   ```
+///!
+///! `read_message` returns `Ok(Some(body))` on a complete frame,
+///! `Ok(None)` on EOF, `Err` on a malformed frame. Caller buffers the
+///! reader (BufReader<Stdin>) so per-line reads don't trigger a
+///! syscall per byte.
+///!
+///! `write_message` is unbuffered on the writer side — LSP responses
+///! must flush promptly so the client sees them immediately.
+
+namespace Protocol::Framing;
+
+import std::core::option;
+import std::core::result;
+import std::io::traits;
+import std::io::error;
+import std::io::buf;
+import std::collections::str;
+import std::collections::string;
+import std::fmt::integer;
+import Util::StringOps;
+
+const HEADER_CONTENT_LENGTH:     string = "Content-Length:";
+const HEADER_CONTENT_LENGTH_LEN: u64    = 15;
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+type enum FramingError {
+    Io(IoError);
+    MissingContentLength;
+    InvalidContentLength;
+    UnexpectedEof;
+    HeaderTooLong;
+}
+
+const MAX_HEADER_LINE: u64 = 8192;
+
+// ============================================================================
+// Read
+// ============================================================================
+
+/// Read one full message body. Returns `Ok(Some(body))` for a clean
+/// frame, `Ok(None)` if EOF arrives before any byte of a frame.
+function read_message<R>(reader: mut &R) -> Result<Option<String>, FramingError>
+where R: Read {
+    mut content_length: u64 = 0;
+    mut got_length: boolean = false;
+    mut saw_any_byte: boolean = false;
+    mut line_buf: String = String::new();
+
+    loop {
+        line_buf.clear();
+        match (read_header_line(reader, &mut line_buf)) {
+            Result::Ok(line_status) => {
+                match (line_status) {
+                    LineStatus::Eof => {
+                        line_buf.drop();
+                        if (saw_any_byte) { return Result::Err(FramingError::UnexpectedEof); }
+                        return Result::Ok(Option::None);
+                    }
+                    LineStatus::Blank => {
+                        // End of headers.
+                        break;
+                    }
+                    LineStatus::Read => {
+                        saw_any_byte = true;
+                        const trimmed: Str = StringOps::trim(line_buf.as_str());
+                        if (header_is_content_length(trimmed)) {
+                            match (parse_content_length(trimmed)) {
+                                Option::Some(n) => {
+                                    content_length = n;
+                                    got_length = true;
+                                }
+                                Option::None => {
+                                    line_buf.drop();
+                                    return Result::Err(FramingError::InvalidContentLength);
+                                }
+                            }
+                        }
+                        // Other headers (Content-Type, etc.) are ignored.
+                    }
+                }
+            }
+            Result::Err(e) => {
+                line_buf.drop();
+                return Result::Err(e);
+            }
+        }
+    }
+
+    line_buf.drop();
+    if (!got_length) { return Result::Err(FramingError::MissingContentLength); }
+
+    // Read exactly content_length bytes.
+    mut body: String = String::with_capacity(content_length);
+    if (content_length == 0) { return Result::Ok(Option::Some(body)); }
+
+    // String has no `set_length` API; reserve and write through the
+    // buffer pointer, then bump the logical length via push_byte.
+    mut i: u64 = 0;
+    mut scratch: u8 = 0;
+    while (i < content_length) {
+        match (reader.read(&mut scratch, 1)) {
+            Result::Ok(n) => {
+                if (n == 0) { body.drop(); return Result::Err(FramingError::UnexpectedEof); }
+                body.push_byte(scratch);
+                i = i + 1;
+            }
+            Result::Err(e) => { body.drop(); return Result::Err(FramingError::Io(e)); }
+        }
+    }
+    return Result::Ok(Option::Some(body));
+}
+
+type enum LineStatus {
+    Eof;
+    Blank;
+    Read;
+}
+
+/// Read bytes until a `\r\n` terminator. Strips the terminator. Empty
+/// line ⇒ `LineStatus::Blank`. Caller-cleared `out` accumulates the
+/// content. Returns `Eof` if the stream ended before any byte arrived.
+function read_header_line<R>(reader: mut &R, out: mut &String) -> Result<LineStatus, FramingError>
+where R: Read {
+    mut prev_cr: boolean = false;
+    mut got_any: boolean = false;
+    mut byte: u8 = 0;
+    loop {
+        match (reader.read(&mut byte, 1)) {
+            Result::Ok(n) => {
+                if (n == 0) {
+                    if (!got_any) { return Result::Ok(LineStatus::Eof); }
+                    return Result::Err(FramingError::UnexpectedEof);
+                }
+                got_any = true;
+                if (byte == 10) {                            // \n
+                    if (prev_cr) {
+                        // Strip the trailing CR we already pushed.
+                        const cur: u64 = out.length();
+                        if (cur > 0) { out.truncate(cur - 1); }
+                    }
+                    if (out.length() == 0) { return Result::Ok(LineStatus::Blank); }
+                    return Result::Ok(LineStatus::Read);
+                }
+                if (out.length() >= MAX_HEADER_LINE) {
+                    return Result::Err(FramingError::HeaderTooLong);
+                }
+                out.push_byte(byte);
+                prev_cr = (byte == 13);
+            }
+            Result::Err(e) => { return Result::Err(FramingError::Io(e)); }
+        }
+    }
+    return Result::Ok(LineStatus::Read);
+}
+
+function header_is_content_length(line: Str) -> boolean {
+    if (line.length() < HEADER_CONTENT_LENGTH_LEN) { return false; }
+    const head: Str = line.sub_bytes(0, HEADER_CONTENT_LENGTH_LEN);
+    return head.equals(&Str::from_raw(HEADER_CONTENT_LENGTH as u8*, HEADER_CONTENT_LENGTH_LEN));
+}
+
+function parse_content_length(line: Str) -> Option<u64> {
+    const tail: Str = line.sub_bytes(HEADER_CONTENT_LENGTH_LEN, line.length());
+    const trimmed: Str = StringOps::trim(tail);
+    return integer::parse_u64(trimmed);
+}
+
+// ============================================================================
+// Write
+// ============================================================================
+
+/// Encode and write one frame: `Content-Length: N\r\n\r\n<body>`.
+/// Caller is responsible for flushing if their writer is buffered.
+function write_message<W>(writer: mut &W, body: Str) -> Result<(), IoError>
+where W: Write {
+    mut header: String = String::with_capacity(64);
+    push_lit(&mut header, "Content-Length: ", 16);
+
+    // Append the decimal length.
+    mut digits: u8[20];
+    const written: u64 = integer::write_u64_decimal(&digits[0], body.length());
+    mut i: u64 = 0;
+    while (i < written) {
+        header.push_byte(digits[i]);
+        i = i + 1;
+    }
+    header.push_byte(13); header.push_byte(10);   // \r\n
+    header.push_byte(13); header.push_byte(10);   // blank line
+
+    match (writer.write_all(header.as_ptr(), header.length())) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { header.drop(); return Result::Err(e); }
+    }
+    header.drop();
+    match (writer.write_all(body.as_ptr(), body.length())) {
+        Result::Ok(_)  => { return Result::Ok(()); }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+function push_lit(out: mut &String, lit: string, lit_len: u64) -> void {
+    const bytes: u8* = lit as u8*;
+    mut i: u64 = 0;
+    while (i < lit_len) {
+        out.push_byte(bytes[i]);
+        i++;
+    }
+}

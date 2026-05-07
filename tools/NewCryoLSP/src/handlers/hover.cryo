@@ -1,0 +1,128 @@
+///! textDocument/hover handler.
+///!
+///! Position → smallest-enclosing AST node → resolved type → markdown.
+///! For an identifier reference, we additionally resolve the symbol
+///! through `ResolutionMap` to enrich the hover with the symbol kind
+///! ("function", "variable", etc).
+
+namespace Handlers::HoverHandler;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::json::value;
+
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::Types::TypeArena;
+import Compiler::Types::TypeRef;
+
+import Protocol::LspTypes;
+import Protocol::Conv;
+
+import Server::Document;
+import Server::CompilerSession;
+import AstQuery::PositionFinder;
+
+/// Return the JSON `result` payload for a `textDocument/hover` request.
+/// Returns JSON `null` when nothing useful applies (out-of-range
+/// position, unresolved type, missing session).
+function handle(docs: &DocumentStore, compiler: &CompilerSession,
+                params: &JsonValue) -> JsonValue {
+    // Extract { textDocument: { uri }, position: { line, character } }.
+    mut uri_s: String = String::new();
+    match (params.get(Str::from_raw("textDocument" as u8*, 12))) {
+        Option::Some(td) => {
+            match (td.get(Str::from_raw("uri" as u8*, 3))) {
+                Option::Some(u) => {
+                    match (u.as_str()) {
+                        Option::Some(s) => { uri_s = String::from_str(s); }
+                        Option::None    => { return JsonValue::Null; }
+                    }
+                }
+                Option::None => { return JsonValue::Null; }
+            }
+        }
+        Option::None => { return JsonValue::Null; }
+    }
+
+    mut line0: u32 = 0;
+    mut char0: u32 = 0;
+    match (params.get(Str::from_raw("position" as u8*, 8))) {
+        Option::Some(pj) => {
+            match (Position::from_json(pj)) {
+                Result::Ok(p)  => { line0 = p.line; char0 = p.character; }
+                Result::Err(e) => { mut err: LspParseError = e; err.drop(); uri_s.drop(); return JsonValue::Null; }
+            }
+        }
+        Option::None => { uri_s.drop(); return JsonValue::Null; }
+    }
+
+    // 1-indexed for the compiler's span model.
+    const line: u32 = line0 + 1;
+    const col:  u32 = char0 + 1;
+
+    match (compiler.get(uri_s.as_str())) {
+        Option::Some(sess) => {
+            uri_s.drop();
+            if (sess.ctx == null || sess.ctx.artifacts.ast.root == null) {
+                return JsonValue::Null;
+            }
+            const node: ASTNode* = AstQuery::PositionFinder::find_node_at(
+                sess.ctx.artifacts.ast.root, line, col);
+            if (node == null) { return JsonValue::Null; }
+            return build_hover(node, sess.ctx.type_arena);
+        }
+        Option::None => { uri_s.drop(); return JsonValue::Null; }
+    }
+}
+
+/// Construct the hover payload from the located node. ExpressionNode-
+/// derived nodes carry a `resolved_type` we can render via the
+/// TypeArena's display formatter.
+function build_hover(node: ASTNode*, arena: TypeArena*) -> JsonValue {
+    if (node == null) { return JsonValue::Null; }
+
+    // Try to interpret as ExpressionNode — has resolved_type.
+    const as_expr: ExpressionNode* = node as ExpressionNode*;
+    if (as_expr == null || arena == null) {
+        return JsonValue::Null;
+    }
+    if (!as_expr.resolved_type.is_valid()) {
+        return JsonValue::Null;
+    }
+
+    const type_name: string = arena.format_display(as_expr.resolved_type);
+    if (type_name == null) { return JsonValue::Null; }
+
+    // Build "```cryo\n<type_name>\n```" — the markdown that VS Code,
+    // neovim (with cmp-nvim-lsp's built-in renderer), and Helix all
+    // render as a syntax-highlighted code block.
+    mut md: String = String::with_capacity(64);
+    push_lit(&mut md, "```cryo\n", 8);
+    mut tn_len: u64 = 0;
+    while (type_name[tn_len] != 0) { tn_len = tn_len + 1; }
+    md.push_str(Str::from_raw(type_name as u8*, tn_len));
+    md.push_byte(10);                                      // \n
+    push_lit(&mut md, "```", 3);
+
+    const span_range: Range = Protocol::Conv::span_to_range(&node.span);
+    const hover: Hover = Hover {
+        contents: MarkupContent::markdown(md),
+        range:    Option::Some(span_range),
+    };
+    mut owned: Hover = hover;
+    const result: JsonValue = owned.to_json();
+    owned.drop();
+    return result;
+}
+
+function push_lit(out: mut &String, lit: string, lit_len: u64) -> void {
+    const bytes: u8* = lit as u8*;
+    mut i: u64 = 0;
+    while (i < lit_len) {
+        out.push_byte(bytes[i]);
+        i++;
+    }
+}

@@ -1,0 +1,130 @@
+///! conv — span ↔ Range, severity-string ↔ int, file-path ↔ URI.
+///!
+///! Bridges the compiler's `SourceSpan` / `LspDiagnostic` shapes (still
+///! 1-indexed line/col + string severity) to the LSP wire shapes
+///! (0-indexed Position + integer severity).
+
+namespace Protocol::Conv;
+
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+import Compiler::Diag::Lsp;
+import Compiler::Diag::SourceSpan;
+
+import Protocol::LspTypes;
+import Util::Uri;
+
+// ============================================================================
+// LSP DiagnosticSeverity (integer per spec)
+// ============================================================================
+
+const SEVERITY_ERROR:       i32 = 1;
+const SEVERITY_WARNING:     i32 = 2;
+const SEVERITY_INFORMATION: i32 = 3;
+const SEVERITY_HINT:        i32 = 4;
+
+/// Map the compiler's severity string back to the LSP integer.
+/// Anything unrecognized falls through to `Information` — the closest
+/// "harmless" rendering in most editor themes.
+function severity_string_to_int(s: Str) -> i32 {
+    if (s.equals(&Str::from_raw("error" as u8*, 5)))       { return SEVERITY_ERROR; }
+    if (s.equals(&Str::from_raw("warning" as u8*, 7)))     { return SEVERITY_WARNING; }
+    if (s.equals(&Str::from_raw("hint" as u8*, 4)))        { return SEVERITY_HINT; }
+    if (s.equals(&Str::from_raw("information" as u8*, 11))) { return SEVERITY_INFORMATION; }
+    return SEVERITY_INFORMATION;
+}
+
+// ============================================================================
+// SourceSpan -> LSP Range
+// ============================================================================
+
+/// 1-indexed compiler span → 0-indexed LSP range. Spans without a
+/// location collapse to `{start: 0:0, end: 0:0}` per LSP convention
+/// for whole-file diagnostics.
+function span_to_range(span: &SourceSpan) -> Range {
+    if (!span.has_location()) { return Range::zero(); }
+    mut sl: u32 = 0;
+    mut sc: u32 = 0;
+    mut el: u32 = 0;
+    mut ec: u32 = 0;
+    if (span.start_line > 0) { sl = span.start_line - 1; }
+    if (span.start_col  > 0) { sc = span.start_col  - 1; }
+    if (span.end_line   > 0) { el = span.end_line   - 1; }
+    if (span.end_col    > 0) { ec = span.end_col    - 1; }
+    return Range {
+        start: Position::new(sl, sc),
+        end:   Position::new(el, ec),
+    };
+}
+
+// ============================================================================
+// LspDiagnostic (compiler shape) -> LSP wire JSON
+// ============================================================================
+
+/// Convert one compiler-side `LspDiagnostic` into an LSP-spec
+/// JsonValue. Severity becomes an integer; range is taken as-is
+/// (already 0-indexed by `LspRange::from_span`); related info is
+/// emitted in spec order.
+function compiler_diag_to_json(diag: &LspDiagnostic) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+
+    // range
+    mut r: Range = Range {
+        start: Position::new(diag.range.start_line, diag.range.start_char),
+        end:   Position::new(diag.range.end_line,   diag.range.end_char),
+    };
+    o.insert(string_from_lit("range"), r.to_json());
+
+    // severity (integer)
+    o.insert(string_from_lit("severity"),
+             JsonValue::Number(JsonNumber::Int(
+                severity_string_to_int(diag.severity.as_str()) as i64)));
+
+    // code (string is fine per spec)
+    o.insert(string_from_lit("code"),
+             JsonValue::String(String::from_str(diag.code.as_str())));
+
+    // source — identifies the producer in the editor UI
+    o.insert(string_from_lit("source"),
+             JsonValue::String(String::from_str(Str::from_raw("cryo" as u8*, 4))));
+
+    // message
+    o.insert(string_from_lit("message"),
+             JsonValue::String(String::from_str(diag.message.as_str())));
+
+    // related information
+    if (diag.related.length() > 0) {
+        mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(diag.related.length());
+        mut i: u64 = 0;
+        while (i < diag.related.length()) {
+            const r: LspRelatedInfo = diag.related.ptr[i];
+            mut rel: JsonObject = JsonObject::new();
+            mut loc: JsonObject = JsonObject::new();
+            mut uri: String = Util::Uri::path_to_uri(r.uri.as_str());
+            loc.insert(string_from_lit("uri"), JsonValue::String(uri));
+            mut rng: Range = Range {
+                start: Position::new(r.range.start_line, r.range.start_char),
+                end:   Position::new(r.range.end_line,   r.range.end_char),
+            };
+            loc.insert(string_from_lit("range"), rng.to_json());
+            rel.insert(string_from_lit("location"), JsonValue::Object(loc));
+            rel.insert(string_from_lit("message"),
+                       JsonValue::String(String::from_str(r.message.as_str())));
+            arr.push(JsonValue::Object(rel));
+            i++;
+        }
+        o.insert(string_from_lit("relatedInformation"), JsonValue::Array(arr));
+    }
+
+    return JsonValue::Object(o);
+}
+
+function string_from_lit(lit: string) -> String {
+    mut len: u64 = 0;
+    const ptr: u8* = lit as u8*;
+    while (ptr[len] != 0) { len = len + 1; }
+    return String::from_str(Str::from_raw(ptr, len));
+}

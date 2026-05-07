@@ -1,0 +1,110 @@
+///! textDocument/definition handler.
+///!
+///! Position → identifier-bearing AST node → ResolutionMap.resolve
+///! → Symbol.declaring_span → LSP Location.
+
+namespace Handlers::DefinitionHandler;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+import Compiler::AST::Node;
+import Compiler::Resolver;
+import Compiler::Resolver::Symbol;
+import Compiler::Resolver::ResolutionMap;
+import Compiler::Diag::SourceSpan;
+
+import Protocol::LspTypes;
+import Protocol::Conv;
+
+import Server::Document;
+import Server::CompilerSession;
+import AstQuery::PositionFinder;
+import Util::Uri;
+
+/// Return either:
+///   • `null`              — no definition found.
+///   • `Location[]` (single element) — the declaring span as a URI +
+///     range. LSP allows an array of locations; v1 always returns
+///     exactly one.
+function handle(docs: &DocumentStore, compiler: &CompilerSession,
+                params: &JsonValue) -> JsonValue {
+    mut uri_s: String = String::new();
+    match (params.get(Str::from_raw("textDocument" as u8*, 12))) {
+        Option::Some(td) => {
+            match (td.get(Str::from_raw("uri" as u8*, 3))) {
+                Option::Some(u) => {
+                    match (u.as_str()) {
+                        Option::Some(s) => { uri_s = String::from_str(s); }
+                        Option::None    => { return JsonValue::Null; }
+                    }
+                }
+                Option::None => { return JsonValue::Null; }
+            }
+        }
+        Option::None => { return JsonValue::Null; }
+    }
+
+    mut line0: u32 = 0;
+    mut char0: u32 = 0;
+    match (params.get(Str::from_raw("position" as u8*, 8))) {
+        Option::Some(pj) => {
+            match (Position::from_json(pj)) {
+                Result::Ok(p)  => { line0 = p.line; char0 = p.character; }
+                Result::Err(e) => { mut err: LspParseError = e; err.drop(); uri_s.drop(); return JsonValue::Null; }
+            }
+        }
+        Option::None => { uri_s.drop(); return JsonValue::Null; }
+    }
+
+    const line: u32 = line0 + 1;
+    const col:  u32 = char0 + 1;
+
+    match (compiler.get(uri_s.as_str())) {
+        Option::Some(sess) => {
+            uri_s.drop();
+            if (sess.ctx == null || sess.ctx.artifacts.ast.root == null) { return JsonValue::Null; }
+            const node: ASTNode* = AstQuery::PositionFinder::find_node_at(
+                sess.ctx.artifacts.ast.root, line, col);
+            if (node == null) { return JsonValue::Null; }
+            return resolve_to_location(node, sess.ctx.resolver);
+        }
+        Option::None => { uri_s.drop(); return JsonValue::Null; }
+    }
+}
+
+function resolve_to_location(node: ASTNode*, resolver: Resolver*) -> JsonValue {
+    if (resolver == null || resolver.resolution_map == null) {
+        return JsonValue::Null;
+    }
+    const sym_id: u32 = resolver.resolution_map.resolve(&node.span);
+    if (sym_id == 0) { return JsonValue::Null; }
+    const sym: Symbol* = resolver.get_symbol(sym_id);
+    if (sym == null) { return JsonValue::Null; }
+    if (!sym.declaring_span.has_location()) { return JsonValue::Null; }
+
+    const range: Range = Protocol::Conv::span_to_range(&sym.declaring_span);
+    mut uri: String = Util::Uri::path_to_uri(
+        Str::from_raw(sym.declaring_span.file as u8*,
+                       file_path_len(sym.declaring_span.file)));
+    const loc: Location = Location { uri: uri, range: range };
+
+    // Wrap in a single-element array so the response shape is stable
+    // (clients prefer `Location[]` over `Location` for "definition").
+    mut arr: Array<JsonValue> = Array<JsonValue>::new();
+    mut owned: Location = loc;
+    arr.push(owned.to_json());
+    owned.drop();
+    return JsonValue::Array(arr);
+}
+
+function file_path_len(p: string) -> u64 {
+    if (p == null) { return 0; }
+    mut n: u64 = 0;
+    while (p[n] != 0) { n = n + 1; }
+    return n;
+}

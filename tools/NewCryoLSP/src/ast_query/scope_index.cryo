@@ -1,0 +1,48 @@
+///! ScopeIndex — span → ScopeID lookup for completion.
+///!
+///! v1 implementation: linear search over `resolver.scopes[]`. For
+///! each scope, check whether its `span` contains the cursor; the
+///! smallest containing scope wins. O(n) per query but n is small for
+///! typical files (hundreds of scopes).
+///!
+///! v1.1 will tree-build a span → ScopeID map post-NameResolution so
+///! lookup is O(log n). The shape of `find_enclosing_scope` doesn't
+///! change.
+
+namespace AstQuery::ScopeIndex;
+
+import Compiler::Resolver;
+import Compiler::Resolver::Scope;
+import Compiler::Diag::SourceSpan;
+
+/// Find the smallest scope whose span contains `(line, col)`. Returns
+/// the scope id, or `0` (the global scope ID convention) if no match.
+function find_enclosing_scope(resolver: Resolver*, line: u32, col: u32) -> u32 {
+    if (resolver == null) { return 0; }
+    mut best_id:    u32 = 0;
+    mut best_width: u64 = 0xFFFFFFFFFFFFFFFF;
+    for (mut i: int = 0; i < resolver.scopes.length; i++) {
+        const sc: Scope* = &resolver.scopes[i];
+        if (sc == null) { continue; }
+        if (!sc.span.has_location()) { continue; }
+        if (line < sc.span.start_line || line > sc.span.end_line) { continue; }
+        if (line == sc.span.start_line && col < sc.span.start_col) { continue; }
+        if (line == sc.span.end_line   && col > sc.span.end_col)   { continue; }
+        const w: u64 = scope_width(&sc.span);
+        if (w < best_width) {
+            best_id    = sc.id;
+            best_width = w;
+        }
+    }
+    return best_id;
+}
+
+function scope_width(span: SourceSpan*) -> u64 {
+    if (span.start_line == span.end_line) {
+        if (span.end_col >= span.start_col) {
+            return (span.end_col - span.start_col) as u64;
+        }
+        return 0;
+    }
+    return ((span.end_line - span.start_line) as u64) * 1000000;
+}
