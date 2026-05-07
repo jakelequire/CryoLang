@@ -316,7 +316,7 @@ type struct Parser {
             const buf: u8* = malloc(literal_len + 1);
             intrinsics::memcpy(buf as void*, (this.src + start) as void*, literal_len);
             buf[literal_len] = 0;
-            const v: f64 = libc_strtod(buf, null);
+            const v: f64 = strtod(buf, null);
             free(buf as void*);
             return Result::Ok(JsonValue::Number(JsonNumber::Float(v)));
         }
@@ -324,6 +324,12 @@ type struct Parser {
         // Integer path — parse digits directly without going through libc.
         // For the negative case we accumulate as u64 and negate at the end;
         // i64::MIN is exactly -2^63, which fits as u64 magnitude 2^63.
+        // Hoisted u64 constants below: inline literals exceeding i64::MAX
+        // don't get promoted when compared against a u64 (Cryo quirk),
+        // so we name them with explicit u64 type.
+        const U64_DIV10:    u64 = 1844674407370955161;  // u64::MAX / 10
+        const I64_MAX_U64:  u64 = 9223372036854775807;  // i64::MAX as u64
+        const I64_MIN_MAG:  u64 = 9223372036854775808;  // |i64::MIN| as u64
         mut acc: u64 = 0;
         mut i: u64 = start;
         if (negative) { i = i + 1; }
@@ -331,7 +337,7 @@ type struct Parser {
         while (i < end) {
             const d: u64 = (this.src[i] - ZERO) as u64;
             // Check for overflow: if acc would exceed (u64::MAX - d) / 10.
-            if (acc > 1844674407370955161) {
+            if (acc > U64_DIV10) {
                 overflow = true;
                 break;
             }
@@ -349,14 +355,13 @@ type struct Parser {
         }
 
         if (negative) {
-            // i64::MIN is -9223372036854775808; magnitude 9223372036854775808 (=1<<63).
-            if (acc > 9223372036854775808) {
+            if (acc > I64_MIN_MAG) {
                 return Result::Err(this.err_at(
                     JsonErrorKind::InvalidNumber,
                     Str::from_raw("integer overflow" as u8*, 16)
                 ));
             }
-            if (acc == 9223372036854775808) {
+            if (acc == I64_MIN_MAG) {
                 // i64::MIN
                 return Result::Ok(JsonValue::Number(JsonNumber::Int(-9223372036854775808)));
             }
@@ -364,7 +369,7 @@ type struct Parser {
             return Result::Ok(JsonValue::Number(JsonNumber::Int(v)));
         }
 
-        if (acc <= 9223372036854775807) {
+        if (acc <= I64_MAX_U64) {
             return Result::Ok(JsonValue::Number(JsonNumber::Int(acc as i64)));
         }
         return Result::Ok(JsonValue::Number(JsonNumber::UInt(acc)));
@@ -558,13 +563,13 @@ type struct Parser {
             match (this.parse_value()) {
                 Result::Ok(v)  => { arr.push(v); }
                 Result::Err(e) => {
-                    drop_array(&mut arr);
+                    drop_array(&arr);
                     return Result::Err(e);
                 }
             }
             this.skip_ws();
             if (this.eof()) {
-                drop_array(&mut arr);
+                drop_array(&arr);
                 return Result::Err(this.err_eof());
             }
             const b: u8 = this.peek();
@@ -574,7 +579,7 @@ type struct Parser {
                 this.depth = this.depth - 1;
                 return Result::Ok(JsonValue::Array(arr));
             }
-            drop_array(&mut arr);
+            drop_array(&arr);
             return Result::Err(this.err_at(
                 JsonErrorKind::UnexpectedChar,
                 Str::from_raw("expected ',' or ']'" as u8*, 19)
@@ -717,8 +722,9 @@ function encode_utf8(out: mut &String, cp: u32) -> Result<(), JsonError> {
 /// strtod from libc — used to parse JSON floats. Cryo doesn't yet
 /// have a native arbitrary-precision float parser; strtod is well-
 /// specified for IEEE 754 round-trip on most platforms.
-extern function libc_strtod(nptr: u8*, endptr: u8**) -> f64
-    asm "strtod";
+extern "C" {
+    function strtod(nptr: u8*, endptr: u8**) -> f64;
+}
 
 // ============================================================================
 // Public entry point
