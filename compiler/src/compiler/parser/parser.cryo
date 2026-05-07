@@ -282,8 +282,14 @@ public:
             return func;
         }
 
-        // Variable declaration: const or mut
+        // Variable declaration: const or mut.  If the next-after token is `{`
+        // it's a struct destructure binding (`const { f }: T = expr;`); these
+        // are body-only (no global destructures), so the global path stays on
+        // the VarDeclNode form.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
+            if (this.peek_at(1).kind == TokenType::LBrace && this.scope_depth > 0) {
+                return this.parse_destructure_decl();
+            }
             const vd: VarDeclNode* = this.parse_variable_declaration();
             if (vd != null) {
                 if (doc != "") { vd.set_documentation(doc); }
@@ -392,6 +398,99 @@ public:
         return node;
     }
 
+    /// Parse a struct destructure declaration: `const { f1, f2: alias, mut f3 }: T = expr;`.
+    /// Caller has confirmed the next-after-const/mut token is `{`.
+    parse_destructure_decl() -> DestructureDeclNode* {
+        const start: Token = this.current();
+        const is_mutable: boolean = this.current().kind == TokenType::KwMut;
+        this.advance(); // consume 'const' or 'mut'
+
+        mut node: DestructureDeclNode* = new DestructureDeclNode(this.span_from_token(start));
+        node.set_mutable(is_mutable);
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        // Comma-separated bindings.  Empty `{}` is rejected here — the user
+        // can express "consume without binding" with a unit-pattern when we
+        // add rest-patterns post-v1.
+        if (this.check(TokenType::RBrace)) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "destructure pattern must bind at least one field");
+        }
+
+        mut first: boolean = true;
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            if (!first) {
+                if (!this.match_tok(TokenType::Comma)) { break; }
+                if (this.check(TokenType::RBrace)) { break; } // trailing comma
+            }
+            first = false;
+
+            const entry_start: Token = this.current();
+
+            // Optional per-field `mut`
+            mut entry_mut: boolean = false;
+            if (this.check(TokenType::KwMut)) {
+                this.advance();
+                entry_mut = true;
+            }
+
+            // Source field name
+            mut field_tok: Token = this.current();
+            if (field_tok.kind == TokenType::Identifier || field_tok.kind.is_keyword()) {
+                this.advance();
+            } else {
+                field_tok = this.consume(TokenType::Identifier, "field name");
+            }
+            const source_field: SymbolStr = this.intern_lexeme(field_tok);
+            const field_span: SourceSpan = this.span_from_token(field_tok);
+
+            // Optional `: alias` rename
+            mut local_name: SymbolStr = source_field;
+            mut name_span: SourceSpan = field_span;
+            if (this.match_tok(TokenType::Colon)) {
+                mut alias_tok: Token = this.current();
+                if (alias_tok.kind == TokenType::Identifier || alias_tok.kind.is_keyword()) {
+                    this.advance();
+                } else {
+                    alias_tok = this.consume(TokenType::Identifier, "rename target");
+                }
+                local_name = this.intern_lexeme(alias_tok);
+                name_span = this.span_from_token(alias_tok);
+            }
+
+            const entry_span: SourceSpan = this.span_from(entry_start);
+            const binding: DestructureBinding = DestructureBinding::new(
+                source_field, local_name, entry_mut || is_mutable,
+                entry_span, name_span);
+            node.add_binding(binding);
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+
+        // Required `: Type` annotation
+        if (this.match_tok(TokenType::Colon)) {
+            const type_ann: TypeAnnotation* = this.parse_type_annotation();
+            node.set_type_annotation(type_ann);
+        } else {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "destructure binding requires ': Type' after the pattern");
+        }
+
+        // Initializer is mandatory for destructure (can't bind fields of nothing)
+        if (this.match_tok(TokenType::Equal)) {
+            const init: ExpressionNode* = this.parse_expression();
+            node.set_initializer(init);
+        } else {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "destructure binding requires an initializer (`= expr`)");
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+        node.span = this.span_from(start);
+        return node;
+    }
+
     /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
     /// The leading `function` keyword is optional: trait bodies use the
     /// keyword-less `name(params) -> RetType;` form for declarations.
@@ -431,7 +530,13 @@ public:
                 // that's parse_parameter's signal for variadic.  Set the
                 // flag (so the LLVM decl is emitted with `...`) but still
                 // add the parameter so `args` is in scope inside the body.
-                if (p.type_annotation == null && i == params.length - 1) {
+                // Bare `this` (value-receiver) ALSO arrives here with no
+                // annotation; the `&this` form already synthesizes one to
+                // dodge this heuristic, but `this` does not — exclude it
+                // by name so a method like `leak(mut this) -> T*` isn't
+                // miscategorized as variadic.
+                if (p.type_annotation == null && i == params.length - 1
+                        && !p.name.equals(this.ctx.intern("this"))) {
                     func.set_variadic(true);
                 }
                 func.add_parameter(p);
@@ -801,7 +906,8 @@ public:
             const params: VarDeclNode*[] = this.parse_parameter_list();
             for (mut i: int = 0; i < params.length; i++) {
                 const p: VarDeclNode* = params[i];
-                if (p.type_annotation == null && i == params.length - 1) {
+                if (p.type_annotation == null && i == params.length - 1
+                        && !p.name.equals(this.ctx.intern("this"))) {
                     func.set_variadic(true);
                 }
                 func.add_parameter(p);
@@ -916,7 +1022,8 @@ public:
             const params: VarDeclNode*[] = this.parse_parameter_list();
             for (mut i: int = 0; i < params.length; i++) {
                 const p: VarDeclNode* = params[i];
-                if (p.type_annotation == null && i == params.length - 1) {
+                if (p.type_annotation == null && i == params.length - 1
+                        && !p.name.equals(this.ctx.intern("this"))) {
                     func.set_variadic(true);
                 }
                 func.add_parameter(p);
@@ -2042,8 +2149,17 @@ public:
             return this.parse_unsafe_block();
         }
 
-        // Variable declarations (as statements)
+        // Variable declarations (as statements).  Peek past `const`/`mut`:
+        // if the next token is `{`, this is a struct destructure binding
+        // (`const { f }: T = expr;`); otherwise the standard var decl path.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
+            if (this.peek_at(1).kind == TokenType::LBrace) {
+                const dd: DestructureDeclNode* = this.parse_destructure_decl();
+                if (dd != null) {
+                    return new DeclStmtNode(dd, dd.span);
+                }
+                return null;
+            }
             const var_decl: VarDeclNode* = this.parse_variable_declaration();
             if (var_decl != null) {
                 return new DeclStmtNode(var_decl, var_decl.span);

@@ -1093,6 +1093,8 @@ public:
             const dk: NodeKind = decl.kind;
             if (dk == NodeKind::VariableDeclaration) {
                 this.visit_var_decl(decl as VarDeclNode*);
+            } else if (dk == NodeKind::DestructureDeclaration) {
+                this.visit_destructure_decl(decl as DestructureDeclNode*);
             }
         }
     }
@@ -1106,6 +1108,77 @@ public:
         }
         codegen_local_var(this.cg, node.name, node.resolved_type,
                           init_val, has_init, node.span);
+    }
+
+    /// Lower a struct destructure declaration into N field reads + N allocas.
+    /// Picks `extractvalue` (for SSA struct values) vs `struct_gep + load`
+    /// (for stored structs) per source — same dispatch as codegen_member_access.
+    visit_destructure_decl(mut &this, node: DestructureDeclNode*) -> void {
+        if (node.initializer == null) { return; }
+        if (!node.resolved_type.is_valid()) { return; }
+
+        // Pull the struct fields off the resolved type so we can map binding
+        // names → field indices.
+        const ty: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        if (ty == null) { return; }
+
+        mut fields_arr: FieldInfo[] = [];
+        if (ty.kind == TypeKind::Struct) {
+            const st: StructType* = ty as StructType*;
+            fields_arr = st.fields;
+        } else if (ty.kind == TypeKind::Class) {
+            const ct: ClassType* = ty as ClassType*;
+            fields_arr = ct.fields;
+        } else {
+            return;  // sema already errored on non-struct destructure
+        }
+
+        const struct_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (!struct_lty.is_valid()) { return; }
+
+        // Codegen the initializer once.  `last_value`/`last_is_lvalue` after
+        // generate_expression mirror the conventions used by member-access:
+        // an alloca pointer (lvalue) or an SSA struct value (rvalue).  The
+        // LLVMTypeOf check below is the same defensive recheck that
+        // codegen_member_access does — under opaque pointers an alloca
+        // address is `ptr` (kind 12), so a kind-10 (struct) means the
+        // value is already in SSA form, regardless of last_is_lvalue.
+        this.generate_expression(node.initializer);
+        const src_val: LValue = this.last_value;
+        if (!src_val.is_valid()) { return; }
+
+        const src_llvm_ty: void* = llvm::LLVMTypeOf(src_val.raw);
+        const src_is_struct_value: boolean = src_llvm_ty != null
+            && llvm::LLVMGetTypeKind(src_llvm_ty) == 10;
+
+        for (mut i: i64 = 0; i < node.bindings.length; i++) {
+            const b: DestructureBinding = node.bindings[i];
+            if (!b.resolved_type.is_valid()) { continue; }
+
+            mut field_idx: i64 = -1;
+            for (mut k: i64 = 0; k < fields_arr.length; k++) {
+                if (fields_arr[k].name.id == b.source_field.id) {
+                    field_idx = k;
+                    break;
+                }
+            }
+            if (field_idx < 0) { continue; }
+
+            mut field_val: LValue = LValue::null();
+            if (src_is_struct_value) {
+                field_val = this.cg.builder.build_extract_value(
+                    src_val, field_idx as u32, "destruct.field");
+            } else {
+                const field_ptr: LValue = this.cg.builder.build_struct_gep(
+                    struct_lty, src_val, field_idx as u32, "destruct.fieldptr");
+                const field_lty: LType = this.cg.type_mapper.map_type(b.resolved_type);
+                if (!field_lty.is_valid()) { continue; }
+                field_val = this.cg.builder.build_load(field_lty, field_ptr, "destruct.fieldval");
+            }
+
+            codegen_local_var(this.cg, b.local_name, b.resolved_type,
+                              field_val, true, b.span);
+        }
     }
 
 

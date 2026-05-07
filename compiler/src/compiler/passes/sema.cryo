@@ -1043,6 +1043,10 @@ public:
     visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
+        if (decl.kind == NodeKind::DestructureDeclaration) {
+            this.visit_destructure_decl(decl as DestructureDeclNode*);
+            return;
+        }
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
 
         const var_node: VarDeclNode* = decl as VarDeclNode*;
@@ -1128,6 +1132,184 @@ public:
             // No type annotation resolved and no initializer — register with void
             // to keep the variable visible in scope.
             this.register_local(var_node.name, this.arena.get_void());
+        }
+    }
+
+    /// Type-check a struct destructure declaration: `const { f1, f2: alias }: T = expr;`.
+    /// Validates the RHS resolves to a struct/class, that every binding entry
+    /// names a real field, that no field is duplicated, and that all of the
+    /// type's fields are bound (until rest patterns land).  Registers each
+    /// local with its field's resolved type.
+    visit_destructure_decl(mut &this, node: DestructureDeclNode*) -> void {
+        // Lazy-resolve the type annotation (mirrors visit_decl_stmt's pattern).
+        if (!node.has_resolved_type() && node.type_annotation != null
+                && this.ctx.type_resolver != null) {
+            mut res_ctx: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            const ttype: TypeRef = this.ctx.type_resolver.resolve(
+                node.type_annotation, &res_ctx);
+            if (ttype.is_valid()) {
+                node.resolved_type = ttype;
+            }
+        }
+
+        // Resolve and type-check the initializer against the declared type.
+        if (node.has_initializer()) {
+            const saved_expected: TypeRef = this.expected_type;
+            if (node.has_resolved_type()) {
+                this.expected_type = node.resolved_type;
+            }
+            const init_type: TypeRef = this.resolve_expr(node.initializer);
+            this.expected_type = saved_expected;
+            if (node.has_resolved_type() && init_type.is_valid()) {
+                if (!this.checker.can_assign(init_type, node.resolved_type)) {
+                    const decl_ty: Type* = this.arena.lookup(node.resolved_type.id);
+                    const init_ty: Type* = this.arena.lookup(init_type.id);
+                    const decl_sym: SymbolStr = this.intern.intern(
+                        if (decl_ty != null) { this.arena.format_display(decl_ty) } else { "?" });
+                    const init_sym: SymbolStr = this.intern.intern(
+                        if (init_ty != null) { this.arena.format_display(init_ty) } else { "?" });
+                    const decl_name: string = this.intern.resolve(decl_sym);
+                    const init_name: string = this.intern.resolve(init_sym);
+                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                        format("cannot destructure value of type '%s' as '%s'",
+                            init_name, decl_name),
+                        node.span);
+                }
+            }
+        }
+
+        // Look up the struct fields and validate each binding.  If the
+        // declared type doesn't resolve to a struct/class with a populated
+        // field list, register all bindings as void so downstream uses don't
+        // emit cascading "undefined variable" errors.
+        if (!node.has_resolved_type()) {
+            this.register_destructure_locals_void(node);
+            return;
+        }
+
+        const ty: Type* = this.arena.lookup(node.resolved_type.id);
+        if (ty == null) {
+            this.register_destructure_locals_void(node);
+            return;
+        }
+
+        // Pull fields off StructType / ClassType.  Other type kinds (Reference,
+        // Pointer, primitives, etc.) are not destructurable.
+        mut fields_ptr: FieldInfo[] = [];
+        mut got_fields: boolean = false;
+        if (ty.kind == TypeKind::Struct) {
+            const st: StructType* = ty as StructType*;
+            fields_ptr = st.fields;
+            got_fields = true;
+        } else if (ty.kind == TypeKind::Class) {
+            const ct: ClassType* = ty as ClassType*;
+            fields_ptr = ct.fields;
+            got_fields = true;
+        }
+
+        if (!got_fields) {
+            const ty_sym: SymbolStr = this.intern.intern(this.arena.format_display(ty));
+            const ty_name: string = this.intern.resolve(ty_sym);
+            this.ctx.emit_error_at(ErrorCode::E0361_DESTRUCTURE_NON_STRUCT,
+                format("cannot destructure non-struct type '%s'", ty_name),
+                node.span);
+            this.register_destructure_locals_void(node);
+            return;
+        }
+
+        // For each binding entry: look up field by source name, check for
+        // duplicates among earlier bindings, write the resolved type back to
+        // the AST, and register the local in scope.
+        for (mut i: i64 = 0; i < node.bindings.length; i++) {
+            mut b: DestructureBinding = node.bindings[i];
+
+            // Duplicate detection: walk earlier bindings.
+            mut dup: boolean = false;
+            for (mut j: i64 = 0; j < i; j++) {
+                if (node.bindings[j].source_field.id == b.source_field.id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                const dup_name: string = this.intern.resolve(b.source_field);
+                this.ctx.emit_error_at(ErrorCode::E0356_DUPLICATE_FIELD,
+                    format("field '%s' bound more than once in destructure", dup_name),
+                    b.span);
+                this.register_local_with_mut(b.local_name, this.arena.get_void(),
+                    b.is_mutable);
+                continue;
+            }
+
+            // Field lookup.
+            mut field_type: TypeRef = TypeRef::invalid();
+            mut found: boolean = false;
+            for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+                if (fields_ptr[k].name.id == b.source_field.id) {
+                    field_type = fields_ptr[k].field_type;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                const field_name: string = this.intern.resolve(b.source_field);
+                const ty_sym: SymbolStr = this.intern.intern(this.arena.format_display(ty));
+                const ty_name: string = this.intern.resolve(ty_sym);
+                this.ctx.emit_error_at(ErrorCode::E0350_STRUCT_FIELD_NOT_FOUND,
+                    format("field '%s' not found on type '%s'", field_name, ty_name),
+                    b.span);
+                this.register_local_with_mut(b.local_name, this.arena.get_void(),
+                    b.is_mutable);
+                continue;
+            }
+
+            // Write field type back to the binding so codegen has it without
+            // re-doing the lookup.
+            b.resolved_type = field_type;
+            node.bindings[i] = b;
+
+            // Register in scope.
+            this.register_local_with_mut(b.local_name, field_type, b.is_mutable);
+        }
+
+        // Completeness check: every field of the struct must be bound.
+        // (Rest patterns are post-v1; until then, partial destructure is
+        // an error rather than implicitly leaving fields un-moved.)
+        if (node.bindings.length < fields_ptr.length) {
+            mut missing: string = "";
+            mut count: i64 = 0;
+            for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+                mut bound: boolean = false;
+                for (mut bi: i64 = 0; bi < node.bindings.length; bi++) {
+                    if (node.bindings[bi].source_field.id == fields_ptr[k].name.id) {
+                        bound = true;
+                        break;
+                    }
+                }
+                if (!bound) {
+                    if (count > 0) { missing = format("%s, %s", missing, this.intern.resolve(fields_ptr[k].name)); }
+                    else { missing = this.intern.resolve(fields_ptr[k].name); }
+                    count++;
+                }
+            }
+            const ty_sym: SymbolStr = this.intern.intern(this.arena.format_display(ty));
+            const ty_name: string = this.intern.resolve(ty_sym);
+            this.ctx.emit_error_at(ErrorCode::E0362_DESTRUCTURE_INCOMPLETE,
+                format("destructure of '%s' must bind all %lld field(s); missing: %s",
+                    ty_name, fields_ptr.length, missing),
+                node.span);
+        }
+    }
+
+    /// Fallback: register every destructure binding as a void-typed local.
+    /// Used when the declared type doesn't resolve, so downstream uses of the
+    /// new bindings still find them in scope (avoiding cascading errors).
+    register_destructure_locals_void(mut &this, node: DestructureDeclNode*) -> void {
+        for (mut i: i64 = 0; i < node.bindings.length; i++) {
+            const b: DestructureBinding = node.bindings[i];
+            this.register_local_with_mut(b.local_name, this.arena.get_void(),
+                b.is_mutable);
         }
     }
 
