@@ -442,9 +442,12 @@ type struct DropInserter {
             }
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-                if (ds.declaration != null &&
-                    ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    this.walk_var_decl(ds.declaration as VarDeclNode*);
+                if (ds.declaration != null) {
+                    if (ds.declaration.kind == NodeKind::VariableDeclaration) {
+                        this.walk_var_decl(ds.declaration as VarDeclNode*);
+                    } else if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                        this.walk_destructure_decl(ds.declaration as DestructureDeclNode*);
+                    }
                 }
                 out.push(stmt);
                 false
@@ -507,6 +510,22 @@ type struct DropInserter {
         }
         if (!vd.is_global) {
             this.register_binding(vd.name, vd.resolved_type, vd.span);
+        }
+    }
+
+    /// Destructure declaration: consumes the RHS (sema enforces "all fields
+    /// bound" via E0362, so by the time we get here the RHS is fully moved
+    /// out).  walk_expr_move marks the RHS identifier (if any) as moved.
+    /// Each new field local registers as an owned binding with its own
+    /// scope-end drop, identical to a normal VarDecl.
+    walk_destructure_decl(mut &this, dd: DestructureDeclNode*) -> void {
+        if (dd == null) { return; }
+        if (dd.initializer != null) {
+            this.walk_expr_move(dd.initializer);
+        }
+        for (mut i: i64 = 0; i < dd.bindings.length; i++) {
+            const b: DestructureBinding = dd.bindings[i];
+            this.register_binding(b.local_name, b.resolved_type, b.span);
         }
     }
 
