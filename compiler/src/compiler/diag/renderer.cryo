@@ -300,19 +300,30 @@ type struct DiagRenderer {
         // 1. Header line:  error[E0200]: message
         this.render_header(diag);
 
-        // 2. Primary span snippet (if present)
+        // 2. Primary + same-file secondaries: combined snippet when
+        //    any secondary lives in the primary's file (rustc-style:
+        //    one snippet block, line groups separated by `...`).
+        //    Otherwise fall back to the single-span snippet.
         if (diag.span.has_location()) {
             this.load_source(diag.span.file);
-            this.render_snippet(diag.span, diag.severity, diag.message);
+            if (this.has_same_file_secondary(diag)) {
+                this.render_combined_snippet(diag);
+            } else {
+                this.render_snippet(diag.span, diag.severity, diag.message);
+            }
         }
 
-        // 3. Secondary span labels
+        // 3. Cross-file secondary labels (rendered as separate snippets
+        //    since they can't share a margin with the primary).
         for (mut i: int = 0; i < diag.labels.length; i++) {
             const label: SpanLabel = diag.labels[i];
-            if (!label.is_primary && label.span.has_location()) {
-                this.load_source(label.span.file);
-                this.render_secondary_span(label);
+            if (label.is_primary) { continue; }
+            if (!label.span.has_location()) { continue; }
+            if (label.span.file == diag.span.file && diag.span.has_location()) {
+                continue;  // already rendered in the combined block
             }
+            this.load_source(label.span.file);
+            this.render_secondary_span(label);
         }
 
         // 4. Children (notes, helps)
@@ -329,6 +340,21 @@ type struct DiagRenderer {
 
         // Trailing blank line for separation
         fprintf(g_stderr, "\n");
+    }
+
+    /// True iff the diagnostic has at least one secondary label that
+    /// shares the primary span's file. Cross-file secondaries are kept
+    /// out of the combined block so the margin/line numbers stay
+    /// coherent.
+    has_same_file_secondary(&this, diag: Diagnostic) -> boolean {
+        if (!diag.span.has_location()) { return false; }
+        for (mut i: int = 0; i < diag.labels.length; i++) {
+            const lbl: SpanLabel = diag.labels[i];
+            if (lbl.is_primary) { continue; }
+            if (!lbl.span.has_location()) { continue; }
+            if (lbl.span.file == diag.span.file) { return true; }
+        }
+        return false;
     }
 
     /// Render the header line:  error[E0200]: message
@@ -427,6 +453,223 @@ type struct DiagRenderer {
         const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
         fprintf(g_stderr, " %*s %s|%s\n", line_width, "", blue, reset);
+    }
+
+    /// Render an ellipsis line that separates non-adjacent line groups
+    /// in a combined snippet:  "..."
+    render_ellipsis(&this, line_width: u32) -> void {
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+        fprintf(g_stderr, "%s%*s...%s\n", blue, line_width, "", reset);
+    }
+
+    /// Width of the largest line number a combined snippet will render,
+    /// used to align the margin column. Mirrors the per-snippet rule of
+    /// "minimum 3 digits, scale up past 999/9999".
+    line_number_width(&this, max_line: u32) -> u32 {
+        mut w: u32 = 3;
+        if (max_line > 999)   { w = 4; }
+        if (max_line > 9999)  { w = 5; }
+        if (max_line > 99999) { w = 6; }
+        return w;
+    }
+
+    /// Build a sorted list of labels in the primary span's file. The
+    /// result is stable on tied lines, so multiple labels on the same
+    /// line preserve their original (push) order.
+    collect_same_file_labels(&this, diag: Diagnostic) -> SpanLabel[] {
+        mut out: SpanLabel[] = [];
+        for (mut i: int = 0; i < diag.labels.length; i++) {
+            const lbl: SpanLabel = diag.labels[i];
+            if (!lbl.span.has_location()) { continue; }
+            if (lbl.span.file != diag.span.file) { continue; }
+            out.push(lbl);
+        }
+        // Insertion sort by start_line (small N, stable).
+        for (mut i: int = 1; i < out.length; i++) {
+            for (mut j: int = i; j > 0; j--) {
+                if (out[j].span.start_line < out[j - 1].span.start_line) {
+                    const tmp: SpanLabel = out[j];
+                    out[j] = out[j - 1];
+                    out[j - 1] = tmp;
+                } else {
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /// Render a rustc-style combined snippet that folds the primary
+    /// span and every same-file secondary label into one block. Line
+    /// groups are merged when their ±context_lines windows overlap;
+    /// otherwise they're separated by a `...` ellipsis row.
+    render_combined_snippet(mut &this, diag: Diagnostic) -> void {
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+        const bold: string  = this.color_bold();
+
+        const primary_span: SourceSpan = diag.span;
+        const labels: SpanLabel[] = this.collect_same_file_labels(diag);
+        if (labels.length == 0) {
+            // Nothing to combine — fall back to single-span rendering.
+            this.render_snippet(primary_span, diag.severity, diag.message);
+            return;
+        }
+
+        // Compute line-number column width from the largest line we'll
+        // print across every group.
+        const ctx: u32 = this.config.context_lines;
+        mut max_line: u32 = primary_span.start_line + ctx;
+        for (mut i: int = 0; i < labels.length; i++) {
+            const ln: u32 = labels[i].span.start_line + ctx;
+            if (ln > max_line) { max_line = ln; }
+        }
+        const line_width: u32 = this.line_number_width(max_line);
+
+        // Header arrow:  --> file:line:col  (always anchored at primary)
+        fprintf(g_stderr, " %s%s-->%s %s:%u:%u\n",
+            bold, blue, reset,
+            primary_span.file, primary_span.start_line, primary_span.start_col);
+
+        this.render_margin(line_width);
+
+        // Walk labels in line order, accumulating a "current group"
+        // [group_start..group_end]. When the next label's window
+        // doesn't touch the current group, flush + ellipsis + start a
+        // new group. Group windows are inclusive.
+        mut group_start: u32 = 0;
+        mut group_end:   u32 = 0;
+        mut have_group:  boolean = false;
+
+        for (mut i: int = 0; i < labels.length; i++) {
+            const lbl: SpanLabel = labels[i];
+            const ln: u32 = lbl.span.start_line;
+            const want_start: u32 = if (ln > ctx) { ln - ctx } else { 1 };
+            const want_end:   u32 = ln + ctx;
+
+            if (!have_group) {
+                group_start = want_start;
+                group_end   = want_end;
+                have_group  = true;
+            } else if (want_start <= group_end + 1) {
+                if (want_end > group_end) { group_end = want_end; }
+            } else {
+                this.render_line_group(diag.severity, primary_span.file,
+                                       group_start, group_end,
+                                       labels, line_width);
+                this.render_ellipsis(line_width);
+                group_start = want_start;
+                group_end   = want_end;
+            }
+        }
+        if (have_group) {
+            this.render_line_group(diag.severity, primary_span.file,
+                                   group_start, group_end,
+                                   labels, line_width);
+        }
+
+        this.render_margin(line_width);
+    }
+
+    /// Render a contiguous line range as part of a combined snippet.
+    /// For each line in [start_line..end_line]: print the line itself
+    /// (bold blue line-number when it carries a label, grey otherwise),
+    /// then one underline row per label that anchors on that line.
+    render_line_group(mut &this, severity: Severity, file: string,
+                      start_line: u32, end_line: u32,
+                      labels: SpanLabel[], line_width: u32) -> void {
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+        const grey: string  = this.color_grey();
+        const bold: string  = this.color_bold();
+
+        for (mut ln: u32 = start_line; ln <= end_line; ln++) {
+            const line_text: string = this.get_line(file, ln);
+            // get_line returns "" for both empty and out-of-bounds; if
+            // we've passed the end of file there's nothing more to do.
+            // Detect end-of-file by trying one line further than the
+            // first empty: if the *next* line is also empty AND we're
+            // past the last labeled line, stop.
+            mut has_label: boolean = false;
+            for (mut k: int = 0; k < labels.length; k++) {
+                if (labels[k].span.start_line == ln) { has_label = true; break; }
+            }
+
+            if (line_text == "" && !has_label) {
+                // Print blank line with line-number column (preserves
+                // rustc's behavior for genuinely blank lines inside a
+                // group). If we've actually run off the file end, the
+                // caller already bounded us by max_line, so this is
+                // safe.
+                fprintf(g_stderr, " %s%*u%s %s|%s\n",
+                    grey, line_width, ln, reset, blue, reset);
+                continue;
+            }
+
+            if (has_label) {
+                fprintf(g_stderr, " %s%s%*u%s %s|%s ",
+                    bold, blue, line_width, ln, reset,
+                    blue, reset);
+            } else {
+                fprintf(g_stderr, " %s%*u%s %s|%s ",
+                    grey, line_width, ln, reset,
+                    blue, reset);
+            }
+            SyntaxHighlighter::print_line(line_text, this.config.colors);
+            fprintf(g_stderr, "\n");
+
+            if (has_label) {
+                for (mut k: int = 0; k < labels.length; k++) {
+                    if (labels[k].span.start_line == ln) {
+                        this.render_label_underline(labels[k], severity, line_width);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render the underline row for a single label inside a combined
+    /// snippet. Primaries get `^^^^` in the diagnostic's severity
+    /// color; secondaries get `----` in cyan, matching the user's
+    /// "value moved here" caption style.
+    render_label_underline(&this, label: SpanLabel, severity: Severity,
+                           line_width: u32) -> void {
+        const blue: string  = this.color_blue();
+        const reset: string = this.color_reset();
+        const bold: string  = this.color_bold();
+
+        const span: SourceSpan = label.span;
+        mut ul_start: u32 = 0;
+        if (span.start_col > 0) { ul_start = span.start_col - 1; }
+        mut ul_len: u32 = 1;
+        if (span.end_col > span.start_col) {
+            ul_len = span.end_col - span.start_col;
+        }
+
+        fprintf(g_stderr, " %*s %s|%s ", line_width, "", blue, reset);
+        for (mut s: u32 = 0; s < ul_start; s++) {
+            fprintf(g_stderr, " ");
+        }
+
+        if (label.is_primary) {
+            const sev_color: string = this.severity_color(severity);
+            fprintf(g_stderr, "%s%s^", bold, sev_color);
+            for (mut t: u32 = 1; t < ul_len; t++) {
+                fprintf(g_stderr, "^");
+            }
+        } else {
+            const cyan: string = this.color_cyan();
+            fprintf(g_stderr, "%s%s-", bold, cyan);
+            for (mut t: u32 = 1; t < ul_len; t++) {
+                fprintf(g_stderr, "-");
+            }
+        }
+
+        if (label.message != "") {
+            fprintf(g_stderr, " %s", label.message);
+        }
+        fprintf(g_stderr, "%s\n", reset);
     }
 
     /// Render the caret underline below a source line.

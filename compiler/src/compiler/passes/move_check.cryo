@@ -54,11 +54,13 @@ type struct MoveChecker {
     types: HashMap<u32, TypeRef>;
 
     /// Set of bindings currently in the Moved state, encoded as a
-    /// (key, line) parallel-array stack rather than a HashMap so
+    /// (key, span) parallel-array stack rather than a HashMap so
     /// snapshot/restore is just an array-length checkpoint. Keys not
-    /// in this list are Live by default.
+    /// in this list are Live by default. The full span is retained
+    /// (not just the line) so the renderer can underline the move
+    /// site in a combined rustc-style multi-span snippet.
     moved_keys:  u32[];
-    moved_lines: i32[];
+    moved_spans: SourceSpan[];
 
     fired: i64;
 
@@ -70,7 +72,7 @@ type struct MoveChecker {
             intern:   ctx.get_intern_table(),
             types:       HashMap<u32, TypeRef>::new(),
             moved_keys:  [],
-            moved_lines: [],
+            moved_spans: [],
             fired: 0,
         };
     }
@@ -78,7 +80,7 @@ type struct MoveChecker {
     enter_function(mut &this, func: FunctionDeclNode*) -> void {
         this.types       = HashMap<u32, TypeRef>::new();
         this.moved_keys  = [];
-        this.moved_lines = [];
+        this.moved_spans = [];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -99,11 +101,11 @@ type struct MoveChecker {
         return false;
     }
 
-    moved_at_line(&this, name: SymbolStr) -> i32 {
+    moved_at_span(&this, name: SymbolStr) -> SourceSpan {
         for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
-            if (this.moved_keys[i] == name.id) { return this.moved_lines[i]; }
+            if (this.moved_keys[i] == name.id) { return this.moved_spans[i]; }
         }
-        return 0;
+        return SourceSpan::none();
     }
 
     lookup_type(&this, name: SymbolStr) -> TypeRef {
@@ -121,7 +123,7 @@ type struct MoveChecker {
         if (!name.is_valid()) { return; }
         if (this.is_moved(name)) { return; }
         this.moved_keys.push(name.id);
-        this.moved_lines.push(span.start_line as i32);
+        this.moved_spans.push(span);
     }
 
     /// Snapshot the moved-set as the current array length. Restore
@@ -136,7 +138,7 @@ type struct MoveChecker {
     restore_moves(mut &this, checkpoint: i64) -> void {
         while (this.moved_keys.length > checkpoint) {
             this.moved_keys.pop();
-            this.moved_lines.pop();
+            this.moved_spans.pop();
         }
     }
 
@@ -144,6 +146,21 @@ type struct MoveChecker {
               span: SourceSpan) -> void {
         mut diag: Diagnostic = Diagnostic::warning(code, message);
         diag = diag.at(span);
+        this.ctx.emit_diagnostic(diag);
+        this.fired = this.fired + 1;
+    }
+
+    /// Emit a use-after-move warning with a primary label at the use
+    /// site and a secondary label at the original move site. Renderer
+    /// combines them into a single rustc-style snippet with `...`
+    /// between non-adjacent line groups.
+    emit_use_after_move(mut &this, code: ErrorCode, headline: string,
+                        use_span: SourceSpan, move_span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::warning(code, headline);
+        diag = diag.at_with_label(use_span, "value used here after move");
+        if (move_span.has_location()) {
+            diag = diag.also_at(move_span, "value moved here");
+        }
         this.ctx.emit_diagnostic(diag);
         this.fired = this.fired + 1;
     }
@@ -424,14 +441,11 @@ type struct MoveChecker {
         if (_is_copy) { return; }
 
         if (this.is_moved(name)) {
-            const moved_at: i32 = this.moved_at_line(name);
-            const msg: string = if (moved_at > 0) {
-                format("use of moved value '%s' (moved at line %d)",
-                    this.intern.resolve(name), moved_at)
-            } else {
-                format("use of moved value '%s'", this.intern.resolve(name))
-            };
-            this.emit_warn(ErrorCode::E0452_USE_AFTER_MOVE, msg, ident.span);
+            const move_span: SourceSpan = this.moved_at_span(name);
+            const headline: string = format("use of moved value '%s'",
+                this.intern.resolve(name));
+            this.emit_use_after_move(ErrorCode::E0452_USE_AFTER_MOVE,
+                headline, ident.span, move_span);
             return;
         }
         if (in_move_context) {
