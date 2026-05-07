@@ -66,6 +66,13 @@ type struct CompilerConfig {
     /// cryoconfig value so a single project config can be cross-compiled
     /// to multiple targets without editing the file.
     target_triple_override: string;
+    /// Internal flag set by `compile_project_multi` when re-execing the
+    /// same binary for one specific target of a multi-target project.
+    /// Form: "lib:NAME" or "bin:NAME".  Used to break the multi-target
+    /// dispatch recursion in the child process: when set, `compile_project`
+    /// looks up the named target and compiles it in isolation rather than
+    /// iterating every target in the cryoconfig.
+    single_target: string;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -77,6 +84,7 @@ type struct CompilerConfig {
             stdlib_path_override: "",
             test_mode:           false,
             target_triple_override: "",
+            single_target:       "",
         };
     }
 
@@ -90,6 +98,7 @@ type struct CompilerConfig {
             stdlib_path_override: "",
             test_mode:           false,
             target_triple_override: "",
+            single_target:       "",
         };
     }
 }
@@ -239,6 +248,61 @@ function resolve_stdlib_root(cli_override: string, project_root: string,
         tried_out.push("../stdlib  (cwd-relative)");
     }
     return "";
+}
+
+
+/// Read `/proc/self/exe` to find the path to the running binary.
+/// Used by the multi-target build dispatcher to spawn child processes
+/// for per-target compilation.  Returns "" on failure (e.g. non-Linux
+/// host where /proc/self/exe doesn't exist).
+function read_self_exe_path() -> string {
+    const buf: i8* = malloc(4096) as i8*;
+    memset(buf as void*, 0, 4096);
+    const n: i64 = readlink("/proc/self/exe", buf, 4096);
+    if (n <= 0 || n >= 4096) {
+        return "";
+    }
+    // readlink doesn't NUL-terminate; we malloc'd a zeroed buffer wide
+    // enough that the byte at [n] is already 0.
+    return buf as string;
+}
+
+/// Build the shell command for re-execing this binary against one
+/// target of a multi-target project.  Forwards the relevant CLI
+/// overrides so the child sees the same view of stdlib/build-dir/
+/// target-triple/debug as the parent.
+function build_subcmd(exe: string, kind: string, name: string,
+                      cfg: CompilerConfig) -> string {
+    mut cmd: string = format("%s build --single-target=%s:%s", exe, kind, name);
+    if (cfg.debug)               { cmd = format("%s --debug", cmd); }
+    if (strlen(cfg.output_dir_override)    > 0) { cmd = format("%s --build-dir=%s", cmd, cfg.output_dir_override); }
+    if (strlen(cfg.stdlib_path_override)   > 0) { cmd = format("%s --stdlib=%s",    cmd, cfg.stdlib_path_override); }
+    if (strlen(cfg.target_triple_override) > 0) { cmd = format("%s --target=%s",    cmd, cfg.target_triple_override); }
+    if (cfg.emit_llvm)           { cmd = format("%s --emit-llvm", cmd); }
+    return cmd;
+}
+
+/// Build a ProjectConfig view that compiles the `[lib]` half of a
+/// multi-target project as a Library.  Inherits debug/optimize/no_std/
+/// stdlib + linkage settings from the base config; overrides only the
+/// fields that select what to compile and what to name the output.
+function make_lib_view(base: ProjectConfig) -> ProjectConfig {
+    mut view: ProjectConfig = base;
+    view.target_type  = TargetType::Library;
+    view.project_name = base.lib.name;
+    view.source_dir   = base.lib.source_dir;
+    return view;
+}
+
+/// Build a ProjectConfig view that compiles a single `[[bin]]` entry
+/// as an Executable.  As with `make_lib_view`, inherits everything
+/// other than what selects the entry point and names the output.
+function make_bin_view(base: ProjectConfig, bin: BinTarget) -> ProjectConfig {
+    mut view: ProjectConfig = base;
+    view.target_type  = TargetType::Executable;
+    view.project_name = bin.name;
+    view.entry_point  = bin.entry_point;
+    return view;
 }
 
 
@@ -465,6 +529,119 @@ type struct CompilerInstance {
             set_compiler_debug(true);
         }
 
+        // Child re-exec: parent set --single-target=lib:NAME or
+        // --single-target=bin:NAME to compile exactly one target.  Look
+        // it up in the parsed config, synthesize the per-target view,
+        // and skip the multi-target dispatch.
+        if (strlen(this.config.single_target) > 0) {
+            return this.compile_project_single_target(config, this.config.single_target);
+        }
+
+        // Multi-target projects ([lib] and/or [[bin]]) build each output
+        // in a fresh subprocess: re-exec this binary once per target
+        // with --single-target=KIND:NAME.  Subprocess isolation keeps
+        // process-global state (LLVM context, type arena, intern table)
+        // from leaking between target compiles.
+        if (config.is_multi_target()) {
+            return this.compile_project_multi(config);
+        }
+        return this.compile_project_with_config(config);
+    }
+
+    /// Drive a multi-target build: the [lib] (when present) followed by
+    /// each [[bin]] in declaration order.  Each target is compiled in
+    /// its own subprocess (via re-exec of `/proc/self/exe`) so process-
+    /// global compiler state stays clean across targets.  Stops at the
+    /// first failure.  Returns the last bin's output path so `cryo run`
+    /// works against the trailing executable.
+    compile_project_multi(&this, base: ProjectConfig) -> CompilationResult {
+        const exe: string = read_self_exe_path();
+        if (strlen(exe) == 0) {
+            printf("error: multi-target build needs /proc/self/exe (Linux only for now)\n");
+            return CompilationResult::failed(1, 0);
+        }
+
+        mut last_output: string = "";
+
+        if (base.lib.is_present()) {
+            cdebug("[Compiler] Multi-target: building lib '%s' from %s\n",
+                base.lib.name, base.lib.source_dir);
+            const cmd: string = build_subcmd(exe, "lib", base.lib.name, this.config);
+            cdebug("[Compiler] Multi-target spawn: %s\n", cmd);
+            const rc: i32 = system(cmd);
+            if (rc != 0) {
+                return CompilationResult::failed(1, 0);
+            }
+        }
+
+        for (mut i: int = 0; i < base.bins.length; i++) {
+            cdebug("[Compiler] Multi-target: building bin '%s' from %s\n",
+                base.bins[i].name, base.bins[i].entry_point);
+            const cmd: string = build_subcmd(exe, "bin", base.bins[i].name, this.config);
+            cdebug("[Compiler] Multi-target spawn: %s\n", cmd);
+            const rc: i32 = system(cmd);
+            if (rc != 0) {
+                return CompilationResult::failed(1, 0);
+            }
+            last_output = format("%s/bin/%s", base.output_dir, base.bins[i].name);
+        }
+
+        return CompilationResult::ok(last_output);
+    }
+
+    /// Compile one named target out of a multi-target cryoconfig.  The
+    /// re-exec path (`compile_project_multi` -> `system`) calls back into
+    /// `compile_project` here with `--single-target` set; we look up
+    /// `kind:name` in the parsed config, synthesize the per-target view,
+    /// and dispatch directly into `compile_project_with_config`.
+    compile_project_single_target(&this, base: ProjectConfig,
+                                  spec: string) -> CompilationResult {
+        const spec_len: i64 = strlen(spec) as i64;
+        mut colon: i64 = -1;
+        for (mut i: i64 = 0; i < spec_len; i++) {
+            if (spec[i] == ':') { colon = i; break; }
+        }
+        if (colon <= 0) {
+            printf("error: --single-target expects 'lib:NAME' or 'bin:NAME', got '%s'\n", spec);
+            return CompilationResult::failed(1, 0);
+        }
+        const kind_buf: i8* = malloc(colon as u64 + 1) as i8*;
+        memcpy(kind_buf as void*, spec as void*, colon as u64);
+        const kind_term: i8* = ptr_add(kind_buf as void*, colon) as i8*;
+        memset(kind_term as void*, 0, 1);
+        const kind: string = kind_buf as string;
+
+        const name_len: i64 = spec_len - colon - 1;
+        const name_buf: i8* = malloc(name_len as u64 + 1) as i8*;
+        memcpy(name_buf as void*, ptr_add(spec as void*, colon + 1) as void*, name_len as u64);
+        const name_term: i8* = ptr_add(name_buf as void*, name_len) as i8*;
+        memset(name_term as void*, 0, 1);
+        const name: string = name_buf as string;
+
+        if (strcmp(kind, "lib") == 0) {
+            if (!base.lib.is_present() || strcmp(base.lib.name, name) != 0) {
+                printf("error: no [lib] named '%s' in cryoconfig\n", name);
+                return CompilationResult::failed(1, 0);
+            }
+            return this.compile_project_with_config(make_lib_view(base));
+        }
+        if (strcmp(kind, "bin") == 0) {
+            for (mut i: int = 0; i < base.bins.length; i++) {
+                if (strcmp(base.bins[i].name, name) == 0) {
+                    return this.compile_project_with_config(make_bin_view(base, base.bins[i]));
+                }
+            }
+            printf("error: no [[bin]] named '%s' in cryoconfig\n", name);
+            return CompilationResult::failed(1, 0);
+        }
+        printf("error: --single-target kind must be 'lib' or 'bin', got '%s'\n", kind);
+        return CompilationResult::failed(1, 0);
+    }
+
+    /// Compile a single target view of a project.  Shared between the
+    /// legacy single-target path and each iteration of
+    /// `compile_project_multi`.
+    compile_project_with_config(&this, config: ProjectConfig) -> CompilationResult {
         const root_path: string = config.discovery_root_path();
 
         cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
@@ -544,7 +721,8 @@ type struct CompilerInstance {
         }
         ctx.stdlib_root = stdlib_root;
         mut loader: ModuleLoader = ModuleLoader::new(
-            config.project_root, root_path, stdlib_root, config.no_std);
+            config.project_root, root_path, stdlib_root, config.no_std,
+            config.include_paths);
 
         const discovery_ok: boolean = loader.discover_project(
             ctx.intern_table, ctx.module_graph, ctx.diagnostics,
