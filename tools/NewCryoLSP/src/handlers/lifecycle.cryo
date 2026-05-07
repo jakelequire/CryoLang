@@ -1,32 +1,110 @@
-///! Lifecycle handlers — `shutdown` and the `exit` integration point.
+///! `initialize` and `shutdown` handlers.
 ///!
-///! `initialize` is handled inline in `Server::Server::handle_initialize`
-///! because it needs to mutate state that lives on the server. This
-///! module owns `shutdown` (drop tracked sessions) and provides helpers
-///! the server uses for the `exit` notification.
+///! `initialize` is the only request the server accepts before
+///! `state.initialized` flips true.  It captures the workspace
+///! `rootUri` (so imports relative to the project root resolve)
+///! and returns the server's capabilities.  `shutdown` flips
+///! `shutdown_requested`; the next `exit` notification ends the
+///! process cleanly with code 0.
 
-namespace Handlers::Lifecycle;
+namespace Lsp::Handlers::Lifecycle;
 
-import Server::Document;
-import Server::CompilerSession;
-import Util::Log;
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
 
-/// Drop every open document + compiler session and flag the server
-/// as ready to exit. Subsequent requests will be rejected.
-function handle_shutdown(state: mut &ServerState, docs: mut &DocumentStore,
-                        compiler: mut &CompilerSession) -> void {
-    Util::Log::info(Str::from_raw("shutdown received" as u8*, 17));
-    state.shutdown_requested = true;
-    docs.drop();
-    *docs = DocumentStore::new();
-    compiler.drop();
-    *compiler = CompilerSession::new();
+import Lsp::Server::State;
+
+
+/// Handle an `initialize` request.  Mutates `state` and returns the
+/// JSON value to put into the response's `result` field.
+public function handle_initialize(state: mut &ServerState, params: &JsonValue) -> JsonValue {
+    // Stash the workspace root if present.  Either `rootUri` (older
+    // spec) or `workspaceFolders[0].uri` (newer) is acceptable; we
+    // accept the former since most clients still send it.
+    match (params.get(Str::from_cstr("rootUri"))) {
+        Option::Some(uri_v) => {
+            match (uri_v.as_str()) {
+                Option::Some(uri) => {
+                    state.root_uri.drop();
+                    state.root_uri = String::from_str(uri);
+                }
+                Option::None => { }
+            }
+        }
+        Option::None => { }
+    }
+
+    state.initialized = true;
+    return build_initialize_result();
 }
 
-/// Lifecycle/state struct shared with the server. Re-exported here so
-/// the dispatcher in `server.cryo` and the handler agree on the shape.
-type struct ServerState {
-    initialized:        boolean;
-    shutdown_requested: boolean;
-    root_uri:           String;
+/// Handle a `shutdown` request.  Per LSP spec the response body is
+/// `null`; the client sends `exit` next, which the server loop
+/// catches at the top of its dispatch path.
+public function handle_shutdown(state: mut &ServerState) -> JsonValue {
+    state.shutdown_requested = true;
+    return JsonValue::Null;
+}
+
+
+// ============================================================================
+// Capabilities
+// ============================================================================
+
+/// Build the `InitializeResult` payload.  Only what we actually
+/// support today — adding a feature should grow this object, not a
+/// separate registration step.
+function build_initialize_result() -> JsonValue {
+    mut caps: JsonObject = JsonObject::new();
+
+    // textDocumentSync: 2 = Incremental.  Phase B will treat
+    // didChange's content as an incremental ContentChanges event,
+    // applying ranges to the stored buffer.
+    caps.insert(
+        String::from_str(Str::from_cstr("textDocumentSync")),
+        JsonValue::Number(JsonNumber::Int(2 as i64)));
+
+    caps.insert(
+        String::from_str(Str::from_cstr("hoverProvider")),
+        JsonValue::Bool(true));
+    caps.insert(
+        String::from_str(Str::from_cstr("definitionProvider")),
+        JsonValue::Bool(true));
+
+    // Completion: trigger on `.` and `:` (member access + scope
+    // resolution).  Both are entered in Phase C; advertised here so
+    // editors enable the keystroke handler.
+    mut completion: JsonObject = JsonObject::new();
+    mut triggers: Array<JsonValue> = Array<JsonValue>::with_capacity(2);
+    triggers.push(JsonValue::String(String::from_str(Str::from_cstr("."))));
+    triggers.push(JsonValue::String(String::from_str(Str::from_cstr(":"))));
+    completion.insert(
+        String::from_str(Str::from_cstr("triggerCharacters")),
+        JsonValue::Array(triggers));
+    caps.insert(
+        String::from_str(Str::from_cstr("completionProvider")),
+        JsonValue::Object(completion));
+
+    mut result: JsonObject = JsonObject::new();
+    result.insert(
+        String::from_str(Str::from_cstr("capabilities")),
+        JsonValue::Object(caps));
+
+    // serverInfo block — purely cosmetic; lets clients log the
+    // language server's version next to its own.
+    mut info: JsonObject = JsonObject::new();
+    info.insert(
+        String::from_str(Str::from_cstr("name")),
+        JsonValue::String(String::from_str(Str::from_cstr("cryolsp"))));
+    info.insert(
+        String::from_str(Str::from_cstr("version")),
+        JsonValue::String(String::from_str(Str::from_cstr("0.1.0"))));
+    result.insert(
+        String::from_str(Str::from_cstr("serverInfo")),
+        JsonValue::Object(info));
+
+    return JsonValue::Object(result);
 }

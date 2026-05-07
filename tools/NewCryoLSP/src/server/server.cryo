@@ -1,78 +1,60 @@
-///! Server — event loop + dispatcher + lifecycle state.
+///! Server — event loop + dispatcher + lifecycle gate.
 ///!
 ///! Reads framed JSON-RPC from stdin, dispatches by method, writes
-///! responses + notifications back over stdout. Lifecycle gating
+///! responses + notifications back over stdout.  Lifecycle gating
 ///! enforces the LSP contract:
+///!
 ///!   • Pre-`initialize`: any non-`exit` request returns
-///!     `SERVER_NOT_INITIALIZED`. Notifications are dropped.
+///!     `SERVER_NOT_INITIALIZED`.  Notifications are dropped silently.
 ///!   • Post-`initialize`: normal operation.
-///!   • Post-`shutdown`: only `exit` is honored.
+///!   • Post-`shutdown`: only `exit` is honoured; everything else
+///!     returns `INVALID_REQUEST`.
 ///!
 ///! Process exit code:
 ///!   • 0  — clean shutdown (`shutdown` then `exit`)
-///!   • 1  — anything else (EOF mid-frame, fatal protocol error)
+///!   • 1  — anything else (mid-frame EOF, fatal protocol error)
 
-namespace Server::Server;
+namespace Lsp::Server::Server;
 
 import std::core::option;
 import std::core::result;
+import std::core::intrinsics;
 import std::collections::str;
 import std::collections::string;
 import std::io::stdio;
-import std::io::buf;
+import std::io::error;
+import std::io::traits;
 import std::json::value;
-import std::json::serializer;
+import std::env;
 
-import Protocol::Framing;
-import Protocol::JsonRpc;
-import Protocol::LspTypes;
-import Protocol::Capabilities;
-import Protocol::Conv;
+import Lsp::Protocol::Framing;
+import Lsp::Protocol::JsonRpc;
+import Lsp::Server::State;
+import Lsp::Handlers::Lifecycle;
 
-import Server::Document;
-import Server::CompilerSession;
-
-import Handlers::Lifecycle;
-import Handlers::TextSync;
-import Handlers::DiagHandler;
-import Handlers::HoverHandler;
-import Handlers::DefinitionHandler;
-import Handlers::CompletionHandler;
-
-import Util::Log;
-
-type struct ServerState {
-    initialized:        boolean;
-    shutdown_requested: boolean;
-    root_uri:           String;
-}
 
 type struct Server {
-    state:    ServerState;
-    docs:     DocumentStore;
-    compiler: CompilerSession;
-    reader:   BufReader<Stdin>;
-    writer:   Stdout;
+    state:  ServerState;
+    reader: Stdin;
+    writer: Stdout;
 
     static new() -> Server {
-        mut sin: Stdin = stdin();
-        const reader: BufReader<Stdin> = BufReader::new(sin);
         return Server {
-            state: ServerState {
-                initialized:        false,
-                shutdown_requested: false,
-                root_uri:           String::new(),
-            },
-            docs:     DocumentStore::new(),
-            compiler: CompilerSession::new(),
-            reader:   reader,
-            writer:   stdout(),
+            state:  ServerState::new(),
+            reader: stdin(),
+            writer: stdout(),
         };
     }
 
-    run(mut &this) -> int {
+    drop(mut &this) -> void {
+        this.state.drop();
+    }
+
+    /// Run until either `exit` or stdin closes.  Returns the process
+    /// exit code (0 on a clean shutdown, 1 otherwise).
+    run(mut &this) -> i32 {
         loop {
-            match (Framing::read_message(&mut this.reader)) {
+            match (Framing::read_message(&this.reader)) {
                 Result::Ok(maybe) => {
                     match (maybe) {
                         Option::Some(body) => {
@@ -81,185 +63,149 @@ type struct Server {
                             owned.drop();
                         }
                         Option::None => {
-                            // EOF before any frame.
-                            if (this.state.shutdown_requested) { return 0; }
-                            Util::Log::warn(Str::from_raw("eof before shutdown" as u8*, 19));
-                            return 1;
+                            // Clean EOF.  Treat as success only if we
+                            // already received a `shutdown` request —
+                            // anything else is a peer that gave up
+                            // mid-conversation.
+                            if (this.state.shutdown_requested) {
+                                return 0 as i32;
+                            }
+                            return 1 as i32;
                         }
                     }
                 }
                 Result::Err(_) => {
-                    Util::Log::error(Str::from_raw("framing error", 13));
-                    return 1;
+                    // Logging the error itself would help, but the
+                    // spec gives us no place to send it (stdout is
+                    // the wire).  Bail with a non-zero code.
+                    return 1 as i32;
                 }
             }
         }
-        return 1;
+        return 1 as i32;                                    // unreachable
     }
 
+    /// Decode one frame body and route it.  Errors during decode
+    /// (malformed JSON, missing fields) collapse to `Invalid` and
+    /// are logged but otherwise ignored — there's no `id` we can
+    /// reply against.
     handle(mut &this, body: Str) -> void {
-        match (JsonRpc::parse_incoming(body)) {
-            JsonRpc::IncomingMessage::Request(req) => {
-                mut request: RequestMessage = req;
-                this.dispatch_request(&mut request);
-                request.drop();
+        mut msg: IncomingMessage = JsonRpc::parse_incoming(body);
+        match (msg) {
+            IncomingMessage::Request(_)      => { this.dispatch_request(&msg); }
+            IncomingMessage::Notification(_) => { this.dispatch_notification(&msg); }
+            IncomingMessage::Invalid(_)      => {
+                // Drop the parse-failure reason on the floor — the
+                // alternative is logging to stderr, which is fine
+                // but adds dependency on `eprintln`.  Add when
+                // surface area justifies it.
             }
-            JsonRpc::IncomingMessage::Notification(notif) => {
-                mut n: NotificationMessage = notif;
-                this.dispatch_notification(&mut n);
-                n.drop();
+        }
+        msg.drop();
+    }
+
+    dispatch_request(mut &this, msg: mut &IncomingMessage) -> void {
+        // Extract a borrow of the inner request without moving it
+        // out of the enum — match-binding gives us `&` access.
+        match (msg) {
+            IncomingMessage::Request(req) => {
+                const method: Str = req.method.as_str();
+
+                // `initialize` is the only request that runs while
+                // uninitialized.  Everything else gets the
+                // SERVER_NOT_INITIALIZED rejection.
+                if (!this.state.initialized
+                        && !method.equals(&Str::from_cstr("initialize"))) {
+                    this.reply_error(&req.id,
+                        JsonRpc::SERVER_NOT_INITIALIZED,
+                        Str::from_cstr("server not initialized"));
+                    return;
+                }
+
+                if (method.equals(&Str::from_cstr("initialize"))) {
+                    const result: JsonValue =
+                        Lifecycle::handle_initialize(&this.state, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+
+                if (method.equals(&Str::from_cstr("shutdown"))) {
+                    const result: JsonValue =
+                        Lifecycle::handle_shutdown(&this.state);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+
+                // Phase A: every other request gets METHOD_NOT_FOUND.
+                // Phase B/C will fan out hover/definition/completion.
+                this.reply_error(&req.id,
+                    JsonRpc::METHOD_NOT_FOUND,
+                    Str::from_cstr("method not found"));
             }
-            JsonRpc::IncomingMessage::Invalid(reason) => {
-                mut r: String = reason;
-                Util::Log::warn(r.as_str());
-                r.drop();
-            }
+            _ => { }
         }
     }
 
-    // ------------------------------------------------------------------
-    // Dispatch
-    // ------------------------------------------------------------------
+    dispatch_notification(mut &this, msg: mut &IncomingMessage) -> void {
+        match (msg) {
+            IncomingMessage::Notification(notif) => {
+                const method: Str = notif.method.as_str();
 
-    dispatch_request(mut &this, req: mut &RequestMessage) -> void {
-        // Lifecycle gate.
-        if (!this.state.initialized) {
-            const m: Str = req.method.as_str();
-            if (!m.equals(&Str::from_raw("initialize" as u8*, 10))) {
-                this.reply_error(&req.id, JsonRpc::SERVER_NOT_INITIALIZED,
-                    Str::from_raw("server not initialized", 22));
-                return;
+                // `exit` is honoured even before initialize — it's
+                // the only way for a stuck handshake to terminate.
+                if (method.equals(&Str::from_cstr("exit"))) {
+                    const code: i32 = if (this.state.shutdown_requested) {
+                        0 as i32
+                    } else {
+                        1 as i32
+                    };
+                    env::process_exit(code);
+                }
+
+                // Lifecycle gate: pre-`initialize`, drop everything
+                // except `exit` (handled above).
+                if (!this.state.initialized) { return; }
+
+                // Phase B will route textDocument/didOpen etc. here.
+                // Unknown methods are silently ignored per LSP spec.
             }
+            _ => { }
         }
-
-        const m: Str = req.method.as_str();
-
-        if (m.equals(&Str::from_raw("initialize" as u8*, 10))) {
-            this.handle_initialize(req);
-            return;
-        }
-        if (m.equals(&Str::from_raw("shutdown" as u8*, 8))) {
-            Handlers::Lifecycle::handle_shutdown(&mut this.state, &mut this.docs,
-                                                  &mut this.compiler);
-            this.reply_ok(&req.id, JsonValue::Null);
-            return;
-        }
-        if (m.equals(&Str::from_raw("textDocument/hover" as u8*, 18))) {
-            const result: JsonValue = Handlers::HoverHandler::handle(
-                &this.docs, &this.compiler, &req.params);
-            this.reply_ok(&req.id, result);
-            return;
-        }
-        if (m.equals(&Str::from_raw("textDocument/definition" as u8*, 23))) {
-            const result: JsonValue = Handlers::DefinitionHandler::handle(
-                &this.docs, &this.compiler, &req.params);
-            this.reply_ok(&req.id, result);
-            return;
-        }
-        if (m.equals(&Str::from_raw("textDocument/completion" as u8*, 23))) {
-            const result: JsonValue = Handlers::CompletionHandler::handle(
-                &this.docs, &this.compiler, &req.params);
-            this.reply_ok(&req.id, result);
-            return;
-        }
-
-        // Unknown — reply METHOD_NOT_FOUND so the client knows.
-        this.reply_error(&req.id, JsonRpc::METHOD_NOT_FOUND,
-            Str::from_raw("method not found", 16));
     }
 
-    dispatch_notification(mut &this, notif: mut &NotificationMessage) -> void {
-        const m: Str = notif.method.as_str();
-
-        if (m.equals(&Str::from_raw("initialized" as u8*, 11))) {
-            Util::Log::info(Str::from_raw("client signaled initialized", 27));
-            return;
-        }
-        if (m.equals(&Str::from_raw("exit" as u8*, 4))) {
-            const code: int = if (this.state.shutdown_requested) { 0 } else { 1 };
-            std::env::exit(code);
-        }
-
-        // Lifecycle gate: ignore any notification other than `exit`
-        // before initialization.
-        if (!this.state.initialized) {
-            Util::Log::warn(Str::from_raw("notification before initialize", 30));
-            return;
-        }
-
-        if (m.equals(&Str::from_raw("textDocument/didOpen" as u8*, 20))) {
-            Handlers::TextSync::did_open(&mut this.docs, &mut this.compiler,
-                                          &notif.params, &mut this.writer);
-            return;
-        }
-        if (m.equals(&Str::from_raw("textDocument/didChange" as u8*, 22))) {
-            Handlers::TextSync::did_change(&mut this.docs, &mut this.compiler,
-                                            &notif.params, &mut this.writer);
-            return;
-        }
-        if (m.equals(&Str::from_raw("textDocument/didSave" as u8*, 20))) {
-            Util::Log::debug(Str::from_raw("didSave (no-op)", 15));
-            return;
-        }
-        if (m.equals(&Str::from_raw("textDocument/didClose" as u8*, 21))) {
-            Handlers::TextSync::did_close(&mut this.docs, &mut this.compiler,
-                                           &notif.params, &mut this.writer);
-            return;
-        }
-        if (m.equals(&Str::from_raw("$/cancelRequest" as u8*, 15))) {
-            // V1 doesn't support cancellation; silently drop.
-            return;
-        }
-
-        Util::Log::debug(m);
-    }
 
     // ------------------------------------------------------------------
     // Replies
     // ------------------------------------------------------------------
 
-    handle_initialize(mut &this, req: mut &RequestMessage) -> void {
-        // Stash root URI if present.
-        match (req.params.get(Str::from_raw("rootUri" as u8*, 7))) {
-            Option::Some(root) => {
-                match (root.as_str()) {
-                    Option::Some(s) => {
-                        this.state.root_uri.drop();
-                        this.state.root_uri = String::from_str(s);
-                    }
-                    Option::None => { }
-                }
-            }
-            Option::None => { }
-        }
-        this.state.initialized = true;
-        const result: JsonValue = Capabilities::build_initialize_result();
-        this.reply_ok(&req.id, result);
-    }
-
     reply_ok(mut &this, id: &JsonValue, result: JsonValue) -> void {
-        mut clone_id: JsonValue = JsonRpc::clone_value(id);
-        const resp: ResponseMessage = ResponseMessage::success(clone_id, result);
-        mut body: String = JsonRpc::encode_response(&resp);
-        mut owned_resp: ResponseMessage = resp;
-        owned_resp.drop();
-        match (Framing::write_message(&mut this.writer, body.as_str())) {
-            Result::Ok(_)  => { }
-            Result::Err(_) => { Util::Log::error(Str::from_raw("write failed", 12)); }
-        }
-        body.drop();
+        const id_clone: JsonValue = JsonRpc::clone_value(id);
+        const resp: ResponseMessage =
+            ResponseMessage::success(id_clone, result);
+        this.send_response(&resp);
+        mut owned: ResponseMessage = resp;
+        owned.drop();
     }
 
     reply_error(mut &this, id: &JsonValue, code: i32, message: Str) -> void {
-        mut clone_id: JsonValue = JsonRpc::clone_value(id);
-        const err: ErrorObject = ErrorObject::new(code, String::from_str(message));
-        const resp: ResponseMessage = ResponseMessage::failure(clone_id, err);
-        mut body: String = JsonRpc::encode_response(&resp);
-        mut owned_resp: ResponseMessage = resp;
-        owned_resp.drop();
-        match (Framing::write_message(&mut this.writer, body.as_str())) {
+        const id_clone: JsonValue = JsonRpc::clone_value(id);
+        const err: ErrorObject =
+            ErrorObject::new(code, String::from_str(message));
+        const resp: ResponseMessage =
+            ResponseMessage::failure(id_clone, err);
+        this.send_response(&resp);
+        mut owned: ResponseMessage = resp;
+        owned.drop();
+    }
+
+    send_response(mut &this, resp: &ResponseMessage) -> void {
+        mut body: String = JsonRpc::encode_response(resp);
+        match (Framing::write_message(&this.writer, body.as_str())) {
             Result::Ok(_)  => { }
-            Result::Err(_) => { Util::Log::error(Str::from_raw("write failed", 12)); }
+            Result::Err(_) => {
+                // Write failed — the only reasonable response is to
+                // bail.  We can't even log because stdout is the wire.
+            }
         }
         body.drop();
     }

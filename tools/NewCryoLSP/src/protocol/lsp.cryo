@@ -1,0 +1,312 @@
+///! LSP 3.17 wire types.
+///!
+///! Just the shapes the v1 server actually emits — Position, Range,
+///! Location, Diagnostic, Hover, MarkupContent, CompletionItem.  Each
+///! type carries `to_json()` so dispatch handlers can build a wire
+///! payload without touching JsonObject directly.
+///!
+///! Field names follow the spec exactly so the JSON encoder doesn't
+///! need a translation table.
+
+namespace Lsp::Protocol::Lsp;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+import std::fmt::integer;
+
+
+// ============================================================================
+// Position / Range / Location  (LSP §3.6.4 / 3.6.5 / 3.6.6)
+// ============================================================================
+
+/// Zero-based line + UTF-16 character offset.  Cryo source is UTF-8
+/// internally; the conversion happens in `Server::LineIndex`.
+type struct Position {
+    line:      u32;
+    character: u32;
+
+    static new(line: u32, character: u32) -> Position {
+        return Position { line: line, character: character };
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("line")),
+                 JsonValue::Number(JsonNumber::Int(this.line as i64)));
+        o.insert(String::from_str(Str::from_cstr("character")),
+                 JsonValue::Number(JsonNumber::Int(this.character as i64)));
+        return JsonValue::Object(o);
+    }
+
+    static from_json(v: &JsonValue) -> Option<Position> {
+        match (v.get(Str::from_cstr("line"))) {
+            Option::Some(line_v) => {
+                match (line_v.get(Str::from_cstr("character"))) { _ => { } }
+                const line: u32 = json_u32_or(line_v, 0);
+                match (v.get(Str::from_cstr("character"))) {
+                    Option::Some(ch_v) => {
+                        const ch: u32 = json_u32_or(ch_v, 0);
+                        return Option::Some(Position::new(line, ch));
+                    }
+                    Option::None => { return Option::None; }
+                }
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+type struct Range {
+    start: Position;
+    end:   Position;
+
+    static new(start: Position, end: Position) -> Range {
+        return Range { start: start, end: end };
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("start")), this.start.to_json());
+        o.insert(String::from_str(Str::from_cstr("end")),   this.end.to_json());
+        return JsonValue::Object(o);
+    }
+}
+
+type struct Location {
+    uri:   String;
+    range: Range;
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("uri")),
+                 JsonValue::String(String::from_str(this.uri.as_str())));
+        o.insert(String::from_str(Str::from_cstr("range")), this.range.to_json());
+        return JsonValue::Object(o);
+    }
+
+    drop(mut &this) -> void {
+        this.uri.drop();
+    }
+}
+
+
+// ============================================================================
+// Diagnostic  (LSP §3.6.13)
+// ============================================================================
+
+type enum DiagnosticSeverity {
+    Error;          // 1
+    Warning;        // 2
+    Information;    // 3
+    Hint;           // 4
+}
+
+implement enum DiagnosticSeverity {
+    to_int(&this) -> i64 {
+        return match (this) {
+            DiagnosticSeverity::Error       => { 1 as i64 }
+            DiagnosticSeverity::Warning     => { 2 as i64 }
+            DiagnosticSeverity::Information => { 3 as i64 }
+            DiagnosticSeverity::Hint        => { 4 as i64 }
+        };
+    }
+}
+
+type struct Diagnostic {
+    range:    Range;
+    severity: DiagnosticSeverity;
+    code:     Option<String>;          // e.g. "E0102"
+    source:   Option<String>;          // e.g. "cryoc"
+    message:  String;
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("range")),
+                 this.range.to_json());
+        o.insert(String::from_str(Str::from_cstr("severity")),
+                 JsonValue::Number(JsonNumber::Int(this.severity.to_int())));
+        match (this.code) {
+            Option::Some(c) => {
+                o.insert(String::from_str(Str::from_cstr("code")),
+                         JsonValue::String(String::from_str(c.as_str())));
+            }
+            Option::None => { }
+        }
+        match (this.source) {
+            Option::Some(src) => {
+                o.insert(String::from_str(Str::from_cstr("source")),
+                         JsonValue::String(String::from_str(src.as_str())));
+            }
+            Option::None => { }
+        }
+        o.insert(String::from_str(Str::from_cstr("message")),
+                 JsonValue::String(String::from_str(this.message.as_str())));
+        return JsonValue::Object(o);
+    }
+
+    drop(mut &this) -> void {
+        match (this.code) {
+            Option::Some(c) => { c.drop(); }
+            Option::None    => { }
+        }
+        match (this.source) {
+            Option::Some(s) => { s.drop(); }
+            Option::None    => { }
+        }
+        this.message.drop();
+    }
+}
+
+
+// ============================================================================
+// Hover + MarkupContent  (LSP §3.6.18)
+// ============================================================================
+
+type struct MarkupContent {
+    /// "plaintext" or "markdown"
+    kind:  String;
+    value: String;
+
+    static markdown(value: String) -> MarkupContent {
+        return MarkupContent {
+            kind:  String::from_str(Str::from_cstr("markdown")),
+            value: value,
+        };
+    }
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("kind")),
+                 JsonValue::String(String::from_str(this.kind.as_str())));
+        o.insert(String::from_str(Str::from_cstr("value")),
+                 JsonValue::String(String::from_str(this.value.as_str())));
+        return JsonValue::Object(o);
+    }
+
+    drop(mut &this) -> void {
+        this.kind.drop();
+        this.value.drop();
+    }
+}
+
+type struct Hover {
+    contents: MarkupContent;
+    range:    Option<Range>;
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("contents")),
+                 this.contents.to_json());
+        match (this.range) {
+            Option::Some(r) => {
+                o.insert(String::from_str(Str::from_cstr("range")), r.to_json());
+            }
+            Option::None => { }
+        }
+        return JsonValue::Object(o);
+    }
+
+    drop(mut &this) -> void {
+        this.contents.drop();
+    }
+}
+
+
+// ============================================================================
+// CompletionItem  (LSP §3.6.21)
+// ============================================================================
+
+/// Subset of CompletionItemKind we currently emit.  The numeric
+/// values are the LSP-spec encodings — VS Code and others render
+/// distinct icons per kind.
+type enum CompletionItemKind {
+    Text;        // 1
+    Method;      // 2
+    Function;    // 3
+    Variable;    // 6
+    Class;       // 7
+    Interface;   // 8
+    Module;      // 9
+    Field;       // 5
+    Enum;        // 13
+    Keyword;     // 14
+    Snippet;     // 15
+}
+
+implement enum CompletionItemKind {
+    to_int(&this) -> i64 {
+        return match (this) {
+            CompletionItemKind::Text      => { 1 as i64 }
+            CompletionItemKind::Method    => { 2 as i64 }
+            CompletionItemKind::Function  => { 3 as i64 }
+            CompletionItemKind::Field     => { 5 as i64 }
+            CompletionItemKind::Variable  => { 6 as i64 }
+            CompletionItemKind::Class     => { 7 as i64 }
+            CompletionItemKind::Interface => { 8 as i64 }
+            CompletionItemKind::Module    => { 9 as i64 }
+            CompletionItemKind::Enum      => { 13 as i64 }
+            CompletionItemKind::Keyword   => { 14 as i64 }
+            CompletionItemKind::Snippet   => { 15 as i64 }
+        };
+    }
+}
+
+type struct CompletionItem {
+    label:  String;
+    kind:   CompletionItemKind;
+    detail: Option<String>;
+
+    to_json(&this) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.insert(String::from_str(Str::from_cstr("label")),
+                 JsonValue::String(String::from_str(this.label.as_str())));
+        o.insert(String::from_str(Str::from_cstr("kind")),
+                 JsonValue::Number(JsonNumber::Int(this.kind.to_int())));
+        match (this.detail) {
+            Option::Some(d) => {
+                o.insert(String::from_str(Str::from_cstr("detail")),
+                         JsonValue::String(String::from_str(d.as_str())));
+            }
+            Option::None => { }
+        }
+        return JsonValue::Object(o);
+    }
+
+    drop(mut &this) -> void {
+        this.label.drop();
+        match (this.detail) {
+            Option::Some(d) => { d.drop(); }
+            Option::None    => { }
+        }
+    }
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Read a non-negative integer field from a JsonValue, with a fallback
+/// when the key is missing or the value isn't a number.  Saturates at
+/// u32::MAX so a malformed huge number doesn't overflow callers.
+function json_u32_or(v: &JsonValue, fallback: u32) -> u32 {
+    match (v) {
+        JsonValue::Number(n) => {
+            match (n) {
+                JsonNumber::Int(i) => {
+                    if (i < 0)             { return fallback; }
+                    if (i > 4294967295)    { return 4294967295 as u32; }
+                    return i as u32;
+                }
+                JsonNumber::Float(f) => {
+                    if (f < 0.0)           { return fallback; }
+                    return f as u32;
+                }
+            }
+        }
+        _ => { return fallback; }
+    }
+}
