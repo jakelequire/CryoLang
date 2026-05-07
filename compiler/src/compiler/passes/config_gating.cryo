@@ -29,6 +29,7 @@ namespace Compiler::Passes::ConfigGating;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
 import Compiler::AST::Pattern;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
@@ -235,6 +236,85 @@ function decl_is_active(decl: DeclarationNode*, os: HostOS) -> boolean {
     return true;
 }
 
+/// Same predicate for block-attached directives.  Used by the
+/// function-body walker to decide whether `![dir] { ... }` blocks
+/// survive.
+function block_is_active(block: BlockStmtNode*, os: HostOS) -> boolean {
+    if (block == null) { return true; }
+    for (mut i: i64 = 0; i < block.attached_directives.length; i++) {
+        const d: DirectiveNode* = block.attached_directives[i];
+        const r: CfgEvalResult = eval_directive(d, os);
+        if (match (r) { CfgEvalResult::Inactive => { true } _ => { false } }) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// ============================================================================
+// Function-body walker
+// ============================================================================
+
+/// Walk a block's statements, filtering out child BlockStmt nodes whose
+/// attached cfg directives are inactive.  Recurses into nested blocks
+/// so gates can sit at any nesting level.  Active gated blocks have
+/// their `attached_directives` cleared once kept — downstream passes
+/// see them as plain blocks.
+function process_block(block: BlockStmtNode*, os: HostOS, ctx: CompilationContext*) -> void {
+    if (block == null) { return; }
+    // Fast-path scan: most function bodies have no inline cfg-gated
+    // sub-blocks at all.  Skip the rebuild loop in that case so we
+    // don't touch `block.statements` — array assignment through a
+    // class-field write is a known-fragile codegen path on the
+    // current pin.
+    mut needs_filter: boolean = false;
+    for (mut i: i64 = 0; i < block.statements.length; i++) {
+        const stmt: StatementNode* = block.statements[i];
+        if (stmt == null) { continue; }
+        if (stmt.kind == NodeKind::BlockStatement) {
+            const inner: BlockStmtNode* = stmt as BlockStmtNode*;
+            if (inner.has_directives()) { needs_filter = true; break; }
+        }
+    }
+    if (!needs_filter) { return; }
+
+    mut kept: StatementNode*[] = [];
+    for (mut i: i64 = 0; i < block.statements.length; i++) {
+        const stmt: StatementNode* = block.statements[i];
+        if (stmt == null) { continue; }
+
+        if (stmt.kind == NodeKind::BlockStatement) {
+            const inner: BlockStmtNode* = stmt as BlockStmtNode*;
+            if (inner.has_directives() && !block_is_active(inner, os)) {
+                if (ctx.debug_mode) {
+                    cdebug("[ConfigGating] stripped inline block at line %u\n",
+                        inner.span.start_line);
+                }
+                continue;
+            }
+            process_block(inner, os, ctx);
+        }
+        kept.push(stmt);
+    }
+    block.statements = kept;
+}
+
+
+/// Walk every method body in `methods`, processing cfg-gated blocks.
+/// Hoisted out of `run()` so a single call site invokes process_block
+/// with `m.body` — the bootstrap miscompiles when this same pattern
+/// appears repeatedly inside a `match` expression's arms.
+function walk_method_bodies(methods: MethodNode*[], os: HostOS, ctx: CompilationContext*) -> void {
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m != null) {
+            const body: BlockStmtNode* = m.body;
+            process_block(body, os, ctx);
+        }
+    }
+}
+
 
 // ============================================================================
 // Pass entry point
@@ -287,15 +367,36 @@ function run(ctx: CompilationContext*) -> PassResult {
         }
 
         const decl: DeclarationNode* = stmt as DeclarationNode*;
-        if (decl_is_active(decl, os)) {
-            kept.push(stmt);
-        } else {
+        if (!decl_is_active(decl, os)) {
             stripped = stripped + 1;
             if (ctx.debug_mode) {
                 cdebug("[ConfigGating] stripped %s for target os\n",
                     k.to_string());
             }
+            continue;
         }
+
+        // Phase 2b: recurse into function/method bodies for inline
+        // `![dir] { ... }` gates.  Method/Impl/Class/Struct recursion
+        // is currently disabled — the pin's match codegen miscompiles
+        // consecutive class-cast-and-call arms.  After this binary is
+        // pinned, the next session can re-enable those branches with
+        // a clean pin that handles the pattern correctly.
+        if (k == NodeKind::FunctionDeclaration) {
+            const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
+            const body: BlockStmtNode* = fd.body;
+            if (body != null) {
+                process_block(body, os, ctx);
+            }
+        }
+        if (k == NodeKind::MethodDeclaration) {
+            const md: MethodNode* = stmt as MethodNode*;
+            const mbody: BlockStmtNode* = md.body;
+            if (mbody != null) {
+                process_block(mbody, os, ctx);
+            }
+        }
+        kept.push(stmt);
     }
 
     if (stripped > 0) {
