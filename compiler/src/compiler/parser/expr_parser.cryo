@@ -984,12 +984,19 @@ public:
         mut match_expr: MatchExprNode* = new MatchExprNode(subject, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const before_pos: int = this.pos;
             const arm: MatchArmNode* = this.parse_expr_match_arm();
             if (arm != null) {
                 match_expr.add_arm(arm);
             }
             if (this.panic_mode) {
                 this.synchronize();
+            }
+            // Progress guard: synchronize() stops at statement-start tokens
+            // without advancing.  Without this, a malformed scrutinee can
+            // leave the cursor on a non-pattern token and we loop forever.
+            if (this.pos == before_pos) {
+                this.advance();
             }
         }
 
@@ -1128,14 +1135,31 @@ public:
     }
 
     /// Parse an enum pattern: EnumName::Variant or EnumName::Variant(bindings)
+    /// Also accepts namespace-qualified enum paths like
+    /// `Protocol::JsonRpc::IncomingMessage::Request(req)`: every segment but
+    /// the last is folded into the enum name (joined with `::`), and the
+    /// final identifier becomes the variant name.  The match-arm consumer
+    /// (sema) only needs the enum's resolved type — the joined string is
+    /// purely for diagnostics.
     parse_enum_pattern_internal() -> PatternNode* {
         const start: Token = this.current();
-        const enum_tok: Token = this.advance(); // enum name
+        const first_tok: Token = this.advance(); // first identifier
         this.consume(TokenType::ColonColon, "'::'");
-        const variant_tok: Token = this.consume(TokenType::Identifier, "variant name");
+        mut variant_tok: Token = this.consume(TokenType::Identifier, "variant name");
+
+        // Walk extra `::` segments.  Once we see `Foo::Bar`, if `Bar` is
+        // followed by another `::` then `Bar` is just another namespace
+        // segment and the *next* identifier is a candidate variant name.
+        // Repeat until the lookahead is no longer `::`.
+        mut enum_path: string = first_tok.lexeme;
+        while (this.check(TokenType::ColonColon)) {
+            enum_path = format("%s::%s", enum_path, variant_tok.lexeme);
+            this.advance(); // consume '::'
+            variant_tok = this.consume(TokenType::Identifier, "variant name");
+        }
 
         mut pat: EnumPatternNode* = new EnumPatternNode(this.span_from_token(start));
-        pat.set_enum_name(this.intern_lexeme(enum_tok));
+        pat.set_enum_name(this.ctx.intern(enum_path));
         pat.set_variant_name(this.intern_lexeme(variant_tok));
 
         // Optional destructuring: Variant(a, b, _)

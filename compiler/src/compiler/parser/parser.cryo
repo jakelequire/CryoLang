@@ -2202,6 +2202,7 @@ public:
         mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const before_pos: int = this.pos;
             if (this.panic_mode) {
                 this.synchronize();
                 if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
@@ -2225,6 +2226,13 @@ public:
                 if (stmt != null) {
                     block.add_statement(stmt);
                 }
+            }
+
+            // Progress guard: a faulty parse_statement that returned null
+            // without advancing (e.g. panic_mode tripped early) would otherwise
+            // loop forever on the same token.
+            if (this.pos == before_pos) {
+                this.advance();
             }
         }
 
@@ -2337,12 +2345,21 @@ public:
         mut match_stmt: MatchStmtNode* = new MatchStmtNode(subject, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const before_pos: int = this.pos;
             const arm: MatchArmNode* = this.parse_match_arm();
             if (arm != null) {
                 match_stmt.add_arm(arm);
             }
             if (this.panic_mode) {
                 this.synchronize();
+            }
+            // Progress guard: if neither parse_match_arm nor synchronize
+            // advanced the cursor, force one token of progress so we don't
+            // loop forever on a token that can't start a pattern (e.g. a
+            // KwReturn left over after a malformed scrutinee — synchronize
+            // stops at statement-start tokens without consuming them).
+            if (this.pos == before_pos) {
+                this.advance();
             }
         }
 
@@ -2365,6 +2382,7 @@ public:
             mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
 
             while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+                const before_pos: int = this.pos;
                 if (this.panic_mode) {
                     // If we're at '}', the error was likely a missing ';' — recover gracefully
                     if (this.check(TokenType::RBrace)) {
@@ -2397,6 +2415,11 @@ public:
                     // Consume ';' if present, but don't require it
                     this.match_tok(TokenType::Semicolon);
                 }
+
+                // Progress guard: matches the rationale in parse_match_statement.
+                if (this.pos == before_pos) {
+                    this.advance();
+                }
             }
 
             this.consume(TokenType::RBrace, "'}'");
@@ -2423,9 +2446,14 @@ public:
         mut switch_stmt: SwitchStmtNode* = new SwitchStmtNode(expr, this.span_from_token(start));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const before_pos: int = this.pos;
             const case_node: CaseStmtNode* = this.parse_case_statement();
             if (case_node != null) {
                 switch_stmt.add_case(case_node);
+            }
+            // Progress guard: matches the rationale in parse_match_statement.
+            if (this.pos == before_pos) {
+                this.advance();
             }
         }
 
