@@ -724,14 +724,26 @@ function init_native_target() -> void {
 
 /// Create a target machine for the host triple.
 function create_native_target_machine() -> LTargetMachine {
-    const triple: string = llvm::LLVMGetDefaultTargetTriple() as string;
+    return create_target_machine_for_triple(get_default_triple());
+}
+
+/// Create a target machine for an explicit LLVM target triple.  Used by
+/// codegen when the project specifies `target = "..."` in cryoconfig or
+/// the user passed `--target=TRIPLE`.  Falls back to the host triple when
+/// `triple` is the empty string.
+function create_target_machine_for_triple(triple: string) -> LTargetMachine {
+    mut effective: string = triple;
+    if (triple == "" || strlen(triple) == 0) {
+        effective = llvm::LLVMGetDefaultTargetTriple() as string;
+    }
     mut target: void* = null;
     mut err_msg: i8* = null;
 
-    const found: i32 = llvm::LLVMGetTargetFromTriple(triple, &target as void*, &err_msg as void*);
+    const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as void*, &err_msg as void*);
     if (found != 0) {
         if (err_msg != null) {
-            printf("[Codegen] Target lookup failed: %s\n", err_msg as string);
+            printf("[Codegen] Target lookup failed for triple '%s': %s\n",
+                effective, err_msg as string);
             llvm::LLVMDisposeMessage(err_msg as void*);
         }
         return LTargetMachine::null();
@@ -739,7 +751,7 @@ function create_native_target_machine() -> LTargetMachine {
 
     // LLVMCodeGenLevelDefault=2, LLVMRelocPIC=2, LLVMCodeModelDefault=0
     const tm: void* = llvm::LLVMCreateTargetMachine(
-        target, triple, "generic", "", 2, 2, 0);
+        target, effective, "generic", "", 2, 2, 0);
 
     return LTargetMachine { raw: tm };
 }
@@ -747,4 +759,15 @@ function create_native_target_machine() -> LTargetMachine {
 /// Get the default target triple string.
 function get_default_triple() -> string {
     return llvm::LLVMGetDefaultTargetTriple() as string;
+}
+
+/// Resolve the effective triple for codegen: returns `requested` when it
+/// is non-empty, otherwise the host triple.  Centralizes the precedence
+/// rule so both IR generation and the linker decision read the same
+/// answer.
+function resolve_effective_triple(requested: string) -> string {
+    if (requested == "" || strlen(requested) == 0) {
+        return get_default_triple();
+    }
+    return requested;
 }

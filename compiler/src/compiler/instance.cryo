@@ -60,6 +60,12 @@ type struct CompilerConfig {
     /// `![test]` function through `std::test::runner::run_all`.  The
     /// produced executable lands at `<output_dir>/bin/<name>-test`.
     test_mode:           boolean;
+    /// CLI override for the codegen target triple (`--target=TRIPLE`).
+    /// Empty string ("") means "fall back to cryoconfig's `target` key,
+    /// then to the host triple from LLVM".  Takes priority over the
+    /// cryoconfig value so a single project config can be cross-compiled
+    /// to multiple targets without editing the file.
+    target_triple_override: string;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -70,6 +76,7 @@ type struct CompilerConfig {
             output_dir_override: "",
             stdlib_path_override: "",
             test_mode:           false,
+            target_triple_override: "",
         };
     }
 
@@ -82,6 +89,7 @@ type struct CompilerConfig {
             output_dir_override: "",
             stdlib_path_override: "",
             test_mode:           false,
+            target_triple_override: "",
         };
     }
 }
@@ -336,6 +344,7 @@ type struct CompilerInstance {
 
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
         ctx.debug_mode = this.config.debug;
+        ctx.target_triple = this.config.target_triple_override;
         mut pipeline: PassRegistry = PassRegistry::build_standard_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
@@ -353,6 +362,7 @@ type struct CompilerInstance {
 
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::Raw, source);
         ctx.debug_mode = this.config.debug;
+        ctx.target_triple = this.config.target_triple_override;
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
@@ -440,6 +450,12 @@ type struct CompilerInstance {
                 && strlen(this.config.output_dir_override) > 0) {
             config.output_dir = this.config.output_dir_override;
         }
+        // CLI `--target=TRIPLE` overrides the cryoconfig `target` key.
+        // Empty string in either slot means "build for the host".
+        if (this.config.target_triple_override != ""
+                && strlen(this.config.target_triple_override) > 0) {
+            config.target_triple = this.config.target_triple_override;
+        }
 
         // Mirror cryoconfig `debug = true` into the global compiler debug
         // gate so the [Tag] trace printfs fire.  Only flips it ON — CLI
@@ -493,6 +509,7 @@ type struct CompilerInstance {
         mut ctx: CompilationContext* = _box_ctx.leak();
         ctx.debug_mode = this.config.debug;
         ctx.project_no_std = config.no_std;
+        ctx.target_triple = config.target_triple;
 
         const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config);
         ctx.set_project_config(_box_config.leak());
