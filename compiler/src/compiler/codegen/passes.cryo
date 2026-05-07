@@ -156,14 +156,18 @@ type struct CodegenPasses {
         const cg: CodegenContext* = _box_cg.leak();
         cdebug("[Codegen] Step 5: CodegenContext created\n");
 
-        // Set target triple and data layout.
+        // Set target triple and data layout.  Honor a project-level
+        // override (cryoconfig `target = "..."` or CLI `--target=TRIPLE`)
+        // when one is set; otherwise fall back to the host triple from
+        // LLVM.  The resolved triple is also fed to the target machine
+        // below so the data-layout string matches.
         cdebug("[Codegen] Step 6: Setting target triple...\n");
-        const triple: string = get_default_triple();
+        const triple: string = resolve_effective_triple(ctx.target_triple);
         cg.llvm_module.set_target_triple(triple);
-        cdebug("[Codegen] Step 7: Target triple set\n");
+        cdebug("[Codegen] Step 7: Target triple set: %s\n", triple);
 
         cdebug("[Codegen] Step 8: Creating target machine...\n");
-        mut tm: LTargetMachine = create_native_target_machine();
+        mut tm: LTargetMachine = create_target_machine_for_triple(triple);
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
             cg.llvm_module.set_data_layout(layout);
@@ -357,7 +361,8 @@ type struct CodegenPasses {
             cdebug("[Codegen] Optimization for module: %s\n", ctx.artifacts.ir.module_name);
         }
 
-        mut tm: LTargetMachine = create_native_target_machine();
+        const opt_triple: string = resolve_effective_triple(ctx.target_triple);
+        mut tm: LTargetMachine = create_target_machine_for_triple(opt_triple);
         if (!tm.is_valid()) {
             return PassResult::ok();
         }
@@ -417,7 +422,12 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        mut tm: LTargetMachine = create_native_target_machine();
+        // Resolve the effective triple here too — the object format
+        // (ELF / COFF / Mach-O) is selected by the target machine, so
+        // a stale host machine here would silently undo the cross-
+        // compile we set up in IR generation.
+        const obj_triple: string = resolve_effective_triple(ctx.target_triple);
+        mut tm: LTargetMachine = create_target_machine_for_triple(obj_triple);
         if (!tm.is_valid()) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 "failed to create target machine for object emission");
@@ -507,6 +517,24 @@ type struct CodegenPasses {
 
         const cfg: ProjectConfig* = ctx.project_config;
         const output_dir: string = cfg.output_dir;
+        // Cross-compilation: when the target triple differs from the
+        // host, the per-module .o files were emitted for that target's
+        // ABI/object format and the host's `cc` cannot link them.  Skip
+        // the link step, leave the artifacts in `<output_dir>/obj/`,
+        // and tell the user how to finish the link with a target-aware
+        // toolchain.  Empty `ctx.target_triple` ⇒ host build, link
+        // normally.
+        if (strlen(ctx.target_triple) > 0
+                && strcmp(ctx.target_triple, get_default_triple()) != 0) {
+            const obj_only_dir: string = format("%s/obj", output_dir);
+            printf("Cross-compile: produced %lld object file(s) for target '%s' in %s\n",
+                ctx.artifacts.object_files.length, ctx.target_triple, obj_only_dir);
+            printf("  (host linker skipped — link with a %s-aware toolchain, e.g.:\n",
+                ctx.target_triple);
+            printf("     clang --target=%s %s/*.o -o <output>)\n",
+                ctx.target_triple, obj_only_dir);
+            return PassResult::ok();
+        }
         // Ensure parent dir exists for custom `--build-dir=...` paths
         // that haven't been pre-created.
         mkdir(output_dir, 493);
