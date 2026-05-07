@@ -21,6 +21,13 @@ type enum PassID {
     // Stage 1: Frontend
     Lexing;
     Parsing;
+    /// Strips declarations whose attached `![config(...)]` / `![target(...)]`
+    /// / bare-OS-atom (`![windows]`, `![linux]`, `![macos]`, `![unix]`)
+    /// directives evaluate to "inactive" against the resolved target
+    /// triple.  Runs before ASTValidation so downstream passes never see
+    /// platform-specific declarations whose `extern` references would
+    /// fail to resolve on the current target.
+    ConfigGating;
     ASTValidation;
     CHeaderImport;
 
@@ -69,6 +76,7 @@ implement enum PassID {
         return match (this) {
             PassID::Lexing                      => { "Lexing"                      }
             PassID::Parsing                     => { "Parsing"                     }
+            PassID::ConfigGating                => { "ConfigGating"                }
             PassID::ASTValidation               => { "ASTValidation"               }
             PassID::CHeaderImport               => { "CHeaderImport"               }
             PassID::AutoImport                  => { "AutoImport"                  }
@@ -101,6 +109,7 @@ implement enum PassID {
         return match (this) {
             PassID::Lexing                      => { PassStage::Frontend              }
             PassID::Parsing                     => { PassStage::Frontend              }
+            PassID::ConfigGating                => { PassStage::Frontend              }
             PassID::ASTValidation               => { PassStage::Frontend              }
             PassID::CHeaderImport               => { PassStage::Frontend              }
             PassID::AutoImport                  => { PassStage::ModuleResolution      }
@@ -133,30 +142,31 @@ implement enum PassID {
         return match (this) {
             PassID::Lexing                      => { 0  }
             PassID::Parsing                     => { 1  }
-            PassID::ASTValidation               => { 2  }
-            PassID::CHeaderImport               => { 3  }
-            PassID::AutoImport                  => { 4  }
-            PassID::ImportResolution            => { 5  }
-            PassID::NameResolution              => { 6  }
-            PassID::TypeDeclaration             => { 7  }
-            PassID::FunctionSignature           => { 8  }
-            PassID::TemplateRegistration        => { 9  }
-            PassID::DefaultExpansion            => { 10 }
-            PassID::TypeResolution              => { 11 }
-            PassID::StructFieldTypeSync         => { 12 }
-            PassID::DirectiveProcessing         => { 13 }
-            PassID::Monomorphization            => { 14 }
-            PassID::GenericExpressionResolution => { 15 }
-            PassID::GenericValidation           => { 16 }
-            PassID::FunctionBodyTypeCheck       => { 17 }
-            PassID::MoveCheck                   => { 18 }
-            PassID::DropInsertion               => { 19 }
-            PassID::TypeLowering                => { 20 }
-            PassID::FunctionDeclaration         => { 21 }
-            PassID::IRGeneration                => { 22 }
-            PassID::Optimization                => { 23 }
-            PassID::ObjectEmission              => { 24 }
-            PassID::Linking                     => { 25 }
+            PassID::ConfigGating                => { 2  }
+            PassID::ASTValidation               => { 3  }
+            PassID::CHeaderImport               => { 4  }
+            PassID::AutoImport                  => { 5  }
+            PassID::ImportResolution            => { 6  }
+            PassID::NameResolution              => { 7  }
+            PassID::TypeDeclaration             => { 8  }
+            PassID::FunctionSignature           => { 9  }
+            PassID::TemplateRegistration        => { 10 }
+            PassID::DefaultExpansion            => { 11 }
+            PassID::TypeResolution              => { 12 }
+            PassID::StructFieldTypeSync         => { 13 }
+            PassID::DirectiveProcessing         => { 14 }
+            PassID::Monomorphization            => { 15 }
+            PassID::GenericExpressionResolution => { 16 }
+            PassID::GenericValidation           => { 17 }
+            PassID::FunctionBodyTypeCheck       => { 18 }
+            PassID::MoveCheck                   => { 19 }
+            PassID::DropInsertion               => { 20 }
+            PassID::TypeLowering                => { 21 }
+            PassID::FunctionDeclaration         => { 22 }
+            PassID::IRGeneration                => { 23 }
+            PassID::Optimization                => { 24 }
+            PassID::ObjectEmission              => { 25 }
+            PassID::Linking                     => { 26 }
         };
     }
 
@@ -187,6 +197,12 @@ implement enum PassID {
 type enum Provision {
     Tokens;
     AST;
+    /// Set after ConfigGating has stripped declarations whose attached
+    /// `![config(...)]` / bare-OS-atom directives don't match the
+    /// resolved target.  Optional dependency for ASTValidation so the
+    /// validator never sees a declaration that was supposed to be
+    /// pruned.
+    ConfigsGated;
     ASTValidated;
     CHeadersImported;
     ImportsDiscovered;
@@ -220,6 +236,7 @@ implement enum Provision {
         return match (this) {
             Provision::Tokens                     => { 0  }
             Provision::AST                        => { 1  }
+            Provision::ConfigsGated               => { 27 }
             Provision::ASTValidated               => { 2  }
             Provision::CHeadersImported           => { 3  }
             Provision::ImportsDiscovered          => { 4  }
@@ -252,6 +269,7 @@ implement enum Provision {
         return match (this) {
             Provision::Tokens                     => { "Tokens"                     }
             Provision::AST                        => { "AST"                        }
+            Provision::ConfigsGated               => { "ConfigsGated"               }
             Provision::ASTValidated               => { "ASTValidated"               }
             Provision::CHeadersImported           => { "CHeadersImported"           }
             Provision::ImportsDiscovered          => { "ImportsDiscovered"          }
@@ -428,13 +446,24 @@ function get_pass_metadata(id: PassID) -> PassMetadata {
                 provisions:       [Provision::AST],
             }
         }
+        PassID::ConfigGating => {
+            PassMetadata {
+                id:               PassID::ConfigGating,
+                name:             "ConfigGating",
+                stage:            PassStage::Frontend,
+                order:            2,
+                requirements:     [PassRequirement::required(Provision::AST)],
+                provisions:       [Provision::ConfigsGated],
+            }
+        }
         PassID::ASTValidation => {
             PassMetadata {
                 id:               PassID::ASTValidation,
                 name:             "ASTValidation",
                 stage:            PassStage::Frontend,
-                order:            2,
-                requirements:     [PassRequirement::required(Provision::AST)],
+                order:            3,
+                requirements:     [PassRequirement::required(Provision::AST),
+                                   PassRequirement::optional(Provision::ConfigsGated)],
                 provisions:       [Provision::ASTValidated],
             }
         }
