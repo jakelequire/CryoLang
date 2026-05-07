@@ -25,7 +25,10 @@
 ///   ![align(N)]               — struct/class: align bytes (N integer)
 ///   ![repr(C)] / ![repr(packed)] — struct/class: layout repr
 ///   ![link("name")]           — extern fn / block: linker name override
-///   ![cfg(...)] / ![target(...)] — any decl: conditional-compile gate
+///   ![config(<atom>)] / ![target(<atom>)] / ![<atom>] — platform gate
+///                                 evaluated by ConfigGating; <atom> is
+///                                 windows / linux / macos / unix or
+///                                 `not(<atom>)`.
 ///   ![allow(name)] / ![warn(name)] / ![deny(name)] — lint level
 ///   ![derive(Trait, ...)]     — struct/class/enum: traits to auto-derive
 ///
@@ -149,12 +152,30 @@ function is_known_builtin(name: string) -> boolean {
         || strcmp(name, "align") == 0
         || strcmp(name, "repr") == 0
         || strcmp(name, "link") == 0
-        || strcmp(name, "cfg") == 0
         || strcmp(name, "target") == 0
         || strcmp(name, "allow") == 0
         || strcmp(name, "warn") == 0
         || strcmp(name, "deny") == 0
-        || strcmp(name, "derive") == 0;
+        || strcmp(name, "derive") == 0
+        // Bare-atom forms of the cfg/config gate.  These are sugar for
+        // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
+        || strcmp(name, "windows") == 0
+        || strcmp(name, "linux") == 0
+        || strcmp(name, "macos") == 0
+        || strcmp(name, "unix") == 0
+        // Top-level negation form: `![not(<atom>)]`.  Mirrors the
+        // nested `not(...)` form recognised inside `config(...)`.
+        || strcmp(name, "not") == 0;
+}
+
+/// Local copy of the OS-atom predicate so the validator can extend
+/// `config(...)` arg-shape checking without cross-importing the
+/// ConfigGating pass.  Kept in sync with config_gating.cryo's atom set.
+function is_cfg_os_atom(name: string) -> boolean {
+    return strcmp(name, "windows") == 0
+        || strcmp(name, "linux") == 0
+        || strcmp(name, "macos") == 0
+        || strcmp(name, "unix") == 0;
 }
 
 
@@ -271,22 +292,85 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
             return;
         }
         const a: DirectiveArg = dir.args[0];
+
+        // Nested call shape: `config(not(<atom>))` etc.  Only `not(...)`
+        // is recognised today; vocabulary expansion (any/all) plugs in
+        // here.  Placement is unrestricted — platform gates can attach
+        // to any decl.
+        if (a.kind == DirectiveArgKind::Nested) {
+            if (a.nested == null
+                    || strcmp(a.nested.directive_kind, "not") != 0) {
+                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                const msg: string =
+                    "directive `![config(...)]`: nested calls must be `not(<atom>)`";
+                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                diag = diag.at(dir.span);
+                ctx.emit_diagnostic(diag);
+            }
+            return;
+        }
+
         if (a.kind != DirectiveArgKind::Ident) {
             emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
             return;
         }
-        if (strcmp(a.name, "testing") != 0) {
+
+        // OS-atom flavor: `config(windows)` etc.  No placement
+        // restriction — these gate any declaration.
+        if (is_cfg_os_atom(a.name)) {
+            return;
+        }
+
+        // Build-mode flavor: today only `testing` is recognised, and it
+        // must live on a namespace.  Misspelled flavors fall through to
+        // the catch-all error.
+        if (strcmp(a.name, "testing") == 0) {
+            if (target != DirectiveTarget::Module) {
+                emit_placement_error(ctx, dir, name, "namespace", target);
+            }
+            return;
+        }
+
+        const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+        const msg: string = format(
+            "directive `![config]`: unknown flavor `%s` (expected `testing`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
+            a.name);
+        mut diag: Diagnostic = Diagnostic::error(code, msg);
+        diag = diag.at(dir.span);
+        ctx.emit_diagnostic(diag);
+        return;
+    }
+
+    // Bare-atom forms: `![windows]`, `![linux]`, `![macos]`, `![unix]`.
+    // Sugar for `![config(<atom>)]`; identical semantics, evaluated by
+    // the ConfigGating pass.  Zero args, unrestricted placement.
+    if (is_cfg_os_atom(name)) {
+        if (argc != 0) {
+            emit_arity_error(ctx, dir, name, 0, argc);
+        }
+        return;
+    }
+
+    // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
+    // form recognised inside `config(...)`.
+    if (strcmp(name, "not") == 0) {
+        if (argc != 1) {
+            emit_arity_error(ctx, dir, name, 1, argc);
+            return;
+        }
+        const a: DirectiveArg = dir.args[0];
+        if (a.kind != DirectiveArgKind::Ident) {
+            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+            return;
+        }
+        if (!is_cfg_os_atom(a.name)) {
             const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
             const msg: string = format(
-                "directive `![config]`: unknown flavor `%s` (expected `testing`)",
+                "directive `![not]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, or `unix`)",
                 a.name);
             mut diag: Diagnostic = Diagnostic::error(code, msg);
             diag = diag.at(dir.span);
             ctx.emit_diagnostic(diag);
-            return;
-        }
-        if (target != DirectiveTarget::Module) {
-            emit_placement_error(ctx, dir, name, "namespace", target);
         }
         return;
     }
@@ -353,12 +437,41 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
         return;
     }
 
-    if (strcmp(name, "cfg") == 0 || strcmp(name, "target") == 0) {
-        if (argc == 0) {
+    // `![target(<atom>)]` is an alias for `![config(<atom>)]` for
+    // platform-gate purposes.  Accepts the same vocabulary: bare OS
+    // atom or `not(<atom>)`.  The legacy `![cfg]` spelling has been
+    // retired in favor of `config`.
+    if (strcmp(name, "target") == 0) {
+        if (argc != 1) {
             emit_arity_error(ctx, dir, name, 1, argc);
+            return;
         }
-        // Args may be ident, key=value, or nested call.  No further
-        // shape check until we have a real condition evaluator.
+        const a: DirectiveArg = dir.args[0];
+        if (a.kind == DirectiveArgKind::Nested) {
+            if (a.nested == null
+                    || strcmp(a.nested.directive_kind, "not") != 0) {
+                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                const msg: string =
+                    "directive `![target(...)]`: nested calls must be `not(<atom>)`";
+                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                diag = diag.at(dir.span);
+                ctx.emit_diagnostic(diag);
+            }
+            return;
+        }
+        if (a.kind != DirectiveArgKind::Ident) {
+            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+            return;
+        }
+        if (!is_cfg_os_atom(a.name)) {
+            const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+            const msg: string = format(
+                "directive `![target]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
+                a.name);
+            mut diag: Diagnostic = Diagnostic::error(code, msg);
+            diag = diag.at(dir.span);
+            ctx.emit_diagnostic(diag);
+        }
         return;
     }
 
