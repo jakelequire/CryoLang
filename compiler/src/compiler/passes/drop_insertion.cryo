@@ -1,0 +1,1110 @@
+///! Drop Insertion Pass — Phase 1 of auto-drop.
+///!
+///! Runs after MoveCheck and before TypeLowering.  Performs flow-sensitive
+///! ownership analysis with proper branch-join semantics:
+///! - `if`/`match`: definitely-moved is the intersection of the per-branch
+///!   moved-sets, possibly-moved is the symmetric difference.  Diverging
+///!   branches (those that always `return`/`break`/`continue`) are
+///!   excluded from the join — their moves don't escape.
+///! - Possibly-moved bindings emit `E0456_CONDITIONAL_MOVE` and are
+///!   treated as moved going forward to keep cascade noise down.
+///! - Loop bodies snapshot/restore: body-internal moves don't propagate
+///!   to the post-loop state (Phase 3 will revisit with proper fixed-
+///!   point analysis).
+///!
+///! ## Mutation gate (Phase 1.5: disabled)
+///!
+///! The pass is wired to *synthesize* `binding.drop();` calls at every
+///! scope-exit point (normal fall-through and explicit early-exits)
+///! for every live, non-Copy local declared in that scope, in reverse
+///! declaration order.  That synthesis is gated on `SYNTHESIZE_DROPS`
+///! and currently disabled because:
+///!
+///! - stdlib still has ~158 manual `.drop()` call sites and helper
+///!   functions like `drop_cstring_array(&x)` that drop via reference
+///!   (which the analyzer can't detect as a consume).  Enabling
+///!   synthesis without first stripping those produces double-drops.
+///! - Several stdlib methods (e.g. `Box::into_raw`) take `&this`
+///!   syntactically but consume semantically.  Marking them correctly
+///!   needs a `![consumes_self]`-style attribute the language doesn't
+///!   yet support.
+///!
+///! Phase 2 will land the strip + the attribute, then re-enable the
+///! gate.  Until then the pass behaves as a flow-sensitive move-checker
+///! that emits `E0456_CONDITIONAL_MOVE` errors but doesn't mutate.
+
+namespace Compiler::Passes::DropInsertion;
+
+import Compiler::Diag;
+import Compiler::Diag::Snapshot;
+import Compiler::Diag::Sink;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Diagnostic;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::Passes::PassID;
+import Compiler::CompilationContext;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Types;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
+import std::core::option;
+import std::collections::hashmap;
+
+
+/// Phase 1.5 gate: when false the pass runs the analyzer (move
+/// tracking + E0456_CONDITIONAL_MOVE emission) but does not insert
+/// synthesised `binding.drop();` statements.  Flip to true once the
+/// stdlib's manual `.drop()` calls have been stripped and consuming
+/// methods are tagged so synthesis won't double-drop.
+const SYNTHESIZE_DROPS: boolean = false;
+
+
+type struct DropInserter {
+    ctx:      CompilationContext*;
+    arena:    TypeArena*;
+    registry: GenericRegistry*;
+    intern:   InternTable*;
+
+    /// Cached `drop` symbol id, used when matching method calls and
+    /// synthesizing new ones.
+    drop_sym: SymbolStr;
+
+    /// Per-binding type info for live bindings.  Entries are added on
+    /// `let` and conceptually removed when the declaring scope is
+    /// popped.  Stored as parallel arrays rather than a HashMap so
+    /// pop-scope can truncate by length (the bootstrap HashMap's
+    /// remove path corrupts cross-key lookups under our access
+    /// pattern).  Linear search is fine for typical function sizes.
+    types_keys:  u32[];
+    types_refs:  TypeRef[];
+
+    /// Flat scope stack: `binding_*` arrays hold every binding in
+    /// every live scope, and `scope_start_idx[i]` is the offset where
+    /// scope `i` begins.  Pop-scope truncates the binding arrays back
+    /// to that offset.  Innermost scope is `scope_start_idx.length - 1`.
+    scope_start_idx: i64[];
+    binding_names:   u32[];
+    binding_types:   TypeRef[];
+    binding_spans:   SourceSpan[];
+
+    /// Stack of "loop boundary depths".  When walk_while/walk_for/
+    /// walk_loop is processing a loop body, the current scope_stack
+    /// length at entry is pushed here; `break`/`continue` then know to
+    /// limit cumulative drops to scopes at index >= top-of-stack.
+    /// Without this, a break would drop bindings declared OUTSIDE the
+    /// loop, which are still live after the loop exits.
+    loop_boundary: i64[];
+
+    /// Moved-set on the current control-flow path, encoded the same way
+    /// as MoveCheck — parallel-array (key, line) so snapshot/restore is
+    /// just an array-length checkpoint.  Branch-join builds a snapshot,
+    /// walks each branch independently, and merges via intersection.
+    moved_keys:  u32[];
+    moved_lines: i32[];
+
+    fired:        i64;
+    inserted:     i64;
+
+    static new(ctx: CompilationContext*) -> DropInserter {
+        return DropInserter {
+            ctx:             ctx,
+            arena:           ctx.type_arena,
+            registry:        ctx.generic_registry,
+            intern:          ctx.get_intern_table(),
+            drop_sym:        ctx.get_intern_table().intern("drop"),
+            types_keys:      [],
+            types_refs:      [],
+            scope_start_idx: [],
+            binding_names:   [],
+            binding_types:   [],
+            binding_spans:   [],
+            loop_boundary:   [],
+            moved_keys:      [],
+            moved_lines:     [],
+            fired:           0,
+            inserted:        0,
+        };
+    }
+
+    // ---- scope management ------------------------------------------------
+
+    push_scope(mut &this) -> void {
+        this.scope_start_idx.push(this.binding_names.length);
+    }
+
+    pop_scope(mut &this) -> void {
+        const top: i64 = this.scope_start_idx.length;
+        if (top == 0) { return; }
+        // Read by index then truncate via pop() — `pop()`'s return
+        // value is unreliable for `i64[]` in the bootstrap codegen
+        // (we get garbage back), so we never rely on it.  The push
+        // does decrement length correctly, which is what we need.
+        const start: i64 = this.scope_start_idx[top - 1];
+        this.scope_start_idx.pop();
+        // Bindings declared in this scope go out of lexical scope —
+        // truncate them out of types_* and binding_*.  We assume
+        // bindings are pushed onto types_* in the same order as
+        // binding_*, which holds because register_binding is the only
+        // mutator and adds to both arrays in lock-step.
+        while (this.binding_names.length > start) {
+            this.binding_names.pop();
+            this.binding_types.pop();
+            this.binding_spans.pop();
+            this.types_keys.pop();
+            this.types_refs.pop();
+        }
+    }
+
+    /// Start offset of the innermost (top) scope.
+    top_scope_start(&this) -> i64 {
+        if (this.scope_start_idx.length == 0) { return 0; }
+        return this.scope_start_idx[this.scope_start_idx.length - 1];
+    }
+
+    register_binding(mut &this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
+        if (!name.is_valid()) { return; }
+        this.types_keys.push(name.id);
+        this.types_refs.push(ty);
+        this.binding_names.push(name.id);
+        this.binding_types.push(ty);
+        this.binding_spans.push(span);
+    }
+
+    /// Same as register_binding but stores a type-only entry (no
+    /// scope_stack push).  Used for function parameters, which aren't
+    /// auto-dropped at function exit but should still resolve via
+    /// lookup_type for use-after-move analysis.
+    register_param_type(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        if (!name.is_valid()) { return; }
+        this.types_keys.push(name.id);
+        this.types_refs.push(ty);
+    }
+
+    // ---- move tracking ---------------------------------------------------
+
+    is_moved(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    is_moved_id(&this, key: u32) -> boolean {
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    moved_at_line(&this, name: SymbolStr) -> i32 {
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == name.id) { return this.moved_lines[i]; }
+        }
+        return 0;
+    }
+
+    mark_moved(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+        if (!name.is_valid()) { return; }
+        if (this.is_moved(name)) { return; }
+        this.moved_keys.push(name.id);
+        this.moved_lines.push(span.start_line as i32);
+    }
+
+    snapshot_moves(&this) -> i64 {
+        return this.moved_keys.length;
+    }
+
+    /// Truncate the moved-set back to a saved length.  Used by loop
+    /// bodies (Phase 1 doesn't propagate body-internal moves to the
+    /// post-loop state) and as part of branch-join.
+    restore_moves(mut &this, checkpoint: i64) -> void {
+        while (this.moved_keys.length > checkpoint) {
+            this.moved_keys.pop();
+            this.moved_lines.pop();
+        }
+    }
+
+    /// Return the keys moved between [snapshot..len), in order.
+    moves_since_keys(&this, snapshot: i64) -> u32[] {
+        mut out: u32[] = [];
+        for (mut i: i64 = snapshot; i < this.moved_keys.length; i++) {
+            out.push(this.moved_keys[i]);
+        }
+        return out;
+    }
+
+    moves_since_lines(&this, snapshot: i64) -> i32[] {
+        mut out: i32[] = [];
+        for (mut i: i64 = snapshot; i < this.moved_keys.length; i++) {
+            out.push(this.moved_lines[i]);
+        }
+        return out;
+    }
+
+    /// Replace the moved-set tail (after `snapshot`) with the given keys.
+    set_moves_tail(mut &this, snapshot: i64, keys: u32[], lines: i32[]) -> void {
+        this.restore_moves(snapshot);
+        for (mut i: i64 = 0; i < keys.length; i++) {
+            this.moved_keys.push(keys[i]);
+            this.moved_lines.push(lines[i]);
+        }
+    }
+
+    // ---- type queries ----------------------------------------------------
+
+    is_copy(&this, ty: TypeRef) -> boolean {
+        return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
+    }
+
+    lookup_type(&this, name: SymbolStr) -> TypeRef {
+        if (!name.is_valid()) { return TypeRef::invalid(); }
+        // Walk in reverse so an inner-scope shadow wins over an outer
+        // binding of the same name (rare in Cryo, but possible in
+        // pattern arms).
+        for (mut i: i64 = this.types_keys.length - 1; i >= 0; i--) {
+            if (this.types_keys[i] == name.id) { return this.types_refs[i]; }
+        }
+        return TypeRef::invalid();
+    }
+
+    // ---- diagnostics -----------------------------------------------------
+
+    // ---- entry points ----------------------------------------------------
+
+    walk_program(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            this.walk_top_level(stmt);
+        }
+    }
+
+    walk_top_level(mut &this, stmt: ASTNode*) -> void {
+        match (stmt.kind) {
+            NodeKind::FunctionDeclaration => {
+                this.walk_function(stmt as FunctionDeclNode*);
+            }
+            NodeKind::StructDeclaration => {
+                this.walk_methods((stmt as StructDeclNode*).methods);
+            }
+            NodeKind::ClassDeclaration => {
+                this.walk_methods((stmt as ClassDeclNode*).methods);
+            }
+            NodeKind::ImplementationBlock => {
+                this.walk_methods((stmt as ImplBlockNode*).methods);
+            }
+            NodeKind::TraitDeclaration => {
+                const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                for (mut i: i64 = 0; i < td.methods.length; i++) {
+                    const m: FunctionDeclNode* = td.methods[i];
+                    if (m != null) { this.walk_function(m); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_methods(mut &this, methods: MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            this.walk_function(m.func);
+        }
+    }
+
+    walk_function(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.body == null) { return; }
+        if (func.is_generic()) { return; }
+        // Reset per-function state.  We don't drop parameters at function
+        // exit in Phase 1: methods routinely take `mut &this` and
+        // ownership of value parameters is rare in stdlib hot paths.
+        // Fold params into the body scope only as type bindings so
+        // use-after-move on an identified param still fires.
+        this.types_keys      = [];
+        this.types_refs      = [];
+        this.scope_start_idx = [];
+        this.binding_names   = [];
+        this.binding_types   = [];
+        this.binding_spans   = [];
+        this.loop_boundary   = [];
+        this.moved_keys  = [];
+        this.moved_lines = [];
+
+        this.push_scope();
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (p == null) { continue; }
+            this.register_param_type(p.name, p.resolved_type);
+        }
+        this.walk_block_body(func.body);
+        this.pop_scope();
+    }
+
+    /// Walk a block, mutating its `statements` list in-place to inject
+    /// synthesized `binding.drop();` calls at end of scope and before
+    /// any early-exit statements (`return`, `break`, `continue`).
+    /// Returns true when the block always diverges on every control-flow
+    /// path through it — used by the if/match join to ignore branches
+    /// that can't fall through.
+    walk_block(mut &this, block: BlockStmtNode*) -> boolean {
+        if (block == null) { return false; }
+        this.push_scope();
+        const diverges: boolean = this.walk_block_body(block);
+        this.pop_scope();
+        return diverges;
+    }
+
+    /// Body of a block: assumes the caller already pushed the scope
+    /// (so a function can register parameters into the same scope as
+    /// the body's locals before walking).  Returns true if the block
+    /// always diverges.
+    walk_block_body(mut &this, block: BlockStmtNode*) -> boolean {
+        if (block == null) { return false; }
+        const old_stmts: StatementNode*[] = block.statements;
+        mut new_stmts: StatementNode*[] = [];
+        mut terminated: boolean = false;
+
+        for (mut i: i64 = 0; i < old_stmts.length; i++) {
+            const stmt: StatementNode* = old_stmts[i];
+            if (stmt == null) { continue; }
+            if (terminated) {
+                // Statements after an unconditional divergence are
+                // unreachable.  Drop them; the early-exit already
+                // emitted its drops and there's no path here.
+                continue;
+            }
+            const stmt_diverges: boolean = this.walk_stmt_into(stmt, &new_stmts);
+            if (stmt_diverges) { terminated = true; }
+        }
+
+        // Normal fall-through: emit drops for the top scope's bindings
+        // in reverse declaration order, skipping any that have already
+        // been moved on this path.  Suppressed when the block was
+        // unconditionally terminated (drops were already emitted right
+        // before the early-exit).
+        if (!terminated) {
+            this.append_top_scope_drops(&new_stmts);
+        }
+
+        block.statements = new_stmts;
+        return terminated;
+    }
+
+    /// Walk a single statement, appending it (and any synthesized drops
+    /// that must precede it) to `out`.
+    /// Append `stmt` and any preceding synthesized drops to `out`.
+    /// Returns true if `stmt` always diverges (any path through the
+    /// program reaching this point cannot fall through to the next
+    /// statement in the enclosing block).
+    walk_stmt_into(mut &this, stmt: StatementNode*, out: StatementNode*[]*) -> boolean {
+        return match (stmt.kind) {
+            NodeKind::ReturnStatement => {
+                const r: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                if (r.expression != null) { this.walk_expr_move(r.expression); }
+                // Cumulative drops across every live scope, innermost
+                // first, before the return.  The return's expression has
+                // already been move-walked, so any binding consumed by
+                // the return is correctly excluded from the drop set.
+                this.append_cumulative_drops(out);
+                out.push(stmt);
+                true
+            }
+            NodeKind::BreakStatement => {
+                // Drops only the bindings inside the enclosing loop's
+                // scopes.  Bindings declared OUTSIDE the loop survive
+                // the `break` and continue to live in the post-loop
+                // code, so they must NOT be dropped here.
+                this.append_loop_exit_drops(out);
+                out.push(stmt);
+                true
+            }
+            NodeKind::ContinueStatement => {
+                this.append_loop_exit_drops(out);
+                out.push(stmt);
+                true
+            }
+            NodeKind::ExpressionStatement => {
+                const e: ExprStmtNode* = stmt as ExprStmtNode*;
+                if (e.expression != null) { this.walk_expr_read(e.expression); }
+                out.push(stmt);
+                false
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null &&
+                    ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    this.walk_var_decl(ds.declaration as VarDeclNode*);
+                }
+                out.push(stmt);
+                false
+            }
+            NodeKind::BlockStatement => {
+                const d: boolean = this.walk_block(stmt as BlockStmtNode*);
+                out.push(stmt);
+                d
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const u: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                mut d: boolean = false;
+                if (u.block != null) { d = this.walk_block(u.block); }
+                out.push(stmt);
+                d
+            }
+            NodeKind::IfStatement => {
+                const d: boolean = this.walk_if(stmt as IfStmtNode*);
+                out.push(stmt);
+                d
+            }
+            NodeKind::WhileStatement => {
+                this.walk_while(stmt as WhileStmtNode*);
+                out.push(stmt);
+                false
+            }
+            NodeKind::DoWhileStatement => {
+                this.walk_do_while(stmt as DoWhileStmtNode*);
+                out.push(stmt);
+                false
+            }
+            NodeKind::ForStatement => {
+                this.walk_for(stmt as ForStmtNode*);
+                out.push(stmt);
+                false
+            }
+            NodeKind::LoopStatement => {
+                this.walk_loop(stmt as LoopStmtNode*);
+                out.push(stmt);
+                false
+            }
+            NodeKind::MatchStatement => {
+                const d: boolean = this.walk_match(stmt as MatchStmtNode*);
+                out.push(stmt);
+                d
+            }
+            // SwitchStatement, CaseStatement, etc. pass through.
+            // Switch isn't a primary control-flow shape in modern Cryo.
+            _ => {
+                out.push(stmt);
+                false
+            }
+        };
+    }
+
+    walk_var_decl(mut &this, vd: VarDeclNode*) -> void {
+        if (vd == null) { return; }
+        if (vd.initializer != null) {
+            this.walk_expr_move(vd.initializer);
+        }
+        if (!vd.is_global) {
+            this.register_binding(vd.name, vd.resolved_type, vd.span);
+        }
+    }
+
+    // ---- control-flow walks ---------------------------------------------
+
+    walk_if(mut &this, it: IfStmtNode*) -> boolean {
+        if (it == null) { return false; }
+        if (it.condition != null) { this.walk_expr_read(it.condition); }
+        const snap: i64 = this.snapshot_moves();
+
+        mut then_diverges: boolean = false;
+        if (it.then_stmt != null) {
+            it.then_stmt = this.wrap_early_exit(it.then_stmt);
+            then_diverges = this.walk_stmt_in_place(it.then_stmt);
+        }
+        const then_keys:  u32[] = this.moves_since_keys(snap);
+        const then_lines: i32[] = this.moves_since_lines(snap);
+        this.restore_moves(snap);
+
+        mut else_diverges: boolean = false;
+        if (it.else_stmt != null) {
+            it.else_stmt = this.wrap_early_exit(it.else_stmt);
+            else_diverges = this.walk_stmt_in_place(it.else_stmt);
+        }
+        const else_keys:  u32[] = this.moves_since_keys(snap);
+        const else_lines: i32[] = this.moves_since_lines(snap);
+        this.restore_moves(snap);
+
+        // Branch join.  A diverging branch's moves don't escape the if
+        // (control never reaches post-if on that path), so we drop its
+        // contribution from the join entirely.  An if without an else
+        // has an implicit fall-through else-branch — non-diverging,
+        // empty moved-set — making any then-only move conditional.
+        const has_else: boolean = it.else_stmt != null;
+        const both_diverge: boolean = then_diverges && has_else && else_diverges;
+        this.merge_branches(snap,
+            then_keys, then_lines, then_diverges,
+            else_keys, else_lines, has_else, else_diverges);
+        return both_diverge;
+    }
+
+    /// If `stmt` is a bare early-exit (return/break/continue), wrap it
+    /// in a synthesized block so the block walker can splice cumulative
+    /// drops before it.  Otherwise return the stmt unchanged.  The
+    /// parser produces bare statements for `if (c) return;` shapes.
+    wrap_early_exit(mut &this, stmt: StatementNode*) -> StatementNode* {
+        if (stmt == null) { return stmt; }
+        const k: NodeKind = stmt.kind;
+        if (k != NodeKind::ReturnStatement &&
+            k != NodeKind::BreakStatement  &&
+            k != NodeKind::ContinueStatement) {
+            return stmt;
+        }
+        const block: BlockStmtNode* = new BlockStmtNode(stmt.span);
+        block.statements.push(stmt);
+        return block as StatementNode*;
+    }
+
+    walk_while(mut &this, w: WhileStmtNode*) -> void {
+        if (w == null) { return; }
+        if (w.condition != null) { this.walk_expr_read(w.condition); }
+        // Loops run their body 0+ times.  Any move inside the body
+        // either doesn't happen (0 iterations) or may set up a
+        // use-after-move on the next iteration.  Phase 1 conservative
+        // model: snapshot/restore so the post-loop state matches the
+        // pre-loop state — a body-internal move is invisible past the
+        // loop.  Phase 3 fixes this with proper fixed-point analysis.
+        const snap: i64 = this.snapshot_moves();
+        this.loop_boundary.push(this.scope_start_idx.length);
+        if (w.body != null) {
+            w.body = this.wrap_early_exit(w.body);
+            this.walk_stmt_in_place(w.body);
+        }
+        this.loop_boundary.pop();
+        this.restore_moves(snap);
+    }
+
+    walk_do_while(mut &this, w: DoWhileStmtNode*) -> void {
+        if (w == null) { return; }
+        const snap: i64 = this.snapshot_moves();
+        this.loop_boundary.push(this.scope_start_idx.length);
+        if (w.body != null) {
+            w.body = this.wrap_early_exit(w.body);
+            this.walk_stmt_in_place(w.body);
+        }
+        this.loop_boundary.pop();
+        this.restore_moves(snap);
+        if (w.condition != null) { this.walk_expr_read(w.condition); }
+    }
+
+    walk_for(mut &this, f: ForStmtNode*) -> void {
+        if (f == null) { return; }
+        // The init clause typically declares a loop variable like
+        // `mut i: i64 = 0` — its scope is the for-statement, not the
+        // enclosing block.  Push a scope so the init binding is dropped
+        // when the for finishes.
+        this.push_scope();
+        if (f.init != null && f.init.kind == NodeKind::VariableDeclaration) {
+            this.walk_var_decl(f.init as VarDeclNode*);
+        }
+        if (f.condition != null) { this.walk_expr_read(f.condition); }
+        if (f.update != null)    { this.walk_expr_read(f.update); }
+        const snap: i64 = this.snapshot_moves();
+        this.loop_boundary.push(this.scope_start_idx.length);
+        if (f.body != null) {
+            f.body = this.wrap_early_exit(f.body);
+            this.walk_stmt_in_place(f.body);
+        }
+        this.loop_boundary.pop();
+        this.restore_moves(snap);
+        this.pop_scope();
+    }
+
+    walk_loop(mut &this, l: LoopStmtNode*) -> void {
+        if (l == null) { return; }
+        const snap: i64 = this.snapshot_moves();
+        this.loop_boundary.push(this.scope_start_idx.length);
+        if (l.body != null) {
+            l.body = this.wrap_early_exit(l.body);
+            this.walk_stmt_in_place(l.body);
+        }
+        this.loop_boundary.pop();
+        this.restore_moves(snap);
+    }
+
+    walk_match(mut &this, m: MatchStmtNode*) -> boolean {
+        if (m == null) { return false; }
+        if (m.subject != null) { this.walk_expr_read(m.subject); }
+        // Each arm is a separate control-flow path; same
+        // intersection/union join as walk_if, generalised over N arms.
+        if (m.arms.length == 0) { return false; }
+        const snap: i64 = this.snapshot_moves();
+        // Snapshot the outer-scope binding set so we can ignore moves
+        // of arm-local bindings (pattern bindings or `let` inside the
+        // arm body).  Those bindings disappear when the arm ends; they
+        // don't exist on any other arm and are not part of the cross-
+        // arm join.  Without this filter, `match (...) { Ok(x) => {
+        // x.drop(); } Err(_) => {} }` would flag `x` as conditionally
+        // moved.
+        mut outer_names: u32[] = [];
+        for (mut i: i64 = 0; i < this.binding_names.length; i++) {
+            outer_names.push(this.binding_names[i]);
+        }
+
+        mut all_keys:    u32[] = [];
+        mut all_lines:   i32[] = [];
+        mut all_counts:  i64[] = [];
+        const arm_count: i64 = m.arms.length;
+        mut live_arms:   i64 = 0;
+        mut diverge_count: i64 = 0;
+
+        for (mut a: i64 = 0; a < arm_count; a++) {
+            const arm: MatchArmNode* = m.arms[a];
+            if (arm == null || arm.body == null) { continue; }
+            arm.body = this.wrap_early_exit(arm.body);
+            const arm_div: boolean = this.walk_stmt_in_place(arm.body);
+            if (arm_div) {
+                diverge_count = diverge_count + 1;
+                this.restore_moves(snap);
+                continue;
+            }
+            live_arms = live_arms + 1;
+            const arm_keys:  u32[] = this.moves_since_keys(snap);
+            const arm_lines: i32[] = this.moves_since_lines(snap);
+            for (mut i: i64 = 0; i < arm_keys.length; i++) {
+                mut in_outer: boolean = false;
+                for (mut o: i64 = 0; o < outer_names.length; o++) {
+                    if (outer_names[o] == arm_keys[i]) { in_outer = true; }
+                }
+                if (!in_outer) { continue; }
+                mut found: boolean = false;
+                for (mut j: i64 = 0; j < all_keys.length; j++) {
+                    if (all_keys[j] == arm_keys[i]) {
+                        all_counts[j] = all_counts[j] + 1;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    all_keys.push(arm_keys[i]);
+                    all_lines.push(arm_lines[i]);
+                    all_counts.push(1);
+                }
+            }
+            this.restore_moves(snap);
+        }
+
+        // All arms diverge → match diverges; post-state irrelevant.
+        if (live_arms == 0 && diverge_count > 0) {
+            this.restore_moves(snap);
+            return true;
+        }
+
+        mut def_keys:  u32[] = [];
+        mut def_lines: i32[] = [];
+        for (mut i: i64 = 0; i < all_keys.length; i++) {
+            if (all_counts[i] >= live_arms) {
+                def_keys.push(all_keys[i]);
+                def_lines.push(all_lines[i]);
+            } else {
+                this.emit_conditional_move_by_id(all_keys[i], all_lines[i]);
+                def_keys.push(all_keys[i]);
+                def_lines.push(all_lines[i]);
+            }
+        }
+        this.set_moves_tail(snap, def_keys, def_lines);
+        return false;
+    }
+
+    /// Walk a statement in place — used by control-flow walkers that
+    /// don't rebuild a parent statement list.  For block statements
+    /// this recurses into walk_block; for non-block statements we wrap
+    /// it in a 1-element list and let walk_stmt_into route correctly.
+    /// Walk a statement that lives as a child of a control-flow node
+    /// (then/else of an if, body of a while, arm of a match, …) without
+    /// rebuilding a parent statement list.  Returns the divergence flag
+    /// of the statement.  Bare early-exit branches should already have
+    /// been wrapped in a synthesized BlockStmtNode by walk_if/etc. via
+    /// wrap_early_exit, so by the time we get here the statement is
+    /// either a Block or a non-early-exit shape.
+    walk_stmt_in_place(mut &this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        return match (stmt.kind) {
+            NodeKind::BlockStatement => {
+                this.walk_block(stmt as BlockStmtNode*)
+            }
+            _ => {
+                mut throwaway: StatementNode*[] = [];
+                this.walk_stmt_into(stmt, &throwaway)
+            }
+        };
+    }
+
+    // ---- branch-join helpers --------------------------------------------
+
+    /// True iff `key` matches an id that's currently in `binding_names`
+    /// — i.e. the binding is live at the point of the if/match join.
+    /// Used to discard moves of branch-local bindings from the join,
+    /// which otherwise produce false `E0456_CONDITIONAL_MOVE` reports.
+    binding_in_outer_scope(&this, key: u32) -> boolean {
+        for (mut i: i64 = 0; i < this.binding_names.length; i++) {
+            if (this.binding_names[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    merge_branches(mut &this, snap: i64,
+                   then_keys: u32[], then_lines: i32[], then_diverges: boolean,
+                   else_keys: u32[], else_lines: i32[],
+                   has_else: boolean, else_diverges: boolean) -> void {
+        // A diverging branch's moves don't escape — drop its
+        // contribution from the join.  This eliminates the
+        // `if (c) { use(b); return; }` false-positive where `b` would
+        // otherwise look conditionally moved.
+        const live_then: boolean = !then_diverges;
+        const live_else: boolean = has_else && !else_diverges;
+
+        // Effective branches after diverge filtering.  When neither is
+        // live (both diverge), the post-join state is unreachable and
+        // the moved-set doesn't matter.
+        if (!live_then && !live_else) {
+            this.restore_moves(snap);
+            return;
+        }
+        if (live_then && !live_else) {
+            // Only the then-branch falls through.  Its moves apply
+            // unconditionally past the if-stmt — there's no other
+            // surviving path to compare against.
+            this.set_moves_tail(snap, then_keys, then_lines);
+            return;
+        }
+        if (!live_then && live_else) {
+            // Only the else-branch falls through.  When there's no
+            // explicit else, live_else can't be true, so this only
+            // fires for `if (c) { ... return; } else { ... }`.
+            this.set_moves_tail(snap, else_keys, else_lines);
+            return;
+        }
+
+        // Both branches fall through: definitely-moved is the
+        // intersection; possibly-moved is the symmetric difference.
+        // Branch-local bindings (declared inside the then or else
+        // body) are filtered out: they don't exist past the if-stmt
+        // and shouldn't drive the cross-branch join.
+        mut def_keys:  u32[] = [];
+        mut def_lines: i32[] = [];
+        for (mut i: i64 = 0; i < then_keys.length; i++) {
+            if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
+            mut in_else: boolean = false;
+            for (mut j: i64 = 0; j < else_keys.length; j++) {
+                if (then_keys[i] == else_keys[j]) { in_else = true; }
+            }
+            if (in_else) {
+                def_keys.push(then_keys[i]);
+                def_lines.push(then_lines[i]);
+            } else {
+                this.emit_conditional_move_by_id(then_keys[i], then_lines[i]);
+                def_keys.push(then_keys[i]);
+                def_lines.push(then_lines[i]);
+            }
+        }
+        for (mut j: i64 = 0; j < else_keys.length; j++) {
+            if (!this.binding_in_outer_scope(else_keys[j])) { continue; }
+            mut in_then: boolean = false;
+            for (mut i: i64 = 0; i < then_keys.length; i++) {
+                if (then_keys[i] == else_keys[j]) { in_then = true; }
+            }
+            if (!in_then) {
+                this.emit_conditional_move_by_id(else_keys[j], else_lines[j]);
+                def_keys.push(else_keys[j]);
+                def_lines.push(else_lines[j]);
+            }
+        }
+        this.set_moves_tail(snap, def_keys, def_lines);
+    }
+
+    emit_conditional_move_by_id(mut &this, key: u32, line: i32) -> void {
+        // Phase 1.5: emit as a warning rather than an error.  The
+        // analysis is over-eager — it reports any binding moved on
+        // some control-flow paths but not others, even when the
+        // binding's scope ends before the divergence becomes
+        // observable (e.g. declared inside a loop body that resets
+        // each iteration).  Once synthesis is enabled and proper
+        // escape analysis is in place, this can be promoted to error.
+        const sym: SymbolStr = SymbolStr::from_id(key);
+        mut name_str: string = this.intern.resolve(sym);
+        if (strlen(name_str) == 0) {
+            name_str = "<binding>";
+        }
+        const line_u: u32 = if (line > 0) { line as u32 } else { 0 };
+        const span: SourceSpan = SourceSpan::new("", line_u, 0, line_u, 0);
+        const msg: string = format(
+            "value '%s' is moved on some control-flow paths but not others",
+            name_str);
+        mut diag: Diagnostic = Diagnostic::warning(ErrorCode::E0456_CONDITIONAL_MOVE, msg);
+        diag = diag.at(span);
+        this.ctx.emit_diagnostic(diag);
+        this.fired = this.fired + 1;
+    }
+
+    // ---- drop synthesis --------------------------------------------------
+
+    /// Append synthetic drops for the top scope's bindings (reverse
+    /// declaration order) to `out`.  Skips bindings that have already
+    /// been moved on the current path and bindings whose type is Copy.
+    append_top_scope_drops(mut &this, out: StatementNode*[]*) -> void {
+        const start: i64 = this.top_scope_start();
+        const end:   i64 = this.binding_names.length;
+        for (mut i: i64 = end - 1; i >= start; i--) {
+            this.maybe_append_drop(out, i);
+        }
+    }
+
+    /// Append drops for every live scope down to `min_scope`, innermost
+    /// first, reverse declaration order within each scope.
+    append_drops_to_depth(mut &this, out: StatementNode*[]*, min_scope: i64) -> void {
+        const total_scopes: i64 = this.scope_start_idx.length;
+        if (total_scopes == 0 || min_scope >= total_scopes) { return; }
+        const stop: i64 = if (min_scope < 0) { 0 } else { min_scope };
+        for (mut s: i64 = total_scopes - 1; s >= stop; s--) {
+            const start: i64 = this.scope_start_idx[s];
+            const end:   i64 = if (s + 1 < total_scopes) {
+                this.scope_start_idx[s + 1]
+            } else {
+                this.binding_names.length
+            };
+            for (mut i: i64 = end - 1; i >= start; i--) {
+                this.maybe_append_drop(out, i);
+            }
+        }
+    }
+
+    /// Drops for every live scope, innermost first.  Used before
+    /// `return` — the function exits, so every scope gets dropped.
+    append_cumulative_drops(mut &this, out: StatementNode*[]*) -> void {
+        this.append_drops_to_depth(out, 0);
+    }
+
+    /// Drops for scopes inside the current loop body.  Used before
+    /// `break`/`continue` — those exit the enclosing loop only, so
+    /// bindings declared OUTSIDE the loop must NOT be dropped here.
+    append_loop_exit_drops(mut &this, out: StatementNode*[]*) -> void {
+        if (this.loop_boundary.length == 0) {
+            // No enclosing loop — `break`/`continue` outside a loop
+            // would be a sema error already; emit nothing.
+            return;
+        }
+        const boundary: i64 = this.loop_boundary[this.loop_boundary.length - 1];
+        this.append_drops_to_depth(out, boundary);
+    }
+
+    maybe_append_drop(mut &this, out: StatementNode*[]*, idx: i64) -> void {
+        // Phase 1.5: synthesis disabled.  See module doc.  We still run
+        // the analyzer above (move tracking, branch join, E0456) so
+        // turning synthesis back on later is a one-line flip.
+        if (!SYNTHESIZE_DROPS) { return; }
+        const key:  u32       = this.binding_names[idx];
+        const ty:   TypeRef   = this.binding_types[idx];
+        const span: SourceSpan = this.binding_spans[idx];
+        if (this.is_moved_id(key)) { return; }
+        if (this.is_copy(ty))      { return; }
+        // The binding's type might lack a drop method (rare for non-Copy
+        // types, but possible for primitives that escape Copy through
+        // an alias).  Skip in that case — emitting a `.drop()` on a
+        // type without a drop method would fail at codegen.
+        if (!OwnershipQuery::has_inherent_drop(this.arena, this.registry,
+                                                this.intern, ty) &&
+            !OwnershipQuery::type_implements_drop(this.arena, this.registry,
+                                                    this.intern, ty)) {
+            return;
+        }
+        const sym: SymbolStr = SymbolStr::from_id(key);
+        const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
+        if (stmt != null) {
+            out.push(stmt);
+            this.inserted = this.inserted + 1;
+        }
+    }
+
+    /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).
+    make_drop_call(mut &this, name: SymbolStr, ty: TypeRef,
+                    span: SourceSpan) -> StatementNode* {
+        const ident: IdentifierNode* = new IdentifierNode(name, span);
+        const member: MemberAccessNode* = new MemberAccessNode(
+            ident as ExpressionNode*, this.drop_sym, span, span);
+        const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
+        const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        return stmt as StatementNode*;
+    }
+
+    // ---- expression walks (move tracking on identifiers) -----------------
+
+    /// Move-context: bare identifiers of non-Copy types get marked moved.
+    walk_expr_move(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null) { return; }
+        if (expr.kind == NodeKind::Identifier) {
+            this.handle_ident(expr as IdentifierNode*, true);
+            return;
+        }
+        this.walk_expr_read(expr);
+    }
+
+    walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null) { return; }
+        match (expr.kind) {
+            NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false);      }
+            NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                   }
+            NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);               }
+            NodeKind::UnaryExpression    => { this.read_unary(expr as UnaryExprNode*);                 }
+            NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }
+            NodeKind::ArrayAccess        => { this.read_array_access(expr as ArrayAccessNode*);        }
+            NodeKind::CastExpression     => { this.read_cast(expr as CastExprNode*);                   }
+            NodeKind::StructLiteral      => { this.read_struct_lit(expr as StructLiteralNode*);        }
+            NodeKind::TupleLiteral       => { this.read_tuple_lit(expr as TupleLiteralNode*);          }
+            NodeKind::ArrayLiteral       => { this.read_array_lit(expr as ArrayLiteralNode*);          }
+            NodeKind::TernaryExpression  => { this.read_ternary(expr as TernaryExprNode*);             }
+            NodeKind::IfExpression       => { this.read_if_expr(expr as IfExprNode*);                  }
+            NodeKind::NewExpression      => { this.read_new(expr as NewExprNode*);                     }
+            _ => {}
+        }
+    }
+
+    read_call(mut &this, c: CallExprNode*) -> void {
+        if (c == null) { return; }
+        // Recognise `<ident>.drop()` and treat it as a move: the user
+        // is explicitly releasing the binding here, so auto-drop must
+        // not emit a second `.drop()` at scope exit.  Without this, any
+        // file that hand-writes `b.drop();` would double-drop.  Same
+        // applies post-stdlib-migration for user code that opts out of
+        // auto-drop with an explicit consume.
+        if (c.callee != null && c.arguments.length == 0 &&
+            c.callee.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+            if (ma.member.equals(this.drop_sym) && ma.object != null &&
+                ma.object.kind == NodeKind::Identifier) {
+                const id: IdentifierNode* = ma.object as IdentifierNode*;
+                // Only treat as a move when the identifier is a binding
+                // we're tracking (in the types map).  Pattern bindings
+                // introduced by `match` arms aren't currently registered,
+                // and treating their `.drop()` as a move would inflate
+                // the per-arm moved-set and cascade into spurious
+                // conditional-move errors at the match join.
+                if (id.name.is_valid() && this.lookup_type(id.name).is_valid()) {
+                    if (!this.is_moved(id.name)) {
+                        this.mark_moved(id.name, id.span);
+                    }
+                    return;
+                }
+            }
+        }
+        if (c.callee != null) { this.walk_expr_read(c.callee); }
+        for (mut i: i64 = 0; i < c.arguments.length; i++) {
+            this.walk_expr_move(c.arguments[i]);
+        }
+    }
+
+    read_binary(mut &this, b: BinaryExprNode*) -> void {
+        if (b == null) { return; }
+        if (b.left != null) { this.walk_expr_read(b.left); }
+        if (b.right != null) {
+            // `lhs = rhs` moves rhs into lhs.  Walk the rhs in move
+            // context so a bare-ident rhs of a non-Copy type is marked
+            // moved.  Compound assigns (`+=`, `-=`, etc.) read both
+            // sides and write the result, so they aren't moves —
+            // restrict the move semantics to plain `=`.
+            if (b.op.kind == TokenType::Equal) {
+                this.walk_expr_move(b.right);
+            } else {
+                this.walk_expr_read(b.right);
+            }
+        }
+    }
+
+    read_unary(mut &this, u: UnaryExprNode*) -> void {
+        if (u == null) { return; }
+        if (u.operand != null) { this.walk_expr_read(u.operand); }
+    }
+
+    read_member(mut &this, ma: MemberAccessNode*) -> void {
+        if (ma == null) { return; }
+        if (ma.object != null) { this.walk_expr_read(ma.object); }
+    }
+
+    read_array_access(mut &this, aa: ArrayAccessNode*) -> void {
+        if (aa == null) { return; }
+        if (aa.array != null) { this.walk_expr_read(aa.array); }
+        if (aa.index != null) { this.walk_expr_read(aa.index); }
+    }
+
+    read_cast(mut &this, cv: CastExprNode*) -> void {
+        if (cv == null) { return; }
+        if (cv.expression != null) { this.walk_expr_read(cv.expression); }
+    }
+
+    read_struct_lit(mut &this, sl: StructLiteralNode*) -> void {
+        if (sl == null) { return; }
+        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+            this.walk_expr_move(sl.field_inits[i].value);
+        }
+    }
+
+    read_tuple_lit(mut &this, tl: TupleLiteralNode*) -> void {
+        if (tl == null) { return; }
+        for (mut i: i64 = 0; i < tl.elements.length; i++) {
+            this.walk_expr_move(tl.elements[i]);
+        }
+    }
+
+    read_array_lit(mut &this, al: ArrayLiteralNode*) -> void {
+        if (al == null) { return; }
+        for (mut i: i64 = 0; i < al.elements.length; i++) {
+            this.walk_expr_move(al.elements[i]);
+        }
+    }
+
+    read_ternary(mut &this, t: TernaryExprNode*) -> void {
+        if (t == null) { return; }
+        if (t.condition != null)  { this.walk_expr_read(t.condition); }
+        if (t.true_expr != null)  { this.walk_expr_read(t.true_expr); }
+        if (t.false_expr != null) { this.walk_expr_read(t.false_expr); }
+    }
+
+    read_if_expr(mut &this, ie: IfExprNode*) -> void {
+        if (ie == null) { return; }
+        if (ie.condition != null) { this.walk_expr_read(ie.condition); }
+        if (ie.then_expr != null) { this.walk_expr_read(ie.then_expr); }
+        if (ie.else_expr != null) { this.walk_expr_read(ie.else_expr); }
+    }
+
+    read_new(mut &this, n: NewExprNode*) -> void {
+        if (n == null) { return; }
+        for (mut i: i64 = 0; i < n.arguments.length; i++) {
+            this.walk_expr_move(n.arguments[i]);
+        }
+    }
+
+    handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean) -> void {
+        if (ident == null) { return; }
+        const name: SymbolStr = ident.name;
+        const ty: TypeRef = this.lookup_type(name);
+        if (!ty.is_valid()) { return; }
+        if (this.is_copy(ty)) { return; }
+        if (in_move_context && !this.is_moved(name)) {
+            this.mark_moved(name, ident.span);
+        }
+    }
+}
+
+
+type struct DropInsertionPass {
+    static run(ctx: CompilationContext*) -> PassResult {
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return PassResult::ok(); }
+        mut inserter: DropInserter = DropInserter::new(ctx);
+        inserter.walk_program(root);
+        if (ctx.debug_mode) {
+            cdebug("[DropInsertion] %lld drops inserted, %lld diagnostics emitted\n",
+                inserter.inserted, inserter.fired);
+        }
+        return PassResult::ok();
+    }
+}
