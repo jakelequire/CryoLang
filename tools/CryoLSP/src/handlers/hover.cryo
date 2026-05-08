@@ -135,6 +135,13 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
 
     mut content: string = "";
     mut hover_span: SourceSpan = node.span;
+    // Doc-comment text for the decl this hover ultimately points
+    // at — empty when the decl has no `///` cluster directly above
+    // (the parser already filters for "no blank-line gap").
+    // Branches set this whenever they identify a decl; the response
+    // builder appends it as a markdown paragraph after the code
+    // block.
+    mut doc_text: string = "";
 
     // Decl-name hover: render the full callable signature, not just
     // the return type.  `function name(p1: T1, …) -> Ret` reads more
@@ -143,6 +150,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         const f: FunctionDeclNode* = node as FunctionDeclNode*;
         content    = format_function_signature(f, ctx.type_arena);
         hover_span = name_span;
+        doc_text   = f.documentation;
     } else if (on_decl_name && node.kind == NodeKind::MethodDeclaration) {
         const m: MethodNode* = node as MethodNode*;
         if (m.func != null) {
@@ -156,6 +164,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             } else { "" };
             content    = format_method_signature(m, owner_str, ctx.type_arena);
             hover_span = name_span;
+            doc_text   = m.documentation;
         }
     } else if (on_decl_name && node.kind == NodeKind::VariableDeclaration) {
         // `const body_str: Str = …;` — render the declaration form
@@ -164,6 +173,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         const v: VarDeclNode* = node as VarDeclNode*;
         content    = format_variable_decl(v, ctx.type_arena);
         hover_span = name_span;
+        doc_text   = v.documentation;
     } else if (node.kind == NodeKind::VariableDeclaration) {
         // Cursor on a `VarDeclNode` outside the name token — the
         // common case is the synthesized `&this` / `mut &this` /
@@ -183,6 +193,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         const fld: FieldDeclNode* = node as FieldDeclNode*;
         content    = format_field_decl(fld, ctx.type_arena);
         hover_span = name_span;
+        doc_text   = fld.documentation;
     } else if (on_decl_name && (
                   node.kind == NodeKind::StructDeclaration
                || node.kind == NodeKind::ClassDeclaration
@@ -194,6 +205,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // defaults so the user can see the full parameter list.
         content    = format_type_decl(node, ctx.type_arena);
         hover_span = name_span;
+        doc_text   = (node as DeclarationNode*).documentation;
     } else if (on_decl_name && node.kind == NodeKind::EnumVariant) {
         // `NotFound;` inside `type enum IoErrorKind { … }` — show
         // `IoErrorKind::NotFound = 0` (auto-numbered) or the explicit
@@ -205,6 +217,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         if (parent != null) {
             content    = format_enum_variant(parent, variant, ctx.type_arena);
             hover_span = name_span;
+            doc_text   = variant.documentation;
         }
     } else if (node.kind == NodeKind::ScopeResolution) {
         // `Type::method(...)` or `Module::function(...)` — show the
@@ -217,12 +230,14 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         if (m != null && m.func != null) {
             const owner_str: string = leaf_after_separator(
                 ctx.type_arena.intern_table.resolve(sr.scope_name));
-            content = format_method_signature(m, owner_str, ctx.type_arena);
+            content  = format_method_signature(m, owner_str, ctx.type_arena);
+            doc_text = m.documentation;
         } else {
             const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
                 ctx.module_graph, sr.member_name);
             if (f != null) {
-                content = format_function_signature(f, ctx.type_arena);
+                content  = format_function_signature(f, ctx.type_arena);
+                doc_text = f.documentation;
             } else {
                 // Enum-variant fallback.  `find_type_decl_in_modules`
                 // already accepts qualified-or-bare names and matches
@@ -234,7 +249,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     const v: EnumVariantNode* = find_variant_in_enum(
                         ed, sr.member_name);
                     if (v != null) {
-                        content = format_enum_variant(ed, v, ctx.type_arena);
+                        content  = format_enum_variant(ed, v, ctx.type_arena);
+                        doc_text = v.documentation;
                     }
                 }
             }
@@ -254,6 +270,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         if (sl_result.content != "") {
             content    = sl_result.content;
             hover_span = sl_result.span;
+            doc_text   = sl_result.doc;
         }
     } else if (node.kind == NodeKind::MemberAccess) {
         // `obj.method(...)` — look up the method on the receiver's
@@ -275,13 +292,90 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     if (m != null && m.func != null) {
                         const owner_str: string = ctx.type_arena.resolve_display_name_short(
                             recv_ty.id);
-                        content = format_method_signature(m, owner_str, ctx.type_arena);
+                        content  = format_method_signature(m, owner_str, ctx.type_arena);
+                        doc_text = m.documentation;
                         if (NodeLocator::span_contains(
                                 ma.member_span, cursor_line, cursor_char)) {
                             hover_span = ma.member_span;
                         }
                     }
                 }
+            }
+        }
+    } else if (node.kind == NodeKind::ImportDeclaration) {
+        // `import std::core::panic;` — hovering an individual
+        // segment shows the corresponding namespace's `_module.cryo`
+        // banner: the `namespace X::Y;` line plus its `public module`
+        // re-exports.  Inside stdlib files imports are relative
+        // (`import core::option;` from `std::net::socket_addr`), so
+        // resolve the literal path against `std::` as a fallback —
+        // matching the loader's stdlib-search behavior.
+        const imp: ImportDeclNode* = node as ImportDeclNode*;
+        const seg_idx: i64 = import_segment_at(
+            imp, cursor_line, cursor_char);
+        if (seg_idx >= 0) {
+            const literal: string = build_segment_path(
+                imp, seg_idx, ctx.type_arena.intern_table);
+            const seg_path: string = resolve_namespace_path(
+                ctx.module_graph, literal);
+            content    = format_namespace_overview(
+                seg_path, ctx.module_graph);
+            hover_span = imp.path_segment_spans[seg_idx];
+        }
+    } else if (node.kind == NodeKind::ModuleDeclaration) {
+        // `namespace std::net::socket_addr;` and
+        // `public module collections::string;` — same per-segment
+        // dispatch as imports.  `parse_namespace_declaration` lowers
+        // the namespace decl into a `ModuleDeclNode`; both syntaxes
+        // share the per-segment span tracking populated by the
+        // parser.
+        const md: ModuleDeclNode* = node as ModuleDeclNode*;
+        const seg_idx: i64 = module_decl_segment_at(
+            md, cursor_line, cursor_char);
+        if (seg_idx >= 0) {
+            const literal: string = build_module_decl_path(
+                md, seg_idx, ctx.type_arena.intern_table);
+            const seg_path: string = resolve_namespace_path(
+                ctx.module_graph, literal);
+            content    = format_namespace_overview(
+                seg_path, ctx.module_graph);
+            hover_span = md.path_segment_spans[seg_idx];
+        }
+    } else if (node.kind == NodeKind::ImplementationBlock) {
+        // `implement [trait <T> for] [struct|enum|class] <Target> { … }`
+        // — hover the trait name, the target type name, or both.  The
+        // locator stops at the impl block when the cursor is on the
+        // head (it only descends into methods), so this branch routes
+        // both sub-positions.
+        const impl_blk: ImplBlockNode* = node as ImplBlockNode*;
+        // Trait side: the trait_annotation owns spans on its own
+        // NamedAnnotations, so reuse the same path used for type
+        // annotations elsewhere in this file.
+        if (impl_blk.trait_annotation != null) {
+            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+                impl_blk.trait_annotation, cursor_line, cursor_char);
+            if (named != null) {
+                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    ctx.module_graph, ctx.intern_table, named.name);
+                if (decl != null) {
+                    content    = format_type_decl(decl, ctx.type_arena);
+                    hover_span = named.span;
+                    doc_text   = (decl as DeclarationNode*).documentation;
+                }
+            }
+        }
+        // Target side: cursor on the target-type lexeme.  Span set by
+        // `parse_implementation_block`; absent on legacy paths
+        // (defensive `is_valid` check).
+        if (content == "" && impl_blk.target_type_span.has_location()
+                && NodeLocator::span_contains(impl_blk.target_type_span,
+                                              cursor_line, cursor_char)) {
+            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                ctx.module_graph, ctx.intern_table, impl_blk.target_type);
+            if (decl != null) {
+                content    = format_type_decl(decl, ctx.type_arena);
+                hover_span = impl_blk.target_type_span;
+                doc_text   = (decl as DeclarationNode*).documentation;
             }
         }
     } else if (node.kind == NodeKind::Pattern) {
@@ -299,6 +393,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             if (v != null) {
                 content    = format_variable_decl(v, ctx.type_arena);
                 hover_span = pat.span;
+                doc_text   = v.documentation;
             }
         }
     } else if (node.kind == NodeKind::Literal) {
@@ -338,6 +433,14 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 ctx.module_graph, sym.declaring_span);
             content = format_identifier_use(
                 sym, id_node.resolved_type, ctx.type_arena, init_str);
+            // Pull doc from the symbol's source decl, if reachable.
+            // Covers `const ENOENT: i32 = 2` use sites and free
+            // function references; method/field/parameter uses fall
+            // through with empty doc (parameters carry no doc and
+            // method/field hovers go through dedicated branches).
+            const v: VarDeclNode* = var_decl_at_span(
+                ctx.module_graph, sym.declaring_span);
+            if (v != null) { doc_text = v.documentation; }
         }
     }
 
@@ -345,30 +448,64 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     // expressions, type tokens).  Use the short type name so the
     // tooltip says `Str` not `std::collections::str::Str`.
     if (content == "") {
-        const ty: TypeRef = NodeLocator::resolved_type_of(node);
-        if (!ty.is_valid()) { return JsonValue::Null; }
-        const type_name: string = ctx.type_arena.resolve_display_name_short(ty.id);
-        if (type_name == "") { return JsonValue::Null; }
-        content = type_name;
-        if (on_decl_name) { hover_span = name_span; }
-        // Narrow the highlight to a type-annotation span when the
-        // cursor sits on one.  Without this, hovering `i32` in
-        // `function foo() -> i32 { … }` would underline the entire
-        // function — the locator can't descend into TypeAnnotation
-        // (it's an enum, not an AST node) so the walk stops at the
-        // enclosing decl.
-        const ann_span: SourceSpan = annotation_span_at_cursor(
-            node, cursor_line, cursor_char);
-        if (NodeLocator::span_contains(ann_span, cursor_line, cursor_char)) {
-            hover_span = ann_span;
+        // Type-annotation cursor (e.g. `: IoError`) — find the named
+        // segment under the cursor, look up the declaring struct /
+        // class / enum / trait / typealias, and render the full body
+        // via `format_type_decl`.  Falls through to the type-name
+        // fallback when the named segment isn't a user-defined type
+        // (primitives, generic params).
+        const ann_root: TypeAnnotation* = annotation_for_decl(node);
+        if (ann_root != null) {
+            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+                ann_root, cursor_line, cursor_char);
+            if (named != null) {
+                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    ctx.module_graph, ctx.intern_table, named.name);
+                if (decl != null) {
+                    content    = format_type_decl(decl, ctx.type_arena);
+                    hover_span = named.span;
+                    doc_text   = (decl as DeclarationNode*).documentation;
+                }
+            }
+        }
+
+        if (content == "") {
+            const ty: TypeRef = NodeLocator::resolved_type_of(node);
+            if (!ty.is_valid()) { return JsonValue::Null; }
+            const type_name: string = ctx.type_arena.resolve_display_name_short(ty.id);
+            if (type_name == "") { return JsonValue::Null; }
+            content = type_name;
+            if (on_decl_name) { hover_span = name_span; }
+            // Narrow the highlight to a type-annotation span when the
+            // cursor sits on one.  Without this, hovering `i32` in
+            // `function foo() -> i32 { … }` would underline the entire
+            // function — the locator can't descend into TypeAnnotation
+            // (it's an enum, not an AST node) so the walk stops at the
+            // enclosing decl.
+            const ann_span: SourceSpan = annotation_span_at_cursor(
+                node, cursor_line, cursor_char);
+            if (NodeLocator::span_contains(ann_span, cursor_line, cursor_char)) {
+                hover_span = ann_span;
+            }
         }
     }
 
     // -- Build the LSP Hover response --------------------------------
+    // Layout: code-block signature, then a blank line, then the doc
+    // comment as plain markdown.  The blank line is required for
+    // markdown to treat the doc as a separate paragraph rather than
+    // a continuation of the fenced code block.
     mut value_buf: String = String::with_capacity(64);
     value_buf.push_cstr("```cryo\n");
     value_buf.push_cstr(content);
     value_buf.push_cstr("\n```");
+    if (doc_text != "") {
+        const doc_clean: string = clean_doc_for_hover(doc_text);
+        if (doc_clean != "") {
+            value_buf.push_cstr("\n\n");
+            value_buf.push_cstr(doc_clean);
+        }
+    }
 
     const contents: MarkupContent = MarkupContent::markdown(value_buf);
     const hover: Hover = Hover {
@@ -467,33 +604,83 @@ function format_field_decl(fld: FieldDeclNode*, arena: TypeArena*) -> string {
     return sig;
 }
 
-/// Render a type-decl head: `type struct HashMap<K, V, A = GlobalAlloc>`,
-/// `type class Foo<T>`, `type enum Color`, `type trait Iterator<T>`,
-/// or `type alias Bytes = u8[]`.  Generic params are rendered with
-/// optional `= Default` clauses when the parser captured a default
-/// annotation; constraints (`<T: Ord>`) are omitted to keep the
-/// signature one-line.
+/// Render a type declaration's full body for hover:
+///
+///   type struct Point<T = i32> {
+///       x: T;
+///       y: T;
+///   }
+///
+/// Struct/class hovers list fields; enum hovers list variants with
+/// their auto-numbered or explicit discriminants; trait hovers list
+/// method signatures; type-alias hovers append the resolved target
+/// after `=`.  Methods on struct/class are intentionally omitted —
+/// individual method hovers cover those, and including them would
+/// make the type-hover unwieldy for stdlib types like `HashMap` or
+/// `Array`.  Empty bodies collapse to just the head.
 function format_type_decl(node: ASTNode*, arena: TypeArena*) -> string {
     return match (node.kind) {
         NodeKind::StructDeclaration => {
             const d: StructDeclNode* = node as StructDeclNode*;
-            "type struct " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table)
+            mut sig: string = "type struct " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table);
+            if (d.fields.length > 0) {
+                sig = sig + " {\n";
+                for (mut i: i64 = 0; i < d.fields.length; i++) {
+                    sig = sig + "    " + format_field_decl(d.fields[i], arena) + ";\n";
+                }
+                sig = sig + "}";
+            }
+            sig
         }
         NodeKind::ClassDeclaration => {
             const d: ClassDeclNode* = node as ClassDeclNode*;
-            "type class " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table)
+            mut sig: string = "type class " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table);
+            if (d.base_class.is_valid()) {
+                sig = sig + " : "
+                    + leaf_after_separator(arena.intern_table.resolve(d.base_class));
+            }
+            if (d.fields.length > 0) {
+                sig = sig + " {\n";
+                for (mut i: i64 = 0; i < d.fields.length; i++) {
+                    sig = sig + "    " + format_field_decl(d.fields[i], arena) + ";\n";
+                }
+                sig = sig + "}";
+            }
+            sig
         }
         NodeKind::EnumDeclaration => {
             const d: EnumDeclNode* = node as EnumDeclNode*;
-            "type enum " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table)
+            mut sig: string = "type enum " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table);
+            if (d.variants.length > 0) {
+                sig = sig + " {\n";
+                for (mut i: i64 = 0; i < d.variants.length; i++) {
+                    sig = sig + "    " + format_variant_in_decl(d, d.variants[i], arena) + "\n";
+                }
+                sig = sig + "}";
+            }
+            sig
         }
         NodeKind::TraitDeclaration => {
             const d: TraitDeclNode* = node as TraitDeclNode*;
-            "type trait " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table)
+            mut sig: string = "type trait " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table);
+            if (d.methods.length > 0) {
+                sig = sig + " {\n";
+                for (mut i: i64 = 0; i < d.methods.length; i++) {
+                    const m: FunctionDeclNode* = d.methods[i];
+                    if (m == null) { continue; }
+                    sig = sig + "    " + arena.intern_table.resolve(m.name)
+                        + format_params(m.parameters, arena)
+                        + " -> "
+                        + arena.resolve_display_name_short(m.resolved_return_type.id)
+                        + ";\n";
+                }
+                sig = sig + "}";
+            }
+            sig
         }
         NodeKind::TypeAliasDeclaration => {
             const d: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
@@ -510,6 +697,32 @@ function format_type_decl(node: ASTNode*, arena: TypeArena*) -> string {
         }
         _ => { "" }
     };
+}
+
+/// Render one variant inside an enum-decl body: `Name = N;` for
+/// unit-only variants (auto-numbered or explicit), `Name(T1, T2);`
+/// for payload variants.  Mirrors the standalone variant hover but
+/// without the enclosing `EnumName::` prefix — it's redundant inside
+/// the enum's own decl listing.
+function format_variant_in_decl(parent: EnumDeclNode*, variant: EnumVariantNode*,
+                                 arena: TypeArena*) -> string {
+    if (variant == null) { return ""; }
+    mut s: string = arena.intern_table.resolve(variant.name);
+    if (variant.associated_types.length > 0) {
+        s = s + "(";
+        for (mut i: i64 = 0; i < variant.associated_types.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            s = s + format_annotation(
+                variant.associated_types[i], arena.intern_table);
+        }
+        return s + ");";
+    }
+    const disc: i64 = if (variant.has_value) {
+        variant.explicit_value
+    } else {
+        variant_auto_index(parent, variant)
+    };
+    return s + " = " + i64_to_text(disc) + ";";
 }
 
 function format_generic_params(params: GenericParamNode*[],
@@ -596,25 +809,39 @@ function is_receiver_param(v: VarDeclNode*, arena: TypeArena*) -> boolean {
 /// fields.  Used to narrow the hover highlight when the cursor sits
 /// on a type token that isn't its own AST node.
 function annotation_span_at_cursor(node: ASTNode*, line: u32, ch: u32) -> SourceSpan {
-    if (node == null) { return SourceSpan::none(); }
+    const ann: TypeAnnotation* = annotation_for_decl(node);
+    return NodeLocator::annotation_span(ann);
+}
+
+/// Return the type-annotation tree attached to a decl-like node, or
+/// null when the node has no annotation surface (statements,
+/// expressions, struct/class/enum bodies).  Mirrors the same lookup
+/// `definition.cryo` does — kept duplicated rather than shared until
+/// a third handler needs it.
+function annotation_for_decl(node: ASTNode*) -> TypeAnnotation* {
+    if (node == null) { return null; }
     if (node.kind == NodeKind::FunctionDeclaration) {
         const f: FunctionDeclNode* = node as FunctionDeclNode*;
-        return NodeLocator::annotation_span(f.return_type_annotation);
+        return f.return_type_annotation;
     }
     if (node.kind == NodeKind::MethodDeclaration) {
         const m: MethodNode* = node as MethodNode*;
-        if (m.func == null) { return SourceSpan::none(); }
-        return NodeLocator::annotation_span(m.func.return_type_annotation);
+        if (m.func == null) { return null; }
+        return m.func.return_type_annotation;
     }
     if (node.kind == NodeKind::VariableDeclaration) {
         const v: VarDeclNode* = node as VarDeclNode*;
-        return NodeLocator::annotation_span(v.type_annotation);
+        return v.type_annotation;
     }
     if (node.kind == NodeKind::FieldDeclaration) {
         const fld: FieldDeclNode* = node as FieldDeclNode*;
-        return NodeLocator::annotation_span(fld.type_annotation);
+        return fld.type_annotation;
     }
-    return SourceSpan::none();
+    if (node.kind == NodeKind::TypeAliasDeclaration) {
+        const ta: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+        return ta.target_annotation;
+    }
+    return null;
 }
 
 /// Render a method receiver as `this: <ReceiverType>`.  The receiver
@@ -796,6 +1023,286 @@ function var_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> VarDecl
     if (node.kind != NodeKind::VariableDeclaration) { return null; }
     return node as VarDeclNode*;
 }
+
+// ============================================================================
+// Import-segment hover
+// ============================================================================
+
+/// Return the index into `imp.path_segments` whose span contains
+/// the cursor, or -1 when the cursor sits on the `import` keyword,
+/// the trailing `;`, or any inter-segment punctuation (`::`).
+function import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
+    if (imp == null) { return -1 as i64; }
+    for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
+        if (NodeLocator::span_contains(imp.path_segment_spans[i], line, ch)) {
+            return i;
+        }
+    }
+    return -1 as i64;
+}
+
+/// Build the namespace path for `imp.path_segments[0..=index]`,
+/// joined with `::`.  Used to find the matching `_module.cryo`
+/// (the file whose `namespace_name` equals this prefix).
+function build_segment_path(imp: ImportDeclNode*, index: i64,
+                             intern: InternTable*) -> string {
+    mut path: string = "";
+    for (mut i: i64 = 0; i <= index; i++) {
+        if (i > 0) { path = path + "::"; }
+        path = path + intern.resolve(imp.path_segments[i]);
+    }
+    return path;
+}
+
+/// Index of the `ModuleDeclNode` segment whose span contains the
+/// cursor, or -1 when the cursor is on `namespace` / `module` /
+/// `public` / `;` / a `::` separator.  Mirror of
+/// `import_segment_at` for `namespace X::Y::Z;` and
+/// `public module X::Y;` decls.
+function module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
+    if (md == null) { return -1 as i64; }
+    for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
+        if (NodeLocator::span_contains(md.path_segment_spans[i], line, ch)) {
+            return i;
+        }
+    }
+    return -1 as i64;
+}
+
+/// `::`-joined namespace path for `md.path_segments[0..=index]`.
+function build_module_decl_path(md: ModuleDeclNode*, index: i64,
+                                  intern: InternTable*) -> string {
+    mut path: string = "";
+    for (mut i: i64 = 0; i <= index; i++) {
+        if (i > 0) { path = path + "::"; }
+        path = path + intern.resolve(md.path_segments[i]);
+    }
+    return path;
+}
+
+/// Resolve an import-segment literal path to the absolute namespace
+/// path the loader would pick.  Stdlib imports inside stdlib source
+/// are written relative (`import core::option;`); the loader
+/// resolves them under `<stdlib>/`, which corresponds to the `std::`
+/// namespace prefix.  We try the literal first so absolute paths
+/// (and project-relative imports whose namespace already matches)
+/// stay correct, then `std::<literal>` as the fallback.  When
+/// neither matches a loaded module, we still prefer the candidate
+/// that has loaded *descendants* in the graph so the synth-children
+/// fallback in `format_namespace_overview` produces useful output.
+function resolve_namespace_path(graph: ModuleGraph*, literal: string) -> string {
+    if (graph == null) { return literal; }
+    if (NodeLocator::find_program_by_namespace(graph, literal) != null) {
+        return literal;
+    }
+    const std_path: string = "std::" + literal;
+    if (NodeLocator::find_program_by_namespace(graph, std_path) != null) {
+        return std_path;
+    }
+    // Neither namespace is loaded — pick whichever has descendants
+    // under it (so the children-synth fallback in the formatter
+    // shows the expected sub-modules).  Prefer `std::` because
+    // stdlib-relative is the dominant relative-import case.
+    if (namespace_has_descendants(graph, std_path))  { return std_path; }
+    if (namespace_has_descendants(graph, literal))   { return literal; }
+    return literal;
+}
+
+/// True when any module in the graph declares a namespace whose
+/// path starts with `prefix::`.  Used by `resolve_namespace_path`
+/// to pick the candidate whose synth-children list will be
+/// non-empty.
+function namespace_has_descendants(graph: ModuleGraph*, prefix: string) -> boolean {
+    if (graph == null) { return false; }
+    const prefix_len: i64 = strlen(prefix) as i64;
+    if (prefix_len == 0) { return false; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        const ns: string = ast.namespace_name;
+        const ns_len: i64 = strlen(ns) as i64;
+        if (ns_len <= prefix_len + 2) { continue; }
+        if (ns[prefix_len] != ':' as i8 || ns[prefix_len + 1] != ':' as i8) {
+            continue;
+        }
+        mut prefix_match: boolean = true;
+        for (mut i: i64 = 0; i < prefix_len; i++) {
+            if (ns[i] != prefix[i]) { prefix_match = false; break; }
+        }
+        if (prefix_match) { return true; }
+    }
+    return false;
+}
+
+
+/// Render the namespace overview for `path`: the `namespace X::Y;`
+/// line plus every `public module …;` declaration in the matching
+/// `_module.cryo`.  When no `_module.cryo` for this namespace is in
+/// the graph (the compiler doesn't load ancestor module files
+/// proactively — only the leaf file directly imported is parsed),
+/// derive the sub-module list by walking all loaded modules and
+/// taking the unique next-segment of those whose namespace starts
+/// with `path::`.  That gives a useful "what's reachable under
+/// this namespace" view from already-parsed source.
+function format_namespace_overview(path: string, graph: ModuleGraph*) -> string {
+    mut sig: string = "namespace " + path + ";";
+    const prog: ProgramNode* = NodeLocator::find_program_by_namespace(graph, path);
+
+    if (prog != null) {
+        mut had_modules: boolean = false;
+        for (mut i: i64 = 0; i < prog.statements.length; i++) {
+            const stmt: ASTNode* = unwrap_top_decl(prog.statements[i]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::ModuleDeclaration) { continue; }
+            const m: ModuleDeclNode* = stmt as ModuleDeclNode*;
+            // Skip the file's own `namespace X::Y::Z;` line —
+            // `parse_namespace_declaration` lowers it into a
+            // ModuleDeclNode with the qualified path, but it isn't a
+            // re-export of itself.
+            if (strcmp(m.path, path) == 0) { continue; }
+            if (!had_modules) { sig = sig + "\n"; had_modules = true; }
+            sig = sig + "\n";
+            if (m.is_public) { sig = sig + "public "; }
+            sig = sig + "module " + m.path + ";";
+        }
+        if (had_modules) { return sig; }
+    }
+
+    // Fallback: synthesize the sub-module list from descendant
+    // namespaces in the graph.  Each unique direct child becomes a
+    // synthetic `module <name>;` line.
+    if (graph == null) { return sig; }
+    const path_len: i64 = strlen(path) as i64;
+    mut children: string[] = [];
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        const ns: string = ast.namespace_name;
+        const ns_len: i64 = strlen(ns) as i64;
+        // Match `path` followed by `::` then a segment.
+        if (ns_len <= path_len + 2) { continue; }
+        if (ns[path_len] != ':' as i8 || ns[path_len + 1] != ':' as i8) { continue; }
+        // Compare the prefix.
+        mut prefix_match: boolean = true;
+        for (mut i: i64 = 0; i < path_len; i++) {
+            if (ns[i] != path[i]) { prefix_match = false; break; }
+        }
+        if (!prefix_match) { continue; }
+        // Extract first child segment after `path::`.
+        const child: string = first_segment_after(ns, (path_len + 2 as i64) as i64);
+        if (child == "") { continue; }
+        if (!contains_string(children, child)) {
+            children.push(child);
+        }
+    }
+    if (children.length == 0) { return sig; }
+    sig = sig + "\n";
+    for (mut i: i64 = 0; i < children.length; i++) {
+        sig = sig + "\nmodule " + children[i] + ";";
+    }
+    return sig;
+}
+
+/// Return the substring of `s` from byte index `start` up to (but
+/// not including) the next `::` or end-of-string.  Used to extract
+/// the first namespace segment after a known prefix.
+function first_segment_after(s: string, start: i64) -> string {
+    const len: i64 = strlen(s) as i64;
+    mut end: i64 = start;
+    while (end < len) {
+        if (end + 1 < len
+                && s[end] == ':' as i8 && s[end + 1] == ':' as i8) {
+            break;
+        }
+        end = end + 1;
+    }
+    const seg_len: i64 = end - start;
+    if (seg_len <= 0) { return ""; }
+    const buf: i8* = malloc((seg_len + 1) as u64) as i8*;
+    for (mut i: i64 = 0; i < seg_len; i++) { buf[i] = s[start + i]; }
+    buf[seg_len] = 0 as i8;
+    return buf as string;
+}
+
+function contains_string(arr: string[], target: string) -> boolean {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        if (strcmp(arr[i], target) == 0) { return true; }
+    }
+    return false;
+}
+
+
+/// Strip per-line `///` (and a single optional space after) from a
+/// doc-comment cluster so the rendered hover reads as plain markdown
+/// rather than as a wall of Cryo source.  Lines starting with the
+/// alternate doc-block markers (`///!`, `/**`, `* `, `*/`) get the
+/// same treatment — keeps stdlib-style module banners legible.
+/// Trailing whitespace + blank trailing lines are trimmed; embedded
+/// blank lines pass through (markdown paragraph breaks).
+function clean_doc_for_hover(raw: string) -> string {
+    const len: i64 = strlen(raw) as i64;
+    if (len == 0) { return ""; }
+    const buf: i8* = malloc((len + 1) as u64) as i8*;
+    mut out: i64 = 0;
+    mut i:   i64 = 0;
+    while (i < len) {
+        // Skip leading whitespace on this line.
+        while (i < len && (raw[i] == ' ' as i8 || raw[i] == '\t' as i8)) {
+            i = i + 1;
+        }
+        // Strip `///!`, `///`, `/**`, `*/`, or a leading `*` continuation.
+        if (i + 3 < len
+                && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
+                && raw[i + 2] == '/' as i8 && raw[i + 3] == '!' as i8) {
+            i = i + 4;
+        } else if (i + 2 < len
+                && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
+                && raw[i + 2] == '/' as i8) {
+            i = i + 3;
+        } else if (i + 2 < len
+                && raw[i] == '/' as i8 && raw[i + 1] == '*' as i8
+                && raw[i + 2] == '*' as i8) {
+            i = i + 3;
+        } else if (i + 1 < len
+                && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
+            i = i + 2;
+        } else if (i < len && raw[i] == '*' as i8
+                && (i + 1 >= len || raw[i + 1] != '*' as i8)) {
+            i = i + 1;
+        }
+        // Single optional space after the marker.
+        if (i < len && raw[i] == ' ' as i8) { i = i + 1; }
+
+        // Copy until end of line, stopping at a trailing `*/`.
+        while (i < len && raw[i] != '\n' as i8) {
+            if (i + 1 < len
+                    && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
+                i = i + 2;
+                break;
+            }
+            buf[out] = raw[i];
+            out = out + 1;
+            i = i + 1;
+        }
+        // Trim trailing whitespace on this line.
+        while (out > 0 && (buf[out - 1] == ' ' as i8 || buf[out - 1] == '\t' as i8)) {
+            out = out - 1;
+        }
+        // Append the newline if present.
+        if (i < len) {
+            buf[out] = '\n' as i8;
+            out = out + 1;
+            i = i + 1;
+        }
+    }
+    // Drop trailing newlines so markdown doesn't render a dangling blank line.
+    while (out > 0 && buf[out - 1] == '\n' as i8) { out = out - 1; }
+    buf[out] = 0 as i8;
+    return buf as string;
+}
+
 
 /// Format an `i64` as a heap-leased decimal `string`.  Routes through
 /// `std::fmt::integer::push_i64_decimal` so the digit logic stays in
@@ -990,6 +1497,7 @@ function unwrap_top_decl(node: ASTNode*) -> ASTNode* {
 type struct StructLiteralHover {
     content: string;
     span:    SourceSpan;
+    doc:     string;
 }
 
 /// Decide which sub-region of `IoError { kind: …, os_code: … }` the
@@ -1008,6 +1516,7 @@ function struct_literal_hover_at(sl: StructLiteralNode*, line: u32, ch: u32,
     mut result: StructLiteralHover = StructLiteralHover {
         content: "",
         span:    sl.span,
+        doc:     "",
     };
     if (sl == null) { return result; }
 
@@ -1036,6 +1545,7 @@ function struct_literal_hover_at(sl: StructLiteralNode*, line: u32, ch: u32,
             if (fld != null) {
                 result.content = format_field_decl(fld, arena);
                 result.span    = field_init_name_span(init.span, init.value.span);
+                result.doc     = fld.documentation;
                 return result;
             }
         }
@@ -1055,6 +1565,7 @@ function struct_literal_hover_at(sl: StructLiteralNode*, line: u32, ch: u32,
     if (decl != null) {
         result.content = format_type_decl(decl, arena);
         result.span    = struct_literal_head_span(sl, intern);
+        result.doc     = (decl as DeclarationNode*).documentation;
     }
     return result;
 }

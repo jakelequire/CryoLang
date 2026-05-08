@@ -358,12 +358,25 @@ public:
     specific_imports: SymbolStr[];
     style:            ImportStyle;
 
+    /// Per-segment metadata for `import std::core::panic;` —
+    /// `path_segments[i]` is the i-th identifier and
+    /// `path_segment_spans[i]` is its exact span in source.  Used by
+    /// the LSP to dispatch hover/go-to on an individual segment
+    /// (`std` shows the `std` namespace's public modules; `core` the
+    /// `std::core` ones; etc.).  Aligned with `module_path`'s
+    /// `::`-joined form so the i-th segment's effective namespace is
+    /// `segments[0..=i]` joined by `::`.
+    path_segments:      SymbolStr[];
+    path_segment_spans: SourceSpan[];
+
     ImportDeclNode(module_path: string, style: ImportStyle, span: SourceSpan)
         : DeclarationNode(NodeKind::ImportDeclaration, span) {
-        this.module_path      = module_path;
-        this.alias            = SymbolStr::empty();
-        this.specific_imports = [];
-        this.style            = style;
+        this.module_path        = module_path;
+        this.alias              = SymbolStr::empty();
+        this.specific_imports   = [];
+        this.style              = style;
+        this.path_segments      = [];
+        this.path_segment_spans = [];
     }
 
     has_alias() -> boolean { return !this.alias.is_empty(); }
@@ -372,6 +385,11 @@ public:
 
     add_specific_import(name: SymbolStr) -> void {
         this.specific_imports.push(name);
+    }
+
+    add_path_segment(name: SymbolStr, span: SourceSpan) -> void {
+        this.path_segments.push(name);
+        this.path_segment_spans.push(span);
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -385,10 +403,24 @@ public:
     path:      string;
     is_public: boolean;
 
+    /// Per-segment metadata mirroring `ImportDeclNode` — populated by
+    /// the parser for both `namespace X::Y::Z;` and
+    /// `public module X::Y;` decls so the LSP can hover/go-to on an
+    /// individual segment.
+    path_segments:      SymbolStr[];
+    path_segment_spans: SourceSpan[];
+
     ModuleDeclNode(path: string, is_public: boolean, span: SourceSpan)
         : DeclarationNode(NodeKind::ModuleDeclaration, span) {
-        this.path      = path;
-        this.is_public = is_public;
+        this.path               = path;
+        this.is_public          = is_public;
+        this.path_segments      = [];
+        this.path_segment_spans = [];
+    }
+
+    add_path_segment(name: SymbolStr, span: SourceSpan) -> void {
+        this.path_segments.push(name);
+        this.path_segment_spans.push(span);
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -632,6 +664,11 @@ public:
     /// `where T: Bound + Bound2, U: Other` constraints from the impl head.
     /// Empty for impls without a where clause.
     where_bounds:   TraitBound[];
+    /// Source span of the target-type lexeme in the impl head (the
+    /// `Stdin` in `implement trait Read for struct Stdin {`).  Used by
+    /// the LSP to detect cursor on the target name and render the
+    /// type's hover / jump to its declaration.
+    target_type_span: SourceSpan;
 
     ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ImplementationBlock, span) {
@@ -641,6 +678,7 @@ public:
         this.methods               = [];
         this.trait_annotation      = null;
         this.where_bounds          = [];
+        this.target_type_span      = SourceSpan::none();
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -650,6 +688,10 @@ public:
     is_generic() -> boolean { return this.generic_params.length > 0; }
     is_trait_impl(&this) -> boolean { return this.trait_annotation != null; }
     set_target_type(n: SymbolStr) -> void { this.target_type = n; }
+
+    set_target_type_span(mut &this, sp: SourceSpan) -> void {
+        this.target_type_span = sp;
+    }
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);

@@ -177,6 +177,25 @@ public:
         }
 
         program.span = this.span_from(start);
+
+        // Set the file's namespace from its `namespace X::Y::Z;` line.
+        // The parser converts that line into a `ModuleDeclNode`; the
+        // first such node in the statement list is, by convention, the
+        // file's own namespace (subsequent `public module …;` lines
+        // are sub-module re-exports).  Skipping over directive nodes
+        // keeps `![config(...)]`-prefixed files producing the right
+        // `namespace_name`.
+        for (mut i: i64 = 0; i < program.statements.length; i++) {
+            const s: ASTNode* = program.statements[i];
+            if (s == null) { continue; }
+            if (s.kind == NodeKind::Directive) { continue; }
+            if (s.kind == NodeKind::ModuleDeclaration) {
+                const m: ModuleDeclNode* = s as ModuleDeclNode*;
+                program.set_namespace_name(m.path);
+            }
+            break;
+        }
+
         return program;
     }
 
@@ -542,6 +561,10 @@ public:
                 func.add_parameter(p);
             }
         }
+        if (this.pending_bare_variadic) {
+            func.set_variadic(true);
+            this.pending_bare_variadic = false;
+        }
         this.consume(TokenType::RParen, "')'");
 
         // Optional return type
@@ -571,14 +594,22 @@ public:
     }
 
     /// Parse a parameter list (inside parentheses).
+    ///
+    /// A bare `...` (no accompanying name) sets `this.pending_bare_variadic`
+    /// instead of producing a parameter — callers forward that flag onto
+    /// the function node they're building. The named form `args...` flows
+    /// through parse_parameter and is detected separately by the caller's
+    /// no-type-annotation-on-last-param heuristic.
     parse_parameter_list() -> VarDeclNode*[] {
         mut params: VarDeclNode*[] = [];
+        this.pending_bare_variadic = false;
 
         while (true) {
-            // Check for variadic: ...
+            // Bare variadic: `...` with no preceding name. Common in extern
+            // C declarations like `printf(format: string, ...)`.
             if (this.check(TokenType::Ellipsis)) {
                 this.advance();
-                // Mark previous or current function as variadic
+                this.pending_bare_variadic = true;
                 break;
             }
 
@@ -913,6 +944,10 @@ public:
                 func.add_parameter(p);
             }
         }
+        if (this.pending_bare_variadic) {
+            func.set_variadic(true);
+            this.pending_bare_variadic = false;
+        }
         this.consume(TokenType::RParen, "')'");
 
         mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
@@ -1028,6 +1063,10 @@ public:
                 }
                 func.add_parameter(p);
             }
+        }
+        if (this.pending_bare_variadic) {
+            func.set_variadic(true);
+            this.pending_bare_variadic = false;
         }
         this.consume(TokenType::RParen, "')'");
 
@@ -1302,6 +1341,14 @@ public:
         // Intern the first segment to get a heap-pinned copy
         mut path_sym: SymbolStr = this.ctx.intern(first_tok.lexeme);
 
+        // Per-segment tracking for the LSP — each segment's name +
+        // span gets stamped on the resulting `ImportDeclNode` so
+        // hover/go-to-def can target an individual segment.
+        mut seg_names: SymbolStr[] = [];
+        mut seg_spans: SourceSpan[] = [];
+        seg_names.push(this.ctx.intern(first_tok.lexeme));
+        seg_spans.push(this.span_from_token(first_tok));
+
         while (this.check(TokenType::ColonColon)) {
             this.advance();
             const next: Token = this.current();
@@ -1312,6 +1359,9 @@ public:
                 const pinned: string = this.ctx.resolve_str(path_sym);
                 const star_path: string = format("%s::*", pinned);
                 mut imp: ImportDeclNode* = new ImportDeclNode(star_path, ImportStyle::Wildcard, this.span_from_token(start));
+                for (mut i: i64 = 0; i < seg_names.length; i++) {
+                    imp.add_path_segment(seg_names[i], seg_spans[i]);
+                }
                 this.consume(TokenType::Semicolon, "';'");
                 imp.span = this.span_from(start);
                 return imp;
@@ -1321,6 +1371,9 @@ public:
                 this.advance(); // consume '{'
                 const path: string = this.ctx.resolve_str(path_sym);
                 mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Specific, this.span_from_token(start));
+                for (mut i: i64 = 0; i < seg_names.length; i++) {
+                    imp.add_path_segment(seg_names[i], seg_spans[i]);
+                }
                 while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
                     const item_tok: Token = this.consume(TokenType::Identifier, "import name");
                     imp.add_specific_import(this.intern_lexeme(item_tok));
@@ -1334,11 +1387,16 @@ public:
             // Append "::segment" and intern to pin on the heap
             const prev: string = this.ctx.resolve_str(path_sym);
             path_sym = this.ctx.intern(format("%s::%s", prev, next.lexeme));
+            seg_names.push(this.ctx.intern(next.lexeme));
+            seg_spans.push(this.span_from_token(next));
             this.advance();
         }
 
         const path: string = this.ctx.resolve_str(path_sym);
         mut imp: ImportDeclNode* = new ImportDeclNode(path, ImportStyle::Wildcard, this.span_from_token(start));
+        for (mut i: i64 = 0; i < seg_names.length; i++) {
+            imp.add_path_segment(seg_names[i], seg_spans[i]);
+        }
 
         // Optional alias: import A::B as C
         if (this.check(TokenType::KwAs)) {
@@ -1357,6 +1415,9 @@ public:
     parse_namespace_declaration() -> ASTNode* {
         const start: Token = this.advance(); // consume 'namespace'
         mut qn: QualifiedName = QualifiedName::empty();
+        mut seg_names: SymbolStr[] = [];
+        mut seg_spans: SourceSpan[] = [];
+
         // Accept identifiers or keywords as namespace segments
         mut first_tok: Token = this.current();
         if (first_tok.kind == TokenType::Identifier || first_tok.kind.is_keyword()) {
@@ -1365,6 +1426,8 @@ public:
             first_tok = this.consume(TokenType::Identifier, "namespace name");
         }
         qn.push(this.ctx.get_intern_table(), first_tok.lexeme);
+        seg_names.push(this.ctx.intern(first_tok.lexeme));
+        seg_spans.push(this.span_from_token(first_tok));
 
         while (this.check(TokenType::ColonColon)) {
             this.advance();
@@ -1375,13 +1438,20 @@ public:
                 next = this.consume(TokenType::Identifier, "namespace segment");
             }
             qn.push(this.ctx.get_intern_table(), next.lexeme);
+            seg_names.push(this.ctx.intern(next.lexeme));
+            seg_spans.push(this.span_from_token(next));
         }
 
         this.consume(TokenType::Semicolon, "';'");
 
         // Create a module declaration node representing the namespace
         const span: SourceSpan = this.span_from(start);
-        return new ModuleDeclNode(qn.display(this.ctx.get_intern_table()), true, span);
+        mut node: ModuleDeclNode* = new ModuleDeclNode(
+            qn.display(this.ctx.get_intern_table()), true, span);
+        for (mut i: i64 = 0; i < seg_names.length; i++) {
+            node.add_path_segment(seg_names[i], seg_spans[i]);
+        }
+        return node;
     }
 
     /// Parse a module declaration: public module Name;
@@ -1403,7 +1473,11 @@ public:
 
         // Handle qualified module names: A::B
         mut qn: QualifiedName = QualifiedName::empty();
+        mut seg_names: SymbolStr[] = [];
+        mut seg_spans: SourceSpan[] = [];
         qn.push(this.ctx.get_intern_table(), name_tok.lexeme);
+        seg_names.push(this.ctx.intern(name_tok.lexeme));
+        seg_spans.push(this.span_from_token(name_tok));
         while (this.check(TokenType::ColonColon)) {
             this.advance();
             mut next: Token = this.current();
@@ -1413,11 +1487,18 @@ public:
                 next = this.consume(TokenType::Identifier, "module name segment");
             }
             qn.push(this.ctx.get_intern_table(), next.lexeme);
+            seg_names.push(this.ctx.intern(next.lexeme));
+            seg_spans.push(this.span_from_token(next));
         }
 
         this.consume(TokenType::Semicolon, "';'");
         const span: SourceSpan = this.span_from(start);
-        return new ModuleDeclNode(qn.display(this.ctx.get_intern_table()), is_public, span);
+        mut node: ModuleDeclNode* = new ModuleDeclNode(
+            qn.display(this.ctx.get_intern_table()), is_public, span);
+        for (mut i: i64 = 0; i < seg_names.length; i++) {
+            node.add_path_segment(seg_names[i], seg_spans[i]);
+        }
+        return node;
     }
 
     /// Parse an implementation block. Two shapes:
@@ -1581,6 +1662,7 @@ public:
             type_name = this.intern_lexeme(type_tok);
         }
         mut node: ImplBlockNode* = new ImplBlockNode(type_name, this.span_from_token(start));
+        node.set_target_type_span(this.span_from_token(type_tok));
         this.current_type_name = type_tok.lexeme;
 
         // Attach the trait annotation and the leading generic params (if any)
@@ -1785,6 +1867,10 @@ public:
                     node.add_parameter(p);
                 }
             }
+        }
+        if (this.pending_bare_variadic) {
+            node.set_variadic(true);
+            this.pending_bare_variadic = false;
         }
         this.consume(TokenType::RParen, "')'");
 

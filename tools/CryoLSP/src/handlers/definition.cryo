@@ -37,6 +37,7 @@ import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Types::TypeRef;
 import Compiler::ModuleGraph;
+import Utils::File;
 
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
@@ -111,6 +112,76 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //    consistent (the editor may choose to highlight, peek, etc.).
     if (on_decl_name) {
         target_span = name_span;
+    }
+
+    // 1.5. Import-path segment go-to (`std` / `core` / `panic` in
+    //      `import std::core::panic;`).  Each segment maps to the
+    //      file declaring `namespace std[::core[::panic]];`.  When
+    //      the file is in the graph, jump to its namespace-decl
+    //      line.  When it isn't (the loader only pulls in the leaf
+    //      .cryo for most imports), derive the candidate
+    //      `_module.cryo` / `lib.cryo` from a loaded descendant's
+    //      file path and jump to file start when it exists on disk.
+    if (!target_span.has_location() && node.kind == NodeKind::ImportDeclaration) {
+        const imp: ImportDeclNode* = node as ImportDeclNode*;
+        const seg_idx: i64 = import_segment_at(imp, cursor_line, cursor_char);
+        if (seg_idx >= 0 && ctx.intern_table != null) {
+            const literal: string = build_import_segment_path(
+                imp, seg_idx, ctx.intern_table);
+            const result: JsonValue = jump_to_namespace(
+                ctx.module_graph, literal);
+            if (!result.is_null()) { return result; }
+        }
+    }
+
+    // 1.6. Namespace-decl segment go-to (`std`, `net` in
+    //      `namespace std::net::socket_addr;`) and qualified
+    //      `public module …;` decls.  Both lower into the same
+    //      `ModuleDeclNode`, so they share the dispatch.
+    if (!target_span.has_location() && node.kind == NodeKind::ModuleDeclaration) {
+        const md: ModuleDeclNode* = node as ModuleDeclNode*;
+        const seg_idx: i64 = module_decl_segment_at(md, cursor_line, cursor_char);
+        if (seg_idx >= 0 && ctx.intern_table != null) {
+            const literal: string = build_module_decl_path(
+                md, seg_idx, ctx.intern_table);
+            const result: JsonValue = jump_to_namespace(
+                ctx.module_graph, literal);
+            if (!result.is_null()) { return result; }
+        }
+    }
+
+    // 1.7. Impl-block head:
+    //        `implement [trait <Trait> for] [struct|enum|class] <Target>`
+    //      Two sub-positions:
+    //        • cursor on a NamedAnnotation inside `trait_annotation`
+    //          → jump to the trait declaration
+    //        • cursor on `target_type_span`
+    //          → jump to the target type's declaration
+    //      The locator stops at ImplBlockNode for impl-head positions
+    //      (it only descends into methods), so dispatch routes here.
+    if (!target_span.has_location() && node.kind == NodeKind::ImplementationBlock) {
+        const impl_blk: ImplBlockNode* = node as ImplBlockNode*;
+        if (impl_blk.trait_annotation != null) {
+            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+                impl_blk.trait_annotation, cursor_line, cursor_char);
+            if (named != null) {
+                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    ctx.module_graph, ctx.intern_table, named.name);
+                if (decl != null) {
+                    target_span = NodeLocator::name_span_of(decl);
+                }
+            }
+        }
+        if (!target_span.has_location()
+                && impl_blk.target_type_span.has_location()
+                && NodeLocator::span_contains(impl_blk.target_type_span,
+                                              cursor_line, cursor_char)) {
+            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                ctx.module_graph, ctx.intern_table, impl_blk.target_type);
+            if (decl != null) {
+                target_span = NodeLocator::name_span_of(decl);
+            }
+        }
     }
 
     // 2. `Foo::bar` — try method on `Foo`, then a free function `bar`.
@@ -210,6 +281,200 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     if (strlen(target_span.file) == 0 as u64) { return JsonValue::Null; }
 
     return build_location_json(target_span);
+}
+
+
+// ============================================================================
+// Span narrowing
+// ============================================================================
+
+// ============================================================================
+// Import-segment helpers (mirror the hover dispatch)
+// ============================================================================
+
+/// Index into `imp.path_segments` whose span contains the cursor,
+/// or -1 when the cursor is on `import`, `;`, or a `::` separator.
+function import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
+    if (imp == null) { return -1 as i64; }
+    for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
+        if (NodeLocator::span_contains(imp.path_segment_spans[i], line, ch)) {
+            return i;
+        }
+    }
+    return -1 as i64;
+}
+
+/// Build the `::`-joined namespace path for `imp.path_segments[0..=index]`.
+function build_import_segment_path(imp: ImportDeclNode*, index: i64,
+                                    intern: InternTable*) -> string {
+    mut path: string = "";
+    for (mut i: i64 = 0; i <= index; i++) {
+        if (i > 0) { path = path + "::"; }
+        path = path + intern.resolve(imp.path_segments[i]);
+    }
+    return path;
+}
+
+/// Index of the `ModuleDeclNode` segment whose span covers the
+/// cursor.  Mirrors `import_segment_at` for `namespace X::Y;` and
+/// `public module X::Y;` decls.
+function module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
+    if (md == null) { return -1 as i64; }
+    for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
+        if (NodeLocator::span_contains(md.path_segment_spans[i], line, ch)) {
+            return i;
+        }
+    }
+    return -1 as i64;
+}
+
+/// `::`-joined namespace path for `md.path_segments[0..=index]`.
+function build_module_decl_path(md: ModuleDeclNode*, index: i64,
+                                  intern: InternTable*) -> string {
+    mut path: string = "";
+    for (mut i: i64 = 0; i <= index; i++) {
+        if (i > 0) { path = path + "::"; }
+        path = path + intern.resolve(md.path_segments[i]);
+    }
+    return path;
+}
+
+/// Resolve `literal` (a namespace path candidate) to a Location for
+/// go-to-def.  Tries the literal first, then `std::<literal>` for
+/// stdlib-relative imports.  When the resolved namespace's
+/// `_module.cryo` is in the graph, jumps to its `namespace` line;
+/// otherwise falls back to deriving the file path from a loaded
+/// descendant + checking disk.  Returns `JsonValue::Null` when no
+/// target found, so callers can chain.
+function jump_to_namespace(graph: ModuleGraph*, literal: string) -> JsonValue {
+    const std_path: string = "std::" + literal;
+
+    mut prog: ProgramNode* = NodeLocator::find_program_by_namespace(graph, literal);
+    if (prog == null) {
+        prog = NodeLocator::find_program_by_namespace(graph, std_path);
+    }
+    if (prog != null) {
+        const span: SourceSpan = first_namespace_decl_span(prog);
+        if (span.has_location() && strlen(span.file) > 0 as u64) {
+            return build_location_json(span);
+        }
+    }
+
+    mut disk_path: string = derive_namespace_file(graph, literal);
+    if (strlen(disk_path) == 0 as u64) {
+        disk_path = derive_namespace_file(graph, std_path);
+    }
+    if (strlen(disk_path) > 0 as u64) {
+        return build_file_start_location(disk_path);
+    }
+    return JsonValue::Null;
+}
+
+/// Span of a file's `namespace X::Y;` line, derived from the first
+/// `ModuleDeclNode` in the program's statement list (the convention
+/// the parser establishes by lowering namespace decls into module
+/// decls).  Falls back to `SourceSpan::none()` when there's no
+/// namespace statement — keeps the caller's `has_location` filter
+/// from shipping a bad jump.
+function first_namespace_decl_span(prog: ProgramNode*) -> SourceSpan {
+    if (prog == null) { return SourceSpan::none(); }
+    for (mut i: i64 = 0; i < prog.statements.length; i++) {
+        const s: ASTNode* = prog.statements[i];
+        if (s == null) { continue; }
+        if (s.kind == NodeKind::Directive) { continue; }
+        if (s.kind == NodeKind::ModuleDeclaration) { return s.span; }
+        return SourceSpan::none();
+    }
+    return SourceSpan::none();
+}
+
+/// When `target_path` (e.g. `"std::core"`) isn't itself loaded into
+/// the graph, derive a candidate file path by walking a loaded
+/// descendant's path back up to the corresponding directory and
+/// trying `_module.cryo` / `lib.cryo`.  Returns the candidate's
+/// absolute path when it exists on disk, or "" when nothing matches.
+function derive_namespace_file(graph: ModuleGraph*, target_path: string) -> string {
+    if (graph == null) { return ""; }
+    const target_len: i64 = strlen(target_path) as i64;
+    if (target_len == 0) { return ""; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        const ns: string = ast.namespace_name;
+        const ns_len: i64 = strlen(ns) as i64;
+        if (ns_len <= target_len + 2) { continue; }
+        // ns must start with `target_path::`.
+        if (ns[target_len] != ':' as i8 || ns[target_len + 1] != ':' as i8) { continue; }
+        mut prefix_match: boolean = true;
+        for (mut i: i64 = 0; i < target_len; i++) {
+            if (ns[i] != target_path[i]) { prefix_match = false; break; }
+        }
+        if (!prefix_match) { continue; }
+
+        // Count `::` occurrences in the suffix to know how many
+        // directory components to drop from the file path.  The
+        // suffix is at least one segment (otherwise we'd have an
+        // exact match handled by `find_program_by_namespace`).
+        mut extras: i64 = 1;
+        mut k: i64 = target_len + 2;
+        while (k + 1 < ns_len) {
+            if (ns[k] == ':' as i8 && ns[k + 1] == ':' as i8) {
+                extras = extras + 1;
+                k = k + 2;
+            } else {
+                k = k + 1;
+            }
+        }
+
+        const info: ModuleInfo = graph.get_module(mi as i64);
+        const dir: string = drop_path_components(info.file_path, extras);
+        if (strlen(dir) == 0 as u64) { continue; }
+
+        const cand_module: string = format("%s/_module.cryo", dir);
+        if (File::exists(cand_module)) { return cand_module; }
+        const cand_lib: string = format("%s/lib.cryo", dir);
+        if (File::exists(cand_lib))    { return cand_lib; }
+    }
+    return "";
+}
+
+/// Drop the last `n` `/`-delimited components from `path`.  Returns
+/// the leading directory portion (no trailing slash).  Returns ""
+/// when there aren't enough components to drop.
+function drop_path_components(path: string, n: i64) -> string {
+    const len: i64 = strlen(path) as i64;
+    mut end: i64 = len;
+    mut dropped: i64 = 0;
+    while (end > 0 && dropped < n) {
+        end = end - 1;
+        if (path[end] == '/' as i8) {
+            dropped = dropped + 1;
+        }
+    }
+    if (dropped < n) { return ""; }
+    if (end <= 0) { return ""; }
+    const buf: i8* = malloc((end + 1) as u64) as i8*;
+    for (mut i: i64 = 0; i < end; i++) { buf[i] = path[i]; }
+    buf[end] = 0 as i8;
+    return buf as string;
+}
+
+/// Build an LSP `Location` JSON pointing at the start of `fs_path`
+/// (line 0, col 0 — no useful sub-range).  Used when the target
+/// file isn't loaded so we can't pinpoint its namespace decl, but
+/// can still get the user to the right file.
+function build_file_start_location(fs_path: string) -> JsonValue {
+    mut uri_buf: String = String::with_capacity(strlen(fs_path) + FILE_SCHEME_LEN);
+    uri_buf.push_cstr(FILE_SCHEME);
+    uri_buf.push_cstr(fs_path);
+
+    const range: Range = Range::new(Position::new(0, 0), Position::new(0, 0));
+    const loc: Location = Location { uri: uri_buf, range: range };
+    const result: JsonValue = loc.to_json();
+    mut l: Location = loc;
+    l.drop();
+    return result;
 }
 
 
