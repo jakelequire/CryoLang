@@ -762,6 +762,96 @@ type struct TypeArena {
         return ty.display_name();
     }
 
+    /// Same as `resolve_display_name` but strips namespace prefixes
+    /// from leaf type names: `std::collections::str::Str` becomes
+    /// `Str`, `std::core::option::Option<std::collections::str::Str>`
+    /// becomes `Option<Str>`.  Used by the LSP for hover/completion
+    /// where the full path is just visual noise — call sites already
+    /// say `Str::from_raw`, so the qualified prefix is implied.
+    /// Composite kinds (pointer/reference/array/optional/function/
+    /// tuple/instantiated) recurse through this method so every leaf
+    /// is shortened.
+    resolve_display_name_short(&this, id: u64) -> string {
+        const t: Type* = this.lookup(id);
+        if (t == null) { return "?"; }
+        return this.format_display_short(t);
+    }
+
+    format_display_short(&this, ty: Type*) -> string {
+        if (ty == null) { return "?"; }
+
+        if (ty.kind == TypeKind::Pointer) {
+            const p: PointerType* = ty as PointerType*;
+            return this.resolve_display_name_short(p.pointee.id) + "*";
+        }
+        if (ty.kind == TypeKind::Reference) {
+            const r: ReferenceType* = ty as ReferenceType*;
+            const inner: string = this.resolve_display_name_short(r.referent.id);
+            if (r.is_mutable()) { return "&mut " + inner; }
+            return "&" + inner;
+        }
+        if (ty.kind == TypeKind::Array) {
+            const a: ArrayType* = ty as ArrayType*;
+            const elem: string = this.resolve_display_name_short(a.element.id);
+            if (a.is_dynamic()) { return elem + "[]"; }
+            return elem + "[" + format("%ld", a.size) + "]";
+        }
+        if (ty.kind == TypeKind::Optional) {
+            const o: OptionalType* = ty as OptionalType*;
+            return this.resolve_display_name_short(o.wrapped.id) + "?";
+        }
+        if (ty.kind == TypeKind::Function) {
+            const f: FunctionType* = ty as FunctionType*;
+            mut result: string = "(";
+            for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                if (i > 0) { result = result + ", "; }
+                result = result + this.resolve_display_name_short(f.param_types[i].id);
+            }
+            if (f.is_variadic) {
+                if (f.param_types.length > 0) { result = result + ", "; }
+                result = result + "...";
+            }
+            return result + ") -> "
+                + this.resolve_display_name_short(f.return_type.id);
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const t: TupleType* = ty as TupleType*;
+            mut result: string = "(";
+            for (mut i: i64 = 0; i < t.elements.length; i++) {
+                if (i > 0) { result = result + ", "; }
+                result = result + this.resolve_display_name_short(t.elements[i].id);
+            }
+            return result + ")";
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            mut result: string = this.resolve_display_name_short(inst.generic_base.id) + "<";
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (i > 0) { result = result + ", "; }
+                result = result + this.resolve_display_name_short(inst.type_args[i].id);
+            }
+            return result + ">";
+        }
+        if (ty.kind == TypeKind::GenericParam) {
+            const gp: GenericParamType* = ty as GenericParamType*;
+            return this.intern_table.resolve(gp.param_name);
+        }
+        if (ty.kind == TypeKind::BoundedParam) {
+            const bp: BoundedParamType* = ty as BoundedParamType*;
+            return this.intern_table.resolve(bp.param_name);
+        }
+
+        // Leaf user-defined types — strip qualified prefixes.
+        // `shorten_qualified_names` walks the display string and
+        // shortens *every* `::`-path, including those nested inside
+        // a `<…>` from the monomorphizer's `custom_display`
+        // (`Array<u8, std::alloc::allocator::GlobalAlloc>` →
+        // `Array<u8, GlobalAlloc>`).  Plain extract_leaf_segment
+        // would chop the whole thing at the inner `::` and produce
+        // `GlobalAlloc>` — wrong, scary, and fielded by users.
+        return shorten_qualified_names(ty.display_name());
+    }
+
     debug_dump(&this) -> void {
         cdebug("\n=== TypeArena Dump: %lld types ===\n", this.types.length);
         cdebug("%-5s | %-16s | %-28s | %5s | %5s | %-20s | %-6s | %-17s | %s\n",
@@ -1070,4 +1160,64 @@ function extract_leaf_segment(s: string) -> string {
     // Use format("%s") on the tail pointer to create a safe copy
     const tail: string = ptr_add(s as void*, start) as string;
     return format("%s", tail);
+}
+
+/// Shorten every qualified path in `s` to its leaf, keeping all
+/// non-identifier punctuation (`<`, `>`, `,`, `&`, `*`, etc.) intact.
+/// Unlike `extract_leaf_segment`, this is safe to apply to display
+/// strings that contain generic-arg lists:
+///
+///   "Array<u8, std::alloc::allocator::GlobalAlloc>"
+///     → "Array<u8, GlobalAlloc>"
+///
+/// The walk treats `Foo::Bar::Baz` as one identifier path and emits
+/// only the last segment; mangled names (which use `.` and `$L$G`,
+/// not `::`) pass through unchanged because no `::` ever matches.
+/// Used by `format_display_short` for the leaf user-defined type
+/// case where the Type's `display_name()` already includes generic
+/// args from the monomorphizer's `custom_display`.
+function shorten_qualified_names(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    // Worst case the output is the same length as the input (when no
+    // qualified path appears) so a single len+1 buffer suffices.
+    const buf: i8* = malloc((len + 1) as u64) as i8*;
+    mut out_idx: i64 = 0;
+    mut i: i64 = 0;
+    while (i < len) {
+        const c: i8 = s[i];
+        if (is_id_start_char(c)) {
+            // Scan an identifier path: <ident> ("::" <ident>)*
+            mut leaf_start: i64 = i;
+            while (i < len && is_id_cont_char(s[i])) { i = i + 1; }
+            while (i + 2 < len
+                   && s[i] == ':' as i8
+                   && s[i + 1] == ':' as i8
+                   && is_id_start_char(s[i + 2])) {
+                i = i + 2;
+                leaf_start = i;
+                while (i < len && is_id_cont_char(s[i])) { i = i + 1; }
+            }
+            for (mut j: i64 = leaf_start; j < i; j++) {
+                buf[out_idx] = s[j];
+                out_idx = out_idx + 1;
+            }
+        } else {
+            buf[out_idx] = c;
+            out_idx = out_idx + 1;
+            i = i + 1;
+        }
+    }
+    buf[out_idx] = 0 as i8;
+    return buf as string;
+}
+
+function is_id_start_char(c: i8) -> boolean {
+    return (c >= 'a' as i8 && c <= 'z' as i8)
+        || (c >= 'A' as i8 && c <= 'Z' as i8)
+        || c == '_' as i8;
+}
+
+function is_id_cont_char(c: i8) -> boolean {
+    return is_id_start_char(c)
+        || (c >= '0' as i8 && c <= '9' as i8);
 }

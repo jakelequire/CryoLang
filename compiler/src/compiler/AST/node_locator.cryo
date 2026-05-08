@@ -25,6 +25,9 @@ import Compiler::AST::Expression;
 import Compiler::AST::Statement;
 import Compiler::AST::Declaration;
 import Compiler::Diag::SourceSpan;
+import Compiler::ModuleGraph;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
 import Compiler::Types::TypeRef;
 
 
@@ -130,9 +133,20 @@ function first_covering_child(node: ASTNode*,
             return pick_array_expr(e.elements, line, character);
         }
         NodeKind::StructLiteral => {
-            // StructLiteral fields are name=expr pairs; descending into
-            // the field exprs is enough for hover.  Field names render
-            // their own type via the parent struct lookup.
+            // StructLiteral fields are name=expr pairs.  Descend into
+            // each `FieldInit.value` so the cursor on a value
+            // expression (an identifier, a `Foo::Bar` ScopeResolution,
+            // a literal) reaches the inner node.  When the cursor is
+            // on the field name itself the descent finds nothing and
+            // the caller falls back to the StructLiteral hover branch
+            // — which classifies cursor-on-name vs cursor-on-head.
+            const e: StructLiteralNode* = node as StructLiteralNode*;
+            for (mut i: i64 = 0; i < e.field_inits.length; i++) {
+                const v: ExpressionNode* = e.field_inits[i].value;
+                if (v != null && span_contains(v.span, line, character)) {
+                    return v as ASTNode*;
+                }
+            }
             return null;
         }
         NodeKind::TypeofExpression => {
@@ -157,7 +171,9 @@ function first_covering_child(node: ASTNode*,
         }
         NodeKind::MatchExpression => {
             const e: MatchExprNode* = node as MatchExprNode*;
-            return pick(e.subject as ASTNode*, null, null, null, line, character);
+            const subj: ASTNode* = pick_one(e.subject as ASTNode*, line, character);
+            if (subj != null) { return subj; }
+            return pick_array_arm(e.arms, line, character);
         }
 
         // -- Statements --
@@ -208,7 +224,20 @@ function first_covering_child(node: ASTNode*,
         }
         NodeKind::MatchStatement => {
             const s: MatchStmtNode* = node as MatchStmtNode*;
-            return pick(s.subject as ASTNode*, null, null, null, line, character);
+            const subj: ASTNode* = pick_one(s.subject as ASTNode*, line, character);
+            if (subj != null) { return subj; }
+            return pick_array_arm(s.arms, line, character);
+        }
+        NodeKind::MatchArm => {
+            const a: MatchArmNode* = node as MatchArmNode*;
+            // Patterns first — `ENOENT` in `ENOENT => { … }` is a
+            // PatternNode with `pattern_kind = Identifier`.  Hover
+            // dispatch resolves the pattern's `value` SymbolStr
+            // through the resolver to recover the const it names.
+            const pat_match: ASTNode* = pick_array_pattern(
+                a.patterns, line, character);
+            if (pat_match != null) { return pat_match; }
+            return pick(a.body as ASTNode*, null, null, null, line, character);
         }
 
         // -- Declarations --
@@ -228,15 +257,49 @@ function first_covering_child(node: ASTNode*,
         NodeKind::MethodDeclaration => {
             const d: MethodNode* = node as MethodNode*;
             if (d.func == null) { return null; }
-            return pick(d.func as ASTNode*, null, null, null, line, character);
+            // Stop at MethodNode when the cursor is on the method's
+            // name token — otherwise the walk descends into the inner
+            // FunctionDeclNode and the hover renders as a free
+            // function with a `function` keyword.  The method-name
+            // case is more useful, so let the MethodDeclaration
+            // hover branch handle it.
+            if (span_contains(d.func.name_span, line, character)) { return null; }
+            // Drive descent into the inner `FunctionDeclNode`'s
+            // params and body directly: parse_method leaves
+            // `func.span` covering only the method-name token, so a
+            // generic `pick(d.func)` span check would miss every
+            // position inside the params or body and the walk would
+            // stop at MethodNode (whole method) instead of the
+            // identifier under the cursor.
+            const f: FunctionDeclNode* = d.func;
+            const param_match: ASTNode* = pick_array_var(
+                f.parameters, line, character);
+            if (param_match != null) { return param_match; }
+            if (f.body != null && span_contains(f.body.span, line, character)) {
+                return f.body as ASTNode*;
+            }
+            return null;
         }
         NodeKind::StructDeclaration => {
             const d: StructDeclNode* = node as StructDeclNode*;
+            const f: ASTNode* = pick_array_field(d.fields, line, character);
+            if (f != null) { return f; }
             return pick_array_method(d.methods, line, character);
         }
         NodeKind::ClassDeclaration => {
             const d: ClassDeclNode* = node as ClassDeclNode*;
+            const f: ASTNode* = pick_array_field(d.fields, line, character);
+            if (f != null) { return f; }
             return pick_array_method(d.methods, line, character);
+        }
+        NodeKind::EnumDeclaration => {
+            // Descend into variants so a hover on `NotFound` inside
+            // `type enum X { NotFound; … }` reaches the
+            // `EnumVariantNode` directly.  Without this descent the
+            // walk stops at `EnumDeclaration` and the hover renders
+            // the enum head instead of the specific variant.
+            const d: EnumDeclNode* = node as EnumDeclNode*;
+            return pick_array_variant(d.variants, line, character);
         }
         NodeKind::ImplementationBlock => {
             const d: ImplBlockNode* = node as ImplBlockNode*;
@@ -307,6 +370,46 @@ function pick_array_method(arr: MethodNode*[], line: u32, character: u32) -> AST
     return null;
 }
 
+function pick_array_field(arr: FieldDeclNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: FieldDeclNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+function pick_array_arm(arr: MatchArmNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: MatchArmNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+function pick_array_variant(arr: EnumVariantNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: EnumVariantNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+function pick_array_pattern(arr: PatternNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: PatternNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
 
 // ============================================================================
 // Per-node-kind type extraction for hover.
@@ -348,6 +451,67 @@ public function resolved_type_of(node: ASTNode*) -> TypeRef {
     }
 }
 
+/// Span of a `TypeAnnotation*` — every variant carries a `span`
+/// field stamped by the parser, but it's tucked inside the variant
+/// payload rather than on the enum itself.  Returns `SourceSpan::none()`
+/// for null inputs so callers can chain into `span_contains` without
+/// extra null-checking.
+public function annotation_span(ann: TypeAnnotation*) -> SourceSpan {
+    if (ann == null) { return SourceSpan::none(); }
+    return match (*ann) {
+        TypeAnnotation::Primitive(p) => { p.span }
+        TypeAnnotation::Named(n)     => { n.span }
+        TypeAnnotation::Pointer(p)   => { p.span }
+        TypeAnnotation::Reference(r) => { r.span }
+        TypeAnnotation::Array(a)     => { a.span }
+        TypeAnnotation::Function(f)  => { f.span }
+        TypeAnnotation::Tuple(t)     => { t.span }
+        TypeAnnotation::Optional(o)  => { o.span }
+        TypeAnnotation::Generic(g)   => { g.span }
+        TypeAnnotation::ThisType(tt) => { tt.span }
+    };
+}
+
+/// Return the `name_span` of a declaration node — the narrow range
+/// covering just the declared identifier (e.g. `body_str` in
+/// `const body_str: Str = …;`).  Returns `SourceSpan::none()` for
+/// non-declarations, for nodes whose name span the parser hasn't
+/// stamped, and for `MethodNode` (which delegates to its inner
+/// `FunctionDeclNode`).
+public function name_span_of(node: ASTNode*) -> SourceSpan {
+    if (node == null) { return SourceSpan::none(); }
+    if (node.kind == NodeKind::MethodDeclaration) {
+        const m: MethodNode* = node as MethodNode*;
+        if (m.func == null) { return SourceSpan::none(); }
+        return m.func.name_span;
+    }
+    if (!is_declaration_kind(node.kind)) { return SourceSpan::none(); }
+    const d: DeclarationNode* = node as DeclarationNode*;
+    return d.name_span;
+}
+
+function is_declaration_kind(k: NodeKind) -> boolean {
+    return match (k) {
+        NodeKind::VariableDeclaration       => { true }
+        NodeKind::DestructureDeclaration    => { true }
+        NodeKind::FunctionDeclaration       => { true }
+        NodeKind::MethodDeclaration         => { true }
+        NodeKind::IntrinsicDeclaration      => { true }
+        NodeKind::IntrinsicConstDeclaration => { true }
+        NodeKind::StructDeclaration         => { true }
+        NodeKind::ClassDeclaration          => { true }
+        NodeKind::EnumDeclaration           => { true }
+        NodeKind::EnumVariant               => { true }
+        NodeKind::TraitDeclaration          => { true }
+        NodeKind::TypeAliasDeclaration      => { true }
+        NodeKind::ImplementationBlock       => { true }
+        NodeKind::ExternBlock               => { true }
+        NodeKind::FieldDeclaration          => { true }
+        NodeKind::GenericParamDeclaration   => { true }
+        _ => { false }
+    };
+}
+
 function is_expression_kind(k: NodeKind) -> boolean {
     return match (k) {
         NodeKind::Literal           => { true }
@@ -376,4 +540,337 @@ function is_expression_kind(k: NodeKind) -> boolean {
         NodeKind::AsyncExpression   => { true }
         _ => { false }
     };
+}
+
+
+// ============================================================================
+// Whole-graph decl lookup (LSP signature hover / go-to-definition).
+//
+// These walk every module's parsed AST looking for a matching decl.
+// O(modules × top-level statements × methods) per call — fine for
+// hover (one lookup per request, bounded by source size); not for
+// hot paths.  Add a per-namespace decl-index here when callers want
+// to query it on every keystroke.
+// ============================================================================
+
+/// Find a method named `method_name` on a type/impl-target named
+/// `type_name`.  `type_name` may be either bare (`Str`, as the parser
+/// stores it on `StructDeclNode.name`) or qualified
+/// (`std::collections::str::Str`, as `decl_index.lookup_type_name`
+/// returns) — the matcher pre-extracts the leaf segment so both
+/// shapes hit.  Returns `null` when no struct, class, enum, or
+/// impl-block defines a matching method.
+public function find_method_in_modules(graph: ModuleGraph*,
+                                        intern: InternTable*,
+                                        type_name: SymbolStr,
+                                        method_name: SymbolStr) -> MethodNode* {
+    if (graph == null) { return null; }
+    const type_leaf: string = if (intern != null) {
+        leaf_segment_str(intern.resolve(type_name))
+    } else { "" };
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const found: MethodNode* = match_methods_on_type(
+                stmt, intern, type_name, type_leaf, method_name);
+            if (found != null) { return found; }
+        }
+    }
+    return null;
+}
+
+/// Last segment after the final `::`, matching `extract_leaf_segment`
+/// in `Compiler::Types::Arena`.  Local copy because the locator
+/// avoids a cross-module dependency on the arena module.
+function leaf_segment_str(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i + 1 < len; i++) {
+        if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
+    }
+    if (last_sep < 0) { return s; }
+    const start: i64 = last_sep + 2;
+    if (start >= len) { return ""; }
+    return ptr_add(s as void*, start) as string;
+}
+
+/// True when `decl_name` matches `type_name` either by SymbolStr id
+/// (caller passed the bare name) or by string content vs. the
+/// pre-extracted leaf (caller passed a qualified name).
+function type_name_matches(intern: InternTable*, decl_name: SymbolStr,
+                            type_name: SymbolStr, type_leaf: string) -> boolean {
+    if (decl_name.equals(type_name)) { return true; }
+    if (intern == null || strlen(type_leaf) == 0) { return false; }
+    const dn: string = intern.resolve(decl_name);
+    return strcmp(dn, type_leaf) == 0;
+}
+
+/// Find a top-level free function named `name` anywhere in the
+/// module graph.  Used for `Module::function`-style scope-resolution
+/// hover where the scope is a namespace, not a type.
+public function find_function_in_modules(graph: ModuleGraph*,
+                                          name: SymbolStr) -> FunctionDeclNode* {
+    if (graph == null) { return null; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::FunctionDeclaration) { continue; }
+            const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+            if (f.name.equals(name)) { return f; }
+        }
+    }
+    return null;
+}
+
+/// Find a top-level (global) `const`/`mut` variable named `name`
+/// anywhere in the module graph.  Used by the LSP to surface const
+/// values through name lookup when the resolver's span→symbol map
+/// doesn't apply — for instance, match-arm identifier patterns
+/// (which Cryo treats as fresh bindings rather than const compares),
+/// where the user still wants to see the const's value.
+public function find_const_in_modules(graph: ModuleGraph*,
+                                       name: SymbolStr) -> VarDeclNode* {
+    if (graph == null) { return null; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::VariableDeclaration) { continue; }
+            const v: VarDeclNode* = stmt as VarDeclNode*;
+            if (v.is_global && v.name.equals(name)) { return v; }
+        }
+    }
+    return null;
+}
+
+/// `ProgramNode.statements` mixes raw decl nodes and `DeclStmtNode`
+/// wrappers depending on how the parser shaped that file's top-level
+/// list.  Unwrap so callers can branch on the inner decl's `NodeKind`
+/// directly.
+function unwrap_decl_stmt(node: ASTNode*) -> ASTNode* {
+    if (node == null) { return null; }
+    if (node.kind != NodeKind::DeclarationStatement) { return node; }
+    const d: DeclStmtNode* = node as DeclStmtNode*;
+    return d.declaration as ASTNode*;
+}
+
+function match_methods_on_type(stmt: ASTNode*, intern: InternTable*,
+                                type_name: SymbolStr, type_leaf: string,
+                                method_name: SymbolStr) -> MethodNode* {
+    if (stmt == null) { return null; }
+    match (stmt.kind) {
+        NodeKind::StructDeclaration => {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            return method_by_name(d.methods, method_name);
+        }
+        NodeKind::ClassDeclaration => {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            return method_by_name(d.methods, method_name);
+        }
+        NodeKind::EnumDeclaration => {
+            const d: EnumDeclNode* = stmt as EnumDeclNode*;
+            if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            // EnumDeclNode currently has no methods array; methods
+            // for enums live in ImplBlockNode.  Match struct/class
+            // pattern when that changes.
+            return null;
+        }
+        NodeKind::ImplementationBlock => {
+            const d: ImplBlockNode* = stmt as ImplBlockNode*;
+            if (!type_name_matches(intern, d.target_type, type_name, type_leaf)) {
+                return null;
+            }
+            return method_by_name(d.methods, method_name);
+        }
+        _ => { return null; }
+    }
+}
+
+function method_by_name(methods: MethodNode*[], name: SymbolStr) -> MethodNode* {
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null || m.func == null) { continue; }
+        if (m.func.name.equals(name)) { return m; }
+    }
+    return null;
+}
+
+/// Find the owner type-name for a `MethodNode` by reverse-walking
+/// every module's top-level decls.  Returns `SymbolStr::empty()` when
+/// the method isn't owned by any struct/class/impl-block in the graph
+/// (shouldn't happen for parsed source, but the locator gracefully
+/// renders no prefix in that case).
+public function find_method_owner(graph: ModuleGraph*,
+                                   method: MethodNode*) -> SymbolStr {
+    if (graph == null || method == null) { return SymbolStr::empty(); }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            const owner: SymbolStr = owner_if_contains(stmt, method);
+            if (owner.is_valid()) { return owner; }
+        }
+    }
+    return SymbolStr::empty();
+}
+
+function owner_if_contains(stmt: ASTNode*, method: MethodNode*) -> SymbolStr {
+    match (stmt.kind) {
+        NodeKind::StructDeclaration => {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            if (methods_contains(d.methods, method)) { return d.name; }
+            return SymbolStr::empty();
+        }
+        NodeKind::ClassDeclaration => {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            if (methods_contains(d.methods, method)) { return d.name; }
+            return SymbolStr::empty();
+        }
+        NodeKind::ImplementationBlock => {
+            const d: ImplBlockNode* = stmt as ImplBlockNode*;
+            if (methods_contains(d.methods, method)) { return d.target_type; }
+            return SymbolStr::empty();
+        }
+        _ => { return SymbolStr::empty(); }
+    }
+}
+
+function methods_contains(arr: MethodNode*[], target: MethodNode*) -> boolean {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        if (arr[i] == target) { return true; }
+    }
+    return false;
+}
+
+
+/// Find a type declaration named `type_name` anywhere in the module
+/// graph.  Matches struct, class, enum, trait, and type-alias decls;
+/// `type_name` may be bare (`Str`) or qualified
+/// (`std::collections::str::Str`) — the leaf-aware matcher accepts
+/// both.  Used by go-to-definition to jump from a use site (a
+/// scope-resolution token, an identifier, or a name in a type
+/// annotation) to the declaring node.  Returns `null` when no decl
+/// matches.
+public function find_type_decl_in_modules(graph: ModuleGraph*,
+                                           intern: InternTable*,
+                                           type_name: SymbolStr) -> ASTNode* {
+    if (graph == null) { return null; }
+    const type_leaf: string = if (intern != null) {
+        leaf_segment_str(intern.resolve(type_name))
+    } else { "" };
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (decl_name_matches(stmt, intern, type_name, type_leaf)) {
+                return stmt;
+            }
+        }
+    }
+    return null;
+}
+
+function decl_name_matches(stmt: ASTNode*, intern: InternTable*,
+                            type_name: SymbolStr, type_leaf: string) -> boolean {
+    match (stmt.kind) {
+        NodeKind::StructDeclaration => {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            return type_name_matches(intern, d.name, type_name, type_leaf);
+        }
+        NodeKind::ClassDeclaration => {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            return type_name_matches(intern, d.name, type_name, type_leaf);
+        }
+        NodeKind::EnumDeclaration => {
+            const d: EnumDeclNode* = stmt as EnumDeclNode*;
+            return type_name_matches(intern, d.name, type_name, type_leaf);
+        }
+        NodeKind::TraitDeclaration => {
+            const d: TraitDeclNode* = stmt as TraitDeclNode*;
+            return type_name_matches(intern, d.name, type_name, type_leaf);
+        }
+        NodeKind::TypeAliasDeclaration => {
+            const d: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
+            return type_name_matches(intern, d.alias_name, type_name, type_leaf);
+        }
+        _ => { return false; }
+    }
+    return false;
+}
+
+
+/// Walk a `TypeAnnotation*` tree and return the innermost
+/// `NamedAnnotation*` whose span contains (line, character).  Used by
+/// go-to-definition to identify which token in a complex annotation
+/// (e.g. `HashMap<K, V>` or `&mut Foo*`) the cursor sits on, so the
+/// caller can resolve that name to its declaring node.  Returns
+/// `null` when no named segment matches — `_ => { null }` covers
+/// `Primitive` (no decl to jump to) and `ThisType` (the implementing
+/// type is supplied by sema, not the parser).
+public function find_named_annotation_at(ann: TypeAnnotation*,
+                                          line: u32, ch: u32) -> NamedAnnotation* {
+    if (ann == null) { return null; }
+    if (!span_contains(annotation_span(ann), line, ch)) { return null; }
+    match (*ann) {
+        TypeAnnotation::Named(n) => { return n; }
+        TypeAnnotation::Pointer(p) => {
+            return find_named_annotation_at(p.inner, line, ch);
+        }
+        TypeAnnotation::Reference(r) => {
+            return find_named_annotation_at(r.inner, line, ch);
+        }
+        TypeAnnotation::Optional(o) => {
+            return find_named_annotation_at(o.inner, line, ch);
+        }
+        TypeAnnotation::Array(a) => {
+            return find_named_annotation_at(a.element, line, ch);
+        }
+        TypeAnnotation::Generic(g) => {
+            const base_hit: NamedAnnotation* = find_named_annotation_at(
+                g.base, line, ch);
+            if (base_hit != null) { return base_hit; }
+            for (mut i: i64 = 0; i < g.args.length; i++) {
+                const arg_hit: NamedAnnotation* = find_named_annotation_at(
+                    g.args[i], line, ch);
+                if (arg_hit != null) { return arg_hit; }
+            }
+            return null;
+        }
+        TypeAnnotation::Tuple(t) => {
+            for (mut i: i64 = 0; i < t.elements.length; i++) {
+                const hit: NamedAnnotation* = find_named_annotation_at(
+                    t.elements[i], line, ch);
+                if (hit != null) { return hit; }
+            }
+            return null;
+        }
+        TypeAnnotation::Function(f) => {
+            for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                const hit: NamedAnnotation* = find_named_annotation_at(
+                    f.parameters[i], line, ch);
+                if (hit != null) { return hit; }
+            }
+            return find_named_annotation_at(f.return_type, line, ch);
+        }
+        _ => { return null; }
+    }
+    return null;
 }

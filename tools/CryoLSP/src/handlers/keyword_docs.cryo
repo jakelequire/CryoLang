@@ -1,0 +1,399 @@
+///! Keyword hover docs.
+///!
+///! When the cursor in a hover request lands on a known Cryo
+///! keyword token, render a short markdown blurb describing the
+///! keyword's role, syntax, and quirks — instead of the default
+///! AST-driven hover (which has nothing useful to say about a
+///! keyword token itself).
+///!
+///! Looked up *before* the AST walk in `Lsp::Handlers::Hover` so
+///! `function`, `mut`, `i32`, etc. always produce keyword docs even
+///! when they sit inside a larger node whose span covers the token.
+///!
+///! Source of truth for the keyword set is
+///! `Compiler::Lex::keyword_from_str` in `lex/_module.cryo`; if a
+///! keyword is added there, add a doc here.
+
+namespace Lsp::Handlers::KeywordDocs;
+
+import std::core::option;
+import std::core::intrinsics;
+import std::collections::str;
+import std::collections::string;
+import std::json::value;
+
+import Lsp::Server::Docs;
+import Lsp::Server::LineIndex;
+import Lsp::Protocol::Lsp;
+
+
+// ============================================================================
+// Public entry point
+// ============================================================================
+
+/// Try to render a keyword hover at `(line, character)` in `doc`.
+/// Returns `None` when the cursor isn't on an identifier-shaped run,
+/// the run doesn't match a known keyword, or the run starts with a
+/// digit (number literal).
+public function try_keyword_hover(doc: Document*, line: u32, character: u32) -> Option<JsonValue> {
+    if (doc == null) { return Option::None; }
+
+    const text: Str = doc.text.as_str();
+    const len:  u64 = text.length();
+    if (len == 0 as u64) { return Option::None; }
+    const ptr:  u8* = text.as_ptr();
+
+    const byte_off: u64 = doc.line_index.byte_offset(line, character);
+    if (byte_off > len) { return Option::None; }
+
+    // Walk back, then forward, over the identifier-shaped run that
+    // brackets `byte_off`.  If `byte_off` sits one past the end of a
+    // word (caret rendered on the trailing edge) the back-walk picks
+    // it up; if it sits at the start of the next word, the forward
+    // walk does.
+    mut start: u64 = byte_off;
+    while (start > 0 && is_ident_byte(ptr[start - 1])) { start = start - 1; }
+    mut end: u64 = byte_off;
+    while (end < len && is_ident_byte(ptr[end])) { end = end + 1; }
+    if (start == end) { return Option::None; }
+
+    // Identifiers can't start with a digit.  Bail before the table
+    // lookup so number-literal cursors don't waste effort.
+    if (is_digit(ptr[start])) { return Option::None; }
+
+    // Build a NUL-terminated copy of the word so we can compare it
+    // against `string` literals in `lookup_keyword_doc`.
+    const word_len: u64 = end - start;
+    mut word_buf: String = String::with_capacity(word_len + 1);
+    word_buf.push_str(text.sub_bytes(start, end));
+    word_buf.push_byte(0 as u8);
+    word_buf.truncate(word_len);
+    const word_cstr: string = word_buf.as_ptr() as string;
+
+    const md: string = lookup_keyword_doc(word_cstr);
+    word_buf.drop();
+    if (md == "") { return Option::None; }
+
+    // Pass markdown straight through — no surrounding ```cryo fence —
+    // so headings and bullet lists render as markdown instead of as
+    // code-block contents.
+    mut value_buf: String = String::with_capacity(strlen(md));
+    value_buf.push_cstr(md);
+    const contents: MarkupContent = MarkupContent::markdown(value_buf);
+
+    const start_pos: Position = doc.line_index.position_of(start);
+    const end_pos:   Position = doc.line_index.position_of(end);
+    const range:     Range    = Range::new(start_pos, end_pos);
+
+    const hover: Hover = Hover {
+        contents: contents,
+        range:    Option::Some(range),
+    };
+    const result: JsonValue = hover.to_json();
+    mut h: Hover = hover;
+    h.drop();
+    return Option::Some(result);
+}
+
+
+// ============================================================================
+// Byte classification
+//
+// Keep these byte-level (not char-level) since the document text is
+// indexed via `text.as_ptr()` which yields `u8*`.  ASCII codes are
+// inlined as numeric literals — same idiom as `Server::LineIndex`.
+// ============================================================================
+
+function is_ident_byte(b: u8) -> boolean {
+    // 'a'..'z'
+    if (b >= 97 as u8 && b <= 122 as u8) { return true; }
+    // 'A'..'Z'
+    if (b >= 65 as u8 && b <= 90 as u8)  { return true; }
+    // '0'..'9'
+    if (b >= 48 as u8 && b <= 57 as u8)  { return true; }
+    // '_'
+    if (b == 95 as u8) { return true; }
+    return false;
+}
+
+function is_digit(b: u8) -> boolean {
+    return b >= 48 as u8 && b <= 57 as u8;
+}
+
+
+// ============================================================================
+// Keyword → markdown table
+//
+// Mirrors the keyword set from `Compiler::Lex::keyword_from_str`.
+// Each blurb is a single `\n`-delimited string literal so the
+// function can return a static pointer directly (no per-hover
+// allocation).
+//
+// Style:
+//   `## keyword` heading
+//   one-line description
+//   `### Syntax` cryo code fence
+//   `### Notes` bullets where useful
+// ============================================================================
+
+function lookup_keyword_doc(s: string) -> string {
+    // -- Declarations --------------------------------------------------
+    if (s == "function") {
+        return "## function\nDeclares a callable. Free-standing in a namespace, or attached to a type via `implement`.\n\n### Syntax\n```cryo\nfunction name<T>(p: T) -> Ret { ... }\n```\n\n### Notes\n- Prefix with `public` to export the function from its namespace\n- Generic params go between `<` and `>`; `where` clauses constrain them\n- Return type is required — use `-> void` for no value";
+    }
+    if (s == "class") {
+        return "## class\nReference-typed aggregate with methods, fields, and inheritance.\n\n### Syntax\n```cryo\ntype class Name<T> {\n    field: T;\n\n    static new(value: T) -> Name<T> { ... }\n    method(&this) -> T { ... }\n}\n```\n\n### Notes\n- Always written as `type class` — bare `class` is not a top-level form\n- Use `&this` / `mut &this` / `this` for instance receivers\n- `static` methods omit the receiver";
+    }
+    if (s == "struct") {
+        return "## struct\nValue-typed aggregate of named fields. Methods are added in `implement` blocks or inline.\n\n### Syntax\n```cryo\ntype struct Point {\n    x: i32;\n    y: i32;\n}\n```\n\n### Notes\n- Always written as `type struct` — bare `struct` is not a top-level form\n- Generic params: `type struct Vec<T> { ... }`\n- Lay-out matches C structs unless `@packed` is applied";
+    }
+    if (s == "enum") {
+        return "## enum\nSum type whose values are one of a fixed set of variants. Variants may carry associated types.\n\n### Syntax\n```cryo\ntype enum IoErrorKind {\n    NotFound;\n    PermissionDenied;\n    Other(string);\n}\n```\n\n### Notes\n- Always written as `type enum` — bare `enum` is not a top-level form\n- Variants are accessed as `IoErrorKind::NotFound`\n- Pattern-match with `match (kind) { ... }`";
+    }
+    if (s == "trait") {
+        return "## trait\nAbstract interface — a set of method signatures a type must provide. Implemented for a type via `implement trait`.\n\n### Syntax\n```cryo\ntype trait Drop {\n    drop(mut &this) -> void;\n}\n\nimplement trait Drop for MyType {\n    drop(mut &this) -> void { ... }\n}\n```\n\n### Notes\n- Generic constraints use `where T: TraitName`\n- `implement trait T for U` requires every method on `T`";
+    }
+    if (s == "type") {
+        return "## type\nIntroduces a type declaration. Pairs with `struct`, `class`, `enum`, `trait`, or `alias` to specify the kind.\n\n### Syntax\n```cryo\ntype struct Point { x: i32; y: i32; }\ntype enum Color { Red; Green; Blue; }\ntype trait Eq { equals(&this, other: &This) -> boolean; }\ntype alias Bytes = u8[];\n```\n\n### Notes\n- Bare `type` is never used alone — it always introduces one of the forms above";
+    }
+    if (s == "namespace") {
+        return "## namespace\nDeclares the namespace path the file's symbols live under. Namespace segments are joined with `::`.\n\n### Syntax\n```cryo\nnamespace Lsp::Handlers::Hover;\n```\n\n### Notes\n- Goes at the top of the file, after the leading `///!` doc comments\n- Modules under the namespace are exposed via `_module.cryo` declarations\n- Cross-namespace references use the full path: `Compiler::AST::Node`";
+    }
+    if (s == "module") {
+        return "## module\nDeclares a sub-module within a `_module.cryo`. Used to wire up the namespace tree the project exposes.\n\n### Syntax\n```cryo\nnamespace Lsp::Handlers;\n\npublic module Hover;\npublic module Definition;\nmodule Internal;\n```\n\n### Notes\n- Lives only in `_module.cryo` files\n- `public module` re-exports the inner module to consumers; bare `module` keeps it crate-internal";
+    }
+    if (s == "import") {
+        return "## import\nBrings a namespace path into scope so its symbols can be referenced unqualified or by their leaf name.\n\n### Syntax\n```cryo\nimport std::collections::str;\nimport Compiler::AST::NodeLocator;\n```\n\n### Notes\n- Imports go at the top of the file after `namespace`\n- `import M::T` makes `T`'s public items reachable\n- The compiler resolves paths via `cryoconfig` + the stdlib root";
+    }
+    if (s == "export") {
+        return "## export\nExplicitly exports a symbol from the current namespace, even when the surrounding module is not `public`.\n\n### Syntax\n```cryo\nexport function helper() -> void { ... }\n```\n\n### Notes\n- Most code uses `public` on the declaration itself; `export` is reserved for advanced re-exports";
+    }
+    // `from` is intentionally NOT in this table.  It's used as a bare
+    // method name throughout stdlib (`From::from`, numeric `static
+    // from(value: ...)` impls in `std::core::convert`); the AST path
+    // produces real method signatures for those.  Bare-keyword `from`
+    // (in `import { … } from path` syntax) is rare enough to live
+    // without dedicated docs.
+    if (s == "as") {
+        return "## as\nTwo unrelated roles: a type-cast operator, or an alias in `import`.\n\n### Syntax\n```cryo\nconst n: i64 = x as i64;          // cast\nimport std::collections::str as S; // alias\n```\n\n### Notes\n- Cast: `expr as Type` — must be a legal numeric / pointer / reference conversion\n- Alias: import-only; the alias is local to the file";
+    }
+    if (s == "implement") {
+        return "## implement\nAttaches methods to a type, or implements a trait for a type.\n\n### Syntax\n```cryo\nimplement Point {\n    method(&this) -> i32 { return this.x; }\n}\n\nimplement trait Drop for Buffer {\n    drop(mut &this) -> void { ... }\n}\n\nimplement enum Color {\n    is_warm(&this) -> boolean { ... }\n}\n```\n\n### Notes\n- `implement T` adds inherent methods\n- `implement trait T for U` is the trait-impl form — every method on `T` must be defined";
+    }
+    if (s == "intrinsic") {
+        return "## intrinsic\nDeclares a function whose body is provided by the compiler / runtime instead of by source code.\n\n### Syntax\n```cryo\nintrinsic function strlen(str: string) -> u64;\n```\n\n### Notes\n- Used in stdlib for primitives the codegen lowers directly to LLVM IR\n- Not for application code — prefer normal `function` definitions";
+    }
+    if (s == "where") {
+        return "## where\nAttaches trait bounds to generic parameters.\n\n### Syntax\n```cryo\nfunction max<T>(a: T, b: T) -> T where T: Ord {\n    if (a > b) { return a; }\n    return b;\n}\n```\n\n### Notes\n- Multiple bounds: `where T: Ord, U: Drop`\n- `where`-clauses go between the parameter list and the return type or body";
+    }
+    if (s == "const") {
+        return "## const\nImmutable binding. The value cannot be reassigned, and the binding holds for the entire scope.\n\n### Syntax\n```cryo\nconst PI: f64 = 3.14159;\nconst name: Str = Str::from_cstr(\"cryo\");\n```\n\n### Notes\n- Top-level `const` is a global with static storage\n- Local `const` is a stack binding the compiler treats as immutable\n- For mutable bindings, use `mut`";
+    }
+    if (s == "static") {
+        return "## static\nDeclares a static method on a type, or — outside `implement` blocks — a static-storage global.\n\n### Syntax\n```cryo\nimplement Point {\n    static origin() -> Point { return Point { x: 0, y: 0 }; }\n}\n```\n\n### Notes\n- Static methods have no `&this` receiver — call them as `Point::origin()`\n- Free `static` globals live for the program's lifetime";
+    }
+    if (s == "extern") {
+        return "## extern\nDeclares a function or variable provided by an external object — typically a C ABI symbol from `libc` or another linked library.\n\n### Syntax\n```cryo\nextern function malloc(size: u64) -> void*;\nextern function free(ptr: void*) -> void;\n```\n\n### Notes\n- The signature uses Cryo types but the linker resolves the C symbol\n- Must match the C ABI declaration exactly";
+    }
+    if (s == "auto") {
+        return "## auto\nLets the compiler infer the type of a binding from its initializer.\n\n### Syntax\n```cryo\nauto count = some_array.length();   // count: u64\n```\n\n### Notes\n- Equivalent to omitting the type annotation in many positions\n- Prefer explicit types at module boundaries for clarity";
+    }
+    if (s == "unsigned") {
+        return "## unsigned\nModifier for the legacy `unsigned int` form. Modern Cryo prefers the explicit-width primitives.\n\n### Syntax\n```cryo\nconst x: unsigned int = 0;   // legacy\nconst y: u32 = 0;            // preferred\n```\n\n### Notes\n- Use `u8` / `u16` / `u32` / `u64` / `u128` instead of `unsigned int`";
+    }
+
+    // -- Control flow --------------------------------------------------
+    if (s == "if") {
+        return "## if\nConditional branch. Executes the body when the boolean condition is `true`.\n\n### Syntax\n```cryo\nif (cond) { ... }\nelse if (other) { ... }\nelse { ... }\n```\n\n### Notes\n- Parentheses around the condition are required\n- `if` is also an expression: `const x = if (cond) { 1 } else { 2 };`";
+    }
+    if (s == "else") {
+        return "## else\nFallback branch that runs when no preceding `if` / `elif` matched.\n\n### Syntax\n```cryo\nif (cond) { ... }\nelse { ... }\n```\n\n### Notes\n- Combines with `if` to form `else if`\n- May be omitted when no fallback is needed";
+    }
+    if (s == "elif") {
+        return "## elif\nShorthand for `else if`.\n\n### Syntax\n```cryo\nif (a) { ... }\nelif (b) { ... }\nelse { ... }\n```\n\n### Notes\n- Functionally identical to `else if` — pick the form that reads better";
+    }
+    if (s == "switch") {
+        return "## switch\nC-style multi-way branch dispatching on a scalar value. Modern code usually prefers `match`, which is exhaustive and supports destructuring.\n\n### Syntax\n```cryo\nswitch (x) {\n    case 1: { ... }\n    case 2: { ... }\n    default: { ... }\n}\n```\n\n### Notes\n- Cases do **not** fall through implicitly\n- Use `match` for enums and pattern dispatch";
+    }
+    if (s == "case") {
+        return "## case\nLabels one arm of a `switch`.\n\n### Syntax\n```cryo\nswitch (x) {\n    case 1: { ... }\n    case 2: { ... }\n}\n```\n\n### Notes\n- Each arm gets its own block — no implicit fall-through";
+    }
+    if (s == "default") {
+        return "## default\nThe catch-all arm of a `switch`. Runs when no other `case` matches.\n\n### Syntax\n```cryo\nswitch (x) {\n    case 1: { ... }\n    default: { ... }\n}\n```";
+    }
+    if (s == "match") {
+        return "## match\nExhaustive pattern dispatch. Preferred over `switch` for enums and structured values.\n\n### Syntax\n```cryo\nmatch (kind) {\n    IoErrorKind::NotFound         => { ... }\n    IoErrorKind::PermissionDenied => { ... }\n    _                             => { ... }\n}\n```\n\n### Notes\n- Parentheses around the scrutinee are required\n- The `_` arm catches any unmatched variants — required when arms aren't exhaustive\n- `match` is also an expression: each arm yields a value when written `=> { value }`";
+    }
+    if (s == "while") {
+        return "## while\nLoop while a condition is `true`. Tests the condition before each iteration.\n\n### Syntax\n```cryo\nwhile (cond) { ... }\n```\n\n### Notes\n- Parentheses around the condition are required\n- For an infinite loop, use `loop { ... }`";
+    }
+    if (s == "for") {
+        return "## for\nC-style three-clause loop: init, condition, step.\n\n### Syntax\n```cryo\nfor (mut i: i64 = 0; i < n; i++) { ... }\n```\n\n### Notes\n- All three clauses are required — semicolon-separated\n- Range iteration uses `for x in ...` (see the `in` keyword)";
+    }
+    if (s == "loop") {
+        return "## loop\nUnconditional loop. Equivalent to `while (true)`.\n\n### Syntax\n```cryo\nloop {\n    if (done) { break; }\n    ...\n}\n```\n\n### Notes\n- Exit with `break` (optionally yielding a value: `break value;`)\n- Idiomatic for retry / driver loops";
+    }
+    if (s == "do") {
+        return "## do\nLoop where the condition is tested *after* each iteration — the body always runs at least once.\n\n### Syntax\n```cryo\ndo {\n    ...\n} while (cond);\n```";
+    }
+    if (s == "break") {
+        return "## break\nExit the innermost surrounding loop (`while`, `for`, `loop`, `do`).\n\n### Syntax\n```cryo\nfor (mut i: i64 = 0; i < n; i++) {\n    if (done) { break; }\n}\n```\n\n### Notes\n- `break value;` (in `loop`) yields the value as the loop's result";
+    }
+    if (s == "continue") {
+        return "## continue\nSkip the rest of this iteration and continue with the next one.\n\n### Syntax\n```cryo\nfor (mut i: i64 = 0; i < n; i++) {\n    if (skip(i)) { continue; }\n    process(i);\n}\n```";
+    }
+    if (s == "return") {
+        return "## return\nReturn from the enclosing function. Yields the given value when the function has a non-`void` return type.\n\n### Syntax\n```cryo\nfunction add(a: i32, b: i32) -> i32 {\n    return a + b;\n}\n```\n\n### Notes\n- A bare `return;` is required for `void` functions exiting early";
+    }
+    if (s == "yield") {
+        return "## yield\nReturns the next value from a generator-style coroutine, suspending its execution.\n\n### Syntax\n```cryo\nfunction range(n: i64) -> Generator<i64> {\n    for (mut i: i64 = 0; i < n; i++) {\n        yield i;\n    }\n}\n```\n\n### Notes\n- Reserved for the coroutine / generator surface";
+    }
+
+    // -- Modifiers + ownership ----------------------------------------
+    if (s == "public") {
+        return "## public\nVisibility modifier. Exposes the declaration to consumers outside the current namespace.\n\n### Syntax\n```cryo\npublic function open(path: string) -> File { ... }\npublic type struct Buffer { ... }\n```\n\n### Notes\n- Without `public`, declarations are reachable only within the namespace\n- Pairs with `public module` in `_module.cryo`";
+    }
+    if (s == "private") {
+        return "## private\nVisibility modifier. Restricts the declaration to the current namespace / type.\n\n### Syntax\n```cryo\ntype struct File {\nprivate:\n    fd: i32;\n\npublic:\n    static open(path: string) -> File { ... }\n}\n```\n\n### Notes\n- Default for top-level declarations when no modifier is given";
+    }
+    if (s == "protected") {
+        return "## protected\nVisibility modifier. Restricts a member to the declaring type and its subclasses.\n\n### Syntax\n```cryo\ntype class Base {\nprotected:\n    state: i32;\n}\n```\n\n### Notes\n- Most useful inside `type class` hierarchies";
+    }
+    if (s == "mut") {
+        return "## mut\nMarks a binding, parameter, or receiver as mutable.\n\n### Syntax\n```cryo\nmut count: i32 = 0;\nfunction push(mut &this, v: i32) -> void { ... }\n```\n\n### Notes\n- `mut x` — the binding can be reassigned\n- `mut &this` — the method can mutate the receiver\n- `&mut T` — a mutable reference to `T`\n- `mut x: T = ...;` is the local-variable form; pair with `const` for immutable bindings";
+    }
+    if (s == "mutable") {
+        return "## mutable\nLong-form alias for `mut`. Most code uses `mut`.\n\n### Syntax\n```cryo\nmutable counter: i32 = 0;\n```";
+    }
+    if (s == "inline") {
+        return "## inline\nHint that the function should be inlined at call sites. Most often used as the `@inline` attribute.\n\n### Syntax\n```cryo\n@inline\nfunction add(a: i32, b: i32) -> i32 { return a + b; }\n```\n\n### Notes\n- The compiler ultimately decides; `inline` is a hint, not a guarantee\n- Use `@noinline` when forced inlining would hurt code size";
+    }
+    if (s == "async") {
+        return "## async\nMarks a function as asynchronous — it returns a future / task that completes later.\n\n### Syntax\n```cryo\nasync function fetch(url: string) -> Response { ... }\n```\n\n### Notes\n- Async support is part of the runtime surface; check the std::async module for the current shape\n- `await` an async call to suspend until the value is ready";
+    }
+    if (s == "await") {
+        return "## await\nSuspend the current async function until the awaited future resolves.\n\n### Syntax\n```cryo\nconst body: Response = await fetch(url);\n```\n\n### Notes\n- Only legal inside an `async` function";
+    }
+    if (s == "unsafe") {
+        return "## unsafe\nMarks a block whose operations are not memory-safe — raw pointer derefs, type punning, etc. The author asserts the invariants by hand.\n\n### Syntax\n```cryo\nunsafe {\n    const value: i32 = *raw_ptr;\n}\n```\n\n### Notes\n- Use sparingly — the surrounding code relies on the unsafe block upholding its invariants\n- Document the invariants you're asserting in a comment";
+    }
+    if (s == "virtual") {
+        return "## virtual\nMarks a method that can be overridden by subclasses (vtable dispatch).\n\n### Syntax\n```cryo\ntype class Base {\n    virtual greet(&this) -> string { return \"hello\"; }\n}\n```\n\n### Notes\n- Dispatch goes through the receiver's runtime type";
+    }
+    if (s == "override") {
+        return "## override\nMarks a method as an explicit override of a `virtual` method on a parent class.\n\n### Syntax\n```cryo\ntype class Greeter : Base {\n    override greet(&this) -> string { return \"hi\"; }\n}\n```\n\n### Notes\n- The compiler verifies that a matching `virtual` exists on the parent — catches typos in the override";
+    }
+
+    // -- Type primitives -----------------------------------------------
+    if (s == "void") {
+        return "## void\nNo value. Used as a return type for functions that produce no result, and as `void*` for opaque pointers.\n\n### Syntax\n```cryo\nfunction log(msg: string) -> void { ... }\nconst raw: void* = some_ptr as void*;\n```";
+    }
+    if (s == "boolean") {
+        return "## boolean\nPrimitive truth value. Holds `true` or `false`.\n\n### Syntax\n```cryo\nconst is_open: boolean = true;\n```\n\n### Notes\n- Use in conditions for `if`, `while`, etc.\n- 1 byte of storage";
+    }
+    if (s == "int") {
+        return "## int\nPlatform-default signed integer. Modern Cryo prefers the explicit-width primitives `i32` / `i64`.\n\n### Notes\n- Width is platform-dependent — usually `i64` on 64-bit targets\n- Prefer `i32` or `i64` for clear ABI semantics";
+    }
+    if (s == "i8") {
+        return "## i8\nSigned 8-bit integer. Range: −128 to 127.";
+    }
+    if (s == "i16") {
+        return "## i16\nSigned 16-bit integer. Range: −32 768 to 32 767.";
+    }
+    if (s == "i32") {
+        return "## i32\nSigned 32-bit integer. Range: −2 147 483 648 to 2 147 483 647.\n\n### Notes\n- Default integer type for most calculations\n- Wraps on overflow in release builds";
+    }
+    if (s == "i64") {
+        return "## i64\nSigned 64-bit integer. Range: ±9.2 × 10¹⁸.\n\n### Notes\n- Used for sizes, indices, and the lengths returned by collections";
+    }
+    if (s == "i128") {
+        return "## i128\nSigned 128-bit integer. Useful for big-number arithmetic where `i64` would overflow.";
+    }
+    if (s == "uint") {
+        return "## uint\nPlatform-default unsigned integer. Modern Cryo prefers `u32` / `u64`.\n\n### Notes\n- Width is platform-dependent — usually `u64` on 64-bit targets";
+    }
+    if (s == "u8") {
+        return "## u8\nUnsigned 8-bit integer. Range: 0 to 255. Also the type of raw bytes from `Str::as_ptr()`.";
+    }
+    if (s == "u16") {
+        return "## u16\nUnsigned 16-bit integer. Range: 0 to 65 535.";
+    }
+    if (s == "u32") {
+        return "## u32\nUnsigned 32-bit integer. Range: 0 to 4 294 967 295.\n\n### Notes\n- Common for line / column / version counters";
+    }
+    if (s == "u64") {
+        return "## u64\nUnsigned 64-bit integer. Range: 0 to ~1.8 × 10¹⁹.\n\n### Notes\n- Used for byte offsets, hash codes, and lengths\n- Be careful comparing against literals exceeding `i64::MAX` — hoist into a `const u64` to avoid wraparound";
+    }
+    if (s == "u128") {
+        return "## u128\nUnsigned 128-bit integer.";
+    }
+    if (s == "float") {
+        return "## float\nPlatform-default floating-point type. Modern Cryo prefers `f32` / `f64` for clarity.";
+    }
+    if (s == "f32") {
+        return "## f32\n32-bit IEEE-754 floating-point.\n\n### Notes\n- ~7 decimal digits of precision\n- Use `f64` when precision matters";
+    }
+    if (s == "f64") {
+        return "## f64\n64-bit IEEE-754 floating-point.\n\n### Notes\n- ~15-17 decimal digits of precision\n- Default for scientific / numerical code";
+    }
+    if (s == "double") {
+        return "## double\nLegacy alias for `f64`.\n\n### Notes\n- Prefer the explicit `f64` form";
+    }
+    if (s == "char") {
+        return "## char\nA single byte / character. 8-bit storage.\n\n### Syntax\n```cryo\nconst c: char = 'A';\n```\n\n### Notes\n- Character literals use single quotes: `'A'`, `'\\n'`, `'\\0'`\n- For full-string text use `string` (C-string) or `Str` / `String` (UTF-8 buffer)";
+    }
+    if (s == "string") {
+        return "## string\nC-string: a NUL-terminated `char*`. Lightweight pointer with no length stored separately.\n\n### Syntax\n```cryo\nconst greeting: string = \"hello\";\n```\n\n### Notes\n- `string` is the raw C-style form\n- Prefer `Str` (`std::collections::str`) for slices with explicit length\n- Prefer `String` for owned, growable buffers";
+    }
+    if (s == "tuple") {
+        return "## tuple\nFixed-arity heterogeneous record. Tuple **types** use `[T, U]`; tuple values use `[a, b]`.\n\n### Syntax\n```cryo\nconst pair: [i32, string] = [42, \"answer\"];\nconst first: i32 = pair.0;\nconst second: string = pair.1;\n```\n\n### Notes\n- Access fields by zero-based index: `t.0`, `t.1`, ...\n- The bare `tuple` keyword is rarely written in source — `[T, U]` syntax is the common form";
+    }
+    if (s == "optional") {
+        return "## optional\nA value that may be present or absent — backed by `Option<T>`.\n\n### Syntax\n```cryo\nconst slot: Option<i32> = Option::Some(7);\nmatch (slot) {\n    Option::Some(v) => { ... }\n    Option::None    => { ... }\n}\n```\n\n### Notes\n- Trailing `?` on a type annotation is the shorthand: `i32?` ≡ `Option<i32>`";
+    }
+    if (s == "any") {
+        return "## any\nDynamic type — accepts a value of any concrete type.\n\n### Notes\n- Used sparingly; prefer trait bounds + generics for type-safe polymorphism";
+    }
+    if (s == "generic") {
+        return "## generic\nReserved keyword used by some compiler-internal forms.\n\n### Notes\n- Day-to-day generics use the `<T>` syntax on the declaration: `function f<T>(x: T) -> T { ... }`";
+    }
+
+    // -- Special values + operator-keywords ---------------------------
+    if (s == "true") {
+        return "## true\nBoolean literal — the truthy value.\n\n### Syntax\n```cryo\nconst is_open: boolean = true;\n```";
+    }
+    if (s == "false") {
+        return "## false\nBoolean literal — the falsy value.\n\n### Syntax\n```cryo\nconst is_open: boolean = false;\n```";
+    }
+    if (s == "null") {
+        return "## null\nNull pointer literal. Compatible with any pointer type.\n\n### Syntax\n```cryo\nmut p: i32* = null;\nif (p == null) { ... }\n```\n\n### Notes\n- Distinct from `Option::None` — `null` is a raw-pointer concept\n- Prefer `Option<T>` for safe absence; reserve `null` for FFI / interior pointers";
+    }
+    // `this` and `This` are intentionally NOT in this table.  The
+    // AST-driven path renders something more useful for them: the
+    // receiver's resolved type (e.g. `this: &MyType`) for `this`,
+    // and the enclosing type for `This`.  Falling through to that
+    // path beats a static keyword blurb.
+    if (s == "in") {
+        return "## in\nIteration operator in the for-each form of `for`.\n\n### Syntax\n```cryo\nfor (item in items) { ... }\n```\n\n### Notes\n- For C-style indexed loops, use the three-clause `for (init; cond; step)` form\n- The right-hand side must be iterable";
+    }
+    if (s == "typeof") {
+        return "## typeof\nYields the static type of an expression — useful in metaprogramming or generic helpers.\n\n### Syntax\n```cryo\nconst t: typeof(value) = ...;\n```";
+    }
+    if (s == "sizeof") {
+        return "## sizeof\nYields the size in bytes of a type or expression.\n\n### Syntax\n```cryo\nconst n: u64 = sizeof(i64);     // 8\nconst m: u64 = sizeof(some_value);\n```\n\n### Notes\n- Returns `u64`\n- For alignment, use `alignof`";
+    }
+    if (s == "alignof") {
+        return "## alignof\nYields the alignment requirement (in bytes) of a type.\n\n### Syntax\n```cryo\nconst a: u64 = alignof(SomeStruct);\n```\n\n### Notes\n- Useful when manually laying out memory or calling allocator APIs";
+    }
+    // `new` and `delete` are intentionally NOT in this table.  Both
+    // appear far more often as method names (`Array::new()`,
+    // `static new() -> Self`, `box.delete()`) than as the reserved
+    // forms — the AST path resolves those to real method signatures,
+    // which beats a static blurb about a reserved word.
+    if (s == "with") {
+        return "## with\nReserved for scope / context forms.\n\n### Notes\n- Reserved keyword — current usage is limited; behaviour may evolve";
+    }
+
+    // Not a keyword we have docs for.
+    return "";
+}

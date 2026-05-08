@@ -64,7 +64,7 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     if (!serverPath) {
         const hint =
             'CryoLSP binary not found. Build with "cryo build" inside ' +
-            'tools/NewCryoLSP, or set cryo.languageServer.path.';
+            'tools/CryoLSP, or set cryo.languageServer.path.';
         outputChannel.appendLine(hint);
         vscode.window.showWarningMessage(hint);
         updateStatus('error');
