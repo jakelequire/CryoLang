@@ -37,6 +37,46 @@ import Utils::Logger;
 
 
 // ============================================================================
+// OutputKind — Single-file `-o PATH` artifact selector
+// ============================================================================
+
+/// What artifact a single-file build should produce.  Inferred from the
+/// extension of `-o PATH` by the CLI; read by `run_object_emission` to
+/// pick between LLVM's emit-to-file modes and by the single-file Exe
+/// flow to drive `cc` for final linking.
+///
+/// `None` is the default — keeps the legacy `build/obj/<module>.o`
+/// layout when the user didn't pass `-o`.
+type enum OutputKind {
+    None;
+    Object;
+    Asm;
+    IRText;
+    Exe;
+}
+
+implement enum OutputKind {
+    /// Map the kind to LLVM's `LLVMCodeGenFileType` value where one
+    /// applies (Asm = 0, Object = 1).  Returns -1 for kinds that
+    /// don't go through `LLVMTargetMachineEmitToFile`.
+    llvm_file_type(&this) -> i32 {
+        return match (this) {
+            OutputKind::Asm    => {  0 }
+            OutputKind::Object => {  1 }
+            _                  => { -1 }
+        };
+    }
+
+    is_override(&this) -> boolean {
+        return match (this) {
+            OutputKind::None => { false }
+            _                => { true  }
+        };
+    }
+}
+
+
+// ============================================================================
 // CompilationContext
 // ============================================================================
 
@@ -97,6 +137,25 @@ public:
     /// the `cc` shellout (cross-compile object files cannot be linked
     /// by the host linker without a target-aware toolchain).
     target_triple:       string;
+    /// Single-file `-o PATH` override.  Set by `compile_file` from
+    /// `CompilerConfig::output_path_override`.  Empty string ⇒ no
+    /// override (legacy `build/obj/<module>.o` path).  Read by
+    /// `run_object_emission` to redirect emission and by the
+    /// single-file Exe flow to drive `cc` for final linking.
+    output_path_override: string;
+    /// Single-file output kind selector.  Mirrors
+    /// `CompilerConfig::output_kind`.  `OutputKind::None` ⇔ no `-o`.
+    output_kind:         OutputKind;
+
+    /// LSP in-memory source override.  When the Lexing pass switches
+    /// to the module whose `source_file` equals `lsp_override_path`,
+    /// it reads from `lsp_override_content` instead of the file on
+    /// disk — letting the language server compile what's currently
+    /// in the editor buffer (which may diverge from what's saved)
+    /// while every OTHER module in the project loads from disk.
+    /// Empty `lsp_override_path` (the default) disables the override.
+    lsp_override_path:    string;
+    lsp_override_content: string;
 
 private:
     // Owned components (initialized lazily by passes that need them).
@@ -154,6 +213,11 @@ public:
             active_module_index: -1,
             stdlib_root:         "",
             target_triple:       "",
+            output_path_override: "",
+            output_kind:         OutputKind::None,
+
+            lsp_override_path:    "",
+            lsp_override_content: "",
 
             resolver:             null,
             type_resolver:        null,

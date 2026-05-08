@@ -1,6 +1,7 @@
 namespace CLI::Commands;
 
 import Compiler::Instance;
+import Compiler::CompilationContext;
 import Compiler::ProjectConfig;
 import Compiler::Resolver::Demangler;
 import Utils;
@@ -722,6 +723,39 @@ type struct Executor {
     // Direct File Compilation
     // ================================================================
 
+    /// Result type for `infer_output_kind`.  Cryo enums can't carry
+    /// payloads here, so the rejection reason rides alongside the kind.
+    /// `is_rejected = true` means the extension is one we explicitly
+    /// refuse (e.g. `.a` archive); the caller should print an error.
+    static infer_output_kind(path: string, mut rejected: boolean*) -> OutputKind {
+        *rejected = false;
+        const len: i64 = strlen(path) as i64;
+        if (len == 0) { return OutputKind::Exe; }
+        // Find last '/' and last '.' so we only look at the basename's
+        // extension.
+        mut last_slash: i64 = -1;
+        mut last_dot:   i64 = -1;
+        for (mut i: i64 = 0; i < len; i++) {
+            const c: char = path[i];
+            if (c == '/') { last_slash = i; last_dot = -1; continue; }
+            if (c == '.') { last_dot = i; }
+        }
+        if (last_dot < 0 || last_dot == last_slash + 1) {
+            // No extension, or hidden file like `.foo` with no real ext
+            return OutputKind::Exe;
+        }
+        const ext: string = ptr_add(path as void*, (last_dot + 1) as i64) as string;
+        if (strcmp(ext, "o")   == 0) { return OutputKind::Object; }
+        if (strcmp(ext, "asm") == 0) { return OutputKind::Asm; }
+        if (strcmp(ext, "s")   == 0) { return OutputKind::Asm; }
+        if (strcmp(ext, "ll")  == 0) { return OutputKind::IRText; }
+        if (strcmp(ext, "a")   == 0) { *rejected = true; return OutputKind::None; }
+        // Unknown extension: caller may want an executable named like
+        // `foo.bin` or `tool.exe`.  Treat as Exe; the link step writes
+        // the bytes regardless of suffix.
+        return OutputKind::Exe;
+    }
+
     /// Compiles a single file directly from a path.
     /// Routes through CompilerInstance for proper phase management.
     static compile_file(file_path: string, args: ParsedArgs) -> int {
@@ -747,6 +781,32 @@ type struct Executor {
         }
         if (args.has_arg("target")) {
             config.target_triple_override = args.get_value("target");
+        }
+
+        // `-o PATH` / `--output PATH` — single-file output redirect.
+        // Path extension picks the emission kind:
+        //   .o            → Object (1)
+        //   .asm | .s     → Asm    (2)
+        //   .ll           → IRText (3)
+        //   anything else → Exe    (4) — link via `cc`
+        // .a (static archive) is rejected up-front: single-file builds
+        // emit one TU, so producing an archive would require either
+        // wrapping a lone .o (`ar rcs`, fine) or cross-linking other
+        // sources we don't have.  Defer until cmd_project grows a
+        // library output path.
+        mut out_path: string = "";
+        if (args.has_arg("o"))      { out_path = args.get_value("o"); }
+        if (args.has_arg("output")) { out_path = args.get_value("output"); }
+        if (strlen(out_path) > 0) {
+            mut rejected: boolean = false;
+            const kind: OutputKind = Executor::infer_output_kind(out_path, &rejected);
+            if (rejected) {
+                printf("Error: unsupported output extension for '%s'\n", out_path);
+                printf("  supported: .o (object), .asm/.s (assembly), .ll (LLVM IR text), no-extension (executable)\n");
+                return 1;
+            }
+            config.output_path_override = out_path;
+            config.output_kind          = kind;
         }
 
         mut compiler: CompilerInstance = CompilerInstance::new(config);

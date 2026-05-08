@@ -1,5 +1,125 @@
-///! Open-document store — Phase B.
+///! Open-document store.
+///!
+///! Maps `URI → Document`.  A document holds the current editor
+///! buffer (text + version + LineIndex); whoever owns it is also
+///! responsible for keeping the per-doc CompilerSession in sync —
+///! the two structures are paired by URI in `Server`.
+///!
+///! Lookup returns a borrow (`Document*`) so handlers can read the
+///! text and line index without cloning the whole buffer.  The borrow
+///! is invalidated by the next `remove(uri)` for that key, but
+///! `insert` for a different URI does not invalidate prior borrows
+///! (HashMap entries are individually heap-allocated).
 
 namespace Lsp::Server::Docs;
 
+import std::core::option;
+import std::core::drop;
 import std::collections::str;
+import std::collections::string;
+import std::collections::hashmap;
+import Lsp::Server::LineIndex;
+
+
+type struct Document {
+    uri:        String;
+    version:    i32;
+    text:       String;
+    line_index: LineIndex;
+
+    static new(uri: String, text: String, version: i32) -> Document {
+        const idx: LineIndex = LineIndex::build(text.as_str());
+        return Document {
+            uri:        uri,
+            version:    version,
+            text:       text,
+            line_index: idx,
+        };
+    }
+
+    /// Replace the buffer (full sync) — drops the previous text and
+    /// LineIndex, then rebuilds the index from the new contents.
+    replace_text(mut &this, new_text: String, new_version: i32) -> void {
+        this.text.drop();
+        this.line_index.drop();
+        this.text       = new_text;
+        this.version    = new_version;
+        this.line_index = LineIndex::build(this.text.as_str());
+    }
+}
+
+type struct Docs {
+    by_uri: HashMap<String, Document>;
+
+    static new() -> Docs {
+        return Docs { by_uri: HashMap<String, Document>::new() };
+    }
+
+    /// Insert a freshly-built document.  If a document already exists
+    /// at the same URI it is dropped (the editor has effectively
+    /// re-opened the file from scratch).
+    insert(mut &this, doc: Document) -> void {
+        const key: String = String::from_str(doc.uri.as_str());
+        match (this.by_uri.insert(key, doc)) {
+            Option::Some(prev) => { mut p: Document = prev; p.drop(); }
+            Option::None       => { }
+        }
+    }
+
+    /// Borrow the document at `uri`, or `None` if no such document is
+    /// open.  The pointer remains valid until `remove(uri)`.
+    get(&this, uri: Str) -> Option<Document*> {
+        const key: String = String::from_str(uri);
+        const result: Option<Document*> = this.by_uri.get_ptr(&key);
+        mut owned: String = key;
+        owned.drop();
+        return result;
+    }
+
+    /// Remove and drop the document at `uri`.  Returns whether one
+    /// was actually removed (mostly for diagnostic logging — handlers
+    /// don't generally care about the answer).
+    remove(mut &this, uri: Str) -> boolean {
+        const key: String = String::from_str(uri);
+        match (this.by_uri.remove(&key)) {
+            Option::Some(doc) => {
+                mut d: Document = doc;
+                d.drop();
+                mut k: String = key;
+                k.drop();
+                return true;
+            }
+            Option::None => {
+                mut k: String = key;
+                k.drop();
+                return false;
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Drop trait impls
+//
+// `HashMap<K, V>::drop` is bounded `where K: Drop, V: Drop`.  Inherent
+// `drop` methods on stdlib templates (`String`, `Document` here) are
+// recognised by the bound check, but only when expressed via the
+// `implement trait Drop for T` shape — the stdlib documents the
+// contract this way at `std::core::drop`.  Without these impls we
+// can't store `Document` or `CompilerSession` in a HashMap.
+// ============================================================================
+
+implement trait Drop for Document {
+    drop(mut &this) -> void {
+        this.uri.drop();
+        this.text.drop();
+        this.line_index.drop();
+    }
+}
+
+implement trait Drop for Docs {
+    drop(mut &this) -> void {
+        this.by_uri.drop();
+    }
+}

@@ -552,21 +552,45 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
         cdebug("[Lexing] Tokenizing: %s\n", source_path);
     }
 
-    // Check if source content was already provided (LSP in-memory mode)
-    if (ctx.artifacts.tokens.source_content != "") {
-        // TODO: Lex from in-memory content when Lexer supports it
-        if (ctx.debug_mode) {
-            cdebug("[Lexing] In-memory source provided, using existing content\n");
+    // LSP in-memory mode.  Two sources of in-memory content:
+    //
+    //   (a) Single-file LSP entry (`compile_for_lsp_content_into`)
+    //       pre-populates `ctx.artifacts.tokens.source_content` for the
+    //       one file it knows about.  Used by tooling that drives the
+    //       compiler against a single buffer with no project context.
+    //
+    //   (b) Multi-module LSP entry (`compile_for_lsp_project_into`)
+    //       sets `ctx.lsp_override_path` and `ctx.lsp_override_content`
+    //       so the orchestrator can keep iterating every module from
+    //       disk while the ONE module the user is editing reads from
+    //       the editor buffer instead.  This is the path that gives
+    //       the LSP cross-file type info — every sibling module is
+    //       parsed and analysed normally, only the active buffer is
+    //       overridden.
+    //
+    // `File::from_content` returns a `loaded`-flagged File so the
+    // lexer's `file.load()` call short-circuits past the disk read.
+    mut inmem_content: string = "";
+    if (strlen(ctx.lsp_override_path) > 0
+            && strcmp(ctx.lsp_override_path, source_path) == 0) {
+        inmem_content = ctx.lsp_override_content;
+    } else if (ctx.artifacts.tokens.source_content != "") {
+        inmem_content = ctx.artifacts.tokens.source_content;
+    }
+    const inmem_mode: boolean =
+        (inmem_content != "" && strlen(inmem_content) > 0 as u64);
+
+    mut file: File = File::from_content("", "", "");
+    if (inmem_mode) {
+        file = File::from_content(source_path, "cryo", inmem_content);
+    } else {
+        if (!File::exists(source_path)) {
+            ctx.emit_error(ErrorCode::E0800_FILE_NOT_FOUND,
+                format("Source file not found: %s", source_path));
+            return PassResult::failure(1);
         }
+        file = File::new(source_path);
     }
-
-    // Read and tokenize the source file
-    if (!File::exists(source_path)) {
-        ctx.emit_error(ErrorCode::E0800_FILE_NOT_FOUND, format("Source file not found: %s", source_path));
-        return PassResult::failure(1);
-    }
-
-    const file: File      = File::new(source_path);
     const lexer: Lexer    = Lexer::new(file, ctx.diagnostics);
     const tokens: Token[] = lexer.lex();
 

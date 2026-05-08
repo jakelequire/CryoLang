@@ -1,5 +1,181 @@
-///! Hover handler — Phase C.
+///! Hover handler.
+///!
+///! Locates the AST node under the cursor and renders its resolved
+///! type as a markdown code block.
+///!
+///! Steps:
+///!   1. Pull `uri` + `position` out of the request params.
+///!   2. Look up the URI's `CompilerSession` (recompile already ran
+///!      from didOpen / didChange).
+///!   3. From the session's `CompilationContext`, find the module
+///!      whose `file_path` matches the URI's filesystem path.
+///!   4. Walk that module's AST via `Compiler::AST::NodeLocator` to find
+///!      the innermost node covering the cursor (1-based on entry).
+///!   5. Read the node's `resolved_type` and render it via the type
+///!      arena's display formatter.
+///!
+///! Returns `null` when any step yields no info — no session, no
+///! AST, no node at cursor, or no type on that node.  The LSP spec
+///! treats `null` as "no hover here", which the editor renders as
+///! "no tooltip" (clean fallback).
 
 namespace Lsp::Handlers::Hover;
 
+import std::core::option;
 import std::collections::str;
+import std::collections::string;
+import std::json::value;
+
+import Compiler::CompilationContext;
+import Compiler::AST::Node;
+import Compiler::AST::NodeLocator;
+import Compiler::Types::TypeRef;
+import Compiler::ModuleGraph;
+
+import Lsp::Server::Docs;
+import Lsp::Server::Session;
+import Lsp::Protocol::Lsp;
+
+
+public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
+                              params: &JsonValue) -> JsonValue {
+    // -- Extract URI + 0-based (line, character) from the params ------
+    // Use stepwise extraction with early returns; deeply nested
+    // `match` arms returning `Str` AND diverging via `return` confuse
+    // the codegen's PHI-node type unification.
+    const td_opt: Option<JsonValue*> = params.get(Str::from_cstr("textDocument"));
+    if (!td_opt.is_some()) { return JsonValue::Null; }
+    const td: JsonValue* = td_opt.unwrap_or(null);
+    if (td == null) { return JsonValue::Null; }
+
+    const uri_opt: Option<JsonValue*> = td.get(Str::from_cstr("uri"));
+    if (!uri_opt.is_some()) { return JsonValue::Null; }
+    const uri_val: JsonValue* = uri_opt.unwrap_or(null);
+    if (uri_val == null) { return JsonValue::Null; }
+
+    const uri_str_opt: Option<Str> = uri_val.as_str();
+    if (!uri_str_opt.is_some()) { return JsonValue::Null; }
+    const uri: Str = uri_str_opt.unwrap_or(Str::from_cstr(""));
+
+    const pos_opt: Option<JsonValue*> = params.get(Str::from_cstr("position"));
+    if (!pos_opt.is_some()) { return JsonValue::Null; }
+    const pos: JsonValue* = pos_opt.unwrap_or(null);
+    if (pos == null) { return JsonValue::Null; }
+    const line:      u32 = json_u32_field(pos, "line");
+    const character: u32 = json_u32_field(pos, "character");
+
+    // -- Find the session + module + AST for this URI ----------------
+    const session_opt: Option<CompilerSession*> = sessions.get(uri);
+    if (!session_opt.is_some()) { return JsonValue::Null; }
+    const session: CompilerSession* = session_opt.unwrap_or(null);
+    if (session == null) { return JsonValue::Null; }
+    const ctx: CompilationContext* = session.context();
+    if (ctx == null) { return JsonValue::Null; }
+
+    // Strip `file://` to get the filesystem path the loader stored.
+    const fs_path: Str = uri_to_fs_path(uri);
+    mut path_buf: String = String::with_capacity(fs_path.length() + 1);
+    path_buf.push_str(fs_path);
+    path_buf.push_byte(0 as u8);
+    const path_buf_len: u64 = path_buf.length() - 1;
+    path_buf.truncate(path_buf_len);
+    const path_cstr: string = path_buf.as_ptr() as string;
+
+    const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
+    path_buf.drop();
+    if (mod_idx < 0) { return JsonValue::Null; }
+
+    const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return JsonValue::Null; }
+
+    // -- Walk to the innermost node ----------------------------------
+    // Compiler spans are 1-based; LSP positions are 0-based.
+    const node: ASTNode* = NodeLocator::find_innermost_node_at(
+        ast, line + 1 as u32, character + 1 as u32);
+    if (node == null) { return JsonValue::Null; }
+
+    const ty: TypeRef = NodeLocator::resolved_type_of(node);
+    if (!ty.is_valid()) { return JsonValue::Null; }
+    if (ctx.type_arena == null) { return JsonValue::Null; }
+
+    const type_name: string = ctx.type_arena.resolve_display_name(ty.id);
+    if (type_name == "") { return JsonValue::Null; }
+
+    // -- Build the LSP Hover response --------------------------------
+    // ```cryo
+    // <type>
+    // ```
+    mut value_buf: String = String::with_capacity(64);
+    value_buf.push_cstr("```cryo\n");
+    value_buf.push_cstr(type_name);
+    value_buf.push_cstr("\n```");
+
+    const contents: MarkupContent = MarkupContent::markdown(value_buf);
+    const hover: Hover = Hover {
+        contents: contents,
+        range:    Option::Some(range_from_node_span(node)),
+    };
+    const result: JsonValue = hover.to_json();
+    mut h: Hover = hover;
+    h.drop();
+    return result;
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+const FILE_SCHEME:     string = "file://";
+const FILE_SCHEME_LEN: u64    = 7;
+
+function uri_to_fs_path(uri: Str) -> Str {
+    if (uri.length() >= FILE_SCHEME_LEN) {
+        const prefix: Str = uri.sub_bytes(0, FILE_SCHEME_LEN);
+        if (prefix.equals(&Str::from_cstr(FILE_SCHEME))) {
+            return uri.sub_bytes(FILE_SCHEME_LEN, uri.length());
+        }
+    }
+    return uri;
+}
+
+function json_u32_field(obj: &JsonValue, key: string) -> u32 {
+    match (obj.get(Str::from_cstr(key))) {
+        Option::Some(v) => {
+            match (v) {
+                JsonValue::Number(n) => {
+                    match (n) {
+                        JsonNumber::Int(i)   => {
+                            if (i < 0) { return 0 as u32; }
+                            return i as u32;
+                        }
+                        JsonNumber::UInt(u)  => { return u as u32; }
+                        JsonNumber::Float(f) => {
+                            if (f < 0.0) { return 0 as u32; }
+                            return f as u32;
+                        }
+                    }
+                }
+                _ => { return 0 as u32; }
+            }
+        }
+        Option::None => { return 0 as u32; }
+    }
+    return 0 as u32;
+}
+
+/// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
+/// Used so the editor highlights the matched token while the tooltip
+/// is open — without a range the hover anchors to a single point.
+function range_from_node_span(node: ASTNode*) -> Range {
+    const span: SourceSpan = node.span;
+    mut sl: u32 = 0;
+    mut sc: u32 = 0;
+    mut el: u32 = 0;
+    mut ec: u32 = 0;
+    if (span.start_line > 0) { sl = span.start_line - 1; }
+    if (span.start_col  > 0) { sc = span.start_col  - 1; }
+    if (span.end_line   > 0) { el = span.end_line   - 1; }
+    if (span.end_col    > 0) { ec = span.end_col    - 1; }
+    return Range::new(Position::new(sl, sc), Position::new(el, ec));
+}

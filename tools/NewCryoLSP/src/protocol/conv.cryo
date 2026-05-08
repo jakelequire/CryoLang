@@ -1,9 +1,163 @@
-///! Conversions between compiler-internal types and LSP wire types.
+///! Conversions between compiler-internal types and LSP wire JSON.
 ///!
-///! Phase A stub — populated in Phase B when diagnostic publishing,
-///! hover, and definition land.  Centralising the conversions here
-///! keeps each handler focused on dispatch rather than wire format.
+///! `Compiler::Diag::Diagnostic` → JSON for `publishDiagnostics`.
+///! Built directly as `JsonValue` rather than via the LSP-side
+///! `Diagnostic` struct because both types are named `Diagnostic` and
+///! the import-resolution path through both top-level namespaces in
+///! the same file picks whichever was imported last — depending on
+///! the resolution order this either compiles or doesn't.  Going
+///! direct keeps the file insensitive to import order.
 
 namespace Lsp::Protocol::Conv;
 
+import std::core::option;
 import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+import Compiler::Diag;
+import Compiler::Diag::Severity;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Diagnostic;
+
+
+/// Build a `Range` JSON object from a 1-based compiler `SourceSpan`.
+///
+///   { "start": { "line": L0, "character": C0 },
+///     "end":   { "line": L1, "character": C1 } }
+///
+/// Spans without a location (start_line == 0) collapse to (0,0)→(0,0)
+/// — VS Code renders that harmlessly at the top of the document.
+public function range_json_from_span(span: SourceSpan) -> JsonValue {
+    mut sl: u32 = 0;
+    mut sc: u32 = 0;
+    mut el: u32 = 0;
+    mut ec: u32 = 0;
+    if (span.start_line > 0) { sl = span.start_line - 1; }
+    if (span.start_col  > 0) { sc = span.start_col  - 1; }
+    if (span.end_line   > 0) { el = span.end_line   - 1; }
+    if (span.end_col    > 0) { ec = span.end_col    - 1; }
+    return range_json(sl, sc, el, ec);
+}
+
+public function range_json(sl: u32, sc: u32, el: u32, ec: u32) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_cstr("start")), pos_json(sl, sc));
+    o.insert(String::from_str(Str::from_cstr("end")),   pos_json(el, ec));
+    return JsonValue::Object(o);
+}
+
+function pos_json(line: u32, character: u32) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_cstr("line")),
+             JsonValue::Number(JsonNumber::Int(line as i64)));
+    o.insert(String::from_str(Str::from_cstr("character")),
+             JsonValue::Number(JsonNumber::Int(character as i64)));
+    return JsonValue::Object(o);
+}
+
+
+/// Map a compiler `Severity` onto LSP's integer codes (1..4).
+/// `Note` and `Help` both surface as `Information` (3) — VS Code
+/// renders Hint (4) very quietly, which is the wrong affordance for
+/// the compiler's "please look at this" diagnostics.
+public function severity_int_from(sev: Severity) -> i64 {
+    return match (sev) {
+        Severity::Error   => { 1 as i64 }
+        Severity::Warning => { 2 as i64 }
+        Severity::Note    => { 3 as i64 }
+        Severity::Help    => { 3 as i64 }
+    };
+}
+
+
+/// Build the `params` object for a `textDocument/publishDiagnostics`
+/// notification:
+///
+///   { "uri": "<uri>", "diagnostics": [ ... ] }
+///
+/// Filters `diags` to only those whose `span.file` matches the URI's
+/// filesystem path — multi-module project compiles populate the sink
+/// with diagnostics from EVERY module they touched, but each
+/// `publishDiagnostics` notification is per-URI on the wire.  Without
+/// the filter, an editor showing `main.cryo` would render diagnostics
+/// from sibling files at made-up positions in the active buffer.
+public function build_publish_params(uri: Str, diags: Diagnostic[]) -> JsonValue {
+    const fs_path: Str = uri_to_fs_path(uri);
+    mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(diags.length as u64);
+    for (mut i: i64 = 0; i < diags.length; i++) {
+        if (diag_is_for_path(&diags[i], fs_path)) {
+            arr.push(diag_to_json(&diags[i]));
+        }
+    }
+
+    mut params: JsonObject = JsonObject::new();
+    params.insert(
+        String::from_str(Str::from_cstr("uri")),
+        JsonValue::String(String::from_str(uri)));
+    params.insert(
+        String::from_str(Str::from_cstr("diagnostics")),
+        JsonValue::Array(arr));
+    return JsonValue::Object(params);
+}
+
+
+// ============================================================================
+// URI / span filtering
+// ============================================================================
+
+const FILE_SCHEME:     string = "file://";
+const FILE_SCHEME_LEN: u64    = 7;
+
+/// Strip the `file://` scheme from a URI to get the absolute
+/// filesystem path the compiler stores in `SourceSpan::file`.
+function uri_to_fs_path(uri: Str) -> Str {
+    if (uri.length() >= FILE_SCHEME_LEN) {
+        const prefix: Str = uri.sub_bytes(0, FILE_SCHEME_LEN);
+        if (prefix.equals(&Str::from_cstr(FILE_SCHEME))) {
+            return uri.sub_bytes(FILE_SCHEME_LEN, uri.length());
+        }
+    }
+    return uri;
+}
+
+/// True when this diagnostic's source span belongs to `fs_path`.
+/// Spanless diagnostics (`span.file == ""`) are dropped — they have
+/// no editor position to render against, so attributing them to the
+/// publishing URI would surface them at line 0 (or worse, at
+/// whatever stale line/col the span happened to carry over) and
+/// confuse the user.  A future pass can route them into the LSP
+/// output channel instead.
+function diag_is_for_path(diag: &Diagnostic, fs_path: Str) -> boolean {
+    const span_file: string = diag.span.file;
+    if (span_file == "") { return false; }
+    if (strlen(span_file) == 0 as u64) { return false; }
+    return fs_path.equals(&Str::from_cstr(span_file));
+}
+
+
+/// Render one compiler diagnostic as an LSP `Diagnostic` JSON object.
+public function diag_to_json(diag: &Diagnostic) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_cstr("range")),
+             range_json_from_span(diag.span));
+    o.insert(String::from_str(Str::from_cstr("severity")),
+             JsonValue::Number(JsonNumber::Int(severity_int_from(diag.severity))));
+
+    // Code: rendered as the canonical "E0102" / "W0001" string.
+    mut code_str: String = String::new();
+    code_str.push_cstr(diag.code.format());
+    o.insert(String::from_str(Str::from_cstr("code")),
+             JsonValue::String(code_str));
+
+    o.insert(String::from_str(Str::from_cstr("source")),
+             JsonValue::String(String::from_str(Str::from_cstr("cryoc"))));
+
+    mut msg: String = String::new();
+    msg.push_cstr(diag.message);
+    o.insert(String::from_str(Str::from_cstr("message")),
+             JsonValue::String(msg));
+
+    return JsonValue::Object(o);
+}

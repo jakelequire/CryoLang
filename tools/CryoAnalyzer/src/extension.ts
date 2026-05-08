@@ -60,14 +60,13 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
         return;
     }
 
-    const serverPath = resolveServerPath(context.extensionPath);
+    const serverPath = resolveServerPath(context.extensionPath, outputChannel);
     if (!serverPath) {
-        outputChannel.appendLine(
-            'CryoLSP binary not found. Build with "make lsp" or set cryo.languageServer.path'
-        );
-        vscode.window.showWarningMessage(
-            'CryoLSP binary not found. Build with "make lsp" or configure the path in settings.'
-        );
+        const hint =
+            'CryoLSP binary not found. Build with "cryo build" inside ' +
+            'tools/NewCryoLSP, or set cryo.languageServer.path.';
+        outputChannel.appendLine(hint);
+        vscode.window.showWarningMessage(hint);
         updateStatus('error');
         return;
     }

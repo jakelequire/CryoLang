@@ -1,0 +1,379 @@
+/// AST Position Lookup
+///
+/// `find_innermost_node_at(root, line, character)` walks the AST and
+/// returns the deepest `ASTNode*` whose `span` covers (line, character),
+/// or `null` when no node matches.  Both inputs are 1-based to match
+/// the compiler's `SourceSpan` convention; LSP callers convert their
+/// 0-based positions before invoking.
+///
+/// Dispatch is by `NodeKind` rather than the visitor pattern.  The
+/// visitor needs ~50 method overrides per concrete walker; this file
+/// recurses inline through the children that actually exist for each
+/// kind, which keeps the walk in one place.  Kinds with no children
+/// (Identifier, Literal, the various leaf statements) terminate the
+/// recursion automatically — `descend` returns null and the caller
+/// keeps the current node as the innermost match.
+///
+/// "Innermost" semantics: we descend into the FIRST child whose span
+/// covers the cursor.  Two siblings with overlapping spans is normally
+/// a parser bug; if it happens, we pick the leftmost one.
+namespace Compiler::AST::NodeLocator;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::Diag::SourceSpan;
+import Compiler::Types::TypeRef;
+
+
+/// True when (line, character) falls within `span` inclusive of both
+/// endpoints.  Spanless nodes (start_line == 0) never match — they
+/// have no editor coordinate to compare against.
+public function span_contains(span: SourceSpan, line: u32, character: u32) -> boolean {
+    if (span.start_line == 0 as u32) { return false; }
+    if (line < span.start_line) { return false; }
+    if (line > span.end_line)   { return false; }
+    if (line == span.start_line && character < span.start_col) { return false; }
+    if (line == span.end_line   && character > span.end_col)   { return false; }
+    return true;
+}
+
+
+/// Walk `root` and return the innermost `ASTNode*` whose span covers
+/// (line, character).  Returns `null` when the cursor falls outside
+/// every top-level statement (typical for cursor-on-blank-line above
+/// the first declaration).
+public function find_innermost_node_at(root: ProgramNode*,
+                                        line: u32, character: u32) -> ASTNode* {
+    if (root == null) { return null; }
+    for (mut i: i64 = 0; i < root.statements.length; i++) {
+        const stmt: ASTNode* = root.statements[i];
+        if (stmt == null) { continue; }
+        if (!span_contains(stmt.span, line, character)) { continue; }
+        return walk_node(stmt, line, character);
+    }
+    return null;
+}
+
+
+/// Generic descent: given an `ASTNode*` known to cover the position,
+/// look for a child whose span ALSO covers it.  When one is found,
+/// recurse; otherwise return the input as the innermost match.
+function walk_node(node: ASTNode*, line: u32, character: u32) -> ASTNode* {
+    if (node == null) { return null; }
+
+    const child: ASTNode* = first_covering_child(node, line, character);
+    if (child == null) { return node; }
+    return walk_node(child, line, character);
+}
+
+
+/// Return the first child of `node` whose span covers (line, character),
+/// or `null` if no child does.  Per-kind dispatch: each branch knows
+/// the structural children of its node type.  Add new node kinds here
+/// when they need to participate in position lookup — leaving a kind
+/// out is harmless (the walk just stops at that node).
+function first_covering_child(node: ASTNode*,
+                               line: u32, character: u32) -> ASTNode* {
+    match (node.kind) {
+        // -- Expressions --
+        NodeKind::BinaryExpression => {
+            const e: BinaryExprNode* = node as BinaryExprNode*;
+            return pick(e.left as ASTNode*, e.right as ASTNode*, null, null,
+                        line, character);
+        }
+        NodeKind::UnaryExpression => {
+            const e: UnaryExprNode* = node as UnaryExprNode*;
+            return pick(e.operand as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::TernaryExpression => {
+            const e: TernaryExprNode* = node as TernaryExprNode*;
+            return pick(e.condition as ASTNode*, e.true_expr as ASTNode*,
+                        e.false_expr as ASTNode*, null, line, character);
+        }
+        NodeKind::IfExpression => {
+            const e: IfExprNode* = node as IfExprNode*;
+            return pick(e.condition as ASTNode*, e.then_expr as ASTNode*,
+                        e.else_expr as ASTNode*, null, line, character);
+        }
+        NodeKind::CallExpression => {
+            const e: CallExprNode* = node as CallExprNode*;
+            const callee_match: ASTNode* = pick_one(e.callee as ASTNode*, line, character);
+            if (callee_match != null) { return callee_match; }
+            return pick_array_expr(e.arguments, line, character);
+        }
+        NodeKind::NewExpression => {
+            const e: NewExprNode* = node as NewExprNode*;
+            return pick_array_expr(e.arguments, line, character);
+        }
+        NodeKind::CastExpression => {
+            const e: CastExprNode* = node as CastExprNode*;
+            return pick(e.expression as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::MemberAccess => {
+            const e: MemberAccessNode* = node as MemberAccessNode*;
+            return pick(e.object as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::ArrayAccess => {
+            const e: ArrayAccessNode* = node as ArrayAccessNode*;
+            return pick(e.array as ASTNode*, e.index as ASTNode*, null, null,
+                        line, character);
+        }
+        NodeKind::ArrayLiteral => {
+            const e: ArrayLiteralNode* = node as ArrayLiteralNode*;
+            return pick_array_expr(e.elements, line, character);
+        }
+        NodeKind::TupleLiteral => {
+            const e: TupleLiteralNode* = node as TupleLiteralNode*;
+            return pick_array_expr(e.elements, line, character);
+        }
+        NodeKind::StructLiteral => {
+            // StructLiteral fields are name=expr pairs; descending into
+            // the field exprs is enough for hover.  Field names render
+            // their own type via the parent struct lookup.
+            return null;
+        }
+        NodeKind::TypeofExpression => {
+            const e: TypeofExprNode* = node as TypeofExprNode*;
+            return pick(e.operand as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::DeleteExpression => {
+            const e: DeleteExprNode* = node as DeleteExprNode*;
+            return pick(e.operand as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::AwaitExpression => {
+            const e: AwaitExprNode* = node as AwaitExprNode*;
+            return pick(e.operand as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::YieldExpression => {
+            const e: YieldExprNode* = node as YieldExprNode*;
+            return pick(e.operand as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::LambdaExpression => {
+            const e: LambdaExprNode* = node as LambdaExprNode*;
+            return pick(e.body as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::MatchExpression => {
+            const e: MatchExprNode* = node as MatchExprNode*;
+            return pick(e.subject as ASTNode*, null, null, null, line, character);
+        }
+
+        // -- Statements --
+        NodeKind::BlockStatement => {
+            const s: BlockStmtNode* = node as BlockStmtNode*;
+            return pick_array_stmt(s.statements, line, character);
+        }
+        NodeKind::UnsafeBlockStatement => {
+            const s: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
+            return pick(s.block as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::ReturnStatement => {
+            const s: ReturnStmtNode* = node as ReturnStmtNode*;
+            return pick(s.expression as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::IfStatement => {
+            const s: IfStmtNode* = node as IfStmtNode*;
+            return pick(s.condition as ASTNode*, s.then_stmt as ASTNode*,
+                        s.else_stmt as ASTNode*, null, line, character);
+        }
+        NodeKind::WhileStatement => {
+            const s: WhileStmtNode* = node as WhileStmtNode*;
+            return pick(s.condition as ASTNode*, s.body as ASTNode*, null, null,
+                        line, character);
+        }
+        NodeKind::DoWhileStatement => {
+            const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
+            return pick(s.body as ASTNode*, s.condition as ASTNode*, null, null,
+                        line, character);
+        }
+        NodeKind::ForStatement => {
+            const s: ForStmtNode* = node as ForStmtNode*;
+            return pick(s.init, s.condition as ASTNode*,
+                        s.update as ASTNode*, s.body as ASTNode*,
+                        line, character);
+        }
+        NodeKind::LoopStatement => {
+            const s: LoopStmtNode* = node as LoopStmtNode*;
+            return pick(s.body as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::ExpressionStatement => {
+            const s: ExprStmtNode* = node as ExprStmtNode*;
+            return pick(s.expression as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::DeclarationStatement => {
+            const s: DeclStmtNode* = node as DeclStmtNode*;
+            return pick(s.declaration as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::MatchStatement => {
+            const s: MatchStmtNode* = node as MatchStmtNode*;
+            return pick(s.subject as ASTNode*, null, null, null, line, character);
+        }
+
+        // -- Declarations --
+        NodeKind::VariableDeclaration => {
+            const d: VarDeclNode* = node as VarDeclNode*;
+            return pick(d.initializer as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::FunctionDeclaration => {
+            const d: FunctionDeclNode* = node as FunctionDeclNode*;
+            // Body almost always covers the cursor; parameters span the
+            // signature line so they're checked first.
+            const param_match: ASTNode* = pick_array_var(
+                d.parameters, line, character);
+            if (param_match != null) { return param_match; }
+            return pick(d.body as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::MethodDeclaration => {
+            const d: MethodNode* = node as MethodNode*;
+            if (d.func == null) { return null; }
+            return pick(d.func as ASTNode*, null, null, null, line, character);
+        }
+        NodeKind::StructDeclaration => {
+            const d: StructDeclNode* = node as StructDeclNode*;
+            return pick_array_method(d.methods, line, character);
+        }
+        NodeKind::ClassDeclaration => {
+            const d: ClassDeclNode* = node as ClassDeclNode*;
+            return pick_array_method(d.methods, line, character);
+        }
+        NodeKind::ImplementationBlock => {
+            const d: ImplBlockNode* = node as ImplBlockNode*;
+            return pick_array_method(d.methods, line, character);
+        }
+        _ => { return null; }
+    }
+}
+
+
+// ============================================================================
+// pick* — scan a small fixed set of children + return the first that
+// covers the cursor.  Avoids the boilerplate of writing the same
+// `if (a != null && contains) return a;` chain per node kind.
+// ============================================================================
+
+function pick(a: ASTNode*, b: ASTNode*, c: ASTNode*, d: ASTNode*,
+              line: u32, character: u32) -> ASTNode* {
+    if (a != null && span_contains(a.span, line, character)) { return a; }
+    if (b != null && span_contains(b.span, line, character)) { return b; }
+    if (c != null && span_contains(c.span, line, character)) { return c; }
+    if (d != null && span_contains(d.span, line, character)) { return d; }
+    return null;
+}
+
+function pick_one(a: ASTNode*, line: u32, character: u32) -> ASTNode* {
+    if (a != null && span_contains(a.span, line, character)) { return a; }
+    return null;
+}
+
+function pick_array_expr(arr: ExpressionNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: ExpressionNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+function pick_array_stmt(arr: StatementNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: StatementNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+function pick_array_var(arr: VarDeclNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: VarDeclNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+function pick_array_method(arr: MethodNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: MethodNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+
+// ============================================================================
+// Per-node-kind type extraction for hover.
+//
+// Most expressions stash their resolved type on `ExpressionNode.resolved_type`
+// (which the LSP can read after sema completes); declarations store theirs
+// on the per-class field (`VarDeclNode.resolved_type`,
+// `FunctionDeclNode.resolved_return_type`).  Returning `TypeRef::invalid()`
+// signals "no type info available" — the hover handler renders nothing
+// in that case rather than guessing.
+// ============================================================================
+
+public function resolved_type_of(node: ASTNode*) -> TypeRef {
+    if (node == null) { return TypeRef::invalid(); }
+
+    // All ExpressionNode subclasses carry resolved_type on the base.
+    // The compiler treats Expression / its concrete kinds uniformly,
+    // so a single downcast suffices for the whole expression family.
+    if (is_expression_kind(node.kind)) {
+        const e: ExpressionNode* = node as ExpressionNode*;
+        return e.resolved_type;
+    }
+
+    match (node.kind) {
+        NodeKind::VariableDeclaration => {
+            const d: VarDeclNode* = node as VarDeclNode*;
+            return d.resolved_type;
+        }
+        NodeKind::FunctionDeclaration => {
+            const d: FunctionDeclNode* = node as FunctionDeclNode*;
+            return d.resolved_return_type;
+        }
+        NodeKind::MethodDeclaration => {
+            const d: MethodNode* = node as MethodNode*;
+            if (d.func == null) { return TypeRef::invalid(); }
+            return d.func.resolved_return_type;
+        }
+        _ => { return TypeRef::invalid(); }
+    }
+}
+
+function is_expression_kind(k: NodeKind) -> boolean {
+    return match (k) {
+        NodeKind::Literal           => { true }
+        NodeKind::Identifier        => { true }
+        NodeKind::BinaryExpression  => { true }
+        NodeKind::UnaryExpression   => { true }
+        NodeKind::TernaryExpression => { true }
+        NodeKind::IfExpression      => { true }
+        NodeKind::MatchExpression   => { true }
+        NodeKind::CallExpression    => { true }
+        NodeKind::NewExpression     => { true }
+        NodeKind::SizeofExpression  => { true }
+        NodeKind::AlignofExpression => { true }
+        NodeKind::CastExpression    => { true }
+        NodeKind::StructLiteral     => { true }
+        NodeKind::ArrayLiteral      => { true }
+        NodeKind::TupleLiteral      => { true }
+        NodeKind::LambdaExpression  => { true }
+        NodeKind::ArrayAccess       => { true }
+        NodeKind::MemberAccess      => { true }
+        NodeKind::ScopeResolution   => { true }
+        NodeKind::TypeofExpression  => { true }
+        NodeKind::DeleteExpression  => { true }
+        NodeKind::AwaitExpression   => { true }
+        NodeKind::YieldExpression   => { true }
+        NodeKind::AsyncExpression   => { true }
+        _ => { false }
+    };
+}
