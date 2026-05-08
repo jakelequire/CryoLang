@@ -27,7 +27,7 @@ LEGACY_BOOT := $(ROOT)/legacy/bootstrap/bin/cryo
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
-LSP_BUILD_DIR := $(ROOT)/tools/NewCryoLSP/build
+LSP_BUILD_DIR := $(ROOT)/tools/CryoLSP/build
 LSP_BIN       := $(LSP_BUILD_DIR)/bin/cryolsp
 LSP_PIN       := $(ROOT)/bin/cryolsp
 
@@ -80,12 +80,12 @@ pin-cryo:
 	@python3 scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
 
 # ---- Cryo-language LSP server -----------------------------------------
-# Builds tools/NewCryoLSP/ (entirely Cryo source) into bin/cryolsp.
+# Builds tools/CryoLSP/ (entirely Cryo source) into bin/cryolsp.
 # Depends on `cryo` because the LSP imports the self-hosted compiler
 # library + stdlib via include_paths.
 lsp: cryo
-	@echo "==> Building NewCryoLSP via bin/cryo"
-	@cd tools/NewCryoLSP && "$(PIN)" build
+	@echo "==> Building CryoLSP via bin/cryo"
+	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN)"
 	@echo "==> bin/cryolsp ready"
 
@@ -126,7 +126,7 @@ $(LEGACY_BOOT):
 clean:
 	@echo "==> Cleaning compiler + stdlib build outputs"
 	@rm -rf compiler/build stdlib/.bin
-	@rm -rf tools/NewCryoLSP/build
+	@rm -rf tools/CryoLSP/build
 	@rm -f bin/cryolsp
 
 distclean: clean

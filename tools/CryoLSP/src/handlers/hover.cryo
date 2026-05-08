@@ -24,17 +24,28 @@ namespace Lsp::Handlers::Hover;
 import std::core::option;
 import std::collections::str;
 import std::collections::string;
+import std::fmt::integer;
 import std::json::value;
 
 import Compiler::CompilationContext;
+import Compiler::AST;
 import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Declaration;
 import Compiler::AST::NodeLocator;
+import Compiler::Diag::SourceSpan;
+import Compiler::Resolver::Resolver;
+import Compiler::Resolver::Symbol;
+import Compiler::Resolver::SymbolID;
+import Compiler::Resolver::SymbolStr;
 import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
 import Compiler::ModuleGraph;
 
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
 import Lsp::Protocol::Lsp;
+import Lsp::Handlers::KeywordDocs;
 
 
 public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
@@ -64,6 +75,26 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     const line:      u32 = json_u32_field(pos, "line");
     const character: u32 = json_u32_field(pos, "character");
 
+    // -- Keyword hover (token-level, AST-independent) -----------------
+    // Run before any session/AST work: keywords like `function`,
+    // `mut`, `i32` either don't map to an AST node at all or sit
+    // inside a larger node whose span covers them — neither case
+    // produces useful hover via the AST path.  Document text is
+    // enough; if the cursor lands on a known keyword, return its
+    // markdown blurb.  A miss falls through to the AST flow.
+    const doc_opt: Option<Document*> = docs.get(uri);
+    match (doc_opt) {
+        Option::Some(doc) => {
+            const kw_hover: Option<JsonValue> =
+                KeywordDocs::try_keyword_hover(doc, line, character);
+            match (kw_hover) {
+                Option::Some(json) => { return json; }
+                Option::None       => { }
+            }
+        }
+        Option::None => { }
+    }
+
     // -- Find the session + module + AST for this URI ----------------
     const session_opt: Option<CompilerSession*> = sessions.get(uri);
     if (!session_opt.is_some()) { return JsonValue::Null; }
@@ -90,35 +121,560 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
 
     // -- Walk to the innermost node ----------------------------------
     // Compiler spans are 1-based; LSP positions are 0-based.
+    const cursor_line: u32 = line + 1 as u32;
+    const cursor_char: u32 = character + 1 as u32;
     const node: ASTNode* = NodeLocator::find_innermost_node_at(
-        ast, line + 1 as u32, character + 1 as u32);
+        ast, cursor_line, cursor_char);
     if (node == null) { return JsonValue::Null; }
-
-    const ty: TypeRef = NodeLocator::resolved_type_of(node);
-    if (!ty.is_valid()) { return JsonValue::Null; }
     if (ctx.type_arena == null) { return JsonValue::Null; }
 
-    const type_name: string = ctx.type_arena.resolve_display_name(ty.id);
-    if (type_name == "") { return JsonValue::Null; }
+    // -- Pick a content string and a span for the highlight ---------
+    const name_span: SourceSpan = NodeLocator::name_span_of(node);
+    const on_decl_name: boolean =
+        NodeLocator::span_contains(name_span, cursor_line, cursor_char);
+
+    mut content: string = "";
+    mut hover_span: SourceSpan = node.span;
+
+    // Decl-name hover: render the full callable signature, not just
+    // the return type.  `function name(p1: T1, …) -> Ret` reads more
+    // like the source line and matches how editors show signatures.
+    if (on_decl_name && node.kind == NodeKind::FunctionDeclaration) {
+        const f: FunctionDeclNode* = node as FunctionDeclNode*;
+        content    = format_function_signature(f, ctx.type_arena);
+        hover_span = name_span;
+    } else if (on_decl_name && node.kind == NodeKind::MethodDeclaration) {
+        const m: MethodNode* = node as MethodNode*;
+        if (m.func != null) {
+            // Reverse-walk to find which struct/class/impl block owns
+            // this method so the hover reads `Str::from_raw`, not just
+            // `from_raw`.  Empty owner falls through to bare-name form.
+            const owner: SymbolStr = NodeLocator::find_method_owner(
+                ctx.module_graph, m);
+            const owner_str: string = if (owner.is_valid()) {
+                leaf_after_separator(ctx.type_arena.intern_table.resolve(owner))
+            } else { "" };
+            content    = format_method_signature(m, owner_str, ctx.type_arena);
+            hover_span = name_span;
+        }
+    } else if (on_decl_name && node.kind == NodeKind::VariableDeclaration) {
+        // `const body_str: Str = …;` — render the declaration form
+        // rather than just the type, so the hover reflects what the
+        // user wrote (`const` vs. `mut`, the variable's name).
+        const v: VarDeclNode* = node as VarDeclNode*;
+        content    = format_variable_decl(v, ctx.type_arena);
+        hover_span = name_span;
+    } else if (node.kind == NodeKind::VariableDeclaration) {
+        // Cursor on a `VarDeclNode` outside the name token — the
+        // common case is the synthesized `&this` / `mut &this` /
+        // `this` receiver parameter (the parser stores the literal
+        // `&this` as the param name).  Render those as
+        // `this: &Type` so the receiver's resolved type is visible
+        // even though there's no source-level name-span to anchor.
+        const v: VarDeclNode* = node as VarDeclNode*;
+        if (is_receiver_param(v, ctx.type_arena)) {
+            content    = format_receiver(v, ctx.type_arena);
+            hover_span = v.span;
+        }
+    } else if (on_decl_name && node.kind == NodeKind::FieldDeclaration) {
+        // `name: Type` inside `type struct/class { … }`.  Hover the
+        // field name in source — the locator descends into the
+        // struct's `fields[]` to land here — and render `name: Type`.
+        const fld: FieldDeclNode* = node as FieldDeclNode*;
+        content    = format_field_decl(fld, ctx.type_arena);
+        hover_span = name_span;
+    } else if (on_decl_name && (
+                  node.kind == NodeKind::StructDeclaration
+               || node.kind == NodeKind::ClassDeclaration
+               || node.kind == NodeKind::EnumDeclaration
+               || node.kind == NodeKind::TraitDeclaration
+               || node.kind == NodeKind::TypeAliasDeclaration)) {
+        // `type struct HashMap<K, V, A = GlobalAlloc>` — render the
+        // type-decl head, including generic params with their
+        // defaults so the user can see the full parameter list.
+        content    = format_type_decl(node, ctx.type_arena);
+        hover_span = name_span;
+    } else if (on_decl_name && node.kind == NodeKind::EnumVariant) {
+        // `NotFound;` inside `type enum IoErrorKind { … }` — show
+        // `IoErrorKind::NotFound = 0` (auto-numbered) or the explicit
+        // discriminant when set.  Reverse-walks the graph to find the
+        // enclosing enum so the hover renders the qualified name.
+        const variant: EnumVariantNode* = node as EnumVariantNode*;
+        const parent: EnumDeclNode* = find_enum_for_variant(
+            ctx.module_graph, variant);
+        if (parent != null) {
+            content    = format_enum_variant(parent, variant, ctx.type_arena);
+            hover_span = name_span;
+        }
+    } else if (node.kind == NodeKind::ScopeResolution) {
+        // `Type::method(...)` or `Module::function(...)` — show the
+        // callable's signature.  Method on `Type` wins; falls back to
+        // a free function in some module if no method matches; finally
+        // an enum variant (`IoErrorKind::NotFound`) when neither hits.
+        const sr: ScopeResolutionNode* = node as ScopeResolutionNode*;
+        const m: MethodNode* = NodeLocator::find_method_in_modules(
+            ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
+        if (m != null && m.func != null) {
+            const owner_str: string = leaf_after_separator(
+                ctx.type_arena.intern_table.resolve(sr.scope_name));
+            content = format_method_signature(m, owner_str, ctx.type_arena);
+        } else {
+            const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
+                ctx.module_graph, sr.member_name);
+            if (f != null) {
+                content = format_function_signature(f, ctx.type_arena);
+            } else {
+                // Enum-variant fallback.  `find_type_decl_in_modules`
+                // already accepts qualified-or-bare names and matches
+                // enum decls; cast and scan variants for the member.
+                const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    ctx.module_graph, ctx.intern_table, sr.scope_name);
+                if (td != null && td.kind == NodeKind::EnumDeclaration) {
+                    const ed: EnumDeclNode* = td as EnumDeclNode*;
+                    const v: EnumVariantNode* = find_variant_in_enum(
+                        ed, sr.member_name);
+                    if (v != null) {
+                        content = format_enum_variant(ed, v, ctx.type_arena);
+                    }
+                }
+            }
+        }
+    } else if (node.kind == NodeKind::StructLiteral) {
+        // `IoError { kind: …, os_code: … }` — three sub-cases based
+        // on cursor position:
+        //   • on the type-name token (`IoError`)         → struct head
+        //   • on a field-init name (`kind`, `os_code`)   → `name: Type`
+        //   • inside a field-init value                  → falls through
+        //     (the locator descends into `value` so we typically don't
+        //     even reach this branch in that case)
+        const sl: StructLiteralNode* = node as StructLiteralNode*;
+        const sl_result: StructLiteralHover = struct_literal_hover_at(
+            sl, cursor_line, cursor_char,
+            ctx.module_graph, ctx.intern_table, ctx.type_arena);
+        if (sl_result.content != "") {
+            content    = sl_result.content;
+            hover_span = sl_result.span;
+        }
+    } else if (node.kind == NodeKind::MemberAccess) {
+        // `obj.method(...)` — look up the method on the receiver's
+        // resolved type.  Use the type arena's display for the owner
+        // prefix so monomorphized generics render as
+        // `Array<u8, GlobalAlloc>::push_slice(...)` rather than the
+        // mangled spec-name `5Array$Lh_N$L3std…`.  Method lookup
+        // still goes through the bare/qualified SymbolStr from
+        // `decl_index.lookup_type_name` because that's what the
+        // locator's leaf-aware matcher compares against.
+        const ma: MemberAccessNode* = node as MemberAccessNode*;
+        if (ma.object != null && ctx.decl_index != null) {
+            const recv_ty: TypeRef = ma.object.resolved_type;
+            if (recv_ty.is_valid()) {
+                const type_sym: SymbolStr = ctx.decl_index.lookup_type_name(recv_ty);
+                if (type_sym.is_valid()) {
+                    const m: MethodNode* = NodeLocator::find_method_in_modules(
+                        ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                    if (m != null && m.func != null) {
+                        const owner_str: string = ctx.type_arena.resolve_display_name_short(
+                            recv_ty.id);
+                        content = format_method_signature(m, owner_str, ctx.type_arena);
+                        if (NodeLocator::span_contains(
+                                ma.member_span, cursor_line, cursor_char)) {
+                            hover_span = ma.member_span;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (node.kind == NodeKind::Pattern) {
+        // Match-arm identifier patterns (e.g. `ENOENT => …`).  Cryo's
+        // current pattern semantics treat identifier patterns as
+        // fresh bindings — the resolver doesn't record a span→sym
+        // entry and the binding shadows any const of the same name.
+        // For hover utility, look up the global const by name so the
+        // tooltip surfaces the value the author almost certainly
+        // intended (an errno-style table is the canonical case).
+        const pat: PatternNode* = node as PatternNode*;
+        if (pat.pattern_kind == PatternKind::Identifier) {
+            const v: VarDeclNode* = NodeLocator::find_const_in_modules(
+                ctx.module_graph, pat.binding_name);
+            if (v != null) {
+                content    = format_variable_decl(v, ctx.type_arena);
+                hover_span = pat.span;
+            }
+        }
+    } else if (node.kind == NodeKind::Literal) {
+        // String literals render as `string("Hello, …")[len]`; numeric
+        // literals as `<value>: <inferred-type>` so the hover surfaces
+        // both the source value and the type sema picked from context
+        // (the same `42` is `i32` in `const x: i32 = 42` but `u64`
+        // when passed to a `u64` parameter).  Char/bool/null fall
+        // through to the type-only fallback — their value already
+        // shows in source and the type alone is the useful info.
+        const lit: LiteralNode* = node as LiteralNode*;
+        if (lit.literal_kind == LiteralKind::String) {
+            content    = format_string_literal(lit);
+            hover_span = lit.span;
+        } else if (lit.literal_kind == LiteralKind::Integer
+                || lit.literal_kind == LiteralKind::Float) {
+            content    = format_numeric_literal(lit, ctx.type_arena);
+            hover_span = lit.span;
+        }
+    } else if (node.kind == NodeKind::Identifier && ctx.resolver != null) {
+        // `body_str` (use site) — show the declaration form so the
+        // hover reads `const body_str: Str` instead of just `Str`.
+        // Symbol lookup happens via the resolver's span → sym_id map
+        // populated during NameResolution; absent (sema bailed) falls
+        // through to the type-only fallback.
+        //
+        // For top-level constants (errno-style numbers, sentinel
+        // strings) we ALSO append the initializer literal so hover
+        // reads `const ENOENT: i32 = 2` rather than just the type.
+        // Walks back through the symbol's declaring span to find the
+        // VarDeclNode and reads its initializer.
+        const id_node: IdentifierNode* = node as IdentifierNode*;
+        const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
+        if (sym_id.is_valid()) {
+            const sym: Symbol = ctx.resolver.get_symbol(sym_id);
+            const init_str: string = const_initializer_text(
+                ctx.module_graph, sym.declaring_span);
+            content = format_identifier_use(
+                sym, id_node.resolved_type, ctx.type_arena, init_str);
+        }
+    }
+
+    // Fallback path for everything else (variables, identifiers,
+    // expressions, type tokens).  Use the short type name so the
+    // tooltip says `Str` not `std::collections::str::Str`.
+    if (content == "") {
+        const ty: TypeRef = NodeLocator::resolved_type_of(node);
+        if (!ty.is_valid()) { return JsonValue::Null; }
+        const type_name: string = ctx.type_arena.resolve_display_name_short(ty.id);
+        if (type_name == "") { return JsonValue::Null; }
+        content = type_name;
+        if (on_decl_name) { hover_span = name_span; }
+        // Narrow the highlight to a type-annotation span when the
+        // cursor sits on one.  Without this, hovering `i32` in
+        // `function foo() -> i32 { … }` would underline the entire
+        // function — the locator can't descend into TypeAnnotation
+        // (it's an enum, not an AST node) so the walk stops at the
+        // enclosing decl.
+        const ann_span: SourceSpan = annotation_span_at_cursor(
+            node, cursor_line, cursor_char);
+        if (NodeLocator::span_contains(ann_span, cursor_line, cursor_char)) {
+            hover_span = ann_span;
+        }
+    }
 
     // -- Build the LSP Hover response --------------------------------
-    // ```cryo
-    // <type>
-    // ```
     mut value_buf: String = String::with_capacity(64);
     value_buf.push_cstr("```cryo\n");
-    value_buf.push_cstr(type_name);
+    value_buf.push_cstr(content);
     value_buf.push_cstr("\n```");
 
     const contents: MarkupContent = MarkupContent::markdown(value_buf);
     const hover: Hover = Hover {
         contents: contents,
-        range:    Option::Some(range_from_node_span(node)),
+        range:    Option::Some(range_from_span(hover_span)),
     };
     const result: JsonValue = hover.to_json();
     mut h: Hover = hover;
     h.drop();
     return result;
+}
+
+
+// ============================================================================
+// Signature formatters
+//
+// Render a callable as `function name(p1: T1, p2: T2) -> Ret` (free
+// function) or `method name(...)` / `static name(...)` (method).
+// Parameter types come from `VarDeclNode.resolved_type`; the function's
+// return type comes from `FunctionDeclNode.resolved_return_type`.  Both
+// are filled in by sema, so this only produces useful output once name
+// resolution + type checking have run.  When sema bailed mid-pipeline
+// (the common LSP case for in-progress edits) the affected slots stay
+// `TypeRef::invalid()` and render as `?`.
+// ============================================================================
+
+function format_function_signature(func: FunctionDeclNode*,
+                                    arena: TypeArena*) -> string {
+    if (func == null) { return ""; }
+    mut sig: string = "function ";
+    sig = sig + arena.intern_table.resolve(func.name);
+    sig = sig + format_params(func.parameters, arena);
+    sig = sig + " -> ";
+    sig = sig + arena.resolve_display_name_short(func.resolved_return_type.id);
+    return sig;
+}
+
+/// Render a method as `<modifier>? <Owner>::<name>(<params>) -> <ret>`.
+/// Modifier is one of `static` / `constructor` / `destructor` and is
+/// omitted on plain instance methods — the `&this` / `mut &this`
+/// receiver in the parameter list already conveys instance-ness, so
+/// a leading `method` keyword would just be noise.
+///
+/// `owner_display` is the rendered owner string the caller has
+/// already computed.  For decl-name and scope-resolution hovers the
+/// caller passes the leaf of a SymbolStr (`Str` from
+/// `std::collections::str::Str`).  For member-access hovers the
+/// caller passes the receiver type's display name from the type
+/// arena — which goes through the arena's `format_display_short` and
+/// covers monomorphized generics correctly
+/// (`Array<u8, GlobalAlloc>` rather than the mangled
+/// `5Array$Lh_N$L3std.5alloc.9allocator.11GlobalAlloc$G$G`).  Empty
+/// string means "no owner prefix".
+function format_method_signature(method: MethodNode*, owner_display: string,
+                                  arena: TypeArena*) -> string {
+    if (method == null || method.func == null) { return ""; }
+    const f: FunctionDeclNode* = method.func;
+    mut sig: string = "";
+    if (method.is_static)      { sig = sig + "static "; }
+    if (method.is_constructor) { sig = sig + "constructor "; }
+    if (method.is_destructor)  { sig = sig + "destructor "; }
+    if (owner_display != "") {
+        sig = sig + owner_display + "::";
+    }
+    sig = sig + arena.intern_table.resolve(f.name);
+    sig = sig + format_params(f.parameters, arena);
+    sig = sig + " -> ";
+    sig = sig + arena.resolve_display_name_short(f.resolved_return_type.id);
+    return sig;
+}
+
+/// Return everything after the final `::` in `s`, or `s` itself when
+/// there's no `::`.  Mirrors `extract_leaf_segment` in
+/// `Compiler::Types::Arena` — duplicated here to avoid the cross-
+/// module import for one tiny string helper.
+function leaf_after_separator(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i + 1 < len; i++) {
+        if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
+    }
+    if (last_sep < 0) { return s; }
+    const start: i64 = last_sep + 2;
+    if (start >= len) { return ""; }
+    return ptr_add(s as void*, start) as string;
+}
+
+/// Render a struct/class field as `<name>: <Type>`.  No `field`
+/// keyword: the surrounding `type struct/class` already conveys
+/// it, and source uses just `name: Type` for fields.
+function format_field_decl(fld: FieldDeclNode*, arena: TypeArena*) -> string {
+    if (fld == null) { return ""; }
+    mut sig: string = arena.intern_table.resolve(fld.name);
+    sig = sig + ": ";
+    sig = sig + arena.resolve_display_name_short(fld.resolved_type.id);
+    return sig;
+}
+
+/// Render a type-decl head: `type struct HashMap<K, V, A = GlobalAlloc>`,
+/// `type class Foo<T>`, `type enum Color`, `type trait Iterator<T>`,
+/// or `type alias Bytes = u8[]`.  Generic params are rendered with
+/// optional `= Default` clauses when the parser captured a default
+/// annotation; constraints (`<T: Ord>`) are omitted to keep the
+/// signature one-line.
+function format_type_decl(node: ASTNode*, arena: TypeArena*) -> string {
+    return match (node.kind) {
+        NodeKind::StructDeclaration => {
+            const d: StructDeclNode* = node as StructDeclNode*;
+            "type struct " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table)
+        }
+        NodeKind::ClassDeclaration => {
+            const d: ClassDeclNode* = node as ClassDeclNode*;
+            "type class " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table)
+        }
+        NodeKind::EnumDeclaration => {
+            const d: EnumDeclNode* = node as EnumDeclNode*;
+            "type enum " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table)
+        }
+        NodeKind::TraitDeclaration => {
+            const d: TraitDeclNode* = node as TraitDeclNode*;
+            "type trait " + arena.intern_table.resolve(d.name)
+                + format_generic_params(d.generic_params, arena.intern_table)
+        }
+        NodeKind::TypeAliasDeclaration => {
+            const d: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+            mut sig: string = "type alias " + arena.intern_table.resolve(d.alias_name);
+            sig = sig + format_generic_params(d.generic_params, arena.intern_table);
+            // Append the resolved target after `=` when sema has filled
+            // it in; otherwise leave the head bare so partially-typed
+            // sources still produce useful hovers.
+            if (d.resolved_target.is_valid()) {
+                sig = sig + " = "
+                    + arena.resolve_display_name_short(d.resolved_target.id);
+            }
+            sig
+        }
+        _ => { "" }
+    };
+}
+
+function format_generic_params(params: GenericParamNode*[],
+                                intern: InternTable*) -> string {
+    if (params.length == 0) { return ""; }
+    mut s: string = "<";
+    for (mut i: i64 = 0; i < params.length; i++) {
+        if (i > 0) { s = s + ", "; }
+        const p: GenericParamNode* = params[i];
+        if (p == null) { continue; }
+        s = s + intern.resolve(p.name);
+        if (p.default_annotation != null) {
+            s = s + " = " + format_annotation(p.default_annotation, intern);
+        }
+    }
+    return s + ">";
+}
+
+/// Render a `TypeAnnotation*` as a one-line string.  Handles the
+/// common shapes generic-param defaults take: bare `Named` (e.g.
+/// `GlobalAlloc`), `Primitive` (e.g. `i32`), and pointer/reference
+/// wrappers.  Unhandled variants render as `?` rather than error —
+/// hover should never crash when sema has only partially digested
+/// the source.
+function format_annotation(ann: TypeAnnotation*, intern: InternTable*) -> string {
+    if (ann == null) { return "?"; }
+    return match (*ann) {
+        TypeAnnotation::Primitive(p) => { intern.resolve(p.name) }
+        TypeAnnotation::Named(n)     => {
+            leaf_after_separator(intern.resolve(n.name))
+        }
+        TypeAnnotation::Pointer(p)   => {
+            format_annotation(p.inner, intern) + "*"
+        }
+        TypeAnnotation::Reference(r) => {
+            const inner: string = format_annotation(r.inner, intern);
+            const prefix: string = if (r.is_mutable) { "&mut " } else { "&" };
+            prefix + inner
+        }
+        TypeAnnotation::Optional(o)  => {
+            format_annotation(o.inner, intern) + "?"
+        }
+        TypeAnnotation::Array(a)     => {
+            format_annotation(a.element, intern) + "[]"
+        }
+        _                            => { "?" }
+    };
+}
+
+
+/// Render a variable declaration as `const|mut <name>: <Type>`,
+/// matching the source-level form.  `is_global` doesn't get a
+/// dedicated marker — the type already conveys what matters.
+/// For globals with a literal initializer, the value is appended:
+/// `const ENOENT: i32 = 2` — useful for errno-style constant tables
+/// where the value is the relevant fact about the binding.
+function format_variable_decl(v: VarDeclNode*, arena: TypeArena*) -> string {
+    if (v == null) { return ""; }
+    mut sig: string = if (v.is_mutable) { "mut " } else { "const " };
+    sig = sig + arena.intern_table.resolve(v.name);
+    sig = sig + ": ";
+    sig = sig + arena.resolve_display_name_short(v.resolved_type.id);
+    if (v.is_global && v.initializer != null) {
+        const init: string = literal_text(v.initializer);
+        if (init != "") { sig = sig + " = " + init; }
+    }
+    return sig;
+}
+
+/// True when `v` is a method receiver parameter (`&this` /
+/// `mut &this` / `this`).  The parser stores the literal lexeme
+/// (`&this` etc.) as the param's `name`, so a string-content match
+/// against the interned name is the most direct way to detect it.
+function is_receiver_param(v: VarDeclNode*, arena: TypeArena*) -> boolean {
+    if (v == null) { return false; }
+    const name_str: string = arena.intern_table.resolve(v.name);
+    return strcmp(name_str, "&this") == 0
+        || strcmp(name_str, "this")  == 0;
+}
+
+/// Return the type-annotation span on `node` that covers the
+/// cursor, if any.  Looks at the return-type annotation for
+/// functions and methods, and the type annotation for variables /
+/// fields.  Used to narrow the hover highlight when the cursor sits
+/// on a type token that isn't its own AST node.
+function annotation_span_at_cursor(node: ASTNode*, line: u32, ch: u32) -> SourceSpan {
+    if (node == null) { return SourceSpan::none(); }
+    if (node.kind == NodeKind::FunctionDeclaration) {
+        const f: FunctionDeclNode* = node as FunctionDeclNode*;
+        return NodeLocator::annotation_span(f.return_type_annotation);
+    }
+    if (node.kind == NodeKind::MethodDeclaration) {
+        const m: MethodNode* = node as MethodNode*;
+        if (m.func == null) { return SourceSpan::none(); }
+        return NodeLocator::annotation_span(m.func.return_type_annotation);
+    }
+    if (node.kind == NodeKind::VariableDeclaration) {
+        const v: VarDeclNode* = node as VarDeclNode*;
+        return NodeLocator::annotation_span(v.type_annotation);
+    }
+    if (node.kind == NodeKind::FieldDeclaration) {
+        const fld: FieldDeclNode* = node as FieldDeclNode*;
+        return NodeLocator::annotation_span(fld.type_annotation);
+    }
+    return SourceSpan::none();
+}
+
+/// Render a method receiver as `this: <ReceiverType>`.  The receiver
+/// type is whatever sema resolved on the synthetic `&this` /
+/// `mut &this` / `this` `VarDeclNode` — that already includes the
+/// `&` / `&mut` / value shape, so the formatter doesn't need to
+/// reconstruct it from the name lexeme.
+function format_receiver(v: VarDeclNode*, arena: TypeArena*) -> string {
+    return "this: " + arena.resolve_display_name_short(v.resolved_type.id);
+}
+
+/// Render an identifier use as the declaration form of the symbol it
+/// resolves to: `const body_str: Str` for a const local,
+/// `mut body_str: Str` for a mutable local, `body_str: Str` for a
+/// parameter (with `mut` prefix when the param itself is mutable),
+/// `<name>: <Type>` for a field reached via `this.<name>` or similar.
+/// `ty` is the use-site's resolved type (already short-formatted so
+/// callers don't have to re-resolve through the arena).  `init_str`
+/// is the literal text of the symbol's initializer (empty when the
+/// symbol has no literal value or isn't a top-level const) — appended
+/// as ` = <value>` so a hovered errno reads `const ENOENT: i32 = 2`.
+function format_identifier_use(sym: Symbol, ty: TypeRef,
+                                arena: TypeArena*, init_str: string) -> string {
+    const type_str: string = arena.resolve_display_name_short(ty.id);
+    const name_str: string = arena.intern_table.resolve(sym.name);
+    const init_suffix: string = if (init_str != "") { " = " + init_str } else { "" };
+
+    return match (sym.kind) {
+        SymbolKind::Variable  => {
+            const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
+            prefix + name_str + ": " + type_str + init_suffix
+        }
+        SymbolKind::Constant  => {
+            "const " + name_str + ": " + type_str + init_suffix
+        }
+        SymbolKind::Parameter => {
+            const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
+            prefix + name_str + ": " + type_str
+        }
+        SymbolKind::Field     => {
+            "field " + name_str + ": " + type_str
+        }
+        // For Function/Method/Type/etc. just show the type — the
+        // ScopeResolution and decl-name branches above already handle
+        // the signature-rich cases.
+        _                     => { type_str }
+    };
+}
+
+function format_params(params: VarDeclNode*[], arena: TypeArena*) -> string {
+    mut s: string = "(";
+    for (mut i: i64 = 0; i < params.length; i++) {
+        if (i > 0) { s = s + ", "; }
+        const p: VarDeclNode* = params[i];
+        if (p == null) { continue; }
+        s = s + arena.intern_table.resolve(p.name);
+        s = s + ": ";
+        s = s + arena.resolve_display_name_short(p.resolved_type.id);
+    }
+    return s + ")";
 }
 
 
@@ -167,8 +723,7 @@ function json_u32_field(obj: &JsonValue, key: string) -> u32 {
 /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
 /// Used so the editor highlights the matched token while the tooltip
 /// is open — without a range the hover anchors to a single point.
-function range_from_node_span(node: ASTNode*) -> Range {
-    const span: SourceSpan = node.span;
+function range_from_span(span: SourceSpan) -> Range {
     mut sl: u32 = 0;
     mut sc: u32 = 0;
     mut el: u32 = 0;
@@ -178,4 +733,382 @@ function range_from_node_span(node: ASTNode*) -> Range {
     if (span.end_line   > 0) { el = span.end_line   - 1; }
     if (span.end_col    > 0) { ec = span.end_col    - 1; }
     return Range::new(Position::new(sl, sc), Position::new(el, ec));
+}
+
+
+// ============================================================================
+// Const initializer text + i64 formatting
+// ============================================================================
+
+/// Render a literal-bearing expression to its source-level text.
+/// Handles bare `LiteralNode` and `-<literal>` UnaryExpressions
+/// (negative integer constants).  Returns "" for any other shape so
+/// hover never displays a partial expression — composite initializers
+/// like `(FOO | BAR)` are better shown by the user navigating to the
+/// decl itself.
+function literal_text(expr: ExpressionNode*) -> string {
+    if (expr == null) { return ""; }
+    if (expr.kind == NodeKind::Literal) {
+        const l: LiteralNode* = expr as LiteralNode*;
+        return l.value;
+    }
+    if (expr.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        if (u.operand != null && u.operand.kind == NodeKind::Literal) {
+            const l: LiteralNode* = u.operand as LiteralNode*;
+            return "-" + l.value;
+        }
+    }
+    return "";
+}
+
+/// Walk the module graph to the decl at `decl_span` and return the
+/// initializer literal as text — empty when the decl isn't a global
+/// const, has no initializer, or the initializer isn't a literal we
+/// can render compactly.  Used to enrich identifier-use hovers for
+/// errno-style const tables (`const ENOENT: i32 = 2`).
+function const_initializer_text(graph: ModuleGraph*, decl_span: SourceSpan) -> string {
+    const v: VarDeclNode* = var_decl_at_span(graph, decl_span);
+    if (v == null)             { return ""; }
+    if (!v.is_global)          { return ""; }
+    if (v.initializer == null) { return ""; }
+    return literal_text(v.initializer);
+}
+
+/// Locate a `VarDeclNode` at the start position of `decl_span`.
+/// Returns `null` when the span isn't reachable in the graph or the
+/// node at that position isn't a variable decl.  Shared between the
+/// initializer-text helper and the Pattern-identifier dispatch.
+function var_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> VarDeclNode* {
+    if (graph == null)                       { return null; }
+    if (decl_span.file == "")                { return null; }
+    if (strlen(decl_span.file) == 0 as u64)  { return null; }
+    if (!decl_span.has_location())           { return null; }
+
+    const mod_idx: i64 = graph.find_module_by_path(decl_span.file);
+    if (mod_idx < 0) { return null; }
+    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return null; }
+
+    const node: ASTNode* = NodeLocator::find_innermost_node_at(
+        ast, decl_span.start_line, decl_span.start_col);
+    if (node == null) { return null; }
+    if (node.kind != NodeKind::VariableDeclaration) { return null; }
+    return node as VarDeclNode*;
+}
+
+/// Format an `i64` as a heap-leased decimal `string`.  Routes through
+/// `std::fmt::integer::push_i64_decimal` so the digit logic stays in
+/// one place; the underlying buffer outlives this call (same pattern
+/// as the other `format_*` helpers in this file — the leak is
+/// per-hover-request and acceptable until the LSP grows a per-call
+/// arena).
+function i64_to_text(value: i64) -> string {
+    mut buf: String = String::new();
+    integer::push_i64_decimal(buf, value);
+    buf.push_byte(0 as u8);
+    return buf.as_ptr() as string;
+}
+
+
+// ============================================================================
+// String literal hover
+// ============================================================================
+
+/// Render a numeric literal as `<value>: <inferred-type>` — for
+/// example `42: i32`, `0xFF: u8`, `3.14: f64`.  The type comes from
+/// `resolved_type` which sema fills in based on the surrounding
+/// context, so the same literal can hover differently depending on
+/// where it appears (annotation, parameter type, arithmetic peer).
+/// When sema bails, the type slot is `?` rather than empty so the
+/// hover still reads sensibly.
+function format_numeric_literal(lit: LiteralNode*, arena: TypeArena*) -> string {
+    if (lit == null) { return ""; }
+    const ty: TypeRef = lit.resolved_type;
+    const type_str: string = if (ty.is_valid()) {
+        arena.resolve_display_name_short(ty.id)
+    } else { "?" };
+    return lit.value + ": " + type_str;
+}
+
+
+/// Render a string literal as `string("<text>")[<bytes>]` so the
+/// hover surfaces both the source text and the byte count.  The
+/// lexer already strips the surrounding quotes and resolves escape
+/// sequences when populating `LiteralNode.value`, so the byte count
+/// is just `strlen(value)` and we re-escape control characters so
+/// the displayed text fits on one line of hover markup.  Long
+/// strings get truncated past 60 visible chars — hover isn't the
+/// place for the full payload.
+function format_string_literal(lit: LiteralNode*) -> string {
+    if (lit == null) { return "string"; }
+    const bytes:   i64    = strlen(lit.value) as i64;
+    const escaped: string = escape_for_hover(lit.value);
+    return "string(\"" + escaped + "\")[" + i64_to_text(bytes) + "]";
+}
+
+/// Re-escape `\n`/`\r`/`\t`/`"`/`\` in `s` so the hover renders the
+/// source-level appearance (newlines wouldn't survive markdown
+/// otherwise).  Truncates with `…` past 60 visible chars to keep the
+/// hover panel one line.
+function escape_for_hover(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    const max_show: i64 = 60;
+    mut out: String = String::new();
+    mut shown: i64 = 0;
+    mut i: i64 = 0;
+    while (i < len) {
+        if (shown >= max_show) {
+            out.push_cstr("...");
+            break;
+        }
+        const c: i8 = s[i];
+        if (c == '\n' as i8) {
+            out.push_cstr("\\n");
+            shown = shown + 2;
+        } else if (c == '\r' as i8) {
+            out.push_cstr("\\r");
+            shown = shown + 2;
+        } else if (c == '\t' as i8) {
+            out.push_cstr("\\t");
+            shown = shown + 2;
+        } else if (c == '"' as i8) {
+            out.push_cstr("\\\"");
+            shown = shown + 2;
+        } else if (c == '\\' as i8) {
+            out.push_cstr("\\\\");
+            shown = shown + 2;
+        } else {
+            out.push_byte(c as u8);
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    out.push_byte(0 as u8);
+    return out.as_ptr() as string;
+}
+
+
+// ============================================================================
+// Enum-variant lookup + rendering
+// ============================================================================
+
+/// Render a variant as `<EnumName>::<VariantName> = <discriminant>`
+/// for unit-only variants, or `<EnumName>::<VariantName>(<types>)`
+/// when the variant carries associated types.  Discriminant is the
+/// explicit value when set, otherwise the variant's index in source
+/// order — Cryo enums start at 0 and step by one.
+function format_enum_variant(parent: EnumDeclNode*, variant: EnumVariantNode*,
+                              arena: TypeArena*) -> string {
+    if (parent == null || variant == null) { return ""; }
+    mut sig: string = arena.intern_table.resolve(parent.name);
+    sig = sig + "::" + arena.intern_table.resolve(variant.name);
+
+    if (variant.associated_types.length > 0) {
+        sig = sig + "(";
+        for (mut i: i64 = 0; i < variant.associated_types.length; i++) {
+            if (i > 0) { sig = sig + ", "; }
+            sig = sig + format_annotation(
+                variant.associated_types[i], arena.intern_table);
+        }
+        return sig + ")";
+    }
+
+    const disc: i64 = if (variant.has_value) {
+        variant.explicit_value
+    } else {
+        variant_auto_index(parent, variant)
+    };
+    return sig + " = " + i64_to_text(disc);
+}
+
+/// Index of `variant` in `parent.variants[]`.  Falls back to 0 when
+/// the variant somehow isn't on the parent — shouldn't happen for
+/// nodes the locator returned.
+function variant_auto_index(parent: EnumDeclNode*, variant: EnumVariantNode*) -> i64 {
+    for (mut i: i64 = 0; i < parent.variants.length; i++) {
+        if (parent.variants[i] == variant) { return i; }
+    }
+    return 0;
+}
+
+/// Linear scan for a variant by name on a known enum decl.  Used by
+/// the `EnumName::Variant` ScopeResolution branch.
+function find_variant_in_enum(parent: EnumDeclNode*, name: SymbolStr) -> EnumVariantNode* {
+    if (parent == null) { return null; }
+    for (mut i: i64 = 0; i < parent.variants.length; i++) {
+        const v: EnumVariantNode* = parent.variants[i];
+        if (v != null && v.name.equals(name)) { return v; }
+    }
+    return null;
+}
+
+/// Reverse-walk: given a variant node, find the enclosing
+/// `EnumDeclNode`.  Mirrors `find_method_owner` for methods —
+/// EnumVariantNodes don't carry a parent pointer so we scan the
+/// graph.  Returns `null` when nothing matches (shouldn't happen for
+/// a variant node the locator just returned).
+function find_enum_for_variant(graph: ModuleGraph*,
+                                variant: EnumVariantNode*) -> EnumDeclNode* {
+    if (graph == null || variant == null) { return null; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_top_decl(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::EnumDeclaration) { continue; }
+            const ed: EnumDeclNode* = stmt as EnumDeclNode*;
+            for (mut vi: i64 = 0; vi < ed.variants.length; vi++) {
+                if (ed.variants[vi] == variant) { return ed; }
+            }
+        }
+    }
+    return null;
+}
+
+/// `ProgramNode.statements` may wrap top-level decls in a
+/// `DeclStmtNode`; unwrap so callers can branch on the inner kind.
+/// Mirrors the locator's `unwrap_decl_stmt` (kept private there).
+function unwrap_top_decl(node: ASTNode*) -> ASTNode* {
+    if (node == null) { return null; }
+    if (node.kind != NodeKind::DeclarationStatement) { return node; }
+    const d: DeclStmtNode* = node as DeclStmtNode*;
+    return d.declaration as ASTNode*;
+}
+
+
+// ============================================================================
+// Struct-literal hover
+// ============================================================================
+
+/// Result of dispatching a struct-literal hover: the rendered string
+/// + the highlight span.  Empty `content` means the struct-literal
+/// branch couldn't classify the cursor (caller falls back to the
+/// generic type-only path).
+type struct StructLiteralHover {
+    content: string;
+    span:    SourceSpan;
+}
+
+/// Decide which sub-region of `IoError { kind: …, os_code: … }` the
+/// cursor hit, and render accordingly:
+///
+///   • Cursor before any field (the `IoError` token region) →
+///     full struct head, span = the type-name range
+///   • Cursor on a field-init name → `<field>: <Type>`, span = the
+///     field-init's name segment (`init.span` start through
+///     `init.value.span` start)
+///   • Cursor in a field-init value → empty (locator usually descends
+///     into the value, so we rarely see this; keep as fallback)
+function struct_literal_hover_at(sl: StructLiteralNode*, line: u32, ch: u32,
+                                  graph: ModuleGraph*, intern: InternTable*,
+                                  arena: TypeArena*) -> StructLiteralHover {
+    mut result: StructLiteralHover = StructLiteralHover {
+        content: "",
+        span:    sl.span,
+    };
+    if (sl == null) { return result; }
+
+    // Look up the struct/class decl whose name appears at the head.
+    const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+        graph, intern, sl.struct_type);
+
+    // Field-name dispatch.  For each field-init, the name occupies
+    // [init.span.start_col, init.value.span.start_col) on
+    // init.span.start_line.  Compare cursor (line, ch) against that
+    // range; on hit, render the field decl.
+    for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+        const init: FieldInit = sl.field_inits[i];
+        if (init.value == null) { continue; }
+        if (line != init.span.start_line) { continue; }
+
+        const name_start: u32 = init.span.start_col;
+        const name_end:   u32 = init.value.span.start_col;
+        if (ch < name_start || ch >= name_end) { continue; }
+
+        // Cursor is on the field name.  Look up the field on the
+        // owning struct/class decl and render `<name>: <Type>`.
+        if (decl != null) {
+            const fld: FieldDeclNode* = find_field_on_type_decl(
+                decl, init.field_name);
+            if (fld != null) {
+                result.content = format_field_decl(fld, arena);
+                result.span    = field_init_name_span(init.span, init.value.span);
+                return result;
+            }
+        }
+
+        // Decl unavailable — fall back to `name: <ResolvedValueType>`.
+        const value_ty: TypeRef = init.value.resolved_type;
+        if (value_ty.is_valid()) {
+            result.content = arena.intern_table.resolve(init.field_name)
+                + ": " + arena.resolve_display_name_short(value_ty.id);
+            result.span    = field_init_name_span(init.span, init.value.span);
+            return result;
+        }
+    }
+
+    // Cursor wasn't on any field-init name span — treat it as a hit
+    // on the struct-type token at the head of the literal.
+    if (decl != null) {
+        result.content = format_type_decl(decl, arena);
+        result.span    = struct_literal_head_span(sl, intern);
+    }
+    return result;
+}
+
+/// Span of just the field name within a `FieldInit`.  The init's
+/// outer span runs from the name through the value; the value's own
+/// span tells us where the name ends.  Falls back to the outer span
+/// when the value span is missing (sema bailed pre-resolution).
+function field_init_name_span(init_span: SourceSpan,
+                               value_span: SourceSpan) -> SourceSpan {
+    if (!value_span.has_location()) { return init_span; }
+    return SourceSpan::new(
+        init_span.file,
+        init_span.start_line, init_span.start_col,
+        init_span.start_line, value_span.start_col);
+}
+
+/// Span of the type-name token at the head of a struct literal.
+/// The literal's outer span starts at the type name; we trim it to
+/// just the identifier's length so the editor highlights `IoError`
+/// rather than `IoError { … }`.
+function struct_literal_head_span(sl: StructLiteralNode*,
+                                   intern: InternTable*) -> SourceSpan {
+    const name: string = if (intern != null) {
+        intern.resolve(sl.struct_type)
+    } else { "" };
+    const name_len: u32 = strlen(name) as u32;
+    return SourceSpan::new(
+        sl.span.file,
+        sl.span.start_line, sl.span.start_col,
+        sl.span.start_line, sl.span.start_col + name_len);
+}
+
+/// Lookup a field by name on a struct or class decl.  Mirrors the
+/// `methods_contains` style of the locator's reverse walks; returns
+/// `null` for kinds without an inline `fields[]` (enums, traits) and
+/// for missing names.
+function find_field_on_type_decl(decl: ASTNode*, name: SymbolStr) -> FieldDeclNode* {
+    if (decl == null) { return null; }
+    if (decl.kind == NodeKind::StructDeclaration) {
+        const sd: StructDeclNode* = decl as StructDeclNode*;
+        return field_by_name(sd.fields, name);
+    }
+    if (decl.kind == NodeKind::ClassDeclaration) {
+        const cd: ClassDeclNode* = decl as ClassDeclNode*;
+        return field_by_name(cd.fields, name);
+    }
+    return null;
+}
+
+function field_by_name(fields: FieldDeclNode*[], name: SymbolStr) -> FieldDeclNode* {
+    for (mut i: i64 = 0; i < fields.length; i++) {
+        const f: FieldDeclNode* = fields[i];
+        if (f != null && f.name.equals(name)) { return f; }
+    }
+    return null;
 }

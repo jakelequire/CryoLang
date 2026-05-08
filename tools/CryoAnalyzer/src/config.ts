@@ -25,12 +25,12 @@ export function getConfig(): CryoConfig {
  *   1. `cryo.languageServer.path` user setting.  Relative paths are
  *      resolved against the first workspace folder so settings like
  *      `./bin/cryolsp` work without expanding to an absolute path.
- *   2. Workspace-local `tools/NewCryoLSP/build/bin/cryolsp` — the
- *      output of `cryo build` inside the in-repo NewCryoLSP project.
+ *   2. Workspace-local `tools/CryoLSP/build/bin/cryolsp` — the
+ *      output of `cryo build` inside the in-repo CryoLSP project.
  *      Picks up dev builds without needing any setting changes.
  *   3. Workspace-local `bin/cryolsp` — legacy install location for
  *      older CryoLSP packages; kept so existing users don't break.
- *   4. Extension-relative paths (sibling NewCryoLSP/ tree, then the
+ *   4. Extension-relative paths (sibling CryoLSP/ tree, then the
  *      legacy `../../bin/` location).
  *
  * If a user-configured path is set but doesn't exist, the resolver
@@ -83,15 +83,15 @@ export function resolveServerPath(
     if (workspaceFolders) {
         for (const folder of workspaceFolders) {
             const root = folder.uri.fsPath;
-            pushPair(root, 'tools', 'NewCryoLSP', 'build', 'bin');
+            pushPair(root, 'tools', 'CryoLSP', 'build', 'bin');
             pushPair(root, 'bin');
         }
     }
 
     // 4. Extension-relative candidates.  When the extension lives at
-    // `<repo>/tools/CryoAnalyzer/`, NewCryoLSP is a sibling at
-    // `<repo>/tools/NewCryoLSP/`; legacy bin/ is two parents up.
-    pushPair(extensionPath, '..', 'NewCryoLSP', 'build', 'bin');
+    // `<repo>/tools/CryoAnalyzer/`, CryoLSP is a sibling at
+    // `<repo>/tools/CryoLSP/`; legacy bin/ is two parents up.
+    pushPair(extensionPath, '..', 'CryoLSP', 'build', 'bin');
     pushPair(extensionPath, '..', '..', 'bin');
 
     for (const candidate of candidates) {

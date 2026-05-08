@@ -52,6 +52,17 @@ type struct ModuleLoader {
     // Value: file path (e.g., "src/compiler/AST/node.cryo")
     ns_map: HashMap<string, string>;
 
+    /// LSP-mode editor-buffer override.  When `lsp_override_path` is
+    /// non-empty and matches the file the loader is about to read, the
+    /// loader feeds `lsp_override_content` to the lexer instead of
+    /// reading the file from disk.  This makes import discovery see
+    /// the imports the user is *currently typing* — the on-disk copy
+    /// may not have them yet, which would leave referenced stdlib
+    /// modules undiscovered and break name resolution downstream.
+    /// Both empty in non-LSP builds.
+    lsp_override_path:    string;
+    lsp_override_content: string;
+
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
                extra_roots: string[]) -> ModuleLoader {
@@ -65,7 +76,28 @@ type struct ModuleLoader {
             loading_flags: [],
             loaded_paths:  [],
             ns_map:        HashMap<string, string>::new(),
+            lsp_override_path:    "",
+            lsp_override_content: "",
         };
+    }
+
+    /// Wire the LSP editor-buffer override.  Called once, before
+    /// `discover_project`, when running under `CompileMode::Lsp`.  No-op
+    /// when `path` is empty.
+    set_lsp_override(mut &this, path: string, content: string) -> void {
+        this.lsp_override_path    = path;
+        this.lsp_override_content = content;
+    }
+
+    /// Build a `File` for `file_path`, substituting the LSP editor
+    /// buffer when the path matches the configured override.  Mirrors
+    /// the same gate the Lexing pass uses (see `pass_registry.cryo`).
+    file_for(&this, file_path: string) -> File {
+        if (strlen(this.lsp_override_path) > 0
+                && strcmp(this.lsp_override_path, file_path) == 0) {
+            return File::from_content(file_path, "cryo", this.lsp_override_content);
+        }
+        return File::new(file_path);
     }
 
 
@@ -205,10 +237,16 @@ type struct ModuleLoader {
     /// Lex a single .cryo file, extract the namespace declaration,
     /// and register it in ns_map.
     scan_file_namespace(mut &this, file_path: string) -> void {
-        if (!File::exists(file_path)) { return; }
+        // Skip the on-disk existence check when the file is the LSP
+        // override target — `file_for` will hand the lexer the editor
+        // buffer regardless of what's on disk (file may be unsaved).
+        const is_override: boolean =
+            (strlen(this.lsp_override_path) > 0
+                && strcmp(this.lsp_override_path, file_path) == 0);
+        if (!is_override && !File::exists(file_path)) { return; }
 
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
-        const file: File = File::new(file_path);
+        const file: File = this.file_for(file_path);
         const lexer: Lexer = Lexer::new(file, &scan_sink);
         const tokens: Token[] = lexer.lex();
 
@@ -293,8 +331,12 @@ type struct ModuleLoader {
             return true;
         }
 
-        // Verify file exists
-        if (!File::exists(file_path)) {
+        // Verify file exists.  Skip the check for the LSP override
+        // target — its content lives in the editor buffer, not on disk.
+        const is_override: boolean =
+            (strlen(this.lsp_override_path) > 0
+                && strcmp(this.lsp_override_path, file_path) == 0);
+        if (!is_override && !File::exists(file_path)) {
             const msg: string = format("module file not found: '%s'", file_path);
             sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
             return false;
@@ -309,7 +351,7 @@ type struct ModuleLoader {
 
         // Quick-scan the file: lex only, extract namespace and import paths
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
-        const file: File = File::new(file_path);
+        const file: File = this.file_for(file_path);
         const lexer: Lexer = Lexer::new(file, &scan_sink);
         const tokens: Token[] = lexer.lex();
 
