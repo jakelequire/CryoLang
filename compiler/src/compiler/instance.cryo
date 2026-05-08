@@ -20,6 +20,7 @@ import Compiler::Passes::PassRegistry;
 import Compiler::ModuleGraph;
 import Compiler::ModuleLoader;
 import Compiler::ProjectConfig;
+import Compiler::DepsResolver;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TestMainCodegen;
@@ -257,45 +258,12 @@ function resolve_stdlib_root(cli_override: string, project_root: string,
 }
 
 
-/// Resolve `[dependencies]` into a list of additional module-loader
-/// scan roots, expressed relative to the consumer's project_root.
-///
-/// For each dep, read its own cryoconfig, then expose:
-///   • `<dep.path>/<lib.source_dir>` if the dep declares a [lib]
-///   • `<dep.path>/<each include_path>` from the dep's [compiler]
-///
-/// This is the minimum needed to make `import Compiler::AST::Node;`
-/// in a consumer resolve, given the dep declares `namespace Compiler;`
-/// somewhere inside one of those source roots.  The dep.alias field is
-/// not yet enforced — a future check can warn if the dep's actual
-/// top-level namespace doesn't match.
-function resolve_dep_extra_roots(consumer_root: string,
-                                 deps: Dependency[]) -> string[] {
-    mut out: string[] = [];
-    for (mut i: int = 0; i < deps.length; i++) {
-        const dep: Dependency = deps[i];
-        if (strlen(dep.path) == 0) { continue; }
-
-        const dep_cryo: string = if (strlen(consumer_root) == 0
-                                     || strcmp(consumer_root, ".") == 0) {
-            format("%s/cryoconfig", dep.path)
-        } else {
-            format("%s/%s/cryoconfig", consumer_root, dep.path)
-        };
-        if (!File::exists(dep_cryo)) {
-            cdebug("[Compiler] dep '%s': no cryoconfig at %s\n",
-                dep.name, dep_cryo);
-            continue;
-        }
-        const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo);
-        if (dep_cfg.lib.is_present() && strlen(dep_cfg.lib.source_dir) > 0) {
-            out.push(format("%s/%s", dep.path, dep_cfg.lib.source_dir));
-        }
-        for (mut j: int = 0; j < dep_cfg.include_paths.length; j++) {
-            out.push(format("%s/%s", dep.path, dep_cfg.include_paths[j]));
-        }
+/// Path to the lockfile next to a given cryoconfig.
+function lock_path_for(consumer_root: string) -> string {
+    if (strlen(consumer_root) == 0 || strcmp(consumer_root, ".") == 0) {
+        return "cryoconfig.lock";
     }
-    return out;
+    return format("%s/cryoconfig.lock", consumer_root);
 }
 
 /// Build a ProjectConfig view that compiles the `[lib]` half of a
@@ -614,6 +582,12 @@ type struct CompilerInstance {
 
         // Phase 0: Parse project configuration
         mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        if (config.error_count > 0) {
+            // ProjectConfig::parse already wrote diagnostics to stderr;
+            // bail before any module discovery / codegen runs against
+            // a half-validated config.
+            return CompilationResult::failed(config.error_count as i32, 0);
+        }
         // CLI `--build-dir=PATH` overrides the cryoconfig output_dir
         // before any consumer (codegen .ll/.o paths, link bin path)
         // reads it.  Required for self-host fixed-point testing
@@ -798,11 +772,21 @@ type struct CompilerInstance {
         for (mut ip: int = 0; ip < config.include_paths.length; ip++) {
             effective_roots.push(config.include_paths[ip]);
         }
-        const dep_roots: string[] = resolve_dep_extra_roots(
-            config.project_root, config.dependencies);
-        for (mut dr: int = 0; dr < dep_roots.length; dr++) {
-            effective_roots.push(dep_roots[dr]);
-            cdebug("[Compiler] Dependency scan root: %s\n", dep_roots[dr]);
+        // Build mode: read the lockfile, materialize any missing git
+        // checkouts, harvest source roots.  Failure here means the user
+        // hasn't run `cryo fetch` yet (or the lockfile is stale relative
+        // to cryoconfig); we surface a hard error rather than dropping
+        // dep roots and reporting confusing "namespace not found"
+        // diagnostics later.
+        const lock_path: string = lock_path_for(config.project_root);
+        const dep_outcome: ResolveOutcome = DepsResolver::resolve(
+            &config, ResolveMode::Build, lock_path);
+        if (dep_outcome.failed) {
+            return CompilationResult::failed(1, 0);
+        }
+        for (mut dr: int = 0; dr < dep_outcome.roots.length; dr++) {
+            effective_roots.push(dep_outcome.roots[dr]);
+            cdebug("[Compiler] Dependency scan root: %s\n", dep_outcome.roots[dr]);
         }
 
         mut loader: ModuleLoader = ModuleLoader::new(

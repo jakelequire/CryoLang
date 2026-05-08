@@ -1,0 +1,279 @@
+///! Dependency Git Operations
+///!
+///! Thin wrappers over the system `git` binary that the dep resolver
+///! drives.  Bare clones live under `cache/git/<sanitized>` and serve
+///! as the source-of-truth; working trees are materialised under
+///! `cache/checkouts/<sanitized>/<sha>` on demand.
+///!
+///! All operations shell out via `system()` or `popen()`.  We rely on
+///! the user's git installation for protocol/auth handling; nothing
+///! here is reimplemented in-process.
+
+namespace Compiler::DepsGit;
+
+import Utils::File;
+import Utils::Logger;
+import Compiler::DepsCache;
+
+
+// ============================================================================
+// Bare clone management
+// ============================================================================
+
+/// Ensure the bare clone for `url` exists and (when `refresh` is true)
+/// has the latest remote refs.  Idempotent.  Returns true on success.
+function ensure_bare_clone(url: string, refresh: boolean) -> boolean {
+    const dir: string = DepsCache::git_dir_for(url);
+
+    if (!File::exists(dir)) {
+        // First-time clone.  `--bare` skips materialising a working
+        // tree (we make those on demand via `materialize_checkout`).
+        // `--quiet` keeps `cryo fetch` output focused on what's
+        // happening across multiple deps; users wanting verbose git
+        // output can run with `CRYO_DEBUG=1`.
+        DepsCache::ensure_dir(parent_dir(dir));
+        printf("[deps] cloning %s\n", url);
+        const cmd: string = format("git clone --bare --quiet '%s' '%s'", url, dir);
+        const status: i32 = system(cmd);
+        if (status != 0) {
+            fprintf(g_stderr, "error: git clone failed for %s\n", url);
+            return false;
+        }
+        return true;
+    }
+
+    if (refresh) {
+        printf("[deps] refreshing %s\n", url);
+        const cmd: string = format(
+            "git --git-dir='%s' fetch --quiet --tags --prune --all", dir);
+        const status: i32 = system(cmd);
+        if (status != 0) {
+            fprintf(g_stderr, "warning: git fetch failed for %s (using stale refs)\n", url);
+            // Soft-fail: an offline build with a populated cache is
+            // still useful, and an unreachable remote shouldn't kill
+            // a project that was already pinned.
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Ref resolution
+// ============================================================================
+
+/// Resolve a ref (tag, branch, or short SHA) inside the bare clone
+/// for `url` to a full 40-char commit SHA.  Returns "" on failure
+/// and prints a diagnostic.
+///
+/// Branch refs have to be qualified — `git fetch` from a bare clone
+/// doesn't track local branches, so we look at the remote-tracking
+/// `refs/heads/<branch>` ref directly.
+function resolve_ref_to_sha(url: string, ref_kind: GitRefKind, ref_val: string) -> string {
+    const dir: string = DepsCache::git_dir_for(url);
+
+    // Build the candidate refspec list.  We try them in order; the
+    // first one that resolves wins.  `git rev-parse` succeeds (exit 0)
+    // and prints the SHA; on failure it prints to stderr and exits
+    // non-zero.
+    mut candidates: string[] = [];
+    match (ref_kind) {
+        GitRefKind::Tag => {
+            candidates.push(format("refs/tags/%s", ref_val));
+            candidates.push(ref_val);  // bare name in case user wrote `tag = "0.1.0"` and the tag is also `0.1.0`
+        }
+        GitRefKind::Branch => {
+            candidates.push(format("refs/heads/%s", ref_val));
+            candidates.push(ref_val);
+        }
+        GitRefKind::Rev => {
+            candidates.push(ref_val);
+        }
+        GitRefKind::Version => {
+            // Caller resolves Version → tag separately via list_tags;
+            // by the time we land here it should have been rewritten.
+            fprintf(g_stderr,
+                "internal error: resolve_ref_to_sha called with raw Version ref\n");
+            return "";
+        }
+        GitRefKind::None => {
+            fprintf(g_stderr,
+                "internal error: resolve_ref_to_sha called with no ref\n");
+            return "";
+        }
+    }
+
+    for (mut i: int = 0; i < candidates.length; i++) {
+        const cmd: string = format(
+            "git --git-dir='%s' rev-parse --verify --quiet '%s^{commit}' 2>/dev/null",
+            dir, candidates[i]);
+        const sha: string = read_first_line(cmd);
+        if (strlen(sha) > 0) {
+            return sha;
+        }
+    }
+
+    fprintf(g_stderr,
+        "error: could not resolve '%s' inside %s\n", ref_val, url);
+    return "";
+}
+
+/// List every tag in the bare clone for `url`, one per element.
+/// Used for semver-range resolution against `version = "..."`.
+/// Returns an empty list on failure (and prints a diagnostic).
+function list_tags(url: string) -> string[] {
+    const dir: string = DepsCache::git_dir_for(url);
+    const cmd: string = format(
+        "git --git-dir='%s' tag --list 2>/dev/null", dir);
+    return read_lines(cmd);
+}
+
+
+// ============================================================================
+// Working-tree materialisation
+// ============================================================================
+
+/// Path to the working tree for (`url`, `sha`).  Does not check
+/// existence — callers use `is_checkout_present` for that.
+function checkout_path(url: string, sha: string) -> string {
+    return DepsCache::checkout_dir_for(url, sha);
+}
+
+/// True when the working tree at (`url`, `sha`) is fully materialised.
+/// We probe for `.git` rather than the directory itself because an
+/// interrupted clone may leave a half-populated dir behind.
+function is_checkout_present(url: string, sha: string) -> boolean {
+    const dir: string = DepsCache::checkout_dir_for(url, sha);
+    if (!File::exists(dir)) { return false; }
+    return File::exists(format("%s/.git", dir));
+}
+
+/// Clone the bare cache into a fresh working tree at `<checkout>/<sha>`,
+/// then `checkout` the requested SHA.  `--local` uses hardlinks where
+/// the filesystem permits, so per-SHA storage cost is dominated by the
+/// working tree itself rather than the .git history.
+function materialize_checkout(url: string, sha: string) -> boolean {
+    if (is_checkout_present(url, sha)) { return true; }
+
+    const bare:    string = DepsCache::git_dir_for(url);
+    const wt:      string = DepsCache::checkout_dir_for(url, sha);
+    const wt_par:  string = parent_dir(wt);
+
+    DepsCache::ensure_dir(wt_par);
+
+    // If a previous run left a partial tree behind (e.g., crash
+    // mid-checkout), clear it so the clone starts from a clean slate.
+    if (File::exists(wt)) {
+        DepsCache::remove_dir(wt);
+    }
+
+    const clone_cmd: string = format(
+        "git clone --local --quiet '%s' '%s'", bare, wt);
+    if (system(clone_cmd) != 0) {
+        fprintf(g_stderr, "error: failed to materialize working tree at %s\n", wt);
+        return false;
+    }
+    const co_cmd: string = format(
+        "git -C '%s' checkout --quiet --detach '%s'", wt, sha);
+    if (system(co_cmd) != 0) {
+        fprintf(g_stderr, "error: failed to checkout %s in %s\n", sha, wt);
+        return false;
+    }
+    return true;
+}
+
+
+// ============================================================================
+// Subprocess output capture
+// ============================================================================
+
+/// Run `cmd` and return its first line of stdout (with trailing
+/// newline stripped).  Returns "" if the process produced no output
+/// or exited non-zero.  Caller is responsible for adding redirection
+/// (`2>/dev/null`) when stderr noise is unwanted.
+function read_first_line(cmd: string) -> string {
+    const pipe: void* = popen(cmd, "r");
+    if (pipe == null) { return ""; }
+    mut buf: i8* = malloc(4096) as i8*;
+    const got: i8* = fgets(buf, 4096, pipe);
+    const status: i32 = pclose(pipe);
+    if (got == null) { return ""; }
+    const line: string = trim_trailing_newline(buf as string);
+    if (status != 0 && strlen(line) == 0) { return ""; }
+    return line;
+}
+
+/// Run `cmd` and return every line of stdout in source order.
+/// Trailing newlines are stripped; empty lines are skipped.
+function read_lines(cmd: string) -> string[] {
+    mut out: string[] = [];
+    const pipe: void* = popen(cmd, "r");
+    if (pipe == null) { return out; }
+
+    mut buf: i8* = malloc(4096) as i8*;
+    while (true) {
+        const got: i8* = fgets(buf, 4096, pipe);
+        if (got == null) { break; }
+        const line: string = trim_trailing_newline(buf as string);
+        if (strlen(line) > 0) {
+            out.push(copy_string(line));
+        }
+    }
+    pclose(pipe);
+    return out;
+}
+
+
+// ============================================================================
+// Internal string helpers
+// ============================================================================
+
+/// Strip a trailing '\n' (and '\r' for cross-platform safety) in place.
+/// Returns the same buffer pointer cast back to a string.
+function trim_trailing_newline(s: string) -> string {
+    const slen: i64 = strlen(s) as i64;
+    if (slen == 0) { return s; }
+    mut end: i64 = slen;
+    while (end > 0 && (s[end - 1] == 10 || s[end - 1] == 13)) {
+        end = end - 1;
+    }
+    if (end == slen) { return s; }
+    // fgets returns a writable buffer; truncate in place.
+    const ptr: i8* = s as i8*;
+    ptr[end as u64] = 0;
+    return ptr as string;
+}
+
+/// Copy a string into a fresh malloc'd buffer.  Needed when reading
+/// successive lines from popen — fgets reuses its destination buffer,
+/// so without copying the prior line gets clobbered by the next read.
+function copy_string(s: string) -> string {
+    const slen: u64 = strlen(s);
+    const buf:  i8* = malloc(slen + 1) as i8*;
+    memcpy(buf as void*, s as void*, slen);
+    buf[slen] = 0;
+    return buf as string;
+}
+
+/// Parent directory of `path` — everything before the last '/'.
+/// Returns "." when `path` has no separators.
+function parent_dir(path: string) -> string {
+    const len: i64 = strlen(path) as i64;
+    mut last: i64 = -1;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (path[i] == '/') { last = i; }
+    }
+    if (last <= 0) { return "."; }
+    return substr_local(path, 0, last);
+}
+
+/// Local copy of `substr` — same body as in `project_config.cryo` and
+/// `deps_cache.cryo`, kept here so each module is self-contained.
+function substr_local(s: string, start: i64, length: i64) -> string {
+    if (length <= 0) { return ""; }
+    const buf: i8* = malloc(length as u64 + 1);
+    memcpy(buf as void*, ptr_add(s as void*, start) as void*, length as u64);
+    const term: i8* = ptr_add(buf as void*, length) as i8*;
+    memset(term as void*, 0, 1);
+    return buf as string;
+}

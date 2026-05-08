@@ -1,0 +1,174 @@
+///! Dependency Cache
+///!
+///! Locates the global cryo cache and lays out per-dependency directories
+///! inside it.  The cache is shared across projects on a single machine
+///! so that repeated `cryo fetch` calls don't re-clone identical repos.
+///!
+///! Layout under `<cache_root>/`:
+///!
+///!   git/<sanitized-url>/                 — bare clone, refreshed by `git fetch`
+///!   checkouts/<sanitized-url>/<sha>/     — working tree at the resolved commit
+///!
+///! Cache root resolution (first match wins):
+///!   1. $CRYO_HOME/cache             (explicit override for CI / sandboxes)
+///!   2. $XDG_CACHE_HOME/cryo         (Linux/freedesktop convention)
+///!   3. $HOME/.cache/cryo            (POSIX fallback)
+///!   4. /tmp/cryo-cache              (no-HOME fallback; warned)
+
+namespace Compiler::DepsCache;
+
+import Utils::File;
+import Utils::Logger;
+
+
+// ============================================================================
+// Cache root
+// ============================================================================
+
+/// Resolve the cache root directory.  Creates intermediate dirs on
+/// first use.  Returns the absolute (or env-relative) path; never empty.
+function cache_root() -> string {
+    const cryo_home: i8* = getenv("CRYO_HOME") as i8*;
+    if (cryo_home != null) {
+        const root: string = format("%s/cache", cryo_home as string);
+        ensure_dir(root);
+        return root;
+    }
+    const xdg: i8* = getenv("XDG_CACHE_HOME") as i8*;
+    if (xdg != null) {
+        const root: string = format("%s/cryo", xdg as string);
+        ensure_dir(root);
+        return root;
+    }
+    const home: i8* = getenv("HOME") as i8*;
+    if (home != null) {
+        const root: string = format("%s/.cache/cryo", home as string);
+        ensure_dir(root);
+        return root;
+    }
+    fprintf(g_stderr,
+        "warning: $HOME unset; using /tmp/cryo-cache as the dependency cache\n");
+    ensure_dir("/tmp/cryo-cache");
+    return "/tmp/cryo-cache";
+}
+
+/// `<cache_root>/git/<sanitized>` — bare clone for a given remote URL.
+function git_dir_for(url: string) -> string {
+    return format("%s/git/%s", cache_root(), sanitize_url(url));
+}
+
+/// `<cache_root>/checkouts/<sanitized>/<sha>` — working tree at a
+/// specific resolved commit.  Multiple SHAs from the same remote can
+/// coexist (e.g., when two projects pin different versions).
+function checkout_dir_for(url: string, sha: string) -> string {
+    return format("%s/checkouts/%s/%s",
+                  cache_root(), sanitize_url(url), sha);
+}
+
+
+// ============================================================================
+// URL sanitization
+// ============================================================================
+
+/// Normalize a remote URL into a filesystem-safe directory name.
+///
+/// Examples:
+///   https://github.com/foo/bar.git     →  github.com_foo_bar
+///   git@github.com:foo/bar.git         →  github.com_foo_bar
+///   ssh://git@github.com/foo/bar       →  github.com_foo_bar
+///
+/// Collisions between distinct URLs that normalize to the same name
+/// are theoretically possible but vanishingly unlikely for real-world
+/// remotes; we accept the risk for a much friendlier cache layout
+/// than a raw hash would give.
+function sanitize_url(url: string) -> string {
+    mut s: string = url;
+
+    // Strip recognized scheme prefixes.
+    s = strip_prefix(s, "https://");
+    s = strip_prefix(s, "http://");
+    s = strip_prefix(s, "ssh://");
+    s = strip_prefix(s, "git://");
+    s = strip_prefix(s, "git@");
+
+    // Strip trailing ".git" if present.
+    const slen: i64 = strlen(s) as i64;
+    if (slen >= 4
+            && s[slen-4] == '.' && s[slen-3] == 'g'
+            && s[slen-2] == 'i' && s[slen-1] == 't') {
+        s = substr_local(s, 0, slen - 4);
+    }
+
+    // Replace path-unfriendly characters with '_'.
+    const out_len: i64 = strlen(s) as i64;
+    mut buf: i8* = malloc(out_len as u64 + 1) as i8*;
+    for (mut i: i64 = 0; i < out_len; i++) {
+        const c: i8 = s[i];
+        const safe: boolean =
+               (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || c == '.' || c == '-' || c == '_';
+        buf[i as u64] = if (safe) { c } else { '_' as i8 };
+    }
+    buf[out_len as u64] = 0;
+    return buf as string;
+}
+
+
+// ============================================================================
+// Filesystem helpers
+// ============================================================================
+
+/// `mkdir -p <path>` with shell-out semantics.  The compiler isn't
+/// in a hot loop here — the `system()` call cost (~1 ms) is fine for
+/// a once-per-fetch operation, and the shell already handles the
+/// "creates every missing parent" case for us.
+function ensure_dir(path: string) -> boolean {
+    if (File::exists(path)) { return true; }
+    // Quote the path so spaces in $HOME / $XDG_CACHE_HOME don't break
+    // the command line.  `mkdir -p` is silent when the dir already
+    // exists, so racing `cryo fetch` invocations won't fight each other.
+    const cmd: string = format("mkdir -p '%s'", path);
+    const status: i32 = system(cmd);
+    if (status != 0) {
+        fprintf(g_stderr, "error: failed to create cache directory %s\n", path);
+        return false;
+    }
+    return true;
+}
+
+/// Remove a directory tree (`rm -rf`).  Used when an interrupted
+/// checkout left a partial tree behind that needs to be redone.
+function remove_dir(path: string) -> boolean {
+    if (!File::exists(path)) { return true; }
+    const cmd: string = format("rm -rf '%s'", path);
+    return system(cmd) == 0;
+}
+
+
+// ============================================================================
+// Internal string helpers
+// ============================================================================
+
+/// Strip a leading `prefix` from `s` if present; otherwise return `s`.
+function strip_prefix(s: string, prefix: string) -> string {
+    const plen: u64 = strlen(prefix);
+    if (strlen(s) < plen) { return s; }
+    if (strncmp(s, prefix, plen) == 0) {
+        const slen: i64 = strlen(s) as i64;
+        return substr_local(s, plen as i64, slen - plen as i64);
+    }
+    return s;
+}
+
+/// Local copy of `substr` to avoid cross-module dependence on the
+/// helper in `project_config.cryo`.
+function substr_local(s: string, start: i64, length: i64) -> string {
+    if (length <= 0) { return ""; }
+    const buf: i8* = malloc(length as u64 + 1);
+    memcpy(buf as void*, ptr_add(s as void*, start) as void*, length as u64);
+    const term: i8* = ptr_add(buf as void*, length) as i8*;
+    memset(term as void*, 0, 1);
+    return buf as string;
+}

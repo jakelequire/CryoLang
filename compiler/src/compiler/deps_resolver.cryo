@@ -1,0 +1,434 @@
+///! Dependency Resolver
+///!
+///! Top-level orchestrator for `[dependencies]`.  Walks the dep
+///! tree from a consumer's cryoconfig and either:
+///!
+///!   • Build mode:  reads `cryoconfig.lock`, materializes any missing
+///!                  checkouts, and returns the source roots the
+///!                  module loader should scan.  No network, no
+///!                  lockfile writes — everything must already be
+///!                  resolved.
+///!
+///!   • Fetch mode:  resolves git deps against their remotes,
+///!                  re-using existing lockfile entries when their
+///!                  ref-spec is unchanged, materializes the
+///!                  checkouts, and writes a fresh lockfile.
+///!
+///!   • Update mode: like Fetch but ignores existing lockfile entries
+///!                  entirely — every git dep is re-resolved.
+///!
+///! Recursion: the resolver follows the `[dependencies]` of every
+///! dep it visits.  Cycles are broken by tracking visited project
+///! roots; a duplicate is a no-op rather than an error.
+
+namespace Compiler::DepsResolver;
+
+import Utils::File;
+import Utils::Logger;
+import Compiler::ProjectConfig;
+import Compiler::DepsCache;
+import Compiler::DepsGit;
+import Compiler::DepsSemver;
+import Compiler::DepsLockfile;
+
+
+// ============================================================================
+// Mode
+// ============================================================================
+
+/// What the resolver is asked to do.
+type enum ResolveMode {
+    /// Read-only against the lockfile.  Hard error if anything is
+    /// missing or stale.
+    Build;
+    /// Resolve everything; reuse existing lockfile entries when the
+    /// ref-spec is unchanged.  Writes a new lockfile.
+    Fetch;
+    /// Force re-resolution — ignore any existing lockfile entry.
+    Update;
+}
+
+
+// ============================================================================
+// Outcome
+// ============================================================================
+
+type struct ResolveOutcome {
+    /// Source roots the module loader should add to its scan list.
+    /// Always populated even when `failed` is true (so debug builds
+    /// can see partial progress); the caller MUST check `failed`
+    /// before proceeding.
+    roots:  string[];
+    /// True ⇔ at least one dep failed to resolve.
+    failed: boolean;
+    /// The lockfile produced by Fetch/Update.  In Build mode this is
+    /// just the file we read in (returned for caller convenience).
+    lock:   Lockfile;
+
+    static empty() -> ResolveOutcome {
+        return ResolveOutcome {
+            roots:  [],
+            failed: false,
+            lock:   Lockfile::empty(),
+        };
+    }
+}
+
+
+// ============================================================================
+// Visited tracker (cycle detection)
+// ============================================================================
+
+/// Identity keys we hand to the visited set.  Two deps with the
+/// same key produce the same source roots, so we resolve each
+/// only once even when the dep graph has diamonds.
+type struct DepKey {
+    /// "path:<abs>" or "git:<sanitized-url>@<sha>".
+    val: string;
+
+    static for_path(abs_path: string) -> DepKey {
+        return DepKey { val: format("path:%s", abs_path) };
+    }
+    static for_git(url: string, sha: string) -> DepKey {
+        return DepKey { val: format("git:%s@%s", DepsCache::sanitize_url(url), sha) };
+    }
+}
+
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Resolve every `[dependencies]` entry reachable from `top_config`.
+///
+/// `lock_path` is the path to `cryoconfig.lock` next to the consumer's
+/// cryoconfig.  In Build mode we read it; in Fetch/Update we (re)write
+/// it.
+function resolve(top_config: ProjectConfig*,
+                 mode: ResolveMode,
+                 lock_path: string) -> ResolveOutcome {
+    mut outcome: ResolveOutcome = ResolveOutcome::empty();
+    mut visited: string[] = [];
+
+    // Existing lockfile drives Build mode and seeds Fetch mode's
+    // "reuse the entry if spec unchanged" optimization.  Update
+    // ignores it entirely.
+    mut existing: Lockfile = match (mode) {
+        ResolveMode::Update => { Lockfile::empty() }
+        _ => { DepsLockfile::read(lock_path) }
+    };
+    mut new_lock: Lockfile = Lockfile::empty();
+
+    walk_deps(top_config, mode, &existing, &new_lock, &visited, &outcome);
+
+    // Write the lockfile only on the success path of Fetch/Update.
+    // A failed Fetch leaves the on-disk lock untouched so the user's
+    // last good state is preserved.
+    const should_write: boolean = !outcome.failed
+        && (mode == ResolveMode::Fetch || mode == ResolveMode::Update);
+    if (should_write) {
+        DepsLockfile::write(lock_path, &new_lock);
+    }
+
+    outcome.lock = match (mode) {
+        ResolveMode::Build => { existing }
+        _                  => { new_lock }
+    };
+    return outcome;
+}
+
+
+// ============================================================================
+// Walk
+// ============================================================================
+
+/// Recursive walk: for each dep in `cfg.dependencies`, resolve it and
+/// then descend into the dep's own `[dependencies]`.
+///
+/// Cycle detection keys deps by `(kind, identifier)` — see `DepKey`.
+function walk_deps(cfg: ProjectConfig*,
+                   mode: ResolveMode,
+                   existing: Lockfile*,
+                   new_lock: Lockfile*,
+                   visited: string[]*,
+                   outcome: ResolveOutcome*) -> void {
+    for (mut i: int = 0; i < cfg.dependencies.length; i++) {
+        const dep: Dependency = cfg.dependencies[i];
+
+        match (dep.kind) {
+            DepKind::Invalid => {
+                // Parser already emitted a diagnostic.  Mark failure
+                // and skip — there's no recoverable path for an
+                // invalid dep schema.
+                outcome.failed = true;
+            }
+            DepKind::Path => {
+                resolve_path_dep(cfg, dep, mode, existing, new_lock, visited, outcome);
+            }
+            DepKind::Git => {
+                resolve_git_dep(cfg, dep, mode, existing, new_lock, visited, outcome);
+            }
+        }
+    }
+}
+
+/// Path dep: resolved by joining the consumer's project root with
+/// the relative path.  We then read the dep's own cryoconfig and
+/// recurse, harvesting its source roots into `outcome.roots`.
+function resolve_path_dep(cfg: ProjectConfig*,
+                          dep: Dependency,
+                          mode: ResolveMode,
+                          existing: Lockfile*,
+                          new_lock: Lockfile*,
+                          visited: string[]*,
+                          outcome: ResolveOutcome*) -> void {
+    const dep_root: string = join_path(cfg.project_root, dep.path);
+    if (!File::exists(format("%s/cryoconfig", dep_root))) {
+        cdebug("[deps] path dep '%s': no cryoconfig at %s\n", dep.name, dep_root);
+        return;
+    }
+
+    const key: DepKey = DepKey::for_path(dep_root);
+    if (already_visited(visited, key.val)) { return; }
+    push_visited(visited, key.val);
+
+    const dep_cfg: ProjectConfig = ProjectConfig::parse(
+        format("%s/cryoconfig", dep_root));
+    if (dep_cfg.error_count > 0) {
+        fprintf(g_stderr,
+            "error: dependency '%s' has invalid cryoconfig at %s\n",
+            dep.name, dep_root);
+        outcome.failed = true;
+        return;
+    }
+    harvest_roots(&dep_cfg, dep_root, dep.path, outcome);
+    walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
+}
+
+/// Git dep: the source-of-truth for what's on disk is the lockfile.
+/// In Build mode we trust the lockfile completely; in Fetch/Update we
+/// (re)resolve the ref to a SHA, materialize the checkout, and write
+/// a fresh lockfile entry.
+function resolve_git_dep(cfg: ProjectConfig*,
+                         dep: Dependency,
+                         mode: ResolveMode,
+                         existing: Lockfile*,
+                         new_lock: Lockfile*,
+                         visited: string[]*,
+                         outcome: ResolveOutcome*) -> void {
+    mut sha: string = "";
+
+    match (mode) {
+        ResolveMode::Build => {
+            const locked: LockedDep* = existing.find(dep.name);
+            if (locked == null) {
+                fprintf(g_stderr,
+                    "error: dependency '%s' is not pinned; run `cryo fetch`\n",
+                    dep.name);
+                outcome.failed = true;
+                return;
+            }
+            if (!locked_matches_dep(locked, dep)) {
+                fprintf(g_stderr,
+                    "error: lockfile entry for '%s' is stale (cryoconfig changed); run `cryo fetch`\n",
+                    dep.name);
+                outcome.failed = true;
+                return;
+            }
+            sha = locked.sha;
+            if (!DepsGit::is_checkout_present(dep.git_url, sha)) {
+                if (!DepsGit::materialize_checkout(dep.git_url, sha)) {
+                    outcome.failed = true;
+                    return;
+                }
+            }
+        }
+        _ => {
+            // Fetch/Update: reuse the locked SHA if (Fetch only) the
+            // dep's spec is unchanged; otherwise re-resolve.
+            mut reused: boolean = false;
+            if (mode == ResolveMode::Fetch) {
+                const locked: LockedDep* = existing.find(dep.name);
+                if (locked != null && locked_matches_dep(locked, dep)) {
+                    sha    = locked.sha;
+                    reused = true;
+                }
+            }
+            if (!reused) {
+                if (!DepsGit::ensure_bare_clone(dep.git_url, true)) {
+                    outcome.failed = true;
+                    return;
+                }
+                sha = resolve_to_sha(dep);
+                if (strlen(sha) == 0) {
+                    outcome.failed = true;
+                    return;
+                }
+            }
+            if (!DepsGit::materialize_checkout(dep.git_url, sha)) {
+                outcome.failed = true;
+                return;
+            }
+            // Append to the new lockfile.
+            mut entry: LockedDep = LockedDep::empty();
+            entry.name     = dep.name;
+            entry.url      = dep.git_url;
+            entry.ref_kind = ref_kind_label(dep.ref_kind);
+            entry.ref_val  = dep.ref_val;
+            entry.sha      = sha;
+            new_lock.packages.push(entry);
+        }
+    }
+
+    // Cycle detection — scoped to this URL@SHA pair.
+    const key: DepKey = DepKey::for_git(dep.git_url, sha);
+    if (already_visited(visited, key.val)) { return; }
+    push_visited(visited, key.val);
+
+    const co_dir: string = DepsGit::checkout_path(dep.git_url, sha);
+    const dep_root: string = if (strlen(dep.subdir) > 0) {
+        format("%s/%s", co_dir, dep.subdir)
+    } else {
+        co_dir
+    };
+
+    const dep_cryo: string = format("%s/cryoconfig", dep_root);
+    if (!File::exists(dep_cryo)) {
+        fprintf(g_stderr,
+            "error: dependency '%s' has no cryoconfig at %s\n",
+            dep.name, dep_root);
+        outcome.failed = true;
+        return;
+    }
+    const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo);
+    if (dep_cfg.error_count > 0) {
+        fprintf(g_stderr,
+            "error: dependency '%s' has invalid cryoconfig at %s\n",
+            dep.name, dep_root);
+        outcome.failed = true;
+        return;
+    }
+    // Harvest using the absolute checkout path so source roots are
+    // self-contained; the consumer's project_root is irrelevant for
+    // git deps.
+    harvest_roots_abs(&dep_cfg, dep_root, outcome);
+    walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Resolve a git dep's ref-spec to a 40-char SHA.  Handles each
+/// `GitRefKind` flavour; returns "" on failure (and prints).
+function resolve_to_sha(dep: Dependency) -> string {
+    match (dep.ref_kind) {
+        GitRefKind::Version => {
+            const c: Constraint = DepsSemver::parse_constraint(dep.ref_val);
+            if (!c.valid) {
+                fprintf(g_stderr,
+                    "error: dependency '%s' has invalid version constraint '%s'\n",
+                    dep.name, dep.ref_val);
+                return "";
+            }
+            const tags: string[] = DepsGit::list_tags(dep.git_url);
+            const best: string = DepsSemver::select_best_tag(c, tags);
+            if (strlen(best) == 0) {
+                fprintf(g_stderr,
+                    "error: no tag in %s satisfies version '%s'\n",
+                    dep.git_url, dep.ref_val);
+                return "";
+            }
+            return DepsGit::resolve_ref_to_sha(
+                dep.git_url, GitRefKind::Tag, best);
+        }
+        GitRefKind::Tag => {
+            return DepsGit::resolve_ref_to_sha(
+                dep.git_url, GitRefKind::Tag, dep.ref_val);
+        }
+        GitRefKind::Branch => {
+            return DepsGit::resolve_ref_to_sha(
+                dep.git_url, GitRefKind::Branch, dep.ref_val);
+        }
+        GitRefKind::Rev => {
+            return DepsGit::resolve_ref_to_sha(
+                dep.git_url, GitRefKind::Rev, dep.ref_val);
+        }
+        GitRefKind::None => {
+            // parse_inline_table_into_dep would have flagged this.
+            return "";
+        }
+    }
+}
+
+/// Does the locked entry's recorded ref-spec still match the cryoconfig?
+/// Comparing on (url, ref_kind, ref_val) catches the "user changed
+/// `version = ...`" case and forces a re-resolve.
+function locked_matches_dep(locked: LockedDep*, dep: Dependency) -> boolean {
+    if (strcmp(locked.url, dep.git_url) != 0) { return false; }
+    if (strcmp(locked.ref_kind, ref_kind_label(dep.ref_kind)) != 0) { return false; }
+    if (strcmp(locked.ref_val, dep.ref_val) != 0) { return false; }
+    return true;
+}
+
+/// String label for a `GitRefKind` — used in lockfile round-tripping.
+/// Free function (rather than a method on the enum) to side-step the
+/// "unsized enum return in impl block" codegen wart.
+function ref_kind_label(k: GitRefKind) -> string {
+    return match (k) {
+        GitRefKind::Version => { "version" }
+        GitRefKind::Tag     => { "tag" }
+        GitRefKind::Branch  => { "branch" }
+        GitRefKind::Rev     => { "rev" }
+        GitRefKind::None    => { "" }
+    };
+}
+
+/// Harvest a dep's published source roots into `outcome.roots`.
+/// `dep_root` is the dep's project root on disk; `path_for_loader`
+/// is the form the loader expects (relative for path deps so the
+/// loader prefixes consumer_root, absolute for git deps).
+function harvest_roots(dep_cfg: ProjectConfig*,
+                       dep_root: string,
+                       path_for_loader: string,
+                       outcome: ResolveOutcome*) -> void {
+    if (dep_cfg.lib.is_present() && strlen(dep_cfg.lib.source_dir) > 0) {
+        outcome.roots.push(format("%s/%s", path_for_loader, dep_cfg.lib.source_dir));
+    }
+    for (mut j: int = 0; j < dep_cfg.include_paths.length; j++) {
+        outcome.roots.push(format("%s/%s", path_for_loader, dep_cfg.include_paths[j]));
+    }
+}
+
+/// Same as `harvest_roots` but always uses absolute paths — git deps
+/// live outside the consumer's project tree.
+function harvest_roots_abs(dep_cfg: ProjectConfig*,
+                           dep_root: string,
+                           outcome: ResolveOutcome*) -> void {
+    if (dep_cfg.lib.is_present() && strlen(dep_cfg.lib.source_dir) > 0) {
+        outcome.roots.push(format("%s/%s", dep_root, dep_cfg.lib.source_dir));
+    }
+    for (mut j: int = 0; j < dep_cfg.include_paths.length; j++) {
+        outcome.roots.push(format("%s/%s", dep_root, dep_cfg.include_paths[j]));
+    }
+}
+
+/// `<base>/<rel>` with a defensive shortcut when `base` is "." or empty.
+function join_path(base: string, rel: string) -> string {
+    if (strlen(base) == 0 || strcmp(base, ".") == 0) {
+        return rel;
+    }
+    return format("%s/%s", base, rel);
+}
+
+function already_visited(visited: string[]*, key: string) -> boolean {
+    for (mut i: int = 0; i < visited.length; i++) {
+        if (strcmp(visited[i], key) == 0) { return true; }
+    }
+    return false;
+}
+
+function push_visited(visited: string[]*, key: string) -> void {
+    visited.push(key);
+}
