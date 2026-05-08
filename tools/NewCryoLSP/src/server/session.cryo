@@ -1,9 +1,372 @@
-///! Per-document compiler session — Phase B.
+///! Per-document compiler session.
 ///!
-///! Each open document keeps its own `CompilationContext` alive across
-///! requests so hover/definition handlers can walk the AST + types
-///! without re-parsing.  Filled in once Phase A is verified.
+///! Wraps a long-lived `CompilationContext` so hover / definition /
+///! completion handlers can walk the AST + resolver + type arena
+///! between recompiles.  Each `recompile()` builds a *fresh* context
+///! (the previous one is leaked — see `Drop` impl); the cost of
+///! re-parsing the project per keystroke beats fighting per-pass
+///! reset semantics across the multi-module orchestrator.
+///!
+///! Two compile paths:
+///!
+///!   • Multi-module — when `cryoconfig` is found by walking up from
+///!     the edited file, the WHOLE project is compiled with one
+///!     module's source overridden by the editor buffer.  This is
+///!     what gives the LSP cross-file type info, real diagnostics,
+///!     and the populated type arena that hover/completion need.
+///!
+///!   • Single-file fallback — when no cryoconfig is found, fall
+///!     back to compiling just the editor buffer.  Cross-file types
+///!     resolve to invalid TypeRefs and the post-NameResolution
+///!     pipeline can't run; only lex / parse / name diagnostics are
+///!     emitted.
+///!
+///! The session also owns the NUL-terminated buffer strings backing
+///! the context's `TokenStream::source_file` / `source_content` and
+///! the cryoconfig path.  Those are raw `string` (i.e. C `char*`)
+///! pointers; the buffers must outlive the context.
 
 namespace Lsp::Server::Session;
 
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::core::intrinsics;
 import std::collections::str;
+import std::collections::string;
+import std::collections::hashmap;
+
+import Compiler::CompileMode;
+import Compiler::CompilationContext;
+import Compiler::Instance;
+
+
+type struct CompilerSession {
+    instance:    CompilerInstance;
+    /// Heap-allocated CompilationContext — null until the first
+    /// `recompile()`.  Replaced (and the old one leaked) on every
+    /// subsequent recompile.
+    ctx:         CompilationContext*;
+    /// NUL-terminated copy of the absolute file path, keep-alive for
+    /// `ctx` and used as the LSP override path when a project is
+    /// detected.
+    path_buf:    String;
+    /// NUL-terminated copy of the editor buffer, keep-alive for `ctx`.
+    content_buf: String;
+    /// NUL-terminated copy of the discovered cryoconfig path (or
+    /// empty when no project context was found).
+    config_buf:  String;
+    /// NUL-terminated copy of the discovered stdlib root.  Held alive
+    /// for the session because `instance.config.stdlib_path_override`
+    /// is a `string` (raw `char*`) pointer into this buffer.
+    stdlib_buf:  String;
+
+    static new() -> CompilerSession {
+        return CompilerSession {
+            instance:    CompilerInstance::new(CompilerConfig::default()),
+            ctx:         null,
+            path_buf:    String::new(),
+            content_buf: String::new(),
+            config_buf:  String::new(),
+            stdlib_buf:  String::new(),
+        };
+    }
+
+    /// Borrow the current `CompilationContext`.  Returns `null` if no
+    /// `recompile()` has run yet — handlers should bail in that case
+    /// since there's no AST / resolver / type arena to walk.
+    context(&this) -> CompilationContext* {
+        return this.ctx;
+    }
+
+    /// Re-run the full LSP pipeline on the given source.  Allocates
+    /// a fresh CompilationContext, finds the project's cryoconfig,
+    /// and either drives the whole-project compile (preferred) or
+    /// falls back to single-file mode if no cryoconfig is reachable.
+    recompile(mut &this, uri: Str, content: Str) -> CompilationResult {
+        // Editor-side `uri` is `file://<absolute-path>`; strip the
+        // scheme to get a filesystem path the loader will recognise.
+        const fs_path: Str = uri_to_fs_path(uri);
+
+        // Replace backing buffers.  The previous `ctx` (if any) holds
+        // raw `string` pointers into the OLD buffers, but we leak the
+        // ctx anyway (see `Drop` impl) so the buffer aliasing is a
+        // non-issue.
+        this.path_buf.drop();
+        this.content_buf.drop();
+        this.config_buf.drop();
+        this.stdlib_buf.drop();
+        this.path_buf    = build_cstring_buffer(fs_path);
+        this.content_buf = build_cstring_buffer(content);
+        this.config_buf  = discover_project_cryoconfig(fs_path);
+        this.stdlib_buf  = discover_stdlib_root(fs_path);
+
+        // Wire the discovered stdlib path through to the compiler's
+        // `--stdlib=` equivalent.  If `stdlib_buf` is empty the
+        // compiler falls back to its own search (binary-relative,
+        // env var, etc.) — same chain as `cryo build` with no flag.
+        const stdlib_cstr: string = if (this.stdlib_buf.length() > 0) {
+            this.stdlib_buf.as_ptr() as string
+        } else {
+            ""
+        };
+        this.instance.config.stdlib_path_override = stdlib_cstr;
+
+        const path_cstr:    string = this.path_buf.as_ptr() as string;
+        const content_cstr: string = this.content_buf.as_ptr() as string;
+
+        // Allocate a fresh CompilationContext on the heap with mode=Lsp.
+        const ctx_box: Box<CompilationContext> =
+            Box<CompilationContext>::new(
+                CompilationContext::new(CompileMode::Lsp, path_cstr));
+        this.ctx = ctx_box.leak();
+
+        if (this.config_buf.length() == 0) {
+            // No project context — fall back to single-file mode.  The
+            // user gets lex / parse / AST-validation / name-resolution
+            // diagnostics; later passes can't run because cross-file
+            // types are invalid.
+            return this.instance.compile_for_lsp_content_into(
+                this.ctx, path_cstr, content_cstr);
+        }
+
+        const config_cstr: string = this.config_buf.as_ptr() as string;
+        return this.instance.compile_for_lsp_project_into(
+            this.ctx, config_cstr, path_cstr, content_cstr);
+    }
+}
+
+
+// ============================================================================
+// SessionMap — per-URI sessions
+// ============================================================================
+
+/// Map URI → CompilerSession.  Same lookup-by-borrow pattern as
+/// `Docs`: `get` returns a `CompilerSession*` so handlers can mutate
+/// the contained session (recompile) without copying it out.
+type struct SessionMap {
+    by_uri: HashMap<String, CompilerSession>;
+
+    static new() -> SessionMap {
+        return SessionMap {
+            by_uri: HashMap<String, CompilerSession>::new(),
+        };
+    }
+
+    /// Insert a fresh session for `uri`.  If one already exists it is
+    /// dropped.  Use `get_or_create` for the common case where you
+    /// want to recompile an already-open document.
+    insert(mut &this, uri: Str, session: CompilerSession) -> void {
+        const key: String = String::from_str(uri);
+        match (this.by_uri.insert(key, session)) {
+            Option::Some(prev) => { mut p: CompilerSession = prev; p.drop(); }
+            Option::None       => { }
+        }
+    }
+
+    get(&this, uri: Str) -> Option<CompilerSession*> {
+        const key: String = String::from_str(uri);
+        const result: Option<CompilerSession*> = this.by_uri.get_ptr(&key);
+        mut owned: String = key;
+        owned.drop();
+        return result;
+    }
+
+    /// Return a borrow of the session at `uri`, creating one if
+    /// absent.  The created session has `ctx == null`; the caller is
+    /// expected to call `recompile()` next.
+    get_or_create(mut &this, uri: Str) -> CompilerSession* {
+        match (this.get(uri)) {
+            Option::Some(p) => { return p; }
+            Option::None    => { }
+        }
+        this.insert(uri, CompilerSession::new());
+        match (this.get(uri)) {
+            Option::Some(p) => { return p; }
+            Option::None    => { return null; }      // unreachable
+        }
+    }
+
+    remove(mut &this, uri: Str) -> boolean {
+        const key: String = String::from_str(uri);
+        match (this.by_uri.remove(&key)) {
+            Option::Some(session) => {
+                mut s: CompilerSession = session;
+                s.drop();
+                mut k: String = key;
+                k.drop();
+                return true;
+            }
+            Option::None => {
+                mut k: String = key;
+                k.drop();
+                return false;
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+const FILE_SCHEME:     string = "file://";
+const FILE_SCHEME_LEN: u64    = 7;
+
+/// Convert a `file://` URI to an absolute filesystem path.  Other
+/// schemes pass through unchanged — the compiler will fail to find
+/// them, which surfaces as a lex-pass file-not-found diagnostic.
+function uri_to_fs_path(uri: Str) -> Str {
+    if (uri.length() >= FILE_SCHEME_LEN) {
+        const prefix: Str = uri.sub_bytes(0, FILE_SCHEME_LEN);
+        if (prefix.equals(&Str::from_cstr(FILE_SCHEME))) {
+            return uri.sub_bytes(FILE_SCHEME_LEN, uri.length());
+        }
+    }
+    return uri;
+}
+
+/// Walk parents of `fs_path` looking for a directory that contains
+/// `stdlib/lib.cryo`; return that `stdlib` directory's absolute
+/// path as a NUL-terminated `String` (empty when nothing is found).
+///
+/// Mirrors the compiler's `resolve_stdlib_root` search but rooted at
+/// the file being edited rather than at the binary or `cwd` — the
+/// LSP binary often lives many directories away from the active
+/// project (`.../tools/NewCryoLSP/build/bin/cryolsp`), so the
+/// binary-relative search the CLI driver uses doesn't reach the
+/// in-repo stdlib.  Walking up from the source file does.
+function discover_stdlib_root(fs_path: Str) -> String {
+    mut dir: String = parent_dir(fs_path);
+    loop {
+        if (dir.length() == 0) { dir.drop(); return String::new(); }
+
+        mut probe: String = String::with_capacity(dir.length() + 16);
+        probe.push_str(dir.as_str());
+        probe.push_cstr("/stdlib/lib.cryo");
+        probe.push_byte(0 as u8);
+        const probe_len: u64 = probe.length() - 1;
+        probe.truncate(probe_len);
+        const p_cstr: string = probe.as_ptr() as string;
+
+        if (intrinsics::access(p_cstr, 0 as i32) == 0 as i32) {
+            // Found <dir>/stdlib/lib.cryo — return <dir>/stdlib.
+            mut out: String = String::with_capacity(dir.length() + 8);
+            out.push_str(dir.as_str());
+            out.push_cstr("/stdlib");
+            out.push_byte(0 as u8);
+            const out_len: u64 = out.length() - 1;
+            out.truncate(out_len);
+            probe.drop();
+            dir.drop();
+            return out;
+        }
+        probe.drop();
+
+        const next: String = parent_dir(dir.as_str());
+        dir.drop();
+        dir = next;
+    }
+    return String::new();
+}
+
+/// Walk parents of `fs_path` until a `cryoconfig` is found; return
+/// its absolute path as a NUL-terminated `String` (empty `String`
+/// when nothing is found by the time we hit `/`).
+///
+/// "Closest" wins: editing
+///   /home/.../CryoLang/compiler/src/compiler/diag/sink.cryo
+/// finds
+///   /home/.../CryoLang/compiler/cryoconfig
+/// even though /home/.../CryoLang has no cryoconfig at the root.
+function discover_project_cryoconfig(fs_path: Str) -> String {
+    // Start from the file's directory.
+    mut dir: String = parent_dir(fs_path);
+    loop {
+        if (dir.length() == 0) { dir.drop(); return String::new(); }
+
+        mut candidate: String = String::with_capacity(dir.length() + 12);
+        candidate.push_str(dir.as_str());
+        candidate.push_cstr("/cryoconfig");
+        candidate.push_byte(0 as u8);
+        const cand_len: u64 = candidate.length() - 1;
+        candidate.truncate(cand_len);
+        const c_cstr: string = candidate.as_ptr() as string;
+
+        // F_OK == 0; access returns 0 when the path is reachable.
+        if (intrinsics::access(c_cstr, 0 as i32) == 0 as i32) {
+            dir.drop();
+            return candidate;
+        }
+        candidate.drop();
+
+        // Step up to the parent.  parent_dir of "/" is "" — that's
+        // the loop's exit condition.
+        const next: String = parent_dir(dir.as_str());
+        dir.drop();
+        dir = next;
+    }
+    return String::new();
+}
+
+/// Return the parent directory of `path` as an owned `String`.
+/// Trailing slashes are stripped, then everything from the last `/`
+/// onwards is dropped.  `parent_dir("/foo/bar")` → `"/foo"`,
+/// `parent_dir("/foo")` → `""` (we treat `"/"`'s parent as empty so
+/// the discover_project_cryoconfig loop terminates).
+function parent_dir(path: Str) -> String {
+    const len: u64 = path.length();
+    if (len == 0) { return String::new(); }
+    const ptr: u8* = path.as_ptr();
+
+    // Find the last '/' that isn't a trailing one.
+    mut end: u64 = len;
+    while (end > 0 && ptr[end - 1] == 47) { end = end - 1; }   // strip trailing /
+    mut last_slash: i64 = -1;
+    mut i: u64 = 0;
+    while (i < end) {
+        if (ptr[i] == 47) { last_slash = i as i64; }
+        i = i + 1;
+    }
+    if (last_slash < 0) { return String::new(); }
+    if (last_slash == 0) { return String::new(); }              // path is "/foo"
+    return String::from_str(path.sub_bytes(0, last_slash as u64));
+}
+
+/// Build a `String` whose underlying buffer is NUL-terminated, suitable
+/// for `String.as_ptr() as string`.  The reported `length()` excludes
+/// the trailing NUL, but the byte sits in the buffer immediately past
+/// the last logical byte.
+function build_cstring_buffer(s: Str) -> String {
+    mut out: String = String::with_capacity(s.length() + 1);
+    out.push_str(s);
+    out.push_byte(0 as u8);
+    out.truncate(s.length());                       // hide the NUL from length()
+    return out;
+}
+
+
+// ============================================================================
+// Drop trait impls — see Lsp::Server::Docs for the rationale.
+// ============================================================================
+
+implement trait Drop for CompilerSession {
+    drop(mut &this) -> void {
+        // The current `ctx` is leaked.  Reclaiming would mean walking
+        // CompilationContext's internal Box::leak'd sub-components and
+        // freeing each — none of which expose `drop` today.  Acceptable
+        // for v1 (LSP processes are short-lived); revisit when memory
+        // growth in long-running sessions becomes a concern.
+        this.path_buf.drop();
+        this.content_buf.drop();
+        this.config_buf.drop();
+        this.stdlib_buf.drop();
+    }
+}
+
+implement trait Drop for SessionMap {
+    drop(mut &this) -> void {
+        this.by_uri.drop();
+    }
+}

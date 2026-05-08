@@ -67,6 +67,16 @@ type struct CompilerConfig {
     /// cryoconfig value so a single project config can be cross-compiled
     /// to multiple targets without editing the file.
     target_triple_override: string;
+    /// Single-file `-o PATH` / `--output PATH` override.  Empty string
+    /// ("") keeps the legacy `build/obj/<module>.o` layout.  Output
+    /// kind is inferred from the path extension into `output_kind`
+    /// so codegen can branch without re-parsing.
+    output_path_override: string;
+    /// Output kind for single-file `-o PATH`.  `OutputKind::None`
+    /// keeps the legacy emission path; the other variants pick the
+    /// emit-to-file mode in codegen (Asm/Object) or trigger the
+    /// IR-text dump / `cc` link flow (IRText/Exe).
+    output_kind:         OutputKind;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -78,6 +88,8 @@ type struct CompilerConfig {
             stdlib_path_override: "",
             test_mode:           false,
             target_triple_override: "",
+            output_path_override: "",
+            output_kind:         OutputKind::None,
         };
     }
 
@@ -91,6 +103,8 @@ type struct CompilerConfig {
             stdlib_path_override: "",
             test_mode:           false,
             target_triple_override: "",
+            output_path_override: "",
+            output_kind:         OutputKind::None,
         };
     }
 }
@@ -179,7 +193,7 @@ function resolve_stdlib_root(cli_override: string, project_root: string,
     }
 
     // 1. Explicit env var.
-    const env_raw: i8* = getenv("CRYO_STDLIB");
+    const env_raw: i8* = getenv("CRYO_STDLIB") as i8*;
     if (env_raw != null) {
         const env_path: string = env_raw as string;
         if (File::exists(env_path + "/lib.cryo")) {
@@ -365,9 +379,21 @@ type struct CompilerInstance {
         // missing LLVM declarations for cross-module trait impls) are
         // collected but never rendered, so the user sees a green build
         // followed by `undefined reference` link-time failures.
-        if (ctx.diagnostics.has_errors()
-                || ctx.diagnostics.has_warnings()
-                || this.config.debug) {
+        //
+        // LSP mode: skip the terminal-rendered output entirely.  The
+        // language server consumes `ctx.diagnostics.diagnostics`
+        // directly and emits them as JSON over stdout; an extra render
+        // to stderr would (a) try to read source from disk via the
+        // diag span's `file:` URI path and (b) print colour codes that
+        // confuse the editor's log capture.
+        const skip_flush: boolean = match (ctx.mode) {
+            CompileMode::Lsp => { true }
+            _                => { false }
+        };
+        if (!skip_flush
+                && (ctx.diagnostics.has_errors()
+                    || ctx.diagnostics.has_warnings()
+                    || this.config.debug)) {
             ctx.diagnostics.flush();
             if (ctx.diag_renderer != null) {
                 ctx.diag_renderer.print_summary(
@@ -411,6 +437,16 @@ type struct CompilerInstance {
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
         ctx.debug_mode = this.config.debug;
         ctx.target_triple = this.config.target_triple_override;
+        ctx.output_path_override = this.config.output_path_override;
+        ctx.output_kind          = this.config.output_kind;
+        // Resolve stdlib root so the Linking pass can find libcryo.a
+        // when single-file Exe (`-o foo`) shells out to `cc`.  Failure
+        // to resolve isn't fatal here — non-Exe single-file output
+        // (object/asm/IR text) doesn't link at all, and Exe will only
+        // fail at link time if the program actually references stdlib
+        // symbols.
+        mut tried: string[] = [];
+        ctx.stdlib_root = resolve_stdlib_root(this.config.stdlib_path_override, "", &tried);
         mut pipeline: PassRegistry = PassRegistry::build_standard_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
@@ -429,6 +465,8 @@ type struct CompilerInstance {
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::Raw, source);
         ctx.debug_mode = this.config.debug;
         ctx.target_triple = this.config.target_triple_override;
+        ctx.output_path_override = this.config.output_path_override;
+        ctx.output_kind          = this.config.output_kind;
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
@@ -453,14 +491,82 @@ type struct CompilerInstance {
     }
 
     /// Compile for LSP into a caller-owned context.
-    /// Lets the language server keep the CompilationContext alive after
-    /// the pipeline returns so hover/definition/completion handlers can
-    /// walk the AST, resolver, and type arena.
+    /// Single-file mode: parses + type-checks just the one file the
+    /// editor is showing, with no project context.  Cross-file
+    /// references resolve to invalid TypeRefs, which makes the
+    /// mangler `panic` — so this path skips post-NameResolution
+    /// passes.  Used as a fallback when we can't find a cryoconfig.
+    /// For real diagnostics, route through `compile_for_lsp_project_into`.
     compile_for_lsp_content_into(&this, ctx: CompilationContext*,
                                  virtual_path: string, content: string) -> CompilationResult {
+        // Same risk as the multi-target build path: TypeArena.next_id
+        // resets every compile, so without clearing the (TypeRef.id →
+        // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
+        // would alias a stale entry from a prior keystroke's compile.
+        Compiler::Codegen::TypeMap::reset_shared_type_cache();
         ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(ctx, &pipeline, "");
+    }
+
+    /// Compile a whole project for the LSP, with one module's source
+    /// overridden by the editor buffer.  Discovers every `.cryo` in
+    /// the project (per the cryoconfig at `config_path`), parses and
+    /// type-checks the lot, but reads `override_path`'s content from
+    /// `override_content` instead of the file on disk.
+    ///
+    /// The resulting `CompilationContext` has the same populated AST,
+    /// resolver, type arena, and decl index that a real build would
+    /// — the LSP uses this for diagnostics, hover, go-to-def, and
+    /// completion.  Codegen is gated off via `CompileMode::Lsp` so
+    /// no LLVM IR is emitted; everything stops cleanly at TypeLowering.
+    compile_for_lsp_project_into(&this, ctx: CompilationContext*,
+                                 config_path: string,
+                                 override_path: string,
+                                 override_content: string) -> CompilationResult {
+        ctx.lsp_override_path    = override_path;
+        ctx.lsp_override_content = override_content;
+        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        if (this.config.output_dir_override != ""
+                && strlen(this.config.output_dir_override) > 0) {
+            config.output_dir = this.config.output_dir_override;
+        }
+        if (this.config.target_triple_override != ""
+                && strlen(this.config.target_triple_override) > 0) {
+            config.target_triple = this.config.target_triple_override;
+        }
+        // Multi-target projects ([lib] + [[bin]]) need a single view
+        // picked: the orchestrator only handles one target at a time
+        // and `compile_project_multi` builds them in sequence.  The
+        // LSP picks the view whose discovery graph actually reaches
+        // the file the user is editing — picking the lib unconditionally
+        // would miss bin entry points (e.g. `src/main.cryo`) that no
+        // module under the lib's `_module.cryo` imports.
+        //
+        // Heuristic:
+        //   1. If override matches a `[[bin]]` entry_point, use that bin view.
+        //   2. Else if a `[lib]` is present, use the lib view.
+        //   3. Else use the first `[[bin]]`.
+        // Single-target configs fall through unchanged.
+        if (config.is_multi_target()) {
+            mut chosen: int = -1;
+            for (mut bi: int = 0; bi < config.bins.length; bi++) {
+                const bin_full: string = format("%s/%s",
+                    config.project_root, config.bins[bi].entry_point);
+                if (strcmp(bin_full, override_path) == 0) {
+                    chosen = bi;
+                    break;
+                }
+            }
+            if (chosen >= 0) {
+                config = make_bin_view(config, config.bins[chosen]);
+            } else if (config.lib.is_present()) {
+                config = make_lib_view(config);
+            } else if (config.bins.length > 0) {
+                config = make_bin_view(config, config.bins[0]);
+            }
+        }
+        return this.compile_project_with_ctx(ctx, config);
     }
 
     /// Switch to a module AND load its AST from the local buffers.
@@ -580,12 +686,6 @@ type struct CompilerInstance {
     /// legacy single-target path and each iteration of
     /// `compile_project_multi`.
     compile_project_with_config(&this, config: ProjectConfig) -> CompilationResult {
-        // Drop any cached (TypeRef.id → LLVMTypeRef) entries from a prior
-        // compile in this process.  TypeArena.next_id resets to 1 every
-        // compile, so without this every fresh TypeRef would alias a
-        // stale cache entry from the previous run.
-        Compiler::Codegen::TypeMap::reset_shared_type_cache();
-
         const root_path: string = config.discovery_root_path();
 
         cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
@@ -628,6 +728,31 @@ type struct CompilerInstance {
         const _box_ctx: Box<CompilationContext> = Box<CompilationContext>::new(
             CompilationContext::new(mode, root_path));
         mut ctx: CompilationContext* = _box_ctx.leak();
+        return this.compile_project_with_ctx(ctx, config);
+    }
+
+    /// Drive the multi-module orchestration against a caller-provided
+    /// context.  Lets the language server compile the whole project
+    /// (every module, every phase) while keeping the resulting `ctx`
+    /// alive afterwards so hover / definition / completion handlers
+    /// can walk the populated AST + resolver + type arena.
+    ///
+    /// The caller is responsible for:
+    ///   • Allocating `ctx` (heap, via `Box::leak`) with the correct
+    ///     `CompileMode` — `Lsp` for the language server entry,
+    ///     whatever `compile_project_with_config` picks for CLI builds.
+    ///   • Setting `ctx.lsp_override_path` + `ctx.lsp_override_content`
+    ///     before this call when the editor buffer should win over
+    ///     the on-disk version of one of the discovered modules.
+    compile_project_with_ctx(&this, ctx: CompilationContext*,
+                             config: ProjectConfig) -> CompilationResult {
+        // Drop any cached (TypeRef.id → LLVMTypeRef) entries from a prior
+        // compile in this process.  TypeArena.next_id resets to 1 every
+        // compile, so without this every fresh TypeRef would alias a
+        // stale cache entry from the previous run.
+        Compiler::Codegen::TypeMap::reset_shared_type_cache();
+
+        const root_path: string = config.discovery_root_path();
         ctx.debug_mode = this.config.debug;
         ctx.project_no_std = config.no_std;
         ctx.target_triple = config.target_triple;
@@ -804,6 +929,11 @@ type struct CompilerInstance {
             // Save the parsed AST using local buffer
             const ast_slot: void** = ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
             *ast_slot = ctx.artifacts.ast.root as void*;
+            // Mirror into the module_graph's per-module AST table so
+            // out-of-band consumers (the LSP for hover/definition) can
+            // retrieve a module's AST after the orchestrator returns —
+            // the local `ast_buf` goes out of scope at end of function.
+            ctx.module_graph.set_module_ast(mod_idx, ctx.artifacts.ast.root);
             pipeline.reset();
             ctx.provisions.clear();
         }
@@ -1189,9 +1319,20 @@ type struct CompilerInstance {
         // silently-dropped function bodies never reach the user — the
         // build looks green, then the linker fails with `undefined
         // reference`.
-        if (ctx.diagnostics.has_errors()
-                || ctx.diagnostics.has_warnings()
-                || this.config.debug) {
+        // Skip terminal flush in LSP mode — same rationale as in
+        // `run_pipeline`: the renderer fprintfs to `g_stderr` which
+        // a host that drives the compiler purely as a library hasn't
+        // necessarily wired up (the LSP, for one, gets `NULL`).  The
+        // language server reads `ctx.diagnostics.diagnostics` directly
+        // and emits them as JSON over stdout.
+        const skip_flush: boolean = match (ctx.mode) {
+            CompileMode::Lsp => { true }
+            _                => { false }
+        };
+        if (!skip_flush
+                && (ctx.diagnostics.has_errors()
+                    || ctx.diagnostics.has_warnings()
+                    || this.config.debug)) {
             ctx.diagnostics.flush();
             if (ctx.diag_renderer != null) {
                 ctx.diag_renderer.print_summary(
@@ -1228,10 +1369,20 @@ type struct CompilerInstance {
 
     /// Helper: build a failure result from context diagnostics.
     project_failure(&this, ctx: CompilationContext*) -> CompilationResult {
-        ctx.diagnostics.flush();
-        if (ctx.diag_renderer != null) {
-            ctx.diag_renderer.print_summary(
-                ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+        // Same LSP-mode skip as the success path in compile_project_with_ctx:
+        // the renderer's stderr stream may be `NULL` when the compiler runs
+        // as a library inside another process.  The diagnostic array stays
+        // populated for the LSP to read and emit as JSON.
+        const skip_flush: boolean = match (ctx.mode) {
+            CompileMode::Lsp => { true }
+            _                => { false }
+        };
+        if (!skip_flush) {
+            ctx.diagnostics.flush();
+            if (ctx.diag_renderer != null) {
+                ctx.diag_renderer.print_summary(
+                    ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+            }
         }
         return CompilationResult::failed(
             ctx.diagnostics.error_count, ctx.diagnostics.warning_count);

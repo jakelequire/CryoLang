@@ -1,5 +1,69 @@
-///! Diagnostic publishing — Phase B.
+///! Diagnostic publishing.
+///!
+///! After every `recompile()` we walk the freshly-populated
+///! `ctx.diagnostics.diagnostics` array, build a
+///! `textDocument/publishDiagnostics` notification, and write it to
+///! the wire.  Diagnostics are URI-scoped: every notification names
+///! exactly one document, so an empty `diagnostics: []` array is the
+///! way to clear stale squiggles after a fix.
 
 namespace Lsp::Handlers::Diagnostics;
 
+import std::core::result;
 import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::io::stdio;
+import std::io::error;
+import std::json::value;
+
+import Compiler::CompilationContext;
+
+import Lsp::Protocol::Framing;
+import Lsp::Protocol::JsonRpc;
+import Lsp::Protocol::Conv;
+
+
+/// Publish diagnostics for `uri`, reading them from the compilation
+/// context's diagnostic sink.  Always emits — even when `diagnostics`
+/// is empty — so the editor clears squiggles after a successful
+/// recompile.
+public function publish_for(writer: mut &Stdout, uri: Str,
+                            ctx: CompilationContext*) -> void {
+    if (ctx == null) {
+        publish_empty(writer, uri);
+        return;
+    }
+    const params: JsonValue =
+        Conv::build_publish_params(uri, ctx.diagnostics.diagnostics);
+    send_notification(writer, params);
+}
+
+
+/// Publish an empty diagnostics array for `uri`.  Used when there's
+/// no compilation context to consult (e.g. didClose, or a session
+/// that never compiled successfully).
+public function publish_empty(writer: mut &Stdout, uri: Str) -> void {
+    mut params: JsonObject = JsonObject::new();
+    params.insert(
+        String::from_str(Str::from_cstr("uri")),
+        JsonValue::String(String::from_str(uri)));
+    params.insert(
+        String::from_str(Str::from_cstr("diagnostics")),
+        JsonValue::Array(Array<JsonValue>::with_capacity(0)));
+    send_notification(writer, JsonValue::Object(params));
+}
+
+
+/// Encode + frame + write a `publishDiagnostics` notification.  Write
+/// failures are swallowed (consistent with the rest of the server —
+/// stdout is the wire, so logging the error there would corrupt it).
+function send_notification(writer: mut &Stdout, params: JsonValue) -> void {
+    mut body: String = JsonRpc::encode_notification(
+        Str::from_cstr("textDocument/publishDiagnostics"), params);
+    match (Framing::write_message(writer, body.as_str())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    body.drop();
+}

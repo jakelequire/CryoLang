@@ -416,10 +416,32 @@ type struct CodegenPasses {
     }
 
 
-    /// ObjectEmission pass.  Emits a .o file from the LLVM module.
+    /// ObjectEmission pass.  Emits a per-module artifact from the LLVM
+    /// module.  Kind selection:
+    ///   • No `-o` override        → legacy `<output_dir>/obj/<mod>.o`
+    ///   • `-o foo.o`  / Object    → emit object to the override path
+    ///   • `-o foo.s`  / Asm       → emit assembly to the override path
+    ///   • `-o foo.ll` / IRText    → dump module text to the override path
+    ///   • `-o foo`    / Exe       → emit object to the legacy path; the
+    ///                                Linking pass picks it up and shells
+    ///                                out to `cc` to produce the final
+    ///                                executable at the override path.
     static run_object_emission(ctx: CompilationContext*) -> PassResult {
         if (!ctx.artifacts.ir.is_valid()) {
             return PassResult::ok();
+        }
+
+        const kind: OutputKind = ctx.output_kind;
+
+        // IRText is the only kind that doesn't go through LLVM's
+        // target-machine emit path — it's a pure text dump of the
+        // module IR, no codegen needed.  Handle first to avoid
+        // creating a target machine we won't use.
+        match (kind) {
+            OutputKind::IRText => {
+                return CodegenPasses::emit_ir_text(ctx, ctx.output_path_override);
+            }
+            _ => { /* fall through */ }
         }
 
         // Resolve the effective triple here too — the object format
@@ -434,7 +456,79 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        // Determine output path: {build_dir}/obj/{module_name}.o
+        // Decide the emit path + LLVM file_type.  Asm and Object kinds
+        // route directly to the user's override.  Exe and the legacy
+        // (no-override) case keep the `build/obj/<mod>.o` layout so
+        // the Linking pass has a stable per-module input set.
+        mut emit_path: string = "";
+        mut emit_type: i32    = 1;  // LLVMObjectFile
+        match (kind) {
+            OutputKind::Asm => {
+                emit_path = ctx.output_path_override;
+                emit_type = 0;  // LLVMAssemblyFile
+            }
+            OutputKind::Object => {
+                emit_path = ctx.output_path_override;
+                emit_type = 1;
+            }
+            _ => {
+                emit_path = CodegenPasses::legacy_obj_path(ctx);
+                emit_type = 1;
+            }
+        }
+
+        const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+        const success: boolean = tm.emit_to_file(mod, emit_path, emit_type);
+        tm.dispose();
+
+        if (!success) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("failed to emit %s",
+                    match (kind) {
+                        OutputKind::Asm => { format("assembly file: %s", emit_path) }
+                        _               => { format("object file: %s", emit_path) }
+                    }));
+            return PassResult::failure(1);
+        }
+
+        // Store the object file path.
+        // NOTE: Deep nested struct assignment (ctx.artifacts.linked.object_file_path)
+        // is not supported by the C++ compiler. Use a LinkedOutput replacement instead.
+        ctx.artifacts.linked = LinkedOutput { object_file_path: emit_path };
+
+        // Accumulate every module's object path so the linker pass can
+        // invoke `cc` once over all of them at the end of Phase 7.
+        // Route through `register_object_file` — directly calling
+        // `.push()` on a multi-deref field chain lands on a temp copy
+        // in the bootstrap codegen (known push-through-pointer limitation).
+        //
+        // Skip registration for Asm/Object/IRText: those kinds emit a
+        // user-facing artifact (assembly text, object, IR text) that
+        // is NOT something `cc` should re-link.  Registering an .s/.ll
+        // here would feed it back into run_linking and corrupt the
+        // link command.  The legacy path and Exe kind both want the
+        // .o registered — Exe so the link step picks it up, legacy so
+        // multi-module project builds aggregate it.
+        match (kind) {
+            OutputKind::Asm    => { /* no register */ }
+            OutputKind::Object => { /* no register */ }
+            OutputKind::IRText => { /* unreachable: handled above */ }
+            _ => {
+                ctx.artifacts.register_object_file(emit_path);
+            }
+        }
+
+        if (ctx.debug_mode) {
+            cdebug("[Codegen] Emitted: %s\n", emit_path);
+        }
+
+        return PassResult::ok();
+    }
+
+    /// Build the legacy object path: `<output_dir>/obj/<safe_module>.o`.
+    /// Used when no `-o PATH` override is in effect, and for the per-module
+    /// object that feeds the Exe link step in single-file mode.
+    static legacy_obj_path(ctx: CompilationContext*) -> string {
         mut output_dir: string = "build/obj";
         if (ctx.project_config != null) {
             // mkdir() doesn't create parent dirs — ensure the parent
@@ -444,7 +538,6 @@ type struct CodegenPasses {
             mkdir(ctx.project_config.output_dir, 493);
             output_dir = format("%s/obj", ctx.project_config.output_dir);
         }
-        // Ensure output directory exists.
         mkdir(output_dir, 493);
 
         // Mangle module name: replace "::" with "_" for filesystem safety.
@@ -457,35 +550,28 @@ type struct CodegenPasses {
             if (name_buf[k] == ':') { name_buf[k] = '_'; }
         }
         safe_name = name_buf as string;
+        return format("%s/%s.o", output_dir, safe_name);
+    }
 
-        const obj_name: string = format("%s/%s.o", output_dir, safe_name);
-
-        const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-        // LLVMObjectFile = 1
-        const success: boolean = tm.emit_to_file(mod, obj_name, 1);
-        tm.dispose();
-
-        if (!success) {
+    /// Dump the LLVM module to a `.ll` text file at `path`.  Skips the
+    /// target machine entirely — IR text is target-independent and the
+    /// only failure mode is filesystem (permissions, missing parent).
+    static emit_ir_text(ctx: CompilationContext*, path: string) -> PassResult {
+        const mod_ref: void* = ctx.artifacts.ir.llvm_module;
+        mut err: i8* = null;
+        const rc: i32 = llvm::LLVMPrintModuleToFile(mod_ref, path, &err as void*);
+        if (rc != 0) {
+            const note: string = if (err != null) { err as string } else { "(no detail)" };
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("failed to emit object file: %s", obj_name));
+                format("failed to write IR text to %s: %s", path, note));
+            if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
             return PassResult::failure(1);
         }
-
-        // Store the object file path.
-        // NOTE: Deep nested struct assignment (ctx.artifacts.linked.object_file_path)
-        // is not supported by the C++ compiler. Use a LinkedOutput replacement instead.
-        ctx.artifacts.linked = LinkedOutput { object_file_path: obj_name };
-        // Accumulate every module's object path so the linker pass can
-        // invoke `cc` once over all of them at the end of Phase 7.
-        // Route through `register_object_file` — directly calling
-        // `.push()` on a multi-deref field chain lands on a temp copy
-        // in the bootstrap codegen (known push-through-pointer limitation).
-        ctx.artifacts.register_object_file(obj_name);
-
+        if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+        ctx.artifacts.linked = LinkedOutput { object_file_path: path };
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Emitted: %s\n", obj_name);
+            cdebug("[Codegen] Emitted IR text: %s\n", path);
         }
-
         return PassResult::ok();
     }
 
@@ -502,7 +588,14 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
         if (ctx.project_config == null) {
-            return PassResult::ok();
+            // Single-file mode: only Exe needs linking.  Asm / Object /
+            // IRText emit their final artifact straight from object
+            // emission; Default (no `-o`) leaves the .o behind without
+            // linking, matching the historic behaviour.
+            return match (ctx.output_kind) {
+                OutputKind::Exe => { CodegenPasses::run_linking_singlefile(ctx) }
+                _               => { PassResult::ok() }
+            };
         }
         if (!ctx.project_config.requires_entry_point()) {
             // Library / stdlib target — no executable to produce, but
@@ -615,6 +708,53 @@ type struct CodegenPasses {
             cdebug("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
         }
 
+        return PassResult::ok();
+    }
+
+
+    /// Single-file `-o PATH` Exe link.  Mirrors the project link path
+    /// minus the cryoconfig-driven extras: there are no `[link]` paths,
+    /// no test-suffix logic, and no llvm-link IR dump.  The stdlib
+    /// archive is still pulled in when `ctx.stdlib_root` was resolved
+    /// — without it most non-trivial programs would fail to link.
+    static run_linking_singlefile(ctx: CompilationContext*) -> PassResult {
+        const exe_path: string = ctx.output_path_override;
+        if (strlen(exe_path) == 0) {
+            // Defensive — run_linking only routes here when output_kind
+            // is Exe, which the CLI sets alongside output_path_override.
+            return PassResult::ok();
+        }
+
+        mut cmd: string = format("cc -o %s", exe_path);
+        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
+            cmd = format("%s %s", cmd, ctx.artifacts.object_files[i]);
+        }
+        // Stdlib archive — same lookup as the project link path.  Empty
+        // stdlib_root means single-file mode never resolved one (e.g.
+        // user passed `--no-std` semantically by stripping prelude
+        // resolution); skip the archive in that case and let the
+        // linker error if the program needs stdlib symbols.
+        if (strlen(ctx.stdlib_root) > 0) {
+            const stdlib_archive: string = format("%s/.bin/libcryo.a",
+                ctx.stdlib_root);
+            cmd = format("%s %s", cmd, stdlib_archive);
+        }
+        cmd = format("%s -lm -lstdc++", cmd);
+
+        if (ctx.debug_mode) {
+            cdebug("[Codegen] Single-file link → %s\n", exe_path);
+            cdebug("[Codegen] Link command: %s\n", cmd);
+        }
+
+        const rc: i32 = system(cmd);
+        if (rc != 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("linker invocation failed (cc exited with %d): %s", rc, cmd));
+            return PassResult::failure(1);
+        }
+
+        cdebug("[Codegen] Linked executable: %s\n", exe_path);
+        ctx.artifacts.linked = LinkedOutput { object_file_path: exe_path };
         return PassResult::ok();
     }
 

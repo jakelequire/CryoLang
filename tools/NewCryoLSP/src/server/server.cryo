@@ -30,24 +30,36 @@ import std::env;
 import Lsp::Protocol::Framing;
 import Lsp::Protocol::JsonRpc;
 import Lsp::Server::State;
+import Lsp::Server::Docs;
+import Lsp::Server::Session;
 import Lsp::Handlers::Lifecycle;
+import Lsp::Handlers::TextSync;
+import Lsp::Handlers::Hover;
+import Lsp::Handlers::Definition;
+import Lsp::Handlers::Completion;
 
 
 type struct Server {
-    state:  ServerState;
-    reader: Stdin;
-    writer: Stdout;
+    state:    ServerState;
+    docs:     Docs;
+    sessions: SessionMap;
+    reader:   Stdin;
+    writer:   Stdout;
 
     static new() -> Server {
         return Server {
-            state:  ServerState::new(),
-            reader: stdin(),
-            writer: stdout(),
+            state:    ServerState::new(),
+            docs:     Docs::new(),
+            sessions: SessionMap::new(),
+            reader:   stdin(),
+            writer:   stdout(),
         };
     }
 
     drop(mut &this) -> void {
         this.state.drop();
+        this.docs.drop();
+        this.sessions.drop();
     }
 
     /// Run until either `exit` or stdin closes.  Returns the process
@@ -136,8 +148,30 @@ type struct Server {
                     return;
                 }
 
-                // Phase A: every other request gets METHOD_NOT_FOUND.
-                // Phase B/C will fan out hover/definition/completion.
+                if (method.equals(&Str::from_cstr("textDocument/hover"))) {
+                    // Fully-qualified: bare `Hover::` would resolve to
+                    // the wire-shape `Lsp::Protocol::Lsp::Hover` struct.
+                    const result: JsonValue =
+                        Lsp::Handlers::Hover::handle_hover(
+                            &this.docs, &this.sessions, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&Str::from_cstr("textDocument/definition"))) {
+                    const result: JsonValue =
+                        Lsp::Handlers::Definition::handle_definition(
+                            &this.docs, &this.sessions, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&Str::from_cstr("textDocument/completion"))) {
+                    const result: JsonValue =
+                        Lsp::Handlers::Completion::handle_completion(
+                            &this.docs, &this.sessions, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+
                 this.reply_error(&req.id,
                     JsonRpc::METHOD_NOT_FOUND,
                     Str::from_cstr("method not found"));
@@ -166,8 +200,23 @@ type struct Server {
                 // except `exit` (handled above).
                 if (!this.state.initialized) { return; }
 
-                // Phase B will route textDocument/didOpen etc. here.
-                // Unknown methods are silently ignored per LSP spec.
+                if (method.equals(&Str::from_cstr("textDocument/didOpen"))) {
+                    TextSync::did_open(&this.docs, &this.sessions,
+                                        &this.writer, &notif.params);
+                    return;
+                }
+                if (method.equals(&Str::from_cstr("textDocument/didChange"))) {
+                    TextSync::did_change(&this.docs, &this.sessions,
+                                          &this.writer, &notif.params);
+                    return;
+                }
+                if (method.equals(&Str::from_cstr("textDocument/didClose"))) {
+                    TextSync::did_close(&this.docs, &this.sessions,
+                                         &this.writer, &notif.params);
+                    return;
+                }
+
+                // Unknown notifications are silently ignored per LSP spec.
             }
             _ => { }
         }

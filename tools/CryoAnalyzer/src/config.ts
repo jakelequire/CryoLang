@@ -19,45 +19,107 @@ export function getConfig(): CryoConfig {
     };
 }
 
-export function resolveServerPath(extensionPath: string): string | undefined {
+/**
+ * Locate the `cryolsp` binary.  Resolution order:
+ *
+ *   1. `cryo.languageServer.path` user setting.  Relative paths are
+ *      resolved against the first workspace folder so settings like
+ *      `./bin/cryolsp` work without expanding to an absolute path.
+ *   2. Workspace-local `tools/NewCryoLSP/build/bin/cryolsp` — the
+ *      output of `cryo build` inside the in-repo NewCryoLSP project.
+ *      Picks up dev builds without needing any setting changes.
+ *   3. Workspace-local `bin/cryolsp` — legacy install location for
+ *      older CryoLSP packages; kept so existing users don't break.
+ *   4. Extension-relative paths (sibling NewCryoLSP/ tree, then the
+ *      legacy `../../bin/` location).
+ *
+ * If a user-configured path is set but doesn't exist, the resolver
+ * SILENTLY falls through to auto-detection.  A warning is logged to
+ * the output channel only if the eventual return value is `undefined`
+ * — otherwise stale settings (e.g. a Windows `.exe` path on Linux)
+ * spam a popup on every restart even when auto-detection succeeds.
+ *
+ * `.exe` candidates are only probed on Windows; Linux/macOS skip them
+ * to avoid wasted `existsSync` calls and to avoid suggesting a path
+ * that would mis-spawn on the wrong platform.
+ */
+export function resolveServerPath(
+    extensionPath: string,
+    outputChannel?: vscode.OutputChannel
+): string | undefined {
     const config = getConfig();
+    const isWindows = process.platform === 'win32';
+    const exeName = isWindows ? 'cryolsp.exe' : 'cryolsp';
 
-    // 1. Check user-configured path
+    // 1. User-configured path.  Resolve relative paths against the
+    //    first workspace folder so `./bin/cryolsp` is interpreted the
+    //    way users expect (relative to the project root, not VS Code's
+    //    CWD).  An absolute path is returned as-is when it exists.
     if (config.serverPath) {
-        if (fs.existsSync(config.serverPath)) {
-            return config.serverPath;
+        const resolved = resolveUserPath(config.serverPath);
+        if (resolved && fs.existsSync(resolved)) {
+            return resolved;
         }
-        vscode.window.showWarningMessage(
-            `CryoLSP: Configured server path not found: ${config.serverPath}`
+        outputChannel?.appendLine(
+            `CryoLSP: configured server path not found, falling back to ` +
+            `auto-detection: ${config.serverPath}`
         );
     }
 
-    // 2. Check workspace root bin/
+    const candidates: string[] = [];
+    const pushPair = (...parts: string[]) => {
+        candidates.push(path.join(...parts, exeName));
+        // On Linux/macOS where the user's configured path included
+        // `.exe` accidentally, also try the no-extension form.  The
+        // exeName already handled the canonical case; this is a safety
+        // net for the inverse mistake.
+        if (isWindows) {
+            candidates.push(path.join(...parts, 'cryolsp'));
+        }
+    };
+
+    // 2 + 3. Workspace-relative candidates.
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders) {
         for (const folder of workspaceFolders) {
-            const candidates = [
-                path.join(folder.uri.fsPath, 'bin', 'cryolsp.exe'),
-                path.join(folder.uri.fsPath, 'bin', 'cryolsp'),
-            ];
-            for (const candidate of candidates) {
-                if (fs.existsSync(candidate)) {
-                    return candidate;
-                }
-            }
+            const root = folder.uri.fsPath;
+            pushPair(root, 'tools', 'NewCryoLSP', 'build', 'bin');
+            pushPair(root, 'bin');
         }
     }
 
-    // 3. Check relative to extension
-    const extBinCandidates = [
-        path.join(extensionPath, '..', '..', 'bin', 'cryolsp.exe'),
-        path.join(extensionPath, '..', '..', 'bin', 'cryolsp'),
-    ];
-    for (const candidate of extBinCandidates) {
+    // 4. Extension-relative candidates.  When the extension lives at
+    // `<repo>/tools/CryoAnalyzer/`, NewCryoLSP is a sibling at
+    // `<repo>/tools/NewCryoLSP/`; legacy bin/ is two parents up.
+    pushPair(extensionPath, '..', 'NewCryoLSP', 'build', 'bin');
+    pushPair(extensionPath, '..', '..', 'bin');
+
+    for (const candidate of candidates) {
         if (fs.existsSync(candidate)) {
             return candidate;
         }
     }
 
     return undefined;
+}
+
+/**
+ * Resolve a user-supplied path string.  Absolute paths and `~/...`
+ * paths are returned unchanged; bare and `./...` relative paths are
+ * joined to the first workspace folder if one is open.
+ */
+function resolveUserPath(p: string): string | undefined {
+    if (path.isAbsolute(p)) { return p; }
+
+    if (p.startsWith('~/')) {
+        const home = process.env.HOME || process.env.USERPROFILE;
+        if (home) { return path.join(home, p.slice(2)); }
+    }
+
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length > 0) {
+        return path.resolve(folders[0].uri.fsPath, p);
+    }
+
+    return p;                              // fall through to existsSync
 }

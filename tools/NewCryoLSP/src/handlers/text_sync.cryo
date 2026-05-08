@@ -1,5 +1,172 @@
-///! Text-document synchronization — Phase B.
+///! Text-document synchronization.
+///!
+///! Three notifications, all carrying a `textDocument` and (for
+///! didOpen / didChange) some text:
+///!
+///!   • didOpen   → store doc, create session, recompile, publish
+///!   • didChange → replace doc text, recompile, publish
+///!   • didClose  → drop doc, drop session, publish empty diagnostics
+///!
+///! The advertised `textDocumentSync` value is `2 = Incremental`, but
+///! v1 treats every didChange's `contentChanges` as "the last entry
+///! is a whole-document replacement" and ignores any range.  Most
+///! editors send the whole text by default; the few that send true
+///! incremental updates will see correct behaviour as long as their
+///! final entry has no `range` field (the LSP spec allows this).
 
 namespace Lsp::Handlers::TextSync;
 
+import std::core::option;
 import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::io::stdio;
+import std::json::value;
+
+import Lsp::Server::Docs;
+import Lsp::Server::Session;
+import Lsp::Handlers::Diagnostics;
+
+
+public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
+                          writer: mut &Stdout, params: &JsonValue) -> void {
+    match (params.get(Str::from_cstr("textDocument"))) {
+        Option::Some(td) => {
+            const uri:     String = clone_string_field_or_empty(td, "uri");
+            const version: i32    = i32_field_or(td, "version", 1 as i32);
+            const text:    String = clone_string_field_or_empty(td, "text");
+
+            mut doc: Document = Document::new(
+                String::from_str(uri.as_str()),
+                String::from_str(text.as_str()),
+                version);
+            docs.insert(doc);
+
+            const session_ptr: CompilerSession* = sessions.get_or_create(uri.as_str());
+            if (session_ptr != null) {
+                session_ptr.recompile(uri.as_str(), text.as_str());
+                Diagnostics::publish_for(writer, uri.as_str(), session_ptr.context());
+            }
+
+            mut u: String = uri;     u.drop();
+            mut t: String = text;    t.drop();
+        }
+        Option::None => { }
+    }
+}
+
+
+public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
+                            writer: mut &Stdout, params: &JsonValue) -> void {
+    match (params.get(Str::from_cstr("textDocument"))) {
+        Option::Some(td) => {
+            const uri:     String = clone_string_field_or_empty(td, "uri");
+            const version: i32    = i32_field_or(td, "version", 1 as i32);
+
+            // Pull the LAST entry of `contentChanges` — for full-sync
+            // clients there's exactly one; for incremental clients
+            // taking this approach loses partial edits (TODO when v2).
+            const new_text: String = match (params.get(Str::from_cstr("contentChanges"))) {
+                Option::Some(changes) => { last_change_text(changes) }
+                Option::None          => { String::new() }
+            };
+
+            // Update the stored document — `replace_text` rebuilds the
+            // line index, which is needed even for full sync.
+            match (docs.get(uri.as_str())) {
+                Option::Some(doc_ptr) => {
+                    doc_ptr.replace_text(String::from_str(new_text.as_str()), version);
+                }
+                Option::None => {
+                    // didChange before didOpen — accept it anyway by
+                    // creating the doc.
+                    mut fresh: Document = Document::new(
+                        String::from_str(uri.as_str()),
+                        String::from_str(new_text.as_str()),
+                        version);
+                    docs.insert(fresh);
+                }
+            }
+
+            const session_ptr: CompilerSession* = sessions.get_or_create(uri.as_str());
+            if (session_ptr != null) {
+                session_ptr.recompile(uri.as_str(), new_text.as_str());
+                Diagnostics::publish_for(writer, uri.as_str(), session_ptr.context());
+            }
+
+            mut u: String = uri;       u.drop();
+            mut t: String = new_text;  t.drop();
+        }
+        Option::None => { }
+    }
+}
+
+
+public function did_close(docs: mut &Docs, sessions: mut &SessionMap,
+                           writer: mut &Stdout, params: &JsonValue) -> void {
+    match (params.get(Str::from_cstr("textDocument"))) {
+        Option::Some(td) => {
+            const uri: String = clone_string_field_or_empty(td, "uri");
+            docs.remove(uri.as_str());
+            sessions.remove(uri.as_str());
+            // Clear stale squiggles in the editor.
+            Diagnostics::publish_empty(writer, uri.as_str());
+            mut u: String = uri;  u.drop();
+        }
+        Option::None => { }
+    }
+}
+
+
+// ============================================================================
+// JSON field helpers
+// ============================================================================
+
+function clone_string_field_or_empty(obj: &JsonValue, key: string) -> String {
+    match (obj.get(Str::from_cstr(key))) {
+        Option::Some(v) => {
+            match (v.as_str()) {
+                Option::Some(s) => { return String::from_str(s); }
+                Option::None    => { return String::new(); }
+            }
+        }
+        Option::None => { return String::new(); }
+    }
+}
+
+function i32_field_or(obj: &JsonValue, key: string, fallback: i32) -> i32 {
+    match (obj.get(Str::from_cstr(key))) {
+        Option::Some(v) => {
+            match (v) {
+                JsonValue::Number(n) => {
+                    match (n) {
+                        JsonNumber::Int(i)   => { return i as i32; }
+                        JsonNumber::UInt(u)  => { return u as i32; }
+                        JsonNumber::Float(f) => { return f as i32; }
+                    }
+                }
+                _ => { return fallback; }
+            }
+        }
+        Option::None => { return fallback; }
+    }
+    return fallback;
+}
+
+/// Pull the `text` field out of the LAST change entry.  Treats every
+/// change as a whole-document replacement; `range`-bearing entries are
+/// silently overridden by whichever entry sits last in the array.
+function last_change_text(changes: &JsonValue) -> String {
+    match (changes) {
+        JsonValue::Array(arr) => {
+            if (arr.length() == 0) { return String::new(); }
+            match (arr.get(arr.length() - 1)) {
+                Option::Some(last) => {
+                    return clone_string_field_or_empty(&last, "text");
+                }
+                Option::None => { return String::new(); }
+            }
+        }
+        _ => { return String::new(); }
+    }
+}

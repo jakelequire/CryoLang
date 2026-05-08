@@ -1,9 +1,141 @@
 ///! Byte-offset ↔ (line, character) conversion.
 ///!
-///! Phase A stub — populated in Phase B alongside `docs` and the
-///! diagnostic converter (which needs to translate the compiler's
-///! 1-based line/col SourceSpan into the LSP's 0-based UTF-16 form).
+///! Built once per document at didOpen / didChange.  Subsequent
+///! lookups are O(log N) where N is the line count, via binary
+///! search of the line-start table.
+///!
+///! Line/character semantics:
+///!   • `line` is 0-based.
+///!   • `character` is currently a *byte* offset into the line
+///!     (TODO: real UTF-16 code-unit conversion).  ASCII source —
+///!     which Cryo files almost always are — round-trips correctly;
+///!     non-BMP scalars in source comments will be off by the
+///!     usual UTF-8 vs UTF-16 unit-count delta.
+///!
+///! The compiler hands us 1-based line/col SourceSpans; the LSP
+///! wants 0-based.  Conversion lives in `Protocol::Conv`, not here —
+///! this module is the position-only substrate.
 
 namespace Lsp::Server::LineIndex;
 
+import std::core::option;
+import std::core::drop;
 import std::collections::str;
+import std::collections::array;
+import Lsp::Protocol::Lsp;
+
+
+type struct LineIndex {
+    /// Total length of the indexed text, in bytes.  Cached so callers
+    /// can clamp out-of-range positions without a separate length read.
+    text_length: u64;
+    /// Byte offset of the start of each line.  Always at least one
+    /// entry (offset 0); a trailing newline produces an extra entry
+    /// for the empty last line.
+    line_starts: Array<u64>;
+
+    static build(text: Str) -> LineIndex {
+        const len: u64 = text.length();
+        mut starts: Array<u64> = Array<u64>::with_capacity(64);
+        starts.push(0 as u64);
+
+        const ptr: u8* = text.as_ptr();
+        mut i: u64 = 0;
+        while (i < len) {
+            const b: u8 = ptr[i];
+            if (b == 10) {
+                // '\n' — next line starts at the byte after the LF.
+                starts.push(i + 1);
+            }
+            // '\r' alone is rare in editor buffers (LSP normalises to
+            // \n on the wire).  Treating CR as a line break would
+            // double-count CRLF; ignoring it is correct for both LF
+            // and CRLF inputs.
+            i = i + 1;
+        }
+
+        return LineIndex {
+            text_length: len,
+            line_starts: starts,
+        };
+    }
+
+    line_count(&this) -> u64 {
+        return this.line_starts.length();
+    }
+
+    /// Byte offset of the start of `line`.  Out-of-range lines clamp
+    /// to text_length so callers building substrings get an empty
+    /// slice rather than a panic.
+    line_start(&this, line: u32) -> u64 {
+        const idx: u64 = line as u64;
+        if (idx >= this.line_starts.length()) {
+            return this.text_length;
+        }
+        match (this.line_starts.get(idx)) {
+            Option::Some(off) => { return off; }
+            Option::None      => { return this.text_length; }
+        }
+    }
+
+    /// Byte offset of the END of `line` (exclusive — i.e. start of the
+    /// next line, or text_length for the last line).
+    line_end(&this, line: u32) -> u64 {
+        const next: u64 = (line as u64) + 1;
+        if (next >= this.line_starts.length()) {
+            return this.text_length;
+        }
+        match (this.line_starts.get(next)) {
+            Option::Some(off) => { return off; }
+            Option::None      => { return this.text_length; }
+        }
+    }
+
+    /// Convert (line, character) → byte offset.  `character` is treated
+    /// as a byte offset within the line; clamp to the line's end so a
+    /// past-the-end column doesn't run into the next line.
+    byte_offset(&this, line: u32, character: u32) -> u64 {
+        const start: u64 = this.line_start(line);
+        const end:   u64 = this.line_end(line);
+        const want:  u64 = start + (character as u64);
+        if (want > end) { return end; }
+        return want;
+    }
+
+    /// Convert byte offset → (line, character).  Binary search over
+    /// the line-start table; O(log N) in the line count.
+    position_of(&this, byte_offset: u64) -> Position {
+        const n: u64 = this.line_starts.length();
+        if (n == 0) {
+            return Position::new(0 as u32, 0 as u32);
+        }
+        // Find the largest index `lo` with line_starts[lo] <= byte_offset.
+        mut lo: u64 = 0;
+        mut hi: u64 = n;                                   // exclusive
+        while (lo + 1 < hi) {
+            const mid: u64 = (lo + hi) / 2;
+            const v: u64 = match (this.line_starts.get(mid)) {
+                Option::Some(x) => { x }
+                Option::None    => { 0 as u64 }
+            };
+            if (v <= byte_offset) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        const start: u64 = match (this.line_starts.get(lo)) {
+            Option::Some(x) => { x }
+            Option::None    => { 0 as u64 }
+        };
+        const ch: u64 = byte_offset - start;
+        return Position::new(lo as u32, ch as u32);
+    }
+}
+
+
+implement trait Drop for LineIndex {
+    drop(mut &this) -> void {
+        this.line_starts.drop();
+    }
+}
