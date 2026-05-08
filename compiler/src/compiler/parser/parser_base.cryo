@@ -38,10 +38,23 @@ public:
     paren_depth:   int;
     bracket_depth: int;
 
-    // (reserved for future context flags)
+    // Set by parse_parameter_list when a bare `...` is encountered (no
+    // accompanying name like `args...`). Callers that build a function
+    // node check this after parsing the parameter list and forward the
+    // variadic flag onto the node. Reset on entry to parse_parameter_list.
+    pending_bare_variadic: boolean;
 
     // Doc comment accumulation
     pending_doc_comments: string[];
+
+    // Source line where the most recently pushed doc comment ended.
+    // -1 means no pending doc.  Used to enforce "doc is immediately
+    // above the decl" — `take_documentation` discards the cluster
+    // when there's a blank-line gap between the last doc and the
+    // current token.  Same check inside `push_doc` discards an
+    // earlier cluster when a NEW doc appears after a gap, so two
+    // doc clusters separated by blank lines never merge.
+    last_doc_end_line: int;
 
     // For self-referential type detection
     current_type_name: string;
@@ -63,9 +76,10 @@ public:
         this.paren_depth  = 0;
         this.bracket_depth = 0;
 
-        // (no context flags currently needed)
+        this.pending_bare_variadic = false;
 
         this.pending_doc_comments = [];
+        this.last_doc_end_line    = -1;
         this.current_type_name    = "";
     }
 
@@ -120,11 +134,11 @@ public:
                     this.pos = this.pos + 1;
                 }
                 TokenType::DocCommentLine => {
-                    this.pending_doc_comments.push(next.lexeme);
+                    this.push_doc(next);
                     this.pos = this.pos + 1;
                 }
                 TokenType::DocCommentBlock => {
-                    this.pending_doc_comments.push(next.lexeme);
+                    this.push_doc(next);
                     this.pos = this.pos + 1;
                 }
                 _ => { break; }
@@ -210,10 +224,26 @@ public:
     }
 
     /// Create a span from a start token to the previously consumed token.
+    /// `advance()` skips over comments and doc-comments after each
+    /// real consumption, so `tokens[pos - 1]` may be a comment that
+    /// followed the last real token.  Walk backwards over those to
+    /// find the actual end of the consumed range — without this, a
+    /// `namespace X;` followed by `///` doc comments on later lines
+    /// gets a span ending at the last doc comment instead of `;`.
     span_from(start: Token) -> SourceSpan {
-        // The previous token is at pos - 1
-        if (this.pos > 0 && this.pos <= this.tokens.length) {
-            const end_tok: Token = this.tokens[this.pos - 1];
+        mut idx: int = this.pos - 1;
+        while (idx >= 0 && idx < this.tokens.length) {
+            const k: TokenType = this.tokens[idx].kind;
+            if (k == TokenType::Comment
+                    || k == TokenType::DocCommentLine
+                    || k == TokenType::DocCommentBlock) {
+                idx = idx - 1;
+                continue;
+            }
+            break;
+        }
+        if (idx >= 0 && idx < this.tokens.length) {
+            const end_tok: Token = this.tokens[idx];
             const end_col: u32 = end_tok.column as u32 + end_tok.source_length as u32;
             return SourceSpan::new(
                 this.source_file,
@@ -480,11 +510,11 @@ public:
             const tok: Token = this.current();
             match (&tok.kind) {
                 TokenType::DocCommentLine => {
-                    this.pending_doc_comments.push(tok.lexeme);
+                    this.push_doc(tok);
                     this.pos = this.pos + 1;
                 }
                 TokenType::DocCommentBlock => {
-                    this.pending_doc_comments.push(tok.lexeme);
+                    this.push_doc(tok);
                     this.pos = this.pos + 1;
                 }
                 TokenType::Comment => {
@@ -495,9 +525,36 @@ public:
         }
     }
 
-    /// Extract and clear pending doc comments, joining them with newlines.
+    /// Push one doc-comment token's lexeme into `pending_doc_comments`,
+    /// updating `last_doc_end_line`.  When the new doc starts after a
+    /// blank-line gap from the previous pending doc, the earlier
+    /// cluster is discarded — a doc cluster is the maximal run of
+    /// consecutive doc-comment lines / blocks with no source-line
+    /// gaps between them.  Block doc comments span multiple lines;
+    /// `count_newlines_in_str` counts how many to derive the end line.
+    push_doc(mut &this, tok: Token) -> void {
+        const start_line: int = tok.line;
+        const end_line:   int = start_line + count_newlines_in_str(tok.lexeme);
+        if (this.last_doc_end_line >= 0 && start_line > this.last_doc_end_line + 1) {
+            this.pending_doc_comments = [];
+        }
+        this.pending_doc_comments.push(tok.lexeme);
+        this.last_doc_end_line = end_line;
+    }
+
+    /// Extract and clear pending doc comments, joining them with
+    /// newlines.  Discards the cluster (returns "") when there's a
+    /// blank-line gap between the last doc and the current token —
+    /// the spec is "doc must be immediately above the decl", so a
+    /// doc separated from the decl by a blank line doesn't count.
     take_documentation() -> string {
         if (this.pending_doc_comments.length == 0) {
+            return "";
+        }
+        if (this.last_doc_end_line >= 0
+            && this.current().line > this.last_doc_end_line + 1) {
+            this.pending_doc_comments = [];
+            this.last_doc_end_line = -1;
             return "";
         }
         mut result: string = "";
@@ -508,6 +565,7 @@ public:
             result = result.append(this.pending_doc_comments[i]);
         }
         this.pending_doc_comments = [];
+        this.last_doc_end_line = -1;
         return result;
     }
 
@@ -544,4 +602,18 @@ public:
         }
         this.error_expected("'>'");
     }
+}
+
+
+/// Count the number of `'\n'` bytes in `s`.  Used to compute the
+/// end-line of a multi-line block doc comment from its lexeme so
+/// the doc-cluster gap check sees a `/** … */` spanning multiple
+/// lines correctly.
+function count_newlines_in_str(s: string) -> int {
+    const len: i64 = strlen(s) as i64;
+    mut n: int = 0;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (s[i] == '\n' as i8) { n = n + 1; }
+    }
+    return n;
 }

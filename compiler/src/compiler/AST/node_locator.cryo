@@ -302,8 +302,18 @@ function first_covering_child(node: ASTNode*,
             return pick_array_variant(d.variants, line, character);
         }
         NodeKind::ImplementationBlock => {
+            // `synthesize_default_trait_methods` (TypeResolution) clones
+            // default-bodied trait methods INTO this impl's `methods`
+            // array.  The clones retain spans from the trait decl's
+            // source file (e.g. `io/traits.cryo`), so a line-only match
+            // can land on a synthesized method whose line number
+            // happens to overlap the impl head in the impl's own file.
+            // Filter to methods whose span.file matches the impl
+            // block's span.file so position lookup only sees real
+            // source positions in the file we're walking.
             const d: ImplBlockNode* = node as ImplBlockNode*;
-            return pick_array_method(d.methods, line, character);
+            return pick_array_method_in_file(
+                d.methods, d.span.file, line, character);
         }
         _ => { return null; }
     }
@@ -368,6 +378,33 @@ function pick_array_method(arr: MethodNode*[], line: u32, character: u32) -> AST
         }
     }
     return null;
+}
+
+/// Like `pick_array_method`, but skips methods whose span.file differs
+/// from `expected_file`.  Used by the ImplementationBlock dispatch:
+/// `synthesize_default_trait_methods` clones default-bodied trait
+/// methods into the impl's `methods` array, and the clones retain
+/// spans from the trait decl's source file.  Without the file filter
+/// a line-only match can pick a synthesized method whose line range
+/// overlaps the impl head in the impl's own file.
+function pick_array_method_in_file(arr: MethodNode*[], expected_file: string,
+                                    line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: MethodNode* = arr[i];
+        if (elem == null) { continue; }
+        if (!same_file(elem.span.file, expected_file)) { continue; }
+        if (span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+/// String equality on file paths.  Both args may be null; null/empty
+/// counts as "unknown" and never matches a known file.
+function same_file(a: string, b: string) -> boolean {
+    if (a == null || b == null) { return false; }
+    return strcmp(a, b) == 0;
 }
 
 function pick_array_field(arr: FieldDeclNode*[], line: u32, character: u32) -> ASTNode* {
@@ -649,6 +686,24 @@ public function find_const_in_modules(graph: ModuleGraph*,
             const v: VarDeclNode* = stmt as VarDeclNode*;
             if (v.is_global && v.name.equals(name)) { return v; }
         }
+    }
+    return null;
+}
+
+/// Find a `ProgramNode` whose `namespace_name` matches `path`
+/// exactly (e.g. `"std::core"`).  Used by the LSP to render hovers
+/// for individual import-path segments — each segment maps to a
+/// namespace-rooted file (the `_module.cryo` for non-leaf segments,
+/// the actual source file for the leaf).  Returns `null` when no
+/// module in the graph declares that namespace.
+public function find_program_by_namespace(graph: ModuleGraph*,
+                                           path: string) -> ProgramNode* {
+    if (graph == null) { return null; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        if (strcmp(ast.namespace_name, path) == 0) { return ast; }
     }
     return null;
 }
