@@ -1,7 +1,332 @@
+///! cqlite demo — a tiny notebook backed by SQLite.
+///!
+///! Walks through the cqlite lifecycle end-to-end: open a database
+///! on disk, set up a schema, seed it inside a transaction, query
+///! and pretty-print rows, then mutate a couple via UPDATE/DELETE.
+///!
+///! The point of this example is not to be a production task
+///! manager — it's to demonstrate how a project consumes a
+///! git-pinned Cryo dependency.  The library is fetched from
+///! github.com/jakelequire/cqlite at the version pinned in
+///! cryoconfig.lock; everything else is plain Cryo + a `printf`.
+
 namespace Main;
 
-import cqlite::*;
+import std::collections::str;
+import std::collections::string;
+import cqlite::connection;
+import cqlite::statement;
+import cqlite::transaction;
+import cqlite::error;
+import cqlite::value;
+
+
+// ============================================================================
+// Output helpers
+// ============================================================================
+
+/// Print a section banner.  Headers like `[init]`, `[seed]`, etc.
+/// keep the demo's stdout legible as it walks through each step.
+function step(label: string, msg: string) -> void {
+    printf("  %-9s %s\n", label, msg);
+}
+
+/// Print a horizontal rule of dashes.  Width is in characters.
+function rule(width: i32) -> void {
+    mut i: i32 = 0;
+    while (i < width) {
+        printf("-");
+        i = i + 1;
+    }
+    printf("\n");
+}
+
+/// Render a `Str` with the C99 %.*s precision specifier — Cryo's
+/// `Str` is length-typed (no NUL terminator) so this is the safe way
+/// to feed one into a printf format.
+function print_str(s: Str) -> void {
+    printf("%.*s", s.length() as i32, s.as_ptr());
+}
+
+
+// ============================================================================
+// Error shorthand
+// ============================================================================
+
+/// Print a cqlite error with its sqlite3 result code and message,
+/// drop the error, and return 1 — enough for `main` to propagate the
+/// failure to the shell while still releasing every resource we own.
+function bail(stage: string, mut err: CqError) -> int {
+    printf("error: %s -- sqlite3 code %d (",
+           stage, err.extended_code);
+    print_str(err.code.label());
+    printf("): ");
+    print_str(err.message_str());
+    printf("\n");
+    err.drop();
+    return 1;
+}
+
+
+// ============================================================================
+// Demo driver
+// ============================================================================
 
 function main() -> int {
+    // ----------------------------------------------------------------
+    // Banner
+    // ----------------------------------------------------------------
+    rule(64);
+    printf("  cqlite demo -- linked against libsqlite3 ");
+    print_str(Connection::library_version());
+    printf("\n");
+    rule(64);
+
+    const db_path: Str = Str::from("notes.db");
+
+    // ----------------------------------------------------------------
+    // Open a database file on disk.  Created if missing; existing data
+    // (from a prior demo run) is wiped by the DELETE below so the
+    // output is deterministic.
+    // ----------------------------------------------------------------
+    step("[init]", "opening notes.db");
+    mut db: Connection = match (Connection::open(db_path)) {
+        Result::Ok(conn)  => { conn }
+        Result::Err(err)  => { return bail("Connection::open", err); }
+    };
+
+    // Idempotent schema.  `IF NOT EXISTS` lets the demo re-run cleanly.
+    const schema: Str = Str::from(
+        "CREATE TABLE IF NOT EXISTS notes (\n"
+      + "    id       INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+      + "    body     TEXT    NOT NULL,\n"
+      + "    priority INTEGER NOT NULL DEFAULT 1,\n"
+      + "    done     INTEGER NOT NULL DEFAULT 0\n"
+      + ");\n"
+      + "DELETE FROM notes;\n"
+      + "DELETE FROM sqlite_sequence WHERE name = 'notes';"
+    );
+    match (db.exec(schema)) {
+        Result::Ok(_)    => { }
+        Result::Err(e)   => { db.drop(); return bail("schema", e); }
+    }
+
+    // ----------------------------------------------------------------
+    // Seed the table.  Wrapping the inserts in a transaction is the
+    // SQLite-canonical way to make N inserts run as one fsync rather
+    // than N -- a real-world idiom worth showing in a getting-started
+    // demo.
+    // ----------------------------------------------------------------
+    step("[seed]", "inserting 5 notes inside a transaction");
+
+    mut txn: Transaction = match (Transaction::begin(&db)) {
+        Result::Ok(t)  => { t }
+        Result::Err(e) => { db.drop(); return bail("BEGIN", e); }
+    };
+
+    mut insert: Statement = match (db.prepare(Str::from(
+        "INSERT INTO notes (body, priority) VALUES (?, ?)"
+    ))) {
+        Result::Ok(s)  => { s }
+        Result::Err(e) => { txn.drop(); db.drop(); return bail("PREPARE INSERT", e); }
+    };
+
+    const seed_bodies: Str[] = [
+        Str::from("Buy milk"),
+        Str::from("Walk the dog"),
+        Str::from("Read SICP, ch. 4"),
+        Str::from("Tag cqlite v0.1.0"),
+        Str::from("Ship Cryo dep manager"),
+    ];
+    mut seed_priorities: i64[] = [];
+    seed_priorities.push(3 as i64);
+    seed_priorities.push(2 as i64);
+    seed_priorities.push(1 as i64);
+    seed_priorities.push(4 as i64);
+    seed_priorities.push(5 as i64);
+
+    mut i: u64 = 0;
+    while (i < 5) {
+        match (insert.bind_text(1, seed_bodies[i])) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                insert.drop(); txn.drop(); db.drop();
+                return bail("bind body", e);
+            }
+        }
+        match (insert.bind_int(2, seed_priorities[i])) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                insert.drop(); txn.drop(); db.drop();
+                return bail("bind priority", e);
+            }
+        }
+        match (insert.execute()) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                insert.drop(); txn.drop(); db.drop();
+                return bail("execute INSERT", e);
+            }
+        }
+        match (insert.reset()) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                insert.drop(); txn.drop(); db.drop();
+                return bail("reset INSERT", e);
+            }
+        }
+        i = i + 1;
+    }
+    insert.drop();
+
+    match (txn.commit()) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { txn.drop(); db.drop(); return bail("COMMIT", e); }
+    }
+    txn.drop();
+
+    step("[ok]", "committed 5 rows");
+
+    // ----------------------------------------------------------------
+    // SELECT after seed.
+    // ----------------------------------------------------------------
+    step("[query]", "SELECT * FROM notes ORDER BY priority DESC");
+    if (print_table_priority_first(&db) != 0) {
+        db.drop();
+        return 1;
+    }
+
+    // ----------------------------------------------------------------
+    // UPDATE one row in place.  Parameterized again -- no string
+    // splicing into SQL.
+    // ----------------------------------------------------------------
+    step("[update]", "marking 'Tag cqlite v0.1.0' as done");
+    mut upd: Statement = match (db.prepare(Str::from(
+        "UPDATE notes SET done = 1 WHERE body = ?"
+    ))) {
+        Result::Ok(s)  => { s }
+        Result::Err(e) => { db.drop(); return bail("PREPARE UPDATE", e); }
+    };
+    match (upd.bind_text(1, Str::from("Tag cqlite v0.1.0"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { upd.drop(); db.drop(); return bail("bind UPDATE", e); }
+    }
+    match (upd.execute()) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { upd.drop(); db.drop(); return bail("UPDATE", e); }
+    }
+    upd.drop();
+    printf("  %-9s updated %d row(s)\n", "[ok]", db.changes());
+
+    // ----------------------------------------------------------------
+    // DELETE rows that survive a predicate.  The aggregate count
+    // probe afterwards exercises a one-shot SELECT-into-int.
+    // ----------------------------------------------------------------
+    step("[delete]", "DELETE FROM notes WHERE priority < 2");
+    match (db.exec(Str::from("DELETE FROM notes WHERE priority < 2"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { db.drop(); return bail("DELETE", e); }
+    }
+    printf("  %-9s deleted %d row(s)\n", "[ok]", db.changes());
+
+    const remaining: i64 = match (count_notes(&db)) {
+        Result::Ok(n)  => { n }
+        Result::Err(e) => { db.drop(); return bail("COUNT(*)", e); }
+    };
+    printf("  %-9s %lld note(s) remain\n", "[stats]", remaining);
+
+    // ----------------------------------------------------------------
+    // Final state.
+    // ----------------------------------------------------------------
+    step("[query]", "final state, ORDER BY id ASC");
+    if (print_table_id_first(&db) != 0) {
+        db.drop();
+        return 1;
+    }
+
+    rule(64);
+    step("[done]", "demo complete");
+    db.drop();
     return 0;
+}
+
+
+// ============================================================================
+// Query helpers
+// ============================================================================
+
+/// Pretty-print every row, ordered with the highest priority first.
+function print_table_priority_first(db: Connection*) -> int {
+    return run_select(db, Str::from(
+        "SELECT id, body, priority, done FROM notes "
+      + "ORDER BY priority DESC, id ASC"));
+}
+
+/// Pretty-print every row in row-creation order — useful for showing
+/// the post-mutation final state.
+function print_table_id_first(db: Connection*) -> int {
+    return run_select(db, Str::from(
+        "SELECT id, body, priority, done FROM notes ORDER BY id ASC"));
+}
+
+/// Drive a four-column SELECT and render it as an aligned table.
+/// Pulls the row loop out of the orderings above so they share one
+/// implementation.
+function run_select(db: Connection*, sql: Str) -> int {
+    mut q: Statement = match (db.prepare(sql)) {
+        Result::Ok(s)  => { s }
+        Result::Err(e) => { return bail("PREPARE SELECT", e); }
+    };
+
+    printf("           +------+------------------------------+----------+------+\n");
+    printf("           |  id  |  body                        | priority | done |\n");
+    printf("           +------+------------------------------+----------+------+\n");
+
+    mut row_count: i32 = 0;
+    loop {
+        match (q.step()) {
+            Result::Ok(outcome) => {
+                if (outcome.is_done()) { break; }
+                const id:        i64 = q.column_int(0);
+                const body:      Str = q.column_text(1);
+                const priority:  i64 = q.column_int(2);
+                const done:      i64 = q.column_int(3);
+                printf("           | %4lld | %-28.*s | %8lld | %s  |\n",
+                       id,
+                       body.length() as i32, body.as_ptr(),
+                       priority,
+                       if (done == 1) { "yes" } else { "no " });
+                row_count = row_count + 1;
+            }
+            Result::Err(e) => {
+                q.drop();
+                return bail("step SELECT", e);
+            }
+        }
+    }
+    printf("           +------+------------------------------+----------+------+\n");
+    if (row_count == 0) {
+        printf("           (no rows)\n");
+    }
+    q.drop();
+    return 0;
+}
+
+/// `SELECT COUNT(*) FROM notes` — single-row, single-column query.
+function count_notes(db: Connection*) -> Result<i64, CqError> {
+    mut q: Statement = match (db.prepare(Str::from(
+        "SELECT COUNT(*) FROM notes"
+    ))) {
+        Result::Ok(s)  => { s }
+        Result::Err(e) => { return Result::Err(e); }
+    };
+    const result: Result<i64, CqError> = match (q.step()) {
+        Result::Ok(_) => {
+            const n: i64 = q.column_int(0);
+            Result::Ok(n)
+        }
+        Result::Err(e) => { Result::Err(e) }
+    };
+    q.drop();
+    return result;
 }
