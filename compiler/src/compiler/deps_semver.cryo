@@ -1,0 +1,214 @@
+///! Semver constraint matching for git deps.
+///!
+///! Parses a small subset of semver — `MAJOR.MINOR.PATCH` with an
+///! optional leading `v` and an optional `^` constraint operator.
+///! Pre-release suffixes (`-rc.1`, `+build.5`) are accepted at the
+///! parser level but ignored for ordering.
+///!
+///! Supported constraint forms:
+///!
+///!   "1.2.3"   exact match against a tag named `1.2.3` or `v1.2.3`
+///!   "^1.2.3"  highest tag X.Y.Z with X==1 and (Y > 2 or Y==2 and Z>=3)
+///!   "^0.2.3"  highest tag 0.Y.Z with Y==2 and Z>=3   (cargo-style)
+///!   "^0.0.3"  highest tag 0.0.Z with Z==3            (cargo-style)
+///!
+///! Tilde, hyphen, and explicit-comparator ranges (`>=`, `<`, `>`, …)
+///! are not yet supported — we'd want them eventually but they're not
+///! load-bearing for the v1 use case.
+
+namespace Compiler::DepsSemver;
+
+import Utils::Logger;
+
+
+// ============================================================================
+// Version
+// ============================================================================
+
+/// Parsed `MAJOR.MINOR.PATCH`.  `valid == false` ⇔ the source string
+/// failed to parse; the numeric fields are meaningless in that case.
+type struct Version {
+    major: i64;
+    minor: i64;
+    patch: i64;
+    valid: boolean;
+
+    static invalid() -> Version {
+        return Version { major: 0, minor: 0, patch: 0, valid: false };
+    }
+
+    /// Lexicographic ordering on (major, minor, patch).  Returns
+    /// negative if `a < b`, 0 on equality, positive if `a > b`.
+    static cmp(a: Version, b: Version) -> i64 {
+        if (a.major != b.major) { return a.major - b.major; }
+        if (a.minor != b.minor) { return a.minor - b.minor; }
+        return a.patch - b.patch;
+    }
+}
+
+/// Parse `vX.Y.Z` or `X.Y.Z`.  Anything trailing the patch (e.g.
+/// `-rc.1` or `+build`) is accepted but discarded.  Returns
+/// `Version::invalid()` on malformed input.
+function parse_version(s: string) -> Version {
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return Version::invalid(); }
+
+    mut i: i64 = 0;
+    if (s[0] == 'v' || s[0] == 'V') { i = 1; }
+
+    mut major: i64 = -1;
+    mut minor: i64 = -1;
+    mut patch: i64 = -1;
+
+    const after_major: i64 = read_digits(s, i, len);
+    if (after_major == i) { return Version::invalid(); }
+    major = read_int(s, i, after_major);
+    i = after_major;
+    if (i >= len || s[i] != '.') { return Version::invalid(); }
+    i = i + 1;
+
+    const after_minor: i64 = read_digits(s, i, len);
+    if (after_minor == i) { return Version::invalid(); }
+    minor = read_int(s, i, after_minor);
+    i = after_minor;
+    if (i >= len || s[i] != '.') { return Version::invalid(); }
+    i = i + 1;
+
+    const after_patch: i64 = read_digits(s, i, len);
+    if (after_patch == i) { return Version::invalid(); }
+    patch = read_int(s, i, after_patch);
+    // Trailing pre-release/build metadata is ignored for ordering.
+
+    return Version { major: major, minor: minor, patch: patch, valid: true };
+}
+
+
+// ============================================================================
+// Constraint
+// ============================================================================
+
+/// Constraint operators we understand.
+type enum ConstraintOp {
+    Exact;   // "1.2.3"   — matches only the literal version
+    Caret;   // "^1.2.3"  — cargo-style upper-bound
+}
+
+type struct Constraint {
+    op:    ConstraintOp;
+    bound: Version;
+    valid: boolean;
+
+    static invalid() -> Constraint {
+        return Constraint {
+            op:    ConstraintOp::Exact,
+            bound: Version::invalid(),
+            valid: false,
+        };
+    }
+}
+
+/// Parse a constraint string — the value the user wrote in
+/// `version = "..."`.  The leading `^` selects caret semantics; absent
+/// it, exact match.
+function parse_constraint(s: string) -> Constraint {
+    if (strlen(s) == 0) { return Constraint::invalid(); }
+
+    mut op:   ConstraintOp = ConstraintOp::Exact;
+    mut body: string       = s;
+    if (s[0] == '^') {
+        op = ConstraintOp::Caret;
+        body = substr_local(s, 1, strlen(s) as i64 - 1);
+    }
+
+    const v: Version = parse_version(body);
+    if (!v.valid) { return Constraint::invalid(); }
+    return Constraint { op: op, bound: v, valid: true };
+}
+
+/// Does `v` satisfy `c`?
+function satisfies(c: Constraint, v: Version) -> boolean {
+    if (!c.valid || !v.valid) { return false; }
+
+    return match (c.op) {
+        ConstraintOp::Exact => { Version::cmp(v, c.bound) == 0 }
+        ConstraintOp::Caret => { caret_satisfies(c.bound, v) }
+    };
+}
+
+/// Caret-range upper-bound check (cargo / npm convention):
+///   ^1.2.3 ⇒ <2.0.0
+///   ^0.2.3 ⇒ <0.3.0
+///   ^0.0.3 ⇒ <0.0.4
+function caret_satisfies(bound: Version, v: Version) -> boolean {
+    if (Version::cmp(v, bound) < 0) { return false; }
+    if (bound.major != 0) {
+        return v.major == bound.major;
+    }
+    if (bound.minor != 0) {
+        return v.major == 0 && v.minor == bound.minor;
+    }
+    return v.major == 0 && v.minor == 0 && v.patch == bound.patch;
+}
+
+
+// ============================================================================
+// Selection
+// ============================================================================
+
+/// Given a list of candidate tag strings, pick the highest-versioned
+/// one that satisfies `c`.  Returns "" when nothing matches.
+///
+/// Tags that fail to parse as semver are silently skipped — projects
+/// often have non-version refs like `latest` or `nightly` mixed in.
+function select_best_tag(c: Constraint, tags: string[]) -> string {
+    mut best_tag: string  = "";
+    mut best_v:   Version = Version::invalid();
+
+    for (mut i: int = 0; i < tags.length; i++) {
+        const tag: string = tags[i];
+        const v:   Version = parse_version(tag);
+        if (!v.valid) { continue; }
+        if (!satisfies(c, v)) { continue; }
+        if (!best_v.valid || Version::cmp(v, best_v) > 0) {
+            best_v   = v;
+            best_tag = tag;
+        }
+    }
+
+    return best_tag;
+}
+
+
+// ============================================================================
+// Internals
+// ============================================================================
+
+/// Walk past the run of ASCII digits in `s` starting at `i`, capped
+/// at `end`.  Returns the index of the first non-digit (or `end`).
+function read_digits(s: string, i: i64, end: i64) -> i64 {
+    mut p: i64 = i;
+    while (p < end && s[p] >= '0' && s[p] <= '9') {
+        p = p + 1;
+    }
+    return p;
+}
+
+/// Parse `s[start..end)` as a non-negative decimal integer.  Caller
+/// must have established the range is all-digits via `read_digits`.
+function read_int(s: string, start: i64, end: i64) -> i64 {
+    mut acc: i64 = 0;
+    for (mut p: i64 = start; p < end; p++) {
+        acc = acc * 10 + (s[p] - '0') as i64;
+    }
+    return acc;
+}
+
+/// Local copy of substr — same body as in the other deps modules.
+function substr_local(s: string, start: i64, length: i64) -> string {
+    if (length <= 0) { return ""; }
+    const buf: i8* = malloc(length as u64 + 1);
+    memcpy(buf as void*, ptr_add(s as void*, start) as void*, length as u64);
+    const term: i8* = ptr_add(buf as void*, length) as i8*;
+    memset(term as void*, 0, 1);
+    return buf as string;
+}

@@ -3,6 +3,7 @@ namespace CLI::Commands;
 import Compiler::Instance;
 import Compiler::CompilationContext;
 import Compiler::ProjectConfig;
+import Compiler::DepsResolver;
 import Compiler::Resolver::Demangler;
 import Utils;
 import Utils::File;
@@ -23,6 +24,8 @@ type enum CommandKind {
     Raw;
     Project; // TODO: remove this and just use `build` with auto-detection of cryoconfig
     Demangle;
+    Fetch;
+    Update;
     Unknown;
 }
 
@@ -39,6 +42,8 @@ implement enum CommandKind {
             CommandKind::Raw     => { "raw"     }
             CommandKind::Project  => { "project"  }
             CommandKind::Demangle => { "demangle" }
+            CommandKind::Fetch    => { "fetch"    }
+            CommandKind::Update   => { "update"   }
             _ => { "" }
         };
     }
@@ -55,6 +60,8 @@ implement enum CommandKind {
             CommandKind::Raw      => { "Compile without stdlib or prelude"            }
             CommandKind::Project  => { "Build a multi-module project from cryoconfig" }
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
+            CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
+            CommandKind::Update   => { "Re-resolve every dependency, ignoring the lockfile" }
             _ => { "" }
         };
     }
@@ -71,6 +78,8 @@ implement enum CommandKind {
             CommandKind::Raw      => { "cryoc raw <file> [flags]"         }
             CommandKind::Project  => { "cryoc project [dir] [flags]"      }
             CommandKind::Demangle => { "cryoc demangle <mangled-symbol>"  }
+            CommandKind::Fetch    => { "cryo fetch"                        }
+            CommandKind::Update   => { "cryo update"                       }
             _ => { "" }
         };
     }
@@ -112,6 +121,12 @@ type struct Executor {
 
         const demangle: CommandKind = CommandKind::Demangle;
         runner.add_command(Command::new(demangle.name(), demangle.description(), demangle.usage()));
+
+        const fetch: CommandKind = CommandKind::Fetch;
+        runner.add_command(Command::new(fetch.name(), fetch.description(), fetch.usage()));
+
+        const update: CommandKind = CommandKind::Update;
+        runner.add_command(Command::new(update.name(), update.description(), update.usage()));
     }
 
     /// Resolves a command name string to a CommandKind.
@@ -126,6 +141,8 @@ type struct Executor {
         if (name == "raw")      { return CommandKind::Raw; }
         if (name == "project")  { return CommandKind::Project; }
         if (name == "demangle") { return CommandKind::Demangle; }
+        if (name == "fetch")    { return CommandKind::Fetch; }
+        if (name == "update")   { return CommandKind::Update; }
         return CommandKind::Unknown;
     }
 
@@ -148,6 +165,8 @@ type struct Executor {
             CommandKind::Raw     => { return Executor::cmd_raw(args); }
             CommandKind::Project  => { return Executor::cmd_project(args); }
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
+            CommandKind::Fetch    => { return Executor::cmd_fetch(args); }
+            CommandKind::Update   => { return Executor::cmd_update(args); }
             CommandKind::Unknown => {
                 printf("Error: Unknown command. Run 'cryoc help' for usage.\n");
                 return 1;
@@ -820,5 +839,65 @@ type struct Executor {
         printf("Compilation failed (%u errors, %u warnings)\n",
             result.error_count, result.warning_count);
         return 1;
+    }
+
+    /// `cryo fetch` — resolve every dep against its remote, materialize
+    /// missing checkouts, and write `cryoconfig.lock`.  Reuses existing
+    /// lockfile entries when the cryoconfig spec is unchanged.
+    static cmd_fetch(args: ParsedArgs) -> int {
+        return Executor::run_dep_resolve(args, ResolveMode::Fetch);
+    }
+
+    /// `cryo update` — like `fetch`, but ignores the existing lockfile
+    /// and re-resolves every git dep from scratch.  Used to bump pinned
+    /// SHAs to the latest tag/branch tip.
+    static cmd_update(args: ParsedArgs) -> int {
+        return Executor::run_dep_resolve(args, ResolveMode::Update);
+    }
+
+    /// Shared implementation for `cryo fetch` and `cryo update`.
+    static run_dep_resolve(args: ParsedArgs, mode: ResolveMode) -> int {
+        if (args.has_flag("debug")) {
+            Logger::enable_debug();
+        }
+
+        const config_path: string = find_cryoconfig(".");
+        if (strlen(config_path) == 0) {
+            printf("Error: no cryoconfig found in this directory.\n");
+            printf("       run `cryo init` first to scaffold a project.\n");
+            return 1;
+        }
+
+        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        if (config.error_count > 0) {
+            printf("cryoconfig has %lld schema error(s); fix them before fetching.\n",
+                config.error_count);
+            return 1;
+        }
+
+        if (config.dependencies.length == 0) {
+            printf("No dependencies declared in %s — nothing to do.\n", config_path);
+            return 0;
+        }
+
+        const lock_path: string = format("%s/cryoconfig.lock",
+            config.project_root);
+        const outcome: ResolveOutcome = DepsResolver::resolve(
+            &config, mode, lock_path);
+        if (outcome.failed) {
+            printf("Dependency resolution failed.\n");
+            return 1;
+        }
+
+        const verb: string = match (mode) {
+            ResolveMode::Update => { "Updated" }
+            _                   => { "Fetched" }
+        };
+        printf("%s %lld dependency entr%s; lockfile written to %s\n",
+            verb,
+            outcome.lock.packages.length as i64,
+            if (outcome.lock.packages.length == 1) { "y" } else { "ies" },
+            lock_path);
+        return 0;
     }
 }
