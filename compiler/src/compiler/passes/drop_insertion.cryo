@@ -24,14 +24,24 @@
 ///!   functions like `drop_cstring_array(&x)` that drop via reference
 ///!   (which the analyzer can't detect as a consume).  Enabling
 ///!   synthesis without first stripping those produces double-drops.
-///! - Several stdlib methods (e.g. `Box::into_raw`) take `&this`
-///!   syntactically but consume semantically.  Marking them correctly
-///!   needs a `![consumes_self]`-style attribute the language doesn't
-///!   yet support.
 ///!
-///! Phase 2 will land the strip + the attribute, then re-enable the
-///! gate.  Until then the pass behaves as a flow-sensitive move-checker
-///! that emits `E0456_CONDITIONAL_MOVE` errors but doesn't mutate.
+///! The `![consumes_self]` attribute landed (see
+///! `passes/directive_processing.cryo` + `types/ownership.cryo`'s
+///! `method_consumes_receiver`), so methods that take `&this`
+///! syntactically but consume semantically can now be tagged.  The
+///! call-site walk in `read_call` below treats those calls as moves
+///! the same way it treats `mut this` / `this` receivers and explicit
+///! `.drop()` calls.
+///!
+///! What's left before flipping `SYNTHESIZE_DROPS = true`:
+///!   1. Sweep stdlib: remove every manual `.drop()` call that the
+///!      analyzer would now synthesize (most of the ~158 sites), and
+///!      tag `![consumes_self]` on the small handful of `&this`
+///!      methods that consume (e.g. `Box::into_raw` if it ever moves
+///!      back to a `&this` shape).
+///!   2. Add coverage for the consume path on generic instantiations
+///!      so the synthesizer doesn't double-drop when a spec inherits
+///!      a tagged method from its template.
 
 namespace Compiler::Passes::DropInsertion;
 
@@ -1015,7 +1025,29 @@ type struct DropInserter {
                 }
             }
         }
-        if (c.callee != null) { this.walk_expr_read(c.callee); }
+        // General consuming-method case: any method whose receiver is
+        // by-value (`mut this` / `this`) or that carries
+        // `![consumes_self]` consumes the LHS at the call site.
+        // Walk the receiver in move context — that mirrors what the
+        // explicit `.drop()` arm above does, but for any consuming
+        // method (e.g. `Box::into_raw`).  When SYNTHESIZE_DROPS flips
+        // on, the same path tells the synthesiser not to emit a drop
+        // for the consumed binding.
+        mut receiver_moved: boolean = false;
+        if (c.resolved_method != null && c.callee != null
+                && c.callee.kind == NodeKind::MemberAccess) {
+            const m: MethodNode* = c.resolved_method as MethodNode*;
+            if (OwnershipQuery::method_consumes_receiver(this.arena, m)) {
+                const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+                if (ma.object != null) {
+                    this.walk_expr_move(ma.object);
+                    receiver_moved = true;
+                }
+            }
+        }
+        if (!receiver_moved && c.callee != null) {
+            this.walk_expr_read(c.callee);
+        }
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
             this.walk_expr_move(c.arguments[i]);
         }

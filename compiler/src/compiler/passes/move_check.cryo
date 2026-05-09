@@ -341,7 +341,29 @@ type struct MoveChecker {
 
     read_call(mut &this, c: CallExprNode*) -> void {
         if (c == null) { return; }
-        if (c.callee != null) { this.walk_expr_read(c.callee); }
+        // Method call to a consuming method: treat the receiver
+        // (`x` in `x.method(...)`) as moved.  Without this, a method
+        // declared `mut this` or marked `![consumes_self]` would still
+        // appear as a borrow at the call site, since the LHS of a
+        // member-access defaults to `walk_expr_read`.  Resolved-method
+        // is null for free functions, scope-resolution calls, and
+        // calls sema couldn't resolve — those fall through to the
+        // standard read+arg-move walk below.
+        mut receiver_moved: boolean = false;
+        if (c.resolved_method != null && c.callee != null
+                && c.callee.kind == NodeKind::MemberAccess) {
+            const m: MethodNode* = c.resolved_method as MethodNode*;
+            if (OwnershipQuery::method_consumes_receiver(this.arena, m)) {
+                const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+                if (ma.object != null) {
+                    this.walk_expr_move(ma.object);
+                    receiver_moved = true;
+                }
+            }
+        }
+        if (!receiver_moved && c.callee != null) {
+            this.walk_expr_read(c.callee);
+        }
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
             this.walk_expr_move(c.arguments[i]);
         }
