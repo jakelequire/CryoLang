@@ -1,0 +1,141 @@
+///! Integer literal codegen — signedness and bit-pattern preservation.
+///!
+///! Pinning the codegen contract for `LiteralKind::Integer`: a u64 (or
+///! any unsigned-typed) literal whose bit pattern crosses i64::MAX must
+///! still compare correctly as unsigned. Historical bug
+///! (expr_codegen.cryo:109) sign-extended every integer literal
+///! regardless of the source-level type's signedness, which made inline
+///! comparisons against u64 literals exceeding i64::MAX silently flip
+///! to signed semantics. The fix gates `sign_extend` on
+///! `IntType::is_unsigned()`.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::IntegerLiterals;
+
+import std::core::result;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// 2^63 — one past i64::MAX. Smallest positive u64 whose top bit is set,
+// so it sign-extends to a negative APInt under the old codegen path.
+const I64_MAX_PLUS_ONE: u64 = 9223372036854775808;
+
+// u64::MAX — every bit set. Under the old codegen path this becomes -1
+// in any signed comparison.
+const U64_ALL_ONES: u64 = 18446744073709551615;
+
+![test]
+function u64_above_i64_max_compares_positive() -> Result<(), TestError> {
+    const big: u64 = I64_MAX_PLUS_ONE;
+    match (expect(big > 0,
+        Str::from_raw("u64 2^63 should be > 0", 22))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function u64_max_compares_positive() -> Result<(), TestError> {
+    const m: u64 = U64_ALL_ONES;
+    match (expect(m > 0,
+        Str::from_raw("u64::MAX should be > 0", 22))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function u64_above_i64_max_greater_than_small() -> Result<(), TestError> {
+    const big: u64 = I64_MAX_PLUS_ONE;
+    const small: u64 = 5;
+    match (expect(big > small,
+        Str::from_raw("u64 2^63 should be > 5", 22))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function u64_high_bit_eq_self() -> Result<(), TestError> {
+    const a: u64 = I64_MAX_PLUS_ONE;
+    const b: u64 = I64_MAX_PLUS_ONE;
+    match (expect_eq(a, b)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function u64_high_bit_round_trips_as_value() -> Result<(), TestError> {
+    // Storing through a parameter (rvalue copy) and reading back must
+    // preserve the high bit. If the literal codegen sign-extended, the
+    // copy back to a u64 slot would still hold the post-extension bits;
+    // the resulting integer should still compare equal to the literal.
+    const expected: u64 = I64_MAX_PLUS_ONE;
+    mut copy: u64 = expected;
+    match (expect_eq(copy, expected)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function u32_high_bit_compares_positive() -> Result<(), TestError> {
+    // Same hazard, narrower type. 2^31 is i32::MAX + 1; under the old
+    // sign-extend-everywhere path a u32 literal at the high bit could
+    // also flip negative.
+    const big: u32 = 2147483648;
+    match (expect(big > 0,
+        Str::from_raw("u32 2^31 should be > 0", 22))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// PINNED REPRODUCER for the inline-literal-vs-u64 sema bug (originally
+// hit in stdlib/json/parser.cryo's parse_number).
+//
+// Shape: a u64 variable compared against an inline integer literal that
+// exceeds i64::MAX.  Sema currently types such literals as the default
+// int (i32), which truncates the bit pattern to its low 32 bits before
+// codegen ever runs.  For 9_223_372_036_854_775_808 (2^63), the low 32
+// bits are 0x00000000 — so `acc > 9223372036854775808` lowers as
+// `acc > 0`, which is true for every non-zero u64.  Const-hoisting the
+// literal into a `const u64` variable forces the right type and works
+// around it.
+//
+// This test is `![ignore]` until sema's literal-promotion path picks u64
+// when one operand is u64 (the type-checker fix the codegen-level
+// sign_extend correction at expr_codegen.cryo:109 cannot reach — by the
+// time codegen sees the literal, it's already typed i32 and truncated).
+// Run with `cryo test --ignored` to unignore.
+![test]
+![ignore]
+function u64_var_vs_inline_literal_above_i64_max_greater_than() -> Result<(), TestError> {
+    const acc: u64 = 7;
+    match (expect(!(acc > 9223372036854775808),
+        Str::from_raw("u64 7 should not be > 2^63 inline literal", 41))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function i64_negative_literal_still_negative() -> Result<(), TestError> {
+    // Sanity: the fix narrows sign-extension to unsigned types only;
+    // signed types must keep working. -1 must still be < 0.
+    const neg: i64 = -1;
+    match (expect(neg < 0,
+        Str::from_raw("i64 -1 should be < 0", 20))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

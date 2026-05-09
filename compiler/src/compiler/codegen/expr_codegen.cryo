@@ -106,7 +106,30 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
     if (kind == LiteralKind::Integer) {
         if (!ty.is_valid()) { ty = LType::i32(); }
         const val: u64 = parse_int_lexeme(node.value);
-        *out_value = LType::const_int(ty, val, true);
+        // Default to sign-extension (matches signed integer types and the
+        // historical fallback when resolved_type is missing).  For unsigned
+        // integer types we have to pass false: a u64 literal whose bit
+        // pattern exceeds i64::MAX (e.g. 0x9000000000000000) is otherwise
+        // sign-extended into a negative APInt, and a later inline `>` against
+        // 0 is lowered as a *signed* compare against a negative constant —
+        // i.e. the literal silently flips negative.  Chase InstantiatedType
+        // wrappers the same way codegen_binary does at line 246 so generic
+        // contexts behave identically to concrete ones.
+        mut sign_extend: boolean = true;
+        mut sty: Type* = cg.lookup_type_by_id(node.resolved_type.id);
+        mut sbd: i32 = 0;
+        while (sty != null && sty.kind == TypeKind::InstantiatedType && sbd < 5) {
+            const sinst: InstantiatedType* = sty as InstantiatedType*;
+            if (sinst.has_resolved_type()) {
+                sty = cg.lookup_type_by_id(sinst.resolved_type.id);
+            } else { break; }
+            sbd = sbd + 1;
+        }
+        if (sty != null && sty.kind == TypeKind::Int) {
+            const sint: IntType* = sty as IntType*;
+            if (sint.int_kind.is_unsigned()) { sign_extend = false; }
+        }
+        *out_value = LType::const_int(ty, val, sign_extend);
     } else if (kind == LiteralKind::Float) {
         if (!ty.is_valid()) { ty = LType::f64(); }
         mut val: f64 = 0.0;

@@ -11,11 +11,21 @@
 #   /usr/local/bin/cryo            → <repo>/bin/cryo
 #   /usr/local/share/cryo/stdlib   → <repo>/stdlib
 #
-# The compiler reads /proc/self/exe at startup and looks for stdlib at
-#   <bindir>/../stdlib            (this layout's repo-pointing symlink)
-#   <bindir>/../share/cryo/stdlib (this layout's share-pointing symlink)
-# in that order, so either resolution path lands on the repo's stdlib.
-# Set $CRYO_STDLIB to override.
+# Stdlib lookup at runtime, in priority order:
+#   1. --stdlib=PATH                   (one-off CLI override)
+#   2. $CRYO_STDLIB                    (explicit stdlib path env override)
+#   3. $CRYO_HOME/stdlib               (install-root env; cross-platform)
+#      $CRYO_HOME/share/cryo/stdlib    (FHS layout under install root)
+#   4. <bindir>/../stdlib              (Linux only, via /proc/self/exe)
+#      <bindir>/../share/cryo/stdlib   (Linux only, via /proc/self/exe)
+#   5. [project] stdlib_root           (per-project pin in cryoconfig)
+#   6. <project_root>/../stdlib        (legacy in-tree fallback)
+#
+# On Linux, this installer's symlink layout makes (4) work without any
+# environment setup — running `/usr/local/bin/cryo` resolves to the
+# repo's stdlib via /proc/self/exe.  On macOS or any non-Linux, (4)
+# fails (no /proc); set $CRYO_HOME to the install share dir (we print
+# the exact line at the end of `install`).
 #
 # Usage: ./install.sh [options]
 #   -y, --yes        Skip the interactive confirmation
@@ -199,8 +209,8 @@ fi
 # ----------------------------------------------------------------------------
 case "$(uname -s)" in
     Linux)  : ;;
-    Darwin) log_warn "macOS install: the compiler's /proc/self/exe-based stdlib lookup is Linux-only. Set CRYO_STDLIB=${SRC_STDLIB} in your shell profile to use this install on macOS." ;;
-    *)      log_warn "unsupported OS: $(uname -s) — proceeding, but stdlib lookup may fail. Set CRYO_STDLIB to override." ;;
+    Darwin) log_warn "macOS install: /proc/self/exe-based stdlib lookup is Linux-only. After install, add 'export CRYO_HOME=${DEST_SHARE}' to your shell profile (or 'export CRYO_STDLIB=${DEST_STDLIB}')." ;;
+    *)      log_warn "unsupported OS: $(uname -s) — proceeding, but stdlib auto-lookup may fail. Set CRYO_HOME=${DEST_SHARE} in your shell profile." ;;
 esac
 
 # ----------------------------------------------------------------------------
@@ -275,6 +285,16 @@ if [ "$ACTION" = "install" ]; then
         echo "  cryo --help"
         echo "  cryo --version"
     fi
+    echo
+    # Cross-platform stdlib setup hint.  On Linux the symlink layout +
+    # /proc/self/exe make this optional, but setting CRYO_HOME makes
+    # things resilient against running the binary from a path that
+    # doesn't have <bindir>/../stdlib (custom prefixes, copied binaries,
+    # macOS, etc.) and is the canonical way to point Cryo at its
+    # install root.
+    echo "Recommended: pin Cryo's install root in your shell profile:"
+    echo "  export CRYO_HOME=\"${DEST_SHARE}\""
+    echo "(Optional on Linux when the symlink install is on PATH; required on macOS / other.)"
     echo
 fi
 
