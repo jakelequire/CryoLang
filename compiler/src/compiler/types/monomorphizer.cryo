@@ -196,6 +196,24 @@ type struct Monomorphizer {
         this.current_module = module;
     }
 
+    /// True iff every queued specialization request has been drained.
+    /// Used by the pipeline driver between Phase 6a (mono across all
+    /// modules) and Phase 6b (sema/validation) to assert that no
+    /// specialization remains pending when sema starts walking.  The
+    /// invariant is structural — sema reads InstantiatedType wrappers
+    /// in the shared TypeArena, and a stale request means sema would
+    /// see types whose specialized AST hasn't been materialized yet.
+    worklist_empty(&this) -> boolean {
+        return this.pending_cursor >= this.pending.length;
+    }
+
+    /// Number of requests still queued (for diagnostic messages).
+    pending_count(&this) -> i64 {
+        const remaining: i64 = this.pending.length - this.pending_cursor;
+        if (remaining < 0) { return 0; }
+        return remaining;
+    }
+
     /// Process all pending monomorphization requests.
     /// Returns true if all succeeded, false if any errors occurred.
     process_all(mut &this) -> boolean {
@@ -636,11 +654,24 @@ type struct Monomorphizer {
             }
         }
 
+        // ====================================================================
+        // SCOPE-SWITCHED REGION — see matching restore at end of region.
+        //
         // Temporarily switch the Resolver to the template's module scope
         // so that names imported by the template's module (e.g. Option,
         // Result, AllocError) can be resolved through the scope chain.
         // This wraps BOTH AST resolution AND type population so that
         // enum variant payload types also resolve in the correct scope.
+        //
+        // !!! DO NOT add early returns or `panic` paths between this line
+        // and the matching `// END SCOPE-SWITCHED REGION` marker.  The
+        // resolver's scope state is process-global; bailing out here
+        // leaves the wrong scope active for every subsequent
+        // specialization in the same pipeline run, which surfaces as
+        // bizarre cross-module name-resolution failures that are very
+        // hard to diagnose.  If you need to bail, jump to the restore
+        // first and then return.
+        // ====================================================================
         mut saved_scope: u64 = 0;
         if (this.type_resolver.name_resolver != null && entry.module_name.is_valid()) {
             const mod_name: string = this.intern_table.resolve(entry.module_name);
@@ -725,7 +756,7 @@ type struct Monomorphizer {
             }
         }
 
-        // Restore the Resolver's scope.
+        // Restore the Resolver's scope.  END SCOPE-SWITCHED REGION.
         if (saved_scope > 0 && this.type_resolver.name_resolver != null) {
             this.type_resolver.name_resolver.set_module_with_scope(
                 this.current_module, saved_scope);

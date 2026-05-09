@@ -130,30 +130,52 @@ function resolve_include_path(source_dir: string, include_path: string) -> strin
 // Preprocessor Invocation
 // ============================================================================
 
+/// Pick the C preprocessor binary.  `CRYO_CC` overrides the default
+/// `clang-20`.  Returned pointer is the env value (caller must NOT
+/// free) when set, otherwise the static default literal.
+function pick_c_preprocessor() -> string {
+    const env_raw: i8* = getenv("CRYO_CC") as i8*;
+    if (env_raw != null) {
+        const env_val: string = env_raw as string;
+        if (strlen(env_val) > 0) { return env_val; }
+    }
+    return "clang-20";
+}
+
 /// Run the C preprocessor on a header file and parse the output.
-/// Returns the number of function declarations extracted.
+/// Returns the number of function declarations extracted.  Emits a
+/// proper diagnostic when the preprocessor fails (missing binary,
+/// non-zero exit, or empty output for a non-empty header) — silent
+/// stderr redirects swallowed every previous failure mode and produced
+/// confusing "no functions imported" results.
 function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
                           ctx: CompilationContext*) -> i32 {
+    const cc: string = pick_c_preprocessor();
+    const cc_len: u64 = strlen(cc);
     const path_len: u64 = strlen(resolved_path);
-    const cmd_prefix: string = "clang-20 -E -P \"";
-    const cmd_suffix: string = "\" 2>/dev/null";
-    const prefix_len: u64 = strlen(cmd_prefix);
-    const suffix_len: u64 = strlen(cmd_suffix);
-    const cmd_len: u64 = prefix_len + path_len + suffix_len + 1;
+    const flags: string = " -E -P \"";
+    const tail:  string = "\"";
+    const flags_len: u64 = strlen(flags);
+    const tail_len:  u64 = strlen(tail);
+    const cmd_len: u64 = cc_len + flags_len + path_len + tail_len + 1;
     const cmd: i8* = malloc(cmd_len) as i8*;
-    memcpy(cmd as void*, cmd_prefix as void*, prefix_len);
-    memcpy((cmd + prefix_len) as void*, resolved_path as void*, path_len);
-    memcpy((cmd + prefix_len + path_len) as void*, cmd_suffix as void*, suffix_len);
-    cmd[prefix_len + path_len + suffix_len] = 0;
+    memcpy(cmd as void*, cc as void*, cc_len);
+    memcpy((cmd + cc_len) as void*, flags as void*, flags_len);
+    memcpy((cmd + cc_len + flags_len) as void*, resolved_path as void*, path_len);
+    memcpy((cmd + cc_len + flags_len + path_len) as void*, tail as void*, tail_len);
+    cmd[cc_len + flags_len + path_len + tail_len] = 0;
 
     if (ctx.debug_mode) {
         cdebug("[CHeaderImport] Running preprocessor: %s\n", cmd);
     }
 
     const pipe: void* = popen(cmd as string, "r");
-    free(cmd as void*);
     if (pipe == null) {
-        cdebug("[CHeaderImport] WARNING: Failed to run clang-20 preprocessor\n");
+        ctx.diagnostics.emit(Diagnostic::error(
+            ErrorCode::E0806_HEADER_PREPROC_FAILED,
+            format("failed to launch C preprocessor '%s' for header '%s' (popen returned null)",
+                cc, resolved_path)));
+        free(cmd as void*);
         return 0;
     }
 
@@ -176,7 +198,23 @@ function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
         output_len = output_len + line_len;
     }
     output_buf[output_len] = 0;
-    pclose(pipe);
+    const exit_code: i32 = pclose(pipe);
+
+    // pclose returns the wait(2) status; non-zero means the preprocessor
+    // exited with an error (or was killed, or the shell couldn't find it
+    // — exit 127).  Surface as a diagnostic instead of silently returning
+    // zero functions, which used to produce "no extern decls visible"
+    // errors at the next pass with no clue why.
+    if (exit_code != 0) {
+        ctx.diagnostics.emit(Diagnostic::error(
+            ErrorCode::E0806_HEADER_PREPROC_FAILED,
+            format("C preprocessor '%s' failed for header '%s' (exit status %d) — set $CRYO_CC if your clang binary is named differently",
+                cc, resolved_path, exit_code)));
+        free(cmd as void*);
+        free(output_buf as void*);
+        return 0;
+    }
+    free(cmd as void*);
 
     if (output_len == 0) {
         free(output_buf as void*);

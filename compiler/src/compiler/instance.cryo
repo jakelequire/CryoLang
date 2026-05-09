@@ -1168,6 +1168,24 @@ type struct CompilerInstance {
             ctx.type_resolver.end_bootstrap();
         }
 
+        // Invariant: every queued specialization must be drained before
+        // Phase 6b starts.  Phase 6b's sema walks the shared TypeArena
+        // expecting every InstantiatedType wrapper to point at a
+        // specialized AST that's already been emitted.  A non-empty
+        // worklist here means a Phase 6a pass exited early without
+        // draining — the system would still produce output but sema
+        // would silently see unresolved generic params, and the bug
+        // would surface as a downstream codegen mangle/link failure.
+        // Cheap insurance for an invariant the pass order silently relies on.
+        if (ctx.monomorphizer != null && !ctx.monomorphizer.worklist_empty()) {
+            const remaining: i64 = ctx.monomorphizer.pending_count();
+            ctx.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("monomorphizer worklist not drained between Phase 6a and 6b (%d pending)",
+                    remaining)));
+            return this.project_failure(ctx);
+        }
+
         // Phase 6b: Validation + Semantic Analysis + Codegen Preparation.
         // Now that every module has been monomorphized and specialized ASTs
         // injected, GenericValidation can safely walk the entire arena
