@@ -67,6 +67,48 @@ type struct TemplateEntry {
         };
     }
 
+    /// Spec base name for this template — what `MangledName::specialized_identifier`
+    /// keys against.  For free functions this is the bare name (`offset`); for
+    /// static method templates registered under `Owner::method` it folds the
+    /// owner's leaf into the bare name (`Owner_method`) so two methods with
+    /// the same leaf in different owners don't collapse to a single spec
+    /// symbol.  Detected by checking whether the qualified name has more
+    /// segments than `module_name + "::" + name` would account for.
+    spec_base_name(&this, table: InternTable*) -> SymbolStr {
+        const qualified_str: string = table.resolve(this.qualified_name);
+        const module_str: string = table.resolve(this.module_name);
+        const name_str: string = table.resolve(this.name);
+        const qualified_len: i64 = strlen(qualified_str) as i64;
+        const module_len: i64 = strlen(module_str) as i64;
+        const name_len: i64 = strlen(name_str) as i64;
+        const expected_no_owner: i64 = if (module_len == 0) {
+            name_len
+        } else {
+            module_len + 2 + name_len
+        };
+        if (qualified_len <= expected_no_owner) {
+            return this.name;
+        }
+        // qualified = "module::Owner::name" — extract `Owner` (the segment
+        // immediately preceding the leaf) and prepend it to the spec base.
+        const owner_start: i64 = if (module_len == 0) { 0 } else { module_len + 2 };
+        const owner_end: i64 = qualified_len - 2 - name_len;
+        if (owner_end <= owner_start) { return this.name; }
+        // Use the LAST owner segment only — multi-segment owners (nested
+        // namespaces) would produce ugly names; the immediate parent type
+        // is what disambiguates same-leaf method collisions.
+        mut last_sep: i64 = owner_start - 1;
+        for (mut i: i64 = owner_start; i + 1 < owner_end; i = i + 1) {
+            if (qualified_str[i] == ':' && qualified_str[i + 1] == ':') {
+                last_sep = i + 1;
+            }
+        }
+        const leaf_start: i64 = last_sep + 1;
+        const owner_leaf: string = substr(
+            qualified_str, leaf_start, owner_end - leaf_start);
+        return table.intern(owner_leaf + "_" + name_str);
+    }
+
     /// Return the GenericParamNode array on the underlying AST declaration.
     /// Used by default-type-parameter substitution to access each param's
     /// `default_annotation`. Returns an empty array for kinds that don't
