@@ -1654,25 +1654,65 @@ public:
     }
 
     resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
-        const lhs: TypeRef = this.resolve_expr(bin.left);
-        // Push the LHS type as the expected type while resolving the RHS
-        // so that shape-less literals (empty array `[]`, bare struct
-        // literals, generic calls without explicit args) can adopt the
-        // slot they are being written into.  Restore afterward so sibling
-        // expressions don't inherit a stale expectation.
+        // Push the non-literal operand's type as the expected type while
+        // resolving the literal so that shape-less literals (empty array
+        // `[]`, bare struct literals, generic calls without explicit
+        // args, *and* integer/float literals that would otherwise default
+        // to i32/f64) adopt the slot they are being written into.  Without
+        // this, `acc: u64 > 9223372036854775808` types the literal as i32,
+        // truncating the bit pattern to its low 32 bits before codegen
+        // ever sees it (pinned reproducer:
+        // tests/tests/lang/integer_literals.cryo ::
+        // u64_var_vs_inline_literal_above_i64_max_greater_than).  Restore
+        // expected_type afterward so sibling expressions don't inherit a
+        // stale expectation.
+        const left_is_lit:  boolean = is_numeric_literal_expr(bin.left);
+        const right_is_lit: boolean = is_numeric_literal_expr(bin.right);
+
+        mut lhs: TypeRef = TypeRef::invalid();
         mut rhs: TypeRef = TypeRef::invalid();
-        if (bin.op.kind.is_assignment_op() && lhs.is_valid()) {
-            const saved_exp: TypeRef = this.expected_type;
-            this.expected_type = lhs;
-            rhs = this.resolve_expr(bin.right);
-            this.expected_type = saved_exp;
-        } else {
-            rhs = this.resolve_expr(bin.right);
-        }
 
         if (bin.op.kind.is_assignment_op()) {
+            // Assignment: LHS is the slot, push its type as expected for RHS.
+            lhs = this.resolve_expr(bin.left);
+            if (lhs.is_valid()) {
+                const saved_exp: TypeRef = this.expected_type;
+                this.expected_type = lhs;
+                rhs = this.resolve_expr(bin.right);
+                this.expected_type = saved_exp;
+            } else {
+                rhs = this.resolve_expr(bin.right);
+            }
             this.check_assignment_lvalue(bin.left);
             return lhs;
+        }
+
+        // Non-assignment binary ops: when one operand is a numeric literal
+        // and the other isn't, resolve the non-literal first and use its
+        // type as the expected_type for the literal.
+        if (right_is_lit && !left_is_lit) {
+            lhs = this.resolve_expr(bin.left);
+            if (lhs.is_valid()) {
+                const saved_exp: TypeRef = this.expected_type;
+                this.expected_type = lhs;
+                rhs = this.resolve_expr(bin.right);
+                this.expected_type = saved_exp;
+            } else {
+                rhs = this.resolve_expr(bin.right);
+            }
+        } else if (left_is_lit && !right_is_lit) {
+            rhs = this.resolve_expr(bin.right);
+            if (rhs.is_valid()) {
+                const saved_exp: TypeRef = this.expected_type;
+                this.expected_type = rhs;
+                lhs = this.resolve_expr(bin.left);
+                this.expected_type = saved_exp;
+            } else {
+                lhs = this.resolve_expr(bin.left);
+            }
+        } else {
+            lhs = this.resolve_expr(bin.left);
+            rhs = this.resolve_expr(bin.right);
         }
 
         if (lhs.is_valid() && rhs.is_valid()) {
@@ -3742,6 +3782,20 @@ function sema_const_int_index(expr: ExpressionNode*) -> i64 {
     const lit: LiteralNode* = expr as LiteralNode*;
     if (lit.literal_kind != LiteralKind::Integer) { return -1; }
     return parse_tuple_index(lit.value);
+}
+
+/// True when `expr` is a bare integer or float literal node — used by
+/// resolve_binary to decide whether to push the other operand's type as
+/// expected_type.  Negative literals (`-5`) parse as UnaryExpression
+/// wrapping the literal and aren't matched here; that's a separate
+/// promotion case to handle if it surfaces.
+function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::Literal) { return false; }
+    const lit: LiteralNode* = expr as LiteralNode*;
+    return lit.literal_kind == LiteralKind::Integer
+        || lit.literal_kind == LiteralKind::Float;
 }
 
 /// Parse a member-name SymbolStr as a non-negative tuple index. Returns
