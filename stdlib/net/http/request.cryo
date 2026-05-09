@@ -9,6 +9,7 @@
 namespace std::net::http::request;
 
 import core::intrinsics;
+import core::drop;
 import core::option;
 import core::result;
 import core::slice;
@@ -56,15 +57,12 @@ type struct Request {
     /// not include a segment with that name).
     param(&this, name: Str) -> Option<String> {
         mut key: String = String::from_str(name);
-        const result: Option<String> = this.params.get(&key);
-        key.drop();
-        return result;
+        return this.params.get(&key);
     }
 
     /// Replace the body and set Content-Length accordingly.
     set_body(mut &this, body: Array<u8>) -> void {
         mut old: Array<u8> = this.body;
-        old.drop();
         this.body = body;
         mut buffer: u8[24];
         const digits: u64 = integer::write_u64_decimal(&buffer[0], this.body.length());
@@ -82,7 +80,7 @@ type struct Request {
         mut line: String = String::new();
         match (read_line(reader, &line, MAX_HEADER_LINE)) {
             Result::Ok(_) => { }
-            Result::Err(err) => { line.drop(); return Result::Err(err); }
+            Result::Err(err) => { return Result::Err(err); }
         }
 
         // Request-Line: METHOD SP PATH SP VERSION
@@ -102,7 +100,6 @@ type struct Request {
             i++;
         }
         if (first_sp == line.length() || second_sp == line.length()) {
-            line.drop();
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
         }
 
@@ -114,7 +111,6 @@ type struct Request {
         match (Method::parse(method_str)) {
             Option::Some(m) => { parsed_method = m; }
             Option::None => {
-                line.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
         }
@@ -127,26 +123,23 @@ type struct Request {
             body:    Array::new(),
             params:  HashMap::new()
         };
-        line.drop();
 
-        // Header block: lines until an empty one.
+        // Header block: lines until an empty one.  The loop body owns
+        // each `header_line` String; loop iterations are conservative
+        // for the analyzer, so we keep an explicit drop on the success
+        // path inside the loop.
         loop {
             mut header_line: String = String::new();
             match (read_line(reader, &header_line, MAX_HEADER_LINE)) {
                 Result::Ok(_) => { }
                 Result::Err(err) => {
-                    header_line.drop();
-                    req.drop();
                     return Result::Err(err);
                 }
             }
             if (header_line.is_empty()) {
-                header_line.drop();
                 break;
             }
             if (!req.headers.parse_line(header_line.as_str())) {
-                header_line.drop();
-                req.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
             header_line.drop();
@@ -159,8 +152,6 @@ type struct Request {
                 match (integer::parse_u64(value.as_str())) {
                     Option::Some(len) => {
                         if (len > MAX_BODY) {
-                            value.drop();
-                            req.drop();
                             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                         }
                         mut body: Array<u8> = Array::with_capacity(len);
@@ -173,9 +164,6 @@ type struct Request {
                             match (reader.read(&buffer[0], take)) {
                                 Result::Ok(n) => {
                                     if (n == 0) {
-                                        value.drop();
-                                        body.drop();
-                                        req.drop();
                                         return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
                                     }
                                     mut j: u64 = 0;
@@ -183,9 +171,6 @@ type struct Request {
                                     remaining = remaining - n;
                                 }
                                 Result::Err(err) => {
-                                    value.drop();
-                                    body.drop();
-                                    req.drop();
                                     return Result::Err(err);
                                 }
                             }
@@ -193,12 +178,9 @@ type struct Request {
                         req.body = body;
                     }
                     Option::None => {
-                        value.drop();
-                        req.drop();
                         return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                     }
                 }
-                value.drop();
             }
             Option::None => { }
         }
@@ -253,6 +235,9 @@ type struct Request {
         return Result::Ok(());
     }
 
+}
+
+implement trait Drop for struct Request {
     drop(mut &this) -> void {
         this.path.drop();
         this.version.drop();

@@ -18,6 +18,7 @@ import core::intrinsics;
 import core::option;
 import core::result;
 import core::slice;
+import core::drop;
 import io::error;
 import io::fd;
 import io::traits;
@@ -93,15 +94,6 @@ type struct ChildStdin {
         return ChildStdin { fd: raw_fd };
     }
 
-    /// Close the pipe. Ownership obligation: call this (or let the
-    /// `Child` drop do it) before the handle goes out of scope.
-    /// Closing here signals EOF to the child's stdin.
-    drop(mut &this) -> void {
-        if (this.fd >= 0) {
-            fd::close_fd(this.fd);
-            this.fd = -1;
-        }
-    }
 }
 
 implement trait Write for struct ChildStdin {
@@ -121,13 +113,6 @@ type struct ChildStdout {
     static from_fd(raw_fd: i32) -> ChildStdout {
         return ChildStdout { fd: raw_fd };
     }
-
-    drop(mut &this) -> void {
-        if (this.fd >= 0) {
-            fd::close_fd(this.fd);
-            this.fd = -1;
-        }
-    }
 }
 
 implement trait Read for struct ChildStdout {
@@ -142,13 +127,6 @@ type struct ChildStderr {
 
     static from_fd(raw_fd: i32) -> ChildStderr {
         return ChildStderr { fd: raw_fd };
-    }
-
-    drop(mut &this) -> void {
-        if (this.fd >= 0) {
-            fd::close_fd(this.fd);
-            this.fd = -1;
-        }
     }
 }
 
@@ -250,23 +228,63 @@ public:
         return Result::Ok(());
     }
 
-    /// Close any captured pipe ends. Does **not** reap the child —
-    /// forgetting to `wait` leaks a zombie in the kernel. Documented
-    /// obligation; a future revision can make this best-effort-reap
-    /// when the type system can express "must be used" linearity.
+}
+
+// ============================================================================
+// Trait impls
+// ============================================================================
+
+/// Close the pipe. Ownership obligation: call drop (or let the `Child`
+/// drop do it) before the handle goes out of scope. Closing here
+/// signals EOF to the child's stdin.
+implement trait Drop for struct ChildStdin {
     drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+implement trait Drop for struct ChildStdout {
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+implement trait Drop for struct ChildStderr {
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+/// Close any captured pipe ends. Does **not** reap the child —
+/// forgetting to `wait` leaks a zombie in the kernel. Documented
+/// obligation; a future revision can make this best-effort-reap when
+/// the type system can express "must be used" linearity.
+implement trait Drop for struct Child {
+    drop(mut &this) -> void {
+        // Drop synthesis releases each `mut handle` at its match-arm
+        // scope exit, which closes the pipe fd before we clear the
+        // field below.
         match (this.stdin) {
-            Option::Some(mut handle) => { handle.drop(); }
+            Option::Some(mut handle) => { }
             Option::None => { }
         }
         this.stdin = Option::None;
         match (this.stdout) {
-            Option::Some(mut handle) => { handle.drop(); }
+            Option::Some(mut handle) => { }
             Option::None => { }
         }
         this.stdout = Option::None;
         match (this.stderr) {
-            Option::Some(mut handle) => { handle.drop(); }
+            Option::Some(mut handle) => { }
             Option::None => { }
         }
         this.stderr = Option::None;

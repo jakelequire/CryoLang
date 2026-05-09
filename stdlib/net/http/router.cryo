@@ -48,6 +48,7 @@ import core::option;
 import core::result;
 import core::hash;
 import core::cmp;
+import core::drop;
 import collections::array;
 import collections::str;
 import collections::string;
@@ -469,19 +470,17 @@ type struct Router {
                         const rm:   Str = route.method.as_str();
                         const reqm: Str = req_local.method.as_str();
                         if (rm.equals(&reqm)) {
-                            // Full match: swap in the captured params and
-                            // dispatch.  HashMap::drop runs each entry's
-                            // K::drop / V::drop via the `Drop` trait, so
-                            // the previous map's owned Strings don't leak.
+                            // Full match: swap in the captured params
+                            // and dispatch.  The explicit drop on the
+                            // old field is required because field
+                            // reassignment isn't covered by drop
+                            // synthesis (only locals at scope exit are).
                             req_local.params.drop();
                             req_local.params = params;
                             return (route.handler)(req_local);
                         } else {
                             path_hit = true;
-                            params.drop();
                         }
-                    } else {
-                        params.drop();
                     }
                 }
                 Option::None => { break; }
@@ -494,7 +493,6 @@ type struct Router {
             match (this.method_not_allowed_handler) {
                 Option::Some(h) => { return (h)(req_local); }
                 Option::None    => {
-                    req_local.drop();
                     return Response::text(
                         StatusCode::method_not_allowed(),
                         Str::from_raw("405 Method Not Allowed\n", 23)
@@ -507,7 +505,6 @@ type struct Router {
         match (this.not_found_handler) {
             Option::Some(h) => { return (h)(req_local); }
             Option::None    => {
-                req_local.drop();
                 return Response::text(
                     StatusCode::not_found(),
                     Str::from_raw("404 Not Found\n", 14)
@@ -518,8 +515,22 @@ type struct Router {
 
     // ── teardown ─────────────────────────────────────────────────────────────
 
-    /// Release the routes array. Call after the server that holds a
-    /// pointer to this router has finished running.
+}
+
+// ============================================================================
+// Trait impls
+// ============================================================================
+
+/// Route holds borrowed Str + plain enums + a function pointer; nothing
+/// to release. The trait impl exists so `Array<Route>` satisfies the
+/// `where T: Drop` bound on `Array::drop`.
+implement trait Drop for struct Route {
+    drop(mut &this) -> void {}
+}
+
+/// Release the routes array. Call after the server that holds a
+/// pointer to this router has finished running.
+implement trait Drop for struct Router {
     drop(mut &this) -> void {
         this.routes.drop();
     }

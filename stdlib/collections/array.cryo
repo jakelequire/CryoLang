@@ -21,6 +21,7 @@ import core::result;
 import core::slice;
 import core::mem;
 import core::ptr;
+import core::drop;
 import alloc::layout;
 import alloc::allocator;
 
@@ -279,22 +280,6 @@ type struct Array<T, A = GlobalAlloc> {
     // Teardown
     // ========================================================================
 
-    /// Release the backing storage. Ownership obligation: every
-    /// Array must have `drop` called before going out of scope. If
-    /// `T` owns resources, drain elements (e.g., loop `pop` and
-    /// drop each) before calling.
-    drop(mut &this) -> void {
-        if (this.ptr != null) {
-            this.alloc.deallocate(
-                NonNull::new(this.ptr as u8*),
-                Layout::array<T>(this.capacity)
-            );
-        }
-        this.ptr = null;
-        this.length = 0;
-        this.capacity = 0;
-    }
-
     // ========================================================================
     // Internal: backing-storage resize
     //
@@ -333,6 +318,36 @@ type struct Array<T, A = GlobalAlloc> {
             }
             Result::Err(err) => { return Result::Err(err); }
         }
+    }
+}
+
+// ============================================================================
+// Trait impls
+// ============================================================================
+
+/// Release the backing storage. Drops every initialized element (the
+/// `[0, length)` prefix) via `T::drop` before reclaiming the allocation,
+/// so `Array<String>`, `Array<Box<…>>`, and similar owning shapes don't
+/// leak. Ownership obligation: every Array must have `drop` called
+/// before going out of scope. Primitive `T`s have no-op `Drop` impls,
+/// so `Array<u32>` etc. still compile to a single deallocation.
+implement<T, A> trait Drop for struct Array<T, A>
+where T: Drop, A: Allocator {
+    drop(mut &this) -> void {
+        mut i: u64 = 0;
+        while (i < this.length) {
+            this.ptr[i].drop();
+            i++;
+        }
+        if (this.ptr != null) {
+            this.alloc.deallocate(
+                NonNull::new(this.ptr as u8*),
+                Layout::array<T>(this.capacity)
+            );
+        }
+        this.ptr = null;
+        this.length = 0;
+        this.capacity = 0;
     }
 }
 

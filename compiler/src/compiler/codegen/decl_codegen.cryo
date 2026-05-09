@@ -835,6 +835,20 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     mut this_ty: LType = LType::null();
     if (is_instance) {
         mut target_ref: TypeRef = di.lookup_type(target_type);
+        if (!target_ref.is_valid()) {
+            // The unit type `()` isn't in the DeclarationIndex (it's a
+            // primitive owned by the arena, never registered through the
+            // decl-collection pass).  Fall back to the arena's canonical
+            // unit TypeRef so `implement trait Drop for ()` and similar
+            // get a real LLVM declaration.  Detected by the literal `()`
+            // suffix on the qualified target name.
+            const target_str: string = intern.resolve(target_type);
+            const tlen: u64 = strlen(target_str);
+            if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
+                          && target_str[tlen - 1] == 0x29 /* ')' */) {
+                target_ref = arena.get_unit();
+            }
+        }
         if (target_ref.is_valid()) {
             target_mapped = cg.type_mapper.map_type(target_ref);
             if (target_mapped.is_valid()) {
@@ -1397,6 +1411,18 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         mut target_ref: TypeRef = cg.ctx.decl_index.lookup_type(qualified_target);
         if (target_ref.is_invalid()) {
             target_ref = cg.ctx.decl_index.lookup_type(target_type);
+        }
+        if (target_ref.is_invalid()) {
+            // Unit-target impls (`implement trait Drop for ()`) — the
+            // unit type lives in the arena, not the DeclarationIndex.
+            // Detected by the literal `()` suffix on the qualified target
+            // name; mirrors the fallback in declare_method.
+            const target_str: string = cg.resolve(target_type);
+            const tlen: u64 = strlen(target_str);
+            if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
+                          && target_str[tlen - 1] == 0x29 /* ')' */) {
+                target_ref = cg.get_arena().get_unit();
+            }
         }
         if (target_ref.is_invalid()) {
             const ts: string = cg.resolve(target_type);

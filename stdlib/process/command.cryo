@@ -21,16 +21,60 @@ import core::intrinsics;
 import core::option;
 import core::result;
 import core::slice;
+import core::drop;
 import io::error;
 import io::fd;
 import io::traits;
 import collections::array;
+import collections::raw_buffer;
 import collections::str;
 import collections::string;
 import alloc::allocator;
 import ffi::cstr;
 import ffi::libc;
 import process::child;
+
+// ============================================================================
+// ArgvBuf — owned grow-on-push buffer of `u8*` for execvp's argv.
+//
+// Wraps `RawBuffer<u8*>` plus a length. Avoids `Array<u8*>` because
+// `Array<T>::drop` requires `T: Drop` and raw pointers can't sit on
+// the impl-target side (the parser only accepts identifier/keyword/`()`).
+// The pointers themselves are non-owning aliases into `argv_storage`'s
+// CStrings — drop just releases the slot array.
+// ============================================================================
+
+type struct ArgvBuf {
+    buf:    RawBuffer<u8*>;
+    length: u64;
+
+    static new() -> ArgvBuf {
+        return ArgvBuf { buf: RawBuffer::new(), length: 0 };
+    }
+
+    push(mut &this, p: u8*) -> Result<(), AllocError> {
+        match (this.buf.reserve(this.length, 1, 8)) {
+            Result::Ok(_) => { }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+        this.buf.ptr()[this.length] = p;
+        this.length = this.length + 1;
+        return Result::Ok(());
+    }
+
+    get(&this, i: u64) -> u8* {
+        return this.buf.ptr()[i];
+    }
+
+    as_ptr(&this) -> u8** {
+        return this.buf.ptr();
+    }
+
+    drop(mut &this) -> void {
+        this.buf.drop();
+        this.length = 0;
+    }
+}
 
 // ============================================================================
 // Stdio
@@ -57,11 +101,6 @@ type enum Stdio {
 type struct EnvEntry {
     key: String;
     value: String;
-
-    drop(mut &this) -> void {
-        this.key.drop();
-        this.value.drop();
-    }
 }
 
 // ============================================================================
@@ -112,8 +151,11 @@ type struct Command {
     }
 
     cwd(mut &this, path: Str) -> void {
+        // Pattern-binding the prior payload to `mut old` makes synthesis
+        // release it at the match-arm scope exit before we overwrite
+        // `this.cwd`.
         match (this.cwd) {
-            Option::Some(mut old) => { old.drop(); }
+            Option::Some(mut old) => { }
             Option::None => { }
         }
         this.cwd = Option::Some(String::from_str(path));
@@ -141,9 +183,7 @@ type struct Command {
         mut configured: Command = clone_command(this);
         configured.stdout_cfg = Stdio::Piped;
         configured.stderr_cfg = Stdio::Piped;
-        const spawned: Result<Child, IoError> = configured.spawn();
-        configured.drop();
-        match (spawned) {
+        match (configured.spawn()) {
             Result::Ok(handle) => {
                 mut c: Child = handle;
                 return collect_output(&c);
@@ -158,37 +198,12 @@ type struct Command {
         match (this.spawn()) {
             Result::Ok(handle) => {
                 mut c: Child = handle;
-                const result: Result<ExitStatus, IoError> = c.wait();
-                c.drop();
-                return result;
+                return c.wait();
             }
             Result::Err(err) => { return Result::Err(err); }
         }
     }
 
-    drop(mut &this) -> void {
-        this.program.drop();
-        // Drain + drop args.
-        loop {
-            match (this.args.pop()) {
-                Option::Some(mut s) => { s.drop(); }
-                Option::None => { break; }
-            }
-        }
-        this.args.drop();
-        loop {
-            match (this.envs.pop()) {
-                Option::Some(mut entry) => { entry.drop(); }
-                Option::None => { break; }
-            }
-        }
-        this.envs.drop();
-        match (this.cwd) {
-            Option::Some(mut path) => { path.drop(); }
-            Option::None => { }
-        }
-        this.cwd = Option::None;
-    }
 }
 
 // ============================================================================
@@ -199,11 +214,6 @@ type struct Output {
     status: ExitStatus;
     stdout: Array<u8>;
     stderr: Array<u8>;
-
-    drop(mut &this) -> void {
-        this.stdout.drop();
-        this.stderr.drop();
-    }
 }
 
 // ============================================================================
@@ -276,16 +286,22 @@ function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
     }
 }
 
-/// Build an argv u8** array from (program, args). `storage` keeps
-/// the CStrings alive; the returned Array<u8*> aliases into them.
+/// Build an argv u8** buffer from (program, args). `storage` keeps the
+/// CStrings alive; the returned `ArgvBuf` aliases into them.
 function build_argv(program: &String,
                     args: &Array<String>,
                     storage: mut &Array<CString>,
-                    argv: mut &Array<u8*>) -> Result<(), IoError> {
+                    argv: mut &ArgvBuf) -> Result<(), IoError> {
     match (CString::from_str(program.as_str())) {
         Result::Ok(c_program) => {
             storage.push(c_program);
-            argv.push(storage.get(storage.length() - 1).unwrap().as_ptr());
+            const slot: u8* = storage.get(storage.length() - 1).unwrap().as_ptr();
+            match (argv.push(slot)) {
+                Result::Ok(_) => { }
+                Result::Err(_) => {
+                    return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                }
+            }
         }
         Result::Err(_) => {
             return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
@@ -298,7 +314,13 @@ function build_argv(program: &String,
                 match (CString::from_str(arg.as_str())) {
                     Result::Ok(c_arg) => {
                         storage.push(c_arg);
-                        argv.push(storage.get(storage.length() - 1).unwrap().as_ptr());
+                        const slot: u8* = storage.get(storage.length() - 1).unwrap().as_ptr();
+                        match (argv.push(slot)) {
+                            Result::Ok(_) => { }
+                            Result::Err(_) => {
+                                return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                            }
+                        }
                     }
                     Result::Err(_) => {
                         return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
@@ -309,7 +331,12 @@ function build_argv(program: &String,
         }
         i++;
     }
-    argv.push(null);
+    match (argv.push(null)) {
+        Result::Ok(_) => { }
+        Result::Err(_) => {
+            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+        }
+    }
     return Result::Ok(());
 }
 
@@ -384,15 +411,13 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
     // 2. Build argv (parent-side; child inherits via fork COW).
     mut argv_storage: Array<CString> = Array::new();
-    mut argv: Array<u8*> = Array::new();
+    mut argv: ArgvBuf = ArgvBuf::new();
     match (build_argv(&cmd.program, &cmd.args, &argv_storage, &argv)) {
         Result::Ok(_) => { }
         Result::Err(err) => {
             close_pipe(&stdin_pipe);
             close_pipe(&stdout_pipe);
             close_pipe(&stderr_pipe);
-            drop_cstring_array(&argv_storage);
-            argv.drop();
             return Result::Err(err);
         }
     }
@@ -407,8 +432,6 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
                     close_pipe(&stdin_pipe);
                     close_pipe(&stdout_pipe);
                     close_pipe(&stderr_pipe);
-                    drop_cstring_array(&argv_storage);
-                    argv.drop();
                     return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
                 }
             }
@@ -423,12 +446,6 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         close_pipe(&stdin_pipe);
         close_pipe(&stdout_pipe);
         close_pipe(&stderr_pipe);
-        drop_cstring_array(&argv_storage);
-        argv.drop();
-        match (cwd_cstr) {
-            Option::Some(mut c) => { c.drop(); }
-            Option::None => { }
-        }
         return Result::Err(err);
     }
 
@@ -450,7 +467,7 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
         if (!apply_env(cmd.clear_env_flag, &cmd.envs)) { libc::_exit(127); }
 
-        libc::execvp(argv.get(0).unwrap(), argv.as_ptr());
+        libc::execvp(argv.get(0), argv.as_ptr());
         // If we got here, exec failed.
         libc::_exit(127);
     }
@@ -501,15 +518,9 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         _ => { }
     }
 
-    // Free CStrings / pointer array — child has its own COW copies,
-    // which are either replaced by exec or abandoned on _exit.
-    drop_cstring_array(&argv_storage);
-    argv.drop();
-    match (cwd_cstr) {
-        Option::Some(mut c) => { c.drop(); }
-        Option::None => { }
-    }
-
+    // The CStrings + pointer array fall out of scope at function exit;
+    // the synthesized drops release them.  The child has its own COW
+    // copies, which are either replaced by exec or abandoned on _exit.
     return Result::Ok(Child::new(pid, stdin_handle, stdout_handle, stderr_handle));
 }
 
@@ -518,15 +529,45 @@ function close_pipe(pair: &PipePair) -> void {
     if (pair.write_end >= 0) { fd::close_fd(pair.write_end); }
 }
 
-function drop_cstring_array(array: &Array<CString>) -> void {
-    mut i: u64 = 0;
-    while (i < array.length()) {
-        match (array.get(i)) {
-            Option::Some(mut c) => { c.drop(); }
-            Option::None => { break; }
-        }
-        i++;
+// ============================================================================
+// Trait impls
+// ============================================================================
+
+implement trait Drop for struct EnvEntry {
+    drop(mut &this) -> void {
+        this.key.drop();
+        this.value.drop();
     }
+}
+
+/// `Array<T>::drop` iterates elements via `where T: Drop`, so the
+/// args/envs arrays release their owned `String`/`EnvEntry` contents
+/// through their own drop calls.
+implement trait Drop for struct Command {
+    drop(mut &this) -> void {
+        this.program.drop();
+        this.args.drop();
+        this.envs.drop();
+        match (this.cwd) {
+            Option::Some(mut path) => { }
+            Option::None => { }
+        }
+        this.cwd = Option::None;
+    }
+}
+
+implement trait Drop for struct Output {
+    drop(mut &this) -> void {
+        this.stdout.drop();
+        this.stderr.drop();
+    }
+}
+
+/// PipePair carries raw fds; the parent/child sides each close their
+/// own end through `close_pipe` / `child_remap`. Dropping the struct
+/// itself is a no-op.
+implement trait Drop for struct PipePair {
+    drop(mut &this) -> void {}
 }
 
 /// Shallow clone of `cmd` so `output()` can override stdout/stderr
@@ -593,14 +634,10 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
                         while (i < n) { stdout_buffer.push(chunk[i]); i++; }
                     }
                     Result::Err(err) => {
-                        handle.drop();
-                        stdout_buffer.drop();
-                        stderr_buffer.drop();
                         return Result::Err(err);
                     }
                 }
             }
-            handle.drop();
             c.stdout = Option::None;
         }
         Option::None => { }
@@ -616,14 +653,10 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
                         while (i < n) { stderr_buffer.push(chunk[i]); i++; }
                     }
                     Result::Err(err) => {
-                        handle.drop();
-                        stdout_buffer.drop();
-                        stderr_buffer.drop();
                         return Result::Err(err);
                     }
                 }
             }
-            handle.drop();
             c.stderr = Option::None;
         }
         Option::None => { }
@@ -638,8 +671,6 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
             });
         }
         Result::Err(err) => {
-            stdout_buffer.drop();
-            stderr_buffer.drop();
             return Result::Err(err);
         }
     }
