@@ -6,11 +6,11 @@
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language and set it apart from its peers:
 
-1. **C-level performance with a modern type system.** Manual memory, no GC, no JIT, monomorphic generics. Algebraic enums, traits, exhaustive pattern matching, and real strings on top of a cost ceiling that doesn't compromise.
+1. **Limitless macros.** The macro system is most similar to Jai's: it is hygienic, powerful enough to express any code transformation, and integrated into the language rather than bolted on as a separate phase. The `macro` keyword introduces a macro definition; the macro body is a function that takes an AST as input and produces an AST as output. Macros are expanded during parsing, so they can be used in any position where normal syntax is allowed.
 
-2. **One toolchain, not a tool stack.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler. Git-backed dependencies resolve into a lockfile; `![test]`-marked functions run fork-per-test.
+2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
-3. **Two abstraction systems, side by side.** Cryo provides single-inheritance classes with virtual dispatch *and* a trait system with monomorphic dispatch. Use a class when the program needs runtime polymorphism over a heterogeneous collection; use a trait when you want compile-time abstraction with no runtime cost.
+3. **Two abstraction systems, side by side.** Cryo provides single-inheritance classes with virtual dispatch *and* a trait system with monomorphic dispatch. Use a class when the program needs runtime polymorphism over a heterogeneous collection; use a trait when you want compile-time abstraction.
 
 The rest of this document is organised by feature area. Examples are runnable against the current compiler; anything aspirational is marked.
 
@@ -1727,6 +1727,7 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
 | Automatic drop synthesis | The analyzer is wired up; AST synthesis is gated off (`SYNTHESIZE_DROPS = false`) until the standard library has been audited and the consuming-method attribute has landed. Owning types currently expose a public `drop(mut &this)` to be called manually. |
+| Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 

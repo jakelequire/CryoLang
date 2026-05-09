@@ -412,6 +412,38 @@ type struct OwnershipQuery {
         return arena.get_qualified_name(ty);
     }
 
+    /// Does a call to `method` move the receiver out of the caller?
+    ///
+    /// True when either:
+    ///   1. The method carries `![consumes_self]` (the user explicitly
+    ///      tagged it as consuming, regardless of receiver syntax).
+    ///   2. The receiver parameter is by-value — i.e. `this` or
+    ///      `mut this`, lowered to a non-reference type on the first
+    ///      parameter slot.  References (`&this` / `mut &this`) lower
+    ///      to a `ReferenceType` and never consume on their own.
+    ///
+    /// Static methods (no receiver) always return false.  Methods with
+    /// an unresolved first-param type return false conservatively —
+    /// the worst that happens is a missed consume diagnostic; the
+    /// alternative would be a false-positive use-after-move warning.
+    static method_consumes_receiver(arena: TypeArena*,
+                                     method: MethodNode*) -> boolean {
+        if (method == null) { return false; }
+        if (method.is_static)         { return false; }
+        if (method.is_consumes_self)  { return true; }
+        if (method.func == null)      { return false; }
+        if (method.func.parameters.length == 0) { return false; }
+        const recv: VarDeclNode* = method.func.parameters[0];
+        if (recv == null || !recv.has_resolved_type()) { return false; }
+        if (arena == null) { return false; }
+        const t: Type* = arena.lookup(recv.resolved_type.id);
+        if (t == null) { return false; }
+        // Reference receivers (`&this` / `mut &this`) borrow.
+        if (t.kind == TypeKind::Reference) { return false; }
+        // Anything else on the first parameter is a by-value receiver.
+        return true;
+    }
+
     /// Strip a qualified name down to its bare leaf — the segment after
     /// the last `::`. Returns the input unchanged when no `::` is
     /// present.
