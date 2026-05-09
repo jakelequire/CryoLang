@@ -22,6 +22,7 @@ import core::option;
 import core::result;
 import core::slice;
 import core::ptr;
+import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import collections::str;
@@ -128,25 +129,6 @@ type struct BufWriter<W> {
         }
     }
 
-    /// Release the buffer. Flushes first so no bytes are dropped
-    /// silently. The inner writer is **not** closed — the caller owns
-    /// and drops it.
-    drop(mut &this) -> void {
-        match (this.flush_buffer()) {
-            Result::Ok(_) => { }
-            Result::Err(_) => { }
-        }
-        if (this.buffer != null) {
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(
-                NonNull::new(this.buffer),
-                Layout::array<u8>(this.capacity)
-            );
-            this.buffer = null;
-            this.capacity = 0;
-            this.length = 0;
-        }
-    }
 }
 
 implement<W> trait Write for struct BufWriter<W>
@@ -214,9 +196,6 @@ type struct LineWriter<W> {
         return this.inner.get_ref();
     }
 
-    drop(mut &this) -> void {
-        this.inner.drop();
-    }
 }
 
 implement<W> trait Write for struct LineWriter<W>
@@ -267,6 +246,33 @@ where W: Write {
 
     flush(mut &this) -> Result<(), IoError> {
         return this.inner.flush();
+    }
+}
+
+/// Release the buffer. Flushes first so no bytes are dropped silently.
+/// The inner writer is **not** closed — the caller owns and drops it.
+implement<W> trait Drop for struct BufWriter<W> {
+    drop(mut &this) -> void {
+        match (this.flush_buffer()) {
+            Result::Ok(_) => { }
+            Result::Err(_) => { }
+        }
+        if (this.buffer != null) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(
+                NonNull::new(this.buffer),
+                Layout::array<u8>(this.capacity)
+            );
+            this.buffer = null;
+            this.capacity = 0;
+            this.length = 0;
+        }
+    }
+}
+
+implement<W> trait Drop for struct LineWriter<W> {
+    drop(mut &this) -> void {
+        this.inner.drop();
     }
 }
 
@@ -357,19 +363,6 @@ type struct BufReader<R> {
         ));
     }
 
-    drop(mut &this) -> void {
-        if (this.buffer != null) {
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(
-                NonNull::new(this.buffer),
-                Layout::array<u8>(this.capacity)
-            );
-            this.buffer = null;
-            this.capacity = 0;
-            this.position = 0;
-            this.filled = 0;
-        }
-    }
 }
 
 implement<R> trait Read for struct BufReader<R>
@@ -438,6 +431,24 @@ where R: Read {
                 }
                 Result::Err(err) => { return Result::Err(err); }
             }
+        }
+    }
+}
+
+implement<R> trait Drop for struct BufReader<R> {
+    drop(mut &this) -> void {
+        // Mirrors the inherent BufReader::drop: release the heap buffer.
+        // The wrapped reader is borrowed; caller drops it.
+        if (this.buffer != null) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(
+                NonNull::new(this.buffer),
+                Layout::array<u8>(this.capacity)
+            );
+            this.buffer = null;
+            this.capacity = 0;
+            this.position = 0;
+            this.filled = 0;
         }
     }
 }

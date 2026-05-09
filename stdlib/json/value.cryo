@@ -18,6 +18,7 @@ import core::option;
 import core::result;
 import core::hash;
 import core::cmp;
+import core::drop;
 import collections::array;
 import collections::hashmap;
 import collections::string;
@@ -134,13 +135,12 @@ type struct JsonObject {
     insert(mut &this, key: String, value: JsonValue) -> void {
         match (this.index.get(&key)) {
             Option::Some(slot) => {
-                // Key already present — drop the old value, drop the
-                // duplicate key, overwrite in place.
+                // Key already present — overwrite in place.  The pulled
+                // `old` and the duplicate `key` are dropped at scope
+                // exit by synthesis.
                 mut old: JsonValue = this.values.get(slot).unwrap();
-                old.drop();
                 this.values.set(slot, value);
                 mut dup: String = key;
-                dup.drop();
                 return;
             }
             Option::None => { }
@@ -164,7 +164,6 @@ type struct JsonObject {
         // optimization is to teach HashMap to take borrowed keys.
         mut probe: String = String::from_str(key);
         const result: Option<u64> = this.index.get(&probe);
-        probe.drop();
         match (result) {
             Option::Some(slot) => {
                 if (slot < this.values.length) {
@@ -194,23 +193,6 @@ type struct JsonObject {
         return this.get(key).is_some();
     }
 
-    /// Recursively drop every value, then the keys, then the index.
-    drop(mut &this) -> void {
-        mut i: u64 = 0;
-        while (i < this.values.length()) {
-            this.values.ptr[i].drop();
-            i++;
-        }
-        mut j: u64 = 0;
-        while (j < this.keys.length()) {
-            this.keys.ptr[j].drop();
-            j++;
-        }
-        this.values.drop();
-        this.keys.drop();
-        // The HashMap stores its own String copies; let it drop them.
-        this.index.drop();
-    }
 }
 
 // ============================================================================
@@ -359,23 +341,31 @@ implement enum JsonValue {
     // Teardown
     // ------------------------------------------------------------------
 
-    /// Recursively free heap storage. The `Null` / `Bool` / `Number`
-    /// variants are no-ops; `String` / `Array` / `Object` walk their
-    /// children.
+}
+
+/// Recursively drop every value, then the keys, then the index.
+/// `Array<T>::drop` and `HashMap<K, V>::drop` walk their elements when
+/// `T`/`K`/`V` implement `Drop`, so we don't iterate by hand here.
+implement trait Drop for struct JsonObject {
+    drop(mut &this) -> void {
+        this.values.drop();
+        this.keys.drop();
+        this.index.drop();
+    }
+}
+
+/// Recursively free heap storage. The `Null` / `Bool` / `Number`
+/// variants are no-ops; `String` / `Array` / `Object` walk their
+/// children. `Array<JsonValue>::drop` recurses into each element via
+/// the `where T: Drop` bound.
+implement trait Drop for enum JsonValue {
     drop(mut &this) -> void {
         match (&this) {
             JsonValue::Null       => { }
             JsonValue::Bool(_)    => { }
             JsonValue::Number(_)  => { }
             JsonValue::String(s)  => { s.drop(); }
-            JsonValue::Array(arr) => {
-                mut i: u64 = 0;
-                while (i < arr.length()) {
-                    arr.ptr[i].drop();
-                    i++;
-                }
-                arr.drop();
-            }
+            JsonValue::Array(arr) => { arr.drop(); }
             JsonValue::Object(obj) => { obj.drop(); }
         }
     }

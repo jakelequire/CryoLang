@@ -17,6 +17,7 @@ import core::intrinsics;
 import core::mem;
 import core::ptr;
 import core::result;
+import core::drop;
 import alloc::layout;
 import alloc::allocator;
 
@@ -74,13 +75,6 @@ type struct Arena {
         this.head = null;
     }
 
-    /// Release every chunk. Ownership obligation: callers must invoke
-    /// `drop` before the Arena goes out of scope. Any pointer returned
-    /// by `allocate` is invalidated.
-    drop(mut &this) -> void {
-        this.reset();
-    }
-
     /// Total bytes currently held in chunks (including unused tail).
     capacity(&this) -> u64 {
         mut total: u64 = 0;
@@ -109,6 +103,22 @@ type struct Arena {
 // ============================================================================
 // Allocator impl
 // ============================================================================
+
+implement trait Drop for struct Arena {
+    drop(mut &this) -> void {
+        // Mirrors the inherent `Arena::drop`: walk the chunk list and
+        // release each backing chunk plus its header.
+        mut chunk: Chunk* = this.head;
+        loop {
+            if (chunk == null) { break; }
+            const next: Chunk* = chunk.next;
+            intrinsics::free(chunk.data as void*);
+            intrinsics::free(chunk as void*);
+            chunk = next;
+        }
+        this.head = null;
+    }
+}
 
 implement trait Allocator for struct Arena {
     allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {

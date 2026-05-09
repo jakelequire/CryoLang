@@ -14,6 +14,7 @@ import core::intrinsics;
 import core::option;
 import core::result;
 import core::slice;
+import core::drop;
 import io::error;
 import io::fd;
 import io::traits;
@@ -126,7 +127,6 @@ type struct File {
             Result::Ok(c_path) => {
                 const raw_fd: i32 = libc::open(c_path.as_ptr(), options.to_flags(), DEFAULT_CREATE_MODE);
                 mut c_local: CString = c_path;
-                c_local.drop();
                 if (raw_fd < 0) {
                     return Result::Err(IoError::from_errno(libc::errno()));
                 }
@@ -148,11 +148,13 @@ type struct File {
         return Result::Ok(pos as u64);
     }
 
-    /// Close the file descriptor. Ownership obligation: every `File`
-    /// must have `drop` called before going out of scope. Calling
-    /// more than once is a bug the kernel may not catch — the second
-    /// `close` could race against an unrelated `open` that reused
-    /// the same fd.
+}
+
+/// Close the file descriptor. Ownership obligation: every `File` must
+/// have `drop` called before going out of scope. Calling more than once
+/// is a bug the kernel may not catch — the second `close` could race
+/// against an unrelated `open` that reused the same fd.
+implement trait Drop for struct File {
     drop(mut &this) -> void {
         if (this.fd >= 0) {
             fd::close_fd(this.fd);
@@ -203,13 +205,10 @@ function read(p: Path) -> Result<Array<u8>, IoError> {
                         }
                     }
                     Result::Err(err) => {
-                        out.drop();
-                        file.drop();
                         return Result::Err(err);
                     }
                 }
             }
-            file.drop();
             return Result::Ok(out);
         }
         Result::Err(err) => { return Result::Err(err); }
@@ -221,9 +220,7 @@ function write(p: Path, bytes: Slice<u8>) -> Result<(), IoError> {
     match (File::create(p)) {
         Result::Ok(handle) => {
             mut file: File = handle;
-            const result: Result<(), IoError> = file.write_all(bytes);
-            file.drop();
-            return result;
+            return file.write_all(bytes);
         }
         Result::Err(err) => { return Result::Err(err); }
     }

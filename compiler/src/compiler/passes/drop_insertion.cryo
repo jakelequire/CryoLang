@@ -12,36 +12,22 @@
 ///!   to the post-loop state (Phase 3 will revisit with proper fixed-
 ///!   point analysis).
 ///!
-///! ## Mutation gate (Phase 1.5: disabled)
+///! ## Synthesis
 ///!
-///! The pass is wired to *synthesize* `binding.drop();` calls at every
-///! scope-exit point (normal fall-through and explicit early-exits)
-///! for every live, non-Copy local declared in that scope, in reverse
-///! declaration order.  That synthesis is gated on `SYNTHESIZE_DROPS`
-///! and currently disabled because:
+///! The pass synthesizes `binding.drop();` calls at every scope-exit
+///! point (normal fall-through and explicit early-exits) for every
+///! live, non-Copy local declared in that scope, in reverse
+///! declaration order.  Move-checked bindings are skipped, as are
+///! types without a `Drop` impl (inherent or trait).
 ///!
-///! - stdlib still has ~158 manual `.drop()` call sites and helper
-///!   functions like `drop_cstring_array(&x)` that drop via reference
-///!   (which the analyzer can't detect as a consume).  Enabling
-///!   synthesis without first stripping those produces double-drops.
+///! Consumption tracking covers three patterns:
+///!   - explicit `.drop()` calls,
+///!   - by-value receivers (`mut this` / `this`),
+///!   - `![consumes_self]`-tagged `&this` methods (e.g. `Box::into_raw`).
 ///!
-///! The `![consumes_self]` attribute landed (see
-///! `passes/directive_processing.cryo` + `types/ownership.cryo`'s
-///! `method_consumes_receiver`), so methods that take `&this`
-///! syntactically but consume semantically can now be tagged.  The
-///! call-site walk in `read_call` below treats those calls as moves
-///! the same way it treats `mut this` / `this` receivers and explicit
-///! `.drop()` calls.
-///!
-///! What's left before flipping `SYNTHESIZE_DROPS = true`:
-///!   1. Sweep stdlib: remove every manual `.drop()` call that the
-///!      analyzer would now synthesize (most of the ~158 sites), and
-///!      tag `![consumes_self]` on the small handful of `&this`
-///!      methods that consume (e.g. `Box::into_raw` if it ever moves
-///!      back to a `&this` shape).
-///!   2. Add coverage for the consume path on generic instantiations
-///!      so the synthesizer doesn't double-drop when a spec inherits
-///!      a tagged method from its template.
+///! All three mark the receiver as moved so synthesis skips it at the
+///! enclosing scope's exit.  See `types/ownership.cryo`'s
+///! `method_consumes_receiver` for the directive plumbing.
 
 namespace Compiler::Passes::DropInsertion;
 
@@ -68,14 +54,6 @@ import Compiler::Types::GenericRegistry;
 import Compiler::Types::Ownership;
 import std::core::option;
 import std::collections::hashmap;
-
-
-/// Phase 1.5 gate: when false the pass runs the analyzer (move
-/// tracking + E0456_CONDITIONAL_MOVE emission) but does not insert
-/// synthesised `binding.drop();` statements.  Flip to true once the
-/// stdlib's manual `.drop()` calls have been stripped and consuming
-/// methods are tagged so synthesis won't double-drop.
-const SYNTHESIZE_DROPS: boolean = false;
 
 
 type struct DropInserter {
@@ -927,10 +905,6 @@ type struct DropInserter {
     }
 
     maybe_append_drop(mut &this, out: StatementNode*[]*, idx: i64) -> void {
-        // Phase 1.5: synthesis disabled.  See module doc.  We still run
-        // the analyzer above (move tracking, branch join, E0456) so
-        // turning synthesis back on later is a one-line flip.
-        if (!SYNTHESIZE_DROPS) { return; }
         const key:  u32       = this.binding_names[idx];
         const ty:   TypeRef   = this.binding_types[idx];
         const span: SourceSpan = this.binding_spans[idx];
@@ -955,9 +929,14 @@ type struct DropInserter {
     }
 
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).
+    /// The synthesized nodes must carry resolved types — codegen runs
+    /// after this pass and won't re-run type resolution, so an
+    /// unresolved `binding.drop()` would lower to `<unknown>.drop()`
+    /// and fail E0156 method lookup.
     make_drop_call(mut &this, name: SymbolStr, ty: TypeRef,
                     span: SourceSpan) -> StatementNode* {
         const ident: IdentifierNode* = new IdentifierNode(name, span);
+        ident.set_resolved_type(ty);
         const member: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
@@ -1030,9 +1009,8 @@ type struct DropInserter {
         // `![consumes_self]` consumes the LHS at the call site.
         // Walk the receiver in move context — that mirrors what the
         // explicit `.drop()` arm above does, but for any consuming
-        // method (e.g. `Box::into_raw`).  When SYNTHESIZE_DROPS flips
-        // on, the same path tells the synthesiser not to emit a drop
-        // for the consumed binding.
+        // method (e.g. `Box::into_raw`).  This tells the synthesiser
+        // not to emit a drop for the consumed binding.
         mut receiver_moved: boolean = false;
         if (c.resolved_method != null && c.callee != null
                 && c.callee.kind == NodeKind::MemberAccess) {

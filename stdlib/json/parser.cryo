@@ -401,7 +401,6 @@ type struct Parser {
         mut out: String = String::new();
         while (true) {
             if (this.eof()) {
-                out.drop();
                 return Result::Err(this.err_eof());
             }
             const b: u8 = this.peek();
@@ -412,18 +411,16 @@ type struct Parser {
             if (b == BACKSLASH) {
                 this.advance();
                 if (this.eof()) {
-                    out.drop();
                     return Result::Err(this.err_eof());
                 }
                 match (this.parse_escape(&out)) {
                     Result::Ok(_)  => { }
-                    Result::Err(e) => { out.drop(); return Result::Err(e); }
+                    Result::Err(e) => { return Result::Err(e); }
                 }
                 continue;
             }
             // Reject unescaped control characters per RFC 8259 §7.
             if (b < 0x20) {
-                out.drop();
                 return Result::Err(this.err_at(
                     JsonErrorKind::UnexpectedChar,
                     Str::from_raw("unescaped control character" as u8*, 27)
@@ -563,13 +560,11 @@ type struct Parser {
             match (this.parse_value()) {
                 Result::Ok(v)  => { arr.push(v); }
                 Result::Err(e) => {
-                    drop_array(&arr);
                     return Result::Err(e);
                 }
             }
             this.skip_ws();
             if (this.eof()) {
-                drop_array(&arr);
                 return Result::Err(this.err_eof());
             }
             const b: u8 = this.peek();
@@ -579,7 +574,6 @@ type struct Parser {
                 this.depth = this.depth - 1;
                 return Result::Ok(JsonValue::Array(arr));
             }
-            drop_array(&arr);
             return Result::Err(this.err_at(
                 JsonErrorKind::UnexpectedChar,
                 Str::from_raw("expected ',' or ']'" as u8*, 19)
@@ -615,11 +609,9 @@ type struct Parser {
         while (true) {
             this.skip_ws();
             if (this.eof()) {
-                obj.drop();
                 return Result::Err(this.err_eof());
             }
             if (this.peek() != QUOTE) {
-                obj.drop();
                 return Result::Err(this.err_at(
                     JsonErrorKind::KeyNotString,
                     Str::from_raw("expected string key" as u8*, 19)
@@ -628,12 +620,10 @@ type struct Parser {
             mut key: String = String::new();
             match (this.parse_string_raw()) {
                 Result::Ok(k)  => { key = k; }
-                Result::Err(e) => { obj.drop(); return Result::Err(e); }
+                Result::Err(e) => { return Result::Err(e); }
             }
             this.skip_ws();
             if (this.eof() || this.peek() != COLON) {
-                key.drop();
-                obj.drop();
                 return Result::Err(this.err_at(
                     JsonErrorKind::UnexpectedChar,
                     Str::from_raw("expected ':'" as u8*, 12)
@@ -643,11 +633,10 @@ type struct Parser {
             this.skip_ws();
             match (this.parse_value()) {
                 Result::Ok(v)  => { obj.insert(key, v); }
-                Result::Err(e) => { key.drop(); obj.drop(); return Result::Err(e); }
+                Result::Err(e) => { return Result::Err(e); }
             }
             this.skip_ws();
             if (this.eof()) {
-                obj.drop();
                 return Result::Err(this.err_eof());
             }
             const b: u8 = this.peek();
@@ -657,7 +646,6 @@ type struct Parser {
                 this.depth = this.depth - 1;
                 return Result::Ok(JsonValue::Object(obj));
             }
-            obj.drop();
             return Result::Err(this.err_at(
                 JsonErrorKind::UnexpectedChar,
                 Str::from_raw("expected ',' or '}'" as u8*, 19)
@@ -671,18 +659,6 @@ type struct Parser {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Drop every element in an `Array<JsonValue>`, then drop the array
-/// itself. Used by error paths in `parse_array` to avoid leaking
-/// partially-constructed children.
-function drop_array(arr: mut &Array<JsonValue>) -> void {
-    mut i: u64 = 0;
-    while (i < arr.length()) {
-        arr.ptr[i].drop();
-        i++;
-    }
-    arr.drop();
-}
 
 /// Encode a Unicode scalar value into UTF-8 and append the bytes to
 /// `out`. Handles 1, 2, 3, and 4 byte sequences.
@@ -742,7 +718,6 @@ function parse(text: Str) -> Result<JsonValue, JsonError> {
             p.skip_ws();
             if (p.pos < p.len) {
                 mut owned: JsonValue = v;
-                owned.drop();
                 return Result::Err(JsonError::new(
                     JsonErrorKind::TrailingData,
                     p.line, p.column, p.pos,

@@ -6,6 +6,7 @@
 namespace std::net::http::response;
 
 import core::intrinsics;
+import core::drop;
 import core::option;
 import core::result;
 import core::slice;
@@ -65,7 +66,6 @@ type struct Response {
     /// the array transfers to the response.
     set_body(mut &this, body: Array<u8>) -> void {
         mut old: Array<u8> = this.body;
-        old.drop();
         this.body = body;
         mut buffer: u8[24];
         const digits: u64 = integer::write_u64_decimal(&buffer[0], this.body.length());
@@ -127,7 +127,7 @@ type struct Response {
         mut status_line: String = String::new();
         match (request::read_line(reader, &status_line, 8192)) {
             Result::Ok(_) => { }
-            Result::Err(err) => { status_line.drop(); return Result::Err(err); }
+            Result::Err(err) => { return Result::Err(err); }
         }
 
         // Status-Line: HTTP/x.y SP code SP reason
@@ -147,7 +147,6 @@ type struct Response {
             i++;
         }
         if (first_sp == status_line.length()) {
-            status_line.drop();
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
         }
         mut code_end: u64 = second_sp;
@@ -160,13 +159,11 @@ type struct Response {
         match (integer::parse_u64(code_str)) {
             Option::Some(value) => {
                 if (value > 65535) {
-                    status_line.drop();
                     return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                 }
                 code = value as u16;
             }
             Option::None => {
-                status_line.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
         }
@@ -177,26 +174,21 @@ type struct Response {
             headers: Headers::new(),
             body: Array::new()
         };
-        status_line.drop();
 
-        // Headers.
+        // Headers.  Loop iterations are conservative for the analyzer,
+        // so the success-path drop on `header_line` is kept explicit.
         loop {
             mut header_line: String = String::new();
             match (request::read_line(reader, &header_line, 8192)) {
                 Result::Ok(_) => { }
                 Result::Err(err) => {
-                    header_line.drop();
-                    resp.drop();
                     return Result::Err(err);
                 }
             }
             if (header_line.is_empty()) {
-                header_line.drop();
                 break;
             }
             if (!resp.headers.parse_line(header_line.as_str())) {
-                header_line.drop();
-                resp.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
             header_line.drop();
@@ -216,9 +208,6 @@ type struct Response {
                             match (reader.read(&chunk[0], take)) {
                                 Result::Ok(n) => {
                                     if (n == 0) {
-                                        value.drop();
-                                        body.drop();
-                                        resp.drop();
                                         return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
                                     }
                                     mut j: u64 = 0;
@@ -226,9 +215,6 @@ type struct Response {
                                     remaining = remaining - n;
                                 }
                                 Result::Err(err) => {
-                                    value.drop();
-                                    body.drop();
-                                    resp.drop();
                                     return Result::Err(err);
                                 }
                             }
@@ -236,12 +222,9 @@ type struct Response {
                         resp.body = body;
                     }
                     Option::None => {
-                        value.drop();
-                        resp.drop();
                         return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                     }
                 }
-                value.drop();
             }
             Option::None => { }
         }
@@ -249,6 +232,9 @@ type struct Response {
         return Result::Ok(resp);
     }
 
+}
+
+implement trait Drop for struct Response {
     drop(mut &this) -> void {
         this.version.drop();
         this.headers.drop();
