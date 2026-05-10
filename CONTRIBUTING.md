@@ -16,9 +16,9 @@ expect rough edges and ongoing churn.
 ## Building
 
 ```bash
-make cryo                # ~5 min cold; canonical path through bootstrap
-make cryo-fast           # ~30 s; uses the pinned bin/cryo, skips bootstrap
-make selfhost-check      # ~3-10 min; full 8-stage byte-identity gate
+make cryo                # ~15 s; builds the self-hosted compiler via bin/cryo
+make selfhost-check      # ~50 s; 6-stage byte-identity gate (3 rounds)
+make test                # runs the test suite via the freshly-built compiler
 ```
 
 To run the resulting compiler from anywhere on your `PATH`, run
@@ -26,29 +26,29 @@ To run the resulting compiler from anywhere on your `PATH`, run
 
 ### Pinned binary (`bin/cryo`)
 
-`bin/cryo` is a known-good self-hosted compiler committed to the repo. It's
-the fast rung for `make cryo-fast` and skips the C++ bootstrap entirely.
+`bin/cryo` is a known-good self-hosted compiler committed to the repo. Every
+build target — `make cryo`, `make selfhost-check`, `make test` — drives off
+this pin. The C++ bootstrap in `legacy/bootstrap/` is no longer on any
+default path; build it explicitly with `make legacy-bootstrap` if you need
+to reproduce a from-source bootstrap.
 
 The pin is **stale** by design — it understands the dialect of `compiler/src/`
-at the moment it was committed, nothing more. When `compiler/src/` adopts
-new parser syntax that the pinned binary can't read, you'll see parse errors
-on `make cryo-fast`.
+at the moment it was committed, nothing more. When `compiler/src/` adopts new
+parser syntax or codegen behaviour that the pinned binary can't represent,
+`make cryo` errors out and you'll need to refresh the pin (or roll back).
 
 To refresh the pin:
 
 ```bash
-make cryo                # build canonically through bootstrap
+make cryo                # build the next-generation compiler via the current pin
 make pin-cryo            # copy compiler/build/bin/cryo to bin/cryo, stripped
 git add bin/cryo
 git commit -m "build: refresh pinned cryo binary"
 ```
 
-Refresh **only** when compiler/src/ has actually adopted new syntax. Do not
-refresh just because a new build exists — the pin is for syntax compatibility,
-not freshness.
-
-The canonical `make cryo` path through bootstrap remains the source of truth
-and is what CI runs. `make selfhost-check` always uses bootstrap.
+Refresh **only** when `compiler/src/` has actually adopted something the
+existing pin can't handle. Do not refresh just because a new build exists —
+the pin is for compatibility, not freshness.
 
 ## Filing issues
 
@@ -64,7 +64,7 @@ Use the GitHub issue tracker. The bug-report template asks for:
 2. Make your change. **Don't touch `legacy/bootstrap/`** unless you're
    genuinely blocked on a 0.1.0 ship issue.
 3. Run `make selfhost-check` locally — your change must preserve the
-   stage-4 / stage-5 byte-identical fixed point.
+   stage-3 / stage-4 byte-identical fixed point.
 4. Open a PR using the provided template; explain *why* in the description.
 
 ## Style
