@@ -1570,75 +1570,84 @@ type struct Monomorphizer {
                            names: SymbolStr[]*, types: TypeRef[]*) -> void {
         if (stmt == null) { return; }
         const node: ASTNode* = stmt as ASTNode*;
-        if (node.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            const inner: DeclarationNode* = ds.declaration;
-            if (inner != null) {
-                const inner_node: ASTNode* = inner as ASTNode*;
-                if (inner_node.kind == NodeKind::VariableDeclaration) {
-                    const vd: VarDeclNode* = inner as VarDeclNode*;
-                    if (vd.resolved_type.is_valid()) {
-                        names.push(vd.name);
-                        types.push(vd.resolved_type);
-                    } else if (vd.type_annotation != null
-                            && this.type_resolver != null) {
-                        // Mono runs BEFORE sema in the pipeline, so most
-                        // local VarDecls don't have their resolved_type
-                        // populated yet.  Fall back to resolving the
-                        // type_annotation on demand so call-arg inference
-                        // can recover concrete types from typed locals
-                        // (e.g. `const local: u8[1] = [byte]; ...
-                        // Slice::from_raw(&local[0], 1)` — without this,
-                        // T can't be inferred from arg[0]'s array element
-                        // type).  Resolve in an empty context — the
-                        // annotation is concrete (no method-level
-                        // generics on a body local), and any type names
-                        // resolve through the resolver's name_resolver
-                        // module scope.
-                        const _empty: string = "";
-                        mut ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
-                        const tr: TypeRef = this.type_resolver.resolve(
-                            vd.type_annotation, &ctx);
-                        if (tr.is_valid()) {
+        match (node.kind) {
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                const inner: DeclarationNode* = ds.declaration;
+                if (inner != null) {
+                    const inner_node: ASTNode* = inner as ASTNode*;
+                    if (inner_node.kind == NodeKind::VariableDeclaration) {
+                        const vd: VarDeclNode* = inner as VarDeclNode*;
+                        if (vd.resolved_type.is_valid()) {
                             names.push(vd.name);
-                            types.push(tr);
+                            types.push(vd.resolved_type);
+                        } else if (vd.type_annotation != null
+                                && this.type_resolver != null) {
+                            // Mono runs BEFORE sema in the pipeline, so most
+                            // local VarDecls don't have their resolved_type
+                            // populated yet.  Fall back to resolving the
+                            // type_annotation on demand so call-arg inference
+                            // can recover concrete types from typed locals
+                            // (e.g. `const local: u8[1] = [byte]; ...
+                            // Slice::from_raw(&local[0], 1)` — without this,
+                            // T can't be inferred from arg[0]'s array element
+                            // type).  Resolve in an empty context — the
+                            // annotation is concrete (no method-level
+                            // generics on a body local), and any type names
+                            // resolve through the resolver's name_resolver
+                            // module scope.
+                            const _empty: string = "";
+                            mut ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+                            const tr: TypeRef = this.type_resolver.resolve(
+                                vd.type_annotation, &ctx);
+                            if (tr.is_valid()) {
+                                names.push(vd.name);
+                                types.push(tr);
+                            }
                         }
                     }
                 }
             }
-        } else if (node.kind == NodeKind::BlockStatement) {
-            this.collect_locals_in_block(stmt as BlockStmtNode*, names, types);
-        } else if (node.kind == NodeKind::IfStatement) {
-            const ifs: IfStmtNode* = stmt as IfStmtNode*;
-            if (ifs.then_stmt != null) {
-                this.collect_locals_in_stmt(ifs.then_stmt, names, types);
+            NodeKind::BlockStatement => {
+                this.collect_locals_in_block(stmt as BlockStmtNode*, names, types);
             }
-            if (ifs.has_else() && ifs.else_stmt != null) {
-                this.collect_locals_in_stmt(ifs.else_stmt, names, types);
-            }
-        } else if (node.kind == NodeKind::WhileStatement) {
-            const ws: WhileStmtNode* = stmt as WhileStmtNode*;
-            if (ws.body != null) {
-                this.collect_locals_in_stmt(ws.body, names, types);
-            }
-        } else if (node.kind == NodeKind::ForStatement) {
-            const fs: ForStmtNode* = stmt as ForStmtNode*;
-            if (fs.body != null) {
-                this.collect_locals_in_stmt(fs.body, names, types);
-            }
-        } else if (node.kind == NodeKind::LoopStatement) {
-            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-            if (ls.body != null) {
-                this.collect_locals_in_stmt(ls.body, names, types);
-            }
-        } else if (node.kind == NodeKind::MatchStatement) {
-            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
-            for (mut i: i64 = 0; i < ms.arms.length; i++) {
-                const arm: MatchArmNode* = ms.arms[i];
-                if (arm != null && arm.body != null) {
-                    this.collect_locals_in_stmt(arm.body, names, types);
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                if (ifs.then_stmt != null) {
+                    this.collect_locals_in_stmt(ifs.then_stmt, names, types);
+                }
+                if (ifs.has_else() && ifs.else_stmt != null) {
+                    this.collect_locals_in_stmt(ifs.else_stmt, names, types);
                 }
             }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                if (ws.body != null) {
+                    this.collect_locals_in_stmt(ws.body, names, types);
+                }
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                if (fs.body != null) {
+                    this.collect_locals_in_stmt(fs.body, names, types);
+                }
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (ls.body != null) {
+                    this.collect_locals_in_stmt(ls.body, names, types);
+                }
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.collect_locals_in_stmt(arm.body, names, types);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1669,81 +1678,92 @@ type struct Monomorphizer {
                                     types: TypeRef[]) -> void {
         if (stmt == null) { return; }
         const node: ASTNode* = stmt as ASTNode*;
-        if (node.kind == NodeKind::ExpressionStatement) {
-            const es: ExprStmtNode* = stmt as ExprStmtNode*;
-            this.discover_inferred_calls_in_expr(es.expression, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            const inner: DeclarationNode* = ds.declaration;
-            if (inner != null) {
-                const inner_node: ASTNode* = inner as ASTNode*;
-                if (inner_node.kind == NodeKind::VariableDeclaration) {
-                    const vd: VarDeclNode* = inner as VarDeclNode*;
-                    if (vd.initializer != null) {
-                        this.discover_inferred_calls_in_expr(vd.initializer, res_ctx, subst, names, types);
+        match (node.kind) {
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.discover_inferred_calls_in_expr(es.expression, res_ctx, subst, names, types);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                const inner: DeclarationNode* = ds.declaration;
+                if (inner != null) {
+                    const inner_node: ASTNode* = inner as ASTNode*;
+                    if (inner_node.kind == NodeKind::VariableDeclaration) {
+                        const vd: VarDeclNode* = inner as VarDeclNode*;
+                        if (vd.initializer != null) {
+                            this.discover_inferred_calls_in_expr(vd.initializer, res_ctx, subst, names, types);
+                        }
                     }
                 }
             }
-        } else if (node.kind == NodeKind::ReturnStatement) {
-            const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
-            if (rs.expression != null) {
-                this.discover_inferred_calls_in_expr(rs.expression, res_ctx, subst, names, types);
-            }
-        } else if (node.kind == NodeKind::BlockStatement) {
-            this.discover_inferred_calls_in_block(stmt as BlockStmtNode*, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::IfStatement) {
-            const ifs: IfStmtNode* = stmt as IfStmtNode*;
-            this.discover_inferred_calls_in_expr(ifs.condition, res_ctx, subst, names, types);
-            if (ifs.then_stmt != null) {
-                this.discover_inferred_calls_in_stmt(ifs.then_stmt, res_ctx, subst, names, types);
-            }
-            if (ifs.has_else() && ifs.else_stmt != null) {
-                this.discover_inferred_calls_in_stmt(ifs.else_stmt, res_ctx, subst, names, types);
-            }
-        } else if (node.kind == NodeKind::WhileStatement) {
-            const ws: WhileStmtNode* = stmt as WhileStmtNode*;
-            this.discover_inferred_calls_in_expr(ws.condition, res_ctx, subst, names, types);
-            if (ws.body != null) {
-                this.discover_inferred_calls_in_stmt(ws.body, res_ctx, subst, names, types);
-            }
-        } else if (node.kind == NodeKind::ForStatement) {
-            const fs: ForStmtNode* = stmt as ForStmtNode*;
-            if (fs.condition != null) {
-                this.discover_inferred_calls_in_expr(fs.condition, res_ctx, subst, names, types);
-            }
-            if (fs.body != null) {
-                this.discover_inferred_calls_in_stmt(fs.body, res_ctx, subst, names, types);
-            }
-        } else if (node.kind == NodeKind::LoopStatement) {
-            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-            if (ls.body != null) {
-                this.discover_inferred_calls_in_stmt(ls.body, res_ctx, subst, names, types);
-            }
-        } else if (node.kind == NodeKind::MatchStatement) {
-            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
-            this.discover_inferred_calls_in_expr(ms.subject, res_ctx, subst, names, types);
-            // Resolve subject's type and pre-register each arm's pattern
-            // bindings on a per-walker scratch stack so `try_infer_method_call`
-            // can look up match-arm bindings (e.g. `Result::Ok(raw) =>
-            // raw.method<...>()` inside a generic body that sema skipped).
-            // We can't push into `names`/`types` directly — those are
-            // pass-by-value arrays here, so pushes don't propagate to the
-            // caller's view but pops do (since pop is just a length tweak),
-            // and that mismatch corrupts the worklist for sibling arms.
-            mut subj_type: TypeRef = this.resolve_arg_type_for_inference(
-                ms.subject, names, types);
-            if (subj_type.is_valid() && subst != null) {
-                subj_type = subst.apply(subj_type, this.arena);
-            }
-            for (mut i: i64 = 0; i < ms.arms.length; i++) {
-                const arm: MatchArmNode* = ms.arms[i];
-                if (arm == null) { continue; }
-                const pushed: i64 = this.push_arm_bindings_to_scope(arm, subj_type);
-                if (arm.body != null) {
-                    this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                if (rs.expression != null) {
+                    this.discover_inferred_calls_in_expr(rs.expression, res_ctx, subst, names, types);
                 }
-                this.pop_scope_bindings(pushed);
             }
+            NodeKind::BlockStatement => {
+                this.discover_inferred_calls_in_block(stmt as BlockStmtNode*, res_ctx, subst, names, types);
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                this.discover_inferred_calls_in_expr(ifs.condition, res_ctx, subst, names, types);
+                if (ifs.then_stmt != null) {
+                    this.discover_inferred_calls_in_stmt(ifs.then_stmt, res_ctx, subst, names, types);
+                }
+                if (ifs.has_else() && ifs.else_stmt != null) {
+                    this.discover_inferred_calls_in_stmt(ifs.else_stmt, res_ctx, subst, names, types);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.discover_inferred_calls_in_expr(ws.condition, res_ctx, subst, names, types);
+                if (ws.body != null) {
+                    this.discover_inferred_calls_in_stmt(ws.body, res_ctx, subst, names, types);
+                }
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                if (fs.condition != null) {
+                    this.discover_inferred_calls_in_expr(fs.condition, res_ctx, subst, names, types);
+                }
+                if (fs.body != null) {
+                    this.discover_inferred_calls_in_stmt(fs.body, res_ctx, subst, names, types);
+                }
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (ls.body != null) {
+                    this.discover_inferred_calls_in_stmt(ls.body, res_ctx, subst, names, types);
+                }
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.discover_inferred_calls_in_expr(ms.subject, res_ctx, subst, names, types);
+                // Resolve subject's type and pre-register each arm's pattern
+                // bindings on a per-walker scratch stack so `try_infer_method_call`
+                // can look up match-arm bindings (e.g. `Result::Ok(raw) =>
+                // raw.method<...>()` inside a generic body that sema skipped).
+                // We can't push into `names`/`types` directly — those are
+                // pass-by-value arrays here, so pushes don't propagate to the
+                // caller's view but pops do (since pop is just a length tweak),
+                // and that mismatch corrupts the worklist for sibling arms.
+                mut subj_type: TypeRef = this.resolve_arg_type_for_inference(
+                    ms.subject, names, types);
+                if (subj_type.is_valid() && subst != null) {
+                    subj_type = subst.apply(subj_type, this.arena);
+                }
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm == null) { continue; }
+                    const pushed: i64 = this.push_arm_bindings_to_scope(arm, subj_type);
+                    if (arm.body != null) {
+                        this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
+                    }
+                    this.pop_scope_bindings(pushed);
+                }
+            }
+            _ => {}
         }
     }
 

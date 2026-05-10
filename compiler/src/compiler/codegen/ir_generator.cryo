@@ -209,82 +209,86 @@ public:
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
 
-            const kind: NodeKind = stmt.kind;
-
-            if (kind == NodeKind::FunctionDeclaration) {
-                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                if (func.generic_params.length > 0) { continue; }
-                if (func.body == null) { continue; }
-                const fn_name: string = this.cg.resolve(func.name);
-                // `cryo test` synthesizes its own `main`; suppress the
-                // user's so the LLVM module has exactly one `main`
-                // symbol.  Mirrors the `declare_function` guard.
-                if (this.cg.ctx.mode.skip_user_main()
-                        && strcmp(fn_name, "main") == 0) {
-                    cdebug("[IRGen]   [%lld] func body: main (suppressed by test mode)\n", i);
-                    fflush(null);
-                    continue;
-                }
-                cdebug("[IRGen]   [%lld] func body: %s\n", i, fn_name); fflush(null);
-                this.generate_function_body(func);
-                cdebug("[IRGen]   [%lld] func done\n", i); fflush(null);
-            } else if (kind == NodeKind::ImplementationBlock) {
-                const impl_node: ImplBlockNode* = stmt as ImplBlockNode*;
-                const impl_target: string = this.cg.resolve(impl_node.target_type);
-                cdebug("[IRGen]   [%lld] impl block: %s (%lld methods)\n",
-                       i, impl_target, impl_node.methods.length); fflush(null);
-                this.generate_impl_block(impl_node);
-                cdebug("[IRGen]   [%lld] impl done\n", i); fflush(null);
-            } else if (kind == NodeKind::StructDeclaration) {
-                const struct_node: StructDeclNode* = stmt as StructDeclNode*;
-                if (struct_node.generic_params.length > 0) { continue; }
-                if (struct_node.methods.length > 0) {
-                    const sname: string = this.cg.resolve(struct_node.name);
-                    cdebug("[IRGen]   [%lld] struct methods: %s (%lld methods)\n",
-                           i, sname, struct_node.methods.length); fflush(null);
-                    // Use the arena's canonical qualified name for specialized
-                    // structs so method keys match the DI registration.
-                    const s_di: DeclarationIndex* = this.cg.get_decl_index();
-                    const s_local: SymbolStr = this.cg.qualify(struct_node.name);
-                    mut s_ref: TypeRef = s_di.lookup_type(s_local);
-                    if (!s_ref.is_valid()) {
-                        s_ref = s_di.lookup_type(struct_node.name);
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    if (func.generic_params.length > 0) { continue; }
+                    if (func.body == null) { continue; }
+                    const fn_name: string = this.cg.resolve(func.name);
+                    // `cryo test` synthesizes its own `main`; suppress the
+                    // user's so the LLVM module has exactly one `main`
+                    // symbol.  Mirrors the `declare_function` guard.
+                    if (this.cg.ctx.mode.skip_user_main()
+                            && strcmp(fn_name, "main") == 0) {
+                        cdebug("[IRGen]   [%lld] func body: main (suppressed by test mode)\n", i);
+                        fflush(null);
+                        continue;
                     }
-                    if (s_ref.is_valid()) {
-                        const s_arena: TypeArena* = this.cg.get_arena();
-                        const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
-                        if (s_qname.is_valid()) {
-                            this.current_impl_target = s_qname;
+                    cdebug("[IRGen]   [%lld] func body: %s\n", i, fn_name); fflush(null);
+                    this.generate_function_body(func);
+                    cdebug("[IRGen]   [%lld] func done\n", i); fflush(null);
+                }
+                NodeKind::ImplementationBlock => {
+                    const impl_node: ImplBlockNode* = stmt as ImplBlockNode*;
+                    const impl_target: string = this.cg.resolve(impl_node.target_type);
+                    cdebug("[IRGen]   [%lld] impl block: %s (%lld methods)\n",
+                           i, impl_target, impl_node.methods.length); fflush(null);
+                    this.generate_impl_block(impl_node);
+                    cdebug("[IRGen]   [%lld] impl done\n", i); fflush(null);
+                }
+                NodeKind::StructDeclaration => {
+                    const struct_node: StructDeclNode* = stmt as StructDeclNode*;
+                    if (struct_node.generic_params.length > 0) { continue; }
+                    if (struct_node.methods.length > 0) {
+                        const sname: string = this.cg.resolve(struct_node.name);
+                        cdebug("[IRGen]   [%lld] struct methods: %s (%lld methods)\n",
+                               i, sname, struct_node.methods.length); fflush(null);
+                        // Use the arena's canonical qualified name for specialized
+                        // structs so method keys match the DI registration.
+                        const s_di: DeclarationIndex* = this.cg.get_decl_index();
+                        const s_local: SymbolStr = this.cg.qualify(struct_node.name);
+                        mut s_ref: TypeRef = s_di.lookup_type(s_local);
+                        if (!s_ref.is_valid()) {
+                            s_ref = s_di.lookup_type(struct_node.name);
+                        }
+                        if (s_ref.is_valid()) {
+                            const s_arena: TypeArena* = this.cg.get_arena();
+                            const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
+                            if (s_qname.is_valid()) {
+                                this.current_impl_target = s_qname;
+                            } else {
+                                this.current_impl_target = s_local;
+                            }
                         } else {
                             this.current_impl_target = s_local;
                         }
-                    } else {
-                        this.current_impl_target = s_local;
+                        for (mut j: i64 = 0; j < struct_node.methods.length; j++) {
+                            this.generate_method_body(struct_node.methods[j]);
+                        }
+                        this.current_impl_target = SymbolStr::empty();
+                        cdebug("[IRGen]   [%lld] struct methods done\n", i); fflush(null);
                     }
-                    for (mut j: i64 = 0; j < struct_node.methods.length; j++) {
-                        this.generate_method_body(struct_node.methods[j]);
-                    }
-                    this.current_impl_target = SymbolStr::empty();
-                    cdebug("[IRGen]   [%lld] struct methods done\n", i); fflush(null);
                 }
-            } else if (kind == NodeKind::ClassDeclaration) {
-                const class_node: ClassDeclNode* = stmt as ClassDeclNode*;
-                if (class_node.generic_params.length > 0) { continue; }
-                if (class_node.methods.length > 0) {
-                    const cname: string = this.cg.resolve(class_node.name);
-                    cdebug("[IRGen]   [%lld] class methods: %s (%lld methods)\n",
-                           i, cname, class_node.methods.length); fflush(null);
-                    this.current_impl_target = this.cg.qualify(class_node.name);
-                    for (mut j: i64 = 0; j < class_node.methods.length; j++) {
-                        this.generate_method_body(class_node.methods[j]);
+                NodeKind::ClassDeclaration => {
+                    const class_node: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (class_node.generic_params.length > 0) { continue; }
+                    if (class_node.methods.length > 0) {
+                        const cname: string = this.cg.resolve(class_node.name);
+                        cdebug("[IRGen]   [%lld] class methods: %s (%lld methods)\n",
+                               i, cname, class_node.methods.length); fflush(null);
+                        this.current_impl_target = this.cg.qualify(class_node.name);
+                        for (mut j: i64 = 0; j < class_node.methods.length; j++) {
+                            this.generate_method_body(class_node.methods[j]);
+                        }
+                        this.current_impl_target = SymbolStr::empty();
+                        cdebug("[IRGen]   [%lld] class methods done\n", i); fflush(null);
                     }
-                    this.current_impl_target = SymbolStr::empty();
-                    cdebug("[IRGen]   [%lld] class methods done\n", i); fflush(null);
                 }
-            } else if (kind == NodeKind::VariableDeclaration) {
-                // Globals are emitted in Phase 2 (declare_functions) so they
-                // are visible to function bodies regardless of source order.
-                // Nothing to do here.
+                NodeKind::VariableDeclaration => {
+                    // Globals are emitted in Phase 2 (declare_functions) so they
+                    // are visible to function bodies regardless of source order.
+                }
+                _ => {}
             }
         }
 
@@ -556,44 +560,59 @@ public:
         const kind: NodeKind = stmt.kind;
         cdebug("[IRGen]           stmt kind=%s\n", kind.to_string()); fflush(null);
 
-        if (kind == NodeKind::BlockStatement) {
-            this.generate_block(stmt as BlockStmtNode*);
-        } else if (kind == NodeKind::ReturnStatement) {
-            this.visit_return_stmt(stmt as ReturnStmtNode*);
-        } else if (kind == NodeKind::IfStatement) {
-            this.visit_if_stmt(stmt as IfStmtNode*);
-        } else if (kind == NodeKind::WhileStatement) {
-            this.visit_while_stmt(stmt as WhileStmtNode*);
-        } else if (kind == NodeKind::ForStatement) {
-            this.visit_for_stmt(stmt as ForStmtNode*);
-        } else if (kind == NodeKind::LoopStatement) {
-            this.visit_loop_stmt(stmt as LoopStmtNode*);
-        } else if (kind == NodeKind::BreakStatement) {
-            codegen_break(this.cg);
-        } else if (kind == NodeKind::ContinueStatement) {
-            codegen_continue(this.cg);
-        } else if (kind == NodeKind::ExpressionStatement) {
-            const expr_stmt: ExprStmtNode* = stmt as ExprStmtNode*;
-            if (expr_stmt.expression != null) {
-                this.codegen_rvalue(expr_stmt.expression);
+        match (kind) {
+            NodeKind::BlockStatement => {
+                this.generate_block(stmt as BlockStmtNode*);
             }
-        } else if (kind == NodeKind::DeclarationStatement) {
-            this.visit_decl_stmt(stmt as DeclStmtNode*);
-        } else if (kind == NodeKind::VariableDeclaration) {
-            // Raw VarDeclNode (not wrapped in DeclStmt) — happens in for-loop init.
-            this.visit_var_decl(stmt as VarDeclNode*);
-        } else if (kind == NodeKind::MatchStatement) {
-            this.visit_match_stmt(stmt as MatchStmtNode*);
-        } else if (kind == NodeKind::UnsafeBlockStatement) {
-            const unsafe_node: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-            this.generate_block(unsafe_node.block);
-        } else {
-            cdebug("[unhandled-stmt] kind=%d at %s:%d:%d node=%p\n",
-                   kind as i32, stmt.span.file,
-                   stmt.span.start_line as i32, stmt.span.start_col as i32, stmt);
-            this.cg.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-                format("codegen: unhandled statement kind %d — skipping (not yet implemented)", kind as i32),
-                stmt.span);
+            NodeKind::ReturnStatement => {
+                this.visit_return_stmt(stmt as ReturnStmtNode*);
+            }
+            NodeKind::IfStatement => {
+                this.visit_if_stmt(stmt as IfStmtNode*);
+            }
+            NodeKind::WhileStatement => {
+                this.visit_while_stmt(stmt as WhileStmtNode*);
+            }
+            NodeKind::ForStatement => {
+                this.visit_for_stmt(stmt as ForStmtNode*);
+            }
+            NodeKind::LoopStatement => {
+                this.visit_loop_stmt(stmt as LoopStmtNode*);
+            }
+            NodeKind::BreakStatement => {
+                codegen_break(this.cg);
+            }
+            NodeKind::ContinueStatement => {
+                codegen_continue(this.cg);
+            }
+            NodeKind::ExpressionStatement => {
+                const expr_stmt: ExprStmtNode* = stmt as ExprStmtNode*;
+                if (expr_stmt.expression != null) {
+                    this.codegen_rvalue(expr_stmt.expression);
+                }
+            }
+            NodeKind::DeclarationStatement => {
+                this.visit_decl_stmt(stmt as DeclStmtNode*);
+            }
+            NodeKind::VariableDeclaration => {
+                // Raw VarDeclNode (not wrapped in DeclStmt) — happens in for-loop init.
+                this.visit_var_decl(stmt as VarDeclNode*);
+            }
+            NodeKind::MatchStatement => {
+                this.visit_match_stmt(stmt as MatchStmtNode*);
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const unsafe_node: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                this.generate_block(unsafe_node.block);
+            }
+            _ => {
+                cdebug("[unhandled-stmt] kind=%d at %s:%d:%d node=%p\n",
+                       kind as i32, stmt.span.file,
+                       stmt.span.start_line as i32, stmt.span.start_col as i32, stmt);
+                this.cg.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                    format("codegen: unhandled statement kind %d — skipping (not yet implemented)", kind as i32),
+                    stmt.span);
+            }
         }
     }
 
