@@ -232,8 +232,7 @@ function auto_deref_to(cg: CodegenContext*, val: LValue, expected: LType) -> LVa
     if (!val.is_valid() || !expected.is_valid()) { return val; }
     const actual_ty: void* = llvm::LLVMTypeOf(val.raw);
     if (actual_ty == null) { return val; }
-    // 12 = LLVMPointerTypeKind; codegen_call uses the same magic numbers.
-    if (llvm::LLVMGetTypeKind(actual_ty) == 12) {
+    if (type_kind_of(actual_ty) == LTypeKind::Pointer) {
         return cg.builder.build_load(expected, val, "deref");
     }
     return val;
@@ -621,8 +620,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         IntrinsicKind::IsFinite => {
             const diff: LValue = cg.builder.build_fsub(a0, a0, "is_fin.diff");
             const zero: LValue = LType::const_real(LType::f64(), 0.0);
-            // FCmp predicate OEQ = 1 in the LLVMRealPredicate enum.
-            cg.builder.build_fcmp(1, diff, zero, "is_fin")
+            cg.builder.build_fcmp(LRealPredicate::OEQ, diff, zero, "is_fin")
         }
 
         // -- dirent_name(entry) → entry == null ? "" : (entry + 19).
@@ -697,8 +695,7 @@ function emit_dirent_name(cg: CodegenContext*, entry: LValue) -> LValue {
     // Null guard: if entry is null, return "" (a global empty string).
     const empty: LValue = cg.builder.build_global_string_ptr("", "d_name.empty");
     const is_null: LValue = cg.builder.build_icmp(
-        // ICmp predicate EQ = 32.
-        32, entry, LType::const_pointer_null(ptr_ty), "d_name.is_null");
+        LIntPredicate::EQ, entry, LType::const_pointer_null(ptr_ty), "d_name.is_null");
     return cg.builder.build_select(is_null, empty, name_ptr, "d_name.sel");
 }
 
@@ -751,28 +748,28 @@ function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
     const ft_socket:  LValue = LType::const_int(i32_ty, 6, false);
     const ft_unknown: LValue = LType::const_int(i32_ty, 7, false);
 
-    // Chain of selects, defaulting to Unknown.  LLVMIntPredicate::IntEQ = 32.
+    // Chain of selects, defaulting to Unknown.
     mut mapped: LValue = ft_unknown;
-    const is_sock: LValue = cg.builder.build_icmp(32, widened, c_dt_sock, "is_sock");
+    const is_sock: LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_sock, "is_sock");
     mapped = cg.builder.build_select(is_sock, ft_socket,  mapped, "ft.sock");
-    const is_lnk:  LValue = cg.builder.build_icmp(32, widened, c_dt_lnk,  "is_lnk");
+    const is_lnk:  LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_lnk,  "is_lnk");
     mapped = cg.builder.build_select(is_lnk,  ft_symlink, mapped, "ft.lnk");
-    const is_reg:  LValue = cg.builder.build_icmp(32, widened, c_dt_reg,  "is_reg");
+    const is_reg:  LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_reg,  "is_reg");
     mapped = cg.builder.build_select(is_reg,  ft_file,    mapped, "ft.reg");
-    const is_blk:  LValue = cg.builder.build_icmp(32, widened, c_dt_blk,  "is_blk");
+    const is_blk:  LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_blk,  "is_blk");
     mapped = cg.builder.build_select(is_blk,  ft_block,   mapped, "ft.blk");
-    const is_dir:  LValue = cg.builder.build_icmp(32, widened, c_dt_dir,  "is_dir");
+    const is_dir:  LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_dir,  "is_dir");
     mapped = cg.builder.build_select(is_dir,  ft_dir,     mapped, "ft.dir");
-    const is_chr:  LValue = cg.builder.build_icmp(32, widened, c_dt_chr,  "is_chr");
+    const is_chr:  LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_chr,  "is_chr");
     mapped = cg.builder.build_select(is_chr,  ft_char,    mapped, "ft.chr");
-    const is_fifo: LValue = cg.builder.build_icmp(32, widened, c_dt_fifo, "is_fifo");
+    const is_fifo: LValue = cg.builder.build_icmp(LIntPredicate::EQ, widened, c_dt_fifo, "is_fifo");
     mapped = cg.builder.build_select(is_fifo, ft_fifo,    mapped, "ft.fifo");
 
     // Null guard: return File(0) if entry is null (matches the prior
     // behaviour where the null check yielded 0).
     const zero: LValue = LType::const_int(i32_ty, 0, false);
     const is_null: LValue = cg.builder.build_icmp(
-        32, entry, LType::const_pointer_null(ptr_ty), "d_type.is_null");
+        LIntPredicate::EQ, entry, LType::const_pointer_null(ptr_ty), "d_type.is_null");
     return cg.builder.build_select(is_null, zero, mapped, "d_type.sel");
 }
 
@@ -884,7 +881,7 @@ function emit_panic_runtime(cg: CodegenContext*) -> void {
     if (!panic_fn.is_valid()) { return; }
 
     // linkonce_odr — every module gets a copy; linker collapses them.
-    panic_fn.set_linkage(3);
+    panic_fn.set_linkage(LLinkage::LinkOnceODR);
 
     const saved_bb: LBasicBlock = cg.builder.get_insert_block();
     const entry_bb: LBasicBlock = LBasicBlock::append(panic_fn, "entry");
@@ -926,9 +923,8 @@ function emit_format_runtime(cg: CodegenContext*) -> void {
     }
     if (!fmt_fn.is_valid()) { return; }
 
-    // linkonce_odr = 3 in the LLVM-C linkage enum (matches the header
-    // we read above).  All copies emitted across modules merge to one.
-    fmt_fn.set_linkage(3);
+    // linkonce_odr — all copies emitted across modules merge to one.
+    fmt_fn.set_linkage(LLinkage::LinkOnceODR);
 
     // Save & restore the builder's insertion position so we don't
     // disturb whatever else is being generated for this module.
@@ -973,8 +969,7 @@ function emit_format_runtime(cg: CodegenContext*) -> void {
 
     // %neg = (n < 0); %buf = load strp; %ret = select neg, null, buf
     const zero32: LValue = LType::const_int(LType::i32(), 0, false);
-    // ICmp predicate SLT = 40 (LLVMIntSLT in the LLVM-C enum).
-    const is_neg: LValue = cg.builder.build_icmp(40, n_result, zero32, "neg");
+    const is_neg: LValue = cg.builder.build_icmp(LIntPredicate::SLT, n_result, zero32, "neg");
     const buf_loaded: LValue = cg.builder.build_load(ptr_ty, strp_alloca, "buf");
     const null_ret: LValue = LType::const_pointer_null(ptr_ty);
     const ret_val: LValue = cg.builder.build_select(is_neg, null_ret, buf_loaded, "ret");

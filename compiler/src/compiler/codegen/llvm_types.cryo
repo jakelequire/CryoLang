@@ -10,6 +10,147 @@ import Compiler::Codegen;
 
 
 // ============================================================================
+// LLVM-C enum mirrors
+// ============================================================================
+//
+// Every integer argument and return value that LLVM-C documents as a
+// named enum is mirrored here so callers reference symbols rather than
+// magic numbers.  An LLVM minor-version surprise (a renumbered variant,
+// an inserted predicate) then becomes a single edit in this file
+// instead of a scavenger hunt across codegen.
+//
+// Values are taken from `llvm-c/Core.h`, `llvm-c/Analysis.h`, and
+// `llvm-c/TargetMachine.h` for LLVM 20 (the version currently linked).
+// These enums have been stable for many releases but are not part of
+// the LLVM-C ABI stability guarantee — verifying against the headers
+// when bumping LLVM is the price of using the C API.
+
+/// Mirror of `LLVMTypeKind` (`llvm-c/Core.h`).
+type enum LTypeKind : i32 {
+    Void           = 0;
+    Half           = 1;
+    Float          = 2;
+    Double         = 3;
+    X86_FP80       = 4;
+    FP128          = 5;
+    PPC_FP128      = 6;
+    Label          = 7;
+    Integer        = 8;
+    Function       = 9;
+    Struct         = 10;
+    Array          = 11;
+    Pointer        = 12;
+    Vector         = 13;
+    Metadata       = 14;
+    X86_MMX        = 15;
+    Token          = 16;
+    ScalableVector = 17;
+    BFloat         = 18;
+    X86_AMX        = 19;
+    TargetExt      = 20;
+}
+
+/// Mirror of `LLVMIntPredicate` (`llvm-c/Core.h`).  The range starts at 32
+/// because LLVM-C's `CmpInst::Predicate` continues past the FCmp space.
+type enum LIntPredicate : i32 {
+    EQ  = 32;
+    NE  = 33;
+    UGT = 34;
+    UGE = 35;
+    ULT = 36;
+    ULE = 37;
+    SGT = 38;
+    SGE = 39;
+    SLT = 40;
+    SLE = 41;
+}
+
+/// Mirror of `LLVMRealPredicate` (`llvm-c/Core.h`).
+type enum LRealPredicate : i32 {
+    PredFalse = 0;
+    OEQ       = 1;
+    OGT       = 2;
+    OGE       = 3;
+    OLT       = 4;
+    OLE       = 5;
+    ONE       = 6;
+    ORD       = 7;
+    UNO       = 8;
+    UEQ       = 9;
+    UGT       = 10;
+    UGE       = 11;
+    ULT       = 12;
+    ULE       = 13;
+    UNE       = 14;
+    PredTrue  = 15;
+}
+
+/// Mirror of `LLVMLinkage` (`llvm-c/Core.h`).
+type enum LLinkage : i32 {
+    External            = 0;
+    AvailableExternally = 1;
+    LinkOnceAny         = 2;
+    LinkOnceODR         = 3;
+    LinkOnceODRAutoHide = 4;
+    WeakAny             = 5;
+    WeakODR             = 6;
+    Appending           = 7;
+    Internal            = 8;
+    Private             = 9;
+    DLLImport           = 10;
+    DLLExport           = 11;
+    ExternalWeak        = 12;
+    Ghost               = 13;
+    Common              = 14;
+    LinkerPrivate       = 15;
+    LinkerPrivateWeak   = 16;
+}
+
+/// Mirror of `LLVMVerifierFailureAction` (`llvm-c/Analysis.h`).
+type enum LVerifierAction : i32 {
+    AbortProcess = 0;
+    PrintMessage = 1;
+    ReturnStatus = 2;
+}
+
+/// Mirror of `LLVMCodeGenOptLevel` (`llvm-c/TargetMachine.h`).
+type enum LCodeGenOptLevel : i32 {
+    LevelNone       = 0;
+    LevelLess       = 1;
+    LevelDefault    = 2;
+    LevelAggressive = 3;
+}
+
+/// Mirror of `LLVMRelocMode` (`llvm-c/TargetMachine.h`).
+type enum LRelocMode : i32 {
+    Default      = 0;
+    Static       = 1;
+    PIC          = 2;
+    DynamicNoPic = 3;
+    ROPI         = 4;
+    RWPI         = 5;
+    ROPI_RWPI    = 6;
+}
+
+/// Mirror of `LLVMCodeModel` (`llvm-c/TargetMachine.h`).
+type enum LCodeModel : i32 {
+    Default    = 0;
+    JITDefault = 1;
+    Tiny       = 2;
+    Small      = 3;
+    Kernel     = 4;
+    Medium     = 5;
+    Large      = 6;
+}
+
+/// Mirror of `LLVMCodeGenFileType` (`llvm-c/TargetMachine.h`).
+type enum LFileType : i32 {
+    Assembly = 0;
+    Object   = 1;
+}
+
+
+// ============================================================================
 // LLVMModule — Wrapper around LLVMModuleRef
 // ============================================================================
 
@@ -38,8 +179,8 @@ type struct LModule {
     /// Verify the module.  Returns true if valid.
     verify(&this) -> boolean {
         mut err_msg: i8* = null;
-        // Action 2 = LLVMReturnStatusAction
-        const result: i32 = llvm::LLVMVerifyModule(this.raw, 2, &err_msg as void*);
+        const result: i32 = llvm::LLVMVerifyModule(
+            this.raw, LVerifierAction::ReturnStatus as i32, &err_msg as void*);
         if (err_msg != null) {
             llvm::LLVMDisposeMessage(err_msg as void*);
         }
@@ -305,27 +446,27 @@ type struct LBuilder {
 
     // ----- Comparisons -----
 
-    build_icmp(&this, op: i32, lhs: LValue, rhs: LValue, name: string) -> LValue {
+    build_icmp(&this, op: LIntPredicate, lhs: LValue, rhs: LValue, name: string) -> LValue {
         if (lhs.raw == null || rhs.raw == null) { return LValue::null(); }
-        return LValue { raw: llvm::LLVMBuildICmp(this.raw, op, lhs.raw, rhs.raw, name) };
+        return LValue { raw: llvm::LLVMBuildICmp(this.raw, op as i32, lhs.raw, rhs.raw, name) };
     }
 
-    build_fcmp(&this, op: i32, lhs: LValue, rhs: LValue, name: string) -> LValue {
+    build_fcmp(&this, op: LRealPredicate, lhs: LValue, rhs: LValue, name: string) -> LValue {
         if (lhs.raw == null || rhs.raw == null) { return LValue::null(); }
-        return LValue { raw: llvm::LLVMBuildFCmp(this.raw, op, lhs.raw, rhs.raw, name) };
+        return LValue { raw: llvm::LLVMBuildFCmp(this.raw, op as i32, lhs.raw, rhs.raw, name) };
     }
 
     // ----- Memory -----
 
     build_alloca(&this, ty: LType, name: string) -> LValue {
         if (ty.raw == null) { return LValue::null(); }
-        if (llvm::LLVMGetTypeKind(ty.raw) == 0) { return LValue::null(); }
+        if (ty.kind() == LTypeKind::Void) { return LValue::null(); }
         return LValue { raw: llvm::LLVMBuildAlloca(this.raw, ty.raw, name) };
     }
 
     build_load(&this, ty: LType, ptr: LValue, name: string) -> LValue {
         if (ty.raw == null || ptr.raw == null) { return LValue::null(); }
-        if (llvm::LLVMGetTypeKind(ty.raw) == 0) { return LValue::null(); }
+        if (ty.kind() == LTypeKind::Void) { return LValue::null(); }
         return LValue { raw: llvm::LLVMBuildLoad2(this.raw, ty.raw, ptr.raw, name) };
     }
 
@@ -334,7 +475,7 @@ type struct LBuilder {
         // Guard: never store a void-typed value — LLVM's DataLayout::getAlignment
         // enters undefined behavior on unsized types, causing infinite recursion.
         const val_ty: void* = llvm::LLVMTypeOf(val.raw);
-        if (val_ty != null && llvm::LLVMGetTypeKind(val_ty) == 0) {
+        if (val_ty != null && type_kind_of(val_ty) == LTypeKind::Void) {
             return LValue::null();
         }
         return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
@@ -465,8 +606,8 @@ type struct LValue {
         return this.raw != null;
     }
 
-    set_linkage(&this, linkage: i32) -> void {
-        llvm::LLVMSetLinkage(this.raw, linkage);
+    set_linkage(&this, linkage: LLinkage) -> void {
+        llvm::LLVMSetLinkage(this.raw, linkage as i32);
     }
 
     set_initializer(&this, val: LValue) -> void {
@@ -504,6 +645,13 @@ type struct LType {
 
     is_valid(&this) -> boolean {
         return this.raw != null;
+    }
+
+    /// Typed wrapper around `LLVMGetTypeKind` — returns `LTypeKind`
+    /// instead of a raw `i32` so callers compare against named variants
+    /// (`ty.kind() == LTypeKind::Void`) rather than re-casting integers.
+    kind(&this) -> LTypeKind {
+        return llvm::LLVMGetTypeKind(this.raw) as LTypeKind;
     }
 
     // ----- Primitive type constructors -----
@@ -679,10 +827,10 @@ type struct LTargetMachine {
         return str;
     }
 
-    emit_to_file(&this, module: LModule, filename: string, file_type: i32) -> boolean {
+    emit_to_file(&this, module: LModule, filename: string, file_type: LFileType) -> boolean {
         mut err_msg: i8* = null;
         const result: i32 = llvm::LLVMTargetMachineEmitToFile(
-            this.raw, module.raw, filename, file_type, &err_msg as void*);
+            this.raw, module.raw, filename, file_type as i32, &err_msg as void*);
         if (err_msg != null) {
             printf("[Codegen] Emit error: %s\n", err_msg as string);
             llvm::LLVMDisposeMessage(err_msg as void*);
@@ -695,6 +843,13 @@ type struct LTargetMachine {
 // ============================================================================
 // Phi Node Helper
 // ============================================================================
+
+/// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles
+/// (where wrapping in an `LType` first would just be ceremony).  Mirrors
+/// `LType::kind()` and lets callers branch on `LTypeKind::Void` etc.
+function type_kind_of(raw: void*) -> LTypeKind {
+    return llvm::LLVMGetTypeKind(raw) as LTypeKind;
+}
 
 /// Add incoming values to a phi node.  `values` and `blocks` are parallel
 /// arrays of LLVMValueRef and LLVMBasicBlockRef raw pointers.
@@ -749,9 +904,11 @@ function create_target_machine_for_triple(triple: string) -> LTargetMachine {
         return LTargetMachine::null();
     }
 
-    // LLVMCodeGenLevelDefault=2, LLVMRelocPIC=2, LLVMCodeModelDefault=0
     const tm: void* = llvm::LLVMCreateTargetMachine(
-        target, effective, "generic", "", 2, 2, 0);
+        target, effective, "generic", "",
+        LCodeGenOptLevel::LevelDefault as i32,
+        LRelocMode::PIC as i32,
+        LCodeModel::Default as i32);
 
     return LTargetMachine { raw: tm };
 }

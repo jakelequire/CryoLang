@@ -510,11 +510,9 @@ public:
             if (opcode == 26) {
                 const alloc_ty: void* = llvm::LLVMGetAllocatedType(arg.raw);
                 if (alloc_ty != null) {
-                    const alloc_kind: i32 = llvm::LLVMGetTypeKind(alloc_ty);
-                    // 12 = LLVMPointerTypeKind, 8 = LLVMIntegerTypeKind,
-                    // 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
-                    if (alloc_kind == 12 || alloc_kind == 8
-                            || alloc_kind == 2 || alloc_kind == 3) {
+                    const alloc_kind: LTypeKind = type_kind_of(alloc_ty);
+                    if (alloc_kind == LTypeKind::Pointer || alloc_kind == LTypeKind::Integer
+                            || alloc_kind == LTypeKind::Float || alloc_kind == LTypeKind::Double) {
                         const alloc_lty: LType = LType { raw: alloc_ty };
                         arg = this.cg.builder.build_load(
                             alloc_lty, arg, "base.arg.load");
@@ -773,7 +771,7 @@ public:
                             const pat_val_coerced: LValue =
                                 coerce_icmp_operands(this.cg, subject, pat_val);
                             cmp = this.cg.builder.build_icmp(
-                                32, subject, pat_val_coerced, "match.cmp");
+                                LIntPredicate::EQ, subject, pat_val_coerced, "match.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -794,7 +792,7 @@ public:
                             const pat_val_coerced: LValue =
                                 coerce_icmp_operands(this.cg, subject, pat_val);
                             cmp = this.cg.builder.build_icmp(
-                                32, subject, pat_val_coerced, "match.cmp");
+                                LIntPredicate::EQ, subject, pat_val_coerced, "match.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -811,7 +809,7 @@ public:
                             const pat_val: LValue = LType::const_int(
                                 LType::i32(), variant.tag_value, false);
                             const cmp: LValue = this.cg.builder.build_icmp(
-                                32, minfo.tag_val, pat_val, "match.cmp");
+                                LIntPredicate::EQ, minfo.tag_val, pat_val, "match.cmp");
                             this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                             matched = true;
                             break;
@@ -936,7 +934,7 @@ public:
         // LLVMPointerTypeKind = 12.
         mut is_ptr: boolean = false;
         const subj_llvm_ty: void* = llvm::LLVMTypeOf(subject.raw);
-        if (subj_llvm_ty != null && llvm::LLVMGetTypeKind(subj_llvm_ty) == 12) {
+        if (subj_llvm_ty != null && type_kind_of(subj_llvm_ty) == LTypeKind::Pointer) {
             is_ptr = true;
         }
 
@@ -1029,7 +1027,7 @@ public:
                 const field_ref: TypeRef = variant.payload_types[pos];
                 const field_llvm: LType = this.cg.type_mapper.map_type(field_ref);
                 if (!field_llvm.is_valid()) { continue; }
-                if (llvm::LLVMGetTypeKind(field_llvm.raw) == 0) { continue; }
+                if (type_kind_of(field_llvm.raw) == LTypeKind::Void) { continue; }
 
                 // field_ptr = payload_ptr + offsets[pos] (byte offset via i8 GEP).
                 mut field_ptr_raw: LValue = payload_ptr;
@@ -1151,7 +1149,7 @@ public:
 
         const src_llvm_ty: void* = llvm::LLVMTypeOf(src_val.raw);
         const src_is_struct_value: boolean = src_llvm_ty != null
-            && llvm::LLVMGetTypeKind(src_llvm_ty) == 10;
+            && type_kind_of(src_llvm_ty) == LTypeKind::Struct;
 
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
@@ -1811,7 +1809,7 @@ public:
                                 }
                             }
                             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-                            if (ctor_ty.is_valid() && llvm::LLVMGetTypeKind(ctor_ty.raw) == 9) {
+                            if (ctor_ty.is_valid() && type_kind_of(ctor_ty.raw) == LTypeKind::Function) {
                                 mut ctor_args: LValue[] = [];
                                 ctor_args.push(obj_alloca);
                                 for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
@@ -2567,7 +2565,7 @@ public:
         // Void calls and unresolved return types must use empty name —
         // LLVM doesn't allow naming void-typed instructions.
         const is_void: boolean = !ret_ty.is_valid() || ret_ty.raw == void_ty.raw ||
-                                  llvm::LLVMGetTypeKind(ret_ty.raw) == 0;
+                                  type_kind_of(ret_ty.raw) == LTypeKind::Void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
         codegen_call(this.cg, callee_val, fn_ty, args, call_name, &result);
@@ -2893,7 +2891,7 @@ public:
             const raw: LValue = this.codegen_rvalue(node.repeat_count_expr);
             if (raw.is_valid()) {
                 const raw_ty: void* = llvm::LLVMTypeOf(raw.raw);
-                if (raw_ty != null && llvm::LLVMGetTypeKind(raw_ty) == 8) {
+                if (raw_ty != null && type_kind_of(raw_ty) == LTypeKind::Integer) {
                     const width: u32 = llvm::LLVMGetIntTypeWidth(raw_ty);
                     if (width < 64) {
                         count_val = this.cg.builder.build_zext(raw, LType::i64(), "cnt.widen");
@@ -2922,8 +2920,8 @@ public:
         if (fill_val.is_valid()) {
             const fill_llvm_ty: void* = llvm::LLVMTypeOf(fill_val.raw);
             if (fill_llvm_ty != null &&
-                llvm::LLVMGetTypeKind(fill_llvm_ty) == 8 &&
-                llvm::LLVMGetTypeKind(elem_ty.raw) == 8) {
+                type_kind_of(fill_llvm_ty) == LTypeKind::Integer &&
+                type_kind_of(elem_ty.raw) == LTypeKind::Integer) {
                 const fw: u32 = llvm::LLVMGetIntTypeWidth(fill_llvm_ty);
                 const ew: u32 = llvm::LLVMGetIntTypeWidth(elem_ty.raw);
                 if (fw < ew) {
@@ -3015,7 +3013,7 @@ public:
 
         this.cg.builder.position_at_end(cond_bb);
         const cur: LValue = this.cg.builder.build_load(LType::i64(), i_slot, "fill.cur");
-        const done: LValue = this.cg.builder.build_icmp(35, cur, count_val, "fill.done");
+        const done: LValue = this.cg.builder.build_icmp(LIntPredicate::UGE, cur, count_val, "fill.done");
         this.cg.builder.build_cond_br(done, end_bb, body_bb);
 
         this.cg.builder.position_at_end(body_bb);
@@ -3053,7 +3051,7 @@ public:
 
         this.cg.builder.position_at_end(cond_bb);
         const cur: LValue = this.cg.builder.build_load(LType::i64(), i_slot, "fill.cur");
-        const done: LValue = this.cg.builder.build_icmp(35, cur, count_val, "fill.done");
+        const done: LValue = this.cg.builder.build_icmp(LIntPredicate::UGE, cur, count_val, "fill.done");
         this.cg.builder.build_cond_br(done, end_bb, body_bb);
 
         this.cg.builder.position_at_end(body_bb);
@@ -3206,9 +3204,8 @@ public:
         // Ensure the entry block has a terminator.
         const cur_bb: LBasicBlock = this.cg.builder.get_insert_block();
         if (cur_bb.is_valid() && !cur_bb.has_terminator()) {
-            const rk: i32 = llvm::LLVMGetTypeKind(ret_ty.raw);
-            if (rk == 0) {
-                // Void — emit implicit ret void.
+            const rk: LTypeKind = type_kind_of(ret_ty.raw);
+            if (rk == LTypeKind::Void) {
                 this.cg.builder.build_ret_void();
             } else {
                 // Non-void without a terminator → unreachable.
@@ -3406,7 +3403,7 @@ public:
                         if (pat_val.is_valid()) {
                             const pat_val_coerced: LValue =
                                 coerce_icmp_operands(this.cg, subject, pat_val);
-                            cmp = this.cg.builder.build_icmp(32, subject, pat_val_coerced, "mexpr.cmp");
+                            cmp = this.cg.builder.build_icmp(LIntPredicate::EQ, subject, pat_val_coerced, "mexpr.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -3426,7 +3423,7 @@ public:
                         if (pat_val.is_valid()) {
                             const pat_val_coerced: LValue =
                                 coerce_icmp_operands(this.cg, subject, pat_val);
-                            cmp = this.cg.builder.build_icmp(32, subject, pat_val_coerced, "mexpr.cmp");
+                            cmp = this.cg.builder.build_icmp(LIntPredicate::EQ, subject, pat_val_coerced, "mexpr.cmp");
                         }
                     }
                     if (cmp.is_valid()) {
@@ -3442,7 +3439,7 @@ public:
                             const pat_val: LValue = LType::const_int(
                                 LType::i32(), variant.tag_value, false);
                             const cmp: LValue = this.cg.builder.build_icmp(
-                                32, minfo.tag_val, pat_val, "mexpr.cmp");
+                                LIntPredicate::EQ, minfo.tag_val, pat_val, "mexpr.cmp");
                             this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
                             matched = true;
                             break;
@@ -3765,8 +3762,8 @@ public:
                         const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(mapped.raw, sf_fidx as u32);
                         const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
                         if (field_llvm_ty != null && val_ty_raw != null
-                                && llvm::LLVMGetTypeKind(field_llvm_ty) == 8
-                                && llvm::LLVMGetTypeKind(val_ty_raw) == 8) {
+                                && type_kind_of(field_llvm_ty) == LTypeKind::Integer
+                                && type_kind_of(val_ty_raw) == LTypeKind::Integer) {
                             const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
                             const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
                             const field_lty: LType = LType { raw: field_llvm_ty };
@@ -3808,7 +3805,7 @@ public:
         }
         if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-            if (ctor_ty.is_valid() && llvm::LLVMGetTypeKind(ctor_ty.raw) == 9) {
+            if (ctor_ty.is_valid() && type_kind_of(ctor_ty.raw) == LTypeKind::Function) {
                 // Same single-element-literal bug applies here — use push.
                 mut ctor_args: LValue[] = [];
                 ctor_args.push(obj_ptr);
@@ -4014,11 +4011,11 @@ function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
     // coercion path.  Dispatch on kind + width instead.
     const got_ty: void* = llvm::LLVMTypeOf(val.raw);
     const want_ty: void* = expected.raw;
-    const gk: i32 = llvm::LLVMGetTypeKind(got_ty);
-    const wk: i32 = llvm::LLVMGetTypeKind(want_ty);
+    const gk: LTypeKind = type_kind_of(got_ty);
+    const wk: LTypeKind = type_kind_of(want_ty);
 
     // int ↔ int: widen or narrow.
-    if (gk == 8 && wk == 8) {
+    if (gk == LTypeKind::Integer && wk == LTypeKind::Integer) {
         const gw: u32 = llvm::LLVMGetIntTypeWidth(got_ty);
         const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
         if (gw == ww) { return val; }
@@ -4029,10 +4026,10 @@ function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
     }
 
     // int → ptr / ptr → int — match the `coerce_return_value` conventions.
-    if (gk == 8 && wk == 12) {
+    if (gk == LTypeKind::Integer && wk == LTypeKind::Pointer) {
         return LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, val.raw, want_ty, "mexpr.i2p") };
     }
-    if (gk == 12 && wk == 8) {
+    if (gk == LTypeKind::Pointer && wk == LTypeKind::Integer) {
         return LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, val.raw, want_ty, "mexpr.p2i") };
     }
 

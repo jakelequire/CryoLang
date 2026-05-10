@@ -184,8 +184,7 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
     } else if (kind == LiteralKind::Null) {
         // Null literal must always be a pointer type.  If resolved_type
         // mapped to void or an invalid type, fall back to i8* (void*).
-        // LLVMPointerTypeKind = 12 in the LLVM-C API.
-        if (!ty.is_valid() || llvm::LLVMGetTypeKind(ty.raw) != 12) {
+        if (!ty.is_valid() || type_kind_of(ty.raw) != LTypeKind::Pointer) {
             ty = LType::pointer_to(LType::i8());
         }
         *out_value = LType::const_pointer_null(ty);
@@ -291,7 +290,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             // Decide concat vs pointer-advance by the RHS's LLVM type.
             // Both operands are already rvalues at this point.
             const rhs_llvm: void* = llvm::LLVMTypeOf(rhs_val.raw);
-            if (rhs_llvm != null && llvm::LLVMGetTypeKind(rhs_llvm) == 8) {
+            if (rhs_llvm != null && type_kind_of(rhs_llvm) == LTypeKind::Integer) {
                 // string + int → GEP i8 for pointer arithmetic.  Caller
                 // uses this idiom for substring-from-offset, C-string
                 // walking, etc.
@@ -344,13 +343,13 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         // stripped any method body containing such a comparison.
         if (op_kind == TokenType::LAngle || op_kind == TokenType::RAngle ||
             op_kind == TokenType::LessEqual || op_kind == TokenType::GreaterEqual) {
-            mut icmp_op: i32 = 36;  // IntULT (default)
+            mut icmp_op: LIntPredicate = LIntPredicate::ULT;
             if (op_kind == TokenType::RAngle) {
-                icmp_op = 34;  // IntUGT
+                icmp_op = LIntPredicate::UGT;
             } else if (op_kind == TokenType::LessEqual) {
-                icmp_op = 37;  // IntULE
+                icmp_op = LIntPredicate::ULE;
             } else if (op_kind == TokenType::GreaterEqual) {
-                icmp_op = 35;  // IntUGE
+                icmp_op = LIntPredicate::UGE;
             }
             *out_value = cg.builder.build_icmp(icmp_op, lhs_val, rhs_val, "ptrcmp");
             return;
@@ -368,18 +367,18 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             mut rhs_tag: LValue = rhs_val;
             // Check if this is an ADT enum (struct type in LLVM) or simple (i32).
             const lhs_llvm_ty: void* = llvm::LLVMTypeOf(lhs_val.raw);
-            if (lhs_llvm_ty != null && llvm::LLVMGetTypeKind(lhs_llvm_ty) == 10) {
-                // LLVMStructTypeKind = 10 — extract tag at index 0.
-                // (13 is LLVMVectorTypeKind; the old constant was wrong,
-                // which made every ADT-enum `==` compare full structs
-                // and fail `icmp requires integer operands` at verify.)
+            if (lhs_llvm_ty != null && type_kind_of(lhs_llvm_ty) == LTypeKind::Struct) {
+                // ADT enum — extract the discriminant tag at field 0
+                // before comparing.  Skipping this would feed the full
+                // struct to icmp and trip "icmp requires integer
+                // operands" at verify time.
                 lhs_tag = cg.builder.build_extract_value(lhs_val, 0, "lhs.tag");
                 rhs_tag = cg.builder.build_extract_value(rhs_val, 0, "rhs.tag");
             }
             if (op_kind == TokenType::EqualEqual) {
-                *out_value = cg.builder.build_icmp(32, lhs_tag, rhs_tag, "enum.eq");
+                *out_value = cg.builder.build_icmp(LIntPredicate::EQ, lhs_tag, rhs_tag, "enum.eq");
             } else {
-                *out_value = cg.builder.build_icmp(33, lhs_tag, rhs_tag, "enum.ne");
+                *out_value = cg.builder.build_icmp(LIntPredicate::NE, lhs_tag, rhs_tag, "enum.ne");
             }
             return;
         }
@@ -452,11 +451,10 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     if (!is_float) {
         const lhs_ty: void* = llvm::LLVMTypeOf(lhs.raw);
         const rhs_ty: void* = llvm::LLVMTypeOf(rhs.raw);
-        // LLVMIntegerTypeKind = 8, LLVMPointerTypeKind = 12
-        const lhs_kind: i32 = llvm::LLVMGetTypeKind(lhs_ty);
-        const rhs_kind: i32 = llvm::LLVMGetTypeKind(rhs_ty);
+        const lhs_kind: LTypeKind = type_kind_of(lhs_ty);
+        const rhs_kind: LTypeKind = type_kind_of(rhs_ty);
         if (lhs_ty != null && rhs_ty != null &&
-            lhs_kind == 8 && rhs_kind == 8) {
+            lhs_kind == LTypeKind::Integer && rhs_kind == LTypeKind::Integer) {
             const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty);
             const rhs_w: u32 = llvm::LLVMGetIntTypeWidth(rhs_ty);
             if (lhs_w < rhs_w) {
@@ -475,7 +473,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                 }
             }
         } else if (lhs_ty != null && rhs_ty != null &&
-                   lhs_kind == 8 && rhs_kind == 12) {
+                   lhs_kind == LTypeKind::Integer && rhs_kind == LTypeKind::Pointer) {
             // int <op> ptr — coerce int to ptr so icmp on two pointers
             // succeeds.  Mirrors the bootstrap's ensure_compatible_types
             // path; address comparisons in stdlib (e.g., aligned_addr <
@@ -484,7 +482,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             const ptr_ty: LType = LType { raw: rhs_ty };
             lhs = cg.builder.build_int_to_ptr(lhs, ptr_ty, "int2ptr");
         } else if (lhs_ty != null && rhs_ty != null &&
-                   lhs_kind == 12 && rhs_kind == 8) {
+                   lhs_kind == LTypeKind::Pointer && rhs_kind == LTypeKind::Integer) {
             const ptr_ty: LType = LType { raw: lhs_ty };
             rhs = cg.builder.build_int_to_ptr(rhs, ptr_ty, "int2ptr");
         }
@@ -529,47 +527,47 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     // Comparison
     } else if (op_kind == TokenType::EqualEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(1 /* OEQ */, lhs, rhs, "eqtmp")
+            cg.builder.build_fcmp(LRealPredicate::OEQ, lhs, rhs, "eqtmp")
         } else {
-            cg.builder.build_icmp(32 /* IntEQ */, lhs, rhs, "eqtmp")
+            cg.builder.build_icmp(LIntPredicate::EQ, lhs, rhs, "eqtmp")
         };
     } else if (op_kind == TokenType::ExclaimEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(6 /* ONE */, lhs, rhs, "netmp")
+            cg.builder.build_fcmp(LRealPredicate::ONE, lhs, rhs, "netmp")
         } else {
-            cg.builder.build_icmp(33 /* IntNE */, lhs, rhs, "netmp")
+            cg.builder.build_icmp(LIntPredicate::NE, lhs, rhs, "netmp")
         };
     } else if (op_kind == TokenType::LAngle) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(4 /* OLT */, lhs, rhs, "lttmp")
+            cg.builder.build_fcmp(LRealPredicate::OLT, lhs, rhs, "lttmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(40 /* IntSLT */, lhs, rhs, "lttmp")
+            cg.builder.build_icmp(LIntPredicate::SLT, lhs, rhs, "lttmp")
         } else {
-            cg.builder.build_icmp(36 /* IntULT */, lhs, rhs, "lttmp")
+            cg.builder.build_icmp(LIntPredicate::ULT, lhs, rhs, "lttmp")
         } };
     } else if (op_kind == TokenType::RAngle) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(2 /* OGT */, lhs, rhs, "gttmp")
+            cg.builder.build_fcmp(LRealPredicate::OGT, lhs, rhs, "gttmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(38 /* IntSGT */, lhs, rhs, "gttmp")
+            cg.builder.build_icmp(LIntPredicate::SGT, lhs, rhs, "gttmp")
         } else {
-            cg.builder.build_icmp(34 /* IntUGT */, lhs, rhs, "gttmp")
+            cg.builder.build_icmp(LIntPredicate::UGT, lhs, rhs, "gttmp")
         } };
     } else if (op_kind == TokenType::LessEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(5 /* OLE */, lhs, rhs, "letmp")
+            cg.builder.build_fcmp(LRealPredicate::OLE, lhs, rhs, "letmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(41 /* IntSLE */, lhs, rhs, "letmp")
+            cg.builder.build_icmp(LIntPredicate::SLE, lhs, rhs, "letmp")
         } else {
-            cg.builder.build_icmp(37 /* IntULE */, lhs, rhs, "letmp")
+            cg.builder.build_icmp(LIntPredicate::ULE, lhs, rhs, "letmp")
         } };
     } else if (op_kind == TokenType::GreaterEqual) {
         *out_value = if (is_float) {
-            cg.builder.build_fcmp(3 /* OGE */, lhs, rhs, "getmp")
+            cg.builder.build_fcmp(LRealPredicate::OGE, lhs, rhs, "getmp")
         } else { if (is_signed) {
-            cg.builder.build_icmp(39 /* IntSGE */, lhs, rhs, "getmp")
+            cg.builder.build_icmp(LIntPredicate::SGE, lhs, rhs, "getmp")
         } else {
-            cg.builder.build_icmp(35 /* IntUGE */, lhs, rhs, "getmp")
+            cg.builder.build_icmp(LIntPredicate::UGE, lhs, rhs, "getmp")
         } };
 
     // Bitwise
@@ -662,17 +660,17 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
             // Compare by type kind — void* pointer equality is broken in the
             // Cryo compiler (always returns true), so we cannot rely on
             // expected_ty != actual_ty to detect mismatches.
-            const ek: i32 = llvm::LLVMGetTypeKind(expected_ty);
-            const ak: i32 = llvm::LLVMGetTypeKind(actual_ty);
+            const ek: LTypeKind = type_kind_of(expected_ty);
+            const ak: LTypeKind = type_kind_of(actual_ty);
             if (ek != ak) {
-                if (ek == 12 && ak == 10) {
-                    // Expected ptr (12), actual struct (10): the struct value
-                    // came from `codegen_rvalue` loading through some lvalue.
-                    // If we can recover that pre-load address (`val` is a
-                    // Load whose only operand is the original pointer), use
-                    // it directly — that preserves identity so callees that
-                    // mutate the struct see the caller's memory.  Otherwise
-                    // fall back to a fresh temp alloca + store + addr-of.
+                if (ek == LTypeKind::Pointer && ak == LTypeKind::Struct) {
+                    // Expected ptr, actual struct: the struct value came from
+                    // `codegen_rvalue` loading through some lvalue.  If we can
+                    // recover that pre-load address (`val` is a Load whose
+                    // only operand is the original pointer), use it directly
+                    // — that preserves identity so callees that mutate the
+                    // struct see the caller's memory.  Otherwise fall back
+                    // to a fresh temp alloca + store + addr-of.
                     // LLVMOpcode::Load = 27.
                     mut handled: boolean = false;
                     const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
@@ -689,32 +687,32 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                         cg.builder.build_store(arg_val, tmp);
                         arg_val = tmp;
                     }
-                } else if (ek == 10 && ak == 12) {
-                    // Expected struct by value (10), actual ptr (12): load
-                    // the struct from the pointer.  Handles by-value struct
-                    // args where the caller has the struct via a pointer
-                    // field or local (e.g. `ctx.diagnostics` typed as
+                } else if (ek == LTypeKind::Struct && ak == LTypeKind::Pointer) {
+                    // Expected struct by value, actual ptr: load the struct
+                    // through the pointer.  Handles by-value struct args
+                    // where the caller has the struct via a pointer field
+                    // or local (e.g. `ctx.diagnostics` typed as
                     // `DiagnosticSink*` being passed to a function that
                     // takes `DiagnosticSink` by value).
                     const st: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_load(st, arg_val, "arg.deref");
-                } else if ((ek == 2 || ek == 3) && ak == 12) {
-                    // Expected float (2) or double (3), actual ptr (12):
-                    // load the float through the pointer.  Happens for
-                    // by-value primitive receivers — e.g. `f64::trunc(this) -> f64`
-                    // called as `(&this).trunc()` where `&this` is a ptr to f64.
+                } else if ((ek == LTypeKind::Float || ek == LTypeKind::Double) && ak == LTypeKind::Pointer) {
+                    // Expected float/double, actual ptr: load the float
+                    // through the pointer.  Happens for by-value primitive
+                    // receivers — e.g. `f64::trunc(this) -> f64` called as
+                    // `(&this).trunc()` where `&this` is a ptr to f64.
                     const ft: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_load(ft, arg_val, "arg.deref");
-                } else if (ek == 8 && ak == 12 && expected_count > 0 && i == 0) {
-                    // Expected integer (8), actual ptr (12) for the receiver
-                    // (i==0): same scenario — by-value primitive `this` on
-                    // an integer-kind type.  Load the integer.  We restrict
+                } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer && expected_count > 0 && i == 0) {
+                    // Expected integer, actual ptr for the receiver slot:
+                    // same scenario — by-value primitive `this` on an
+                    // integer-kind type.  Load the integer.  We restrict
                     // to i==0 (the receiver slot) to avoid colliding with
                     // the legitimate ptrtoint coercion for non-receiver args.
                     const it: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_load(it, arg_val, "arg.deref");
-                } else if (ek == 12 && ak == 8) {
-                    // Expected ptr (12), actual integer.
+                } else if (ek == LTypeKind::Pointer && ak == LTypeKind::Integer) {
+                    // Expected ptr, actual integer.
                     //
                     // For the receiver slot (i==0) this is a primitive method
                     // on an rvalue — `this.current().kind.is_unary_prefix_op()`
@@ -738,12 +736,12 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                         const target: LType = LType { raw: expected_ty };
                         arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
                     }
-                } else if (ek == 8 && ak == 12) {
+                } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer) {
                     // Expected integer, actual ptr: ptrtoint.
                     const target: LType = LType { raw: expected_ty };
                     arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
                 }
-            } else if (ek == 8 && ak == 8) {
+            } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
                 // Both integers — coerce widths if needed.
                 const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
                 const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
@@ -1121,10 +1119,10 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     // If `obj_ptr` is a struct VALUE (e.g., a direct return from a
     // function call: `f().field`), it isn't a GEP-able address.  Use
     // `extractvalue` to pull out the field from the value and return
-    // an rvalue.  LLVMStructTypeKind = 10; under opaque pointers an
-    // actual pointer has kind 12, so the check is unambiguous.
+    // an rvalue.  Under opaque pointers an actual pointer has kind
+    // Pointer, so checking for Struct here is unambiguous.
     const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
-    if (obj_llvm_ty != null && llvm::LLVMGetTypeKind(obj_llvm_ty) == 10) {
+    if (obj_llvm_ty != null && type_kind_of(obj_llvm_ty) == LTypeKind::Struct) {
         *out_value = cg.builder.build_extract_value(
             obj_ptr, field_idx as u32, "fieldval");
         *out_is_lvalue = false;
@@ -1308,8 +1306,7 @@ function coerce_fixed_array_to_fat_ptr(cg: CodegenContext*, val: LValue,
     if (arr_t.is_fixed()) { return val; }
 
     const got_ty: void* = llvm::LLVMTypeOf(val.raw);
-    // LLVMArrayTypeKind = 11 (LLVM-C enum, stable across versions).
-    if (llvm::LLVMGetTypeKind(got_ty) != 11) { return val; }
+    if (type_kind_of(got_ty) != LTypeKind::Array) { return val; }
 
     const elem_count: u32 = llvm::LLVMGetArrayLength(got_ty);
     const elem_lty: LType = LType { raw: llvm::LLVMGetElementType(got_ty) };
@@ -1433,8 +1430,8 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                     const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, fidx as u32);
                     const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
                     if (field_llvm_ty != null && val_ty_raw != null
-                            && llvm::LLVMGetTypeKind(field_llvm_ty) == 8
-                            && llvm::LLVMGetTypeKind(val_ty_raw) == 8) {
+                            && type_kind_of(field_llvm_ty) == LTypeKind::Integer
+                            && type_kind_of(val_ty_raw) == LTypeKind::Integer) {
                         const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
                         const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
                         const field_lty: LType = LType { raw: field_llvm_ty };
@@ -1539,7 +1536,7 @@ function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
     const lhs_is_null: i32 = llvm::LLVMIsNull(lhs.raw);
     const rhs_is_null: i32 = llvm::LLVMIsNull(rhs.raw);
     if (lhs_is_null != 0 || rhs_is_null != 0) {
-        const pred: i32 = if (op_kind == TokenType::EqualEqual) { 32 } else { 33 };
+        const pred: LIntPredicate = if (op_kind == TokenType::EqualEqual) { LIntPredicate::EQ } else { LIntPredicate::NE };
         *out_value = cg.builder.build_icmp(pred, lhs, rhs, "strnullcmp");
         return;
     }
@@ -1573,9 +1570,9 @@ function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
     // strcmp returns 0 when equal.
     const zero: LValue = LType::const_int(LType::i32(), 0, false);
     if (op_kind == TokenType::EqualEqual) {
-        *out_value = cg.builder.build_icmp(32 /* IntEQ */, cmp_result, zero, "streq");
+        *out_value = cg.builder.build_icmp(LIntPredicate::EQ, cmp_result, zero, "streq");
     } else {
-        *out_value = cg.builder.build_icmp(33 /* IntNE */, cmp_result, zero, "strne");
+        *out_value = cg.builder.build_icmp(LIntPredicate::NE, cmp_result, zero, "strne");
     }
 }
 
