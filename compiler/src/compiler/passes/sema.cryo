@@ -686,61 +686,55 @@ public:
     stmt_always_returns(&this, stmt: StatementNode*) -> boolean {
         if (stmt == null) { return false; }
         const node: ASTNode* = stmt as ASTNode*;
-        const kind: NodeKind = node.kind;
-
-        if (kind == NodeKind::ReturnStatement) { return true; }
-
-        if (kind == NodeKind::BlockStatement) {
-            return this.block_always_returns(stmt as BlockStmtNode*);
-        }
-
-        if (kind == NodeKind::UnsafeBlockStatement) {
-            const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-            return this.block_always_returns(ub.block);
-        }
-
-        if (kind == NodeKind::IfStatement) {
-            const ifs: IfStmtNode* = stmt as IfStmtNode*;
-            if (!ifs.has_else()) { return false; }
-            return this.stmt_always_returns(ifs.then_stmt)
-                && this.stmt_always_returns(ifs.else_stmt);
-        }
-
-        if (kind == NodeKind::MatchStatement) {
-            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
-            // Match returns iff every arm body returns AND the match
-            // is exhaustive (covers every variant) — exhaustiveness
-            // ensures no fall-through.  `check_match_exhaustive` has
-            // already emitted a diagnostic if the match isn't, so we
-            // only treat exhaustive matches as guaranteed-return here.
-            if (!this.match_is_exhaustive(ms.subject, ms.arms)) {
-                return false;
+        match (node.kind) {
+            NodeKind::ReturnStatement => { return true; }
+            NodeKind::BlockStatement => {
+                return this.block_always_returns(stmt as BlockStmtNode*);
             }
-            for (mut i: i64 = 0; i < ms.arms.length; i++) {
-                const arm: MatchArmNode* = ms.arms[i];
-                if (arm == null || arm.body == null) { return false; }
-                if (!this.stmt_always_returns(arm.body)) { return false; }
+            NodeKind::UnsafeBlockStatement => {
+                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                return this.block_always_returns(ub.block);
             }
-            return true;
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                if (!ifs.has_else()) { return false; }
+                return this.stmt_always_returns(ifs.then_stmt)
+                    && this.stmt_always_returns(ifs.else_stmt);
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                // Match returns iff every arm body returns AND the match
+                // is exhaustive (covers every variant) — exhaustiveness
+                // ensures no fall-through.  `check_match_exhaustive` has
+                // already emitted a diagnostic if the match isn't, so we
+                // only treat exhaustive matches as guaranteed-return here.
+                if (!this.match_is_exhaustive(ms.subject, ms.arms)) {
+                    return false;
+                }
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm == null || arm.body == null) { return false; }
+                    if (!this.stmt_always_returns(arm.body)) { return false; }
+                }
+                return true;
+            }
+            NodeKind::LoopStatement => {
+                // `loop { ... }` is divergent — control can only escape via
+                // `return`, `panic`, or `break`.  If the body contains no
+                // `break` anywhere, the loop runs forever as far as the
+                // caller is concerned, so the function path through the
+                // loop never falls past it.  This is the common shape
+                // (e.g. read-loops that return on EOF / error).
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (!this.block_contains_break(ls.body)) { return true; }
+                return this.block_always_returns(ls.body);
+            }
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                return this.expr_is_divergent(es.expression);
+            }
+            _ => {}
         }
-
-        if (kind == NodeKind::LoopStatement) {
-            // `loop { ... }` is divergent — control can only escape via
-            // `return`, `panic`, or `break`.  If the body contains no
-            // `break` anywhere, the loop runs forever as far as the
-            // caller is concerned, so the function path through the
-            // loop never falls past it.  This is the common shape
-            // (e.g. read-loops that return on EOF / error).
-            const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-            if (!this.block_contains_break(ls.body)) { return true; }
-            return this.block_always_returns(ls.body);
-        }
-
-        if (kind == NodeKind::ExpressionStatement) {
-            const es: ExprStmtNode* = stmt as ExprStmtNode*;
-            return this.expr_is_divergent(es.expression);
-        }
-
         return false;
     }
 
@@ -760,35 +754,37 @@ public:
     stmt_contains_break(&this, stmt: StatementNode*) -> boolean {
         if (stmt == null) { return false; }
         const node: ASTNode* = stmt as ASTNode*;
-        const kind: NodeKind = node.kind;
-        if (kind == NodeKind::BreakStatement) { return true; }
-        if (kind == NodeKind::BlockStatement) {
-            return this.block_contains_break(stmt as BlockStmtNode*);
-        }
-        if (kind == NodeKind::UnsafeBlockStatement) {
-            const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
-            return this.block_contains_break(ub.block);
-        }
-        if (kind == NodeKind::IfStatement) {
-            const ifs: IfStmtNode* = stmt as IfStmtNode*;
-            if (this.stmt_contains_break(ifs.then_stmt)) { return true; }
-            if (ifs.has_else()) {
-                if (this.stmt_contains_break(ifs.else_stmt)) { return true; }
+        match (node.kind) {
+            NodeKind::BreakStatement => { return true; }
+            NodeKind::BlockStatement => {
+                return this.block_contains_break(stmt as BlockStmtNode*);
             }
-            return false;
-        }
-        if (kind == NodeKind::MatchStatement) {
-            const ms: MatchStmtNode* = stmt as MatchStmtNode*;
-            for (mut i: i64 = 0; i < ms.arms.length; i++) {
-                const arm: MatchArmNode* = ms.arms[i];
-                if (arm != null && this.stmt_contains_break(arm.body)) {
-                    return true;
+            NodeKind::UnsafeBlockStatement => {
+                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                return this.block_contains_break(ub.block);
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                if (this.stmt_contains_break(ifs.then_stmt)) { return true; }
+                if (ifs.has_else()) {
+                    if (this.stmt_contains_break(ifs.else_stmt)) { return true; }
                 }
+                return false;
             }
-            return false;
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm != null && this.stmt_contains_break(arm.body)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            // `break` inside a nested loop/while/for breaks that loop, not
+            // the outer one, so don't recurse into them.
+            _ => {}
         }
-        // `break` inside a nested loop/while/for breaks that loop, not
-        // the outer one, so don't recurse into them.
         return false;
     }
 
@@ -1744,59 +1740,59 @@ public:
     /// Anything else is accepted as-is.
     check_assignment_lvalue(mut &this, lhs: ExpressionNode*) -> void {
         if (lhs == null) { return; }
-        if (lhs.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = lhs as IdentifierNode*;
-            // Skip `this` — its mutability is handled by the receiver
-            // logic in MemberAccess / *this; bare `this = X` is rare.
-            if (id.name.equals(this.this_sym)) { return; }
-            // Only check names that appear in our locals map; globals
-            // and pseudo-macros (FILE/LINE) aren't tracked here.
-            match (this.local_muts.get(&id.name.id)) {
-                Option::Some(is_mut) => {
-                    if (!is_mut) {
-                        const name_str: string = this.intern.resolve(id.name);
-                        mut diag: Diagnostic = Diagnostic::error(
-                            ErrorCode::E0200_TYPE_MISMATCH,
-                            format("cannot assign to immutable variable '%s'",
-                                name_str));
-                        diag = diag.at(lhs.span);
-                        diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
-                        this.ctx.diagnostics.emit(diag);
+        match (lhs.kind) {
+            NodeKind::Identifier => {
+                const id: IdentifierNode* = lhs as IdentifierNode*;
+                // Skip `this` — its mutability is handled by the receiver
+                // logic in MemberAccess / *this; bare `this = X` is rare.
+                if (id.name.equals(this.this_sym)) { return; }
+                // Only check names that appear in our locals map; globals
+                // and pseudo-macros (FILE/LINE) aren't tracked here.
+                match (this.local_muts.get(&id.name.id)) {
+                    Option::Some(is_mut) => {
+                        if (!is_mut) {
+                            const name_str: string = this.intern.resolve(id.name);
+                            mut diag: Diagnostic = Diagnostic::error(
+                                ErrorCode::E0200_TYPE_MISMATCH,
+                                format("cannot assign to immutable variable '%s'",
+                                    name_str));
+                            diag = diag.at(lhs.span);
+                            diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
+                            this.ctx.diagnostics.emit(diag);
+                        }
                     }
+                    Option::None => {}
                 }
-                Option::None => {}
             }
-            return;
-        }
-        if (lhs.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = lhs as MemberAccessNode*;
-            if (ma.object == null) { return; }
-            // For value-type receivers, mutating a field requires a
-            // mutable receiver.  For pointer/reference receivers the
-            // receiver itself is the address, so its top-level
-            // mutability doesn't constrain field assignment.
-            const recv_t: Type* = this.arena.lookup(ma.object.resolved_type.id);
-            if (recv_t != null
-                && (recv_t.kind == TypeKind::Pointer
-                    || recv_t.kind == TypeKind::Reference)) {
-                return;
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = lhs as MemberAccessNode*;
+                if (ma.object == null) { return; }
+                // For value-type receivers, mutating a field requires a
+                // mutable receiver.  For pointer/reference receivers the
+                // receiver itself is the address, so its top-level
+                // mutability doesn't constrain field assignment.
+                const recv_t: Type* = this.arena.lookup(ma.object.resolved_type.id);
+                if (recv_t != null
+                    && (recv_t.kind == TypeKind::Pointer
+                        || recv_t.kind == TypeKind::Reference)) {
+                    return;
+                }
+                this.check_assignment_lvalue(ma.object);
             }
-            this.check_assignment_lvalue(ma.object);
-            return;
-        }
-        if (lhs.kind == NodeKind::ArrayAccess) {
-            const aa: ArrayAccessNode* = lhs as ArrayAccessNode*;
-            if (aa.array == null) { return; }
-            const arr_t: Type* = this.arena.lookup(aa.array.resolved_type.id);
-            if (arr_t != null
-                && (arr_t.kind == TypeKind::Pointer
-                    || arr_t.kind == TypeKind::Reference)) {
-                return;
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = lhs as ArrayAccessNode*;
+                if (aa.array == null) { return; }
+                const arr_t: Type* = this.arena.lookup(aa.array.resolved_type.id);
+                if (arr_t != null
+                    && (arr_t.kind == TypeKind::Pointer
+                        || arr_t.kind == TypeKind::Reference)) {
+                    return;
+                }
+                this.check_assignment_lvalue(aa.array);
             }
-            this.check_assignment_lvalue(aa.array);
-            return;
+            // UnaryExpression (deref), CallExpression result, etc. — accept.
+            _ => {}
         }
-        // UnaryExpression (deref), CallExpression result, etc. — accept.
     }
 
     resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
@@ -1863,18 +1859,21 @@ public:
         mut base_t: Type* = this.arena.lookup(obj_type.id);
         mut depth: i32 = 0;
         while (base_t != null && depth < 5) {
-            if (base_t.kind == TypeKind::Pointer) {
-                const pt: PointerType* = base_t as PointerType*;
-                base_t = this.arena.lookup(pt.pointee.id);
-            } else if (base_t.kind == TypeKind::Reference) {
-                const rt: ReferenceType* = base_t as ReferenceType*;
-                base_t = this.arena.lookup(rt.referent.id);
-            } else if (base_t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = base_t as InstantiatedType*;
-                if (!inst.has_resolved_type()) { break; }
-                base_t = this.arena.lookup(inst.resolved_type.id);
-            } else {
-                break;
+            match (base_t.kind) {
+                TypeKind::Pointer => {
+                    const pt: PointerType* = base_t as PointerType*;
+                    base_t = this.arena.lookup(pt.pointee.id);
+                }
+                TypeKind::Reference => {
+                    const rt: ReferenceType* = base_t as ReferenceType*;
+                    base_t = this.arena.lookup(rt.referent.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const inst: InstantiatedType* = base_t as InstantiatedType*;
+                    if (!inst.has_resolved_type()) { break; }
+                    base_t = this.arena.lookup(inst.resolved_type.id);
+                }
+                _ => { break; }
             }
             depth = depth + 1;
         }
@@ -3333,21 +3332,24 @@ public:
         mut walk_t: Type* = this.arena.lookup(walk_ty.id);
         mut depth: i32 = 0;
         while (walk_t != null && depth < 5) {
-            if (walk_t.kind == TypeKind::Pointer) {
-                const pt: PointerType* = walk_t as PointerType*;
-                walk_ty = pt.pointee;
-                walk_t = this.arena.lookup(walk_ty.id);
-            } else if (walk_t.kind == TypeKind::Reference) {
-                const rt: ReferenceType* = walk_t as ReferenceType*;
-                walk_ty = rt.referent;
-                walk_t = this.arena.lookup(walk_ty.id);
-            } else if (walk_t.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = walk_t as InstantiatedType*;
-                if (!it.has_resolved_type()) { break; }
-                walk_ty = it.resolved_type;
-                walk_t = this.arena.lookup(walk_ty.id);
-            } else {
-                break;
+            match (walk_t.kind) {
+                TypeKind::Pointer => {
+                    const pt: PointerType* = walk_t as PointerType*;
+                    walk_ty = pt.pointee;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::Reference => {
+                    const rt: ReferenceType* = walk_t as ReferenceType*;
+                    walk_ty = rt.referent;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { break; }
+                    walk_ty = it.resolved_type;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                _ => { break; }
             }
             depth = depth + 1;
         }
