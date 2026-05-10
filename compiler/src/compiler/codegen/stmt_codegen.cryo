@@ -75,9 +75,9 @@ function codegen_return(cg: CodegenContext*, val: LValue, has_value: boolean) ->
             const fn: LValue = cur_bb.get_parent();
             if (fn.is_valid()) {
                 const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
-                if (llvm::LLVMGetTypeKind(fn_ty_raw) == 9) {
+                if (type_kind_of(fn_ty_raw) == LTypeKind::Function) {
                     const ret_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
-                    if (llvm::LLVMGetTypeKind(ret_ty_raw) == 0) {
+                    if (type_kind_of(ret_ty_raw) == LTypeKind::Void) {
                         emit_va_end_if_variadic(cg, current_variadic_arg(cg));
                         cg.builder.build_ret_void();
                         return;
@@ -114,22 +114,20 @@ function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
     if (!fn.is_valid()) { return val; }
 
     const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
-    if (llvm::LLVMGetTypeKind(fn_ty_raw) != 9) {
-        // Not a function type — can't determine return type.  Kind 9 = Function.
+    if (type_kind_of(fn_ty_raw) != LTypeKind::Function) {
         return val;
     }
     const want_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);
     const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
 
-    // LLVM kind codes: 0=void, 8=integer, 12=pointer.
-    const want_kind: i32 = llvm::LLVMGetTypeKind(want_ty_raw);
-    const got_kind:  i32 = llvm::LLVMGetTypeKind(got_ty_raw);
+    const want_kind: LTypeKind = type_kind_of(want_ty_raw);
+    const got_kind:  LTypeKind = type_kind_of(got_ty_raw);
     const want_lty: LType = LType { raw: want_ty_raw };
 
-    if (want_kind == 12 && got_kind == 8) {
+    if (want_kind == LTypeKind::Pointer && got_kind == LTypeKind::Integer) {
         return cg.builder.build_int_to_ptr(val, want_lty, "ret.inttoptr");
     }
-    if (want_kind == 8 && got_kind == 12) {
+    if (want_kind == LTypeKind::Integer && got_kind == LTypeKind::Pointer) {
         return cg.builder.build_ptr_to_int(val, want_lty, "ret.ptrtoint");
     }
 
@@ -140,7 +138,7 @@ function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
     // can recover the pre-load address (the load's only operand) and
     // return that, leaving the dead load to be DCE'd by LLVM.
     // LLVMOpcode::Load = 27 (LLVM-C enum, stable across LLVM 14-20).
-    if (want_kind == 12 && got_kind == 10) {
+    if (want_kind == LTypeKind::Pointer && got_kind == LTypeKind::Struct) {
         const opcode: i32 = llvm::LLVMGetInstructionOpcode(val.raw);
         if (opcode == 27) {
             const ptr_operand: void* = llvm::LLVMGetOperand(val.raw, 0);
@@ -149,7 +147,7 @@ function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
             }
         }
     }
-    if (want_kind == 8 && got_kind == 8) {
+    if (want_kind == LTypeKind::Integer && got_kind == LTypeKind::Integer) {
         const want_bits: u32 = llvm::LLVMGetIntTypeWidth(want_ty_raw);
         const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(got_ty_raw);
         if (want_bits > got_bits) {
@@ -166,8 +164,7 @@ function coerce_return_value(cg: CodegenContext*, val: LValue) -> LValue {
     // shape.  Stash the loaded array on the stack, malloc N*sizeof(T), memcpy
     // the contents, and build the fat pointer — keeping IR verifiable even
     // when upstream inference is incomplete.
-    // want_kind 10 = Struct, got_kind 11 = Array (LLVM kind codes).
-    if (want_kind == 10 && got_kind == 11) {
+    if (want_kind == LTypeKind::Struct && got_kind == LTypeKind::Array) {
         const len: u32 = llvm::LLVMGetArrayLength(got_ty_raw);
         const elem_ty_raw: void* = llvm::LLVMGetElementType(got_ty_raw);
         const elem_size_val: LValue = LValue { raw: llvm::LLVMSizeOf(elem_ty_raw) };
@@ -403,8 +400,7 @@ function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
     }
 
     // Void is unsized — LLVMBuildAlloca crashes in DataLayout::getAlignment.
-    // Use LLVMGetTypeKind (0 = VoidTypeKind) instead of pointer comparison.
-    if (llvm::LLVMGetTypeKind(llvm_ty.raw) == 0) {
+    if (type_kind_of(llvm_ty.raw) == LTypeKind::Void) {
         return;
     }
 
@@ -438,12 +434,11 @@ function codegen_local_var(cg: CodegenContext*, name: SymbolStr,
         // leaving the high 4 uninitialised.  zext/sext to the alloca
         // type so the full slot is written; same idea for the trunc
         // direction (an i64 expression initialising an i32 local).
-        // LLVMIntegerTypeKind = 8.
         mut store_val: LValue = init_val;
         const init_ty_raw: void* = llvm::LLVMTypeOf(init_val.raw);
         if (init_ty_raw != null
-                && llvm::LLVMGetTypeKind(init_ty_raw) == 8
-                && llvm::LLVMGetTypeKind(llvm_ty.raw) == 8) {
+                && type_kind_of(init_ty_raw) == LTypeKind::Integer
+                && type_kind_of(llvm_ty.raw) == LTypeKind::Integer) {
             const want_bits: u32 = llvm::LLVMGetIntTypeWidth(llvm_ty.raw);
             const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(init_ty_raw);
             if (want_bits > got_bits) {
@@ -494,12 +489,11 @@ function coerce_icmp_operands(cg: CodegenContext*, lhs: LValue, rhs: LValue) -> 
     const lhs_ty_raw: void* = llvm::LLVMTypeOf(lhs.raw);
     const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
     // Only reshape when both are integer — pointer/float cases hit
-    // distinct error paths.  LLVMGetTypeKind code 8 = Integer.  We avoid
-    // `lhs_ty_raw == rhs_ty_raw` for the early-out because the bootstrap
-    // lowers `==` on `void*` to strcmp, which would read from the LLVM
-    // type objects as if they were strings.
-    if (llvm::LLVMGetTypeKind(lhs_ty_raw) != 8) { return rhs; }
-    if (llvm::LLVMGetTypeKind(rhs_ty_raw) != 8) { return rhs; }
+    // distinct error paths.  We avoid `lhs_ty_raw == rhs_ty_raw` for
+    // the early-out because the bootstrap lowers `==` on `void*` to
+    // strcmp, which would read from the LLVM type objects as strings.
+    if (type_kind_of(lhs_ty_raw) != LTypeKind::Integer) { return rhs; }
+    if (type_kind_of(rhs_ty_raw) != LTypeKind::Integer) { return rhs; }
     const lhs_bits: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty_raw);
     const rhs_bits: u32 = llvm::LLVMGetIntTypeWidth(rhs_ty_raw);
     if (lhs_bits == rhs_bits) { return rhs; }

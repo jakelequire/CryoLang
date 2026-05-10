@@ -211,6 +211,34 @@ type struct ASTValidator {
             }
         }
 
+        // Reject duplicate discriminants — including a collision between
+        // an explicit `= N` and an unannotated variant whose carry-forward
+        // tag lands on the same N.  Mirrors C semantics.
+        mut seen_tags: i64[] = [];
+        mut seen_names: SymbolStr[] = [];
+        mut next_tag: i64 = 0;
+        for (mut i: i64 = 0; i < node.variants.length; i++) {
+            const v: EnumVariantNode* = node.variants[i];
+            if (v == null) { continue; }
+            mut tag: i64 = next_tag;
+            if (v.has_value) { tag = v.explicit_value; }
+            next_tag = tag + 1;
+            mut clash_idx: i64 = -1;
+            for (mut k: i64 = 0; k < seen_tags.length; k++) {
+                if (seen_tags[k] == tag) { clash_idx = k; break; }
+            }
+            if (clash_idx >= 0) {
+                this.emit(ErrorCode::E0064_DUPLICATE_ENUM_DISCRIMINANT,
+                    format("variant '%s' shares discriminant %lld with '%s' in enum '%s'",
+                        this.ctx.resolve_str(v.name), tag,
+                        this.ctx.resolve_str(seen_names[clash_idx]), name),
+                    v.span);
+            } else {
+                seen_tags.push(tag);
+                seen_names.push(v.name);
+            }
+        }
+
         this.validate_generic_params(node.generic_params, node.span, name);
     }
 
