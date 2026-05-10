@@ -25,12 +25,23 @@ export function getConfig(): CryoConfig {
  *   1. `cryo.languageServer.path` user setting.  Relative paths are
  *      resolved against the first workspace folder so settings like
  *      `./bin/cryolsp` work without expanding to an absolute path.
- *   2. Workspace-local `tools/CryoLSP/build/bin/cryolsp` — the
+ *   2. `$CRYO_HOME` — the same install-root env var the compiler reads
+ *      for stdlib lookup (see compiler/src/compiler/instance.cryo).
+ *      Probed at `$CRYO_HOME/bin/cryolsp` (FHS-style install) and
+ *      `$CRYO_HOME/tools/CryoLSP/build/bin/cryolsp` (when CRYO_HOME
+ *      points at a source checkout).
+ *   3. Workspace-local `tools/CryoLSP/build/bin/cryolsp` — the
  *      output of `cryo build` inside the in-repo CryoLSP project.
  *      Picks up dev builds without needing any setting changes.
- *   3. Workspace-local `bin/cryolsp` — legacy install location for
+ *   4. Workspace-local `bin/cryolsp` — legacy install location for
  *      older CryoLSP packages; kept so existing users don't break.
- *   4. Extension-relative paths (sibling CryoLSP/ tree, then the
+ *   5. `cryolsp` on `$PATH`.
+ *   6. Sibling of `cryo` on `$PATH`.  We resolve the `cryo` binary
+ *      (following symlinks) and probe `<cryo-dir>/cryolsp` plus the
+ *      in-repo `tools/CryoLSP/build/bin/cryolsp` location relative to
+ *      the resolved repo root — handles the common setup where
+ *      install.sh symlinks /usr/local/bin/cryo into a source checkout.
+ *   7. Extension-relative paths (sibling CryoLSP/ tree, then the
  *      legacy `../../bin/` location).
  *
  * If a user-configured path is set but doesn't exist, the resolver
@@ -78,7 +89,14 @@ export function resolveServerPath(
         }
     };
 
-    // 2 + 3. Workspace-relative candidates.
+    // 2. $CRYO_HOME — same env var the compiler uses for stdlib lookup.
+    const cryoHome = process.env.CRYO_HOME;
+    if (cryoHome) {
+        pushPair(cryoHome, 'bin');
+        pushPair(cryoHome, 'tools', 'CryoLSP', 'build', 'bin');
+    }
+
+    // 3 + 4. Workspace-relative candidates.
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders) {
         for (const folder of workspaceFolders) {
@@ -88,7 +106,27 @@ export function resolveServerPath(
         }
     }
 
-    // 4. Extension-relative candidates.  When the extension lives at
+    // 5. `cryolsp` on $PATH.
+    const onPath = findOnPath(exeName);
+    if (onPath) {
+        candidates.push(onPath);
+    }
+
+    // 6. Sibling of `cryo` on $PATH.  install.sh symlinks
+    //    /usr/local/bin/cryo into <repo>/bin/cryo, so resolving the
+    //    symlink gives us a way back to the source tree even when the
+    //    workspace folder is unrelated.
+    const cryoPath = findOnPath(isWindows ? 'cryo.exe' : 'cryo');
+    if (cryoPath) {
+        let cryoReal = cryoPath;
+        try { cryoReal = fs.realpathSync(cryoPath); } catch { /* keep original */ }
+        const cryoDir = path.dirname(cryoReal);
+        pushPair(cryoDir);
+        // <repo>/bin/cryo → <repo>/tools/CryoLSP/build/bin/cryolsp
+        pushPair(cryoDir, '..', 'tools', 'CryoLSP', 'build', 'bin');
+    }
+
+    // 7. Extension-relative candidates.  When the extension lives at
     // `<repo>/tools/CryoAnalyzer/`, CryoLSP is a sibling at
     // `<repo>/tools/CryoLSP/`; legacy bin/ is two parents up.
     pushPair(extensionPath, '..', 'CryoLSP', 'build', 'bin');
@@ -100,6 +138,31 @@ export function resolveServerPath(
         }
     }
 
+    return undefined;
+}
+
+/**
+ * Search `$PATH` for `name` and return the first match.  Honours the
+ * platform's PATH separator and `PATHEXT` on Windows.
+ */
+function findOnPath(name: string): string | undefined {
+    const pathEnv = process.env.PATH;
+    if (!pathEnv) { return undefined; }
+
+    const sep = process.platform === 'win32' ? ';' : ':';
+    const dirs = pathEnv.split(sep).filter((d) => d.length > 0);
+
+    const exts =
+        process.platform === 'win32'
+            ? (process.env.PATHEXT?.split(';') ?? ['.EXE', '.CMD', '.BAT'])
+            : [''];
+
+    for (const dir of dirs) {
+        for (const ext of exts) {
+            const candidate = path.join(dir, name + ext);
+            if (fs.existsSync(candidate)) { return candidate; }
+        }
+    }
     return undefined;
 }
 
