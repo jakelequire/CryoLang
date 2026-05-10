@@ -1,16 +1,15 @@
 # The Cryo Language Reference
 
-> **Version:** 0.1.0 (pre-release)
+> **Version:** 1.0.0 \
 > **Last revised:** May 2026
-> **Spec status:** This document describes the language as implemented by the self-hosted compiler in [`compiler/`](../compiler/). Where the grammar reserves a form that the compiler does not yet lower, that form is called out explicitly under [§ 21 Reserved Syntax](#21-reserved-syntax).
 
-Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language and set it apart from its peers:
+Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
-1. **Limitless macros.** The macro system is most similar to Jai's: it is hygienic, powerful enough to express any code transformation, and integrated into the language rather than bolted on as a separate phase. The `macro` keyword introduces a macro definition; the macro body is a function that takes an AST as input and produces an AST as output. Macros are expanded during parsing, so they can be used in any position where normal syntax is allowed.
+1. **Explicitness.** Cryo has no implicit conversions, no type inference on variables, and no hidden control flow. The programmer writes out every cast, every type annotation, and every loop condition. This verbosity is a feature: it keeps the cost of every operation visible in the source and makes the code easier to reason about.
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
-3. **Two abstraction systems, side by side.** Cryo provides single-inheritance classes with virtual dispatch *and* a trait system with monomorphic dispatch. Use a class when the program needs runtime polymorphism over a heterogeneous collection; use a trait when you want compile-time abstraction.
+3. **Pay for what you use.** Cryo provides single-inheritance classes with virtual dispatch *and* a trait system with monomorphic dispatch. Use a class when the program needs runtime polymorphism over a heterogeneous collection; use a trait when you want compile-time abstraction.
 
 The rest of this document is organised by feature area. Examples are runnable against the current compiler; anything aspirational is marked.
 
@@ -65,17 +64,23 @@ The compiler does not enforce naming, but the standard library and ecosystem use
 
 Keywords are reserved identifiers. They cannot be used as variable, function, or type names.
 
-**Control flow.** `if` `else` `elif` `switch` `case` `default` `match` `while` `for` `loop` `do` `break` `continue` `return`
+| Control flow | Declarations | | Modifiers | Operator keywords | Special values | Reserved for future use |
+|---|---|---|---|---|---|---|
+| `if`       | `function`   | `from`        | `const`     | `new`    | `true`  | `yield`    |
+| `else`     | `class`      | `as`          | `mut`       | `delete` | `false` | `async`    |
+| `switch`   | `struct`     | `implement`   | `static`    | `sizeof` | `null`  | `await`    |
+| `case`     | `enum`       | `intrinsic`   | `public`    | `alignof`| `this`  | `auto`     |
+| `default`  | `trait`      | `where`       | `private`   | `typeof` | `This`  | `unsigned` |
+| `match`    | `type`       | `extern`      | `protected` | `in`     |         | `tuple`    |
+| `while`    | `namespace`  |               | `virtual`   | `as`     |         | `optional` |
+| `for`      | `module`     |               | `override`  |          |         | `with`     |
+| `loop`     | `import`     |               | `inline`    |          |         |            |
+| `do`       | `export`     |               | `unsafe`    |          |         |            |
+| `break`    |              |               |             |          |         |            |
+| `continue` |              |               |             |          |         |            |
+| `return`   |              |               |             |          |         |            |
 
-**Declarations.** `function` `class` `struct` `enum` `trait` `type` `namespace` `module` `import` `export` `from` `as` `implement` `intrinsic` `where` `extern`
-
-**Modifiers.** `const` `mut` `static` `public` `private` `protected` `virtual` `override` `inline` `unsafe`
-
-**Operator keywords.** `new` `delete` `sizeof` `alignof` `typeof` `in` `as` `with`
-
-**Special values.** `true` `false` `null` `this` `This`
-
-**Reserved for future use.** `yield` `async` `await` `auto` `unsigned` `mutable` `tuple` `optional` `any` `generic`. The lexer recognises these as keywords; the parser may accept them in places that have no semantic implementation. See [§ 21](#21-reserved-syntax).
+Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [§ 21](#21-reserved-syntax).
 
 ### 1.3 Comments
 

@@ -9,7 +9,13 @@
 #
 # Default layout (override with --prefix=…):
 #   /usr/local/bin/cryo            → <repo>/bin/cryo
+#   /usr/local/bin/cryolsp         → <repo>/bin/cryolsp     (or build output)
 #   /usr/local/share/cryo/stdlib   → <repo>/stdlib
+#
+# The cryolsp symlink is created when a built LSP binary is found in the
+# repo (preferring <repo>/bin/cryolsp, then <repo>/tools/CryoLSP/build/bin/
+# cryolsp).  Skip with --no-lsp.  When installed, the VS Code Cryo
+# Analyzer extension auto-detects cryolsp on $PATH from any project.
 #
 # Stdlib lookup at runtime, in priority order:
 #   1. --stdlib=PATH                   (one-off CLI override)
@@ -30,6 +36,7 @@
 # Usage: ./install.sh [options]
 #   -y, --yes        Skip the interactive confirmation
 #       --prefix=DIR Install prefix (default: /usr/local)
+#       --no-lsp     Skip the cryolsp symlink even if a build is present
 #       --uninstall  Remove previously-installed symlinks
 #   -h, --help       Show usage and exit
 #
@@ -85,9 +92,10 @@ print_banner() {
 ASSUME_YES=0
 PREFIX="/usr/local"
 ACTION="install"
+INSTALL_LSP=1
 
 usage() {
-    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,41p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -95,6 +103,7 @@ for arg in "$@"; do
     case $arg in
         -y|--yes)    ASSUME_YES=1 ;;
         --prefix=*)  PREFIX="${arg#--prefix=}" ;;
+        --no-lsp)    INSTALL_LSP=0 ;;
         --uninstall) ACTION="uninstall" ;;
         -h|--help)   usage ;;
         *)           die "unknown argument: $arg (try --help)" ;;
@@ -110,12 +119,23 @@ SRC_BIN="${REPO_ROOT}/bin/cryo"
 SRC_STDLIB="${REPO_ROOT}/stdlib"
 SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/libcryo.a"
 
+# Locate cryolsp source.  Prefer the pinned-style path next to bin/cryo,
+# fall back to the build output that `cryo build` produces.  Empty when
+# neither exists — install.sh treats that as "no LSP to install".
+SRC_LSP=""
+if [ -x "${REPO_ROOT}/bin/cryolsp" ]; then
+    SRC_LSP="${REPO_ROOT}/bin/cryolsp"
+elif [ -x "${REPO_ROOT}/tools/CryoLSP/build/bin/cryolsp" ]; then
+    SRC_LSP="${REPO_ROOT}/tools/CryoLSP/build/bin/cryolsp"
+fi
+
 [ -f "${REPO_ROOT}/Makefile" ] || die "could not find Makefile at ${REPO_ROOT} — is install.sh next to it?"
 
 # ----------------------------------------------------------------------------
 # Destination paths
 # ----------------------------------------------------------------------------
 DEST_BIN="${PREFIX}/bin/cryo"
+DEST_LSP="${PREFIX}/bin/cryolsp"
 DEST_SHARE="${PREFIX}/share/cryo"
 DEST_STDLIB="${DEST_SHARE}/stdlib"
 
@@ -168,8 +188,17 @@ if [ "$ACTION" = "install" ]; then
     echo "  • create symlinks:"
     echo "      ${DEST_BIN}"
     echo "        → ${SRC_BIN}"
+    if [ $INSTALL_LSP -eq 1 ] && [ -n "$SRC_LSP" ]; then
+        echo "      ${DEST_LSP}"
+        echo "        → ${SRC_LSP}"
+    fi
     echo "      ${DEST_STDLIB}"
     echo "        → ${SRC_STDLIB}"
+    if [ $INSTALL_LSP -eq 1 ] && [ -z "$SRC_LSP" ]; then
+        echo
+        echo "  (no cryolsp build found in repo; LSP symlink will be skipped."
+        echo "   build with 'cryo build' inside tools/CryoLSP to enable it.)"
+    fi
     echo
     echo "Repo root: ${REPO_ROOT}"
     echo "Prefix:    ${PREFIX}"
@@ -177,6 +206,7 @@ if [ "$ACTION" = "install" ]; then
 else
     echo "This installer will remove the symlinks:"
     echo "  ${DEST_BIN}"
+    echo "  ${DEST_LSP}        (if present)"
     echo "  ${DEST_STDLIB}"
     echo "  ${DEST_SHARE}      (only if empty after the stdlib symlink is gone)"
     echo
@@ -196,7 +226,7 @@ fi
 # Sudo decision
 # ----------------------------------------------------------------------------
 USE_SUDO=0
-if need_sudo_for "$DEST_BIN" || need_sudo_for "$DEST_STDLIB"; then
+if need_sudo_for "$DEST_BIN" || need_sudo_for "$DEST_LSP" || need_sudo_for "$DEST_STDLIB"; then
     USE_SUDO=1
     log_info "prefix '${PREFIX}' is not writable; will use sudo for install steps."
     if ! command -v sudo >/dev/null 2>&1; then
@@ -234,6 +264,14 @@ do_install() {
     run ln -sfn "$SRC_BIN" "$DEST_BIN"
     log_ok "linked: ${DEST_BIN} → ${SRC_BIN}"
 
+    if [ $INSTALL_LSP -eq 1 ] && [ -n "$SRC_LSP" ]; then
+        run ln -sfn "$SRC_LSP" "$DEST_LSP"
+        log_ok "linked: ${DEST_LSP} → ${SRC_LSP}"
+    elif [ $INSTALL_LSP -eq 1 ]; then
+        log_info "skipping cryolsp symlink — no built binary at <repo>/bin/cryolsp or <repo>/tools/CryoLSP/build/bin/cryolsp."
+        log_info "build it with 'cryo build' in tools/CryoLSP, then re-run install.sh."
+    fi
+
     run ln -sfn "$SRC_STDLIB" "$DEST_STDLIB"
     log_ok "linked: ${DEST_STDLIB} → ${SRC_STDLIB}"
 
@@ -251,6 +289,12 @@ do_uninstall() {
         log_ok "removed: ${DEST_BIN}"
     else
         log_info "nothing to remove at ${DEST_BIN}"
+    fi
+    if [ -L "$DEST_LSP" ] || [ -e "$DEST_LSP" ]; then
+        run rm -f "$DEST_LSP"
+        log_ok "removed: ${DEST_LSP}"
+    else
+        log_info "nothing to remove at ${DEST_LSP}"
     fi
     if [ -L "$DEST_STDLIB" ] || [ -e "$DEST_STDLIB" ]; then
         run rm -f "$DEST_STDLIB"
@@ -284,6 +328,11 @@ if [ "$ACTION" = "install" ]; then
         echo "Try it out:"
         echo "  cryo --help"
         echo "  cryo --version"
+    fi
+    if [ $INSTALL_LSP -eq 1 ] && [ -n "$SRC_LSP" ]; then
+        echo
+        echo "cryolsp is on PATH — the VS Code Cryo Analyzer extension will pick it up"
+        echo "automatically in any project (no cryo.languageServer.path setting needed)."
     fi
     echo
     # Cross-platform stdlib setup hint.  On Linux the symlink layout +

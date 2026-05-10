@@ -293,27 +293,42 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
         return;
     }
 
-    // Look up the pre-computed mangled name from the DI.
+    // Compute this overload's func_type_ref so we can look up the
+    // overload-specific mangled name.  The bare-keyed `lookup_mangled_name`
+    // is last-write-wins — for two `visit(A*)` / `visit(B*)` overloads,
+    // both share the qualified name `Mod::visit` and the second one
+    // overwrites the first's mangled-name entry.  The overload-keyed
+    // table (registered alongside in type_resolution) disambiguates by
+    // (name, func_type_ref).
     const ctx_ptr: CompilationContext* = cg.ctx;
     const intern: InternTable* = ctx_ptr.intern_table;
     const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
     const di: DeclarationIndex* = ctx_ptr.decl_index;
-    mut mangled_sym: SymbolStr = di.lookup_mangled_name(qualified);
+    const arena: TypeArena* = cg.get_arena();
+
+    mut params: TypeRef[] = [];
+    for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+        const param: VarDeclNode* = node.parameters[pi];
+        if (param != null && param.resolved_type.is_valid()) {
+            params.push(param.resolved_type);
+        }
+    }
+    const func_type_ref: TypeRef = arena.get_function(
+        node.resolved_return_type, params, node.is_variadic);
+
+    mut mangled_sym: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
+    if (!mangled_sym.is_valid()) {
+        mangled_sym = di.lookup_mangled_name(qualified);
+    }
     if (!mangled_sym.is_valid()) {
         // Compute and register on first use using the v0.2 mangler.
         const qname: QualifiedName = QualifiedName::from_symbol(qualified);
-        mut params: TypeRef[] = [];
-        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
-            const param: VarDeclNode* = node.parameters[pi];
-            if (param != null && param.resolved_type.is_valid()) {
-                params.push(param.resolved_type);
-            }
-        }
         const computed: MangledName = MangledName::for_free_function(
-            intern, cg.get_arena(), qname, params,
+            intern, arena, qname, params,
             node.resolved_return_type, node.is_variadic);
         mangled_sym = computed.value;
         di.register_mangled_name(qualified, mangled_sym);
+        di.register_overload_mangled(qualified, func_type_ref, mangled_sym);
     }
     // The C ABI entry point must be named `main` verbatim — the C
     // runtime's _start references the unmangled symbol.  Override the
@@ -667,7 +682,18 @@ function find_vtable_slot_impl(cg: CodegenContext*, cls: ClassType*,
             const computed: MangledName = MangledName::for_method(
                 intern, arena, type_qname, slot_name, recv_kind,
                 m.param_types, method_ret, method_variadic);
-            mut fn_val: LValue = resolve_function(cg, computed.value);
+            // Look up the LLVM function by its mangled name directly
+            // in the module.  resolve_function/cg.get_function cache by
+            // bare or qualified name, which is last-write-wins for
+            // overloaded virtuals — the cache would hand out whichever
+            // overload was declared most recently regardless of which
+            // slot we're filling, populating every inherited slot with
+            // the same (wrong) function.
+            const mangled_str: string = intern.resolve(computed.value);
+            mut fn_val: LValue = cg.llvm_module.get_named_function(mangled_str);
+            if (!fn_val.is_valid()) {
+                fn_val = resolve_function(cg, computed.value);
+            }
             if (!fn_val.is_valid()) {
                 const type_str: string = intern.resolve(walk.qualified_name);
                 const combined: string = format("%s::%s", type_str, method_str);
@@ -1189,8 +1215,43 @@ function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
 /// 6. Handle implicit return for void functions
 function codegen_function_prologue(cg: CodegenContext*, node: FunctionDeclNode*) -> LValue {
     const ctx_ptr: CompilationContext* = cg.ctx;
+    const intern: InternTable* = ctx_ptr.intern_table;
     const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-    const fn_val: LValue = resolve_function(cg, qualified);
+    const di: DeclarationIndex* = ctx_ptr.decl_index;
+    const arena: TypeArena* = cg.get_arena();
+
+    // Body emission must attach to the LLVM function for THIS exact
+    // overload, not whichever one was registered last under the bare
+    // qualified-name cache.  Build the same func_type_ref declare_function
+    // used to derive the mangled name, then fetch by name from the LLVM
+    // module directly.  Falls back to the bare cache for non-overloaded
+    // functions (no overload-keyed entry registered).
+    mut params: TypeRef[] = [];
+    for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+        const param: VarDeclNode* = node.parameters[pi];
+        if (param != null && param.resolved_type.is_valid()) {
+            params.push(param.resolved_type);
+        }
+    }
+    const func_type_ref: TypeRef = arena.get_function(
+        node.resolved_return_type, params, node.is_variadic);
+    const overload_mangled: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
+
+    mut fn_val: LValue = LValue::null();
+    if (overload_mangled.is_valid()) {
+        // `main` is special-cased to keep its unmangled C ABI symbol;
+        // mirror declare_function's override so we look up "main" not
+        // the mangled form.
+        const main_sym: SymbolStr = intern.intern("main");
+        mut ir_name: string = intern.resolve(overload_mangled);
+        if (node.name.equals(main_sym)) {
+            ir_name = "main";
+        }
+        fn_val = cg.llvm_module.get_named_function(ir_name);
+    }
+    if (!fn_val.is_valid()) {
+        fn_val = resolve_function(cg, qualified);
+    }
     if (!fn_val.is_valid()) {
         // The prior FunctionDeclaration pass should have produced a
         // declare for this function. When it didn't, the body simply

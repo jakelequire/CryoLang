@@ -607,14 +607,12 @@ public:
             }
         }
 
-        match (stmt.kind) {
-            NodeKind::FunctionDeclaration => { this.visit_function_decl(stmt as FunctionDeclNode*); }
-            NodeKind::StructDeclaration   => { this.visit_struct_decl(stmt as StructDeclNode*); }
-            NodeKind::ClassDeclaration    => { this.visit_class_decl(stmt as ClassDeclNode*); }
-            NodeKind::TraitDeclaration    => { this.visit_trait_decl(stmt as TraitDeclNode*); }
-            NodeKind::ImplementationBlock => { this.visit_impl_block(stmt as ImplBlockNode*); }
-            _ => {}
-        }
+        // Double-dispatch via accept() — runtime type calls the right
+        // `override visit(SpecificType*)` method.  Statement kinds that
+        // don't have a specific override fall through to BaseASTVisitor's
+        // no-op default, which is the desired behavior for top-level
+        // declarations TypeCheckVisitor doesn't process here.
+        stmt.accept(this);
 
         // Restore scope and namespace after processing injected specialization
         if (needs_restore) {
@@ -627,11 +625,11 @@ public:
         }
     }
 
-    visit_function_decl(mut &this, node: FunctionDeclNode*) -> void {
+    override visit(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null || node.is_generic()) { return; }
         const _fn_name: string = this.intern.resolve(node.name);
         this.enter_function(node, TypeRef::invalid());
-        this.visit_block(node.body);
+        this.visit(node.body);
         this.body_count = this.body_count + 1;
         this.check_function_returns(node);
     }
@@ -891,21 +889,21 @@ public:
         return true;
     }
 
-    visit_struct_decl(node: StructDeclNode*) -> void {
+    override visit(mut &this, node: StructDeclNode*) -> void {
         if (node.is_generic()) { return; }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
         const st_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
         this.visit_methods(node.methods, st_type);
     }
 
-    visit_class_decl(node: ClassDeclNode*) -> void {
+    override visit(mut &this, node: ClassDeclNode*) -> void {
         if (node.is_generic()) { return; }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
         const cl_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
         this.visit_methods(node.methods, cl_type);
     }
 
-    visit_trait_decl(node: TraitDeclNode*) -> void {
+    override visit(mut &this, node: TraitDeclNode*) -> void {
         if (node.is_generic()) { return; }
         // Inside a trait declaration, `this` refers to the implementing
         // type — symbolically. Use the same canonical `This` placeholder
@@ -921,13 +919,13 @@ public:
             const func: FunctionDeclNode* = node.methods[j];
             if (func != null && func.body != null) {
                 this.enter_function(func, this_placeholder);
-                this.visit_block(func.body);
+                this.visit(func.body);
                 this.body_count = this.body_count + 1;
             }
         }
     }
 
-    visit_impl_block(node: ImplBlockNode*) -> void {
+    override visit(mut &this, node: ImplBlockNode*) -> void {
         if (node.is_generic()) { return; }
         // Skip impls whose target is a generic template — those exist only
         // as a source for monomorphization. Type-checking the template body
@@ -978,7 +976,7 @@ public:
                     this.resolve_expr(method.base_ctor_args[k]);
                 }
             }
-            this.visit_block(method.func.body);
+            this.visit(method.func.body);
             this.body_count = this.body_count + 1;
             // Constructors and destructors return the receiver / void
             // by convention — no explicit return required.  Everyone
@@ -994,28 +992,13 @@ public:
     // Statement Visitors
     // ================================================================
 
-    /// Route a StatementNode* to the correct typed visitor override.
-    /// Uses non-overloaded helper methods instead of this.visit() to avoid
-    /// the C++ codegen vtable bug where overloaded visit() calls may
-    /// dispatch to the wrong overload.
+    /// Dispatch a StatementNode* to the correct typed visitor override
+    /// via double-dispatch.  Each statement kind has an `override visit()`
+    /// below.  Unknown kinds fall through to BaseASTVisitor's no-op
+    /// default.
     dispatch_stmt(mut &this, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
-        const n: ASTNode* = stmt as ASTNode*;
-        match (n.kind) {
-            NodeKind::BlockStatement       => { this.visit_block(stmt as BlockStmtNode*); }
-            NodeKind::ExpressionStatement  => { this.visit_expr_stmt(stmt as ExprStmtNode*); }
-            NodeKind::DeclarationStatement => { this.visit_decl_stmt(stmt as DeclStmtNode*); }
-            NodeKind::ReturnStatement      => { this.visit_return_stmt(stmt as ReturnStmtNode*); }
-            NodeKind::IfStatement          => { this.visit_if_stmt(stmt as IfStmtNode*); }
-            NodeKind::WhileStatement       => { this.visit_while_stmt(stmt as WhileStmtNode*); }
-            NodeKind::DoWhileStatement     => { this.visit_do_while_stmt(stmt as DoWhileStmtNode*); }
-            NodeKind::ForStatement         => { this.visit_for_stmt(stmt as ForStmtNode*); }
-            NodeKind::MatchStatement       => { this.visit_match_stmt(stmt as MatchStmtNode*); }
-            NodeKind::LoopStatement        => { this.visit_loop_stmt(stmt as LoopStmtNode*); }
-            NodeKind::UnsafeBlockStatement => { this.visit_unsafe_block(stmt as UnsafeBlockStmtNode*); }
-            NodeKind::SwitchStatement      => { this.visit_switch_stmt(stmt as SwitchStmtNode*); }
-            _ => {}
-        }
+        stmt.accept(this);
     }
 
     /// Non-overloaded block visitor.  All function-body and block visits
@@ -1023,7 +1006,7 @@ public:
     /// dispatch (this.visit(BlockStmtNode*)), which may resolve to the
     /// wrong visit() overload when the compiler sees BlockStmtNode* as
     /// StatementNode*.
-    visit_block(mut &this, block: BlockStmtNode*) -> void {
+    override visit(mut &this, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
         const save: i64 = this.save_scope();
         for (mut i: i64 = 0; i < block.statements.length; i++) {
@@ -1032,15 +1015,15 @@ public:
         this.restore_scope(save);
     }
 
-    visit_expr_stmt(node: ExprStmtNode*) -> void {
+    override visit(mut &this, node: ExprStmtNode*) -> void {
         this.resolve_expr(node.expression);
     }
 
-    visit_decl_stmt(mut &this, node: DeclStmtNode*) -> void {
+    override visit(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
         if (decl.kind == NodeKind::DestructureDeclaration) {
-            this.visit_destructure_decl(decl as DestructureDeclNode*);
+            this.visit(decl as DestructureDeclNode*);
             return;
         }
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
@@ -1136,7 +1119,7 @@ public:
     /// names a real field, that no field is duplicated, and that all of the
     /// type's fields are bound (until rest patterns land).  Registers each
     /// local with its field's resolved type.
-    visit_destructure_decl(mut &this, node: DestructureDeclNode*) -> void {
+    override visit(mut &this, node: DestructureDeclNode*) -> void {
         // Lazy-resolve the type annotation (mirrors visit_decl_stmt's pattern).
         if (!node.has_resolved_type() && node.type_annotation != null
                 && this.ctx.type_resolver != null) {
@@ -1309,7 +1292,7 @@ public:
         }
     }
 
-    visit_return_stmt(node: ReturnStmtNode*) -> void {
+    override visit(mut &this, node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
             // Set expected_type to the function's return type so that
             // integer literals adopt the correct type (e.g., `return 8`
@@ -1340,7 +1323,7 @@ public:
         }
     }
 
-    visit_if_stmt(node: IfStmtNode*) -> void {
+    override visit(mut &this, node: IfStmtNode*) -> void {
         this.resolve_expr(node.condition);
         this.dispatch_stmt(node.then_stmt);
         if (node.has_else()) {
@@ -1348,24 +1331,24 @@ public:
         }
     }
 
-    visit_while_stmt(node: WhileStmtNode*) -> void {
+    override visit(mut &this, node: WhileStmtNode*) -> void {
         this.resolve_expr(node.condition);
         this.dispatch_stmt(node.body);
     }
 
-    visit_do_while_stmt(node: DoWhileStmtNode*) -> void {
+    override visit(mut &this, node: DoWhileStmtNode*) -> void {
         this.dispatch_stmt(node.body);
         this.resolve_expr(node.condition);
     }
 
-    visit_for_stmt(node: ForStmtNode*) -> void {
+    override visit(mut &this, node: ForStmtNode*) -> void {
         // For-loop init variable lives in its own scope so it's visible to
         // condition, update, and body, but doesn't leak out.
         const save: i64 = this.save_scope();
 
         if (node.init != null) {
             if (node.init.kind == NodeKind::DeclarationStatement) {
-                this.visit_decl_stmt(node.init as DeclStmtNode*);
+                this.visit(node.init as DeclStmtNode*);
             } else if (node.init.kind == NodeKind::VariableDeclaration) {
                 // Parser produces a raw VarDeclNode (not wrapped in DeclStmtNode)
                 // for C-style for-loop initializers: for (mut i: int = 0; ...)
@@ -1395,7 +1378,7 @@ public:
         this.restore_scope(save);
     }
 
-    visit_match_stmt(mut &this, node: MatchStmtNode*) -> void {
+    override visit(mut &this, node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
@@ -1500,21 +1483,21 @@ public:
         this.ctx.diagnostics.emit(diag);
     }
 
-    visit_loop_stmt(node: LoopStmtNode*) -> void {
+    override visit(mut &this, node: LoopStmtNode*) -> void {
         this.dispatch_stmt(node.body);
     }
 
-    visit_unsafe_block(node: UnsafeBlockStmtNode*) -> void {
-        this.visit_block(node.block);
+    override visit(mut &this, node: UnsafeBlockStmtNode*) -> void {
+        this.visit(node.block);
     }
 
-    visit_switch_stmt(node: SwitchStmtNode*) -> void {
+    override visit(mut &this, node: SwitchStmtNode*) -> void {
         this.resolve_expr(node.expression);
         for (mut i: i64 = 0; i < node.cases.length; i++) {
             const cs: CaseStmtNode* = node.cases[i];
             if (cs == null) { continue; }
             if (cs.value != null) { this.resolve_expr(cs.value); }
-            if (cs.body != null)  { this.visit_block(cs.body); }
+            if (cs.body != null)  { this.visit(cs.body); }
         }
     }
 
@@ -2220,6 +2203,16 @@ public:
                     if (spec_ret.is_valid()) { return spec_ret; }
                 }
             }
+            // Free-function overload resolution.  When multiple overloads
+            // share `ident.name` (e.g. `visit(A*)` / `visit(B*)`), the
+            // bare/qualified mangled-name slot in DI is last-write-wins,
+            // so codegen's downstream `resolve_function*` calls would
+            // dispatch every call to the last-registered overload's
+            // mangled symbol.  Walk the overload set, find the one whose
+            // declared param types match the call's arg types, and pin
+            // its overload-specific mangled name to `resolved_callee` so
+            // codegen can look up the right LLVM function directly.
+            this.try_pin_overload_mangled_callee(call, ident);
             return this.resolve_direct_call(ident);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
@@ -2236,6 +2229,90 @@ public:
         }
 
         return this.resolve_expr(callee);
+    }
+
+    /// Free-function overload resolution.  Walks the overloads registered
+    /// for `ident.name` (qualified first, then bare), finds one whose
+    /// param types match the call's arg types by arena TypeRef ID, and
+    /// pins the overload-specific mangled name as `call.resolved_callee`
+    /// so codegen can look up the exact LLVM function instead of
+    /// resolving by bare/qualified name (which is last-write-wins for
+    /// overloads).  Silently no-ops on no-match — `resolve_direct_call`
+    /// + the codegen fallback chain still produces a working call for
+    /// non-overloaded functions.
+    try_pin_overload_mangled_callee(mut &this, call: CallExprNode*,
+                                    ident: IdentifierNode*) -> void {
+        if (call.resolved_callee.is_valid()) { return; }
+
+        // Gather arg types.  Bail if any arg failed to resolve — we'd
+        // otherwise mismatch on TypeRef::invalid().
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return; }
+            arg_types.push(arg.resolved_type);
+        }
+
+        const di: DeclarationIndex* = this.ctx.decl_index;
+
+        // Try qualified name first (current module), then bare.
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        mut overloads: TypeRef[] = di.lookup_func_type_overloads(qualified);
+        mut lookup_key: SymbolStr = qualified;
+        if (overloads.length == 0) {
+            overloads = di.lookup_func_type_overloads(ident.name);
+            lookup_key = ident.name;
+        }
+        if (overloads.length <= 1) { return; }
+
+        // Find the overload whose declared param types match arg types.
+        // Match rules: exact arena ID match, or implicit Reference→Pointer
+        // coercion (`&local` produces a Reference, but `f(p: T*)` declares
+        // a Pointer; codegen passes a raw `ptr` either way).  Equivalence
+        // by pointee/referent TypeRef.id.
+        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+            const ot: Type* = this.arena.lookup(overloads[oi].id);
+            if (ot == null || ot.kind != TypeKind::Function) { continue; }
+            const fn_ty: FunctionType* = ot as FunctionType*;
+            if (fn_ty.param_types.length != arg_types.length) { continue; }
+            mut all_match: boolean = true;
+            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
+                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (!all_match) { continue; }
+            const mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            if (mangled.is_valid()) {
+                call.set_resolved_callee(mangled);
+                return;
+            }
+        }
+    }
+
+    /// Compatibility predicate for overload-resolution param ↔ arg matching.
+    /// Exact arena-ID match wins; otherwise allows pointer/reference coercion
+    /// when both sides point/refer to the same pointee/referent type.
+    overload_param_matches_arg(&this, param: TypeRef, arg: TypeRef) -> boolean {
+        if (param.id == arg.id) { return true; }
+        const pt: Type* = this.arena.lookup(param.id);
+        const at: Type* = this.arena.lookup(arg.id);
+        if (pt == null || at == null) { return false; }
+        // &T → T*  (reference passed where pointer expected — codegen
+        // passes a raw `ptr` for both).
+        if (pt.kind == TypeKind::Pointer && at.kind == TypeKind::Reference) {
+            const pp: PointerType* = pt as PointerType*;
+            const ar: ReferenceType* = at as ReferenceType*;
+            return pp.pointee.id == ar.referent.id;
+        }
+        // T* → &T  (the symmetric case, less common but mirror it).
+        if (pt.kind == TypeKind::Reference && at.kind == TypeKind::Pointer) {
+            const pr: ReferenceType* = pt as ReferenceType*;
+            const ap: PointerType* = at as PointerType*;
+            return pr.referent.id == ap.pointee.id;
+        }
+        return false;
     }
 
     resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
@@ -2458,6 +2535,30 @@ public:
                             }
                             if (pointee.is_valid() && pointee.id == arg_types[pi].id) {
                                 continue;
+                            }
+                            // Also accept when arg itself is Pointer/Reference
+                            // wrapping the same pointee — e.g. `&local` (Reference)
+                            // passed to a `T*` (Pointer) param.  Codegen passes
+                            // a raw `ptr` for both kinds, so the arg/param
+                            // wrapper-kind difference doesn't change the LLVM
+                            // signature.
+                            const at: Type* = this.arena.lookup(arg_types[pi].id);
+                            if (at != null && pointee.is_valid()) {
+                                mut arg_pointee: TypeRef = TypeRef::invalid();
+                                if (at.kind == TypeKind::Pointer) {
+                                    const apt: PointerType* = at as PointerType*;
+                                    arg_pointee = apt.pointee;
+                                } else if (at.kind == TypeKind::Reference) {
+                                    const art: ReferenceType* = at as ReferenceType*;
+                                    arg_pointee = art.referent;
+                                }
+                                if (arg_pointee.is_valid() && arg_pointee.id == pointee.id) {
+                                    continue;
+                                }
+                                if (allow_subclass && arg_pointee.is_valid() &&
+                                    this.checker.is_subclass_of(arg_pointee, pointee)) {
+                                    continue;
+                                }
                             }
                             if (allow_subclass && pointee.is_valid() &&
                                 this.checker.is_subclass_of(arg_types[pi], pointee)) {
