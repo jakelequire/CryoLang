@@ -8,6 +8,8 @@ import Utils;
 import Utils::File;
 import CLI::Commands;
 import std::collections::hashmap;
+import std::collections::pair;
+import std::core::cmp;
 
 type struct Argument {
     name:          string;
@@ -20,39 +22,50 @@ type struct Argument {
 
 type struct ParsedArgs {
 private:
-    args:        Map<string, Argument>;
-    flags:       Map<string, Argument>;
-    defines:     Map<string, Argument>;
+    // Small associative lists backed by `Pair<string, Argument>[]`.
+    // Argument counts are in the low single digits for any realistic
+    // CLI invocation, so the linear scan is fine and the cache-locality
+    // wins over a `HashMap`.  Equality on the key goes through the
+    // `string` `Eq` impl (byte-level compare), which fixes the
+    // pointer-equality bug that the old `Utils::Map<string, V>` had.
+    args:        Pair<string, Argument>[];
+    flags:       Pair<string, Argument>[];
+    defines:     Pair<string, Argument>[];
     positionals: Argument[];
 
 public:
     set_arg(mut &this, key: string, arg: Argument) -> void {
-        this.args.set(key, arg);
+        for (mut i: int = 0; i < this.args.length; i++) {
+            if (this.args[i].first.equals(&key)) {
+                this.args[i].second = arg;
+                return;
+            }
+        }
+        this.args.push(Pair<string, Argument>::new(key, arg));
     }
 
     get_arg(&this, key: string) -> Argument* {
-        return this.args.get(key);
+        for (mut i: int = 0; i < this.args.length; i++) {
+            if (this.args[i].first.equals(&key)) {
+                return &this.args[i].second;
+            }
+        }
+        return null;
     }
 
     has_arg(&this, key: string) -> boolean {
-        // Workaround: same strcmp issue as has_flag
-        for (mut i: int = 0; i < this.args.keys.length; i++) {
-            if (strcmp(this.args.keys[i], key) == 0) {
-                return true;
-            }
+        for (mut i: int = 0; i < this.args.length; i++) {
+            if (this.args[i].first.equals(&key)) { return true; }
         }
         return false;
     }
 
     /// Returns the string value of a `--key=value` arg, or empty
-    /// string if the key wasn't provided.  Uses the same strcmp
-    /// workaround as has_arg/has_flag (Map<string,…>::get is broken
-    /// for string keys built from different sources).
+    /// string if the key wasn't provided.
     get_value(&this, key: string) -> string {
-        for (mut i: int = 0; i < this.args.keys.length; i++) {
-            if (strcmp(this.args.keys[i], key) == 0) {
-                const arg: Argument = this.args.values[i];
-                return arg.default_value;
+        for (mut i: int = 0; i < this.args.length; i++) {
+            if (this.args[i].first.equals(&key)) {
+                return this.args[i].second.default_value;
             }
         }
         return "";
@@ -67,16 +80,18 @@ public:
             required:      false,
             is_flag:       true,
         };
-        this.flags.set(key, flag);
+        for (mut i: int = 0; i < this.flags.length; i++) {
+            if (this.flags[i].first.equals(&key)) {
+                this.flags[i].second = flag;
+                return;
+            }
+        }
+        this.flags.push(Pair<string, Argument>::new(key, flag));
     }
 
     has_flag(&this, key: string) -> boolean {
-        // Workaround: Map<string,…>::get uses pointer equality (==) for keys,
-        // which fails for strings from different sources.  Use strcmp directly.
-        for (mut i: int = 0; i < this.flags.keys.length; i++) {
-            if (strcmp(this.flags.keys[i], key) == 0) {
-                return true;
-            }
+        for (mut i: int = 0; i < this.flags.length; i++) {
+            if (this.flags[i].first.equals(&key)) { return true; }
         }
         return false;
     }
@@ -134,9 +149,9 @@ type struct ArgumentParser {
     /// go into defines, and everything else is collected as a positional.
     static parse(argc: int, argv: string*, start: int) -> ParsedArgs {
         mut result: ParsedArgs = ParsedArgs {
-            args:        Map<string, Argument>::new(),
-            flags:       Map<string, Argument>::new(),
-            defines:     Map<string, Argument>::new(),
+            args:        [],
+            flags:       [],
+            defines:     [],
             positionals: [],
         };
 
@@ -147,14 +162,25 @@ type struct ArgumentParser {
             // -D defines: -DFOO=bar or -DFOO (defaults to "true")
             if (len > 2 && strncmp(arg, "-D", 2) == 0) {
                 const define_str: string = ptr_add(arg as void*, 2) as string;
-                result.defines.set(define_str, Argument {
+                const define_arg: Argument = Argument {
                     name:          define_str,
                     description:   "",
                     default_value: "true",
                     aliases:       [],
                     required:      false,
                     is_flag:       false,
-                });
+                };
+                mut replaced: boolean = false;
+                for (mut j: int = 0; j < result.defines.length; j++) {
+                    if (result.defines[j].first.equals(&define_str)) {
+                        result.defines[j].second = define_arg;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    result.defines.push(Pair<string, Argument>::new(define_str, define_arg));
+                }
                 continue;
             }
 
