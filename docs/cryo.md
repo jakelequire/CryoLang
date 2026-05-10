@@ -1726,7 +1726,7 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
-| Automatic drop synthesis | The analyzer is wired up; AST synthesis is gated off (`SYNTHESIZE_DROPS = false`) until the standard library has been audited and the consuming-method attribute has landed. Owning types currently expose a public `drop(mut &this)` to be called manually. |
+| Automatic drop synthesis | Implemented. The analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`; non-`Copy` let-bindings are auto-dropped at every scope-exit point in reverse declaration order. Manual `binding.drop()` calls remain valid — the analyzer detects them as moves and the synthesizer skips already-consumed bindings. Pattern bindings (`match` arms) and field/indexed accesses are not registered, so explicit drops in those positions are still required. |
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
