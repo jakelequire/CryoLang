@@ -1,0 +1,215 @@
+///! Break/continue drop synthesis — pin the rule that locals declared
+///! inside a loop body get dropped when control leaves the loop via
+///! `break` or skips to the next iteration via `continue`.
+///!
+///! The contract the drop-insertion pass owes us:
+///!
+///!  * `break;`    drops every binding inside the enclosing loop body's
+///!                scopes (innermost first), then exits the loop.
+///!                Bindings declared OUTSIDE the loop survive.
+///!  * `continue;` drops every binding inside the enclosing loop body's
+///!                scopes (innermost first), then continues to the next
+///!                iteration.  Bindings declared in the for-init are NOT
+///!                dropped (they belong to the for-statement scope, which
+///!                survives across iterations).
+///!  * `loop { let v = ...; break; }` is the bare-stmt early-exit shape
+///!                that `wrap_early_exit` in passes/drop_insertion.cryo
+///!                rewrites into a synthesized block; the drop must still
+///!                be inserted.
+///!
+///! Observable side-effect: each `Probe::drop()` bumps a module-level
+///! counter.  We assert the counter delta matches what the contract
+///! requires for each shape.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::BreakContinueDrops;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Probe — a non-Copy type with a side-effecting drop.  Drop bumps the
+// module-level counter so tests can verify a specific number of drops
+// fired on the path under test.
+// ============================================================================
+
+mut g_drop_count: i32 = 0;
+
+function reset_drop_count() -> void { g_drop_count = 0; }
+function drop_count()       -> i32  { return g_drop_count; }
+
+type struct Probe {
+    tag: i32;
+
+    static new(tag: i32) -> Probe {
+        return Probe { tag: tag };
+    }
+}
+
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void {
+        g_drop_count = g_drop_count + 1;
+    }
+}
+
+// ============================================================================
+// Baseline — confirm that a Probe declared and never moved gets dropped
+// when its enclosing scope ends normally.  If this fails, every other
+// test in this file is meaningless: a 0-vs-N counter check can't
+// distinguish "drop synthesis is off" from "break/continue specifically
+// skips drops".
+// ============================================================================
+
+![test]
+function baseline_scope_exit_drops_once() -> Result<(), TestError> {
+    reset_drop_count();
+    {
+        const p: Probe = Probe::new(1);
+    }
+    match (expect_eq(drop_count(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// loop { ...; break; }
+// ============================================================================
+
+![test]
+function break_in_loop_drops_loop_local() -> Result<(), TestError> {
+    reset_drop_count();
+    loop {
+        const p: Probe = Probe::new(1);
+        break;
+    }
+    match (expect_eq(drop_count(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function break_in_loop_inside_bare_if_drops_loop_local() -> Result<(), TestError> {
+    // `if (cond) break;` with no braces — the parser emits a bare
+    // BreakStmtNode as the if's then-branch.  drop-insertion's
+    // wrap_early_exit must rewrite that into a block so the loop-local
+    // drop gets spliced in before the break.
+    reset_drop_count();
+    mut iters: i32 = 0;
+    loop {
+        const p: Probe = Probe::new(1);
+        iters = iters + 1;
+        if (iters >= 1) break;
+    }
+    match (expect_eq(drop_count(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function break_in_nested_block_drops_inner_and_outer() -> Result<(), TestError> {
+    // The `break` lives inside an inner `{ ... }` scope.  Both the inner
+    // binding `q` and the loop-body binding `p` must be dropped, in
+    // innermost-first order.  We can't observe order from a single
+    // counter, but the count must be 2.
+    reset_drop_count();
+    loop {
+        const p: Probe = Probe::new(1);
+        {
+            const q: Probe = Probe::new(2);
+            break;
+        }
+    }
+    match (expect_eq(drop_count(), 2)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// while { ...; continue; }
+// ============================================================================
+
+![test]
+function continue_in_while_drops_per_iteration() -> Result<(), TestError> {
+    // Three iterations, each declares a Probe and continues.  Drop must
+    // fire on every continue edge (3 total) — if continue skipped the
+    // drop we'd see 0.
+    reset_drop_count();
+    mut i: i32 = 0;
+    while (i < 3) {
+        const p: Probe = Probe::new(i);
+        i = i + 1;
+        continue;
+    }
+    match (expect_eq(drop_count(), 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function break_in_while_preserves_outer_binding() -> Result<(), TestError> {
+    // `outer` is declared BEFORE the loop and must survive `break` — its
+    // drop fires when the enclosing function-body scope ends, not on the
+    // break edge.  So immediately after the loop, count should be 1
+    // (the loop-local Probe); after the function returns, count is 2.
+    // We assert the in-flight count from inside the test, then bump
+    // again so the post-test count check is deterministic.
+    reset_drop_count();
+    const outer: Probe = Probe::new(99);
+    while (true) {
+        const inner: Probe = Probe::new(0);
+        break;
+    }
+    // outer is still alive here — only `inner` has been dropped.
+    match (expect_eq(drop_count(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// for (...; ...; ...) { ...; break; }
+// ============================================================================
+
+![test]
+function break_in_for_drops_body_local_not_init() -> Result<(), TestError> {
+    // The for-init `mut i: i32 = 0` is a primitive (Copy), so it has no
+    // drop side-effect — we use it only to drive iteration.  The Probe
+    // inside the body must be dropped on the break edge.
+    reset_drop_count();
+    for (mut i: i32 = 0; i < 5; i = i + 1) {
+        const p: Probe = Probe::new(i);
+        if (i >= 0) break;
+    }
+    match (expect_eq(drop_count(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function continue_in_for_drops_body_local_each_iter() -> Result<(), TestError> {
+    reset_drop_count();
+    for (mut i: i32 = 0; i < 4; i = i + 1) {
+        const p: Probe = Probe::new(i);
+        continue;
+    }
+    match (expect_eq(drop_count(), 4)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
