@@ -1,13 +1,19 @@
 ///! fmt — itoa, parse, format_to_string.
+///!
+///! Buffer-write formatting hangs off the primitive types in `core::primitives`
+///! (`value.to_decimal_buf(buf)`, `value.to_hex_buf(buf)`, etc.). Parsing
+///! goes through `FromStr` (`u64::from_str(s)`) plus the hex-only
+///! `Str::try_to_hex()`.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::FmtT;
 
 import std::core::result;
 import std::core::option;
+import std::core::primitives;
+import std::core::convert;
 import std::collections::str;
 import std::collections::string;
-import std::fmt::integer;
 import std::fmt::display;
 import std::test::error;
 import std::test::assert;
@@ -19,11 +25,12 @@ import std::test::assert;
 ![test]
 function write_u64_decimal_zero() -> Result<(), TestError> {
     mut buf: u8[20];
-    const n: u64 = integer::write_u64_decimal(&buf[0], 0);
+    const value: u64 = 0;
+    const n: u64 = value.to_decimal_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("0", 1);
     match (expect(view.equals(&want),
-        Str::from_raw("write_u64_decimal(0) should be '0'", 34))) {
+        Str::from_raw("u64(0).to_decimal_buf should be '0'", 35))) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
     }
@@ -33,11 +40,12 @@ function write_u64_decimal_zero() -> Result<(), TestError> {
 ![test]
 function write_u64_decimal_small() -> Result<(), TestError> {
     mut buf: u8[20];
-    const n: u64 = integer::write_u64_decimal(&buf[0], 12345);
+    const value: u64 = 12345;
+    const n: u64 = value.to_decimal_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("12345", 5);
     match (expect(view.equals(&want),
-        Str::from_raw("write_u64_decimal(12345) bytes", 30))) {
+        Str::from_raw("u64(12345).to_decimal_buf bytes", 31))) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
     }
@@ -46,13 +54,13 @@ function write_u64_decimal_small() -> Result<(), TestError> {
 
 ![test]
 function write_i64_decimal_negative() -> Result<(), TestError> {
-    mut buf: u8[20];
+    mut buf: u8[21];
     const value: i64 = -42 as i64;
-    const n: u64 = integer::write_i64_decimal(&buf[0], value);
+    const n: u64 = value.to_decimal_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("-42", 3);
     match (expect(view.equals(&want),
-        Str::from_raw("write_i64_decimal(-42) should be '-42'", 38))) {
+        Str::from_raw("i64(-42).to_decimal_buf should be '-42'", 39))) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
     }
@@ -67,7 +75,7 @@ function write_i64_decimal_negative() -> Result<(), TestError> {
 function write_u64_hex_lower() -> Result<(), TestError> {
     mut buf: u8[16];
     const value: u64 = 0xDEADBEEF as u64;
-    const n: u64 = integer::write_u64_hex(&buf[0], value);
+    const n: u64 = value.to_hex_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("deadbeef", 8);
     match (expect(view.equals(&want),
@@ -82,7 +90,7 @@ function write_u64_hex_lower() -> Result<(), TestError> {
 function write_u64_hex_upper() -> Result<(), TestError> {
     mut buf: u8[16];
     const value: u64 = 0xCAFE as u64;
-    const n: u64 = integer::write_u64_hex_upper(&buf[0], value);
+    const n: u64 = value.to_hex_upper_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("CAFE", 4);
     match (expect(view.equals(&want),
@@ -96,7 +104,8 @@ function write_u64_hex_upper() -> Result<(), TestError> {
 ![test]
 function write_u64_oct_basic() -> Result<(), TestError> {
     mut buf: u8[22];
-    const n: u64 = integer::write_u64_oct(&buf[0], 8);
+    const value: u64 = 8;
+    const n: u64 = value.to_oct_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("10", 2);
     match (expect(view.equals(&want),
@@ -110,7 +119,8 @@ function write_u64_oct_basic() -> Result<(), TestError> {
 ![test]
 function write_u64_bin_basic() -> Result<(), TestError> {
     mut buf: u8[64];
-    const n: u64 = integer::write_u64_bin(&buf[0], 5);
+    const value: u64 = 5;
+    const n: u64 = value.to_bin_buf(&buf[0]);
     const view: Str = Str::from_raw(&buf[0], n);
     const want: Str = Str::from_raw("101", 3);
     match (expect(view.equals(&want),
@@ -122,22 +132,22 @@ function write_u64_bin_basic() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// Parsing
+// Parsing — TryFrom<Str> for the integer widths
 // ============================================================================
 
 ![test]
 function parse_u64_round_trips() -> Result<(), TestError> {
     const src: Str = Str::from_raw("1234", 4);
-    match (integer::parse_u64(src)) {
-        Option::Some(value) => {
+    match (u64::from_str(src)) {
+        Result::Ok(value) => {
             const want: u64 = 1234;
             match (expect_eq(value, want)) {
                 Result::Ok(_) => { }
                 Result::Err(e) => { return Result::Err(e); }
             }
         }
-        Option::None => {
-            return bail(Str::from_raw("parse_u64 should succeed", 24));
+        Result::Err(_) => {
+            return bail(Str::from_raw("u64::from_str should succeed", 28));
         }
     }
     return Result::Ok(());
@@ -146,11 +156,11 @@ function parse_u64_round_trips() -> Result<(), TestError> {
 ![test]
 function parse_u64_rejects_non_digit() -> Result<(), TestError> {
     const src: Str = Str::from_raw("12a4", 4);
-    match (integer::parse_u64(src)) {
-        Option::Some(_) => {
-            return bail(Str::from_raw("parse_u64 should reject non-digit", 33));
+    match (u64::from_str(src)) {
+        Result::Ok(_) => {
+            return bail(Str::from_raw("u64::from_str should reject non-digit", 37));
         }
-        Option::None => { }
+        Result::Err(_) => { }
     }
     return Result::Ok(());
 }
@@ -158,11 +168,11 @@ function parse_u64_rejects_non_digit() -> Result<(), TestError> {
 ![test]
 function parse_u64_rejects_empty() -> Result<(), TestError> {
     const src: Str = Str::from_raw("", 0);
-    match (integer::parse_u64(src)) {
-        Option::Some(_) => {
+    match (u64::from_str(src)) {
+        Result::Ok(_) => {
             return bail(Str::from_raw("empty input should not parse", 28));
         }
-        Option::None => { }
+        Result::Err(_) => { }
     }
     return Result::Ok(());
 }
@@ -171,11 +181,11 @@ function parse_u64_rejects_empty() -> Result<(), TestError> {
 function parse_u32_clamps_to_range() -> Result<(), TestError> {
     // 5_000_000_000 > u32::MAX (~4.29e9).
     const src: Str = Str::from_raw("5000000000", 10);
-    match (integer::parse_u32(src)) {
-        Option::Some(_) => {
+    match (u32::from_str(src)) {
+        Result::Ok(_) => {
             return bail(Str::from_raw("oversized value should not parse to u32", 39));
         }
-        Option::None => { }
+        Result::Err(_) => { }
     }
     return Result::Ok(());
 }
@@ -183,15 +193,15 @@ function parse_u32_clamps_to_range() -> Result<(), TestError> {
 ![test]
 function parse_u8_octet() -> Result<(), TestError> {
     const src: Str = Str::from_raw("255", 3);
-    match (integer::parse_u8(src)) {
-        Option::Some(value) => {
+    match (u8::from_str(src)) {
+        Result::Ok(value) => {
             match (expect_eq(value, 255 as u8)) {
                 Result::Ok(_) => { }
                 Result::Err(e) => { return Result::Err(e); }
             }
         }
-        Option::None => {
-            return bail(Str::from_raw("parse_u8 should accept 255", 26));
+        Result::Err(_) => {
+            return bail(Str::from_raw("u8::from_str should accept 255", 30));
         }
     }
     return Result::Ok(());
@@ -200,17 +210,150 @@ function parse_u8_octet() -> Result<(), TestError> {
 ![test]
 function parse_u64_hex_round_trips() -> Result<(), TestError> {
     const src: Str = Str::from_raw("ff", 2);
-    match (integer::parse_u64_hex(src)) {
-        Option::Some(value) => {
+    match (src.try_to_hex()) {
+        Result::Ok(value) => {
             const want: u64 = 255;
             match (expect_eq(value, want)) {
                 Result::Ok(_) => { }
                 Result::Err(e) => { return Result::Err(e); }
             }
         }
-        Option::None => {
+        Result::Err(_) => {
             return bail(Str::from_raw("hex 'ff' should parse", 21));
         }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Signed parsing
+// ============================================================================
+
+![test]
+function parse_i32_negative() -> Result<(), TestError> {
+    const src: Str = Str::from_raw("-42", 3);
+    match (i32::from_str(src)) {
+        Result::Ok(value) => {
+            const want: i32 = -42;
+            match (expect_eq(value, want)) {
+                Result::Ok(_) => { }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Result::Err(_) => {
+            return bail(Str::from_raw("i32::from_str(\"-42\") should succeed", 35));
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function parse_i32_plus_sign() -> Result<(), TestError> {
+    const src: Str = Str::from_raw("+100", 4);
+    match (i32::from_str(src)) {
+        Result::Ok(value) => {
+            const want: i32 = 100;
+            match (expect_eq(value, want)) {
+                Result::Ok(_) => { }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Result::Err(_) => {
+            return bail(Str::from_raw("i32::from_str(\"+100\") should succeed", 36));
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function parse_i64_min_value() -> Result<(), TestError> {
+    // i64::MIN — the boundary case that breaks naive negate-after-parse.
+    const src: Str = Str::from_raw("-9223372036854775808", 20);
+    match (i64::from_str(src)) {
+        Result::Ok(value) => {
+            const want: i64 = -9223372036854775808;
+            match (expect_eq(value, want)) {
+                Result::Ok(_) => { }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Result::Err(_) => {
+            return bail(Str::from_raw("i64::from_str should accept i64::MIN", 36));
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function parse_i8_overflow_rejected() -> Result<(), TestError> {
+    // 128 is one past i8::MAX.
+    const src: Str = Str::from_raw("128", 3);
+    match (i8::from_str(src)) {
+        Result::Ok(_) => {
+            return bail(Str::from_raw("i8::from_str should reject 128", 30));
+        }
+        Result::Err(_) => { }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function parse_i32_lone_sign_rejected() -> Result<(), TestError> {
+    const src: Str = Str::from_raw("-", 1);
+    match (i32::from_str(src)) {
+        Result::Ok(_) => {
+            return bail(Str::from_raw("bare \"-\" should not parse", 25));
+        }
+        Result::Err(_) => { }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Narrower-width buffer writes
+// ============================================================================
+
+![test]
+function write_u8_decimal_max() -> Result<(), TestError> {
+    mut buf: u8[3];
+    const value: u8 = 255 as u8;
+    const n: u64 = value.to_decimal_buf(&buf[0]);
+    const view: Str = Str::from_raw(&buf[0], n);
+    const want: Str = Str::from_raw("255", 3);
+    match (expect(view.equals(&want),
+        Str::from_raw("u8(255).to_decimal_buf should be '255'", 38))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function write_i16_decimal_negative() -> Result<(), TestError> {
+    mut buf: u8[6];
+    const value: i16 = -32768 as i16;
+    const n: u64 = value.to_decimal_buf(&buf[0]);
+    const view: Str = Str::from_raw(&buf[0], n);
+    const want: Str = Str::from_raw("-32768", 6);
+    match (expect(view.equals(&want),
+        Str::from_raw("i16::MIN should be '-32768'", 27))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function write_u32_hex_lower() -> Result<(), TestError> {
+    mut buf: u8[8];
+    const value: u32 = 0xCAFE as u32;
+    const n: u64 = value.to_hex_buf(&buf[0]);
+    const view: Str = Str::from_raw(&buf[0], n);
+    const want: Str = Str::from_raw("cafe", 4);
+    match (expect(view.equals(&want),
+        Str::from_raw("u32(0xCAFE).to_hex_buf should be 'cafe'", 39))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
     }
     return Result::Ok(());
 }

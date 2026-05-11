@@ -14,8 +14,10 @@ namespace std::collections::str;
 
 import core::intrinsics;
 import core::option;
+import core::result;
 import core::slice;
 import core::cmp;
+import core::convert;
 import core::hash;
 import collections::string;
 
@@ -156,5 +158,255 @@ implement trait Hash for struct Str {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
         hasher.write_bytes(this.as_bytes());
+    }
+}
+
+// ============================================================================
+// Decimal parsing — `FromStr` for each integer width
+//
+// Call sites read `u16::from_str(s)` and get back
+// `Result<u16, ConversionError>`. `FromStr` is defined here rather than
+// reusing `TryFrom<Str>` because Cryo's current dispatcher can't
+// disambiguate `u64::try_from(...)` when both `TryFrom<i64>` and
+// `TryFrom<Str>` exist on the same target — the resolver collides on
+// the method name `try_from`. A dedicated trait with the unique method
+// name `from_str` sidesteps that.
+//
+// Hex parsing lives below in a separate `try_to_hex(&this)` method on Str
+// since `FromStr` can't distinguish decimal from hex on the same
+// source type.
+// ============================================================================
+
+type trait FromStr {
+    static from_str(source: Str) -> Result<This, ConversionError>;
+}
+
+implement trait FromStr for u64 {
+    static from_str(source: Str) -> Result<u64, ConversionError> {
+        if (source.length() == 0) {
+            return Result::Err(ConversionError::new("empty input"));
+        }
+        mut value: u64 = 0;
+        mut i: u64 = 0;
+        while (i < source.length()) {
+            match (source.byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte < 0x30 || byte > 0x39) {
+                        return Result::Err(ConversionError::new("non-digit byte"));
+                    }
+                    const digit: u64 = (byte - 0x30) as u64;
+                    // Overflow check: value * 10 + digit must fit in u64.
+                    // u64::MAX / 10 == 1844674407370955161 (remainder 5).
+                    if (value > 1844674407370955161) {
+                        return Result::Err(ConversionError::new("overflow"));
+                    }
+                    if (value == 1844674407370955161 && digit > 5) {
+                        return Result::Err(ConversionError::new("overflow"));
+                    }
+                    value = value * 10 + digit;
+                }
+                Option::None => {
+                    return Result::Err(ConversionError::new("byte_at out of range"));
+                }
+            }
+            i++;
+        }
+        return Result::Ok(value);
+    }
+}
+
+implement trait FromStr for u32 {
+    static from_str(source: Str) -> Result<u32, ConversionError> {
+        match (u64::from_str(source)) {
+            Result::Ok(value) => {
+                if (value > 4294967295) {
+                    return Result::Err(ConversionError::new("u32 overflow"));
+                }
+                return Result::Ok(value as u32);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+implement trait FromStr for u16 {
+    static from_str(source: Str) -> Result<u16, ConversionError> {
+        match (u64::from_str(source)) {
+            Result::Ok(value) => {
+                if (value > 65535) {
+                    return Result::Err(ConversionError::new("u16 overflow"));
+                }
+                return Result::Ok(value as u16);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+implement trait FromStr for u8 {
+    static from_str(source: Str) -> Result<u8, ConversionError> {
+        match (u64::from_str(source)) {
+            Result::Ok(value) => {
+                if (value > 255) {
+                    return Result::Err(ConversionError::new("u8 overflow"));
+                }
+                return Result::Ok(value as u8);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+// ============================================================================
+// Signed decimal parsing.
+//
+// `i64::from_str` is the canonical implementation; narrower signed
+// widths delegate to it and re-check the range. Handles an optional
+// leading `+` or `-`; treats an empty input or a sign with no digits
+// as an error.
+//
+// `I64_MIN_MAGNITUDE` is the absolute value of `i64::MIN` (2^63). The
+// literal must be hoisted into a named `u64` const because inline
+// literals exceeding `i64::MAX` get sign-extended to negative when
+// compared against a `u64` operand (Cryo bootstrap-codegen quirk —
+// see `tests/lang/integer_literals.cryo`).
+// ============================================================================
+
+const I64_MIN_MAGNITUDE: u64 = 9223372036854775808;
+
+implement trait FromStr for i64 {
+    static from_str(source: Str) -> Result<i64, ConversionError> {
+        if (source.length() == 0) {
+            return Result::Err(ConversionError::new("empty input"));
+        }
+        mut negative: boolean = false;
+        mut start: u64 = 0;
+        match (source.byte_at(0)) {
+            Option::Some(byte) => {
+                if (byte == 0x2D) { // '-'
+                    negative = true;
+                    start = 1;
+                } else if (byte == 0x2B) { // '+'
+                    start = 1;
+                }
+            }
+            Option::None => {
+                return Result::Err(ConversionError::new("byte_at out of range"));
+            }
+        }
+        if (start == source.length()) {
+            return Result::Err(ConversionError::new("sign with no digits"));
+        }
+        const digits: Str = source.sub_bytes(start, source.length());
+        match (u64::from_str(digits)) {
+            Result::Ok(magnitude) => {
+                if (negative) {
+                    if (magnitude > I64_MIN_MAGNITUDE) {
+                        return Result::Err(ConversionError::new("i64 underflow"));
+                    }
+                    if (magnitude == I64_MIN_MAGNITUDE) {
+                        // Spell `i64::MIN` via the static accessor — the
+                        // inline literal `-9223372036854775808 as i64`
+                        // currently codegens to `0` in the bootstrap
+                        // (the literal evaluator goes through u64 and
+                        // the cast back loses the sign bit). `min_value`
+                        // returns the correct constant since the static
+                        // body parses the literal in the right context.
+                        return Result::Ok(i64::min_value());
+                    }
+                    return Result::Ok(0 - (magnitude as i64));
+                }
+                // Positive — magnitude must fit in i64::MAX.
+                if (magnitude > 9223372036854775807) {
+                    return Result::Err(ConversionError::new("i64 overflow"));
+                }
+                return Result::Ok(magnitude as i64);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+implement trait FromStr for i32 {
+    static from_str(source: Str) -> Result<i32, ConversionError> {
+        match (i64::from_str(source)) {
+            Result::Ok(value) => {
+                if (value < -2147483648 || value > 2147483647) {
+                    return Result::Err(ConversionError::new("i32 out of range"));
+                }
+                return Result::Ok(value as i32);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+implement trait FromStr for i16 {
+    static from_str(source: Str) -> Result<i16, ConversionError> {
+        match (i64::from_str(source)) {
+            Result::Ok(value) => {
+                if (value < -32768 || value > 32767) {
+                    return Result::Err(ConversionError::new("i16 out of range"));
+                }
+                return Result::Ok(value as i16);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+implement trait FromStr for i8 {
+    static from_str(source: Str) -> Result<i8, ConversionError> {
+        match (i64::from_str(source)) {
+            Result::Ok(value) => {
+                if (value < -128 || value > 127) {
+                    return Result::Err(ConversionError::new("i8 out of range"));
+                }
+                return Result::Ok(value as i8);
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+// ============================================================================
+// Hex parsing
+// ============================================================================
+
+implement struct Str {
+    /// Parse `this` as a hex `u64`. Accepts both cases. No `0x` prefix —
+    /// the caller strips it before calling. Returns `Err` on any non-hex
+    /// byte, empty input, or overflow (>16 digits).
+    try_to_hex(&this) -> Result<u64, ConversionError> {
+        if (this.length() == 0) {
+            return Result::Err(ConversionError::new("empty input"));
+        }
+        if (this.length() > 16) {
+            return Result::Err(ConversionError::new("hex overflow (>16 digits)"));
+        }
+        mut value: u64 = 0;
+        mut i: u64 = 0;
+        while (i < this.length()) {
+            match (this.byte_at(i)) {
+                Option::Some(byte) => {
+                    mut digit: u64 = 0;
+                    if (byte >= 0x30 && byte <= 0x39) {
+                        digit = (byte - 0x30) as u64;
+                    } else if (byte >= 0x41 && byte <= 0x46) {
+                        digit = (byte - 0x41 + 10) as u64;
+                    } else if (byte >= 0x61 && byte <= 0x66) {
+                        digit = (byte - 0x61 + 10) as u64;
+                    } else {
+                        return Result::Err(ConversionError::new("non-hex byte"));
+                    }
+                    value = (value << 4) | digit;
+                }
+                Option::None => {
+                    return Result::Err(ConversionError::new("byte_at out of range"));
+                }
+            }
+            i++;
+        }
+        return Result::Ok(value);
     }
 }
