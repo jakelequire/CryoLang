@@ -3222,7 +3222,26 @@ public:
                 return resolved;
             }
         }
-        // No method found — treat as enum variant constructor.
+        // No method found — fall back to enum-variant constructor if (and
+        // only if) the type IS an enum.  Without this gate, primitive
+        // aliases registered in the decl_index (e.g. `float` → `f64`,
+        // injected by `pass_registry.cryo:878`) would swallow free
+        // module-qualified function calls like `float::write_f64_buffer(...)`
+        // — sema would interpret them as `f64::write_f64_buffer(...)`,
+        // miss the (non-existent) method, fall through to "constructor"
+        // treatment, and return `f64` as the call's type.  Letting the
+        // module-function resolver downstream try this scope instead
+        // resolves to the real free function.
+        mut concrete_t: Type* = this.arena.lookup(type_ref.id);
+        if (concrete_t != null && concrete_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = concrete_t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                concrete_t = this.arena.lookup(inst.resolved_type.id);
+            }
+        }
+        if (concrete_t == null || concrete_t.kind != TypeKind::Enum) {
+            return TypeRef::invalid();
+        }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
         scope.set_resolved_type(promoted);
         return promoted;
@@ -3233,9 +3252,18 @@ public:
     /// scope name is NOT a known type (prevents false matches for enum
     /// variant calls like IoResult::Ok).
     try_resolve_module_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
-        const scope_as_type: TypeRef = this.lookup_type_by_sym(scope.scope_name);
-        if (scope_as_type.is_valid()) { return TypeRef::invalid(); }
-
+        // The earlier strategies already exhausted "type::method" and
+        // "type::variant" lookups for any genuine type carrier.  If the
+        // scope happens to ALSO resolve to a type (often via the
+        // primitive-keyword aliases registered in `pass_registry.cryo` —
+        // `float` → `f64`, `int` → `i32`, etc.), that doesn't preclude a
+        // module of the same bare name living alongside it.  Stdlib's
+        // `fmt::float` namespace + the `float`-keyword alias hit exactly
+        // this shape: `float::write_f64_buffer(...)` should resolve to
+        // the module function, not be silently swallowed because `float`
+        // also names a type alias.  Reaching this strategy means none of
+        // the earlier type-based interpretations matched, so it's safe
+        // to try a module-function lookup unconditionally.
         const q_ret: TypeRef = this.resolve_module_qualified_function(
             scope.scope_name, scope.member_name);
         if (q_ret.is_valid()) {

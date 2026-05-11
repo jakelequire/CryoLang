@@ -1,0 +1,324 @@
+///! Operators that the language exposes — bitwise, shifts, logical,
+///! comparison, unary.
+///!
+///! `arithmetic.cryo` covers `+` `-` `*` `/` `%`.  This file rounds out
+///! the rest: bit-level operators every parser/sema layer touches, the
+///! short-circuit semantics of `&&` and `||`, and the comparison
+///! operators (which feed every `if`, `while`, and `match` guard).
+///!
+///! Where a test depends on a specific bit pattern, it uses explicit
+///! `0xNN`-style literals rather than chained arithmetic — the digits
+///! are easier to verify against by eye when a regression bisects in.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::Operators;
+
+import std::core::result;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Bitwise AND / OR / XOR
+// ============================================================================
+
+![test]
+function bitwise_and_masks_off_high_bits() -> Result<(), TestError> {
+    const x: u32 = 0xDEADBEEF;
+    const mask: u32 = 0x000000FF;
+    const got: u32 = x & mask;
+    return expect_eq(got, 0xEF as u32);
+}
+
+![test]
+function bitwise_or_sets_bits() -> Result<(), TestError> {
+    const x: u32 = 0x12000000;
+    const y: u32 = 0x000034FF;
+    const got: u32 = x | y;
+    return expect_eq(got, 0x120034FF as u32);
+}
+
+![test]
+function bitwise_xor_flips_overlapping_bits() -> Result<(), TestError> {
+    const x: u32 = 0xFF00FF00;
+    const y: u32 = 0x00FF00FF;
+    const got: u32 = x ^ y;
+    return expect_eq(got, 0xFFFFFFFF as u32);
+}
+
+![test]
+function bitwise_xor_self_is_zero() -> Result<(), TestError> {
+    const x: u64 = 0xCAFEBABE12345678;
+    const got: u64 = x ^ x;
+    return expect_eq(got, 0 as u64);
+}
+
+// ============================================================================
+// Bitwise NOT (unary `~`)
+// ============================================================================
+
+![test]
+function bitwise_not_inverts_zero_to_all_ones() -> Result<(), TestError> {
+    const x: u32 = 0;
+    const got: u32 = ~x;
+    return expect_eq(got, 0xFFFFFFFF as u32);
+}
+
+![test]
+function bitwise_not_inverts_all_ones_to_zero() -> Result<(), TestError> {
+    const x: u32 = 0xFFFFFFFF;
+    const got: u32 = ~x;
+    return expect_eq(got, 0 as u32);
+}
+
+![test]
+function bitwise_not_u64_high_bit() -> Result<(), TestError> {
+    // ~0 on a u64 should produce u64::MAX (every bit set).
+    const x: u64 = 0;
+    const got: u64 = ~x;
+    const want: u64 = 18446744073709551615;
+    return expect_eq(got, want);
+}
+
+// ============================================================================
+// Shifts
+// ============================================================================
+
+![test]
+function shift_left_doubles_each_position() -> Result<(), TestError> {
+    const x: u32 = 1;
+    const got: u32 = x << 8;
+    return expect_eq(got, 0x100 as u32);
+}
+
+![test]
+function shift_right_halves_each_position() -> Result<(), TestError> {
+    const x: u32 = 0x10000000;
+    const got: u32 = x >> 16;
+    return expect_eq(got, 0x1000 as u32);
+}
+
+![test]
+function shift_combination_extracts_byte() -> Result<(), TestError> {
+    // Classic byte-extract idiom: (x >> n) & 0xFF.
+    const x: u32 = 0xDEADBEEF;
+    const second_byte: u32 = (x >> 8) & 0xFF;
+    return expect_eq(second_byte, 0xBE as u32);
+}
+
+![test]
+function shift_left_u64_high_bit() -> Result<(), TestError> {
+    // 1 << 63 — exactly i64::MAX + 1 — exercises the wide path.
+    const one: u64 = 1;
+    const got: u64 = one << 63;
+    const want: u64 = 9223372036854775808;
+    return expect_eq(got, want);
+}
+
+// ============================================================================
+// Logical AND / OR — short-circuit semantics
+// ============================================================================
+
+mut g_side_effect_count: i32 = 0;
+
+function bump_and_return(value: boolean) -> boolean {
+    g_side_effect_count = g_side_effect_count + 1;
+    return value;
+}
+
+![test]
+function logical_and_short_circuits_when_lhs_false() -> Result<(), TestError> {
+    // false && bump() — the RHS must not execute.  Counter stays 0.
+    g_side_effect_count = 0;
+    const _v: boolean = false && bump_and_return(true);
+    return expect_eq(g_side_effect_count, 0);
+}
+
+![test]
+function logical_and_evaluates_rhs_when_lhs_true() -> Result<(), TestError> {
+    g_side_effect_count = 0;
+    const _v: boolean = true && bump_and_return(true);
+    return expect_eq(g_side_effect_count, 1);
+}
+
+![test]
+function logical_or_short_circuits_when_lhs_true() -> Result<(), TestError> {
+    g_side_effect_count = 0;
+    const _v: boolean = true || bump_and_return(true);
+    return expect_eq(g_side_effect_count, 0);
+}
+
+![test]
+function logical_or_evaluates_rhs_when_lhs_false() -> Result<(), TestError> {
+    g_side_effect_count = 0;
+    const _v: boolean = false || bump_and_return(true);
+    return expect_eq(g_side_effect_count, 1);
+}
+
+// ============================================================================
+// Unary `!` — boolean negation
+// ============================================================================
+
+![test]
+function not_true_is_false() -> Result<(), TestError> {
+    const x: boolean = true;
+    return expect_false(!x, Str::from_raw("!true should be false", 21));
+}
+
+![test]
+function not_false_is_true() -> Result<(), TestError> {
+    const x: boolean = false;
+    return expect_true(!x, Str::from_raw("!false should be true", 21));
+}
+
+![test]
+function double_not_returns_original() -> Result<(), TestError> {
+    const a: boolean = true;
+    const b: boolean = false;
+    match (expect_true(!!a, Str::from_raw("!!true should be true", 21))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(!!b, Str::from_raw("!!false should be false", 23));
+}
+
+// ============================================================================
+// Comparison operators — full six-way
+// ============================================================================
+
+![test]
+function comparison_lt_strict() -> Result<(), TestError> {
+    match (expect_true(3 < 5, Str::from_raw("3 < 5", 5))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(5 < 5, Str::from_raw("5 < 5 is strict", 15));
+}
+
+![test]
+function comparison_le_inclusive() -> Result<(), TestError> {
+    match (expect_true(3 <= 5, Str::from_raw("3 <= 5", 6))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(5 <= 5, Str::from_raw("5 <= 5", 6))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(6 <= 5, Str::from_raw("6 <= 5 is false", 15));
+}
+
+![test]
+function comparison_gt_strict() -> Result<(), TestError> {
+    match (expect_true(7 > 3, Str::from_raw("7 > 3", 5))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(3 > 3, Str::from_raw("3 > 3 is strict", 15));
+}
+
+![test]
+function comparison_ge_inclusive() -> Result<(), TestError> {
+    match (expect_true(7 >= 3, Str::from_raw("7 >= 3", 6))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(3 >= 3, Str::from_raw("3 >= 3", 6));
+}
+
+![test]
+function comparison_eq_and_ne_complementary() -> Result<(), TestError> {
+    match (expect_true(4 == 4, Str::from_raw("4 == 4", 6))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(4 == 5, Str::from_raw("4 == 5 should be false", 22))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(4 != 5, Str::from_raw("4 != 5", 6))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(4 != 4, Str::from_raw("4 != 4 should be false", 22));
+}
+
+// ============================================================================
+// Float casts — bridges between numeric domains
+// ============================================================================
+
+![test]
+function cast_i32_to_f64_preserves_value() -> Result<(), TestError> {
+    const x: i32 = 42;
+    const f: f64 = x as f64;
+    return expect_close_f64(f, 42.0, 0.0001);
+}
+
+![test]
+function cast_negative_i32_to_f64_preserves_sign() -> Result<(), TestError> {
+    const x: i32 = -7;
+    const f: f64 = x as f64;
+    return expect_close_f64(f, -7.0, 0.0001);
+}
+
+![test]
+function cast_f64_to_i32_truncates_toward_zero() -> Result<(), TestError> {
+    // Positive: 3.7 → 3 (toward zero).
+    const x: f64 = 3.7;
+    const i: i32 = x as i32;
+    return expect_eq(i, 3);
+}
+
+![test]
+function cast_negative_f64_to_i32_truncates_toward_zero() -> Result<(), TestError> {
+    // Negative: -3.7 → -3 (toward zero, NOT toward minus infinity).
+    const x: f64 = -3.7;
+    const i: i32 = x as i32;
+    return expect_eq(i, -3);
+}
+
+![test]
+function cast_f64_round_trip_through_i64() -> Result<(), TestError> {
+    const x: f64 = 1234.5;
+    const i: i64 = x as i64;
+    // 1234.5 → 1234 (truncate), back to 1234.0
+    const back: f64 = i as f64;
+    return expect_close_f64(back, 1234.0, 0.0001);
+}
+
+// ============================================================================
+// Regression pins for fixed sema bugs
+// ============================================================================
+
+// Free function that takes an f64 and returns u64.  Lives at module scope
+// so call sites read as `Operators::buf_writer(...)`.  Used by the
+// regression below.
+function buf_writer(_buf: u8*, _value: f64) -> u64 {
+    return 7;
+}
+
+![test]
+function const_init_from_call_with_f64_arg() -> Result<(), TestError> {
+    // Regression: sema used to interpret `Operators::buf_writer(...)` as
+    // a constructor call on the type `Operators` (or worse, on a
+    // primitive-keyword alias like `float` resolving to `f64`), and
+    // returned the receiver type as the call's type.  The const-init
+    // path then complained `cannot initialize 'X' of type 'u64' with
+    // value of type 'f64'`.  Fixed by gating the enum-variant fallback
+    // in `try_resolve_type_or_variant` on TypeKind::Enum and letting
+    // `try_resolve_module_function` run regardless of whether the scope
+    // name also resolves to a type alias.
+    mut b: u8[8];
+    const n: u64 = Operators::buf_writer(&b[0], 3.14);
+    return expect_eq(n, 7 as u64);
+}
+
+// ============================================================================
+// Operator precedence — bitwise vs shift vs comparison
+// ============================================================================
+
+![test]
+function shift_binds_tighter_than_bitwise_or() -> Result<(), TestError> {
+    // `1 << 4 | 1` parses as `(1 << 4) | 1` = 0x10 | 0x01 = 0x11.
+    const got: u32 = 1 << 4 | 1;
+    return expect_eq(got, 0x11 as u32);
+}
+
+![test]
+function comparison_lower_precedence_than_arithmetic() -> Result<(), TestError> {
+    // `2 + 3 < 6` parses as `(2 + 3) < 6` = 5 < 6 = true.  If
+    // comparison bound tighter than `+`, we'd get `2 + (3 < 6)` which
+    // wouldn't type-check.
+    return expect_true(2 + 3 < 6, Str::from_raw("2 + 3 < 6 should be true", 24));
+}

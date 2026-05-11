@@ -1,0 +1,214 @@
+///! Pair<A, B> — owned two-element tuple.
+///!
+///! Three concerns to pin:
+///!
+///!   * Construction and field access (both via `Pair { ... }` literal
+///!     and the `Pair::new(a, b)` factory).
+///!   * Parametric `Eq` — equality routes through each member's own
+///!     `Eq` impl.  A mismatch in either half must return false.
+///!   * Parametric `Drop` — the where-bound `A: Drop, B: Drop` impl
+///!     must fire each member's drop exactly once when the pair itself
+///!     is dropped.  This is the load-bearing piece: if `Pair<String, V>`
+///!     forgets to drop the key, every `Pair<string, V>[]`-as-map use
+///!     site silently leaks.
+///!
+///! No tests assert ordering of the two member drops here — Cryo's
+///! drop-insertion contract doesn't yet promise an order across struct
+///! fields, only declaration-order intent.  When that's pinned in a
+///! spec, add a test that hand-builds a tag-stream into the Probe.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::PairT;
+
+import std::core::result;
+import std::core::cmp;
+import std::core::drop;
+import std::collections::pair;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Probe — a non-Copy type with a side-effecting drop.  Module-level
+// counter so we can assert the number of drops on a given test path.
+// ============================================================================
+
+mut g_drop_count: i32 = 0;
+
+function reset_drops() -> void { g_drop_count = 0; }
+function drop_count() -> i32 { return g_drop_count; }
+
+type struct Probe {
+    tag: i32;
+
+    static new(tag: i32) -> Probe {
+        return Probe { tag: tag };
+    }
+}
+
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void {
+        g_drop_count = g_drop_count + 1;
+    }
+}
+
+implement trait Eq for struct Probe {
+    equals(&this, other: &Probe) -> boolean {
+        return this.tag == other.tag;
+    }
+}
+
+// ============================================================================
+// Construction + field access
+// ============================================================================
+
+![test]
+function pair_literal_holds_both_members() -> Result<(), TestError> {
+    const p: Pair<i32, i32> = Pair<i32, i32> { first: 7, second: 11 };
+    match (expect_eq(p.first, 7)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.second, 11);
+}
+
+![test]
+function pair_new_factory_holds_both_members() -> Result<(), TestError> {
+    const p: Pair<i32, i32> = Pair::new(3, 4);
+    match (expect_eq(p.first, 3)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.second, 4);
+}
+
+![test]
+function pair_mixed_types() -> Result<(), TestError> {
+    // The two type parameters are independent — instantiate with
+    // distinct primitive widths.
+    const want_first: i32 = 5;
+    const want_second: u64 = 9000000000;
+    const p: Pair<i32, u64> = Pair::new(want_first, want_second);
+    match (expect_eq(p.first, want_first)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.second, want_second);
+}
+
+// ============================================================================
+// Parametric Eq — both halves must agree
+// ============================================================================
+
+![test]
+function eq_both_equal_yields_true() -> Result<(), TestError> {
+    const a: Pair<i32, i32> = Pair::new(1, 2);
+    const b: Pair<i32, i32> = Pair::new(1, 2);
+    return expect_true(a.equals(&b),
+        Str::from_raw("identical pairs should compare equal", 36));
+}
+
+![test]
+function eq_first_differs_yields_false() -> Result<(), TestError> {
+    const a: Pair<i32, i32> = Pair::new(1, 2);
+    const b: Pair<i32, i32> = Pair::new(9, 2);
+    return expect_false(a.equals(&b),
+        Str::from_raw("pairs differing in first should not be equal", 44));
+}
+
+![test]
+function eq_second_differs_yields_false() -> Result<(), TestError> {
+    const a: Pair<i32, i32> = Pair::new(1, 2);
+    const b: Pair<i32, i32> = Pair::new(1, 9);
+    return expect_false(a.equals(&b),
+        Str::from_raw("pairs differing in second should not be equal", 45));
+}
+
+![test]
+function eq_both_differ_yields_false() -> Result<(), TestError> {
+    const a: Pair<i32, i32> = Pair::new(1, 2);
+    const b: Pair<i32, i32> = Pair::new(7, 8);
+    return expect_false(a.equals(&b),
+        Str::from_raw("pairs differing in both should not be equal", 43));
+}
+
+// ============================================================================
+// Parametric Drop — wiring check
+// ============================================================================
+
+![test]
+function drop_fires_for_both_members() -> Result<(), TestError> {
+    // A `Pair<Probe, Probe>` is itself `Drop` (via the parametric impl).
+    // Its drop must dispatch to each member's drop exactly once — total
+    // of two counter increments.
+    reset_drops();
+    {
+        mut p: Pair<Probe, Probe> = Pair::new(Probe::new(1), Probe::new(2));
+        p.drop();
+    }
+    return expect_eq(drop_count(), 2);
+}
+
+![test]
+function drop_runs_once_per_scope_exit() -> Result<(), TestError> {
+    // Two separately-scoped pairs each contribute two drops — total 4.
+    // Sanity that the dispatch isn't accidentally cached or doubled.
+    reset_drops();
+    {
+        mut p: Pair<Probe, Probe> = Pair::new(Probe::new(1), Probe::new(2));
+        p.drop();
+    }
+    {
+        mut q: Pair<Probe, Probe> = Pair::new(Probe::new(3), Probe::new(4));
+        q.drop();
+    }
+    return expect_eq(drop_count(), 4);
+}
+
+// ============================================================================
+// Where-bound interaction — Pair<Copy, Copy> is not Drop
+// ============================================================================
+//
+// We can't directly assert "Pair<i32, i32> is NOT Drop" from inside the
+// test runner — Cryo's where-bound machinery is checked at the call
+// site, and a negative assertion needs a compile-failure harness we
+// don't have yet.  The closest pin is: this test reaches `Pair<i32,i32>`
+// going out of scope without an explicit drop, with the drop-insertion
+// pass set to NOT synthesize a `.drop()` call for the (non-Drop) type.
+// If a regression mistakenly made `Pair<Copy, Copy>` Drop, the build
+// would fail (we'd be calling i32's nonexistent drop) — that's the
+// catch-net we get for now.
+
+![test]
+function pair_of_copy_types_needs_no_explicit_drop() -> Result<(), TestError> {
+    // No `.drop()` call here.  The pair simply leaves scope.
+    const p: Pair<i32, i32> = Pair::new(100, 200);
+    match (expect_eq(p.first, 100)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.second, 200);
+}
+
+// ============================================================================
+// Composition — Pair as an associative-list element
+// ============================================================================
+
+![test]
+function pair_array_carries_key_value_entries() -> Result<(), TestError> {
+    // Mirrors the CLI ParsedArgs use case: a small array of key/value
+    // pairs keyed on i32, with linear scan via Eq for lookup.  Pins
+    // the "Pair<K, V>[] as a tiny map" idiom that motivated the type.
+    mut entries: Pair<i32, i32>[] = [];
+    entries.push(Pair::new(1, 100));
+    entries.push(Pair::new(2, 200));
+    entries.push(Pair::new(3, 300));
+
+    mut found: i32 = -1;
+    const target: i32 = 2;
+    mut i: u64 = 0;
+    while (i < entries.length) {
+        if (entries[i].first == target) {
+            found = entries[i].second;
+            break;
+        }
+        i = i + 1;
+    }
+    return expect_eq(found, 200);
+}
