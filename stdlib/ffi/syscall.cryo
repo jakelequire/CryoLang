@@ -1,0 +1,1964 @@
+///! syscall — raw system-call bindings, gated per platform.
+///!
+///! Two distinct surfaces live in this module, each gated with
+///! `![target(...)]` so the other platform's symbols never reach
+///! the linker:
+///!
+///!   • Linux x86_64: the libc `syscall(number, ...)` trampoline plus
+///!     the full `SYS_*` number table and typed wrappers for the
+///!     common-case syscalls.
+///!   • Windows x86_64: the Win32 system surface (kernel32.dll,
+///!     user32.dll, advapi32.dll, etc.) plus a small NT API surface
+///!     (ntdll.dll) for programs that want to skip Win32.
+///!
+///! ## When to reach for this vs `ffi::libc`
+///!
+///! Reach for `ffi::libc` first — its functions go through glibc's
+///! well-tested wrappers and are portable across Unix variants. Drop
+///! down to `ffi::syscall` only when:
+///!
+///!   • You need a syscall not exposed by libc (`gettid`, `pidfd_open`,
+///!     `io_uring_setup`, `bpf`, `userfaultfd`, `clone3`, …).
+///!   • You're writing a stub libc and want to avoid recursion.
+///!   • You need bit-exact control over which syscall a code path
+///!     issues (kernel-fuzzing, eBPF tracers, sandbox enforcement).
+///!   • You're on Windows and want the Win32 surface directly rather
+///!     than through a libc personality.
+///!
+///! ## Architecture & ABI
+///!
+///! Linux numbers (`SYS_*`) are the x86_64 ABI from
+///! `<asm/unistd_64.h>`. arm64/i386/riscv64 use different numbers —
+///! a future per-arch split will gate the `SYS_*` block.
+///!
+///! Windows bindings target the x64 ABI (Microsoft x64 calling
+///! convention). x86 stdcall is not supported.
+///!
+///! ## Numeric values
+///!
+///! Constants are just integers — they have no link-time presence,
+///! so the `SYS_*` and Win32 constants are declared unconditionally.
+///! Only the `extern "C"` blocks (and the typed wrappers that call
+///! into them) carry `![target(...)]` gates.
+
+namespace std::ffi::syscall;
+
+import ffi::libc;
+
+// ============================================================================
+// ============================================================================
+//
+//                              LINUX x86_64
+//
+// ============================================================================
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// SYS_* — Linux x86_64 syscall numbers (from `<asm/unistd_64.h>`)
+// ----------------------------------------------------------------------------
+//
+// Stable kernel ABI: numbers are append-only across Linux releases.
+// Numbers up to ~451 (as of Linux 6.x) are covered; gaps in the
+// numbering correspond to retired syscalls that we omit. New syscalls
+// added by later kernels can be appended without renumbering.
+
+/// Linux x86_64 syscall identifier. Mutually exclusive — the kernel
+/// dispatches on the integer value in `rax`. Pass to `syscall()` or
+/// `sys_callN(...)`; the `i64` backing matches glibc's
+/// `long syscall(long, ...)` ABI exactly.
+type enum Syscall : i64 {
+    SYS_read                    = 0;
+    SYS_write                   = 1;
+    SYS_open                    = 2;
+    SYS_close                   = 3;
+    SYS_stat                    = 4;
+    SYS_fstat                   = 5;
+    SYS_lstat                   = 6;
+    SYS_poll                    = 7;
+    SYS_lseek                   = 8;
+    SYS_mmap                    = 9;
+    SYS_mprotect                = 10;
+    SYS_munmap                  = 11;
+    SYS_brk                     = 12;
+    SYS_rt_sigaction            = 13;
+    SYS_rt_sigprocmask          = 14;
+    SYS_rt_sigreturn            = 15;
+    SYS_ioctl                   = 16;
+    SYS_pread64                 = 17;
+    SYS_pwrite64                = 18;
+    SYS_readv                   = 19;
+    SYS_writev                  = 20;
+    SYS_access                  = 21;
+    SYS_pipe                    = 22;
+    SYS_select                  = 23;
+    SYS_sched_yield             = 24;
+    SYS_mremap                  = 25;
+    SYS_msync                   = 26;
+    SYS_mincore                 = 27;
+    SYS_madvise                 = 28;
+    SYS_shmget                  = 29;
+    SYS_shmat                   = 30;
+    SYS_shmctl                  = 31;
+    SYS_dup                     = 32;
+    SYS_dup2                    = 33;
+    SYS_pause                   = 34;
+    SYS_nanosleep               = 35;
+    SYS_getitimer               = 36;
+    SYS_alarm                   = 37;
+    SYS_setitimer               = 38;
+    SYS_getpid                  = 39;
+    SYS_sendfile                = 40;
+    SYS_socket                  = 41;
+    SYS_connect                 = 42;
+    SYS_accept                  = 43;
+    SYS_sendto                  = 44;
+    SYS_recvfrom                = 45;
+    SYS_sendmsg                 = 46;
+    SYS_recvmsg                 = 47;
+    SYS_shutdown                = 48;
+    SYS_bind                    = 49;
+    SYS_listen                  = 50;
+    SYS_getsockname             = 51;
+    SYS_getpeername             = 52;
+    SYS_socketpair              = 53;
+    SYS_setsockopt              = 54;
+    SYS_getsockopt              = 55;
+    SYS_clone                   = 56;
+    SYS_fork                    = 57;
+    SYS_vfork                   = 58;
+    SYS_execve                  = 59;
+    SYS_exit                    = 60;
+    SYS_wait4                   = 61;
+    SYS_kill                    = 62;
+    SYS_uname                   = 63;
+    SYS_semget                  = 64;
+    SYS_semop                   = 65;
+    SYS_semctl                  = 66;
+    SYS_shmdt                   = 67;
+    SYS_msgget                  = 68;
+    SYS_msgsnd                  = 69;
+    SYS_msgrcv                  = 70;
+    SYS_msgctl                  = 71;
+    SYS_fcntl                   = 72;
+    SYS_flock                   = 73;
+    SYS_fsync                   = 74;
+    SYS_fdatasync               = 75;
+    SYS_truncate                = 76;
+    SYS_ftruncate               = 77;
+    SYS_getdents                = 78;
+    SYS_getcwd                  = 79;
+    SYS_chdir                   = 80;
+    SYS_fchdir                  = 81;
+    SYS_rename                  = 82;
+    SYS_mkdir                   = 83;
+    SYS_rmdir                   = 84;
+    SYS_creat                   = 85;
+    SYS_link                    = 86;
+    SYS_unlink                  = 87;
+    SYS_symlink                 = 88;
+    SYS_readlink                = 89;
+    SYS_chmod                   = 90;
+    SYS_fchmod                  = 91;
+    SYS_chown                   = 92;
+    SYS_fchown                  = 93;
+    SYS_lchown                  = 94;
+    SYS_umask                   = 95;
+    SYS_gettimeofday            = 96;
+    SYS_getrlimit               = 97;
+    SYS_getrusage               = 98;
+    SYS_sysinfo                 = 99;
+    SYS_times                   = 100;
+    SYS_ptrace                  = 101;
+    SYS_getuid                  = 102;
+    SYS_syslog                  = 103;
+    SYS_getgid                  = 104;
+    SYS_setuid                  = 105;
+    SYS_setgid                  = 106;
+    SYS_geteuid                 = 107;
+    SYS_getegid                 = 108;
+    SYS_setpgid                 = 109;
+    SYS_getppid                 = 110;
+    SYS_getpgrp                 = 111;
+    SYS_setsid                  = 112;
+    SYS_setreuid                = 113;
+    SYS_setregid                = 114;
+    SYS_getgroups               = 115;
+    SYS_setgroups               = 116;
+    SYS_setresuid               = 117;
+    SYS_getresuid               = 118;
+    SYS_setresgid               = 119;
+    SYS_getresgid               = 120;
+    SYS_getpgid                 = 121;
+    SYS_setfsuid                = 122;
+    SYS_setfsgid                = 123;
+    SYS_getsid                  = 124;
+    SYS_capget                  = 125;
+    SYS_capset                  = 126;
+    SYS_rt_sigpending           = 127;
+    SYS_rt_sigtimedwait         = 128;
+    SYS_rt_sigqueueinfo         = 129;
+    SYS_rt_sigsuspend           = 130;
+    SYS_sigaltstack             = 131;
+    SYS_utime                   = 132;
+    SYS_mknod                   = 133;
+    SYS_personality             = 135;
+    SYS_ustat                   = 136;
+    SYS_statfs                  = 137;
+    SYS_fstatfs                 = 138;
+    SYS_sysfs                   = 139;
+    SYS_getpriority             = 140;
+    SYS_setpriority             = 141;
+    SYS_sched_setparam          = 142;
+    SYS_sched_getparam          = 143;
+    SYS_sched_setscheduler      = 144;
+    SYS_sched_getscheduler      = 145;
+    SYS_sched_get_priority_max  = 146;
+    SYS_sched_get_priority_min  = 147;
+    SYS_sched_rr_get_interval   = 148;
+    SYS_mlock                   = 149;
+    SYS_munlock                 = 150;
+    SYS_mlockall                = 151;
+    SYS_munlockall              = 152;
+    SYS_vhangup                 = 153;
+    SYS_modify_ldt              = 154;
+    SYS_pivot_root              = 155;
+    SYS_prctl                   = 157;
+    SYS_arch_prctl              = 158;
+    SYS_adjtimex                = 159;
+    SYS_setrlimit               = 160;
+    SYS_chroot                  = 161;
+    SYS_sync                    = 162;
+    SYS_acct                    = 163;
+    SYS_settimeofday            = 164;
+    SYS_mount                   = 165;
+    SYS_umount2                 = 166;
+    SYS_swapon                  = 167;
+    SYS_swapoff                 = 168;
+    SYS_reboot                  = 169;
+    SYS_sethostname             = 170;
+    SYS_setdomainname           = 171;
+    SYS_iopl                    = 172;
+    SYS_ioperm                  = 173;
+    SYS_init_module             = 175;
+    SYS_delete_module           = 176;
+    SYS_quotactl                = 179;
+    SYS_gettid                  = 186;
+    SYS_readahead               = 187;
+    SYS_setxattr                = 188;
+    SYS_lsetxattr               = 189;
+    SYS_fsetxattr               = 190;
+    SYS_getxattr                = 191;
+    SYS_lgetxattr               = 192;
+    SYS_fgetxattr               = 193;
+    SYS_listxattr               = 194;
+    SYS_llistxattr              = 195;
+    SYS_flistxattr              = 196;
+    SYS_removexattr             = 197;
+    SYS_lremovexattr            = 198;
+    SYS_fremovexattr            = 199;
+    SYS_tkill                   = 200;
+    SYS_time                    = 201;
+    SYS_futex                   = 202;
+    SYS_sched_setaffinity       = 203;
+    SYS_sched_getaffinity       = 204;
+    SYS_io_setup                = 206;
+    SYS_io_destroy              = 207;
+    SYS_io_getevents            = 208;
+    SYS_io_submit               = 209;
+    SYS_io_cancel               = 210;
+    SYS_lookup_dcookie          = 212;
+    SYS_epoll_create            = 213;
+    SYS_getdents64              = 217;
+    SYS_set_tid_address         = 218;
+    SYS_restart_syscall         = 219;
+    SYS_semtimedop              = 220;
+    SYS_fadvise64               = 221;
+    SYS_timer_create            = 222;
+    SYS_timer_settime           = 223;
+    SYS_timer_gettime           = 224;
+    SYS_timer_getoverrun        = 225;
+    SYS_timer_delete            = 226;
+    SYS_clock_settime           = 227;
+    SYS_clock_gettime           = 228;
+    SYS_clock_getres            = 229;
+    SYS_clock_nanosleep         = 230;
+    SYS_exit_group              = 231;
+    SYS_epoll_wait              = 232;
+    SYS_epoll_ctl               = 233;
+    SYS_tgkill                  = 234;
+    SYS_utimes                  = 235;
+    SYS_mbind                   = 237;
+    SYS_set_mempolicy           = 238;
+    SYS_get_mempolicy           = 239;
+    SYS_mq_open                 = 240;
+    SYS_mq_unlink               = 241;
+    SYS_mq_timedsend            = 242;
+    SYS_mq_timedreceive         = 243;
+    SYS_mq_notify               = 244;
+    SYS_mq_getsetattr           = 245;
+    SYS_kexec_load              = 246;
+    SYS_waitid                  = 247;
+    SYS_add_key                 = 248;
+    SYS_request_key             = 249;
+    SYS_keyctl                  = 250;
+    SYS_ioprio_set              = 251;
+    SYS_ioprio_get              = 252;
+    SYS_inotify_init            = 253;
+    SYS_inotify_add_watch       = 254;
+    SYS_inotify_rm_watch        = 255;
+    SYS_migrate_pages           = 256;
+    SYS_openat                  = 257;
+    SYS_mkdirat                 = 258;
+    SYS_mknodat                 = 259;
+    SYS_fchownat                = 260;
+    SYS_futimesat               = 261;
+    SYS_newfstatat              = 262;
+    SYS_unlinkat                = 263;
+    SYS_renameat                = 264;
+    SYS_linkat                  = 265;
+    SYS_symlinkat               = 266;
+    SYS_readlinkat              = 267;
+    SYS_fchmodat                = 268;
+    SYS_faccessat               = 269;
+    SYS_pselect6                = 270;
+    SYS_ppoll                   = 271;
+    SYS_unshare                 = 272;
+    SYS_set_robust_list         = 273;
+    SYS_get_robust_list         = 274;
+    SYS_splice                  = 275;
+    SYS_tee                     = 276;
+    SYS_sync_file_range         = 277;
+    SYS_vmsplice                = 278;
+    SYS_move_pages              = 279;
+    SYS_utimensat               = 280;
+    SYS_epoll_pwait             = 281;
+    SYS_signalfd                = 282;
+    SYS_timerfd_create          = 283;
+    SYS_eventfd                 = 284;
+    SYS_fallocate               = 285;
+    SYS_timerfd_settime         = 286;
+    SYS_timerfd_gettime         = 287;
+    SYS_accept4                 = 288;
+    SYS_signalfd4               = 289;
+    SYS_eventfd2                = 290;
+    SYS_epoll_create1           = 291;
+    SYS_dup3                    = 292;
+    SYS_pipe2                   = 293;
+    SYS_inotify_init1           = 294;
+    SYS_preadv                  = 295;
+    SYS_pwritev                 = 296;
+    SYS_rt_tgsigqueueinfo       = 297;
+    SYS_perf_event_open         = 298;
+    SYS_recvmmsg                = 299;
+    SYS_fanotify_init           = 300;
+    SYS_fanotify_mark           = 301;
+    SYS_prlimit64               = 302;
+    SYS_name_to_handle_at       = 303;
+    SYS_open_by_handle_at       = 304;
+    SYS_clock_adjtime           = 305;
+    SYS_syncfs                  = 306;
+    SYS_sendmmsg                = 307;
+    SYS_setns                   = 308;
+    SYS_getcpu                  = 309;
+    SYS_process_vm_readv        = 310;
+    SYS_process_vm_writev       = 311;
+    SYS_kcmp                    = 312;
+    SYS_finit_module            = 313;
+    SYS_sched_setattr           = 314;
+    SYS_sched_getattr           = 315;
+    SYS_renameat2               = 316;
+    SYS_seccomp                 = 317;
+    SYS_getrandom               = 318;
+    SYS_memfd_create            = 319;
+    SYS_kexec_file_load         = 320;
+    SYS_bpf                     = 321;
+    SYS_execveat                = 322;
+    SYS_userfaultfd             = 323;
+    SYS_membarrier              = 324;
+    SYS_mlock2                  = 325;
+    SYS_copy_file_range         = 326;
+    SYS_preadv2                 = 327;
+    SYS_pwritev2                = 328;
+    SYS_pkey_mprotect           = 329;
+    SYS_pkey_alloc              = 330;
+    SYS_pkey_free               = 331;
+    SYS_statx                   = 332;
+    SYS_io_pgetevents           = 333;
+    SYS_rseq                    = 334;
+    SYS_pidfd_send_signal       = 424;
+    SYS_io_uring_setup          = 425;
+    SYS_io_uring_enter          = 426;
+    SYS_io_uring_register       = 427;
+    SYS_open_tree               = 428;
+    SYS_move_mount              = 429;
+    SYS_fsopen                  = 430;
+    SYS_fsconfig                = 431;
+    SYS_fspick                  = 433;
+    SYS_pidfd_open              = 434;
+    SYS_clone3                  = 435;
+    SYS_close_range             = 436;
+    SYS_openat2                 = 437;
+    SYS_pidfd_getfd             = 438;
+    SYS_faccessat2              = 439;
+    SYS_process_madvise         = 440;
+    SYS_epoll_pwait2            = 441;
+    SYS_mount_setattr           = 442;
+    SYS_quotactl_fd             = 443;
+    SYS_landlock_create_ruleset = 444;
+    SYS_landlock_add_rule       = 445;
+    SYS_landlock_restrict_self  = 446;
+    SYS_memfd_secret            = 447;
+    SYS_process_mrelease        = 448;
+    SYS_futex_waitv             = 449;
+    SYS_set_mempolicy_home_node = 450;
+}
+
+// ----------------------------------------------------------------------------
+// Linux flag constants used by syscalls (often differ from libc forms)
+// ----------------------------------------------------------------------------
+//
+// `clone`/`clone3` share-flags. OR'd into the clone_args.flags field.
+
+const CLONE_VM:             u64 = 0x00000100;
+const CLONE_FS:             u64 = 0x00000200;
+const CLONE_FILES:          u64 = 0x00000400;
+const CLONE_SIGHAND:        u64 = 0x00000800;
+const CLONE_PIDFD:          u64 = 0x00001000;
+const CLONE_PTRACE:         u64 = 0x00002000;
+const CLONE_VFORK:          u64 = 0x00004000;
+const CLONE_PARENT:         u64 = 0x00008000;
+const CLONE_THREAD:         u64 = 0x00010000;
+const CLONE_NEWNS:          u64 = 0x00020000;
+const CLONE_SYSVSEM:        u64 = 0x00040000;
+const CLONE_SETTLS:         u64 = 0x00080000;
+const CLONE_PARENT_SETTID:  u64 = 0x00100000;
+const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+const CLONE_DETACHED:       u64 = 0x00400000;
+const CLONE_UNTRACED:       u64 = 0x00800000;
+const CLONE_CHILD_SETTID:   u64 = 0x01000000;
+const CLONE_NEWCGROUP:      u64 = 0x02000000;
+const CLONE_NEWUTS:         u64 = 0x04000000;
+const CLONE_NEWIPC:         u64 = 0x08000000;
+const CLONE_NEWUSER:        u64 = 0x10000000;
+const CLONE_NEWPID:         u64 = 0x20000000;
+const CLONE_NEWNET:         u64 = 0x40000000;
+const CLONE_IO:             u64 = 0x80000000;
+
+// `futex` operations (low byte of `op`)
+const FUTEX_WAIT:           i32 = 0;
+const FUTEX_WAKE:           i32 = 1;
+const FUTEX_FD:             i32 = 2;
+const FUTEX_REQUEUE:        i32 = 3;
+const FUTEX_CMP_REQUEUE:    i32 = 4;
+const FUTEX_WAKE_OP:        i32 = 5;
+const FUTEX_LOCK_PI:        i32 = 6;
+const FUTEX_UNLOCK_PI:      i32 = 7;
+const FUTEX_TRYLOCK_PI:     i32 = 8;
+const FUTEX_WAIT_BITSET:    i32 = 9;
+const FUTEX_WAKE_BITSET:    i32 = 10;
+const FUTEX_WAIT_REQUEUE_PI: i32 = 11;
+const FUTEX_CMP_REQUEUE_PI: i32 = 12;
+const FUTEX_PRIVATE_FLAG:   i32 = 128;
+const FUTEX_CLOCK_REALTIME: i32 = 256;
+
+// `getrandom` flags
+const GRND_NONBLOCK: u32 = 1;
+const GRND_RANDOM:   u32 = 2;
+const GRND_INSECURE: u32 = 4;
+
+// `prctl` operations (PR_*) — covered selectively; full list in
+// `<linux/prctl.h>`. The commonly-needed subset:
+const PR_SET_PDEATHSIG: i32 = 1;
+const PR_GET_PDEATHSIG: i32 = 2;
+const PR_SET_DUMPABLE:  i32 = 4;
+const PR_GET_DUMPABLE:  i32 = 3;
+const PR_SET_NAME:      i32 = 15;
+const PR_GET_NAME:      i32 = 16;
+const PR_SET_SECCOMP:   i32 = 22;
+const PR_GET_SECCOMP:   i32 = 21;
+const PR_SET_NO_NEW_PRIVS: i32 = 38;
+const PR_GET_NO_NEW_PRIVS: i32 = 39;
+
+// `seccomp` operations
+const SECCOMP_SET_MODE_STRICT: u32 = 0;
+const SECCOMP_SET_MODE_FILTER: u32 = 1;
+const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
+const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
+
+// `pidfd_open` flags (none yet defined; future PIDFD_NONBLOCK lives at 0x800)
+const PIDFD_NONBLOCK: u32 = 2048;     // == O_NONBLOCK
+
+// ----------------------------------------------------------------------------
+// Linux raw-syscall entry point
+// ----------------------------------------------------------------------------
+//
+// `syscall()` is libc's variadic trampoline that loads the syscall
+// number into `rax` and the up-to-six arguments into the syscall ABI
+// registers (rdi, rsi, rdx, r10, r8, r9). Return value is `rax` —
+// negative `errno` values become libc errno + return -1; the
+// trampoline does the translation.
+
+![target(linux)]
+extern "C" {
+    function syscall(number: Syscall, ...) -> i64;
+}
+
+// ----------------------------------------------------------------------------
+// Typed Linux syscall wrappers
+// ----------------------------------------------------------------------------
+//
+// Every wrapper forwards through `syscall()` with the matching `SYS_*`
+// number, casting arguments to `i64` for the variadic call. Return
+// types follow the kernel ABI — usually `i64` for ssize_t-shaped
+// results, `i32` for int-shaped ones. Errors surface via libc errno
+// (set by the syscall trampoline on negative kernel return).
+
+![target(linux)]
+function sys_read(fd: i32, buf: u8*, count: u64) -> i64 {
+    return syscall(Syscall::SYS_read, fd as i64, buf as i64, count as i64);
+}
+
+![target(linux)]
+function sys_write(fd: i32, buf: u8*, count: u64) -> i64 {
+    return syscall(Syscall::SYS_write, fd as i64, buf as i64, count as i64);
+}
+
+![target(linux)]
+function sys_open(path: u8*, flags: i32, mode: u32) -> i32 {
+    return syscall(Syscall::SYS_open, path as i64, flags as i64, mode as i64) as i32;
+}
+
+![target(linux)]
+function sys_close(fd: i32) -> i32 {
+    return syscall(Syscall::SYS_close, fd as i64) as i32;
+}
+
+![target(linux)]
+function sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    return syscall(Syscall::SYS_lseek, fd as i64, offset, whence as i64);
+}
+
+![target(linux)]
+function sys_mmap(addr: u8*, length: u64, prot: i32,
+                  flags: i32, fd: i32, offset: i64) -> u8* {
+    return syscall(Syscall::SYS_mmap, addr as i64, length as i64,
+                   prot as i64, flags as i64,
+                   fd as i64, offset) as u8*;
+}
+
+![target(linux)]
+function sys_munmap(addr: u8*, length: u64) -> i32 {
+    return syscall(Syscall::SYS_munmap, addr as i64, length as i64) as i32;
+}
+
+![target(linux)]
+function sys_mprotect(addr: u8*, length: u64, prot: i32) -> i32 {
+    return syscall(Syscall::SYS_mprotect, addr as i64, length as i64, prot as i64) as i32;
+}
+
+![target(linux)]
+function sys_brk(addr: u8*) -> u8* {
+    return syscall(Syscall::SYS_brk, addr as i64) as u8*;
+}
+
+![target(linux)]
+function sys_pipe2(pipefd: i32*, flags: i32) -> i32 {
+    return syscall(Syscall::SYS_pipe2, pipefd as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_dup(oldfd: i32) -> i32 {
+    return syscall(Syscall::SYS_dup, oldfd as i64) as i32;
+}
+
+![target(linux)]
+function sys_dup2(oldfd: i32, newfd: i32) -> i32 {
+    return syscall(Syscall::SYS_dup2, oldfd as i64, newfd as i64) as i32;
+}
+
+![target(linux)]
+function sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
+    return syscall(Syscall::SYS_dup3, oldfd as i64, newfd as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+    return syscall(Syscall::SYS_fcntl, fd as i64, cmd as i64, arg) as i32;
+}
+
+![target(linux)]
+function sys_ioctl(fd: i32, request: u64, arg: u8*) -> i32 {
+    return syscall(Syscall::SYS_ioctl, fd as i64, request as i64, arg as i64) as i32;
+}
+
+![target(linux)]
+function sys_fork() -> i32 {
+    return syscall(Syscall::SYS_fork) as i32;
+}
+
+![target(linux)]
+function sys_vfork() -> i32 {
+    return syscall(Syscall::SYS_vfork) as i32;
+}
+
+![target(linux)]
+function sys_execve(path: u8*, argv: u8**, envp: u8**) -> i32 {
+    return syscall(Syscall::SYS_execve, path as i64, argv as i64, envp as i64) as i32;
+}
+
+![target(linux)]
+function sys_exit(status: i32) -> void {
+    syscall(Syscall::SYS_exit, status as i64);
+}
+
+![target(linux)]
+function sys_exit_group(status: i32) -> void {
+    syscall(Syscall::SYS_exit_group, status as i64);
+}
+
+![target(linux)]
+function sys_wait4(pid: i32, wstatus: i32*, options: i32, rusage: u8*) -> i32 {
+    return syscall(Syscall::SYS_wait4, pid as i64, wstatus as i64,
+                   options as i64, rusage as i64) as i32;
+}
+
+![target(linux)]
+function sys_waitid(idtype: i32, id: u32, infop: u8*, options: i32) -> i32 {
+    return syscall(Syscall::SYS_waitid, idtype as i64, id as i64,
+                   infop as i64, options as i64) as i32;
+}
+
+![target(linux)]
+function sys_kill(pid: i32, sig: i32) -> i32 {
+    return syscall(Syscall::SYS_kill, pid as i64, sig as i64) as i32;
+}
+
+![target(linux)]
+function sys_tkill(tid: i32, sig: i32) -> i32 {
+    return syscall(Syscall::SYS_tkill, tid as i64, sig as i64) as i32;
+}
+
+![target(linux)]
+function sys_tgkill(tgid: i32, tid: i32, sig: i32) -> i32 {
+    return syscall(Syscall::SYS_tgkill, tgid as i64, tid as i64, sig as i64) as i32;
+}
+
+![target(linux)]
+function sys_getpid() -> i32 {
+    return syscall(Syscall::SYS_getpid) as i32;
+}
+
+![target(linux)]
+function sys_getppid() -> i32 {
+    return syscall(Syscall::SYS_getppid) as i32;
+}
+
+![target(linux)]
+function sys_gettid() -> i32 {
+    return syscall(Syscall::SYS_gettid) as i32;
+}
+
+![target(linux)]
+function sys_getuid() -> u32 {
+    return syscall(Syscall::SYS_getuid) as u32;
+}
+
+![target(linux)]
+function sys_geteuid() -> u32 {
+    return syscall(Syscall::SYS_geteuid) as u32;
+}
+
+![target(linux)]
+function sys_getgid() -> u32 {
+    return syscall(Syscall::SYS_getgid) as u32;
+}
+
+![target(linux)]
+function sys_getegid() -> u32 {
+    return syscall(Syscall::SYS_getegid) as u32;
+}
+
+![target(linux)]
+function sys_setuid(uid: u32) -> i32 {
+    return syscall(Syscall::SYS_setuid, uid as i64) as i32;
+}
+
+![target(linux)]
+function sys_setgid(gid: u32) -> i32 {
+    return syscall(Syscall::SYS_setgid, gid as i64) as i32;
+}
+
+![target(linux)]
+function sys_chdir(path: u8*) -> i32 {
+    return syscall(Syscall::SYS_chdir, path as i64) as i32;
+}
+
+![target(linux)]
+function sys_fchdir(fd: i32) -> i32 {
+    return syscall(Syscall::SYS_fchdir, fd as i64) as i32;
+}
+
+![target(linux)]
+function sys_getcwd(buf: u8*, size: u64) -> i64 {
+    return syscall(Syscall::SYS_getcwd, buf as i64, size as i64);
+}
+
+![target(linux)]
+function sys_mkdir(path: u8*, mode: u32) -> i32 {
+    return syscall(Syscall::SYS_mkdir, path as i64, mode as i64) as i32;
+}
+
+![target(linux)]
+function sys_rmdir(path: u8*) -> i32 {
+    return syscall(Syscall::SYS_rmdir, path as i64) as i32;
+}
+
+![target(linux)]
+function sys_unlink(path: u8*) -> i32 {
+    return syscall(Syscall::SYS_unlink, path as i64) as i32;
+}
+
+![target(linux)]
+function sys_rename(oldpath: u8*, newpath: u8*) -> i32 {
+    return syscall(Syscall::SYS_rename, oldpath as i64, newpath as i64) as i32;
+}
+
+![target(linux)]
+function sys_link(oldpath: u8*, newpath: u8*) -> i32 {
+    return syscall(Syscall::SYS_link, oldpath as i64, newpath as i64) as i32;
+}
+
+![target(linux)]
+function sys_symlink(target: u8*, linkpath: u8*) -> i32 {
+    return syscall(Syscall::SYS_symlink, target as i64, linkpath as i64) as i32;
+}
+
+![target(linux)]
+function sys_readlink(path: u8*, buf: u8*, bufsize: u64) -> i64 {
+    return syscall(Syscall::SYS_readlink, path as i64, buf as i64, bufsize as i64);
+}
+
+![target(linux)]
+function sys_truncate(path: u8*, length: i64) -> i32 {
+    return syscall(Syscall::SYS_truncate, path as i64, length) as i32;
+}
+
+![target(linux)]
+function sys_ftruncate(fd: i32, length: i64) -> i32 {
+    return syscall(Syscall::SYS_ftruncate, fd as i64, length) as i32;
+}
+
+![target(linux)]
+function sys_fsync(fd: i32) -> i32 {
+    return syscall(Syscall::SYS_fsync, fd as i64) as i32;
+}
+
+![target(linux)]
+function sys_fdatasync(fd: i32) -> i32 {
+    return syscall(Syscall::SYS_fdatasync, fd as i64) as i32;
+}
+
+![target(linux)]
+function sys_stat(path: u8*, buf: u8*) -> i32 {
+    return syscall(Syscall::SYS_stat, path as i64, buf as i64) as i32;
+}
+
+![target(linux)]
+function sys_fstat(fd: i32, buf: u8*) -> i32 {
+    return syscall(Syscall::SYS_fstat, fd as i64, buf as i64) as i32;
+}
+
+![target(linux)]
+function sys_lstat(path: u8*, buf: u8*) -> i32 {
+    return syscall(Syscall::SYS_lstat, path as i64, buf as i64) as i32;
+}
+
+![target(linux)]
+function sys_statx(dirfd: i32, path: u8*, flags: i32, mask: u32, buf: u8*) -> i32 {
+    return syscall(Syscall::SYS_statx, dirfd as i64, path as i64,
+                   flags as i64, mask as i64, buf as i64) as i32;
+}
+
+![target(linux)]
+function sys_access(path: u8*, mode: i32) -> i32 {
+    return syscall(Syscall::SYS_access, path as i64, mode as i64) as i32;
+}
+
+![target(linux)]
+function sys_chmod(path: u8*, mode: u32) -> i32 {
+    return syscall(Syscall::SYS_chmod, path as i64, mode as i64) as i32;
+}
+
+![target(linux)]
+function sys_chown(path: u8*, owner: u32, group: u32) -> i32 {
+    return syscall(Syscall::SYS_chown, path as i64, owner as i64, group as i64) as i32;
+}
+
+![target(linux)]
+function sys_openat(dirfd: i32, path: u8*, flags: i32, mode: u32) -> i32 {
+    return syscall(Syscall::SYS_openat, dirfd as i64, path as i64,
+                   flags as i64, mode as i64) as i32;
+}
+
+![target(linux)]
+function sys_openat2(dirfd: i32, path: u8*, how: u8*, size: u64) -> i32 {
+    return syscall(Syscall::SYS_openat2, dirfd as i64, path as i64,
+                   how as i64, size as i64) as i32;
+}
+
+![target(linux)]
+function sys_close_range(first: u32, last: u32, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_close_range, first as i64,
+                   last as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_getdents64(fd: i32, dirp: u8*, count: u64) -> i64 {
+    return syscall(Syscall::SYS_getdents64, fd as i64, dirp as i64, count as i64);
+}
+
+// Time
+![target(linux)]
+function sys_clock_gettime(clk: i32, tp: u8*) -> i32 {
+    return syscall(Syscall::SYS_clock_gettime, clk as i64, tp as i64) as i32;
+}
+
+![target(linux)]
+function sys_clock_nanosleep(clk: i32, flags: i32, req: u8*, rem: u8*) -> i32 {
+    return syscall(Syscall::SYS_clock_nanosleep, clk as i64, flags as i64,
+                   req as i64, rem as i64) as i32;
+}
+
+![target(linux)]
+function sys_nanosleep(req: u8*, rem: u8*) -> i32 {
+    return syscall(Syscall::SYS_nanosleep, req as i64, rem as i64) as i32;
+}
+
+// Networking
+![target(linux)]
+function sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i32 {
+    return syscall(Syscall::SYS_socket, domain as i64,
+                   sock_type as i64, protocol as i64) as i32;
+}
+
+![target(linux)]
+function sys_connect(sockfd: i32, addr: u8*, addrlen: u32) -> i32 {
+    return syscall(Syscall::SYS_connect, sockfd as i64,
+                   addr as i64, addrlen as i64) as i32;
+}
+
+![target(linux)]
+function sys_bind(sockfd: i32, addr: u8*, addrlen: u32) -> i32 {
+    return syscall(Syscall::SYS_bind, sockfd as i64, addr as i64, addrlen as i64) as i32;
+}
+
+![target(linux)]
+function sys_listen(sockfd: i32, backlog: i32) -> i32 {
+    return syscall(Syscall::SYS_listen, sockfd as i64, backlog as i64) as i32;
+}
+
+![target(linux)]
+function sys_accept4(sockfd: i32, addr: u8*, addrlen: u32*, flags: i32) -> i32 {
+    return syscall(Syscall::SYS_accept4, sockfd as i64, addr as i64,
+                   addrlen as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_sendto(sockfd: i32, buf: u8*, len: u64, flags: i32,
+                    dest_addr: u8*, addrlen: u32) -> i64 {
+    return syscall(Syscall::SYS_sendto, sockfd as i64, buf as i64, len as i64,
+                   flags as i64, dest_addr as i64, addrlen as i64);
+}
+
+![target(linux)]
+function sys_recvfrom(sockfd: i32, buf: u8*, len: u64, flags: i32,
+                      src_addr: u8*, addrlen: u32*) -> i64 {
+    return syscall(Syscall::SYS_recvfrom, sockfd as i64, buf as i64, len as i64,
+                   flags as i64, src_addr as i64, addrlen as i64);
+}
+
+// Polling
+![target(linux)]
+function sys_poll(fds: u8*, nfds: u64, timeout: i32) -> i32 {
+    return syscall(Syscall::SYS_poll, fds as i64, nfds as i64, timeout as i64) as i32;
+}
+
+![target(linux)]
+function sys_ppoll(fds: u8*, nfds: u64, timeout: u8*, sigmask: u8*) -> i32 {
+    return syscall(Syscall::SYS_ppoll, fds as i64, nfds as i64,
+                   timeout as i64, sigmask as i64) as i32;
+}
+
+![target(linux)]
+function sys_epoll_create1(flags: i32) -> i32 {
+    return syscall(Syscall::SYS_epoll_create1, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: u8*) -> i32 {
+    return syscall(Syscall::SYS_epoll_ctl, epfd as i64, op as i64,
+                   fd as i64, event as i64) as i32;
+}
+
+![target(linux)]
+function sys_epoll_wait(epfd: i32, events: u8*, maxevents: i32, timeout: i32) -> i32 {
+    return syscall(Syscall::SYS_epoll_wait, epfd as i64, events as i64,
+                   maxevents as i64, timeout as i64) as i32;
+}
+
+// Memory
+![target(linux)]
+function sys_madvise(addr: u8*, length: u64, advice: i32) -> i32 {
+    return syscall(Syscall::SYS_madvise, addr as i64, length as i64, advice as i64) as i32;
+}
+
+![target(linux)]
+function sys_mlock(addr: u8*, length: u64) -> i32 {
+    return syscall(Syscall::SYS_mlock, addr as i64, length as i64) as i32;
+}
+
+![target(linux)]
+function sys_munlock(addr: u8*, length: u64) -> i32 {
+    return syscall(Syscall::SYS_munlock, addr as i64, length as i64) as i32;
+}
+
+![target(linux)]
+function sys_memfd_create(name: u8*, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_memfd_create, name as i64, flags as i64) as i32;
+}
+
+// Synchronization / threading primitives
+![target(linux)]
+function sys_futex(uaddr: u32*, op: i32, val: u32,
+                   timeout: u8*, uaddr2: u32*, val3: u32) -> i64 {
+    return syscall(Syscall::SYS_futex, uaddr as i64, op as i64, val as i64,
+                   timeout as i64, uaddr2 as i64, val3 as i64);
+}
+
+![target(linux)]
+function sys_clone3(args: u8*, size: u64) -> i64 {
+    return syscall(Syscall::SYS_clone3, args as i64, size as i64);
+}
+
+![target(linux)]
+function sys_set_tid_address(tidptr: i32*) -> i32 {
+    return syscall(Syscall::SYS_set_tid_address, tidptr as i64) as i32;
+}
+
+![target(linux)]
+function sys_sched_yield() -> i32 {
+    return syscall(Syscall::SYS_sched_yield) as i32;
+}
+
+![target(linux)]
+function sys_sched_setaffinity(pid: i32, cpusetsize: u64, mask: u8*) -> i32 {
+    return syscall(Syscall::SYS_sched_setaffinity, pid as i64,
+                   cpusetsize as i64, mask as i64) as i32;
+}
+
+![target(linux)]
+function sys_sched_getaffinity(pid: i32, cpusetsize: u64, mask: u8*) -> i32 {
+    return syscall(Syscall::SYS_sched_getaffinity, pid as i64,
+                   cpusetsize as i64, mask as i64) as i32;
+}
+
+// Randomness, security, namespaces
+![target(linux)]
+function sys_getrandom(buf: u8*, buflen: u64, flags: u32) -> i64 {
+    return syscall(Syscall::SYS_getrandom, buf as i64, buflen as i64, flags as i64);
+}
+
+![target(linux)]
+function sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32 {
+    return syscall(Syscall::SYS_prctl, option as i64,
+                   arg2 as i64, arg3 as i64,
+                   arg4 as i64, arg5 as i64) as i32;
+}
+
+![target(linux)]
+function sys_seccomp(operation: u32, flags: u32, args: u8*) -> i32 {
+    return syscall(Syscall::SYS_seccomp, operation as i64,
+                   flags as i64, args as i64) as i32;
+}
+
+![target(linux)]
+function sys_setns(fd: i32, nstype: i32) -> i32 {
+    return syscall(Syscall::SYS_setns, fd as i64, nstype as i64) as i32;
+}
+
+![target(linux)]
+function sys_unshare(flags: u64) -> i32 {
+    return syscall(Syscall::SYS_unshare, flags as i64) as i32;
+}
+
+// Modern fd-based APIs
+![target(linux)]
+function sys_pidfd_open(pid: i32, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_pidfd_open, pid as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_pidfd_send_signal(pidfd: i32, sig: i32, info: u8*, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_pidfd_send_signal, pidfd as i64, sig as i64,
+                   info as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_pidfd_getfd, pidfd as i64,
+                   targetfd as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_signalfd(fd: i32, mask: u8*, flags: i32) -> i32 {
+    return syscall(Syscall::SYS_signalfd4, fd as i64, mask as i64,
+                   8 as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_eventfd2(initval: u32, flags: i32) -> i32 {
+    return syscall(Syscall::SYS_eventfd2, initval as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_timerfd_create(clockid: i32, flags: i32) -> i32 {
+    return syscall(Syscall::SYS_timerfd_create, clockid as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_inotify_init1(flags: i32) -> i32 {
+    return syscall(Syscall::SYS_inotify_init1, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_inotify_add_watch(fd: i32, path: u8*, mask: u32) -> i32 {
+    return syscall(Syscall::SYS_inotify_add_watch, fd as i64,
+                   path as i64, mask as i64) as i32;
+}
+
+![target(linux)]
+function sys_inotify_rm_watch(fd: i32, wd: i32) -> i32 {
+    return syscall(Syscall::SYS_inotify_rm_watch, fd as i64, wd as i64) as i32;
+}
+
+![target(linux)]
+function sys_fanotify_init(flags: u32, event_f_flags: u32) -> i32 {
+    return syscall(Syscall::SYS_fanotify_init, flags as i64, event_f_flags as i64) as i32;
+}
+
+// io_uring — modern async I/O. `params` is `struct io_uring_params`.
+![target(linux)]
+function sys_io_uring_setup(entries: u32, params: u8*) -> i32 {
+    return syscall(Syscall::SYS_io_uring_setup, entries as i64, params as i64) as i32;
+}
+
+![target(linux)]
+function sys_io_uring_enter(fd: i32, to_submit: u32, min_complete: u32,
+                            flags: u32, sig: u8*, sigsz: u64) -> i32 {
+    return syscall(Syscall::SYS_io_uring_enter, fd as i64, to_submit as i64,
+                   min_complete as i64, flags as i64,
+                   sig as i64, sigsz as i64) as i32;
+}
+
+![target(linux)]
+function sys_io_uring_register(fd: i32, opcode: u32, arg: u8*, nr_args: u32) -> i32 {
+    return syscall(Syscall::SYS_io_uring_register, fd as i64, opcode as i64,
+                   arg as i64, nr_args as i64) as i32;
+}
+
+// eBPF
+![target(linux)]
+function sys_bpf(cmd: i32, attr: u8*, size: u32) -> i32 {
+    return syscall(Syscall::SYS_bpf, cmd as i64, attr as i64, size as i64) as i32;
+}
+
+// Userfault FD
+![target(linux)]
+function sys_userfaultfd(flags: i32) -> i32 {
+    return syscall(Syscall::SYS_userfaultfd, flags as i64) as i32;
+}
+
+// File-range copy
+![target(linux)]
+function sys_copy_file_range(fd_in: i32, off_in: i64*,
+                             fd_out: i32, off_out: i64*,
+                             len: u64, flags: u32) -> i64 {
+    return syscall(Syscall::SYS_copy_file_range, fd_in as i64, off_in as i64,
+                   fd_out as i64, off_out as i64,
+                   len as i64, flags as i64);
+}
+
+// sendfile
+![target(linux)]
+function sys_sendfile(out_fd: i32, in_fd: i32, offset: i64*, count: u64) -> i64 {
+    return syscall(Syscall::SYS_sendfile, out_fd as i64, in_fd as i64,
+                   offset as i64, count as i64);
+}
+
+// splice / tee / vmsplice
+![target(linux)]
+function sys_splice(fd_in: i32, off_in: i64*,
+                    fd_out: i32, off_out: i64*,
+                    len: u64, flags: u32) -> i64 {
+    return syscall(Syscall::SYS_splice, fd_in as i64, off_in as i64,
+                   fd_out as i64, off_out as i64,
+                   len as i64, flags as i64);
+}
+
+![target(linux)]
+function sys_tee(fd_in: i32, fd_out: i32, len: u64, flags: u32) -> i64 {
+    return syscall(Syscall::SYS_tee, fd_in as i64, fd_out as i64,
+                   len as i64, flags as i64);
+}
+
+// Landlock (kernel >= 5.13)
+![target(linux)]
+function sys_landlock_create_ruleset(attr: u8*, size: u64, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_landlock_create_ruleset, attr as i64,
+                   size as i64, flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_landlock_add_rule(ruleset_fd: i32, rule_type: i32,
+                               rule_attr: u8*, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_landlock_add_rule, ruleset_fd as i64,
+                   rule_type as i64, rule_attr as i64,
+                   flags as i64) as i32;
+}
+
+![target(linux)]
+function sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> i32 {
+    return syscall(Syscall::SYS_landlock_restrict_self, ruleset_fd as i64,
+                   flags as i64) as i32;
+}
+
+// Generic escape hatch — call any syscall by `Syscall` variant with
+// up to six i64-shaped arguments. Useful for syscalls that don't yet
+// have a typed wrapper above. Pre-cast non-i64 args at the call site.
+![target(linux)]
+function sys_call0(num: Syscall) -> i64 {
+    return syscall(num);
+}
+
+![target(linux)]
+function sys_call1(num: Syscall, a: i64) -> i64 {
+    return syscall(num, a);
+}
+
+![target(linux)]
+function sys_call2(num: Syscall, a: i64, b: i64) -> i64 {
+    return syscall(num, a, b);
+}
+
+![target(linux)]
+function sys_call3(num: Syscall, a: i64, b: i64, c: i64) -> i64 {
+    return syscall(num, a, b, c);
+}
+
+![target(linux)]
+function sys_call4(num: Syscall, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    return syscall(num, a, b, c, d);
+}
+
+![target(linux)]
+function sys_call5(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    return syscall(num, a, b, c, d, e);
+}
+
+![target(linux)]
+function sys_call6(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    return syscall(num, a, b, c, d, e, f);
+}
+
+
+// ============================================================================
+// ============================================================================
+//
+//                              WINDOWS x86_64
+//
+// ============================================================================
+// ============================================================================
+//
+// Windows doesn't expose stable raw NT syscall numbers — they shift
+// between Windows builds. The "system surface" callers should target
+// is the Win32 API (and, for low-level needs, the NT API in ntdll).
+// Both go through the standard PE import table, so they link cleanly
+// even when the host is Linux (the `![target(windows)]` gate keeps
+// them out of the Linux build).
+
+// ----------------------------------------------------------------------------
+// Win32 sentinel values & status constants
+// ----------------------------------------------------------------------------
+//
+// `HANDLE` is `void*`; `INVALID_HANDLE_VALUE` is `(HANDLE)-1`. We
+// expose the integer form so callers can compare an `i64` cast of
+// the handle.
+
+const INVALID_HANDLE_VALUE: i64 = -1;
+const NULL_HANDLE:          u64 = 0;
+
+// GetStdHandle handle ids
+const STD_INPUT_HANDLE:  u32 = 4294967286;  // (DWORD)-10
+const STD_OUTPUT_HANDLE: u32 = 4294967285;  // (DWORD)-11
+const STD_ERROR_HANDLE:  u32 = 4294967284;  // (DWORD)-12
+
+// CreateFile dwDesiredAccess
+const GENERIC_READ:    u32 = 0x80000000;
+const GENERIC_WRITE:   u32 = 0x40000000;
+const GENERIC_EXECUTE: u32 = 0x20000000;
+const GENERIC_ALL:     u32 = 0x10000000;
+
+// CreateFile dwShareMode
+const FILE_SHARE_READ:   u32 = 0x00000001;
+const FILE_SHARE_WRITE:  u32 = 0x00000002;
+const FILE_SHARE_DELETE: u32 = 0x00000004;
+
+// CreateFile dwCreationDisposition
+const CREATE_NEW:        u32 = 1;
+const CREATE_ALWAYS:     u32 = 2;
+const OPEN_EXISTING:     u32 = 3;
+const OPEN_ALWAYS:       u32 = 4;
+const TRUNCATE_EXISTING: u32 = 5;
+
+// CreateFile dwFlagsAndAttributes (subset)
+const FILE_ATTRIBUTE_READONLY:  u32 = 0x1;
+const FILE_ATTRIBUTE_HIDDEN:    u32 = 0x2;
+const FILE_ATTRIBUTE_SYSTEM:    u32 = 0x4;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_ARCHIVE:   u32 = 0x20;
+const FILE_ATTRIBUTE_NORMAL:    u32 = 0x80;
+const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+const FILE_FLAG_WRITE_THROUGH:  u32 = 0x80000000;
+const FILE_FLAG_OVERLAPPED:     u32 = 0x40000000;
+const FILE_FLAG_NO_BUFFERING:   u32 = 0x20000000;
+const FILE_FLAG_RANDOM_ACCESS:  u32 = 0x10000000;
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
+const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x04000000;
+
+// SetFilePointer dwMoveMethod
+const FILE_BEGIN:   u32 = 0;
+const FILE_CURRENT: u32 = 1;
+const FILE_END:     u32 = 2;
+
+// VirtualAlloc flAllocationType
+const MEM_COMMIT:      u32 = 0x1000;
+const MEM_RESERVE:     u32 = 0x2000;
+const MEM_DECOMMIT:    u32 = 0x4000;
+const MEM_RELEASE:     u32 = 0x8000;
+const MEM_RESET:       u32 = 0x80000;
+const MEM_RESET_UNDO:  u32 = 0x1000000;
+const MEM_LARGE_PAGES: u32 = 0x20000000;
+const MEM_PHYSICAL:    u32 = 0x400000;
+const MEM_TOP_DOWN:    u32 = 0x100000;
+
+// VirtualAlloc / VirtualProtect flProtect
+const PAGE_NOACCESS:          u32 = 0x01;
+const PAGE_READONLY:          u32 = 0x02;
+const PAGE_READWRITE:         u32 = 0x04;
+const PAGE_WRITECOPY:         u32 = 0x08;
+const PAGE_EXECUTE:           u32 = 0x10;
+const PAGE_EXECUTE_READ:      u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+const PAGE_GUARD:             u32 = 0x100;
+const PAGE_NOCACHE:           u32 = 0x200;
+
+// WaitForSingleObject / WaitForMultipleObjects return values
+const WAIT_OBJECT_0:    u32 = 0;
+const WAIT_ABANDONED_0: u32 = 0x80;
+const WAIT_TIMEOUT:     u32 = 0x102;
+const WAIT_FAILED:      u32 = 0xFFFFFFFF;
+const INFINITE:         u32 = 0xFFFFFFFF;
+
+// HeapCreate / HeapAlloc flags
+const HEAP_NO_SERIALIZE:        u32 = 0x1;
+const HEAP_GROWABLE:            u32 = 0x2;
+const HEAP_GENERATE_EXCEPTIONS: u32 = 0x4;
+const HEAP_ZERO_MEMORY:         u32 = 0x8;
+const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
+
+// CreateProcess dwCreationFlags
+const CREATE_SUSPENDED:       u32 = 0x4;
+const DETACHED_PROCESS:       u32 = 0x8;
+const CREATE_NEW_CONSOLE:     u32 = 0x10;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x1000000;
+const CREATE_NO_WINDOW:       u32 = 0x8000000;
+
+// Common Windows error codes (GetLastError values). Full list at
+// `<winerror.h>`; the most-checked subset:
+const ERROR_SUCCESS:           u32 = 0;
+const ERROR_FILE_NOT_FOUND:    u32 = 2;
+const ERROR_PATH_NOT_FOUND:    u32 = 3;
+const ERROR_ACCESS_DENIED:     u32 = 5;
+const ERROR_INVALID_HANDLE:    u32 = 6;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+const ERROR_BAD_FORMAT:        u32 = 11;
+const ERROR_INVALID_DATA:      u32 = 13;
+const ERROR_NO_MORE_FILES:     u32 = 18;
+const ERROR_HANDLE_EOF:        u32 = 38;
+const ERROR_NOT_SUPPORTED:     u32 = 50;
+const ERROR_FILE_EXISTS:       u32 = 80;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_BROKEN_PIPE:       u32 = 109;
+const ERROR_DISK_FULL:         u32 = 112;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_INVALID_NAME:      u32 = 123;
+const ERROR_ALREADY_EXISTS:    u32 = 183;
+const ERROR_NO_DATA:           u32 = 232;
+const ERROR_PIPE_BUSY:         u32 = 231;
+const ERROR_MORE_DATA:         u32 = 234;
+const ERROR_NO_MORE_ITEMS:     u32 = 259;
+const ERROR_DIRECTORY:         u32 = 267;
+const ERROR_OPERATION_ABORTED: u32 = 995;
+const ERROR_IO_INCOMPLETE:     u32 = 996;
+const ERROR_IO_PENDING:        u32 = 997;
+const ERROR_TIMEOUT:           u32 = 1460;
+
+// NTSTATUS macro returns. Negative when failed; the high two bits
+// indicate severity.
+const STATUS_SUCCESS:           i32 = 0;
+const STATUS_PENDING:           i32 = 259;
+const STATUS_BUFFER_OVERFLOW:   i32 = 0x80000005;
+const STATUS_NO_MORE_FILES:     i32 = 0x80000006;
+const STATUS_INVALID_HANDLE:    i32 = 0xC0000008;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000000D;
+const STATUS_END_OF_FILE:       i32 = 0xC0000011;
+const STATUS_ACCESS_DENIED:     i32 = 0xC0000022;
+
+// FormatMessage dwFlags
+const FORMAT_MESSAGE_ALLOCATE_BUFFER: u32 = 0x100;
+const FORMAT_MESSAGE_IGNORE_INSERTS:  u32 = 0x200;
+const FORMAT_MESSAGE_FROM_STRING:     u32 = 0x400;
+const FORMAT_MESSAGE_FROM_HMODULE:    u32 = 0x800;
+const FORMAT_MESSAGE_FROM_SYSTEM:     u32 = 0x1000;
+const FORMAT_MESSAGE_ARGUMENT_ARRAY:  u32 = 0x2000;
+
+// Console mode flags
+const ENABLE_PROCESSED_INPUT:        u32 = 0x1;
+const ENABLE_LINE_INPUT:             u32 = 0x2;
+const ENABLE_ECHO_INPUT:             u32 = 0x4;
+const ENABLE_WINDOW_INPUT:           u32 = 0x8;
+const ENABLE_MOUSE_INPUT:            u32 = 0x10;
+const ENABLE_INSERT_MODE:            u32 = 0x20;
+const ENABLE_QUICK_EDIT_MODE:        u32 = 0x40;
+const ENABLE_EXTENDED_FLAGS:         u32 = 0x80;
+const ENABLE_PROCESSED_OUTPUT:       u32 = 0x1;
+const ENABLE_WRAP_AT_EOL_OUTPUT:     u32 = 0x2;
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
+
+// ----------------------------------------------------------------------------
+// Win32 stable layout structs
+// ----------------------------------------------------------------------------
+
+/// 100-nanosecond intervals since 1601-01-01 UTC.
+type struct FILETIME {
+    dwLowDateTime:  u32;
+    dwHighDateTime: u32;
+}
+
+type struct SYSTEMTIME {
+    wYear:         u16;
+    wMonth:        u16;
+    wDayOfWeek:    u16;
+    wDay:          u16;
+    wHour:         u16;
+    wMinute:       u16;
+    wSecond:       u16;
+    wMilliseconds: u16;
+}
+
+/// Sized-and-attributed object passed to CreateFile, CreateMutex, etc.
+type struct SECURITY_ATTRIBUTES {
+    nLength:              u32;
+    lpSecurityDescriptor: u8*;
+    bInheritHandle:       i32;
+}
+
+/// Overlapped I/O context (asynchronous file ops).
+type struct OVERLAPPED {
+    Internal:     u64;
+    InternalHigh: u64;
+    Offset:       u32;
+    OffsetHigh:   u32;
+    hEvent:       u8*;
+}
+
+/// CreateProcess startup parameters. `lpReserved`/`lpDesktop`/
+/// `lpTitle` are typically null; size constants below.
+type struct STARTUPINFOA {
+    cb:              u32;
+    lpReserved:      u8*;
+    lpDesktop:       u8*;
+    lpTitle:         u8*;
+    dwX:             u32;
+    dwY:             u32;
+    dwXSize:         u32;
+    dwYSize:         u32;
+    dwXCountChars:   u32;
+    dwYCountChars:   u32;
+    dwFillAttribute: u32;
+    dwFlags:         u32;
+    wShowWindow:     u16;
+    cbReserved2:     u16;
+    lpReserved2:     u8*;
+    hStdInput:       u8*;
+    hStdOutput:      u8*;
+    hStdError:       u8*;
+}
+
+type struct PROCESS_INFORMATION {
+    hProcess:    u8*;
+    hThread:     u8*;
+    dwProcessId: u32;
+    dwThreadId:  u32;
+}
+
+/// LARGE_INTEGER for file sizes and QueryPerformanceCounter.
+type struct LARGE_INTEGER {
+    QuadPart: i64;
+}
+
+/// Result from GetSystemInfo — partial; only the fields most callers
+/// read are exposed. Full struct is 48 bytes.
+type struct SYSTEM_INFO_PARTIAL {
+    wProcessorArchitecture: u16;
+    wReserved:              u16;
+    dwPageSize:             u32;
+    lpMinimumApplicationAddress: u8*;
+    lpMaximumApplicationAddress: u8*;
+    dwActiveProcessorMask:  u64;
+    dwNumberOfProcessors:   u32;
+    dwProcessorType:        u32;
+    dwAllocationGranularity: u32;
+    wProcessorLevel:        u16;
+    wProcessorRevision:     u16;
+}
+
+// ----------------------------------------------------------------------------
+// kernel32.dll — file I/O, process, thread, memory, sync, time, error
+// ----------------------------------------------------------------------------
+
+![target(windows)]
+![link("kernel32")]
+extern "C" {
+    // File operations (ANSI / narrow)
+    function CreateFileA(lpFileName: u8*, dwDesiredAccess: u32,
+                         dwShareMode: u32, lpSecurityAttributes: u8*,
+                         dwCreationDisposition: u32,
+                         dwFlagsAndAttributes: u32,
+                         hTemplateFile: u8*) -> u8*;
+    function CreateFileW(lpFileName: u16*, dwDesiredAccess: u32,
+                         dwShareMode: u32, lpSecurityAttributes: u8*,
+                         dwCreationDisposition: u32,
+                         dwFlagsAndAttributes: u32,
+                         hTemplateFile: u8*) -> u8*;
+    function ReadFile(hFile: u8*, lpBuffer: u8*,
+                      nNumberOfBytesToRead: u32,
+                      lpNumberOfBytesRead: u32*,
+                      lpOverlapped: OVERLAPPED*) -> i32;
+    function WriteFile(hFile: u8*, lpBuffer: u8*,
+                       nNumberOfBytesToWrite: u32,
+                       lpNumberOfBytesWritten: u32*,
+                       lpOverlapped: OVERLAPPED*) -> i32;
+    function FlushFileBuffers(hFile: u8*) -> i32;
+    function SetFilePointer(hFile: u8*, lDistanceToMove: i32,
+                            lpDistanceToMoveHigh: i32*,
+                            dwMoveMethod: u32) -> u32;
+    function SetFilePointerEx(hFile: u8*, liDistanceToMove: LARGE_INTEGER,
+                              lpNewFilePointer: LARGE_INTEGER*,
+                              dwMoveMethod: u32) -> i32;
+    function SetEndOfFile(hFile: u8*) -> i32;
+    function GetFileSize(hFile: u8*, lpFileSizeHigh: u32*) -> u32;
+    function GetFileSizeEx(hFile: u8*, lpFileSize: LARGE_INTEGER*) -> i32;
+    function GetFileType(hFile: u8*) -> u32;
+    function GetFileTime(hFile: u8*, lpCreationTime: FILETIME*,
+                         lpLastAccessTime: FILETIME*,
+                         lpLastWriteTime: FILETIME*) -> i32;
+    function SetFileTime(hFile: u8*, lpCreationTime: FILETIME*,
+                         lpLastAccessTime: FILETIME*,
+                         lpLastWriteTime: FILETIME*) -> i32;
+    function GetFileInformationByHandle(hFile: u8*, lpInfo: u8*) -> i32;
+    function GetFileAttributesA(lpFileName: u8*) -> u32;
+    function GetFileAttributesW(lpFileName: u16*) -> u32;
+    function SetFileAttributesA(lpFileName: u8*, dwAttrs: u32) -> i32;
+    function DeleteFileA(lpFileName: u8*) -> i32;
+    function DeleteFileW(lpFileName: u16*) -> i32;
+    function MoveFileA(lpExistingFileName: u8*, lpNewFileName: u8*) -> i32;
+    function MoveFileW(lpExistingFileName: u16*, lpNewFileName: u16*) -> i32;
+    function MoveFileExA(lpExistingFileName: u8*, lpNewFileName: u8*,
+                         dwFlags: u32) -> i32;
+    function CopyFileA(lpExistingFileName: u8*, lpNewFileName: u8*,
+                       bFailIfExists: i32) -> i32;
+    function CopyFileW(lpExistingFileName: u16*, lpNewFileName: u16*,
+                       bFailIfExists: i32) -> i32;
+    function CreateDirectoryA(lpPathName: u8*, lpSecurityAttributes: u8*) -> i32;
+    function CreateDirectoryW(lpPathName: u16*, lpSecurityAttributes: u8*) -> i32;
+    function RemoveDirectoryA(lpPathName: u8*) -> i32;
+    function RemoveDirectoryW(lpPathName: u16*) -> i32;
+    function GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: u8*) -> u32;
+    function GetCurrentDirectoryW(nBufferLength: u32, lpBuffer: u16*) -> u32;
+    function SetCurrentDirectoryA(lpPathName: u8*) -> i32;
+    function SetCurrentDirectoryW(lpPathName: u16*) -> i32;
+    function GetTempPathA(nBufferLength: u32, lpBuffer: u8*) -> u32;
+    function GetTempFileNameA(lpPathName: u8*, lpPrefixString: u8*,
+                              uUnique: u32, lpTempFileName: u8*) -> u32;
+    function FindFirstFileA(lpFileName: u8*, lpFindFileData: u8*) -> u8*;
+    function FindFirstFileW(lpFileName: u16*, lpFindFileData: u8*) -> u8*;
+    function FindNextFileA(hFindFile: u8*, lpFindFileData: u8*) -> i32;
+    function FindNextFileW(hFindFile: u8*, lpFindFileData: u8*) -> i32;
+    function FindClose(hFindFile: u8*) -> i32;
+
+    // Handle lifecycle
+    function CloseHandle(hObject: u8*) -> i32;
+    function DuplicateHandle(hSourceProcessHandle: u8*, hSourceHandle: u8*,
+                             hTargetProcessHandle: u8*, lpTargetHandle: u8**,
+                             dwDesiredAccess: u32, bInheritHandle: i32,
+                             dwOptions: u32) -> i32;
+    function GetHandleInformation(hObject: u8*, lpdwFlags: u32*) -> i32;
+    function SetHandleInformation(hObject: u8*, dwMask: u32, dwFlags: u32) -> i32;
+
+    // Process management
+    function CreateProcessA(lpApplicationName: u8*, lpCommandLine: u8*,
+                            lpProcessAttributes: u8*, lpThreadAttributes: u8*,
+                            bInheritHandles: i32, dwCreationFlags: u32,
+                            lpEnvironment: u8*, lpCurrentDirectory: u8*,
+                            lpStartupInfo: STARTUPINFOA*,
+                            lpProcessInformation: PROCESS_INFORMATION*) -> i32;
+    function CreateProcessW(lpApplicationName: u16*, lpCommandLine: u16*,
+                            lpProcessAttributes: u8*, lpThreadAttributes: u8*,
+                            bInheritHandles: i32, dwCreationFlags: u32,
+                            lpEnvironment: u8*, lpCurrentDirectory: u16*,
+                            lpStartupInfo: u8*,
+                            lpProcessInformation: PROCESS_INFORMATION*) -> i32;
+    function GetCurrentProcess() -> u8*;
+    function GetCurrentProcessId() -> u32;
+    function OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32,
+                         dwProcessId: u32) -> u8*;
+    function ExitProcess(uExitCode: u32) -> void;
+    function TerminateProcess(hProcess: u8*, uExitCode: u32) -> i32;
+    function GetExitCodeProcess(hProcess: u8*, lpExitCode: u32*) -> i32;
+    function WaitForSingleObject(hHandle: u8*, dwMilliseconds: u32) -> u32;
+    function WaitForMultipleObjects(nCount: u32, lpHandles: u8**,
+                                    bWaitAll: i32, dwMilliseconds: u32) -> u32;
+    function GetProcessTimes(hProcess: u8*, lpCreationTime: FILETIME*,
+                             lpExitTime: FILETIME*,
+                             lpKernelTime: FILETIME*,
+                             lpUserTime: FILETIME*) -> i32;
+
+    // Thread management
+    function CreateThread(lpThreadAttributes: u8*, dwStackSize: u64,
+                          lpStartAddress: void*, lpParameter: u8*,
+                          dwCreationFlags: u32, lpThreadId: u32*) -> u8*;
+    function GetCurrentThread() -> u8*;
+    function GetCurrentThreadId() -> u32;
+    function ExitThread(dwExitCode: u32) -> void;
+    function TerminateThread(hThread: u8*, dwExitCode: u32) -> i32;
+    function GetExitCodeThread(hThread: u8*, lpExitCode: u32*) -> i32;
+    function ResumeThread(hThread: u8*) -> u32;
+    function SuspendThread(hThread: u8*) -> u32;
+    function SwitchToThread() -> i32;
+    function Sleep(dwMilliseconds: u32) -> void;
+    function SleepEx(dwMilliseconds: u32, bAlertable: i32) -> u32;
+    function GetThreadPriority(hThread: u8*) -> i32;
+    function SetThreadPriority(hThread: u8*, nPriority: i32) -> i32;
+
+    // Memory — Virtual*
+    function VirtualAlloc(lpAddress: u8*, dwSize: u64,
+                          flAllocationType: u32, flProtect: u32) -> u8*;
+    function VirtualAllocEx(hProcess: u8*, lpAddress: u8*, dwSize: u64,
+                            flAllocationType: u32, flProtect: u32) -> u8*;
+    function VirtualFree(lpAddress: u8*, dwSize: u64, dwFreeType: u32) -> i32;
+    function VirtualFreeEx(hProcess: u8*, lpAddress: u8*, dwSize: u64,
+                           dwFreeType: u32) -> i32;
+    function VirtualProtect(lpAddress: u8*, dwSize: u64,
+                            flNewProtect: u32, lpflOldProtect: u32*) -> i32;
+    function VirtualQuery(lpAddress: u8*, lpBuffer: u8*, dwLength: u64) -> u64;
+    function VirtualLock(lpAddress: u8*, dwSize: u64) -> i32;
+    function VirtualUnlock(lpAddress: u8*, dwSize: u64) -> i32;
+
+    // Memory — Heap
+    function HeapCreate(flOptions: u32, dwInitialSize: u64,
+                        dwMaximumSize: u64) -> u8*;
+    function HeapDestroy(hHeap: u8*) -> i32;
+    function HeapAlloc(hHeap: u8*, dwFlags: u32, dwBytes: u64) -> u8*;
+    function HeapReAlloc(hHeap: u8*, dwFlags: u32, lpMem: u8*,
+                         dwBytes: u64) -> u8*;
+    function HeapFree(hHeap: u8*, dwFlags: u32, lpMem: u8*) -> i32;
+    function HeapSize(hHeap: u8*, dwFlags: u32, lpMem: u8*) -> u64;
+    function HeapValidate(hHeap: u8*, dwFlags: u32, lpMem: u8*) -> i32;
+    function GetProcessHeap() -> u8*;
+    function GetProcessHeaps(NumberOfHeaps: u32, ProcessHeaps: u8**) -> u32;
+
+    // Synchronization
+    function CreateMutexA(lpMutexAttributes: u8*, bInitialOwner: i32,
+                          lpName: u8*) -> u8*;
+    function CreateMutexW(lpMutexAttributes: u8*, bInitialOwner: i32,
+                          lpName: u16*) -> u8*;
+    function OpenMutexA(dwDesiredAccess: u32, bInheritHandle: i32,
+                        lpName: u8*) -> u8*;
+    function ReleaseMutex(hMutex: u8*) -> i32;
+
+    function CreateEventA(lpEventAttributes: u8*, bManualReset: i32,
+                          bInitialState: i32, lpName: u8*) -> u8*;
+    function CreateEventW(lpEventAttributes: u8*, bManualReset: i32,
+                          bInitialState: i32, lpName: u16*) -> u8*;
+    function SetEvent(hEvent: u8*) -> i32;
+    function ResetEvent(hEvent: u8*) -> i32;
+    function PulseEvent(hEvent: u8*) -> i32;
+
+    function CreateSemaphoreA(lpSemaphoreAttributes: u8*,
+                              lInitialCount: i32, lMaximumCount: i32,
+                              lpName: u8*) -> u8*;
+    function ReleaseSemaphore(hSemaphore: u8*, lReleaseCount: i32,
+                              lpPreviousCount: i32*) -> i32;
+
+    // Critical sections — CRITICAL_SECTION is 40 bytes on x64; treat
+    // as opaque buffer.
+    function InitializeCriticalSection(lpCriticalSection: u8*) -> void;
+    function InitializeCriticalSectionAndSpinCount(lpCriticalSection: u8*,
+                                                    dwSpinCount: u32) -> i32;
+    function DeleteCriticalSection(lpCriticalSection: u8*) -> void;
+    function EnterCriticalSection(lpCriticalSection: u8*) -> void;
+    function TryEnterCriticalSection(lpCriticalSection: u8*) -> i32;
+    function LeaveCriticalSection(lpCriticalSection: u8*) -> void;
+
+    // SRW locks — slim reader/writer
+    function InitializeSRWLock(SRWLock: u8*) -> void;
+    function AcquireSRWLockExclusive(SRWLock: u8*) -> void;
+    function ReleaseSRWLockExclusive(SRWLock: u8*) -> void;
+    function AcquireSRWLockShared(SRWLock: u8*) -> void;
+    function ReleaseSRWLockShared(SRWLock: u8*) -> void;
+    function TryAcquireSRWLockExclusive(SRWLock: u8*) -> i32;
+    function TryAcquireSRWLockShared(SRWLock: u8*) -> i32;
+
+    // Condition variables
+    function InitializeConditionVariable(ConditionVariable: u8*) -> void;
+    function SleepConditionVariableCS(ConditionVariable: u8*,
+                                      CriticalSection: u8*,
+                                      dwMilliseconds: u32) -> i32;
+    function SleepConditionVariableSRW(ConditionVariable: u8*,
+                                       SRWLock: u8*,
+                                       dwMilliseconds: u32, Flags: u32) -> i32;
+    function WakeConditionVariable(ConditionVariable: u8*) -> void;
+    function WakeAllConditionVariable(ConditionVariable: u8*) -> void;
+
+    // TLS
+    function TlsAlloc() -> u32;
+    function TlsFree(dwTlsIndex: u32) -> i32;
+    function TlsGetValue(dwTlsIndex: u32) -> u8*;
+    function TlsSetValue(dwTlsIndex: u32, lpTlsValue: u8*) -> i32;
+
+    // DLL / module
+    function LoadLibraryA(lpLibFileName: u8*) -> u8*;
+    function LoadLibraryW(lpLibFileName: u16*) -> u8*;
+    function LoadLibraryExA(lpLibFileName: u8*, hFile: u8*, dwFlags: u32) -> u8*;
+    function FreeLibrary(hLibModule: u8*) -> i32;
+    function GetProcAddress(hModule: u8*, lpProcName: u8*) -> void*;
+    function GetModuleHandleA(lpModuleName: u8*) -> u8*;
+    function GetModuleHandleW(lpModuleName: u16*) -> u8*;
+    function GetModuleFileNameA(hModule: u8*, lpFilename: u8*, nSize: u32) -> u32;
+    function GetModuleFileNameW(hModule: u8*, lpFilename: u16*, nSize: u32) -> u32;
+
+    // Console
+    function GetStdHandle(nStdHandle: u32) -> u8*;
+    function SetStdHandle(nStdHandle: u32, hHandle: u8*) -> i32;
+    function AllocConsole() -> i32;
+    function AttachConsole(dwProcessId: u32) -> i32;
+    function FreeConsole() -> i32;
+    function GetConsoleMode(hConsoleHandle: u8*, lpMode: u32*) -> i32;
+    function SetConsoleMode(hConsoleHandle: u8*, dwMode: u32) -> i32;
+    function ReadConsoleA(hConsoleInput: u8*, lpBuffer: u8*,
+                          nNumberOfCharsToRead: u32,
+                          lpNumberOfCharsRead: u32*,
+                          pInputControl: u8*) -> i32;
+    function WriteConsoleA(hConsoleOutput: u8*, lpBuffer: u8*,
+                           nNumberOfCharsToWrite: u32,
+                           lpNumberOfCharsWritten: u32*,
+                           lpReserved: u8*) -> i32;
+    function WriteConsoleW(hConsoleOutput: u8*, lpBuffer: u16*,
+                           nNumberOfCharsToWrite: u32,
+                           lpNumberOfCharsWritten: u32*,
+                           lpReserved: u8*) -> i32;
+
+    // Time
+    function GetSystemTime(lpSystemTime: SYSTEMTIME*) -> void;
+    function GetLocalTime(lpSystemTime: SYSTEMTIME*) -> void;
+    function SystemTimeToFileTime(lpSystemTime: SYSTEMTIME*,
+                                  lpFileTime: FILETIME*) -> i32;
+    function FileTimeToSystemTime(lpFileTime: FILETIME*,
+                                  lpSystemTime: SYSTEMTIME*) -> i32;
+    function GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: FILETIME*) -> void;
+    function GetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime: FILETIME*) -> void;
+    function GetTickCount() -> u32;
+    function GetTickCount64() -> u64;
+    function QueryPerformanceCounter(lpPerformanceCount: LARGE_INTEGER*) -> i32;
+    function QueryPerformanceFrequency(lpFrequency: LARGE_INTEGER*) -> i32;
+
+    // Error reporting
+    function GetLastError() -> u32;
+    function SetLastError(dwErrCode: u32) -> void;
+    function FormatMessageA(dwFlags: u32, lpSource: u8*,
+                            dwMessageId: u32, dwLanguageId: u32,
+                            lpBuffer: u8*, nSize: u32, Arguments: u8*) -> u32;
+    function FormatMessageW(dwFlags: u32, lpSource: u8*,
+                            dwMessageId: u32, dwLanguageId: u32,
+                            lpBuffer: u16*, nSize: u32, Arguments: u8*) -> u32;
+
+    // Pipes
+    function CreatePipe(hReadPipe: u8**, hWritePipe: u8**,
+                        lpPipeAttributes: u8*, nSize: u32) -> i32;
+    function PeekNamedPipe(hNamedPipe: u8*, lpBuffer: u8*,
+                           nBufferSize: u32, lpBytesRead: u32*,
+                           lpTotalBytesAvail: u32*,
+                           lpBytesLeftThisMessage: u32*) -> i32;
+    function CreateNamedPipeA(lpName: u8*, dwOpenMode: u32,
+                              dwPipeMode: u32, nMaxInstances: u32,
+                              nOutBufferSize: u32, nInBufferSize: u32,
+                              nDefaultTimeOut: u32,
+                              lpSecurityAttributes: u8*) -> u8*;
+    function ConnectNamedPipe(hNamedPipe: u8*, lpOverlapped: OVERLAPPED*) -> i32;
+    function DisconnectNamedPipe(hNamedPipe: u8*) -> i32;
+    function WaitNamedPipeA(lpNamedPipeName: u8*, nTimeOut: u32) -> i32;
+    function SetNamedPipeHandleState(hNamedPipe: u8*, lpMode: u32*,
+                                     lpMaxCollectionCount: u32*,
+                                     lpCollectDataTimeout: u32*) -> i32;
+    function TransactNamedPipe(hNamedPipe: u8*, lpInBuffer: u8*,
+                               nInBufferSize: u32, lpOutBuffer: u8*,
+                               nOutBufferSize: u32, lpBytesRead: u32*,
+                               lpOverlapped: OVERLAPPED*) -> i32;
+
+    // Environment
+    function GetEnvironmentVariableA(lpName: u8*, lpBuffer: u8*, nSize: u32) -> u32;
+    function GetEnvironmentVariableW(lpName: u16*, lpBuffer: u16*, nSize: u32) -> u32;
+    function SetEnvironmentVariableA(lpName: u8*, lpValue: u8*) -> i32;
+    function SetEnvironmentVariableW(lpName: u16*, lpValue: u16*) -> i32;
+    function GetEnvironmentStrings() -> u8*;
+    function GetEnvironmentStringsW() -> u16*;
+    function FreeEnvironmentStringsA(penv: u8*) -> i32;
+    function FreeEnvironmentStringsW(penv: u16*) -> i32;
+    function ExpandEnvironmentStringsA(lpSrc: u8*, lpDst: u8*, nSize: u32) -> u32;
+    function GetCommandLineA() -> u8*;
+    function GetCommandLineW() -> u16*;
+
+    // System info
+    function GetSystemInfo(lpSystemInfo: u8*) -> void;
+    function GetNativeSystemInfo(lpSystemInfo: u8*) -> void;
+    function GetSystemDirectoryA(lpBuffer: u8*, uSize: u32) -> u32;
+    function GetWindowsDirectoryA(lpBuffer: u8*, uSize: u32) -> u32;
+    function GetComputerNameA(lpBuffer: u8*, nSize: u32*) -> i32;
+    function GetVersion() -> u32;
+    function GetVersionExA(lpVersionInformation: u8*) -> i32;
+    function IsDebuggerPresent() -> i32;
+
+    // UTF-16 / multibyte conversion (essential for narrow→wide
+    // crossing when working with UTF-8 paths).
+    function MultiByteToWideChar(CodePage: u32, dwFlags: u32,
+                                 lpMultiByteStr: u8*, cbMultiByte: i32,
+                                 lpWideCharStr: u16*, cchWideChar: i32) -> i32;
+    function WideCharToMultiByte(CodePage: u32, dwFlags: u32,
+                                 lpWideCharStr: u16*, cchWideChar: i32,
+                                 lpMultiByteStr: u8*, cbMultiByte: i32,
+                                 lpDefaultChar: u8*,
+                                 lpUsedDefaultChar: i32*) -> i32;
+
+    // Random
+    function RtlGenRandom(RandomBuffer: u8*, RandomBufferLength: u32) -> i32;
+}
+
+// Code page constants for MultiByteToWideChar / WideCharToMultiByte
+const CP_ACP:        u32 = 0;        // System default ANSI
+const CP_OEMCP:      u32 = 1;        // System default OEM
+const CP_UTF7:       u32 = 65000;
+const CP_UTF8:       u32 = 65001;
+
+// ----------------------------------------------------------------------------
+// user32.dll — message boxes, basic windowing primitives
+// ----------------------------------------------------------------------------
+
+const MB_OK:              u32 = 0;
+const MB_OKCANCEL:        u32 = 1;
+const MB_ABORTRETRYIGNORE: u32 = 2;
+const MB_YESNOCANCEL:     u32 = 3;
+const MB_YESNO:           u32 = 4;
+const MB_RETRYCANCEL:     u32 = 5;
+const MB_ICONERROR:       u32 = 0x10;
+const MB_ICONWARNING:     u32 = 0x30;
+const MB_ICONINFORMATION: u32 = 0x40;
+
+const IDOK:     i32 = 1;
+const IDCANCEL: i32 = 2;
+const IDABORT:  i32 = 3;
+const IDRETRY:  i32 = 4;
+const IDIGNORE: i32 = 5;
+const IDYES:    i32 = 6;
+const IDNO:     i32 = 7;
+
+![target(windows)]
+![link("user32")]
+extern "C" {
+    function MessageBoxA(hWnd: u8*, lpText: u8*, lpCaption: u8*,
+                         uType: u32) -> i32;
+    function MessageBoxW(hWnd: u8*, lpText: u16*, lpCaption: u16*,
+                         uType: u32) -> i32;
+    function GetForegroundWindow() -> u8*;
+    function SetForegroundWindow(hWnd: u8*) -> i32;
+    function FindWindowA(lpClassName: u8*, lpWindowName: u8*) -> u8*;
+}
+
+// ----------------------------------------------------------------------------
+// advapi32.dll — registry, security
+// ----------------------------------------------------------------------------
+
+// HKEY predefined roots (cast as void* / u8*)
+const HKEY_CLASSES_ROOT:     u64 = 0xFFFFFFFF80000000;
+const HKEY_CURRENT_USER:     u64 = 0xFFFFFFFF80000001;
+const HKEY_LOCAL_MACHINE:    u64 = 0xFFFFFFFF80000002;
+const HKEY_USERS:            u64 = 0xFFFFFFFF80000003;
+const HKEY_CURRENT_CONFIG:   u64 = 0xFFFFFFFF80000005;
+
+// Registry access rights (subset)
+const KEY_QUERY_VALUE:        u32 = 0x1;
+const KEY_SET_VALUE:          u32 = 0x2;
+const KEY_CREATE_SUB_KEY:     u32 = 0x4;
+const KEY_ENUMERATE_SUB_KEYS: u32 = 0x8;
+const KEY_NOTIFY:             u32 = 0x10;
+const KEY_READ:               u32 = 0x20019;
+const KEY_WRITE:              u32 = 0x20006;
+const KEY_ALL_ACCESS:         u32 = 0xF003F;
+
+// Registry value types
+const REG_NONE:        u32 = 0;
+const REG_SZ:          u32 = 1;
+const REG_EXPAND_SZ:   u32 = 2;
+const REG_BINARY:      u32 = 3;
+const REG_DWORD:       u32 = 4;
+const REG_DWORD_BIG_ENDIAN: u32 = 5;
+const REG_MULTI_SZ:    u32 = 7;
+const REG_QWORD:       u32 = 11;
+
+![target(windows)]
+![link("advapi32")]
+extern "C" {
+    function RegOpenKeyExA(hKey: u8*, lpSubKey: u8*, ulOptions: u32,
+                           samDesired: u32, phkResult: u8**) -> i32;
+    function RegOpenKeyExW(hKey: u8*, lpSubKey: u16*, ulOptions: u32,
+                           samDesired: u32, phkResult: u8**) -> i32;
+    function RegCloseKey(hKey: u8*) -> i32;
+    function RegCreateKeyExA(hKey: u8*, lpSubKey: u8*, Reserved: u32,
+                             lpClass: u8*, dwOptions: u32, samDesired: u32,
+                             lpSecurityAttributes: u8*, phkResult: u8**,
+                             lpdwDisposition: u32*) -> i32;
+    function RegDeleteKeyA(hKey: u8*, lpSubKey: u8*) -> i32;
+    function RegDeleteValueA(hKey: u8*, lpValueName: u8*) -> i32;
+    function RegQueryValueExA(hKey: u8*, lpValueName: u8*, lpReserved: u32*,
+                              lpType: u32*, lpData: u8*, lpcbData: u32*) -> i32;
+    function RegSetValueExA(hKey: u8*, lpValueName: u8*, Reserved: u32,
+                            dwType: u32, lpData: u8*, cbData: u32) -> i32;
+    function RegEnumKeyExA(hKey: u8*, dwIndex: u32, lpName: u8*,
+                           lpcchName: u32*, lpReserved: u32*,
+                           lpClass: u8*, lpcchClass: u32*,
+                           lpftLastWriteTime: FILETIME*) -> i32;
+    function RegEnumValueA(hKey: u8*, dwIndex: u32, lpValueName: u8*,
+                           lpcchValueName: u32*, lpReserved: u32*,
+                           lpType: u32*, lpData: u8*, lpcbData: u32*) -> i32;
+    function RegFlushKey(hKey: u8*) -> i32;
+    function RegLoadKeyA(hKey: u8*, lpSubKey: u8*, lpFile: u8*) -> i32;
+    function RegUnLoadKeyA(hKey: u8*, lpSubKey: u8*) -> i32;
+}
+
+// ----------------------------------------------------------------------------
+// ntdll.dll — NT API. Stable across releases for the entries below
+// (Microsoft-supported); other NT* functions are undocumented and can
+// shift between builds.
+// ----------------------------------------------------------------------------
+//
+// `OBJECT_ATTRIBUTES`, `UNICODE_STRING`, `IO_STATUS_BLOCK`, etc. are
+// platform-stable. Treat as opaque byte buffers and pack manually;
+// future helpers can land in a `nt::` submodule.
+
+![target(windows)]
+![link("ntdll")]
+extern "C" {
+    // Files / I/O — raw NT layer beneath CreateFile / ReadFile.
+    function NtCreateFile(FileHandle: u8**, DesiredAccess: u32,
+                          ObjectAttributes: u8*, IoStatusBlock: u8*,
+                          AllocationSize: i64*, FileAttributes: u32,
+                          ShareAccess: u32, CreateDisposition: u32,
+                          CreateOptions: u32, EaBuffer: u8*,
+                          EaLength: u32) -> i32;
+    function NtOpenFile(FileHandle: u8**, DesiredAccess: u32,
+                        ObjectAttributes: u8*, IoStatusBlock: u8*,
+                        ShareAccess: u32, OpenOptions: u32) -> i32;
+    function NtReadFile(FileHandle: u8*, Event: u8*, ApcRoutine: void*,
+                        ApcContext: u8*, IoStatusBlock: u8*,
+                        Buffer: u8*, Length: u32,
+                        ByteOffset: i64*, Key: u32*) -> i32;
+    function NtWriteFile(FileHandle: u8*, Event: u8*, ApcRoutine: void*,
+                         ApcContext: u8*, IoStatusBlock: u8*,
+                         Buffer: u8*, Length: u32,
+                         ByteOffset: i64*, Key: u32*) -> i32;
+    function NtClose(Handle: u8*) -> i32;
+    function NtDeviceIoControlFile(FileHandle: u8*, Event: u8*,
+                                   ApcRoutine: void*, ApcContext: u8*,
+                                   IoStatusBlock: u8*,
+                                   IoControlCode: u32,
+                                   InputBuffer: u8*, InputBufferLength: u32,
+                                   OutputBuffer: u8*,
+                                   OutputBufferLength: u32) -> i32;
+    function NtFsControlFile(FileHandle: u8*, Event: u8*,
+                             ApcRoutine: void*, ApcContext: u8*,
+                             IoStatusBlock: u8*,
+                             FsControlCode: u32,
+                             InputBuffer: u8*, InputBufferLength: u32,
+                             OutputBuffer: u8*,
+                             OutputBufferLength: u32) -> i32;
+
+    // Memory
+    function NtAllocateVirtualMemory(ProcessHandle: u8*, BaseAddress: u8**,
+                                     ZeroBits: u64, RegionSize: u64*,
+                                     AllocationType: u32, Protect: u32) -> i32;
+    function NtFreeVirtualMemory(ProcessHandle: u8*, BaseAddress: u8**,
+                                 RegionSize: u64*, FreeType: u32) -> i32;
+    function NtProtectVirtualMemory(ProcessHandle: u8*, BaseAddress: u8**,
+                                    RegionSize: u64*, NewProtect: u32,
+                                    OldProtect: u32*) -> i32;
+    function NtQueryVirtualMemory(ProcessHandle: u8*, BaseAddress: u8*,
+                                  MemoryInformationClass: u32,
+                                  MemoryInformation: u8*,
+                                  MemoryInformationLength: u64,
+                                  ReturnLength: u64*) -> i32;
+
+    // Process / thread
+    function NtTerminateProcess(ProcessHandle: u8*, ExitStatus: i32) -> i32;
+    function NtQueryInformationProcess(ProcessHandle: u8*,
+                                       ProcessInformationClass: u32,
+                                       ProcessInformation: u8*,
+                                       ProcessInformationLength: u32,
+                                       ReturnLength: u32*) -> i32;
+    function NtSuspendProcess(ProcessHandle: u8*) -> i32;
+    function NtResumeProcess(ProcessHandle: u8*) -> i32;
+
+    // System
+    function NtQuerySystemInformation(SystemInformationClass: u32,
+                                      SystemInformation: u8*,
+                                      SystemInformationLength: u32,
+                                      ReturnLength: u32*) -> i32;
+    function NtDelayExecution(Alertable: i32, DelayInterval: i64*) -> i32;
+    function NtYieldExecution() -> i32;
+
+    // Events / synchronization
+    function NtCreateEvent(EventHandle: u8**, DesiredAccess: u32,
+                           ObjectAttributes: u8*, EventType: u32,
+                           InitialState: i32) -> i32;
+    function NtSetEvent(EventHandle: u8*, PreviousState: i32*) -> i32;
+    function NtResetEvent(EventHandle: u8*, PreviousState: i32*) -> i32;
+    function NtWaitForSingleObject(Handle: u8*, Alertable: i32,
+                                   Timeout: i64*) -> i32;
+
+    // Helpers
+    function RtlNtStatusToDosError(Status: i32) -> u32;
+    function RtlGetVersion(VersionInformation: u8*) -> i32;
+}
