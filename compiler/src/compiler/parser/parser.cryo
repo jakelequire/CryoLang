@@ -283,8 +283,16 @@ public:
             return this.parse_directive();
         }
 
-        // Regular declaration (function, type, const, mut, etc.)
-        return this.parse_declaration(false, doc);
+        // Regular declaration (function, type, const, mut, etc.).
+        // Top-level declarations are public by default — modules export
+        // their surface, and individual items can opt out with the
+        // `private` keyword.  Types are unconditionally exported in
+        // name resolution today, so the practical effect of flipping
+        // the default is on free `function` decls: a bare `function
+        // foo() {}` is now visible to wildcard imports, matching the
+        // long-standing stdlib convention where every free function is
+        // written without a `public` prefix.
+        return this.parse_declaration(true, doc);
     }
 
     /// Parse a declaration based on the current token.
@@ -828,10 +836,41 @@ public:
                 continue;
             }
 
-            // For classes, every member must be inside a visibility block.
-            if (!has_visibility_block) {
+            // Inline visibility for the next member: `private foo()`,
+            // `public bar: T;`, or `protected baz()`.  Distinguished
+            // from block-form labels (above) by the absence of a
+            // trailing `:`.  Applies to one member only — the block-
+            // level `current_visibility` is untouched, so a single
+            // inline opt-out doesn't shift the rest of the section.
+            mut member_visibility: Visibility = current_visibility;
+            mut had_inline_visibility: boolean = false;
+            if (this.check(TokenType::KwPublic) && this.peek_at(1).kind != TokenType::Colon) {
+                member_visibility = Visibility::Public;
+                had_inline_visibility = true;
+                this.advance(); // consume 'public'
+            } else if (this.check(TokenType::KwPrivate) && this.peek_at(1).kind != TokenType::Colon) {
+                member_visibility = Visibility::Private;
+                had_inline_visibility = true;
+                this.advance(); // consume 'private'
+            } else if (this.check(TokenType::KwProtected) && this.peek_at(1).kind != TokenType::Colon) {
+                if (is_struct) {
+                    this.report_error(ErrorCode::E0359_PROTECTED_IN_STRUCT,
+                        "'protected' is not allowed in structs (structs do not support inheritance)");
+                    this.advance();
+                    continue;
+                }
+                member_visibility = Visibility::Protected;
+                had_inline_visibility = true;
+                this.advance(); // consume 'protected'
+            }
+
+            // For classes, every member must declare visibility — either
+            // via a block marker (`public:`) or an inline keyword
+            // (`private foo()`).  Structs default to public so the
+            // check is class-only.
+            if (!has_visibility_block && !had_inline_visibility) {
                 this.report_error(ErrorCode::E0360_MISSING_VISIBILITY_BLOCK,
-                    "class members must be inside a visibility block (public:, private:, or protected:)");
+                    "class members must declare visibility (block-form `public:` / `private:` / `protected:`, or inline `public` / `private` / `protected`)");
             }
 
             // Drain consecutive `![...]` directives so we can attach them
@@ -855,7 +894,7 @@ public:
             // Note: use strcmp() because string == string is pointer comparison in Cryo.
             if (this.check(TokenType::Identifier) && strcmp(this.current().lexeme, this.current_type_name) == 0 &&
                 this.peek_at(1).kind == TokenType::LParen) {
-                const method: MethodNode* = this.parse_constructor(current_visibility);
+                const method: MethodNode* = this.parse_constructor(member_visibility);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -869,7 +908,7 @@ public:
 
             // Destructor: ~ClassName() { body }
             if (this.check(TokenType::Tilde)) {
-                const method: MethodNode* = this.parse_destructor(current_visibility);
+                const method: MethodNode* = this.parse_destructor(member_visibility);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -883,7 +922,7 @@ public:
 
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(current_visibility, true, false, false);
+                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, true, false, false);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -897,7 +936,7 @@ public:
 
             // Virtual method
             if (this.check(TokenType::KwVirtual)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(current_visibility, false, true, false);
+                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, false, true, false);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -911,7 +950,7 @@ public:
 
             // Override method
             if (this.check(TokenType::KwOverride)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(current_visibility, false, false, true);
+                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, false, false, true);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -930,7 +969,7 @@ public:
                 // Method pattern: name ( or name < (generic method)
                 const next: Token = this.peek_at(1);
                 if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
-                    const method: MethodNode* = this.parse_method(current_visibility);
+                    const method: MethodNode* = this.parse_method(member_visibility);
                     if (method != null) {
                         if (doc != "") { method.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -942,7 +981,7 @@ public:
                 } else {
                     const field: FieldDeclNode* = this.parse_field_declaration();
                     if (field != null) {
-                        field.set_visibility(current_visibility);
+                        field.set_visibility(member_visibility);
                         if (doc != "") { field.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             field.add_directive(pending_dirs[pi]);

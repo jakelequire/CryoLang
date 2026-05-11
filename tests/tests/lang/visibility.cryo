@@ -1,0 +1,153 @@
+///! Visibility — public-by-default for free functions, plus inline
+///! visibility markers inside class/struct bodies.
+///!
+///! The compiler-level behaviour these tests exercise:
+///!   1. Free functions are public by default — a bare `function foo()`
+///!      is visible to wildcard imports without a `public` prefix.
+///!   2. The `private` keyword opts a free function out; the symbol is
+///!      still declared in the module's scope (so same-module callers
+///!      see it) but is *not* exported.
+///!   3. Inside a class/struct body, the existing block-form
+///!      visibility (`public:` / `private:`) still works, and an
+///!      inline keyword applies to one member only — leaving the
+///!      block-level default untouched for everything that follows.
+///!
+///! These tests confirm that source written under the new defaults
+///! parses, type-checks, and runs.  Negative cases (wildcard import
+///! must not pull a `private` function) require a cross-module
+///! reproducer the test harness doesn't yet support; the parser-level
+///! plumbing is verified here by exercising the syntax.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::Visibility;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Free functions — both forms parse and link.
+// ============================================================================
+
+// Public by default (no keyword).
+function default_public_adder(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+// Explicit `public` is redundant but still accepted.
+public function explicit_public_adder(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+// `private` opts out of cross-module export.  Same-module callers
+// (like the tests below) can still reach it.
+private function private_helper(a: i32, b: i32) -> i32 {
+    return a * b;
+}
+
+![test]
+function default_public_function_callable() -> Result<(), TestError> {
+    match (expect_eq(default_public_adder(2, 3), 5)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function explicit_public_function_callable() -> Result<(), TestError> {
+    match (expect_eq(explicit_public_adder(7, 8), 15)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function private_function_visible_in_same_module() -> Result<(), TestError> {
+    match (expect_eq(private_helper(6, 7), 42)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Inline visibility inside a class body.
+//
+// `Widget` uses the block-form `public:` for the bulk, plus an inline
+// `private` on `secret_seed` to opt one field out without breaking the
+// section.  The constructor and `value()` stay public.
+// ============================================================================
+
+type class Widget {
+public:
+    value_field: i32;
+    private secret_seed: i32;
+
+    Widget(v: i32) {
+        this.value_field = v;
+        this.secret_seed = v * 3;
+    }
+
+    value(&this) -> i32 { return this.value_field; }
+
+    private internal_check(&this) -> i32 {
+        return this.secret_seed;
+    }
+
+    seed_visible_through_public_accessor(&this) -> i32 {
+        return this.internal_check();
+    }
+}
+
+![test]
+function inline_private_field_is_addressable_within_class() -> Result<(), TestError> {
+    const w: Widget* = new Widget(4);
+    // The public accessor reaches the inline-private field via the
+    // inline-private method — proving both inline markers parsed and
+    // the body still has access.
+    match (expect_eq(w.seed_visible_through_public_accessor(), 12)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Public field directly readable.
+    match (expect_eq(w.value(), 4)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ============================================================================
+// Inline visibility inside a struct body.
+//
+// Structs default to public.  An inline `private` should still be
+// honoured on a struct field without forcing the rest of the section
+// into a `private:` block.
+// ============================================================================
+
+type struct Point {
+    x: i32;
+    y: i32;
+    private tag: i32;
+
+    static new(x: i32, y: i32) -> Point {
+        return Point { x: x, y: y, tag: 0 };
+    }
+
+    sum(&this) -> i32 {
+        // Same-module access to `tag` (the private field) still works.
+        return this.x + this.y + this.tag;
+    }
+}
+
+![test]
+function inline_private_field_in_struct_parses_and_runs() -> Result<(), TestError> {
+    const p: Point = Point::new(3, 4);
+    match (expect_eq(p.sum(), 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
