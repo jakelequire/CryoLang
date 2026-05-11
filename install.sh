@@ -147,9 +147,15 @@ need_sudo_for() {
     # user — in which case we'll prefix mutating commands with sudo.
     local target_dir
     target_dir="$(dirname "$1")"
-    [ -w "$target_dir" ] || [ -w "$1" ] && return 1 || true
+    # Fast path: parent dir is writable (we can create or replace the file
+    # there) OR the destination file itself is writable (we can truncate-
+    # in-place even if the dir is read-only).  An explicit `if` instead of
+    # `A || B && return 1 || true` so the precedence is obvious — and so
+    # `set -e` can't trip on either `[ -w ]` failing.
+    if [ -w "$target_dir" ] || [ -w "$1" ]; then
+        return 1
+    fi
     if [ -e "$target_dir" ]; then
-        [ -w "$target_dir" ] && return 1
         return 0
     fi
     # Walk up to the nearest existing ancestor.
@@ -157,7 +163,9 @@ need_sudo_for() {
     while [ ! -e "$cur" ]; do
         cur="$(dirname "$cur")"
     done
-    [ -w "$cur" ] && return 1
+    if [ -w "$cur" ]; then
+        return 1
+    fi
     return 0
 }
 

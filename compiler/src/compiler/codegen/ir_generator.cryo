@@ -1657,46 +1657,22 @@ public:
 
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
-
-            // -1. Sema-pinned specialized callee — set by sema (or the
-            //     monomorphizer's body walk) for generic free-function
-            //     calls, both explicit-arg (`identity<i32>(42)`) and
-            //     inferred-arg (`alloc_entry(map, h, k, v)` inside a
-            //     specialized HashMap method body).  The bare template
-            //     name is skipped at codegen, so we have to look up the
-            //     specialized symbol directly; sema/mono is the only
-            //     code with the context to compute it correctly.
             const id_arity: u32 = node.arguments.length as u32;
-            if (node.resolved_callee.is_valid()) {
-                // Sema may pin an overload-specific mangled name here for
-                // overloaded free-function calls (see
-                // try_pin_overload_mangled_callee).  Try the LLVM module
-                // directly first — declare_function has already emitted
-                // every overload under its own mangled name.
-                const pinned_str: string = intern.resolve(node.resolved_callee);
-                callee_val = this.cg.llvm_module.get_named_function(pinned_str);
-                if (!callee_val.is_valid()) {
-                    callee_val = resolve_function_with_arity(
-                        this.cg, node.resolved_callee, id_arity);
-                }
-                if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, node.resolved_callee);
-                }
-            }
 
-            // 0. Inline-lower intrinsics by bare name (i32_to_i64, ptr_add,
-            //    bswap32, etc.).  These previously linked against cryort.c;
-            //    we now emit the equivalent LLVM IR directly so no runtime
-            //    function symbol is referenced.  Args are codegen'd as
-            //    rvalues since intrinsics expect by-value operands.
+            // Intrinsics first: `i32_to_i64`, `ptr_add`, `bswap32`, etc.
+            // are emitted as inline LLVM IR, not as real function calls,
+            // so they have no LLVM definition.  If sema pinned
+            // `resolved_callee` to an intrinsic's mangled name, the
+            // module DOES contain an extern declaration (from
+            // declare_function), but no module DEFINES the function —
+            // calling it would emit a real call and the link step would
+            // fail with `undefined reference`.  Run the inline dispatcher
+            // up front to avoid that path.
             const intr_name_str: string = intern.resolve(id.name);
             mut intr_args: LValue[] = [];
             mut intr_args_evaluated: boolean = false;
             mut intr_result: LValue = LValue::null();
-            // Try the intrinsic dispatcher; if it claims the name we set
-            // last_value and return.  Args are only codegen'd once we
-            // confirm the dispatcher will handle this name.
-            if (!callee_val.is_valid() && is_intrinsic_name(intr_name_str)) {
+            if (is_intrinsic_name(intr_name_str)) {
                 for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
                     intr_args.push(this.codegen_rvalue(node.arguments[ai]));
                 }
@@ -1708,43 +1684,20 @@ public:
                 }
             }
 
-            // 1. Try current module's qualified name.  Prefer the arity-
-            //    aware lookup so same-bare-name overloads from different
-            //    modules (e.g. `pipe()` free function in std::os vs the
-            //    `pipe(int*)` intrinsic in std::core::intrinsics) get
-            //    discriminated by the call's argument count.  The non-arity
-            //    fallback is the last-wins bucket and would otherwise hand
-            //    out whichever module registered most recently.
-            if (!callee_val.is_valid()) {
-                const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(id.name);
-                callee_val = resolve_function_with_arity(this.cg, qualified, id_arity);
-                if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, qualified);
-                }
-            }
-
-            // 2. Try the DI's bare→qualified mapping (resolves auto-imports
-            //    like printf → std::core::intrinsics::printf).  The mapping
-            //    is last-wins per bare name, so it can point at the wrong
-            //    overload (e.g., bare `pipe` → `std::os::pipe()` 0-arg even
-            //    when the call has 1 arg meaning `intrinsics::pipe(int*)`).
-            //    Restrict to the arity-aware lookup here so a wrong-arity
-            //    match doesn't shadow the correct one available via Step 3's
-            //    bare-name overload-set lookup.
-            if (!callee_val.is_valid()) {
-                const di: DeclarationIndex* = this.cg.get_decl_index();
-                const resolved: SymbolStr = di.resolve_qualified(id.name);
-                callee_val = resolve_function_with_arity(this.cg, resolved, id_arity);
-            }
-
-            // 3. Bare name (for extern C functions registered without
-            //    qualification, and for picking the right overload across
-            //    cross-module bare-name aliases).  Arity-aware first.
-            if (!callee_val.is_valid()) {
-                callee_val = resolve_function_with_arity(this.cg, id.name, id_arity);
-                if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, id.name);
-                }
+            // Trust sema: `resolved_callee` is the mangled LLVM symbol
+            // chosen by overload resolution (or, for unique-name
+            // functions, the canonical mangling registered by
+            // declare_function).  Sema runs
+            // `try_pin_overload_mangled_callee` on every Identifier
+            // call, so any function known to the DeclarationIndex —
+            // qualified, bare-aliased, overloaded, or unique — gets
+            // pinned to its registered mangled symbol.  Codegen calls
+            // `resolve_function_by_mangled` once on that symbol; the
+            // qualified/bare/DI-mapping cascade that used to live here
+            // was re-resolving names sema had already resolved.  See
+            // memory/feedback_codegen_architecture_rules.md.
+            if (node.resolved_callee.is_valid()) {
+                callee_val = resolve_function_by_mangled(this.cg, node.resolved_callee);
             }
 
             // 3b. Class / struct constructor call — `ClassName(args)` resolves
@@ -1933,17 +1886,15 @@ public:
             // Sema-pinned specialized callee — set by the monomorphizer's
             // body walk for generic free-function calls invoked through a
             // ScopeResolution (`mem::offset(p, n)`, `Layout::array<T>(n)`).
-            // Mirrors the Identifier branch above; without this check, the
-            // bare-template-name lookups below register an unspecialized
-            // declaration like `C$3std.4core.3mem.6offset$FPN$L1T$G_l$RPN$L1T$G`
-            // that no spec defines, so the linker fails.
-            const sr_arity_pre: u32 = node.arguments.length as u32;
+            // Routed through the same `resolve_function_by_mangled`
+            // helper as the Identifier branch.  When sema does NOT pin
+            // (the non-generic ScopeResolution path), the fallback
+            // chain below — module-graph walk, combined `scope::member`,
+            // bare member — still runs because sema doesn't yet pin
+            // every ScopeResolution shape upstream.
             if (node.resolved_callee.is_valid()) {
-                callee_val = resolve_function_with_arity(
-                    this.cg, node.resolved_callee, sr_arity_pre);
-                if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, node.resolved_callee);
-                }
+                callee_val = resolve_function_by_mangled(
+                    this.cg, node.resolved_callee);
             }
 
             // Inline-lower intrinsics referenced via a namespace prefix
@@ -2342,66 +2293,30 @@ public:
             // `total_params` registration key.
             const ma_arity: u32 = (node.arguments.length + 1) as u32;
 
-            // Strategy 0: if sema resolved the overload, compute the exact
-            // mangled name from the method's declared param types and look
-            // it up directly.  This is the only strategy that disambiguates
-            // overloads like `String::push(string)` vs `String::push(String)`
-            // — the arity-keyed lookup collapses them to whichever was
-            // registered first.
-            if (node.resolved_method != null) {
-                const rm: MethodNode* = node.resolved_method as MethodNode*;
-                if (rm != null && rm.func != null) {
-                    const rm_fn: FunctionDeclNode* = rm.func;
-                    mut owner_str: string = "";
-                    if (type_sym.is_valid()) {
-                        owner_str = intern.resolve(type_sym);
-                    } else if (t != null) {
-                        if (t.kind == TypeKind::Struct) {
-                            const ost: StructType* = t as StructType*;
-                            owner_str = intern.resolve(ost.qualified_name);
-                        } else if (t.kind == TypeKind::Class) {
-                            const oct: ClassType* = t as ClassType*;
-                            owner_str = intern.resolve(oct.qualified_name);
-                        } else if (t.kind == TypeKind::Enum) {
-                            const oet: EnumType* = t as EnumType*;
-                            owner_str = intern.resolve(oet.qualified_name);
-                        } else if (t.kind == TypeKind::Int
-                                || t.kind == TypeKind::Float
-                                || t.kind == TypeKind::Bool
-                                || t.kind == TypeKind::Char
-                                || t.kind == TypeKind::String
-                                || t.kind == TypeKind::Unit) {
-                            // Primitives don't have a qualified_name; their
-                            // bare display name (`u64`, `i32`, `string`, `()`,
-                            // ...) is what `register_trait_impl` keys against
-                            // and what `MangledName::for_method` expects.
-                            // Without this branch, generic trait methods on
-                            // primitives (e.g. `Display::fmt<W>` for `u64`,
-                            // or `Drop::drop` for `()` reached through
-                            // `HashSet<T> = HashMap<T, ()>`) would fall
-                            // through to the name-based Strategy 1 lookup
-                            // and emit a call against the template's mangled
-                            // symbol with the generic param name still in the
-                            // signature (e.g. `Formatter<W>` instead of
-                            // `Formatter<LineBuf<Stdout>>`).
-                            owner_str = t.display_name();
-                        }
-                    }
-                    if (strlen(owner_str) > 0) {
-                        const arena_ptr: TypeArena* = this.cg.get_arena();
-                        const type_qn: QualifiedName = QualifiedName::single(intern, owner_str);
-                        const recv_kind: ReceiverKind = method_receiver_kind(
-                            rm_fn, rm.is_static, intern);
-                        const method_param_refs: TypeRef[] = method_non_receiver_params(
-                            rm_fn, intern);
-                        const mn: MangledName = MangledName::for_method(
-                            intern, arena_ptr, type_qn, rm_fn.name, recv_kind,
-                            method_param_refs, rm_fn.resolved_return_type, rm_fn.is_variadic);
-                        callee_val = resolve_function(this.cg, mn.value);
-                    }
-                }
+            // Trust sema: `resolved_callee` is the mangled LLVM symbol
+            // chosen by `resolve_method_overload` for inherent methods
+            // on classes / structs / enums (including the base-class
+            // walk for inheritance).  Routes through
+            // `resolve_function_by_mangled`, identical to the
+            // Identifier branch.
+            if (node.resolved_callee.is_valid()) {
+                callee_val = resolve_function_by_mangled(
+                    this.cg, node.resolved_callee);
             }
 
+            // Trait-impl method fallback: methods registered through
+            // `implement trait T for U { ... }` blocks live in the
+            // trait-impl registry under the qualified type name, NOT
+            // on the receiver's inherent `methods[]` array, so sema's
+            // `resolve_method_overload` skips them.  This affects:
+            //   - Primitive trait impls (`Eq for i16`, `Drop for ()`)
+            //   - Trait-impl methods on user types (`FmtWrite for
+            //     String { write_bytes(...) }`)
+            // Until `resolve_method_overload` walks trait impls too,
+            // codegen reconstructs the registered `<qualified>::<method>`
+            // key from the receiver's resolved type and resolves it
+            // through the existing function table.  This branch only
+            // fires when sema's pin is empty.
             if (!callee_val.is_valid() && type_sym.is_valid()) {
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
@@ -2411,9 +2326,6 @@ public:
                     callee_val = resolve_function(this.cg, sym);
                 }
             }
-
-            // Strategy 2: Extract qualified_name directly from the Type object.
-            // Handles cases where type_reverse doesn't have the entry.
             if (!callee_val.is_valid() && t != null) {
                 mut type_str: string = "";
                 if (t.kind == TypeKind::Struct) {
@@ -2431,50 +2343,16 @@ public:
                         || t.kind == TypeKind::Char
                         || t.kind == TypeKind::String
                         || t.kind == TypeKind::Unit) {
-                    // Primitives lack a qualified_name; fall back to the
-                    // bare display name (`u64`, `()`, ...) — the same key
-                    // the trait-impl registry was indexed under.  Without
-                    // this, primitive trait-method calls reached via
-                    // generic-body monomorphization (e.g. `value.drop()`
-                    // with V=() in `HashMap<K, ()>::clear`) fail to find
-                    // the `Drop for ()` impl.
+                    // Primitives have no `qualified_name`; the trait-
+                    // impl registry keys on the bare display name.
                     type_str = t.display_name();
                 }
-
                 if (strlen(type_str) > 0) {
                     const combined: string = format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
                     callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
                     if (!callee_val.is_valid()) {
                         callee_val = resolve_function(this.cg, sym);
-                    }
-                }
-            }
-
-            // Strategy 3: Walk class inheritance chain.
-            if (!callee_val.is_valid() && t != null && t.kind == TypeKind::Class) {
-                mut walk: Type* = t;
-                while (!callee_val.is_valid() && walk != null && walk.kind == TypeKind::Class) {
-                    const wcls: ClassType* = walk as ClassType*;
-                    if (!wcls.has_base) { break; }
-                    walk = this.cg.lookup_type_by_id(wcls.base_class.id);
-                    if (walk == null) { break; }
-
-                    mut parent_str: string = "";
-                    if (walk.kind == TypeKind::Class) {
-                        const pcls: ClassType* = walk as ClassType*;
-                        parent_str = intern.resolve(pcls.qualified_name);
-                    } else if (walk.kind == TypeKind::Struct) {
-                        const pst: StructType* = walk as StructType*;
-                        parent_str = intern.resolve(pst.qualified_name);
-                    }
-                    if (strlen(parent_str) > 0) {
-                        const pcombined: string = format("%s::%s", parent_str, method_str);
-                        const psym: SymbolStr = intern.intern(pcombined);
-                        callee_val = resolve_function_with_arity(this.cg, psym, ma_arity);
-                        if (!callee_val.is_valid()) {
-                            callee_val = resolve_function(this.cg, psym);
-                        }
                     }
                 }
             }
