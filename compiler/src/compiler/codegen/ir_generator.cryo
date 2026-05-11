@@ -1883,27 +1883,18 @@ public:
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
 
-            // Sema-pinned specialized callee — set by the monomorphizer's
-            // body walk for generic free-function calls invoked through a
-            // ScopeResolution (`mem::offset(p, n)`, `Layout::array<T>(n)`).
-            // Routed through the same `resolve_function_by_mangled`
-            // helper as the Identifier branch.  When sema does NOT pin
-            // (the non-generic ScopeResolution path), the fallback
-            // chain below — module-graph walk, combined `scope::member`,
-            // bare member — still runs because sema doesn't yet pin
-            // every ScopeResolution shape upstream.
-            if (node.resolved_callee.is_valid()) {
-                callee_val = resolve_function_by_mangled(
-                    this.cg, node.resolved_callee);
-            }
-
             // Inline-lower intrinsics referenced via a namespace prefix
-            // (e.g., `intrinsics::isfinite`).  The leaf name uniquely
-            // identifies the intrinsic; the prefix is ignored because
-            // intrinsics live in the global LLVM namespace, not in the
-            // source-level module they were declared in.
+            // (e.g., `intrinsics::isfinite`, `intrinsics::ptr_add`).  The
+            // leaf name uniquely identifies the intrinsic; the prefix is
+            // ignored because intrinsics live in the global LLVM namespace,
+            // not in the source-level module they were declared in.  Run
+            // BEFORE the resolved_callee lookup: sema pins
+            // `intrinsics::ptr_add` as a qualified callee symbol, and the
+            // declaration table would happily declare it as an extern,
+            // causing the linker to look for a real `ptr_add` symbol that
+            // doesn't exist (intrinsics are lowered inline, never linked).
             const sr_leaf_str: string = intern.resolve(sr.member_name);
-            if (!callee_val.is_valid() && is_intrinsic_name(sr_leaf_str)) {
+            if (is_intrinsic_name(sr_leaf_str)) {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.codegen_rvalue(node.arguments[sai]));
@@ -1914,6 +1905,19 @@ public:
                     this.last_is_lvalue = false;
                     return;
                 }
+            }
+
+            // Sema-pinned callee — set by the monomorphizer's body walk
+            // for generic free-function calls (`mem::offset(p, n)`,
+            // `Layout::array<T>(n)`) AND by sema's `try_resolve_*` static-
+            // method / module-function / cimport-function paths.  Routes
+            // through `resolve_function_by_mangled`, identical to the
+            // Identifier branch.  The fallback chain below still runs for
+            // call shapes sema doesn't yet pin (the spec-first lookup
+            // based on `node.resolved_type`, enum-variant constructors).
+            if (node.resolved_callee.is_valid()) {
+                callee_val = resolve_function_by_mangled(
+                    this.cg, node.resolved_callee);
             }
 
             // Resolve the scope name (e.g., "LValue") to its qualified form
@@ -1990,12 +1994,23 @@ public:
                 }
             }
 
-            const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
-            const sym: SymbolStr = intern.intern(combined);
-            // ScopeResolution calls are static — no receiver, so the LLVM
-            // arity equals the user-arg count.  Try arity-specific lookup
-            // first so `Array::new()` and `Array::new(u64)` stay distinct.
+            // Post-substitution combined-key lookup: in spec'd function
+            // bodies, AST substituter rewrites `sr.scope_name` from
+            // `String` to the bare-leaf spec form (`6String$L...$G`).
+            // Sema's pin was on the pre-substitution template form
+            // (`String::method`) and the substituter doesn't update
+            // `resolved_callee`, so when codegen lands on this branch the
+            // pinned symbol is for a function that only exists at
+            // template time.  `di.resolve_qualified(sr.scope_name)` maps
+            // the bare-leaf spec back to its fully-qualified arena name
+            // (registered by specialization.cryo), and the combined
+            // `<qualified>::<method>` lookup finds the spec's LLVM
+            // symbol.  Sema upstreams the non-spec case via pinned
+            // `resolved_callee`; this branch covers the spec-context
+            // lookups until AST cloning clears stale callee pins.
             if (!callee_val.is_valid()) {
+                const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
+                const sym: SymbolStr = intern.intern(combined);
                 callee_val = resolve_function_with_arity(this.cg, sym, sr_arity);
                 if (!callee_val.is_valid()) {
                     callee_val = resolve_function(this.cg, sym);
@@ -2004,24 +2019,11 @@ public:
 
             // Module-graph walk: when source writes a shorthand path like
             // `libc::read` or `CHeaderImport::run`, find every module
-            // whose namespace ends with `::scope_str` (or equals it).  For
-            // each match, build `<full_ns>::<member>` and probe the
-            // function table.  Mirrors sema's resolve_module_qualified_function
-            // logic in ../passes/sema.cryo so codegen reaches the same
-            // decision sema already made.
-            //
-            // Why we need this here: without it, codegen falls back to the
-            // bare member name, whose overload slot is last-write-wins
-            // across modules.  Two free functions with the same simple
-            // name in sibling namespaces silently dispatch to whichever
-            // module loaded last — the original symptom that produced the
-            // E0080 storm at selfhost stage 4.
-            //
-            // If exactly one module match resolves, use it; if multiple
-            // resolve, emit E0154 (ambiguous call) listing every
-            // candidate.  Zero matches falls through to the bare fallback
-            // below for extern-C names that genuinely live in the bare
-            // namespace.
+            // whose namespace ends with `::scope_str` (or equals it).
+            // Sema's `resolve_module_qualified_function` mirrors this and
+            // pins resolved_callee for non-spec cases; this branch covers
+            // call sites whose scope name was substituted (where sema's
+            // pin is for the template form) or otherwise didn't pin.
             if (!callee_val.is_valid()) {
                 const matches: SymbolStr[] = collect_namespace_suffix_matches(
                     this.cg, intern, scope_str, sr.member_name, sr_arity);
@@ -2120,10 +2122,16 @@ public:
                 }
             }
         } else if (node.callee.kind == NodeKind::MemberAccess) {
-            // Member access: resolve the object's type to find the method.
-            // Use the same approach as sema: ask the DI for the type's
-            // registered name (via type_reverse), which handles compound
-            // types like ArrayType by mapping through InstantiatedType.
+            // Member access: sema's `resolve_method_overload` pins the
+            // mangled LLVM callee on `resolved_callee` for inherent
+            // class/struct/enum methods AND for trait-impl methods on
+            // non-generic receivers.  Codegen detects the function-
+            // pointer-field shortcut, picks up virtual-dispatch state for
+            // class receivers, then routes the pinned symbol through
+            // `resolve_function_by_mangled`.  The post-specialization
+            // fallback at the bottom covers methods on spec'd receivers
+            // (InstantiatedType, where sema runs before monomorphization
+            // and the receiver's concrete spec name doesn't exist yet).
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
             const method_str: string = intern.resolve(ma.member);
@@ -2239,7 +2247,9 @@ public:
             // Use DI type_reverse to get the type's registered name,
             // then look up "QualifiedType::method" in the function map.
             // For ArrayType, use the element-type → Array_<T> mapping
-            // since ArrayType TypeRefs are not canonical.
+            // since ArrayType TypeRefs are not canonical.  Only used by
+            // the post-specialization fallback below (when sema's pin
+            // was empty or its symbol isn't in the LLVM module).
             mut type_sym: SymbolStr = di.lookup_type_name(obj_ref);
             if (!type_sym.is_valid() && t != null && t.kind == TypeKind::Array) {
                 const arr_t: ArrayType* = t as ArrayType*;
@@ -2294,29 +2304,31 @@ public:
             const ma_arity: u32 = (node.arguments.length + 1) as u32;
 
             // Trust sema: `resolved_callee` is the mangled LLVM symbol
-            // chosen by `resolve_method_overload` for inherent methods
-            // on classes / structs / enums (including the base-class
-            // walk for inheritance).  Routes through
-            // `resolve_function_by_mangled`, identical to the
-            // Identifier branch.
+            // chosen by `resolve_method_overload` for inherent methods on
+            // classes / structs / enums (including the base-class walk
+            // for inheritance) AND for trait-impl methods on non-generic
+            // receivers (e.g. `String::write_bytes` from `implement trait
+            // FmtWrite for String`, or primitive trait impls like
+            // `Eq for i16`).  Routes through `resolve_function_by_mangled`,
+            // identical to the Identifier branch.
             if (node.resolved_callee.is_valid()) {
                 callee_val = resolve_function_by_mangled(
                     this.cg, node.resolved_callee);
             }
 
-            // Trait-impl method fallback: methods registered through
-            // `implement trait T for U { ... }` blocks live in the
-            // trait-impl registry under the qualified type name, NOT
-            // on the receiver's inherent `methods[]` array, so sema's
-            // `resolve_method_overload` skips them.  This affects:
-            //   - Primitive trait impls (`Eq for i16`, `Drop for ()`)
-            //   - Trait-impl methods on user types (`FmtWrite for
-            //     String { write_bytes(...) }`)
-            // Until `resolve_method_overload` walks trait impls too,
-            // codegen reconstructs the registered `<qualified>::<method>`
-            // key from the receiver's resolved type and resolves it
-            // through the existing function table.  This branch only
-            // fires when sema's pin is empty.
+            // Post-specialization fallback: when the receiver is a
+            // monomorphized InstantiatedType (e.g. `Array<u8, GlobalAlloc>`
+            // inside a spec'd `String<GlobalAlloc>::with_capacity`), sema's
+            // pin uses the TEMPLATE's mangled symbol — which doesn't exist
+            // in the LLVM module (only specs are emitted).  Re-resolve via
+            // the post-substitution receiver type name registered in the
+            // DI: `lookup_type_name(obj_ref)` returns the spec's qname
+            // (e.g. `Array_u8_GlobalAlloc`) and the combined
+            // `<spec_qname>::<method>` lookup finds the spec'd LLVM symbol.
+            //
+            // Long-term: move this into a post-monomorphization re-pin
+            // pass that updates `resolved_callee` after AST substitution.
+            // Until then this branch handles the spec'd-receiver case.
             if (!callee_val.is_valid() && type_sym.is_valid()) {
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);

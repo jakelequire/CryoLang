@@ -190,8 +190,9 @@ public:
     /// Searches the module graph for a module whose namespace ends with
     /// scope_name, then looks up "namespace::member_name" in the DeclarationIndex.
     /// Returns invalid TypeRef if no match found.
-    resolve_module_qualified_function(&this, scope_name: SymbolStr,
-                                      member_name: SymbolStr) -> TypeRef {
+    resolve_module_qualified_function(mut &this, scope_name: SymbolStr,
+                                      member_name: SymbolStr,
+                                      call: CallExprNode*) -> TypeRef {
         const scope_str: string = this.intern.resolve(scope_name);
         const member_str: string = this.intern.resolve(member_name);
         const scope_len: i64 = strlen(scope_str) as i64;
@@ -223,6 +224,7 @@ public:
                 const q_sym: SymbolStr = this.ctx.intern(qualified);
                 const ret: TypeRef = this.lookup_func_return(q_sym);
                 if (ret.is_valid()) {
+                    this.pin_scope_callee_qsym(call, q_sym);
                     return ret;
                 }
             }
@@ -2233,7 +2235,7 @@ public:
             return this.resolve_method_call(callee as MemberAccessNode*);
         }
         if (callee_node.kind == NodeKind::ScopeResolution) {
-            return this.resolve_scope_call(callee as ScopeResolutionNode*);
+            return this.resolve_scope_call(callee as ScopeResolutionNode*, call);
         }
 
         return this.resolve_expr(callee);
@@ -2415,28 +2417,37 @@ public:
                                 owner_t: Type*, m: MethodInfo) -> void {
         if (owner_t == null) { return; }
         if (m.ast_node == null) { return; }
-        const mn: MethodNode* = m.ast_node as MethodNode*;
-        if (mn == null || mn.func == null) { return; }
-        const fn_node: FunctionDeclNode* = mn.func;
-
         mut owner_str: string = "";
         if (owner_t.kind == TypeKind::Class) {
-            const ct: ClassType* = owner_t as ClassType*;
-            owner_str = this.intern.resolve(ct.qualified_name);
+            owner_str = this.intern.resolve((owner_t as ClassType*).qualified_name);
         } else if (owner_t.kind == TypeKind::Struct) {
-            const st: StructType* = owner_t as StructType*;
-            owner_str = this.intern.resolve(st.qualified_name);
+            owner_str = this.intern.resolve((owner_t as StructType*).qualified_name);
         } else if (owner_t.kind == TypeKind::Enum) {
-            const et: EnumType* = owner_t as EnumType*;
-            owner_str = this.intern.resolve(et.qualified_name);
+            owner_str = this.intern.resolve((owner_t as EnumType*).qualified_name);
         } else {
             return;
         }
-        if (strlen(owner_str) == 0) { return; }
+        this.pin_method_callee_from_qname(
+            call, owner_str, m.ast_node as MethodNode*, m.is_static);
+    }
 
-        const type_qn: QualifiedName = QualifiedName::single(this.intern, owner_str);
+    /// Pin `resolved_callee` for a method given its owner's qualified-name
+    /// string directly. Used by the trait-impl resolution path, where the
+    /// owner name comes from `register_methods_with_module`'s registration
+    /// key (canonical target qname for user types, bare display name for
+    /// primitives) rather than from a typed `Type*` with a `qualified_name`
+    /// field.  Mangling matches `register_methods_with_module_aliased` so
+    /// the produced symbol is exactly the one declare_method emitted.
+    pin_method_callee_from_qname(mut &this, call: CallExprNode*,
+                                  owner_qname_str: string,
+                                  mn: MethodNode*, is_static: boolean) -> void {
+        if (mn == null || mn.func == null) { return; }
+        if (strlen(owner_qname_str) == 0) { return; }
+        const fn_node: FunctionDeclNode* = mn.func;
+        const type_qn: QualifiedName = QualifiedName::single(
+            this.intern, owner_qname_str);
         const recv_kind: ReceiverKind = method_receiver_kind(
-            fn_node, m.is_static, this.intern);
+            fn_node, is_static, this.intern);
         const param_refs: TypeRef[] = method_non_receiver_params(
             fn_node, this.intern);
         const mangled: MangledName = MangledName::for_method(
@@ -2476,7 +2487,13 @@ public:
         // Structs don't have vtables or a base chain, but they DO have
         // overloaded methods (`String::push(string)` vs `String::push(String)`)
         // and codegen needs `resolved_method` to pick the right mangled
-        // name at the call site.
+        // name at the call site.  Primitives (Int/Float/Bool/Char/String/
+        // Unit) have no inherent methods table but may have trait-impl
+        // methods registered via `implement trait Eq for i16 { ... }` —
+        // we leave methods_ref empty for those and the trait-impl walk at
+        // the bottom of this function picks them up.  Non-matching kinds
+        // (Pointer, Reference, etc. shouldn't reach here after the unwrap
+        // loop) bail.
         mut methods_ref: MethodInfo[] = [];
         mut start_cls: ClassType* = null;
         if (base_t.kind == TypeKind::Class) {
@@ -2488,6 +2505,15 @@ public:
         } else if (base_t.kind == TypeKind::Enum) {
             const est: EnumType* = base_t as EnumType*;
             methods_ref = est.methods;
+        } else if (base_t.kind == TypeKind::Int
+                || base_t.kind == TypeKind::Float
+                || base_t.kind == TypeKind::Bool
+                || base_t.kind == TypeKind::Char
+                || base_t.kind == TypeKind::String
+                || base_t.kind == TypeKind::Unit) {
+            // Primitive receiver — no inherent methods, but the trait-impl
+            // walk below may resolve.  methods_ref stays empty so the
+            // inherent passes loop zero times.
         } else {
             return;
         }
@@ -2666,9 +2692,129 @@ public:
                 depth = depth + 1;
             }
         }
-        // Still no match — leave resolved_method null; codegen falls
-        // back to direct (non-virtual) dispatch via the usual name-based
-        // lookup paths.
+        // Trait-impl walk: methods registered via `implement trait T for U`
+        // live in the trait-impl registry rather than on the receiver's
+        // inherent `methods[]` array, so neither Pass 1 nor Pass 2 above
+        // can see them.  This handles primitive trait impls (e.g.
+        // `Eq for i16`) and trait impls on user types (e.g. `FmtWrite for
+        // String`).  Mangling matches `register_methods_with_module`'s
+        // registration so the pinned symbol resolves at LLVM lookup time.
+        this.try_match_trait_impl_method(call, member, base_t, arg_types);
+    }
+
+    /// Walk the trait-impl registry for `base_t` and pin a matching trait
+    /// method's mangled callee on `call`.  Used as the final fallback in
+    /// `resolve_method_overload` for cases the inherent-method walk
+    /// doesn't cover.
+    try_match_trait_impl_method(mut &this, call: CallExprNode*,
+                                 member: MemberAccessNode*,
+                                 base_t: Type*,
+                                 arg_types: TypeRef[]) -> void {
+        if (call.resolved_callee.is_valid()) { return; }
+        if (this.ctx.generic_registry == null) { return; }
+        if (base_t == null) { return; }
+
+        // Compute the target name in the same form
+        // `register_methods_with_module` keys on:
+        //   - Class/Struct/Enum → canonical qualified_name
+        //   - Primitives        → bare display name interned
+        // The mangle uses this name verbatim as the type qname, so any
+        // mismatch produces a different LLVM symbol than declare_method
+        // emitted.
+        mut target_name: SymbolStr = SymbolStr::empty();
+        mut target_str:  string    = "";
+        if (base_t.kind == TypeKind::Class) {
+            target_name = (base_t as ClassType*).qualified_name;
+        } else if (base_t.kind == TypeKind::Struct) {
+            target_name = (base_t as StructType*).qualified_name;
+        } else if (base_t.kind == TypeKind::Enum) {
+            target_name = (base_t as EnumType*).qualified_name;
+        } else if (base_t.kind == TypeKind::Int
+                || base_t.kind == TypeKind::Float
+                || base_t.kind == TypeKind::Bool
+                || base_t.kind == TypeKind::Char
+                || base_t.kind == TypeKind::String
+                || base_t.kind == TypeKind::Unit) {
+            target_str  = base_t.display_name();
+            target_name = this.intern.intern(target_str);
+        } else {
+            return;
+        }
+        if (!target_name.is_valid()) { return; }
+        if (strlen(target_str) == 0) {
+            target_str = this.intern.resolve(target_name);
+        }
+        if (strlen(target_str) == 0) { return; }
+
+        const traits: SymbolStr[] =
+            this.ctx.generic_registry.traits_implemented_by(target_name);
+        for (mut ti: i64 = 0; ti < traits.length; ti++) {
+            const block: ImplBlockNode* =
+                this.ctx.generic_registry.lookup_trait_impl(
+                    traits[ti], target_name);
+            if (block == null) { continue; }
+            if (this.match_methods_on_impl_block(
+                    call, member, block, target_str, arg_types)) {
+                return;
+            }
+        }
+    }
+
+    /// Two-pass match over an impl block's methods.  Pass 1 is exact
+    /// arena-id match; Pass 2 accepts `can_implicit_convert` widenings
+    /// (e.g. `&local` → `T*` reference/pointer coercion, int widenings).
+    /// Returns true and pins `resolved_method` + `resolved_callee` on the
+    /// first match; otherwise returns false.
+    match_methods_on_impl_block(mut &this, call: CallExprNode*,
+                                 member: MemberAccessNode*,
+                                 block: ImplBlockNode*,
+                                 owner_str: string,
+                                 arg_types: TypeRef[]) -> boolean {
+        if (block == null) { return false; }
+        const this_amp: SymbolStr = this.intern.intern("&this");
+        const this_val: SymbolStr = this.intern.intern("this");
+
+        for (mut sub_pass: i32 = 0; sub_pass < 2; sub_pass++) {
+            const allow_implicit: boolean = (sub_pass == 1);
+            for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
+                const mn: MethodNode* = block.methods[mi];
+                if (mn == null || mn.func == null) { continue; }
+                const fn_node: FunctionDeclNode* = mn.func;
+                if (!fn_node.name.equals(member.member)) { continue; }
+
+                // Build the overload parameter list (skip self in both
+                // forms) the same way ClassType/StructType registration
+                // does — that's the signature against which sema matches
+                // call args.
+                mut params: TypeRef[] = [];
+                for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                    const pp: VarDeclNode* = fn_node.parameters[pi];
+                    if (pp == null) { continue; }
+                    if (pp.name.equals(this_amp)) { continue; }
+                    if (pp.name.equals(this_val)) { continue; }
+                    params.push(pp.resolved_type);
+                }
+                if (params.length != arg_types.length) { continue; }
+
+                mut compat: boolean = true;
+                for (mut pi: i64 = 0; pi < params.length; pi++) {
+                    if (params[pi].id == arg_types[pi].id) { continue; }
+                    if (allow_implicit && this.checker.can_implicit_convert(
+                            arg_types[pi], params[pi])) {
+                        continue;
+                    }
+                    compat = false;
+                    break;
+                }
+                if (compat) {
+                    call.set_resolved_method(mn as ASTNode*);
+                    this.pin_method_callee_from_qname(
+                        call, owner_str, mn, mn.is_static);
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     resolve_method_call(mut &this, member: MemberAccessNode*) -> TypeRef {
@@ -3196,7 +3342,8 @@ public:
     ///   1. Static method call    — Type::method() or SpecializedType::method()
     ///   2. Enum variant constructor — Option::Some(x), ErrorCode::E0001
     ///   3. Module-qualified function — intrinsics::frexp(), math::sqrt()
-    resolve_scope_call(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+    resolve_scope_call(mut &this, scope: ScopeResolutionNode*,
+                       call: CallExprNode*) -> TypeRef {
         // If the scope has generic args (e.g., Pair<int>::new), resolve them
         // to build the specialized type name for method/type lookup.
         mut lookup_sym: SymbolStr = scope.scope_name;
@@ -3210,20 +3357,20 @@ public:
 
         // 1. Static method call
         const method_ret: TypeRef = this.try_resolve_static_method(
-            scope, lookup_sym);
+            scope, lookup_sym, call);
         if (method_ret.is_valid()) { return method_ret; }
 
         // 2. Enum variant / type-based static method
         const type_ret: TypeRef = this.try_resolve_type_or_variant(
-            scope, lookup_sym);
+            scope, lookup_sym, call);
         if (type_ret.is_valid()) { return type_ret; }
 
         // 3. Module-qualified function call
-        const fn_ret: TypeRef = this.try_resolve_module_function(scope);
+        const fn_ret: TypeRef = this.try_resolve_module_function(scope, call);
         if (fn_ret.is_valid()) { return fn_ret; }
 
         // 4. CImport alias-qualified function (e.g., llvm::FunctionName)
-        const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope);
+        const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
         if (cimport_ret.is_valid()) { return cimport_ret; }
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
@@ -3235,10 +3382,101 @@ public:
         return TypeRef::invalid();
     }
 
+    /// True when the scope name in a ScopeResolution callee either:
+    ///   1. resolves to a generic template — the monomorphizer's
+    ///      `try_infer_static_method_on_generic_template` will re-pin
+    ///      with the spec'd form, so sema pinning the template form
+    ///      would shadow it.
+    ///   2. resolves to a function template (`Layout::array<T>`) — the
+    ///      monomorphizer's `try_infer_function_call` handles these.
+    ///   3. resolves to an InstantiatedType — the scope was rewritten by
+    ///      AST specialization to a spec form whose qualified-form key
+    ///      lives in the DI; codegen's spec-first lookup uses the type's
+    ///      `qualified_name` to find it.  Pinning the bare-leaf spec
+    ///      form here would dead-end before the codegen fallback runs.
+    scope_is_generic_template(&this, scope_sym: SymbolStr,
+                              member_sym: SymbolStr) -> boolean {
+        if (this.ctx.generic_registry == null) { return false; }
+        // Direct lookup: scope name registered as a generic template.
+        // Generic structs/classes/enums register under their qualified
+        // name; function templates register under `scope::member`.
+        const scope_entry: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
+        if (scope_entry != null) { return true; }
+
+        // Function template registered under the combined `scope::member`
+        // key (e.g. `Layout::array<T>(n)` — Layout itself isn't generic,
+        // but `Layout::array` IS a function template).
+        if (member_sym.is_valid()) {
+            const scope_str: string = this.intern.resolve(scope_sym);
+            const member_str: string = this.intern.resolve(member_sym);
+            const combined: string = format("%s::%s", scope_str, member_str);
+            const csym: SymbolStr = this.intern.intern(combined);
+            const fn_entry: TemplateEntry* = this.ctx.generic_registry.get_template(csym);
+            if (fn_entry != null) { return true; }
+        }
+
+        // Scope name resolved by AST specialization to a spec'd type
+        // (e.g. `String` → `6String$LN$L3std.5alloc...$G$G`).  These look
+        // like normal types from sema's POV but their methods are
+        // registered under the FULLY-qualified spec name, not the
+        // bare-leaf spec form the AST specializer wrote into scope_name.
+        // Codegen's spec-first lookup uses the resolved type's
+        // qualified_name to find the right key — sema pinning the bare-
+        // leaf form would dead-end before that fallback runs.
+        if (this.ctx.decl_index != null) {
+            const type_ref: TypeRef = this.ctx.decl_index.lookup_type(scope_sym);
+            if (type_ref.is_valid()) {
+                const t: Type* = this.arena.lookup(type_ref.id);
+                if (t != null && t.kind == TypeKind::InstantiatedType) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Pin `resolved_callee` on `call` to the `scope::member` combined
+    /// symbol that `try_resolve_*` matched against in the DI / module
+    /// graph.  Codegen's `resolve_function_by_mangled` step 3 routes
+    /// qualified-name pins through `resolve_function`, which keys exactly
+    /// off this combined form — so the LLVM lookup converges on the
+    /// definition declare_function emitted.  No-op when:
+    ///   - the call is null (sema runs from many sites that aren't calls)
+    ///   - `resolved_callee` is already pinned by an earlier strategy
+    ///   - the scope or method is generic (let the monomorphizer pin the
+    ///     spec'd form post-substitution; pinning the template form here
+    ///     would shadow that)
+    pin_scope_callee_combined(mut &this, call: CallExprNode*,
+                               scope_sym: SymbolStr,
+                               member_sym: SymbolStr) -> void {
+        if (call == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
+        if (this.scope_is_generic_template(scope_sym, member_sym)) { return; }
+        const scope_str: string = this.intern.resolve(scope_sym);
+        const member_str: string = this.intern.resolve(member_sym);
+        if (strlen(scope_str) == 0 || strlen(member_str) == 0) { return; }
+        const combined: string = format("%s::%s", scope_str, member_str);
+        const sym: SymbolStr = this.intern.intern(combined);
+        call.set_resolved_callee(sym);
+    }
+
+    /// Pin `resolved_callee` to a pre-built qualified callee symbol (used
+    /// by `try_resolve_cimport_function` and `resolve_module_qualified_function`,
+    /// which already build the combined form for their own lookup).
+    pin_scope_callee_qsym(mut &this, call: CallExprNode*,
+                           q_sym: SymbolStr) -> void {
+        if (call == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (!q_sym.is_valid()) { return; }
+        call.set_resolved_callee(q_sym);
+    }
+
     /// Try resolving Scope::Member as a static method call.
     /// Tries: specialized name → base name → DI-qualified name.
     try_resolve_static_method(mut &this, scope: ScopeResolutionNode*,
-                              lookup_sym: SymbolStr) -> TypeRef {
+                              lookup_sym: SymbolStr,
+                              call: CallExprNode*) -> TypeRef {
         // Try specialized name (e.g., Pair_i32::new)
         const method_ret: TypeRef = this.lookup_method_return(
             lookup_sym, scope.member_name);
@@ -3246,6 +3484,7 @@ public:
             const resolved: TypeRef = this.try_resolve_generic_return(
                 method_ret, scope.scope_name, scope.member_name, scope);
             scope.set_resolved_type(resolved);
+            this.pin_scope_callee_combined(call, lookup_sym, scope.member_name);
             return resolved;
         }
         // Try the specialized type's DI-registered qualified name.  Generic
@@ -3265,6 +3504,7 @@ public:
                         spec_qn, scope.member_name);
                     if (qn_ret.is_valid()) {
                         scope.set_resolved_type(qn_ret);
+                        this.pin_scope_callee_combined(call, spec_qn, scope.member_name);
                         return qn_ret;
                     }
                 }
@@ -3278,6 +3518,8 @@ public:
                 const resolved: TypeRef = this.try_resolve_generic_return(
                     base_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
+                this.pin_scope_callee_combined(
+                    call, scope.scope_name, scope.member_name);
                 return resolved;
             }
         }
@@ -3288,7 +3530,8 @@ public:
     ///   - Static method via DI-qualified name (FieldInfo::new cross-module)
     ///   - Enum variant constructor (Option::Some, CompileMode::Raw)
     try_resolve_type_or_variant(mut &this, scope: ScopeResolutionNode*,
-                                lookup_sym: SymbolStr) -> TypeRef {
+                                lookup_sym: SymbolStr,
+                                call: CallExprNode*) -> TypeRef {
         const type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
         if (!type_ref.is_valid()) { return TypeRef::invalid(); }
 
@@ -3303,6 +3546,7 @@ public:
                 const resolved: TypeRef = this.try_resolve_generic_return(
                     di_method_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
+                this.pin_scope_callee_combined(call, di_name, scope.member_name);
                 return resolved;
             }
         }
@@ -3335,7 +3579,8 @@ public:
     /// (e.g., intrinsics::frexp, math::sqrt).  Only attempts this if the
     /// scope name is NOT a known type (prevents false matches for enum
     /// variant calls like IoResult::Ok).
-    try_resolve_module_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+    try_resolve_module_function(mut &this, scope: ScopeResolutionNode*,
+                                 call: CallExprNode*) -> TypeRef {
         // The earlier strategies already exhausted "type::method" and
         // "type::variant" lookups for any genuine type carrier.  If the
         // scope happens to ALSO resolve to a type (often via the
@@ -3349,7 +3594,7 @@ public:
         // the earlier type-based interpretations matched, so it's safe
         // to try a module-function lookup unconditionally.
         const q_ret: TypeRef = this.resolve_module_qualified_function(
-            scope.scope_name, scope.member_name);
+            scope.scope_name, scope.member_name, call);
         if (q_ret.is_valid()) {
             scope.set_resolved_type(q_ret);
             return q_ret;
@@ -3359,7 +3604,8 @@ public:
 
     /// Try resolving Scope::Member as a CImport alias-qualified function.
     /// Looks up "alias::member" directly in the DeclIndex.
-    try_resolve_cimport_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+    try_resolve_cimport_function(mut &this, scope: ScopeResolutionNode*,
+                                  call: CallExprNode*) -> TypeRef {
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
         const qualified: string = scope_str + "::" + member_str;
@@ -3368,6 +3614,7 @@ public:
         const ret: TypeRef = this.ctx.decl_index.lookup_func_return(q_sym);
         if (ret.is_valid()) {
             scope.set_resolved_type(ret);
+            this.pin_scope_callee_qsym(call, q_sym);
             return ret;
         }
         return TypeRef::invalid();
