@@ -166,36 +166,29 @@ function register_static_method_templates(owner_name: SymbolStr,
     }
 }
 
-/// Register a non-generic struct/class as an "inherent owner" when it
-/// has at least one inline generic method.  This lets the monomorphizer
-/// find the owner's AST from a receiver TypeRef without walking
-/// `spec_entries` (which only tracks specialized GENERIC types).
+/// Register a non-generic struct/class AST as an "inherent owner",
+/// keyed by both qualified and bare name.  Two consumers:
 ///
-/// Generic STATIC methods are also covered by `register_static_method_templates`,
-/// which keys them by `Owner::method` for ScopeResolution callees.  This
-/// registration is the complement for GENERIC INSTANCE methods, whose
-/// dispatch goes through `try_infer_method_call` by receiver type.
+/// * The monomorphizer / sema walk the owner's `methods[]` to specialize
+///   generic INSTANCE methods (e.g. `Response::write_to<W>`).  Generic
+///   STATIC methods take a separate path via
+///   `register_static_method_templates`, which keys them by
+///   `Owner::method` for ScopeResolution callees.
+/// * `OwnershipQuery::has_inherent_drop` walks the owner's `methods[]`
+///   to detect an inline `drop` so the Copy classifier and the
+///   drop-insertion pass treat the type as non-Copy and synthesize
+///   scope-exit drops.
 ///
-/// Skipped when the owner is itself generic — those types are tracked via
-/// the regular template entry, and their methods get specialized as part
-/// of struct/class monomorphization rather than per-call.
-function register_inherent_owner_if_has_generic_methods(
-        owner_name: SymbolStr, methods: MethodNode*[],
-        owner_ast: ASTNode*, registry: GenericRegistry*,
-        ctx: CompilationContext*) -> void {
-    if (owner_ast == null || methods.length == 0) { return; }
-
-    mut has_generic_method: boolean = false;
-    for (mut i: i64 = 0; i < methods.length; i++) {
-        const m: MethodNode* = methods[i];
-        if (m == null || m.func == null) { continue; }
-        if (m.func.is_generic()) {
-            has_generic_method = true;
-            break;
-        }
-    }
-    if (!has_generic_method) { return; }
-
+/// Registration is unconditional for non-generic owners so the index is
+/// a complete `qualified_name → AST` map for them; receiver-type lookups
+/// no longer have to thread a fallback through DeclarationIndex.  Generic
+/// owners go through `register_generic_template` instead — their methods
+/// are specialized as part of struct/class monomorphization rather than
+/// per-call.
+function register_inherent_owner(
+        owner_name: SymbolStr, owner_ast: ASTNode*,
+        registry: GenericRegistry*, ctx: CompilationContext*) -> void {
+    if (owner_ast == null) { return; }
     const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
     registry.register_inherent_owner(owner_qsym, owner_ast);
     // Also register under the bare name so receiver-type lookups that
@@ -435,8 +428,7 @@ type struct SpecializationPasses {
                         // type rather than scope-qualified name; record the
                         // owner AST here so try_infer_method_call can find
                         // its `methods[]` from a receiver TypeRef.
-                        register_inherent_owner_if_has_generic_methods(
-                            node.name, node.methods, stmt, registry, ctx);
+                        register_inherent_owner(node.name, stmt, registry, ctx);
                     }
                 }
                 NodeKind::EnumDeclaration => {
@@ -455,8 +447,7 @@ type struct SpecializationPasses {
                     if (!node.is_generic()) {
                         register_static_method_templates(node.name, node.methods,
                             registry, arena, ctx);
-                        register_inherent_owner_if_has_generic_methods(
-                            node.name, node.methods, stmt, registry, ctx);
+                        register_inherent_owner(node.name, stmt, registry, ctx);
                     }
                 }
                 NodeKind::FunctionDeclaration => {
