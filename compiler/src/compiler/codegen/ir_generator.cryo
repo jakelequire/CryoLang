@@ -1548,23 +1548,40 @@ public:
             mut is_ptr_like: boolean = false;
             if (op_t != null) {
                 is_ptr_like = op_t.kind == TypeKind::Pointer ||
-                              op_t.kind == TypeKind::Reference || 
+                              op_t.kind == TypeKind::Reference ||
                               op_t.kind == TypeKind::String;
             }
             mut deref_addr: LValue = LValue::null();
             if (is_ptr_like) {
+                // Pointer/reference operand: codegen_rvalue loads the
+                // operand's value (the pointer itself), giving us the
+                // address to dereference.
                 deref_addr = this.codegen_rvalue(node.operand);
             } else {
+                // Value-typed operand reached `*` — this is the
+                // method-receiver case where sema types `this` as the
+                // bare owner (`Option<T>`, etc.) but the ABI passes a
+                // pointer.  codegen_lvalue yields the address of the
+                // operand's storage; loading it produces the value.
                 deref_addr = this.codegen_lvalue(node.operand);
             }
-            const ptr: LValue = this.codegen_rvalue(node.operand);
-            if (!deref_addr.is_valid() || !ptr.is_valid()) {
+            if (!deref_addr.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
             }
+            // The dereferenced expression is always an lvalue: it
+            // names a memory location that callers can either read
+            // (via codegen_rvalue → emit a load) or write (via the
+            // assignment path → use as a store destination).  The
+            // previous code set `last_is_lvalue = is_ptr_like`, which
+            // dropped the load step for value-typed operands and
+            // stored the *address bits* in place of the dereferenced
+            // value — observable as `const x: Option<T> = *this`
+            // emitting `store ptr %this, ptr %x` instead of the
+            // 32-byte value copy, garbaging the enum discriminant.
             this.last_value = deref_addr;
-            this.last_is_lvalue = is_ptr_like;
+            this.last_is_lvalue = true;
             return;
         }
         if (op == TokenType::Amp) {

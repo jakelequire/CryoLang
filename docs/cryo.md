@@ -304,7 +304,7 @@ mut y: int;                     // declared without an initialiser; assigned lat
 **Globals.** Module-level `const` declares a true compile-time constant; module-level `mut` declares mutable global state. Use the latter sparingly.
 
 ```cryo
-const VERSION:    string = "0.1.0";
+const VERSION:    string = "1.0.0";
 mut   g_counter:  u64    = 0;
 ```
 
@@ -1511,7 +1511,7 @@ consume(buf);     // moves buf
 use(buf);         // ⚠ use-after-move (warn-only)
 ```
 
-The check is currently warn-only while the standard library is being audited for explicit-`drop` discipline. Treat the warnings as authoritative; they will become errors before 0.1.0 ships.
+The check emits warnings rather than hard errors so that legitimate idioms that exercise the move-tracker's edge cases (loop bodies that re-initialise a moved binding, conditional moves whose join the analyser can't yet prove sound) compile through. Treat the warnings as authoritative; promotion to errors is on the post-1.0 roadmap once the join-point analyser matures.
 
 ---
 
@@ -1652,7 +1652,7 @@ The prelude is deliberately small. Anything else is an explicit `import`.
 | **`ffi`** | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures. |
 | **`env`** | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code) -> never`. |
 | **`math`** | Thin libm wrappers: `square_root`, `sine`, `cosine`, `power`, `natural_log`, `exponential`, `floor`, `ceil`, `round`, `trunc`, `absolute`, plus `PI`, `TAU`, `E`. |
-| **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, connection-per-request `serve(addr, handler)`, `Client::get`/`post` with `send(addr, req)`. TLS, UDP, HTTP/2, and WebSocket are explicitly out of scope for 0.1.0. |
+| **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. TLS, UDP, HTTP/2, and WebSocket are out of scope for 1.0 and are tracked on the post-1.0 roadmap. |
 | **`process`** | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported. |
 | **`test`** | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing). |
 
