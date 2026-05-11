@@ -882,6 +882,58 @@ function resolve_function(cg: CodegenContext*, name: SymbolStr) -> LValue {
     return declare_extern_function_return_only(cg, name);
 }
 
+/// Resolve a function from a sema-pinned symbol on
+/// `CallExprNode.resolved_callee`.
+///
+/// Two sources pin this symbol:
+///
+///   * `try_pin_overload_mangled_callee` / `pin_method_resolved_callee`
+///     in sema pin the **mangled** LLVM symbol of the chosen overload.
+///   * The monomorphizer pins the **qualified** name of a specialized
+///     generic function or method (the spec'd name maps to a freshly-
+///     mangled definition declared at body-codegen time).
+///
+/// The helper handles both forms in a single fixed lookup:
+///
+///   1. LLVM-level by the pinned string — succeeds when it's already a
+///      mangled symbol present in this module (defined or previously
+///      declared).
+///   2. Reverse-lookup the pinned symbol through DI's overload
+///      registry — declares a cross-module extern from the
+///      `(qualified, FunctionType)` pair that produced the mangled
+///      name, so the next codegen pass over the same module sees a
+///      cached LValue.
+///   3. Qualified-name resolve — handles the mono-pinned spec case
+///      where the pin is the qualified spec name and the registered
+///      mangled symbol differs from the pin.  Reuses the existing
+///      `resolve_function` machinery (cache + DI overload list +
+///      lazy extern declaration).
+///
+/// Returns `null` when none of the above resolves — at which point
+/// codegen reports E0636 and the call site is wrong (or the
+/// registration pipeline has a hole that should be fixed upstream).
+function resolve_function_by_mangled(cg: CodegenContext*, pinned: SymbolStr) -> LValue {
+    if (!pinned.is_valid()) { return LValue::null(); }
+
+    const intern: InternTable* = cg.get_intern();
+    const pinned_str: string = intern.resolve(pinned);
+    mut v: LValue = cg.llvm_module.get_named_function(pinned_str);
+    if (v.is_valid()) { return v; }
+
+    const di: DeclarationIndex* = cg.ctx.decl_index;
+    for (mut i: i64 = 0; i < di.overload_func_keys.length; i++) {
+        if (di.overload_func_mangled[i] != pinned.id) { continue; }
+        const qual: SymbolStr = SymbolStr::from_id(di.overload_func_keys[i]);
+        if (owned_by_current_module(cg, di.get_function_module(qual))) {
+            return LValue::null();
+        }
+        v = declare_extern_function_overload(cg, qual, di.overload_func_types[i]);
+        if (v.is_valid()) { return v; }
+    }
+
+    return resolve_function(cg, pinned);
+}
+
 /// Look up an overloaded function by (name, user-arg-count), declaring a
 /// cross-module extern on demand.  Returns null if no overload matches or
 /// when the symbol is owned by the current module (same reason as

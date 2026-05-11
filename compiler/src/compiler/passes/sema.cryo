@@ -2271,7 +2271,24 @@ public:
             overloads = di.lookup_func_type_overloads(ident.name);
             lookup_key = ident.name;
         }
-        if (overloads.length <= 1) { return; }
+        if (overloads.length == 0) { return; }
+        if (overloads.length == 1) {
+            // Unique-name function — pin the canonical mangled symbol
+            // registered by declare_function so codegen can dispatch
+            // through `resolve_function_by_mangled` instead of replaying
+            // the qualified/bare/DI-mapping cascade.  Prefer the
+            // overload-specific mangled name (matches the LLVM symbol);
+            // fall back to the legacy single-slot mangled_names entry.
+            mut unique_mangled: SymbolStr = di.lookup_overload_mangled(
+                lookup_key, overloads[0]);
+            if (!unique_mangled.is_valid()) {
+                unique_mangled = di.lookup_mangled_name(lookup_key);
+            }
+            if (unique_mangled.is_valid()) {
+                call.set_resolved_callee(unique_mangled);
+            }
+            return;
+        }
 
         // Find the overload whose declared param types match arg types.
         // Match rules: exact arena ID match, or implicit Reference→Pointer
@@ -2383,6 +2400,51 @@ public:
     /// check, not a string compare).  First exact match wins — derived
     /// overloads shadow base overloads with the same signature, which
     /// mirrors C++'s name-hiding rule.  Leaves `call.resolved_method`
+    /// Compute the mangled LLVM callee symbol for a resolved method and
+    /// pin it as `call.resolved_callee`, so codegen can dispatch the
+    /// call by looking up `resolved_callee` directly instead of
+    /// re-running the receiver-kind / non-receiver-params dance and the
+    /// owner-qualified-name lookup.  The mangling here matches
+    /// `declare_method`'s registration in `decl_index.cryo`, so the
+    /// lookup is guaranteed to find the registered LLVM function.
+    ///
+    /// `owner_t` is the class/struct that actually OWNS the matched
+    /// method — for an inherited match, this is the ancestor where the
+    /// method is declared, not the static receiver type.
+    pin_method_resolved_callee(mut &this, call: CallExprNode*,
+                                owner_t: Type*, m: MethodInfo) -> void {
+        if (owner_t == null) { return; }
+        if (m.ast_node == null) { return; }
+        const mn: MethodNode* = m.ast_node as MethodNode*;
+        if (mn == null || mn.func == null) { return; }
+        const fn_node: FunctionDeclNode* = mn.func;
+
+        mut owner_str: string = "";
+        if (owner_t.kind == TypeKind::Class) {
+            const ct: ClassType* = owner_t as ClassType*;
+            owner_str = this.intern.resolve(ct.qualified_name);
+        } else if (owner_t.kind == TypeKind::Struct) {
+            const st: StructType* = owner_t as StructType*;
+            owner_str = this.intern.resolve(st.qualified_name);
+        } else if (owner_t.kind == TypeKind::Enum) {
+            const et: EnumType* = owner_t as EnumType*;
+            owner_str = this.intern.resolve(et.qualified_name);
+        } else {
+            return;
+        }
+        if (strlen(owner_str) == 0) { return; }
+
+        const type_qn: QualifiedName = QualifiedName::single(this.intern, owner_str);
+        const recv_kind: ReceiverKind = method_receiver_kind(
+            fn_node, m.is_static, this.intern);
+        const param_refs: TypeRef[] = method_non_receiver_params(
+            fn_node, this.intern);
+        const mangled: MangledName = MangledName::for_method(
+            this.intern, this.arena, type_qn, fn_node.name, recv_kind,
+            param_refs, fn_node.resolved_return_type, fn_node.is_variadic);
+        call.set_resolved_callee(mangled.value);
+    }
+
     /// null on ambiguity or no-match so codegen can fall back cleanly.
     resolve_method_overload(mut &this, call: CallExprNode*, member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = this.resolve_expr(member.object);
@@ -2423,6 +2485,9 @@ public:
         } else if (base_t.kind == TypeKind::Struct) {
             const sst: StructType* = base_t as StructType*;
             methods_ref = sst.methods;
+        } else if (base_t.kind == TypeKind::Enum) {
+            const est: EnumType* = base_t as EnumType*;
+            methods_ref = est.methods;
         } else {
             return;
         }
@@ -2446,9 +2511,15 @@ public:
         // finds a match we never run pass 2.
         // For structs, walk is null and the loop runs once against
         // `methods_ref`.  For classes, walk inherits through base_class.
+        //
+        // `owner_t` tracks the type that actually OWNS the methods in
+        // `cur_methods` — for an inherited match we need the ancestor's
+        // qualified name to mangle the callee correctly, not the static
+        // receiver type's.
         mut walk: ClassType* = start_cls;
         mut depth: i32 = 0;
         mut cur_methods: MethodInfo[] = methods_ref;
+        mut owner_t: Type* = base_t;
         while (depth < 16) {
             for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
                 const m: MethodInfo = cur_methods[mi];
@@ -2463,6 +2534,7 @@ public:
                 }
                 if (exact) {
                     call.set_resolved_method(m.ast_node as ASTNode*);
+                    this.pin_method_resolved_callee(call, owner_t, m);
                     return;
                 }
             }
@@ -2472,6 +2544,7 @@ public:
             if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
             walk = parent_t as ClassType*;
             cur_methods = walk.methods;
+            owner_t = parent_t;
             depth = depth + 1;
         }
 
@@ -2499,6 +2572,7 @@ public:
             walk = start_cls;
             depth = 0;
             cur_methods = methods_ref;
+            owner_t = base_t;
             while (depth < 16) {
                 for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
                     const m: MethodInfo = cur_methods[mi];
@@ -2578,6 +2652,7 @@ public:
                     }
                     if (compat) {
                         call.set_resolved_method(m.ast_node as ASTNode*);
+                        this.pin_method_resolved_callee(call, owner_t, m);
                         return;
                     }
                 }
@@ -2587,6 +2662,7 @@ public:
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
                 walk = parent_t as ClassType*;
                 cur_methods = walk.methods;
+                owner_t = parent_t;
                 depth = depth + 1;
             }
         }
