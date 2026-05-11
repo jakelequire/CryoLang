@@ -1,0 +1,229 @@
+///! HashSet<T> — insert/contains/remove/length/clear.
+///!
+///! HashSet is a thin wrapper over `HashMap<T, ()>` — the heavy lifting
+///! and the storage layer are exercised by `hashmap.cryo`.  These tests
+///! pin the set-specific surface:
+///!
+///!   * `insert` returns the new-membership predicate, not the previous
+///!     value.  First insert → true; redundant insert → false.
+///!   * `remove` returns whether anything was actually removed.
+///!   * `contains` flips on insert and back off on remove.
+///!   * String keys behave like `HashMap<string, V>` — the Hash + Eq
+///!     impls for `string` work end-to-end, including value-equal
+///!     duplicates declared in different memory.
+///!   * Drop chain — `HashSet::drop` flows through `HashMap::clear`
+///!     which calls `value.drop()` on the marker.  The marker has a
+///!     no-op `Drop` impl, so the chain completes without leaking the
+///!     backing table.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HashSetT;
+
+import std::core::result;
+import std::collections::str;
+import std::collections::hashset;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Empty state
+// ============================================================================
+
+![test]
+function new_set_is_empty() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    const len: u64 = s.length();
+    const empty: boolean = s.is_empty();
+    match (expect_eq(len, 0 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(empty, Str::from_raw("new HashSet should be is_empty", 30));
+}
+
+// ============================================================================
+// insert returns "is this new?"
+// ============================================================================
+
+![test]
+function first_insert_returns_true() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    const inserted: boolean = s.insert(42);
+    return expect_true(inserted,
+        Str::from_raw("first insert should return true (new member)", 44));
+}
+
+![test]
+function redundant_insert_returns_false() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    s.insert(42);
+    const second: boolean = s.insert(42);
+    return expect_false(second,
+        Str::from_raw("repeated insert of same value should return false", 49));
+}
+
+![test]
+function distinct_inserts_each_return_true() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    const ok1: boolean = s.insert(1);
+    const ok2: boolean = s.insert(2);
+    const ok3: boolean = s.insert(3);
+    const len: u64 = s.length();
+    match (expect_true(ok1, Str::from_raw("insert(1)", 9))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ok2, Str::from_raw("insert(2)", 9))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ok3, Str::from_raw("insert(3)", 9))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(len, 3 as u64);
+}
+
+// ============================================================================
+// contains tracks insertion
+// ============================================================================
+
+![test]
+function contains_false_before_insert() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    const target: u32 = 7;
+    const present: boolean = s.contains(&target);
+    return expect_false(present,
+        Str::from_raw("contains on empty set should be false", 37));
+}
+
+![test]
+function contains_true_after_insert() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    const target: u32 = 7;
+    s.insert(target);
+    const present: boolean = s.contains(&target);
+    return expect_true(present,
+        Str::from_raw("contains should be true after insert", 36));
+}
+
+![test]
+function contains_false_for_other_value() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    s.insert(7);
+    const probe: u32 = 8;
+    const present: boolean = s.contains(&probe);
+    return expect_false(present,
+        Str::from_raw("contains(8) on set{7} should be false", 37));
+}
+
+// ============================================================================
+// remove
+// ============================================================================
+
+![test]
+function remove_present_returns_true() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    const target: u32 = 5;
+    s.insert(target);
+    const removed: boolean = s.remove(&target);
+    const len_after: u64 = s.length();
+    const still_present: boolean = s.contains(&target);
+    match (expect_true(removed,
+        Str::from_raw("remove of present member should return true", 43))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(len_after, 0 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(still_present,
+        Str::from_raw("contains should be false after remove", 37));
+}
+
+![test]
+function remove_absent_returns_false() -> Result<(), TestError> {
+    mut s: HashSet<u32> = HashSet::new();
+    s.insert(1);
+    const probe: u32 = 999;
+    const removed: boolean = s.remove(&probe);
+    const len_after: u64 = s.length();
+    match (expect_false(removed,
+        Str::from_raw("remove of absent member should return false", 43))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(len_after, 1 as u64);
+}
+
+// ============================================================================
+// String keys — exercises Hash + Eq for the `string` primitive
+// ============================================================================
+
+![test]
+function string_keys_match_by_value_not_pointer() -> Result<(), TestError> {
+    // `a` and `b` are independent string literals — same bytes, distinct
+    // pointers under most compilers.  HashSet must treat them as the
+    // same member.  This is the regression catcher for the original
+    // Utils::Map bug that motivated the Pair migration.
+    mut s: HashSet<string> = HashSet::new();
+    const a: string = "alpha";
+    const b: string = "alpha";
+
+    const first: boolean = s.insert(a);
+    const second: boolean = s.insert(b);
+    const len: u64 = s.length();
+    const present: boolean = s.contains(&b);
+
+    match (expect_true(first,
+        Str::from_raw("first 'alpha' should be new", 27))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(second,
+        Str::from_raw("duplicate 'alpha' should be rejected", 36))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(len, 1 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(present,
+        Str::from_raw("contains under a value-equal key should be true", 47));
+}
+
+// ============================================================================
+// Drop chain
+// ============================================================================
+
+![test]
+function explicit_drop_completes_cleanly() -> Result<(), TestError> {
+    // Pins that the SetMarker workaround for `HashMap<T, ()>` actually
+    // links — the drop chain goes `HashSet::drop` → `HashMap::drop` →
+    // `HashMap::clear` (with `value.drop()` on each entry, which lands
+    // on `SetMarker::drop` — a real, callable no-op).  Before the
+    // marker switch, this test would have failed at link time with
+    // LLVM verifier complaining about argument-count mismatch on the
+    // zero-sized `()` receiver.
+    mut s: HashSet<u32> = HashSet::new();
+    s.insert(1);
+    s.insert(2);
+    s.insert(3);
+    s.drop();
+    return Result::Ok(());
+}
+
+![test]
+function distinct_string_keys_are_distinct_members() -> Result<(), TestError> {
+    mut s: HashSet<string> = HashSet::new();
+    s.insert("alpha");
+    s.insert("beta");
+    s.insert("gamma");
+    const probe_alpha: string = "alpha";
+    const probe_missing: string = "delta";
+    const has_alpha: boolean = s.contains(&probe_alpha);
+    const has_missing: boolean = s.contains(&probe_missing);
+    const len: u64 = s.length();
+
+    match (expect_true(has_alpha,
+        Str::from_raw("should contain 'alpha'", 22))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(has_missing,
+        Str::from_raw("should NOT contain 'delta'", 26))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(len, 3 as u64);
+}

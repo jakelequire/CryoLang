@@ -5,14 +5,22 @@
 ///! assertion can propagate by an explicit `match` (Cryo has no `?`
 ///! operator yet).
 ///!
-///! Two flavours:
+///! Families:
 ///!
 ///! * `expect(condition, message)` and `bail(message)` — the no-format
 ///!   path. Cheapest to call; the message is whatever the test author
-///!   wrote verbatim.
-///! * `expect_eq` / `expect_ne` — the comparison helpers. Build a
-///!   formatted "left vs. right" message via `Display`, so the failure
-///!   diagnostic shows the actual values that disagreed.
+///!   wrote verbatim. `expect_true` / `expect_false` are readability
+///!   aliases.
+///! * `expect_eq` / `expect_ne` — comparison helpers for `T: Eq + Display`.
+///!   Build a "left vs. right" failure message so the diagnostic shows
+///!   the actual values that disagreed.
+///! * `expect_close_f64(a, b, tolerance)` — approximate equality for
+///!   floats. Replaces the per-test `within(a, b, eps)` helper every
+///!   math test used to roll on its own.
+///! * `expect_some` / `expect_none` — check shape of an `Option<T>`
+///!   without consuming it (takes `&Option<T>`). The caller still owns
+///!   the option and decides whether to drop it.
+///! * `expect_ok`   / `expect_err`  — same idea for `Result<T, E>`.
 ///!
 ///! Test code with no `?` operator looks like:
 ///!
@@ -128,4 +136,105 @@ where T: Display {
         }
     }
     return TestError::Failed(buf);
+}
+
+// ============================================================================
+// expect_true / expect_false — readability aliases over `expect`
+// ============================================================================
+
+/// Same as `expect`. Exists so the spelling at the call site matches the
+/// intent ("is this true?") rather than mentioning the word `expect`
+/// twice in a row.
+function expect_true(condition: boolean, message: Str) -> Result<(), TestError> {
+    return expect(condition, message);
+}
+
+/// Mirror of `expect_true`. `expect_false(condition, msg)` is clearer
+/// than `expect(!condition, msg)` at a call site dominated by negative
+/// assertions.
+function expect_false(condition: boolean, message: Str) -> Result<(), TestError> {
+    if (!condition) {
+        return Result::Ok(());
+    }
+    return Result::Err(TestError::failed(message));
+}
+
+// ============================================================================
+// expect_close_f64 — approximate float equality
+// ============================================================================
+
+/// `Ok(())` iff `|a - b| <= tolerance`. Use this in place of `expect_eq`
+/// whenever floats are involved — `expect_eq` would route through
+/// `f64::equals`, which is exact-bit comparison and disagrees with every
+/// useful definition of "approximately the same".
+///
+/// `tolerance` must be non-negative; passing a negative value will make
+/// every comparison fail.
+///
+/// On failure the message renders the actual values and the tolerance.
+function expect_close_f64(a: f64, b: f64, tolerance: f64) -> Result<(), TestError> {
+    const diff: f64 = if (a > b) { a - b } else { b - a };
+    if (diff <= tolerance) {
+        return Result::Ok(());
+    }
+    mut buf: String = String::new();
+    buf.push_str(Str::from_raw("assertion `|left - right| <= tolerance` failed\n  left:      ", 60));
+    match (format_to_string(&a)) {
+        Result::Ok(mut left_str) => { buf.push_str(left_str.as_str()); }
+        Result::Err(_)           => { buf.push_str(Str::from_raw("<format error>", 14)); }
+    }
+    buf.push_str(Str::from_raw("\n  right:     ", 14));
+    match (format_to_string(&b)) {
+        Result::Ok(mut right_str) => { buf.push_str(right_str.as_str()); }
+        Result::Err(_)            => { buf.push_str(Str::from_raw("<format error>", 14)); }
+    }
+    buf.push_str(Str::from_raw("\n  tolerance: ", 14));
+    match (format_to_string(&tolerance)) {
+        Result::Ok(mut tol_str) => { buf.push_str(tol_str.as_str()); }
+        Result::Err(_)          => { buf.push_str(Str::from_raw("<format error>", 14)); }
+    }
+    return Result::Err(TestError::Failed(buf));
+}
+
+// ============================================================================
+// expect_some / expect_none — Option shape checks (non-consuming)
+// ============================================================================
+
+/// `Ok(())` if `opt` is `Some(_)`. Takes a borrow so the test still owns
+/// the option afterwards — important for `Option<T>` where `T: Drop`,
+/// because the test author is responsible for dropping it.
+function expect_some<T>(opt: &Option<T>, message: Str) -> Result<(), TestError> {
+    if (opt.is_some()) {
+        return Result::Ok(());
+    }
+    return Result::Err(TestError::failed(message));
+}
+
+/// `Ok(())` if `opt` is `None`.
+function expect_none<T>(opt: &Option<T>, message: Str) -> Result<(), TestError> {
+    if (opt.is_none()) {
+        return Result::Ok(());
+    }
+    return Result::Err(TestError::failed(message));
+}
+
+// ============================================================================
+// expect_ok / expect_err — Result shape checks (non-consuming)
+// ============================================================================
+
+/// `Ok(())` if `r` is `Ok(_)`. Takes a borrow so the caller still owns
+/// the result.
+function expect_ok<T, E>(r: &Result<T, E>, message: Str) -> Result<(), TestError> {
+    if (r.is_ok()) {
+        return Result::Ok(());
+    }
+    return Result::Err(TestError::failed(message));
+}
+
+/// `Ok(())` if `r` is `Err(_)`.
+function expect_err<T, E>(r: &Result<T, E>, message: Str) -> Result<(), TestError> {
+    if (r.is_err()) {
+        return Result::Ok(());
+    }
+    return Result::Err(TestError::failed(message));
 }

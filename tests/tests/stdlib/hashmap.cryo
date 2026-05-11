@@ -6,6 +6,7 @@ namespace CryoTests::Tests::Stdlib::HashMapT;
 import std::core::result;
 import std::core::option;
 import std::collections::hashmap;
+import std::collections::str;
 import std::test::error;
 import std::test::assert;
 
@@ -152,4 +153,71 @@ function remove_missing_returns_none() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     return Result::Ok(());
+}
+
+// ============================================================================
+// String keys — the historical breakage that drove the Pair migration
+//
+// Once upon a time, `utils::Map<string, V>` was indexed by raw pointer
+// equality, which silently misbehaved when two value-equal string
+// literals lived in different ROData slots.  `HashMap` routes through
+// `Hash + Eq for string` instead, so value-equal keys with different
+// pointers find each other.  These tests pin that contract.
+// ============================================================================
+
+![test]
+function string_keys_lookup_by_value() -> Result<(), TestError> {
+    mut m: HashMap<string, i32> = HashMap::new();
+    const probe_key: string = "alpha";
+    m.insert(probe_key, 42);
+
+    // A separate "alpha" literal — different RIP-relative address in
+    // the binary, same bytes.  If the hash/eq path used pointers, this
+    // get() would return None.
+    const same_value_distinct_token: string = "alpha";
+    const got: Option<i32> = m.get(&same_value_distinct_token);
+    m.drop();
+    return expect_eq(got.unwrap_or(-1), 42);
+}
+
+![test]
+function string_keys_distinct_values_stay_distinct() -> Result<(), TestError> {
+    mut m: HashMap<string, i32> = HashMap::new();
+    m.insert("name", 1);
+    m.insert("count", 2);
+    m.insert("flag", 3);
+
+    const k_name: string = "name";
+    const k_count: string = "count";
+    const k_missing: string = "nothere";
+
+    const v_name: i32 = m.get(&k_name).unwrap_or(-1);
+    const v_count: i32 = m.get(&k_count).unwrap_or(-1);
+    const missing: Option<i32> = m.get(&k_missing);
+    const has_missing: boolean = missing.is_some();
+    m.drop();
+
+    match (expect_eq(v_name, 1)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v_count, 2)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(has_missing,
+        Str::from_raw("a key not inserted should not be findable", 41));
+}
+
+![test]
+function string_keys_insert_replaces_existing() -> Result<(), TestError> {
+    mut m: HashMap<string, i32> = HashMap::new();
+    m.insert("counter", 10);
+    const prev: Option<i32> = m.insert("counter", 20);
+    const k: string = "counter";
+    const new_val: Option<i32> = m.get(&k);
+    m.drop();
+
+    match (expect_eq(prev.unwrap_or(-1), 10)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(new_val.unwrap_or(-1), 20);
 }

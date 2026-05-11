@@ -1,0 +1,200 @@
+///! core::hash — DefaultHasher (FNV-1a) and primitive Hash impls.
+///!
+///! Three invariants every Hash impl must respect:
+///!
+///!   1. **Determinism.** Hashing the same value through two fresh
+///!      `DefaultHasher`s produces the same digest.  HashMap correctness
+///!      relies on this.
+///!   2. **Discrimination.** Hashing two value-distinct inputs through
+///!      fresh hashers MUST produce different digests for the test
+///!      vectors we choose here.  FNV-1a doesn't promise collision
+///!      resistance in general, but the small handful of inputs below
+///!      are far apart in input-space.
+///!   3. **Eq-Hash consistency.** Values that compare equal under `Eq`
+///!      must hash to the same digest.  This is what makes
+///!      `HashMap<string, V>` work with literal-pointer-distinct keys.
+///!
+///! All assertions hash through `DefaultHasher` because that's the
+///! hasher HashMap and HashSet use under the hood — bugs in either
+///! the primitive Hash impls or in FNV-1a's update step would surface
+///! here before they surface as bizarre `HashMap` misses.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HashT;
+
+import std::core::result;
+import std::core::hash;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// Convenience helper — hash a single value through a fresh hasher and
+// return its finalized digest.  Every test below builds on this.
+function hash_of_u32(value: u32) -> u64 {
+    mut h: DefaultHasher = DefaultHasher::new();
+    value.hash(&h);
+    return h.finish();
+}
+
+function hash_of_u64(value: u64) -> u64 {
+    mut h: DefaultHasher = DefaultHasher::new();
+    value.hash(&h);
+    return h.finish();
+}
+
+function hash_of_bool(value: boolean) -> u64 {
+    mut h: DefaultHasher = DefaultHasher::new();
+    value.hash(&h);
+    return h.finish();
+}
+
+function hash_of_string(value: string) -> u64 {
+    mut h: DefaultHasher = DefaultHasher::new();
+    value.hash(&h);
+    return h.finish();
+}
+
+// ============================================================================
+// Determinism — same input, same digest
+// ============================================================================
+
+![test]
+function u32_hash_is_deterministic() -> Result<(), TestError> {
+    const a: u64 = hash_of_u32(42);
+    const b: u64 = hash_of_u32(42);
+    return expect_eq(a, b);
+}
+
+![test]
+function u64_hash_is_deterministic() -> Result<(), TestError> {
+    const v: u64 = 0xCAFEBABEDEADBEEF;
+    const a: u64 = hash_of_u64(v);
+    const b: u64 = hash_of_u64(v);
+    return expect_eq(a, b);
+}
+
+![test]
+function string_hash_is_deterministic() -> Result<(), TestError> {
+    const a: u64 = hash_of_string("cryo");
+    const b: u64 = hash_of_string("cryo");
+    return expect_eq(a, b);
+}
+
+![test]
+function bool_hash_is_deterministic() -> Result<(), TestError> {
+    const ta: u64 = hash_of_bool(true);
+    const tb: u64 = hash_of_bool(true);
+    const fa: u64 = hash_of_bool(false);
+    const fb: u64 = hash_of_bool(false);
+    match (expect_eq(ta, tb)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(fa, fb);
+}
+
+// ============================================================================
+// Discrimination — distinct inputs, distinct digests (for these vectors)
+// ============================================================================
+
+![test]
+function distinct_u32_values_hash_differently() -> Result<(), TestError> {
+    // Far-apart 32-bit inputs.  If these collide, FNV-1a is broken or
+    // the u32 → 8-byte LE feed is misordered.
+    const h0: u64 = hash_of_u32(0);
+    const h1: u64 = hash_of_u32(1);
+    const h_max: u64 = hash_of_u32(0xFFFFFFFF);
+    match (expect_ne(h0, h1)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_ne(h0, h_max);
+}
+
+![test]
+function distinct_strings_hash_differently() -> Result<(), TestError> {
+    // Three semantically-distinct keys.  Bug catch: if `Hash for string`
+    // ever stops reading bytes past index 0 or stops at a too-early
+    // sentinel, "alpha" and "alpha-extended" could collide.
+    const h_a: u64 = hash_of_string("alpha");
+    const h_b: u64 = hash_of_string("beta");
+    const h_c: u64 = hash_of_string("alpha-extended");
+    match (expect_ne(h_a, h_b)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_ne(h_a, h_c);
+}
+
+![test]
+function true_and_false_hash_differently() -> Result<(), TestError> {
+    const ht: u64 = hash_of_bool(true);
+    const hf: u64 = hash_of_bool(false);
+    return expect_ne(ht, hf);
+}
+
+// ============================================================================
+// Eq-Hash consistency — equal values hash the same
+// ============================================================================
+
+![test]
+function value_equal_string_literals_hash_equal() -> Result<(), TestError> {
+    // The big one.  Two literal "alpha" tokens may sit in different
+    // ROData slots (the compiler is free to dedupe or not), so the
+    // raw pointers differ.  Their byte contents agree, so the Hash
+    // impl for `string` must read bytes and produce the same digest.
+    const a: string = "alpha";
+    const b: string = "alpha";
+    const ha: u64 = hash_of_string(a);
+    const hb: u64 = hash_of_string(b);
+    return expect_eq(ha, hb);
+}
+
+![test]
+function eq_u64_values_hash_equal() -> Result<(), TestError> {
+    const v: u64 = 0x123456789ABCDEF0;
+    const ha: u64 = hash_of_u64(v);
+    const hb: u64 = hash_of_u64(v);
+    return expect_eq(ha, hb);
+}
+
+// ============================================================================
+// FNV-1a empty-input invariant — fresh hasher finalizes to its offset basis
+// ============================================================================
+
+![test]
+function fresh_hasher_finalizes_to_offset_basis() -> Result<(), TestError> {
+    // An untouched DefaultHasher has state = FNV offset basis
+    // 14695981039346656037.  Calling `finish` without feeding any bytes
+    // should report exactly that — proves the constructor wires the
+    // basis correctly and `finish` doesn't accidentally mix in a
+    // sentinel.
+    const h: DefaultHasher = DefaultHasher::new();
+    const got: u64 = h.finish();
+    const want: u64 = 14695981039346656037;
+    return expect_eq(got, want);
+}
+
+// ============================================================================
+// Byte order — confirm we feed integers little-endian
+// ============================================================================
+
+![test]
+function u32_hash_matches_byte_feed() -> Result<(), TestError> {
+    // Independently hash 0x04030201 as a u32, and hash the same four
+    // bytes 0x01, 0x02, 0x03, 0x04 (LE) one at a time through
+    // `write_u8` — and then four more zero bytes since u32 is hashed
+    // as u64-LE via `hash_u64_le`.  The two digests must match.
+    const value: u32 = 0x04030201;
+    const via_trait: u64 = hash_of_u32(value);
+
+    mut h: DefaultHasher = DefaultHasher::new();
+    h.write_u8(0x01 as u8);
+    h.write_u8(0x02 as u8);
+    h.write_u8(0x03 as u8);
+    h.write_u8(0x04 as u8);
+    h.write_u8(0x00 as u8);
+    h.write_u8(0x00 as u8);
+    h.write_u8(0x00 as u8);
+    h.write_u8(0x00 as u8);
+    const manual: u64 = h.finish();
+
+    return expect_eq(via_trait, manual);
+}

@@ -1,0 +1,186 @@
+///! core::clone + core::default — primitive impls and user-defined types.
+///!
+///! `Clone` produces an independent copy.  `Default` returns the
+///! canonical zero value.  Both are basic traits; what's worth pinning
+///! is that every primitive width has an impl, that the impls are
+///! callable through a `where T: Clone` / `where T: Default` bound
+///! from generic code, and that a user-defined `Clone` impl threads
+///! through the trait dispatcher correctly.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::CloneDefaultT;
+
+import std::core::result;
+import std::core::clone;
+import std::core::default;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// Clone — primitives
+// ============================================================================
+
+![test]
+function clone_i32_yields_equal_value() -> Result<(), TestError> {
+    const a: i32 = 42;
+    const b: i32 = a.clone();
+    return expect_eq(b, a);
+}
+
+![test]
+function clone_u64_high_bit() -> Result<(), TestError> {
+    // 2^63 — a u64 whose value would sign-extend wrong if Clone for
+    // u64 routed through a narrower type.
+    const a: u64 = 9223372036854775808;
+    const b: u64 = a.clone();
+    return expect_eq(b, a);
+}
+
+![test]
+function clone_boolean_round_trips() -> Result<(), TestError> {
+    const ta: boolean = true;
+    const fa: boolean = false;
+    match (expect_true(ta.clone(),
+        Str::from_raw("true.clone() should be true", 27))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_false(fa.clone(),
+        Str::from_raw("false.clone() should be false", 29));
+}
+
+![test]
+function clone_char_preserves_byte() -> Result<(), TestError> {
+    const a: char = 'Z';
+    const b: char = a.clone();
+    // Compare via u8 image — char Eq routes the same way.
+    return expect_eq(b as u8, a as u8);
+}
+
+// ============================================================================
+// Clone — through a generic bound
+// ============================================================================
+
+function dup_via_bound<T>(value: T) -> T
+where T: Clone {
+    return value.clone();
+}
+
+![test]
+function generic_clone_dispatch_i32() -> Result<(), TestError> {
+    const a: i32 = 7;
+    const b: i32 = dup_via_bound(a);
+    return expect_eq(b, a);
+}
+
+![test]
+function generic_clone_dispatch_u64() -> Result<(), TestError> {
+    const a: u64 = 1234567890;
+    const b: u64 = dup_via_bound(a);
+    return expect_eq(b, a);
+}
+
+// ============================================================================
+// Clone — user-defined impl
+// ============================================================================
+
+type struct Boxed {
+    x: i32;
+    y: i32;
+}
+
+implement trait Clone for struct Boxed {
+    clone(&this) -> Boxed {
+        return Boxed { x: this.x, y: this.y };
+    }
+}
+
+![test]
+function user_clone_returns_independent_copy() -> Result<(), TestError> {
+    const a: Boxed = Boxed { x: 3, y: 4 };
+    const b: Boxed = a.clone();
+    match (expect_eq(b.x, 3)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(b.y, 4);
+}
+
+![test]
+function user_clone_via_generic_bound() -> Result<(), TestError> {
+    const a: Boxed = Boxed { x: 99, y: 100 };
+    const b: Boxed = dup_via_bound(a);
+    match (expect_eq(b.x, 99)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(b.y, 100);
+}
+
+// ============================================================================
+// Default — primitives
+// ============================================================================
+
+![test]
+function default_i32_is_zero() -> Result<(), TestError> {
+    return expect_eq(i32::default(), 0);
+}
+
+![test]
+function default_u64_is_zero() -> Result<(), TestError> {
+    const got: u64 = u64::default();
+    const want: u64 = 0;
+    return expect_eq(got, want);
+}
+
+![test]
+function default_boolean_is_false() -> Result<(), TestError> {
+    return expect_false(boolean::default(),
+        Str::from_raw("default(boolean) should be false", 32));
+}
+
+![test]
+function default_char_is_nul() -> Result<(), TestError> {
+    return expect_eq(char::default() as u8, 0 as u8);
+}
+
+// ============================================================================
+// Default — through a generic bound (fixed 2026-05-10)
+//
+// The substituter now rewrites the bare generic-param scope name when
+// monomorphizing.  `T::default()` inside `fn f<T>() where T: Default`
+// becomes `i32::default()` after substitution with T=i32, which sema's
+// regular static-method resolver can handle.
+// ============================================================================
+
+function zero_of<T>() -> T
+where T: Default {
+    return T::default();
+}
+
+// `zero_of` has no value-typed parameters, so call-site type inference
+// can't bind T from arguments.  Cryo doesn't yet have a turbofish
+// (`zero_of::<i32>()`) syntax for explicit instantiation, so we route
+// the generic call through a witness-arg helper to bind T concretely
+// at the call site without changing zero_of's signature.
+
+function pick_default_for_kind<T>(_witness: T) -> T
+where T: Default {
+    return T::default();
+}
+
+![test]
+function generic_default_dispatch_i32() -> Result<(), TestError> {
+    const z: i32 = pick_default_for_kind(0);
+    return expect_eq(z, 0);
+}
+
+![test]
+function generic_default_dispatch_u64() -> Result<(), TestError> {
+    const witness: u64 = 1;
+    const z: u64 = pick_default_for_kind(witness);
+    return expect_eq(z, 0 as u64);
+}
+
+![test]
+function generic_default_dispatch_boolean() -> Result<(), TestError> {
+    const z: boolean = pick_default_for_kind(true);
+    return expect_false(z, Str::from_raw("default(boolean) should be false", 32));
+}
