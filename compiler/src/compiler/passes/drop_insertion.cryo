@@ -44,6 +44,7 @@ import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
+import Compiler::DeclIndex;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Types;
@@ -251,7 +252,30 @@ type struct DropInserter {
     // ---- type queries ----------------------------------------------------
 
     is_copy(&this, ty: TypeRef) -> boolean {
-        return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
+        if (OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty)) {
+            // OwnershipQuery's Copy determination treats a struct/class
+            // as Copy when no `impl Drop` is registered and no inherent
+            // `drop` is visible through the template/inherent-owner
+            // indices.  Plain non-generic user types with an inline
+            // `drop` method are invisible to that path; consult the
+            // DeclarationIndex to catch them — if the type has a `drop`
+            // entry there, it owns a destructor and is not Copy.
+            return !this.type_has_drop_via_decl_index_const(ty);
+        }
+        return false;
+    }
+
+    /// Const-receiver counterpart to `type_has_drop_via_decl_index` for
+    /// callers that hold a `&this` (e.g., the Copy classifier).
+    type_has_drop_via_decl_index_const(&this, ty: TypeRef) -> boolean {
+        if (this.ctx == null) { return false; }
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        if (di == null) { return false; }
+        if (this.arena == null) { return false; }
+        const qname: SymbolStr = OwnershipQuery::qualified_name_of(this.arena, ty);
+        if (!qname.is_valid()) { return false; }
+        const ret_ty: TypeRef = di.lookup_method_return(qname, this.drop_sym);
+        return ret_ty.is_valid();
     }
 
     lookup_type(&this, name: SymbolStr) -> TypeRef {
@@ -917,10 +941,19 @@ type struct DropInserter {
         // types, but possible for primitives that escape Copy through
         // an alias).  Skip in that case — emitting a `.drop()` on a
         // type without a drop method would fail at codegen.
+        //
+        // The OwnershipQuery paths cover generic types (template
+        // registry) and non-generic types that own at least one generic
+        // method (inherent-owner registry).  Plain non-generic user
+        // structs/classes with only non-generic methods aren't in
+        // either, so fall back to the DeclarationIndex which sema
+        // populates for every (type, method) pair regardless of
+        // generics shape.
         if (!OwnershipQuery::has_inherent_drop(this.arena, this.registry,
                                                 this.intern, ty) &&
             !OwnershipQuery::type_implements_drop(this.arena, this.registry,
-                                                    this.intern, ty)) {
+                                                    this.intern, ty) &&
+            !this.type_has_drop_via_decl_index(ty)) {
             return;
         }
         const sym: SymbolStr = SymbolStr::from_id(key);
@@ -929,6 +962,23 @@ type struct DropInserter {
             out.push(stmt);
             this.inserted = this.inserted + 1;
         }
+    }
+
+    /// Fallback drop-method probe for non-generic user types without
+    /// any generic methods — these aren't registered in either the
+    /// template or inherent-owner index, so OwnershipQuery's two paths
+    /// both miss.  The DeclarationIndex carries one method-signature
+    /// entry per (type, method) regardless of generics, so a hit there
+    /// is a reliable indicator that the type defines `drop`.
+    type_has_drop_via_decl_index(mut &this, ty: TypeRef) -> boolean {
+        if (this.ctx == null) { return false; }
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        if (di == null) { return false; }
+        if (this.arena == null) { return false; }
+        const qname: SymbolStr = OwnershipQuery::qualified_name_of(this.arena, ty);
+        if (!qname.is_valid()) { return false; }
+        const ret_ty: TypeRef = di.lookup_method_return(qname, this.drop_sym);
+        return ret_ty.is_valid();
     }
 
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).

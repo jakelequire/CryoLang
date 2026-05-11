@@ -28,6 +28,7 @@ import Compiler::Types::Compound;
 import Compiler::Types::UserDefined;
 import Compiler::Types::Generic;
 import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
 import Compiler::Types::Resolver;
 import Compiler::AST;
 import Compiler::AST::Node;
@@ -3841,6 +3842,70 @@ public:
 
     /// Delete expression (heap free) — direct dispatch.
     override visit(mut &this, node: DeleteExprNode*) -> void {
+        // `delete ptr` is the manual-memory dual of an end-of-scope drop:
+        //   1. Run the pointee's drop method, if it has one.
+        //   2. Free the allocation.
+        // The drop call is synthesized as `operand.drop()` and routed
+        // through the normal method-dispatch path so trait `Drop` impls,
+        // inherent `drop`, and virtual class destructors all reach the
+        // right symbol.  The operand expression is then evaluated a
+        // second time for the free — safe for identifiers and member
+        // access on locals (the common case) but the caller should avoid
+        // side-effecting operands like `delete some_fn()`.
+        const operand_type: TypeRef = node.operand.resolved_type;
+        const arena_ptr: TypeArena* = this.cg.get_arena();
+        const intern_ptr: InternTable* = this.cg.get_intern();
+        const registry_ptr: GenericRegistry* = this.cg.ctx.generic_registry;
+
+        mut pointee: TypeRef = TypeRef::invalid();
+        if (operand_type.is_valid() && arena_ptr != null) {
+            const ot: Type* = arena_ptr.lookup(operand_type.id);
+            if (ot != null && ot.kind == TypeKind::Pointer) {
+                const pt: PointerType* = ot as PointerType*;
+                pointee = pt.pointee;
+            }
+        }
+
+        mut should_drop: boolean = false;
+        if (pointee.is_valid() && arena_ptr != null && registry_ptr != null
+                && intern_ptr != null) {
+            should_drop =
+                OwnershipQuery::has_inherent_drop(arena_ptr, registry_ptr,
+                                                    intern_ptr, pointee)
+                || OwnershipQuery::type_implements_drop(arena_ptr, registry_ptr,
+                                                        intern_ptr, pointee);
+        }
+
+        // Fallback for non-generic user types without generic methods:
+        // those aren't registered as templates or inherent owners, so
+        // OwnershipQuery returns false even when a `drop` method exists
+        // on the struct/class.  Consult the DeclarationIndex directly,
+        // which is populated for every type with a method signature.
+        if (!should_drop && pointee.is_valid() && arena_ptr != null
+                && intern_ptr != null && this.cg.ctx != null) {
+            const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena_ptr, pointee);
+            if (qname.is_valid() && this.cg.ctx.decl_index != null) {
+                const drop_sym: SymbolStr = intern_ptr.intern("drop");
+                const ret_ty: TypeRef = this.cg.ctx.decl_index.lookup_method_return(
+                    qname, drop_sym);
+                if (ret_ty.is_valid()) {
+                    should_drop = true;
+                }
+            }
+        }
+
+        if (should_drop) {
+            const drop_sym: SymbolStr = intern_ptr.intern("drop");
+            mut member: MemberAccessNode* = new MemberAccessNode(
+                node.operand, drop_sym, node.span, node.span);
+            member.set_resolved_type(TypeRef::invalid());
+            mut call: CallExprNode* = new CallExprNode(
+                member as ExpressionNode*, node.span);
+            mut stmt: ExprStmtNode* = new ExprStmtNode(
+                call as ExpressionNode*, node.span);
+            stmt.accept(this);
+        }
+
         const ptr: LValue = this.codegen_rvalue(node.operand);
         const free_fn: LValue = resolve_function(this.cg, this.cg.intern_str("free"));
         if (free_fn.is_valid() && ptr.is_valid()) {
@@ -4002,6 +4067,60 @@ public:
 
         // Load and return the complete enum value.
         return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
+    }
+
+
+    // ========================================================================
+    // Unsupported AST node kinds
+    // ========================================================================
+    //
+    // The parser builds these nodes for syntactic completeness, but no
+    // codegen lowering exists yet.  Without these overrides the default
+    // no-op in BaseASTVisitor leaves `last_value` stale from the previous
+    // expression, which the caller would silently consume — a real
+    // miscompile vector.  Emit a clear diagnostic instead and clear
+    // `last_value` so downstream code fails loudly rather than wrongly.
+
+    override visit(mut &this, node: AwaitExprNode*) -> void {
+        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+            "codegen: 'await' expressions are not implemented",
+            node.span);
+        this.last_value     = LValue::null();
+        this.last_is_lvalue = false;
+    }
+
+    override visit(mut &this, node: YieldExprNode*) -> void {
+        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+            "codegen: 'yield' expressions are not implemented",
+            node.span);
+        this.last_value     = LValue::null();
+        this.last_is_lvalue = false;
+    }
+
+    override visit(mut &this, node: TypeofExprNode*) -> void {
+        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+            "codegen: 'typeof' expressions are not implemented",
+            node.span);
+        this.last_value     = LValue::null();
+        this.last_is_lvalue = false;
+    }
+
+    override visit(mut &this, node: DoWhileStmtNode*) -> void {
+        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+            "codegen: 'do { ... } while (...)' statements are not implemented; use 'while' or 'loop' instead",
+            node.span);
+    }
+
+    override visit(mut &this, node: SwitchStmtNode*) -> void {
+        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+            "codegen: 'switch' statements are not implemented; use 'match' instead",
+            node.span);
+    }
+
+    override visit(mut &this, node: CaseStmtNode*) -> void {
+        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+            "codegen: 'case' statements are not implemented; use 'match' arms instead",
+            node.span);
     }
 }
 
