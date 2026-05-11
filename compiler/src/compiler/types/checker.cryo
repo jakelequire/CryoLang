@@ -369,24 +369,19 @@ type struct TypeChecker {
             }
         }
 
-        // void → T* (null literal): void value used as null pointer
-        if (from_type.kind == TypeKind::Void && to_type.kind == TypeKind::Pointer) {
-            return TypeCompatibility::ImplicitConvert;
-        }
+        // NOTE: `void → T*` is intentionally NOT an implicit conversion.
+        // The `null` literal is typed as `void*` (Pointer to Void), so
+        // assigning `null` to any pointer type flows through the
+        // existing `void* ↔ T*` rule in the Pointer↔Pointer branch
+        // above.  Arbitrary void-typed expressions (function results,
+        // etc.) must use an explicit `as` cast.
 
-        // u64 ↔ pointer: pointer-sized integer conversions
-        if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Pointer) {
-            const from_int: IntType* = from_type as IntType*;
-            if (from_int.bit_width() == 64) {
-                return TypeCompatibility::ImplicitConvert;
-            }
-        }
-        if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Int) {
-            const to_int: IntType* = to_type as IntType*;
-            if (to_int.bit_width() == 64) {
-                return TypeCompatibility::ImplicitConvert;
-            }
-        }
+        // NOTE: `u64 ↔ Pointer` is intentionally NOT implicit.  Every
+        // pointer-sized integer round-trip must use `as` — typically in
+        // FFI shims and intrinsics that exchange addresses with
+        // syscall ABIs.  The C-style implicit coercion silently elides
+        // intent at every call site; making it explicit is one of the
+        // 1.0 semantic locks.
 
         // &T → T* (reference to pointer coercion)
         if (from_type.kind == TypeKind::Reference && to_type.kind == TypeKind::Pointer) {
@@ -413,24 +408,26 @@ type struct TypeChecker {
             }
         }
 
-        // T → &T / T → &mut T (auto-referencing for method chaining)
-        if (to_type.kind == TypeKind::Reference) {
-            const to_ref: ReferenceType* = to_type as ReferenceType*;
-            if (effective_from.equals(to_ref.referent)) {
-                return TypeCompatibility::ImplicitConvert;
-            }
-        }
+        // NOTE: blanket `T → &T` auto-referencing is intentionally NOT
+        // an implicit conversion in general.  Method-receiver
+        // auto-referencing (so `value.method()` resolves a `&this`
+        // signature) goes through method dispatch, not
+        // check_compatibility.  Allowing it here would silently take
+        // the address of any local in plain assignment contexts and
+        // freeze a design decision that blocks any future borrow
+        // checker — explicit `&value` is required.
 
-        // Bool coercion: integers, chars, pointers, enums → boolean (implicit)
-        // Mirrors C-style truthiness: any integer/char/pointer/enum can be tested for truth.
-        // Floats → boolean require explicit cast (prevents silent `const z: boolean = 3.14;`).
+        // Bool coercion: integers, chars, pointers, enums → boolean (implicit).
+        // Struct and Class are intentionally excluded — there is no
+        // defined truthiness for an arbitrary aggregate, so
+        // `if (some_struct)` must use an explicit field check.
+        // Floats → boolean require an explicit cast (prevents silent
+        // `const z: boolean = 3.14;`).
         if (to_type.kind == TypeKind::Bool) {
             if (from_type.kind == TypeKind::Int ||
                 from_type.kind == TypeKind::Char ||
                 from_type.kind == TypeKind::Pointer ||
-                from_type.kind == TypeKind::Enum ||
-                from_type.kind == TypeKind::Struct ||
-                from_type.kind == TypeKind::Class) {
+                from_type.kind == TypeKind::Enum) {
                 return TypeCompatibility::ImplicitConvert;
             }
             if (from_type.kind == TypeKind::Float) {
