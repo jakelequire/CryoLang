@@ -12,13 +12,19 @@
 ///!
 ///! NaN / ±Infinity / ±0 are all handled explicitly. Negative zero
 ///! prints as `-0` so the sign isn't lost.
+///!
+///! The public API is `f64.to_buf(buffer)` / `f64.to_buf_with(buffer,
+///! decimals)` — extension methods on the primitive. Integer formatting
+///! lives in `core::primitives`; this file is float-only because the
+///! implementation needs `libm` (fabs / log10 / __isnan / __isinf) which
+///! `core` deliberately doesn't depend on.
 
 namespace std::fmt::float;
 
 import core::intrinsics;
+import core::primitives;
 import core::slice;
 import ffi::libc;
-import fmt::integer;
 
 /// Default fractional digits for fixed-point output.
 const DEFAULT_DECIMALS: u64 = 6;
@@ -29,64 +35,94 @@ const LARGE_THRESHOLD: f64 = 1.0e16;
 /// Below this magnitude (and nonzero), switch to scientific.
 const SMALL_THRESHOLD: f64 = 1.0e-4;
 
-/// Largest buffer any of the writers below will ever touch. A
-/// scientific-notation f64 with 6 fractional digits and a 4-digit
-/// exponent fits well inside this. Callers who stack-allocate pick
-/// this size.
+/// Largest buffer the writers below will ever touch. A scientific-notation
+/// f64 with 6 fractional digits and a 4-digit exponent fits well inside
+/// this. Callers who stack-allocate pick this size.
 const F64_MAX_DIGITS: u64 = 32;
 
-// libm bindings live in `ffi::libc`; this file uses fabs / floor /
-// log10 / pow / __isnan / __isinf via the `libc::` prefix.
-
 // ============================================================================
-// Public entry points
+// Extension methods on f32 — widen to f64 and delegate.
+//
+// `f32 -> f64` is a free widening cast (no precision loss), so the
+// digit logic only lives in one place. Callers that need a true f32-
+// specific shortest-round-trip representation will get one when the
+// f64 path itself gains Grisu/Ryu — same future work, same code path.
 // ============================================================================
 
-/// Write `value` into `buffer`. Returns bytes written. `buffer` must
-/// hold at least `F64_MAX_DIGITS` bytes.
-///
-/// Named `write_f64_buffer` (not `write_f64`) so the qualified call
-/// `float::write_f64_buffer` at higher layers doesn't collide with
-/// `fmt::display`'s own `write_float64<W>` wrapper — name-resolution
-/// inside generic bodies has historically tripped on that.
-function write_f64_buffer(buffer: u8*, value: f64) -> u64 {
-    return write_f64_buffer_with(buffer, value, DEFAULT_DECIMALS);
+implement f32 {
+    to_buf(&this, buffer: u8*) -> u64 {
+        const v: f64 = this as f64;
+        return v.to_buf(buffer);
+    }
+
+    to_buf_with(&this, buffer: u8*, decimals: u64) -> u64 {
+        const v: f64 = this as f64;
+        return v.to_buf_with(buffer, decimals);
+    }
+
+    is_negative_zero(&this) -> boolean {
+        const v: f64 = this as f64;
+        return v.is_negative_zero();
+    }
 }
 
-/// Variant with caller-chosen precision. `decimals` applies to the
-/// fixed-point form and to the mantissa of the scientific form.
-function write_f64_buffer_with(buffer: u8*, value: f64, decimals: u64) -> u64 {
-    if (libc::__isnan(value) != 0) {
-        return write_literal(buffer, "NaN", 3);
+// ============================================================================
+// Extension methods on f64
+// ============================================================================
+
+implement f64 {
+    /// IEEE 754: `-0.0` has bit pattern 0x8000_0000_0000_0000. The cheap
+    /// check is `1.0 / v == -Infinity`, but we'd rather not divide; the
+    /// direct comparison relies on `value == 0.0` being true for both
+    /// ±0 while the sign bit still drives the output branch.
+    is_negative_zero(&this) -> boolean {
+        if (this != 0.0) { return false; }
+        // `1.0 / 0.0` is +Infinity, `1.0 / -0.0` is -Infinity.
+        return (1.0 / this) < 0.0;
     }
-    if (libc::__isinf(value) != 0) {
-        if (value < 0.0) {
-            return write_literal(buffer, "-inf", 4);
+
+    /// Write `this` into `buffer`. Returns bytes written. `buffer` must
+    /// hold at least `F64_MAX_DIGITS` bytes.
+    to_buf(&this, buffer: u8*) -> u64 {
+        return this.to_buf_with(buffer, DEFAULT_DECIMALS);
+    }
+
+    /// Variant with caller-chosen precision. `decimals` applies to the
+    /// fixed-point form and to the mantissa of the scientific form.
+    to_buf_with(&this, buffer: u8*, decimals: u64) -> u64 {
+        const value: f64 = this;
+        if (libc::__isnan(value) != 0) {
+            return write_literal(buffer, "NaN", 3);
         }
-        return write_literal(buffer, "inf", 3);
-    }
+        if (libc::__isinf(value) != 0) {
+            if (value < 0.0) {
+                return write_literal(buffer, "-inf", 4);
+            }
+            return write_literal(buffer, "inf", 3);
+        }
 
-    mut cursor: u64 = 0;
-    mut absolute: f64 = value;
-    if (value < 0.0 || is_negative_zero(value)) {
-        buffer[cursor] = 0x2D; // '-'
-        cursor = cursor + 1;
-        absolute = libc::fabs(value);
-    }
+        mut cursor: u64 = 0;
+        mut absolute: f64 = value;
+        if (value < 0.0 || value.is_negative_zero()) {
+            buffer[cursor] = 0x2D; // '-'
+            cursor = cursor + 1;
+            absolute = libc::fabs(value);
+        }
 
-    if (absolute == 0.0) {
-        buffer[cursor] = 0x30; // '0'
-        return cursor + 1;
-    }
+        if (absolute == 0.0) {
+            buffer[cursor] = 0x30; // '0'
+            return cursor + 1;
+        }
 
-    if (absolute >= LARGE_THRESHOLD || absolute < SMALL_THRESHOLD) {
-        return cursor + write_scientific(buffer + cursor, absolute, decimals);
+        if (absolute >= LARGE_THRESHOLD || absolute < SMALL_THRESHOLD) {
+            return cursor + write_scientific(buffer + cursor, absolute, decimals);
+        }
+        return cursor + write_fixed(buffer + cursor, absolute, decimals);
     }
-    return cursor + write_fixed(buffer + cursor, absolute, decimals);
 }
 
 // ============================================================================
-// Implementation
+// Private helpers
 // ============================================================================
 
 function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
@@ -94,22 +130,12 @@ function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
     return length;
 }
 
-/// IEEE 754: `-0.0` has bit pattern 0x8000_0000_0000_0000. The cheap
-/// check is `1.0 / v == -Infinity`, but we'd rather not divide; the
-/// direct comparison relies on `value == 0.0` being true for both
-/// ±0 while the sign bit still drives the output branch.
-function is_negative_zero(value: f64) -> boolean {
-    if (value != 0.0) { return false; }
-    // `1.0 / 0.0` is +Infinity, `1.0 / -0.0` is -Infinity.
-    return (1.0 / value) < 0.0;
-}
-
 /// Fixed-point: integer part, `.`, zero-padded fraction. Assumes
 /// `value >= 0` and is within LARGE/SMALL thresholds — caller has
 /// routed NaN/Inf/zero/scientific cases already.
 function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
     const integer_part: u64 = value as u64;
-    mut cursor: u64 = integer::write_u64_decimal(buffer, integer_part);
+    mut cursor: u64 = integer_part.to_decimal_buf(buffer);
 
     if (decimals == 0) { return cursor; }
 
@@ -122,24 +148,8 @@ function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
     // for consistency — a half-up bias here would make the integer
     // and fraction halves use different rounding modes.
     const frac_scaled: u64 = ((value - (integer_part as f64)) * scale) as u64;
-    cursor = cursor + write_u64_decimal_padded(buffer + cursor, frac_scaled, decimals);
+    cursor = cursor + frac_scaled.to_decimal_padded_buf(buffer + cursor, decimals);
     return cursor;
-}
-
-/// Zero-padded fixed-width decimal. Writes exactly `width` digits,
-/// truncating the high end if the value doesn't fit. Used for the
-/// fractional piece of a float where we know the digit count ahead
-/// of time.
-function write_u64_decimal_padded(buffer: u8*, value: u64, width: u64) -> u64 {
-    if (width == 0) { return 0; }
-    mut v: u64 = value;
-    mut i: u64 = width;
-    while (i > 0) {
-        i = i - 1;
-        buffer[i] = ((v % 10) as u8) + 0x30;
-        v = v / 10;
-    }
-    return width;
 }
 
 /// Scientific: `<mantissa>e<sign><exponent>`. Assumes `value > 0`.
@@ -172,7 +182,7 @@ function write_scientific(buffer: u8*, value: f64, decimals: u64) -> u64 {
         cursor = cursor + 1;
         exp_magnitude = e as u64;
     }
-    cursor = cursor + integer::write_u64_decimal(buffer + cursor, exp_magnitude);
+    cursor = cursor + exp_magnitude.to_decimal_buf(buffer + cursor);
     return cursor;
 }
 

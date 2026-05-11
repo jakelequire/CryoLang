@@ -15,7 +15,8 @@ import io::traits;
 import collections::array;
 import collections::str;
 import collections::string;
-import fmt::integer;
+import core::convert;
+import core::primitives;
 import net::http::status;
 import net::http::headers;
 import net::http::request;
@@ -68,7 +69,8 @@ type struct Response {
         mut old: Array<u8> = this.body;
         this.body = body;
         mut buffer: u8[24];
-        const digits: u64 = integer::write_u64_decimal(&buffer[0], this.body.length());
+        const body_len: u64 = this.body.length();
+        const digits: u64 = body_len.to_decimal_buf(&buffer[0]);
         this.headers.insert(
             Str::from_raw("Content-Length", 14),
             Str::from_raw(&buffer[0], digits)
@@ -90,7 +92,8 @@ type struct Response {
             Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
         }
         mut code_buf: u8[4];
-        const code_digits: u64 = integer::write_u64_decimal(&code_buf[0], this.status.as_u16() as u64);
+        const code_val: u64 = this.status.as_u16() as u64;
+        const code_digits: u64 = code_val.to_decimal_buf(&code_buf[0]);
         match (writer.write_all(Slice::from_raw(&code_buf[0], code_digits))) {
             Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
         }
@@ -156,14 +159,9 @@ type struct Response {
         const code_str: Str = status_line.as_str().sub_bytes(first_sp + 1, code_end);
 
         mut code: u16 = 0;
-        match (integer::parse_u64(code_str)) {
-            Option::Some(value) => {
-                if (value > 65535) {
-                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                }
-                code = value as u16;
-            }
-            Option::None => {
+        match (u16::from_str(code_str)) {
+            Result::Ok(value) => { code = value; }
+            Result::Err(_) => {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
         }
@@ -194,8 +192,8 @@ type struct Response {
         // Body (Content-Length sized only).
         match (resp.headers.get(Str::from_raw("content-length", 14))) {
             Option::Some(mut value) => {
-                match (integer::parse_u64(value.as_str())) {
-                    Option::Some(len) => {
+                match (u64::from_str(value.as_str())) {
+                    Result::Ok(len) => {
                         mut body: Array<u8> = Array::with_capacity(len);
                         mut remaining: u64 = len;
                         mut chunk: u8[4096];
@@ -218,7 +216,7 @@ type struct Response {
                         }
                         resp.body = body;
                     }
-                    Option::None => {
+                    Result::Err(_) => {
                         return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
                     }
                 }
