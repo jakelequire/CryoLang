@@ -1,19 +1,52 @@
 ///! libc — raw C ABI bindings.
 ///!
-///! Single home for every `extern "C"` declaration the stdlib needs.
-///! Modules consume libc through `import ffi::libc;` and call
-///! `libc::read(...)`, `libc::sqrt(...)`, etc., keeping the rest of
-///! the tree free of inline `extern` blocks.
+///! Single home for every `extern "C"` declaration the stdlib needs,
+///! plus broad coverage of the POSIX / glibc surface for downstream
+///! consumers. Modules consume libc through `import ffi::libc;` and
+///! call `libc::read(...)`, `libc::sqrt(...)`, etc., keeping the rest
+///! of the tree free of inline `extern` blocks.
 ///!
-///! The functions here mirror libc / POSIX headers verbatim — same
-///! names, same signatures, same errno semantics. Cryo-idiomatic
-///! wrappers (returning `Result`, working in `Slice<u8>`, retrying on
-///! `EINTR`, etc.) live at the call site, not here. Code above the
-///! stdlib should rarely need to reach into this module directly.
+///! Functions mirror libc / POSIX headers verbatim — same names, same
+///! signatures, same errno semantics. Cryo-idiomatic wrappers
+///! (returning `Result`, working in `Slice<u8>`, retrying on `EINTR`,
+///! etc.) live at the call site, not here.
 ///!
 ///! Sections are grouped by libc header so a reader can skim for the
 ///! function they need the same way they would in `man 3` or
 ///! `/usr/include`.
+///!
+///! ## Enums vs constants
+///!
+///! Closed sets of mutually-exclusive values (clock ids, locale
+///! categories, address families, lseek whence, etc.) are exposed as
+///! `type enum Name : i32 { ... }` so they can be passed to libc as
+///! typed function parameters. Variant names are kept verbatim from
+///! the C header — `ClockId::CLOCK_MONOTONIC`, not
+///! `ClockId::Monotonic` — so call sites read like the man pages.
+///!
+///! Bit-flag families (`O_*`, `S_IF*`, `POLL*`, `MAP_*`, `EPOLLIN`,
+///! `AI_*`, signal numbers, errno codes, etc.) remain as `const`s —
+///! they're OR'd together or compared against return values and
+///! don't fit a closed enum.
+///!
+///! ## C struct conventions
+///!
+///! Layout-stable POSIX structs (`timespec`, `timeval`, `pollfd`,
+///! `iovec`, `in_addr`, `in6_addr`, `rlimit`, `tm`, `winsize`,
+///! `regmatch_t`) are defined here as Cryo types with matching field
+///! order, so callers can construct them directly. Platform-variant
+///! structs (`sockaddr_in`, `struct stat`, `addrinfo`, `epoll_event`,
+///! `struct termios`, `pthread_*`) are treated as opaque byte
+///! buffers — callers pack/unpack manually, as `net::tcp` does for
+///! `sockaddr_in`. The accompanying `SIZEOF_*` constants give the
+///! Linux x86_64 size so a `u8[SIZEOF_X]` buffer can be sized
+///! correctly.
+///!
+///! ## Numeric constants
+///!
+///! Errno / signal / mode / fcntl / epoll / ioctl values are the
+///! Linux x86_64 / glibc ABI. Other platforms re-derive from
+///! `<asm/errno.h>`, `<bits/signum.h>`, `<sys/stat.h>`, etc.
 
 namespace std::ffi::libc;
 
@@ -26,127 +59,106 @@ const STDOUT_FILENO: i32 = 1;
 const STDERR_FILENO: i32 = 2;
 
 // ============================================================================
-// fcntl.h — open() flags
+// errno.h — error codes + thread-local accessor
 // ============================================================================
 //
-// The low two bits of `flags` are the access mode (`O_RDONLY` /
-// `O_WRONLY` / `O_RDWR`); the rest are bitwise-ORed creation /
-// status flags. Numeric values are the Linux x86_64 ABI; other
-// platforms re-derive from `<bits/fcntl-linux.h>` equivalents.
+// Linux/glibc values; symbol names match `<asm-generic/errno-base.h>`
+// and `<asm-generic/errno.h>`. The set is large and routinely compared
+// against raw integer returns, so errno codes stay as flat constants
+// rather than a closed enum.
 
-const O_RDONLY:   i32 = 0;
-const O_WRONLY:   i32 = 1;
-const O_RDWR:     i32 = 2;
-
-const O_CREAT:    i32 = 64;
-const O_EXCL:     i32 = 128;
-const O_NOCTTY:   i32 = 256;
-const O_TRUNC:    i32 = 512;
-const O_APPEND:   i32 = 1024;
-const O_NONBLOCK: i32 = 2048;
-const O_SYNC:     i32 = 1052672;
-
-// ============================================================================
-// unistd.h — lseek() whence
-// ============================================================================
-
-/// Anchor for `lseek`'s `offset`. Mutually exclusive — these are
-/// not bit flags.
-type enum Whence : i32 {
-    SEEK_SET = 0;
-    SEEK_CUR = 1;
-    SEEK_END = 2;
-}
-
-// ============================================================================
-// sys/wait.h — waitpid() options (bit flags)
-// ============================================================================
-
-const WNOHANG:    i32 = 1;
-const WUNTRACED:  i32 = 2;
-const WCONTINUED: i32 = 8;
-
-// ============================================================================
-// sys/socket.h — domain / type / level / option / shutdown
-// ============================================================================
-
-const AF_UNSPEC: i32 = 0;
-const AF_UNIX:   i32 = 1;
-const AF_INET:   i32 = 2;
-const AF_INET6:  i32 = 10;
-
-const SOCK_STREAM:    i32 = 1;
-const SOCK_DGRAM:     i32 = 2;
-const SOCK_RAW:       i32 = 3;
-const SOCK_SEQPACKET: i32 = 5;
-
-const SOL_SOCKET: i32 = 1;
-
-const SO_REUSEADDR: i32 = 2;
-const SO_BROADCAST: i32 = 6;
-const SO_SNDBUF:    i32 = 7;
-const SO_RCVBUF:    i32 = 8;
-const SO_KEEPALIVE: i32 = 9;
-
-/// Direction(s) `shutdown` tears down on a socket. Mutually exclusive.
-type enum ShutdownHow : i32 {
-    SHUT_RD   = 0;
-    SHUT_WR   = 1;
-    SHUT_RDWR = 2;
-}
-
-// ============================================================================
-// string.h
-// ============================================================================
-
-extern "C" {
-    function strlen(s: u8*) -> u64;
-}
-
-// ============================================================================
-// stdlib.h
-// ============================================================================
-
-extern "C" {
-    function getenv(name: u8*) -> u8*;
-    function setenv(name: u8*, value: u8*, overwrite: i32) -> i32;
-    function unsetenv(name: u8*) -> i32;
-    function clearenv() -> i32;
-    function exit(code: i32) -> void;
-    function _exit(code: i32) -> void;
-}
-
-// ============================================================================
-// unistd.h — POSIX file/process operations
-// ============================================================================
-
-extern "C" {
-    function read(fd: i32, buffer: u8*, count: u64) -> i64;
-    function write(fd: i32, buffer: u8*, count: u64) -> i64;
-    function close(fd: i32) -> i32;
-    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
-    function isatty(fd: i32) -> i32;
-    function fork() -> i32;
-    function execvp(file: u8*, argv: u8**) -> i32;
-    function pipe(fds: i32*) -> i32;
-    function dup2(oldfd: i32, newfd: i32) -> i32;
-    function chdir(path: u8*) -> i32;
-}
-
-// ============================================================================
-// fcntl.h
-// ============================================================================
-
-extern "C" {
-    function open(path: u8*, flags: i32, mode: u32) -> i32;
-}
-
-// ============================================================================
-// errno.h
-// ============================================================================
+const EPERM:           i32 = 1;
+const ENOENT:          i32 = 2;
+const ESRCH:           i32 = 3;
+const EINTR:           i32 = 4;
+const EIO:             i32 = 5;
+const ENXIO:           i32 = 6;
+const E2BIG:           i32 = 7;
+const ENOEXEC:         i32 = 8;
+const EBADF:           i32 = 9;
+const ECHILD:          i32 = 10;
+const EAGAIN:          i32 = 11;
+const EWOULDBLOCK:     i32 = 11;   // == EAGAIN on Linux
+const ENOMEM:          i32 = 12;
+const EACCES:          i32 = 13;
+const EFAULT:          i32 = 14;
+const ENOTBLK:         i32 = 15;
+const EBUSY:           i32 = 16;
+const EEXIST:          i32 = 17;
+const EXDEV:           i32 = 18;
+const ENODEV:          i32 = 19;
+const ENOTDIR:         i32 = 20;
+const EISDIR:          i32 = 21;
+const EINVAL:          i32 = 22;
+const ENFILE:          i32 = 23;
+const EMFILE:          i32 = 24;
+const ENOTTY:          i32 = 25;
+const ETXTBSY:         i32 = 26;
+const EFBIG:           i32 = 27;
+const ENOSPC:          i32 = 28;
+const ESPIPE:          i32 = 29;
+const EROFS:           i32 = 30;
+const EMLINK:          i32 = 31;
+const EPIPE:           i32 = 32;
+const EDOM:            i32 = 33;
+const ERANGE:          i32 = 34;
+const EDEADLK:         i32 = 35;
+const ENAMETOOLONG:    i32 = 36;
+const ENOLCK:          i32 = 37;
+const ENOSYS:          i32 = 38;
+const ENOTEMPTY:       i32 = 39;
+const ELOOP:           i32 = 40;
+const ENOMSG:          i32 = 42;
+const EIDRM:           i32 = 43;
+const ECHRNG:          i32 = 44;
+const ENOSTR:          i32 = 60;
+const ENODATA:         i32 = 61;
+const ETIME:           i32 = 62;
+const ENOSR:           i32 = 63;
+const ENOLINK:         i32 = 67;
+const EPROTO:          i32 = 71;
+const EMULTIHOP:       i32 = 72;
+const EBADMSG:         i32 = 74;
+const EOVERFLOW:       i32 = 75;
+const EILSEQ:          i32 = 84;
+const ENOTSOCK:        i32 = 88;
+const EDESTADDRREQ:    i32 = 89;
+const EMSGSIZE:        i32 = 90;
+const EPROTOTYPE:      i32 = 91;
+const ENOPROTOOPT:     i32 = 92;
+const EPROTONOSUPPORT: i32 = 93;
+const ESOCKTNOSUPPORT: i32 = 94;
+const EOPNOTSUPP:      i32 = 95;
+const ENOTSUP:         i32 = 95;   // == EOPNOTSUPP on Linux
+const EPFNOSUPPORT:    i32 = 96;
+const EAFNOSUPPORT:    i32 = 97;
+const EADDRINUSE:      i32 = 98;
+const EADDRNOTAVAIL:   i32 = 99;
+const ENETDOWN:        i32 = 100;
+const ENETUNREACH:     i32 = 101;
+const ENETRESET:       i32 = 102;
+const ECONNABORTED:    i32 = 103;
+const ECONNRESET:      i32 = 104;
+const ENOBUFS:         i32 = 105;
+const EISCONN:         i32 = 106;
+const ENOTCONN:        i32 = 107;
+const ESHUTDOWN:       i32 = 108;
+const ETOOMANYREFS:    i32 = 109;
+const ETIMEDOUT:       i32 = 110;
+const ECONNREFUSED:    i32 = 111;
+const EHOSTDOWN:       i32 = 112;
+const EHOSTUNREACH:    i32 = 113;
+const EALREADY:        i32 = 114;
+const EINPROGRESS:     i32 = 115;
+const ESTALE:          i32 = 116;
+const EDQUOT:          i32 = 122;
+const ECANCELED:       i32 = 125;
+const EOWNERDEAD:      i32 = 130;
+const ENOTRECOVERABLE: i32 = 131;
 
 extern "C" {
     function __errno_location() -> i32*;
+    function perror(prefix: u8*) -> void;
 }
 
 /// Current thread's `errno`. Thin convenience over the platform's
@@ -156,36 +168,1811 @@ function errno() -> i32 {
     return *__errno_location();
 }
 
-// ============================================================================
-// sys/wait.h
-// ============================================================================
-
-extern "C" {
-    function waitpid(pid: i32, wstatus: i32*, options: i32) -> i32;
+/// Overwrite the current thread's `errno`. Useful when the only way
+/// to detect failure from a libc routine is to clear `errno` first
+/// and inspect it on return (e.g. `strtol`, `readdir`).
+function set_errno(value: i32) -> void {
+    *__errno_location() = value;
 }
 
 // ============================================================================
-// signal.h — raw `kill(2)`. The high-level `Signal` struct lives in
-// `process::signal`; this is the bare syscall.
+// signal.h — signal numbers + raw operations
 // ============================================================================
+//
+// `sigset_t` and `struct sigaction` layouts vary; pass them as opaque
+// `u8*` buffers sized by the `SIZEOF_*` constants below. Signal
+// numbers stay as flat `i32` constants because callers routinely
+// build runtime values like `SIGRTMIN + n`.
+
+const SIGHUP:    i32 = 1;
+const SIGINT:    i32 = 2;
+const SIGQUIT:   i32 = 3;
+const SIGILL:    i32 = 4;
+const SIGTRAP:   i32 = 5;
+const SIGABRT:   i32 = 6;
+const SIGIOT:    i32 = 6;
+const SIGBUS:    i32 = 7;
+const SIGFPE:    i32 = 8;
+const SIGKILL:   i32 = 9;
+const SIGUSR1:   i32 = 10;
+const SIGSEGV:   i32 = 11;
+const SIGUSR2:   i32 = 12;
+const SIGPIPE:   i32 = 13;
+const SIGALRM:   i32 = 14;
+const SIGTERM:   i32 = 15;
+const SIGSTKFLT: i32 = 16;
+const SIGCHLD:   i32 = 17;
+const SIGCONT:   i32 = 18;
+const SIGSTOP:   i32 = 19;
+const SIGTSTP:   i32 = 20;
+const SIGTTIN:   i32 = 21;
+const SIGTTOU:   i32 = 22;
+const SIGURG:    i32 = 23;
+const SIGXCPU:   i32 = 24;
+const SIGXFSZ:   i32 = 25;
+const SIGVTALRM: i32 = 26;
+const SIGPROF:   i32 = 27;
+const SIGWINCH:  i32 = 28;
+const SIGIO:     i32 = 29;
+const SIGPOLL:   i32 = 29;
+const SIGPWR:    i32 = 30;
+const SIGSYS:    i32 = 31;
+
+/// `how` argument to `sigprocmask` and `pthread_sigmask`. Mutually
+/// exclusive — not bit flags.
+type enum SigprocmaskHow : i32 {
+    SIG_BLOCK   = 0;
+    SIG_UNBLOCK = 1;
+    SIG_SETMASK = 2;
+}
+
+// signal() / sigaction handler sentinels — passed as void* via casts.
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+const SIG_ERR: i64 = -1;
+
+// sa_flags bits
+const SA_NOCLDSTOP: i32 = 1;
+const SA_NOCLDWAIT: i32 = 2;
+const SA_SIGINFO:   i32 = 4;
+const SA_ONSTACK:   i32 = 1 << 27;
+const SA_RESTART:   i32 = 1 << 28;
+const SA_NODEFER:   i32 = 1 << 30;
+const SA_RESETHAND: i32 = 1 << 31;
+
+/// `sigset_t` is 128 bytes on Linux/glibc (1024-bit mask).
+const SIZEOF_SIGSET_T: u64 = 128;
+
+/// `struct sigaction` on Linux x86_64 / glibc.
+const SIZEOF_SIGACTION: u64 = 152;
 
 extern "C" {
     function kill(pid: i32, sig: i32) -> i32;
+    function killpg(pgrp: i32, sig: i32) -> i32;
+    function raise(sig: i32) -> i32;
+    function signal(sig: i32, handler: void*) -> void*;
+    function sigaction(sig: i32, act: u8*, oldact: u8*) -> i32;
+    function sigprocmask(how: SigprocmaskHow, set: u8*, oldset: u8*) -> i32;
+    function sigpending(set: u8*) -> i32;
+    function sigsuspend(mask: u8*) -> i32;
+    function sigemptyset(set: u8*) -> i32;
+    function sigfillset(set: u8*) -> i32;
+    function sigaddset(set: u8*, sig: i32) -> i32;
+    function sigdelset(set: u8*, sig: i32) -> i32;
+    function sigismember(set: u8*, sig: i32) -> i32;
+    function sigwait(set: u8*, sig: i32*) -> i32;
+    function pause() -> i32;
+    function strsignal(sig: i32) -> u8*;
+    function psignal(sig: i32, prefix: u8*) -> void;
 }
 
 // ============================================================================
-// sys/socket.h
+// fcntl.h — open() flags + fcntl() commands
+// ============================================================================
+//
+// `O_*` and `F_*` are bit-flag and command sets — kept as constants.
+// `fcntl` is a variadic command dispatcher; arg type depends on cmd.
+
+const O_RDONLY:    i32 = 0;
+const O_WRONLY:    i32 = 1;
+const O_RDWR:      i32 = 2;
+const O_ACCMODE:   i32 = 3;
+
+const O_CREAT:     i32 = 64;
+const O_EXCL:      i32 = 128;
+const O_NOCTTY:    i32 = 256;
+const O_TRUNC:     i32 = 512;
+const O_APPEND:    i32 = 1024;
+const O_NONBLOCK:  i32 = 2048;
+const O_NDELAY:    i32 = 2048;     // == O_NONBLOCK
+const O_DSYNC:     i32 = 4096;
+const O_ASYNC:     i32 = 8192;
+const O_DIRECT:    i32 = 16384;
+const O_LARGEFILE: i32 = 32768;
+const O_DIRECTORY: i32 = 65536;
+const O_NOFOLLOW:  i32 = 131072;
+const O_NOATIME:   i32 = 262144;
+const O_CLOEXEC:   i32 = 524288;
+const O_SYNC:      i32 = 1052672;  // O_DSYNC | O_RSYNC
+const O_PATH:      i32 = 2097152;
+const O_TMPFILE:   i32 = 4259840;  // O_TMPFILE | O_DIRECTORY
+
+// fcntl() commands
+const F_DUPFD:         i32 = 0;
+const F_GETFD:         i32 = 1;
+const F_SETFD:         i32 = 2;
+const F_GETFL:         i32 = 3;
+const F_SETFL:         i32 = 4;
+const F_GETLK:         i32 = 5;
+const F_SETLK:         i32 = 6;
+const F_SETLKW:        i32 = 7;
+const F_SETOWN:        i32 = 8;
+const F_GETOWN:        i32 = 9;
+const F_SETSIG:        i32 = 10;
+const F_GETSIG:        i32 = 11;
+const F_DUPFD_CLOEXEC: i32 = 1030;
+
+// File descriptor flags (F_GETFD/F_SETFD)
+const FD_CLOEXEC: i32 = 1;
+
+/// `struct flock.l_type` lock type.
+type enum LockType : i16 {
+    F_RDLCK = 0;
+    F_WRLCK = 1;
+    F_UNLCK = 2;
+}
+
+// AT_FDCWD and *at() flags
+const AT_FDCWD:            i32 = -100;
+const AT_SYMLINK_NOFOLLOW: i32 = 256;
+const AT_REMOVEDIR:        i32 = 512;
+const AT_EACCESS:          i32 = 512;
+const AT_SYMLINK_FOLLOW:   i32 = 1024;
+const AT_NO_AUTOMOUNT:     i32 = 2048;
+const AT_EMPTY_PATH:       i32 = 4096;
+
+/// `posix_fadvise` access pattern. Mutually exclusive.
+type enum FadviseAdvice : i32 {
+    POSIX_FADV_NORMAL     = 0;
+    POSIX_FADV_RANDOM     = 1;
+    POSIX_FADV_SEQUENTIAL = 2;
+    POSIX_FADV_WILLNEED   = 3;
+    POSIX_FADV_DONTNEED   = 4;
+    POSIX_FADV_NOREUSE    = 5;
+}
+
+extern "C" {
+    function open(path: u8*, flags: i32, mode: u32) -> i32;
+    function openat(dirfd: i32, path: u8*, flags: i32, mode: u32) -> i32;
+    function creat(path: u8*, mode: u32) -> i32;
+    function fcntl(fd: i32, cmd: i32, arg: i64) -> i32;
+    function posix_fadvise(fd: i32, offset: i64, len: i64, advice: FadviseAdvice) -> i32;
+    function posix_fallocate(fd: i32, offset: i64, len: i64) -> i32;
+}
+
+// ============================================================================
+// sys/stat.h — file metadata + mode bits
+// ============================================================================
+//
+// `struct stat` layout varies between glibc versions and architectures;
+// treat it as a `u8[SIZEOF_STAT]` buffer and pull fields out with the
+// helpers in a high-level `fs::stat` module.
+
+/// Size of `struct stat` on Linux x86_64 / glibc.
+const SIZEOF_STAT: u64 = 144;
+
+// File-type masks (st_mode upper bits)
+const S_IFMT:   u32 = 0xF000;
+const S_IFSOCK: u32 = 0xC000;
+const S_IFLNK:  u32 = 0xA000;
+const S_IFREG:  u32 = 0x8000;
+const S_IFBLK:  u32 = 0x6000;
+const S_IFDIR:  u32 = 0x4000;
+const S_IFCHR:  u32 = 0x2000;
+const S_IFIFO:  u32 = 0x1000;
+
+// Set-UID / set-GID / sticky bits
+const S_ISUID: u32 = 0x800;
+const S_ISGID: u32 = 0x400;
+const S_ISVTX: u32 = 0x200;
+
+// Permission bits (mode values, in hex — Cryo lacks octal literals)
+const S_IRWXU: u32 = 0x1C0;  // 0700
+const S_IRUSR: u32 = 0x100;  // 0400
+const S_IWUSR: u32 = 0x80;   // 0200
+const S_IXUSR: u32 = 0x40;   // 0100
+
+const S_IRWXG: u32 = 0x38;   // 0070
+const S_IRGRP: u32 = 0x20;   // 0040
+const S_IWGRP: u32 = 0x10;   // 0020
+const S_IXGRP: u32 = 0x8;    // 0010
+
+const S_IRWXO: u32 = 0x7;    // 0007
+const S_IROTH: u32 = 0x4;    // 0004
+const S_IWOTH: u32 = 0x2;    // 0002
+const S_IXOTH: u32 = 0x1;    // 0001
+
+extern "C" {
+    function stat(path: u8*, buf: u8*) -> i32;
+    function lstat(path: u8*, buf: u8*) -> i32;
+    function fstat(fd: i32, buf: u8*) -> i32;
+    function fstatat(dirfd: i32, path: u8*, buf: u8*, flags: i32) -> i32;
+    function mkdir(path: u8*, mode: u32) -> i32;
+    function mkdirat(dirfd: i32, path: u8*, mode: u32) -> i32;
+    function chmod(path: u8*, mode: u32) -> i32;
+    function fchmod(fd: i32, mode: u32) -> i32;
+    function fchmodat(dirfd: i32, path: u8*, mode: u32, flags: i32) -> i32;
+    function umask(mask: u32) -> u32;
+    function mkfifo(path: u8*, mode: u32) -> i32;
+    function mkfifoat(dirfd: i32, path: u8*, mode: u32) -> i32;
+    function mknod(path: u8*, mode: u32, dev: u64) -> i32;
+    function mknodat(dirfd: i32, path: u8*, mode: u32, dev: u64) -> i32;
+}
+
+// `S_IS*` are C macros — reimplemented as plain Cryo functions over the
+// `st_mode` field of `struct stat`.
+
+function S_ISREG(mode: u32) -> boolean  { return (mode & S_IFMT) == S_IFREG; }
+function S_ISDIR(mode: u32) -> boolean  { return (mode & S_IFMT) == S_IFDIR; }
+function S_ISCHR(mode: u32) -> boolean  { return (mode & S_IFMT) == S_IFCHR; }
+function S_ISBLK(mode: u32) -> boolean  { return (mode & S_IFMT) == S_IFBLK; }
+function S_ISFIFO(mode: u32) -> boolean { return (mode & S_IFMT) == S_IFIFO; }
+function S_ISLNK(mode: u32) -> boolean  { return (mode & S_IFMT) == S_IFLNK; }
+function S_ISSOCK(mode: u32) -> boolean { return (mode & S_IFMT) == S_IFSOCK; }
+
+// ============================================================================
+// sys/uio.h — scatter/gather I/O buffer
+// ============================================================================
+
+/// I/O vector for `readv` / `writev` / `preadv` / `pwritev`.
+type struct iovec {
+    iov_base: u8*;
+    iov_len:  u64;
+}
+
+// ============================================================================
+// unistd.h — lseek() whence + access() mode + sysconf() names
+// ============================================================================
+
+/// Anchor for `lseek`'s `offset`. Mutually exclusive — these are
+/// not bit flags.
+type enum Whence : i32 {
+    SEEK_SET  = 0;
+    SEEK_CUR  = 1;
+    SEEK_END  = 2;
+    SEEK_DATA = 3;
+    SEEK_HOLE = 4;
+}
+
+// access() / faccessat() mode bits (OR'd)
+const F_OK: i32 = 0;
+const X_OK: i32 = 1;
+const W_OK: i32 = 2;
+const R_OK: i32 = 4;
+
+// sysconf() / pathconf() names (Linux/glibc). Left as constants —
+// the set is large and runtime-extensible across glibc versions.
+const _SC_PAGESIZE:         i32 = 30;
+const _SC_NPROCESSORS_CONF: i32 = 83;
+const _SC_NPROCESSORS_ONLN: i32 = 84;
+const _SC_OPEN_MAX:         i32 = 4;
+const _SC_CHILD_MAX:        i32 = 1;
+const _SC_CLK_TCK:          i32 = 2;
+const _SC_ARG_MAX:          i32 = 0;
+const _SC_HOST_NAME_MAX:    i32 = 180;
+const _SC_LOGIN_NAME_MAX:   i32 = 71;
+
+// ============================================================================
+// unistd.h — POSIX file / process operations
 // ============================================================================
 
 extern "C" {
-    function socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
-    function bind(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
-    function listen(sockfd: i32, backlog: i32) -> i32;
-    function accept(sockfd: i32, addr: u8*, addrlen: u32*) -> i32;
-    function connect(sockfd: i32, addr: u8*, addrlen: u32) -> i32;
-    function setsockopt(sockfd: i32, level: i32, optname: i32,
-                        optval: u8*, optlen: u32) -> i32;
-    function shutdown(sockfd: i32, how: ShutdownHow) -> i32;
+    // Byte I/O
+    function read(fd: i32, buffer: u8*, count: u64) -> i64;
+    function write(fd: i32, buffer: u8*, count: u64) -> i64;
+    function pread(fd: i32, buffer: u8*, count: u64, offset: i64) -> i64;
+    function pwrite(fd: i32, buffer: u8*, count: u64, offset: i64) -> i64;
+    function readv(fd: i32, iov: iovec*, iovcnt: i32) -> i64;
+    function writev(fd: i32, iov: iovec*, iovcnt: i32) -> i64;
+    function preadv(fd: i32, iov: iovec*, iovcnt: i32, offset: i64) -> i64;
+    function pwritev(fd: i32, iov: iovec*, iovcnt: i32, offset: i64) -> i64;
+
+    // Descriptor management
+    function close(fd: i32) -> i32;
+    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
+    function dup(oldfd: i32) -> i32;
+    function dup2(oldfd: i32, newfd: i32) -> i32;
+    function dup3(oldfd: i32, newfd: i32, flags: i32) -> i32;
+    function pipe(fds: i32*) -> i32;
+    function pipe2(fds: i32*, flags: i32) -> i32;
+    function isatty(fd: i32) -> i32;
+    function ttyname(fd: i32) -> u8*;
+    function ttyname_r(fd: i32, buf: u8*, buflen: u64) -> i32;
+
+    // Process control
+    function fork() -> i32;
+    function vfork() -> i32;
+    function execv(path: u8*, argv: u8**) -> i32;
+    function execvp(file: u8*, argv: u8**) -> i32;
+    function execve(path: u8*, argv: u8**, envp: u8**) -> i32;
+    function execvpe(file: u8*, argv: u8**, envp: u8**) -> i32;
+    function execveat(dirfd: i32, path: u8*, argv: u8**, envp: u8**, flags: i32) -> i32;
+    function fexecve(fd: i32, argv: u8**, envp: u8**) -> i32;
+    function _exit(code: i32) -> void;
+
+    // Process identity
+    function getpid()  -> i32;
+    function getppid() -> i32;
+    function getpgrp() -> i32;
+    function getpgid(pid: i32) -> i32;
+    function setpgid(pid: i32, pgid: i32) -> i32;
+    function getsid(pid: i32) -> i32;
+    function setsid() -> i32;
+    function tcgetpgrp(fd: i32) -> i32;
+    function tcsetpgrp(fd: i32, pgrp: i32) -> i32;
+
+    // User / group identity
+    function getuid()  -> u32;
+    function geteuid() -> u32;
+    function getgid()  -> u32;
+    function getegid() -> u32;
+    function setuid(uid: u32) -> i32;
+    function seteuid(euid: u32) -> i32;
+    function setgid(gid: u32) -> i32;
+    function setegid(egid: u32) -> i32;
+    function setreuid(ruid: u32, euid: u32) -> i32;
+    function setregid(rgid: u32, egid: u32) -> i32;
+    function getgroups(size: i32, list: u32*) -> i32;
+    function setgroups(size: u64, list: u32*) -> i32;
+
+    // Sleep / alarm
+    function sleep(seconds: u32) -> u32;
+    function usleep(microseconds: u32) -> i32;
+    function alarm(seconds: u32) -> u32;
+    function ualarm(usecs: u32, interval: u32) -> u32;
+
+    // Filesystem navigation
+    function chdir(path: u8*) -> i32;
+    function fchdir(fd: i32) -> i32;
+    function getcwd(buf: u8*, size: u64) -> u8*;
+    function get_current_dir_name() -> u8*;
+
+    // Filesystem mutation
+    function unlink(path: u8*) -> i32;
+    function unlinkat(dirfd: i32, path: u8*, flags: i32) -> i32;
+    function rmdir(path: u8*) -> i32;
+    function link(oldpath: u8*, newpath: u8*) -> i32;
+    function linkat(olddirfd: i32, oldpath: u8*,
+                    newdirfd: i32, newpath: u8*, flags: i32) -> i32;
+    function symlink(target: u8*, linkpath: u8*) -> i32;
+    function symlinkat(target: u8*, newdirfd: i32, linkpath: u8*) -> i32;
+    function readlink(path: u8*, buf: u8*, bufsize: u64) -> i64;
+    function readlinkat(dirfd: i32, path: u8*, buf: u8*, bufsize: u64) -> i64;
+    function access(path: u8*, mode: i32) -> i32;
+    function faccessat(dirfd: i32, path: u8*, mode: i32, flags: i32) -> i32;
+    function chown(path: u8*, owner: u32, group: u32) -> i32;
+    function fchown(fd: i32, owner: u32, group: u32) -> i32;
+    function lchown(path: u8*, owner: u32, group: u32) -> i32;
+    function fchownat(dirfd: i32, path: u8*, owner: u32, group: u32, flags: i32) -> i32;
+    function truncate(path: u8*, length: i64) -> i32;
+    function ftruncate(fd: i32, length: i64) -> i32;
+    function fsync(fd: i32) -> i32;
+    function fdatasync(fd: i32) -> i32;
+    function sync() -> void;
+    function syncfs(fd: i32) -> i32;
+
+    // Hostname / system info
+    function gethostname(name: u8*, len: u64) -> i32;
+    function sethostname(name: u8*, len: u64) -> i32;
+    function getdomainname(name: u8*, len: u64) -> i32;
+    function setdomainname(name: u8*, len: u64) -> i32;
+    function getlogin() -> u8*;
+    function getlogin_r(name: u8*, namesize: u64) -> i32;
+    function gethostid() -> i64;
+    function daemon(nochdir: i32, noclose: i32) -> i32;
+
+    // Limits & scheduling
+    function getpagesize() -> i32;
+    function sysconf(name: i32)  -> i64;
+    function pathconf(path: u8*, name: i32) -> i64;
+    function fpathconf(fd: i32,  name: i32) -> i64;
+    function nice(inc: i32) -> i32;
+
+    // getopt
+    function getopt(argc: i32, argv: u8**, optstring: u8*) -> i32;
+}
+
+// ============================================================================
+// stdio.h — buffered I/O on `FILE*`
+// ============================================================================
+//
+// `FILE` is opaque in libc — pass around as `void*`. Variadic
+// `printf`-family functions take a trailing `...`; format-string-only
+// arguments work, full variadic dispatch goes through the
+// `core::intrinsics` variadic intrinsics.
+
+/// `setvbuf` buffering strategy. Mutually exclusive.
+type enum BufferingMode : i32 {
+    _IOFBF = 0;   // Fully buffered
+    _IOLBF = 1;   // Line buffered
+    _IONBF = 2;   // Unbuffered
+}
+
+// End-of-file sentinel.
+const EOF: i32 = -1;
+
+// Buffer-size hint for setvbuf with non-null buffer.
+const BUFSIZ: u64 = 8192;
+
+// Maximum length of a filename returned by tmpnam.
+const L_tmpnam: u64 = 20;
+
+extern "C" {
+    function fopen(path: u8*, mode: u8*) -> void*;
+    function fdopen(fd: i32, mode: u8*) -> void*;
+    function freopen(path: u8*, mode: u8*, stream: void*) -> void*;
+    function fclose(stream: void*) -> i32;
+    function fcloseall() -> i32;
+
+    function fread(buf: u8*, size: u64, nmemb: u64, stream: void*) -> u64;
+    function fwrite(buf: u8*, size: u64, nmemb: u64, stream: void*) -> u64;
+
+    function fseek(stream: void*, offset: i64, whence: i32) -> i32;
+    function fseeko(stream: void*, offset: i64, whence: i32) -> i32;
+    function ftell(stream: void*)  -> i64;
+    function ftello(stream: void*) -> i64;
+    function rewind(stream: void*) -> void;
+    function fgetpos(stream: void*, pos: u8*) -> i32;
+    function fsetpos(stream: void*, pos: u8*) -> i32;
+
+    function fflush(stream: void*)  -> i32;
+    function fpurge(stream: void*)  -> i32;
+
+    function fgetc(stream: void*)            -> i32;
+    function getc(stream: void*)             -> i32;
+    function getchar()                       -> i32;
+    function ungetc(c: i32, stream: void*)   -> i32;
+    function fputc(c: i32, stream: void*)    -> i32;
+    function putc(c: i32, stream: void*)     -> i32;
+    function putchar(c: i32)                 -> i32;
+    function fgets(buf: u8*, size: i32, stream: void*) -> u8*;
+    function fputs(s: u8*, stream: void*)    -> i32;
+    function puts(s: u8*)                    -> i32;
+
+    function feof(stream: void*)     -> i32;
+    function ferror(stream: void*)   -> i32;
+    function clearerr(stream: void*) -> void;
+    function fileno(stream: void*)   -> i32;
+
+    function setbuf(stream: void*, buf: u8*) -> void;
+    function setvbuf(stream: void*, buf: u8*, mode: BufferingMode, size: u64) -> i32;
+    function setbuffer(stream: void*, buf: u8*, size: u64) -> void;
+    function setlinebuf(stream: void*) -> void;
+
+    function remove(path: u8*)                          -> i32;
+    function rename(oldpath: u8*, newpath: u8*)         -> i32;
+    function renameat(olddirfd: i32, oldpath: u8*,
+                      newdirfd: i32, newpath: u8*)      -> i32;
+    function tmpfile()                                  -> void*;
+    function mkstemp(template: u8*)                     -> i32;
+    function mkstemps(template: u8*, suffixlen: i32)    -> i32;
+    function mkdtemp(template: u8*)                     -> u8*;
+    function tmpnam(buf: u8*)                           -> u8*;
+    function tempnam(dir: u8*, prefix: u8*)             -> u8*;
+
+    function popen(command: u8*, mode: u8*) -> void*;
+    function pclose(stream: void*)          -> i32;
+
+    function getline(lineptr: u8**, n: u64*, stream: void*) -> i64;
+    function getdelim(lineptr: u8**, n: u64*, delim: i32, stream: void*) -> i64;
+
+    // Variadic printf / scanf family. Use the `core::intrinsics`
+    // variants when the call needs Cryo-side variadic forwarding —
+    // these bare externs are for fixed-arg use cases.
+    function printf(fmt: u8*, ...)                          -> i32;
+    function fprintf(stream: void*, fmt: u8*, ...)          -> i32;
+    function dprintf(fd: i32, fmt: u8*, ...)                -> i32;
+    function sprintf(buf: u8*, fmt: u8*, ...)               -> i32;
+    function snprintf(buf: u8*, size: u64, fmt: u8*, ...)   -> i32;
+    function asprintf(ret: u8**, fmt: u8*, ...)             -> i32;
+    function scanf(fmt: u8*, ...)                           -> i32;
+    function fscanf(stream: void*, fmt: u8*, ...)           -> i32;
+    function sscanf(s: u8*, fmt: u8*, ...)                  -> i32;
+}
+
+// ============================================================================
+// stdlib.h — memory, conversion, environment, exit, rand, sort
+// ============================================================================
+
+const RAND_MAX:     i32 = 2147483647;
+const EXIT_SUCCESS: i32 = 0;
+const EXIT_FAILURE: i32 = 1;
+
+extern "C" {
+    // Memory — `core::intrinsics::malloc` shadows these for
+    // allocator implementations; raw externs are here for code that
+    // wants the C symbols directly.
+    function malloc(size: u64)                                -> u8*;
+    function calloc(nmemb: u64, size: u64)                    -> u8*;
+    function realloc(ptr: u8*, size: u64)                     -> u8*;
+    function reallocarray(ptr: u8*, nmemb: u64, size: u64)    -> u8*;
+    function free(ptr: u8*)                                   -> void;
+    function aligned_alloc(alignment: u64, size: u64)         -> u8*;
+    function posix_memalign(memptr: u8**, alignment: u64, size: u64) -> i32;
+    function valloc(size: u64)                                -> u8*;
+    function pvalloc(size: u64)                               -> u8*;
+    function malloc_usable_size(ptr: u8*)                     -> u64;
+
+    // Environment
+    function getenv(name: u8*)                       -> u8*;
+    function setenv(name: u8*, value: u8*, overwrite: i32) -> i32;
+    function unsetenv(name: u8*)                     -> i32;
+    function putenv(string: u8*)                     -> i32;
+    function clearenv()                              -> i32;
+    function secure_getenv(name: u8*)                -> u8*;
+
+    // Termination
+    function exit(code: i32)              -> void;
+    function quick_exit(code: i32)        -> void;
+    function abort()                      -> void;
+    function atexit(func: void*)          -> i32;
+    function at_quick_exit(func: void*)   -> i32;
+    function on_exit(func: void*, arg: u8*) -> i32;
+    function system(command: u8*)         -> i32;
+
+    // Numeric conversion
+    function atoi(s: u8*)  -> i32;
+    function atol(s: u8*)  -> i64;
+    function atoll(s: u8*) -> i64;
+    function atof(s: u8*)  -> f64;
+    function strtol(s: u8*,  endptr: u8**, base: i32) -> i64;
+    function strtoll(s: u8*, endptr: u8**, base: i32) -> i64;
+    function strtoul(s: u8*,  endptr: u8**, base: i32) -> u64;
+    function strtoull(s: u8*, endptr: u8**, base: i32) -> u64;
+    function strtof(s: u8*, endptr: u8**) -> f32;
+    function strtod(s: u8*, endptr: u8**) -> f64;
+    function strtold(s: u8*, endptr: u8**) -> f64;  // approximated
+
+    // Absolute value
+    function abs(j: i32)   -> i32;
+    function labs(j: i64)  -> i64;
+    function llabs(j: i64) -> i64;
+
+    // Pseudo-random number generators
+    function rand()                  -> i32;
+    function srand(seed: u32)        -> void;
+    function rand_r(seed: u32*)      -> i32;
+    function random()                -> i64;
+    function srandom(seed: u32)      -> void;
+    function initstate(seed: u32, state: u8*, size: u64) -> u8*;
+    function setstate(state: u8*)    -> u8*;
+    function drand48()               -> f64;
+    function erand48(xsubi: u16*)    -> f64;
+    function lrand48()               -> i64;
+    function nrand48(xsubi: u16*)    -> i64;
+    function mrand48()               -> i64;
+    function jrand48(xsubi: u16*)    -> i64;
+    function srand48(seedval: i64)   -> void;
+    function arc4random()                            -> u32;
+    function arc4random_uniform(upper_bound: u32)    -> u32;
+    function arc4random_buf(buf: u8*, n: u64)        -> void;
+
+    // Sorting / searching
+    function qsort(base: u8*, nmemb: u64, size: u64, compar: void*) -> void;
+    function qsort_r(base: u8*, nmemb: u64, size: u64,
+                     compar: void*, arg: u8*) -> void;
+    function bsearch(key: u8*, base: u8*, nmemb: u64, size: u64,
+                     compar: void*) -> u8*;
+
+    // Multibyte / wide
+    function mblen(s: u8*, n: u64)        -> i32;
+    function mbtowc(pwc: u32*, s: u8*, n: u64) -> i32;
+    function wctomb(s: u8*, wc: u32)      -> i32;
+    function mbstowcs(dest: u32*, src: u8*, n: u64) -> u64;
+    function wcstombs(dest: u8*, src: u32*, n: u64) -> u64;
+
+    function realpath(path: u8*, resolved: u8*) -> u8*;
+}
+
+// ============================================================================
+// string.h — string and memory routines
+// ============================================================================
+
+extern "C" {
+    // Length
+    function strlen(s: u8*)                   -> u64;
+    function strnlen(s: u8*, maxlen: u64)     -> u64;
+
+    // Compare
+    function strcmp(s1: u8*, s2: u8*)             -> i32;
+    function strncmp(s1: u8*, s2: u8*, n: u64)    -> i32;
+    function strcasecmp(s1: u8*, s2: u8*)         -> i32;
+    function strncasecmp(s1: u8*, s2: u8*, n: u64) -> i32;
+    function strcoll(s1: u8*, s2: u8*)            -> i32;
+    function strxfrm(dest: u8*, src: u8*, n: u64) -> u64;
+
+    // Copy / concatenate
+    function strcpy(dest: u8*, src: u8*)             -> u8*;
+    function strncpy(dest: u8*, src: u8*, n: u64)    -> u8*;
+    function strlcpy(dest: u8*, src: u8*, dsize: u64) -> u64;
+    function stpcpy(dest: u8*, src: u8*)             -> u8*;
+    function stpncpy(dest: u8*, src: u8*, n: u64)    -> u8*;
+    function strcat(dest: u8*, src: u8*)             -> u8*;
+    function strncat(dest: u8*, src: u8*, n: u64)    -> u8*;
+    function strlcat(dest: u8*, src: u8*, dsize: u64) -> u64;
+
+    // Search
+    function strchr(s: u8*, c: i32)        -> u8*;
+    function strrchr(s: u8*, c: i32)       -> u8*;
+    function strchrnul(s: u8*, c: i32)     -> u8*;
+    function strstr(haystack: u8*, needle: u8*)     -> u8*;
+    function strcasestr(haystack: u8*, needle: u8*) -> u8*;
+    function strspn(s: u8*, accept: u8*)   -> u64;
+    function strcspn(s: u8*, reject: u8*)  -> u64;
+    function strpbrk(s: u8*, accept: u8*)  -> u8*;
+    function strtok(s: u8*, delim: u8*)    -> u8*;
+    function strtok_r(s: u8*, delim: u8*, saveptr: u8**) -> u8*;
+    function strsep(stringp: u8**, delim: u8*) -> u8*;
+
+    // Duplicate
+    function strdup(s: u8*)               -> u8*;
+    function strndup(s: u8*, n: u64)      -> u8*;
+
+    // Error message
+    function strerror(errnum: i32)                    -> u8*;
+    function strerror_r(errnum: i32, buf: u8*, buflen: u64) -> i32;
+    function strerror_l(errnum: i32, locale: void*)   -> u8*;
+
+    // Memory
+    function memcpy(dest: u8*, src: u8*, n: u64)   -> u8*;
+    function memmove(dest: u8*, src: u8*, n: u64)  -> u8*;
+    function memccpy(dest: u8*, src: u8*, c: i32, n: u64) -> u8*;
+    function memset(s: u8*, c: i32, n: u64)        -> u8*;
+    function memcmp(s1: u8*, s2: u8*, n: u64)      -> i32;
+    function memchr(s: u8*, c: i32, n: u64)        -> u8*;
+    function memrchr(s: u8*, c: i32, n: u64)       -> u8*;
+    function memmem(haystack: u8*, haystacklen: u64,
+                    needle: u8*, needlelen: u64)   -> u8*;
+    function mempcpy(dest: u8*, src: u8*, n: u64)  -> u8*;
+    function bzero(s: u8*, n: u64)                 -> void;
+    function bcopy(src: u8*, dest: u8*, n: u64)    -> void;
+    function explicit_bzero(s: u8*, n: u64)        -> void;
+}
+
+// ============================================================================
+// ctype.h — character classification (linker-visible versions)
+// ============================================================================
+//
+// In C these are normally macros backed by a table lookup; glibc also
+// exports real function symbols, which is what these externs bind to.
+// Use `core::primitives` `char::is_*` for the common cases in pure
+// Cryo code — these are here for parity with C call sites.
+
+extern "C" {
+    function isalnum(c: i32)   -> i32;
+    function isalpha(c: i32)   -> i32;
+    function isascii(c: i32)   -> i32;
+    function isblank(c: i32)   -> i32;
+    function iscntrl(c: i32)   -> i32;
+    function isdigit(c: i32)   -> i32;
+    function isgraph(c: i32)   -> i32;
+    function islower(c: i32)   -> i32;
+    function isprint(c: i32)   -> i32;
+    function ispunct(c: i32)   -> i32;
+    function isspace(c: i32)   -> i32;
+    function isupper(c: i32)   -> i32;
+    function isxdigit(c: i32)  -> i32;
+    function toupper(c: i32)   -> i32;
+    function tolower(c: i32)   -> i32;
+    function toascii(c: i32)   -> i32;
+}
+
+// ============================================================================
+// time.h — calendar / monotonic / process time
+// ============================================================================
+
+/// High-resolution timestamp. Layout matches Linux x86_64 — `time_t`
+/// and `long` are both 64-bit there.
+type struct timespec {
+    tv_sec:  i64;
+    tv_nsec: i64;
+}
+
+/// Microsecond timestamp. Same Linux x86_64 caveat as `timespec`.
+type struct timeval {
+    tv_sec:  i64;
+    tv_usec: i64;
+}
+
+/// Timezone block for `gettimeofday` (deprecated; pass `null` in new
+/// code).
+type struct timezone {
+    tz_minuteswest: i32;
+    tz_dsttime:     i32;
+}
+
+// `struct tm` field order matches glibc; `tm_zone` is glibc-specific.
+type struct tm {
+    tm_sec:    i32;
+    tm_min:    i32;
+    tm_hour:   i32;
+    tm_mday:   i32;
+    tm_mon:    i32;
+    tm_year:   i32;
+    tm_wday:   i32;
+    tm_yday:   i32;
+    tm_isdst:  i32;
+    tm_gmtoff: i64;
+    tm_zone:   u8*;
+}
+
+// `itimerspec` for `timerfd_settime` / POSIX timers.
+type struct itimerspec {
+    it_interval: timespec;
+    it_value:    timespec;
+}
+
+// `itimerval` for `setitimer` / `getitimer`.
+type struct itimerval {
+    it_interval: timeval;
+    it_value:    timeval;
+}
+
+/// `clockid_t` values for `clock_gettime` and friends.
+type enum ClockId : i32 {
+    CLOCK_REALTIME           = 0;
+    CLOCK_MONOTONIC          = 1;
+    CLOCK_PROCESS_CPUTIME_ID = 2;
+    CLOCK_THREAD_CPUTIME_ID  = 3;
+    CLOCK_MONOTONIC_RAW      = 4;
+    CLOCK_REALTIME_COARSE    = 5;
+    CLOCK_MONOTONIC_COARSE   = 6;
+    CLOCK_BOOTTIME           = 7;
+    CLOCK_REALTIME_ALARM     = 8;
+    CLOCK_BOOTTIME_ALARM     = 9;
+    CLOCK_TAI                = 11;
+}
+
+// TIMER_ABSTIME for clock_nanosleep
+const TIMER_ABSTIME: i32 = 1;
+
+/// `which` selector for `getitimer` / `setitimer`.
+type enum ItimerWhich : i32 {
+    ITIMER_REAL    = 0;
+    ITIMER_VIRTUAL = 1;
+    ITIMER_PROF    = 2;
+}
+
+// Conversions used by libc — CLOCKS_PER_SEC is fixed at 1_000_000 on glibc.
+const CLOCKS_PER_SEC: i64 = 1000000;
+
+extern "C" {
+    function time(t: i64*)                              -> i64;
+    function clock()                                    -> i64;
+    function clock_gettime(clk: ClockId, tp: timespec*) -> i32;
+    function clock_settime(clk: ClockId, tp: timespec*) -> i32;
+    function clock_getres(clk: ClockId,  res: timespec*) -> i32;
+    function clock_nanosleep(clk: ClockId, flags: i32,
+                             req: timespec*, rem: timespec*) -> i32;
+    function nanosleep(req: timespec*, rem: timespec*)  -> i32;
+    function gettimeofday(tv: timeval*, tz: timezone*)  -> i32;
+    function settimeofday(tv: timeval*, tz: timezone*)  -> i32;
+
+    function difftime(end: i64, start: i64)             -> f64;
+    function mktime(tm_ptr: tm*)                        -> i64;
+    function timegm(tm_ptr: tm*)                        -> i64;
+    function gmtime(t: i64*)                            -> tm*;
+    function gmtime_r(t: i64*,    result: tm*)          -> tm*;
+    function localtime(t: i64*)                         -> tm*;
+    function localtime_r(t: i64*, result: tm*)          -> tm*;
+    function asctime(tm_ptr: tm*)                       -> u8*;
+    function asctime_r(tm_ptr: tm*, buf: u8*)           -> u8*;
+    function ctime(t: i64*)                             -> u8*;
+    function ctime_r(t: i64*, buf: u8*)                 -> u8*;
+    function strftime(buf: u8*, max: u64, format: u8*, tm_ptr: tm*) -> u64;
+    function strptime(s: u8*, format: u8*, tm_ptr: tm*) -> u8*;
+
+    function tzset() -> void;
+
+    function getitimer(which: ItimerWhich, value: itimerval*) -> i32;
+    function setitimer(which: ItimerWhich,
+                       new_val: itimerval*, old_val: itimerval*) -> i32;
+
+    // timerfd
+    function timerfd_create(clockid: ClockId, flags: i32) -> i32;
+    function timerfd_settime(fd: i32, flags: i32,
+                             new_val: itimerspec*, old_val: itimerspec*) -> i32;
+    function timerfd_gettime(fd: i32, curr_val: itimerspec*) -> i32;
+}
+
+// timerfd_create flags
+const TFD_NONBLOCK: i32 = 2048;     // == O_NONBLOCK
+const TFD_CLOEXEC:  i32 = 524288;   // == O_CLOEXEC
+
+// timerfd_settime flags
+const TFD_TIMER_ABSTIME:       i32 = 1;
+const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
+
+// ============================================================================
+// sys/wait.h — process status
+// ============================================================================
+
+const WNOHANG:    i32 = 1;
+const WUNTRACED:  i32 = 2;
+const WSTOPPED:   i32 = 2;
+const WEXITED:    i32 = 4;
+const WCONTINUED: i32 = 8;
+const WNOWAIT:    i32 = 16777216;   // 1 << 24
+
+extern "C" {
+    function wait(wstatus: i32*)                             -> i32;
+    function waitpid(pid: i32, wstatus: i32*, options: i32)  -> i32;
+    function wait3(wstatus: i32*, options: i32, rusage: u8*) -> i32;
+    function wait4(pid: i32, wstatus: i32*, options: i32, rusage: u8*) -> i32;
+    function waitid(idtype: i32, id: u32, infop: u8*, options: i32) -> i32;
+}
+
+// `W*` are C macros over the raw status int. Reimplemented as plain
+// Cryo functions so callers don't need to repeat the bit dance.
+
+function WIFEXITED(status: i32)    -> boolean { return (status & 0x7F) == 0; }
+function WEXITSTATUS(status: i32)  -> i32     { return (status >> 8) & 0xFF; }
+function WIFSIGNALED(status: i32)  -> boolean {
+    const low: i32 = status & 0x7F;
+    return low != 0 && low != 0x7F;
+}
+function WTERMSIG(status: i32)     -> i32     { return status & 0x7F; }
+function WCOREDUMP(status: i32)    -> boolean { return (status & 0x80) != 0; }
+function WIFSTOPPED(status: i32)   -> boolean { return (status & 0xFF) == 0x7F; }
+function WSTOPSIG(status: i32)     -> i32     { return (status >> 8) & 0xFF; }
+function WIFCONTINUED(status: i32) -> boolean { return status == 0xFFFF; }
+
+// ============================================================================
+// sys/socket.h — domain / type / level / option / shutdown
+// ============================================================================
+
+/// `socket(domain, ...)` address family.
+type enum AddressFamily : i32 {
+    AF_UNSPEC    = 0;
+    AF_UNIX      = 1;
+    AF_INET      = 2;
+    AF_AX25      = 3;
+    AF_IPX       = 4;
+    AF_APPLETALK = 5;
+    AF_NETROM    = 6;
+    AF_BRIDGE    = 7;
+    AF_ATMPVC    = 8;
+    AF_X25       = 9;
+    AF_INET6     = 10;
+    AF_NETLINK   = 16;
+    AF_PACKET    = 17;
+    AF_BLUETOOTH = 31;
+}
+
+// `PF_*` are aliases for `AF_*` in C; provided as constants so callers
+// who prefer the protocol-family spelling don't lose readability.
+const PF_UNSPEC: i32 = 0;
+const PF_UNIX:   i32 = 1;
+const PF_INET:   i32 = 2;
+const PF_INET6:  i32 = 10;
+const PF_PACKET: i32 = 17;
+
+// `SOCK_*` is mostly a one-of, but Linux allows OR'ing `SOCK_CLOEXEC`
+// and `SOCK_NONBLOCK` into the type argument, so keep this as flat
+// constants rather than a closed enum.
+const SOCK_STREAM:    i32 = 1;
+const SOCK_DGRAM:     i32 = 2;
+const SOCK_RAW:       i32 = 3;
+const SOCK_RDM:       i32 = 4;
+const SOCK_SEQPACKET: i32 = 5;
+const SOCK_DCCP:      i32 = 6;
+const SOCK_PACKET:    i32 = 10;
+const SOCK_CLOEXEC:   i32 = 524288;   // == O_CLOEXEC, OR'd into type
+const SOCK_NONBLOCK:  i32 = 2048;     // == O_NONBLOCK, OR'd into type
+
+/// IP protocol selector for `socket(..., protocol)`.
+type enum Protocol : i32 {
+    IPPROTO_IP     = 0;
+    IPPROTO_ICMP   = 1;
+    IPPROTO_IGMP   = 2;
+    IPPROTO_TCP    = 6;
+    IPPROTO_UDP    = 17;
+    IPPROTO_IPV6   = 41;
+    IPPROTO_GRE    = 47;
+    IPPROTO_ESP    = 50;
+    IPPROTO_AH     = 51;
+    IPPROTO_ICMPV6 = 58;
+    IPPROTO_RAW    = 255;
+}
+
+/// `setsockopt` / `getsockopt` level.
+type enum SocketLevel : i32 {
+    SOL_IP      = 0;
+    SOL_SOCKET  = 1;
+    SOL_TCP     = 6;
+    SOL_UDP     = 17;
+    SOL_IPV6    = 41;
+    SOL_ICMPV6  = 58;
+}
+
+// `SO_*` (per-level optnames). Optname meaning depends on the
+// level argument, so they live as flat constants — keep them grouped
+// by level for readability.
+
+const SO_DEBUG:        i32 = 1;
+const SO_REUSEADDR:    i32 = 2;
+const SO_TYPE:         i32 = 3;
+const SO_ERROR:        i32 = 4;
+const SO_DONTROUTE:    i32 = 5;
+const SO_BROADCAST:    i32 = 6;
+const SO_SNDBUF:       i32 = 7;
+const SO_RCVBUF:       i32 = 8;
+const SO_KEEPALIVE:    i32 = 9;
+const SO_OOBINLINE:    i32 = 10;
+const SO_LINGER:       i32 = 13;
+const SO_REUSEPORT:    i32 = 15;
+const SO_RCVLOWAT:     i32 = 18;
+const SO_SNDLOWAT:     i32 = 19;
+const SO_RCVTIMEO:     i32 = 20;
+const SO_SNDTIMEO:     i32 = 21;
+const SO_ACCEPTCONN:   i32 = 30;
+const SO_BINDTODEVICE: i32 = 25;
+
+// IP_* options
+const IP_TTL:             i32 = 2;
+const IP_MULTICAST_IF:    i32 = 32;
+const IP_MULTICAST_TTL:   i32 = 33;
+const IP_MULTICAST_LOOP:  i32 = 34;
+const IP_ADD_MEMBERSHIP:  i32 = 35;
+const IP_DROP_MEMBERSHIP: i32 = 36;
+
+// IPV6_* options
+const IPV6_UNICAST_HOPS:    i32 = 16;
+const IPV6_MULTICAST_IF:    i32 = 17;
+const IPV6_MULTICAST_HOPS:  i32 = 18;
+const IPV6_MULTICAST_LOOP:  i32 = 19;
+const IPV6_ADD_MEMBERSHIP:  i32 = 20;
+const IPV6_DROP_MEMBERSHIP: i32 = 21;
+const IPV6_V6ONLY:          i32 = 26;
+
+// TCP_* options
+const TCP_NODELAY:      i32 = 1;
+const TCP_MAXSEG:       i32 = 2;
+const TCP_CORK:         i32 = 3;
+const TCP_KEEPIDLE:     i32 = 4;
+const TCP_KEEPINTVL:    i32 = 5;
+const TCP_KEEPCNT:      i32 = 6;
+const TCP_INFO:         i32 = 11;
+const TCP_USER_TIMEOUT: i32 = 18;
+const TCP_FASTOPEN:     i32 = 23;
+
+// MSG_* flags (OR'd into send/recv `flags`)
+const MSG_OOB:          i32 = 1;
+const MSG_PEEK:         i32 = 2;
+const MSG_DONTROUTE:    i32 = 4;
+const MSG_CTRUNC:       i32 = 8;
+const MSG_TRUNC:        i32 = 32;
+const MSG_DONTWAIT:     i32 = 64;
+const MSG_EOR:          i32 = 128;
+const MSG_WAITALL:      i32 = 256;
+const MSG_NOSIGNAL:     i32 = 16384;
+const MSG_MORE:         i32 = 32768;
+const MSG_CMSG_CLOEXEC: i32 = 1073741824;  // 1 << 30
+
+/// Direction(s) `shutdown` tears down on a socket. Mutually exclusive.
+type enum ShutdownHow : i32 {
+    SHUT_RD   = 0;
+    SHUT_WR   = 1;
+    SHUT_RDWR = 2;
+}
+
+/// IPv4 raw address (network byte order in `s_addr`).
+type struct in_addr {
+    s_addr: u32;
+}
+
+/// IPv6 raw address.
+type struct in6_addr {
+    s6_addr: u8[16];
+}
+
+// `struct sockaddr_in` (16 bytes on Linux) and `struct sockaddr_in6`
+// (28 bytes on Linux) have platform-variant `sa_family_t` width.
+// Callers should allocate a `u8[SIZEOF_SOCKADDR_*]` buffer and pack
+// fields by offset, as `net::tcp` already does.
+
+const SIZEOF_SOCKADDR_IN:      u64 = 16;
+const SIZEOF_SOCKADDR_IN6:     u64 = 28;
+const SIZEOF_SOCKADDR_STORAGE: u64 = 128;
+const SIZEOF_SOCKADDR_UN:      u64 = 110;
+
+// `INADDR_ANY` / `INADDR_LOOPBACK` / `INADDR_BROADCAST` in HOST order.
+// Convert to network order with `htonl` before packing into a
+// `sockaddr_in`.
+const INADDR_ANY:       u32 = 0;
+const INADDR_LOOPBACK:  u32 = 2130706433;  // 0x7F000001 == 127.0.0.1
+const INADDR_BROADCAST: u32 = 4294967295;  // 0xFFFFFFFF == 255.255.255.255
+const INADDR_NONE:      u32 = 4294967295;
+
+extern "C" {
+    function socket(domain: AddressFamily, sock_type: i32, protocol: Protocol) -> i32;
+    function socketpair(domain: AddressFamily, sock_type: i32,
+                        protocol: Protocol, sv: i32*) -> i32;
+    function bind(sockfd: i32, addr: u8*, addrlen: u32)            -> i32;
+    function listen(sockfd: i32, backlog: i32)                     -> i32;
+    function accept(sockfd: i32, addr: u8*, addrlen: u32*)         -> i32;
+    function accept4(sockfd: i32, addr: u8*, addrlen: u32*, flags: i32) -> i32;
+    function connect(sockfd: i32, addr: u8*, addrlen: u32)         -> i32;
+    function getsockname(sockfd: i32, addr: u8*, addrlen: u32*)    -> i32;
+    function getpeername(sockfd: i32, addr: u8*, addrlen: u32*)    -> i32;
+
+    function send(sockfd: i32, buf: u8*, len: u64, flags: i32)     -> i64;
+    function sendto(sockfd: i32, buf: u8*, len: u64, flags: i32,
+                    dest_addr: u8*, addrlen: u32)                  -> i64;
+    function sendmsg(sockfd: i32, msg: u8*, flags: i32)            -> i64;
+    function recv(sockfd: i32, buf: u8*, len: u64, flags: i32)     -> i64;
+    function recvfrom(sockfd: i32, buf: u8*, len: u64, flags: i32,
+                      src_addr: u8*, addrlen: u32*)                -> i64;
+    function recvmsg(sockfd: i32, msg: u8*, flags: i32)            -> i64;
+
+    function setsockopt(sockfd: i32, level: SocketLevel, optname: i32,
+                        optval: u8*, optlen: u32)                  -> i32;
+    function getsockopt(sockfd: i32, level: SocketLevel, optname: i32,
+                        optval: u8*, optlen: u32*)                 -> i32;
+    function shutdown(sockfd: i32, how: ShutdownHow)               -> i32;
+}
+
+// ============================================================================
+// arpa/inet.h — byte order + address text conversion
+// ============================================================================
+
+extern "C" {
+    function htons(hostshort: u16) -> u16;
+    function htonl(hostlong: u32)  -> u32;
+    function ntohs(netshort: u16)  -> u16;
+    function ntohl(netlong: u32)   -> u32;
+
+    function inet_addr(cp: u8*)                       -> u32;
+    function inet_network(cp: u8*)                    -> u32;
+    function inet_ntoa(in_a: in_addr)                 -> u8*;
+    function inet_aton(cp: u8*, inp: in_addr*)        -> i32;
+    function inet_pton(af: AddressFamily, src: u8*, dst: u8*) -> i32;
+    function inet_ntop(af: AddressFamily, src: u8*, dst: u8*, size: u32) -> u8*;
+}
+
+// `inet_ntop` buffer-size hints
+const INET_ADDRSTRLEN:  u64 = 16;
+const INET6_ADDRSTRLEN: u64 = 46;
+
+// ============================================================================
+// netdb.h — name resolution
+// ============================================================================
+//
+// `struct addrinfo` chains heap-allocated entries, freed with
+// `freeaddrinfo`. Treat as opaque — high-level wrappers parse fields
+// by offset from `man getaddrinfo`.
+
+const SIZEOF_ADDRINFO: u64 = 48;
+
+// AI_* flags (OR'd into hints.ai_flags)
+const AI_PASSIVE:     i32 = 1;
+const AI_CANONNAME:   i32 = 2;
+const AI_NUMERICHOST: i32 = 4;
+const AI_V4MAPPED:    i32 = 8;
+const AI_ALL:         i32 = 16;
+const AI_ADDRCONFIG:  i32 = 32;
+const AI_NUMERICSERV: i32 = 1024;
+
+// NI_* flags (OR'd into getnameinfo `flags`)
+const NI_NUMERICHOST: i32 = 1;
+const NI_NUMERICSERV: i32 = 2;
+const NI_NOFQDN:      i32 = 4;
+const NI_NAMEREQD:    i32 = 8;
+const NI_DGRAM:       i32 = 16;
+const NI_MAXHOST:     u64 = 1025;
+const NI_MAXSERV:     u64 = 32;
+
+// getaddrinfo() error codes
+const EAI_BADFLAGS:    i32 = -1;
+const EAI_NONAME:      i32 = -2;
+const EAI_AGAIN:       i32 = -3;
+const EAI_FAIL:        i32 = -4;
+const EAI_FAMILY:      i32 = -6;
+const EAI_SOCKTYPE:    i32 = -7;
+const EAI_SERVICE:     i32 = -8;
+const EAI_MEMORY:      i32 = -10;
+const EAI_SYSTEM:      i32 = -11;
+const EAI_OVERFLOW:    i32 = -12;
+const EAI_NODATA:      i32 = -5;
+const EAI_ADDRFAMILY:  i32 = -9;
+const EAI_INPROGRESS:  i32 = -100;
+const EAI_CANCELED:    i32 = -101;
+
+extern "C" {
+    function getaddrinfo(node: u8*, service: u8*,
+                         hints: u8*, res: u8**) -> i32;
+    function freeaddrinfo(res: u8*)             -> void;
+    function getnameinfo(sa: u8*, salen: u32,
+                         host: u8*, hostlen: u32,
+                         serv: u8*, servlen: u32, flags: i32) -> i32;
+    function gai_strerror(errcode: i32)         -> u8*;
+    function herror(prefix: u8*)                -> void;
+    function hstrerror(err: i32)                -> u8*;
+    function gethostbyname(name: u8*)           -> u8*;
+    function gethostbyaddr(addr: u8*, len: u32, type_: i32) -> u8*;
+}
+
+// ============================================================================
+// sys/select.h — synchronous multiplexing
+// ============================================================================
+//
+// `fd_set` is a bitmask 1024 bits wide on glibc. The `FD_*` C macros
+// have small Cryo equivalents — define them at the call site using
+// bit ops, or use poll/epoll for descriptors above the
+// `FD_SETSIZE` cliff.
+
+const FD_SETSIZE:    u64 = 1024;
+const SIZEOF_FD_SET: u64 = 128;
+
+extern "C" {
+    function select(nfds: i32, readfds: u8*, writefds: u8*,
+                    exceptfds: u8*, timeout: timeval*) -> i32;
+    function pselect(nfds: i32, readfds: u8*, writefds: u8*,
+                     exceptfds: u8*, timeout: timespec*, sigmask: u8*) -> i32;
+}
+
+// ============================================================================
+// poll.h — file-descriptor polling
+// ============================================================================
+
+/// One slot of a `poll`/`ppoll` array.
+type struct pollfd {
+    fd:      i32;
+    events:  i16;
+    revents: i16;
+}
+
+// poll event flags (OR'd into events/revents)
+const POLLIN:     i16 = 1;
+const POLLPRI:    i16 = 2;
+const POLLOUT:    i16 = 4;
+const POLLERR:    i16 = 8;
+const POLLHUP:    i16 = 16;
+const POLLNVAL:   i16 = 32;
+const POLLRDNORM: i16 = 64;
+const POLLRDBAND: i16 = 128;
+const POLLWRNORM: i16 = 256;
+const POLLWRBAND: i16 = 512;
+const POLLMSG:    i16 = 1024;
+const POLLREMOVE: i16 = 4096;
+const POLLRDHUP:  i16 = 8192;
+
+extern "C" {
+    function poll(fds: pollfd*, nfds: u64, timeout: i32) -> i32;
+    function ppoll(fds: pollfd*, nfds: u64,
+                   timeout: timespec*, sigmask: u8*) -> i32;
+}
+
+// ============================================================================
+// sys/mman.h — memory mapping
+// ============================================================================
+
+const MAP_FAILED_VALUE: i64 = -1;   // (void*)-1 — compare cast'd return.
+
+// prot bits (OR'd into prot arg)
+const PROT_NONE:      i32 = 0;
+const PROT_READ:      i32 = 1;
+const PROT_WRITE:     i32 = 2;
+const PROT_EXEC:      i32 = 4;
+const PROT_GROWSDOWN: i32 = 0x01000000;
+const PROT_GROWSUP:   i32 = 0x02000000;
+
+// mmap flags (OR'd into flags arg)
+const MAP_SHARED:          i32 = 1;
+const MAP_PRIVATE:         i32 = 2;
+const MAP_SHARED_VALIDATE: i32 = 3;
+const MAP_FIXED:           i32 = 16;
+const MAP_ANONYMOUS:       i32 = 32;
+const MAP_ANON:            i32 = 32;
+const MAP_GROWSDOWN:       i32 = 256;
+const MAP_DENYWRITE:       i32 = 2048;
+const MAP_EXECUTABLE:      i32 = 4096;
+const MAP_LOCKED:          i32 = 8192;
+const MAP_NORESERVE:       i32 = 16384;
+const MAP_POPULATE:        i32 = 32768;
+const MAP_NONBLOCK:        i32 = 65536;
+const MAP_STACK:           i32 = 131072;
+const MAP_HUGETLB:         i32 = 262144;
+const MAP_SYNC:            i32 = 524288;
+const MAP_FIXED_NOREPLACE: i32 = 1048576;
+
+// msync flags
+const MS_ASYNC:      i32 = 1;
+const MS_INVALIDATE: i32 = 2;
+const MS_SYNC:       i32 = 4;
+
+/// `madvise` / `posix_madvise` access pattern. Mutually exclusive.
+type enum MadviseAdvice : i32 {
+    MADV_NORMAL      = 0;
+    MADV_RANDOM      = 1;
+    MADV_SEQUENTIAL  = 2;
+    MADV_WILLNEED    = 3;
+    MADV_DONTNEED    = 4;
+    MADV_FREE        = 8;
+    MADV_REMOVE      = 9;
+    MADV_DONTFORK    = 10;
+    MADV_DOFORK      = 11;
+    MADV_MERGEABLE   = 12;
+    MADV_UNMERGEABLE = 13;
+    MADV_HUGEPAGE    = 14;
+    MADV_NOHUGEPAGE  = 15;
+    MADV_DONTDUMP    = 16;
+    MADV_DODUMP      = 17;
+    MADV_HWPOISON    = 100;
+}
+
+// mlockall flags
+const MCL_CURRENT: i32 = 1;
+const MCL_FUTURE:  i32 = 2;
+const MCL_ONFAULT: i32 = 4;
+
+extern "C" {
+    function mmap(addr: u8*, length: u64, prot: i32,
+                  flags: i32, fd: i32, offset: i64) -> u8*;
+    function munmap(addr: u8*, length: u64)        -> i32;
+    function mremap(old_addr: u8*, old_size: u64,
+                    new_size: u64, flags: i32, new_addr: u8*) -> u8*;
+    function mprotect(addr: u8*, length: u64, prot: i32)        -> i32;
+    function msync(addr: u8*, length: u64, flags: i32)          -> i32;
+    function madvise(addr: u8*, length: u64, advice: MadviseAdvice) -> i32;
+    function posix_madvise(addr: u8*, length: u64, advice: MadviseAdvice) -> i32;
+    function mlock(addr: u8*, length: u64)         -> i32;
+    function munlock(addr: u8*, length: u64)       -> i32;
+    function mlockall(flags: i32)                  -> i32;
+    function munlockall()                          -> i32;
+    function mincore(addr: u8*, length: u64, vec: u8*) -> i32;
+
+    function shm_open(name: u8*, oflag: i32, mode: u32) -> i32;
+    function shm_unlink(name: u8*)                       -> i32;
+    function memfd_create(name: u8*, flags: u32)         -> i32;
+}
+
+// memfd_create flags
+const MFD_CLOEXEC:       u32 = 1;
+const MFD_ALLOW_SEALING: u32 = 2;
+const MFD_HUGETLB:       u32 = 4;
+
+// ============================================================================
+// sys/epoll.h — Linux scalable I/O multiplexing
+// ============================================================================
+//
+// `struct epoll_event` is packed on x86_64 (12 bytes: u32 events,
+// 8-byte union). Cryo's struct layout doesn't currently honor
+// `__attribute__((packed))`, so `epoll_event` is treated as opaque.
+// Allocate `u8[SIZEOF_EPOLL_EVENT]` per slot.
+
+const SIZEOF_EPOLL_EVENT: u64 = 12;
+
+// epoll event mask (u32, OR'd)
+const EPOLLIN:        u32 = 1;
+const EPOLLPRI:       u32 = 2;
+const EPOLLOUT:       u32 = 4;
+const EPOLLRDNORM:    u32 = 64;
+const EPOLLRDBAND:    u32 = 128;
+const EPOLLWRNORM:    u32 = 256;
+const EPOLLWRBAND:    u32 = 512;
+const EPOLLMSG:       u32 = 1024;
+const EPOLLERR:       u32 = 8;
+const EPOLLHUP:       u32 = 16;
+const EPOLLRDHUP:     u32 = 8192;
+const EPOLLEXCLUSIVE: u32 = 268435456;     // 1 << 28
+const EPOLLWAKEUP:    u32 = 536870912;     // 1 << 29
+const EPOLLONESHOT:   u32 = 1073741824;    // 1 << 30
+const EPOLLET:        u32 = 2147483648;    // 1 << 31
+
+/// `op` argument to `epoll_ctl`. Mutually exclusive.
+type enum EpollOp : i32 {
+    EPOLL_CTL_ADD = 1;
+    EPOLL_CTL_DEL = 2;
+    EPOLL_CTL_MOD = 3;
+}
+
+// epoll_create1 flags
+const EPOLL_CLOEXEC: i32 = 524288;   // == O_CLOEXEC
+
+extern "C" {
+    function epoll_create(size: i32)              -> i32;
+    function epoll_create1(flags: i32)            -> i32;
+    function epoll_ctl(epfd: i32, op: EpollOp, fd: i32, event: u8*) -> i32;
+    function epoll_wait(epfd: i32, events: u8*, maxevents: i32, timeout: i32) -> i32;
+    function epoll_pwait(epfd: i32, events: u8*, maxevents: i32,
+                         timeout: i32, sigmask: u8*) -> i32;
+}
+
+// ============================================================================
+// sys/eventfd.h — file-descriptor event counter
+// ============================================================================
+
+const EFD_SEMAPHORE: i32 = 1;
+const EFD_CLOEXEC:   i32 = 524288;   // == O_CLOEXEC
+const EFD_NONBLOCK:  i32 = 2048;     // == O_NONBLOCK
+
+extern "C" {
+    function eventfd(initval: u32, flags: i32) -> i32;
+}
+
+// ============================================================================
+// sys/signalfd.h — receive signals as a file descriptor
+// ============================================================================
+
+const SFD_CLOEXEC:  i32 = 524288;
+const SFD_NONBLOCK: i32 = 2048;
+
+/// `signalfd_siginfo` on x86_64 is 128 bytes.
+const SIZEOF_SIGNALFD_SIGINFO: u64 = 128;
+
+extern "C" {
+    function signalfd(fd: i32, mask: u8*, flags: i32) -> i32;
+}
+
+// ============================================================================
+// dirent.h — directory iteration
+// ============================================================================
+//
+// `DIR*` is opaque — pass as `void*`. `struct dirent` has a flexible
+// trailing name array; access it through `readdir`'s pointer return
+// and offset-read the fields you need.
+
+/// `d_type` field of `struct dirent`.
+type enum DirentType : u8 {
+    DT_UNKNOWN = 0;
+    DT_FIFO    = 1;
+    DT_CHR     = 2;
+    DT_DIR     = 4;
+    DT_BLK     = 6;
+    DT_REG     = 8;
+    DT_LNK     = 10;
+    DT_SOCK    = 12;
+    DT_WHT     = 14;
+}
+
+extern "C" {
+    function opendir(name: u8*)        -> void*;
+    function fdopendir(fd: i32)        -> void*;
+    function readdir(dirp: void*)      -> u8*;
+    function readdir_r(dirp: void*, entry: u8*, result: u8**) -> i32;
+    function closedir(dirp: void*)     -> i32;
+    function rewinddir(dirp: void*)    -> void;
+    function telldir(dirp: void*)      -> i64;
+    function seekdir(dirp: void*, loc: i64) -> void;
+    function dirfd(dirp: void*)        -> i32;
+    function scandir(dirp: u8*, namelist: u8***,
+                     filter: void*, compar: void*) -> i32;
+    function alphasort(a: u8*, b: u8*) -> i32;
+    function versionsort(a: u8*, b: u8*) -> i32;
+}
+
+// ============================================================================
+// pthread.h — POSIX threads
+// ============================================================================
+//
+// `pthread_t`, `pthread_mutex_t`, `pthread_cond_t`, `pthread_rwlock_t`
+// are opaque types whose sizes vary. Allocate `u8[SIZEOF_*]` buffers
+// to back them, then pass `&buf[0]`. On Linux x86_64 / glibc:
+
+const SIZEOF_PTHREAD_T:             u64 = 8;
+const SIZEOF_PTHREAD_ATTR_T:        u64 = 56;
+const SIZEOF_PTHREAD_MUTEX_T:       u64 = 40;
+const SIZEOF_PTHREAD_MUTEXATTR_T:   u64 = 4;
+const SIZEOF_PTHREAD_COND_T:        u64 = 48;
+const SIZEOF_PTHREAD_CONDATTR_T:    u64 = 4;
+const SIZEOF_PTHREAD_RWLOCK_T:      u64 = 56;
+const SIZEOF_PTHREAD_RWLOCKATTR_T:  u64 = 8;
+const SIZEOF_PTHREAD_BARRIER_T:     u64 = 32;
+const SIZEOF_PTHREAD_BARRIERATTR_T: u64 = 4;
+const SIZEOF_PTHREAD_KEY_T:         u64 = 4;
+const SIZEOF_PTHREAD_ONCE_T:        u64 = 4;
+const SIZEOF_PTHREAD_SPINLOCK_T:    u64 = 4;
+
+// PTHREAD_*_INITIALIZER values are zeroed buffers, so a fresh
+// `u8[SIZEOF_PTHREAD_MUTEX_T]` works without explicit init for
+// default-attribute mutexes.
+
+/// Mutex behavior set via `pthread_mutexattr_settype`.
+type enum MutexType : i32 {
+    PTHREAD_MUTEX_NORMAL     = 0;
+    PTHREAD_MUTEX_RECURSIVE  = 1;
+    PTHREAD_MUTEX_ERRORCHECK = 2;
+}
+
+/// Detach state set via `pthread_attr_setdetachstate`.
+type enum DetachState : i32 {
+    PTHREAD_CREATE_JOINABLE = 0;
+    PTHREAD_CREATE_DETACHED = 1;
+}
+
+/// Cancel-enable flag for `pthread_setcancelstate`.
+type enum CancelState : i32 {
+    PTHREAD_CANCEL_ENABLE  = 0;
+    PTHREAD_CANCEL_DISABLE = 1;
+}
+
+/// Cancel delivery mode for `pthread_setcanceltype`.
+type enum CancelType : i32 {
+    PTHREAD_CANCEL_DEFERRED     = 0;
+    PTHREAD_CANCEL_ASYNCHRONOUS = 1;
+}
+
+extern "C" {
+    // Thread lifecycle
+    function pthread_create(thread: u8*, attr: u8*,
+                            start_routine: void*, arg: u8*) -> i32;
+    function pthread_join(thread: u64, retval: u8**)        -> i32;
+    function pthread_tryjoin_np(thread: u64, retval: u8**)  -> i32;
+    function pthread_timedjoin_np(thread: u64, retval: u8**, abstime: timespec*) -> i32;
+    function pthread_detach(thread: u64)                    -> i32;
+    function pthread_self()                                 -> u64;
+    function pthread_equal(t1: u64, t2: u64)                -> i32;
+    function pthread_exit(retval: u8*)                      -> void;
+    function pthread_cancel(thread: u64)                    -> i32;
+    function pthread_kill(thread: u64, sig: i32)            -> i32;
+    function pthread_sigmask(how: SigprocmaskHow, set: u8*, oldset: u8*) -> i32;
+    function pthread_setcancelstate(state: CancelState, oldstate: CancelState*) -> i32;
+    function pthread_setcanceltype(type_: CancelType, oldtype: CancelType*)     -> i32;
+    function pthread_testcancel() -> void;
+
+    // Attributes
+    function pthread_attr_init(attr: u8*)                                -> i32;
+    function pthread_attr_destroy(attr: u8*)                             -> i32;
+    function pthread_attr_setdetachstate(attr: u8*, state: DetachState)  -> i32;
+    function pthread_attr_getdetachstate(attr: u8*, state: DetachState*) -> i32;
+    function pthread_attr_setstacksize(attr: u8*, stacksize: u64)        -> i32;
+    function pthread_attr_getstacksize(attr: u8*, stacksize: u64*)       -> i32;
+    function pthread_attr_setguardsize(attr: u8*, guardsize: u64)        -> i32;
+
+    // Mutex
+    function pthread_mutex_init(mutex: u8*, attr: u8*)               -> i32;
+    function pthread_mutex_destroy(mutex: u8*)                       -> i32;
+    function pthread_mutex_lock(mutex: u8*)                          -> i32;
+    function pthread_mutex_trylock(mutex: u8*)                       -> i32;
+    function pthread_mutex_timedlock(mutex: u8*, abstime: timespec*) -> i32;
+    function pthread_mutex_unlock(mutex: u8*)                        -> i32;
+    function pthread_mutexattr_init(attr: u8*)                       -> i32;
+    function pthread_mutexattr_destroy(attr: u8*)                    -> i32;
+    function pthread_mutexattr_settype(attr: u8*, type_: MutexType)  -> i32;
+    function pthread_mutexattr_gettype(attr: u8*, type_: MutexType*) -> i32;
+
+    // Condition variable
+    function pthread_cond_init(cond: u8*, attr: u8*)               -> i32;
+    function pthread_cond_destroy(cond: u8*)                       -> i32;
+    function pthread_cond_signal(cond: u8*)                        -> i32;
+    function pthread_cond_broadcast(cond: u8*)                     -> i32;
+    function pthread_cond_wait(cond: u8*, mutex: u8*)              -> i32;
+    function pthread_cond_timedwait(cond: u8*, mutex: u8*, abstime: timespec*) -> i32;
+    function pthread_condattr_init(attr: u8*)                      -> i32;
+    function pthread_condattr_destroy(attr: u8*)                   -> i32;
+    function pthread_condattr_setclock(attr: u8*, clock_id: ClockId) -> i32;
+
+    // Read/write lock
+    function pthread_rwlock_init(rwlock: u8*, attr: u8*) -> i32;
+    function pthread_rwlock_destroy(rwlock: u8*)         -> i32;
+    function pthread_rwlock_rdlock(rwlock: u8*)          -> i32;
+    function pthread_rwlock_tryrdlock(rwlock: u8*)       -> i32;
+    function pthread_rwlock_wrlock(rwlock: u8*)          -> i32;
+    function pthread_rwlock_trywrlock(rwlock: u8*)       -> i32;
+    function pthread_rwlock_unlock(rwlock: u8*)          -> i32;
+
+    // Barrier
+    function pthread_barrier_init(barrier: u8*, attr: u8*, count: u32) -> i32;
+    function pthread_barrier_destroy(barrier: u8*) -> i32;
+    function pthread_barrier_wait(barrier: u8*)    -> i32;
+
+    // Spinlock
+    function pthread_spin_init(lock: u8*, pshared: i32) -> i32;
+    function pthread_spin_destroy(lock: u8*)            -> i32;
+    function pthread_spin_lock(lock: u8*)               -> i32;
+    function pthread_spin_trylock(lock: u8*)            -> i32;
+    function pthread_spin_unlock(lock: u8*)             -> i32;
+
+    // Once-init
+    function pthread_once(once_control: u8*, init_routine: void*) -> i32;
+
+    // Thread-local storage keys
+    function pthread_key_create(key: u32*, destructor: void*) -> i32;
+    function pthread_key_delete(key: u32)                     -> i32;
+    function pthread_getspecific(key: u32)                    -> u8*;
+    function pthread_setspecific(key: u32, value: u8*)        -> i32;
+
+    // Naming (Linux glibc)
+    function pthread_setname_np(thread: u64, name: u8*)           -> i32;
+    function pthread_getname_np(thread: u64, name: u8*, len: u64) -> i32;
+}
+
+// ============================================================================
+// termios.h — terminal control
+// ============================================================================
+//
+// `struct termios` on Linux is 60 bytes (`tcflag_t` x4 + cc_t[32] + speeds).
+// Treat as opaque buffer.
+
+const SIZEOF_TERMIOS: u64 = 60;
+const NCCS:           u64 = 32;
+
+// c_cc indices
+const VINTR:    u64 = 0;
+const VQUIT:    u64 = 1;
+const VERASE:   u64 = 2;
+const VKILL:    u64 = 3;
+const VEOF:     u64 = 4;
+const VTIME:    u64 = 5;
+const VMIN:     u64 = 6;
+const VSWTC:    u64 = 7;
+const VSTART:   u64 = 8;
+const VSTOP:    u64 = 9;
+const VSUSP:    u64 = 10;
+const VEOL:     u64 = 11;
+const VREPRINT: u64 = 12;
+const VDISCARD: u64 = 13;
+const VWERASE:  u64 = 14;
+const VLNEXT:   u64 = 15;
+const VEOL2:    u64 = 16;
+
+// c_iflag (OR'd)
+const IGNBRK:  u32 = 1;
+const BRKINT:  u32 = 2;
+const IGNPAR:  u32 = 4;
+const PARMRK:  u32 = 8;
+const INPCK:   u32 = 16;
+const ISTRIP:  u32 = 32;
+const INLCR:   u32 = 64;
+const IGNCR:   u32 = 128;
+const ICRNL:   u32 = 256;
+const IUCLC:   u32 = 512;
+const IXON:    u32 = 1024;
+const IXANY:   u32 = 2048;
+const IXOFF:   u32 = 4096;
+const IMAXBEL: u32 = 8192;
+const IUTF8:   u32 = 16384;
+
+// c_oflag (OR'd)
+const OPOST:  u32 = 1;
+const ONLCR:  u32 = 4;
+const OCRNL:  u32 = 8;
+const ONOCR:  u32 = 16;
+const ONLRET: u32 = 32;
+
+// c_lflag (OR'd)
+const ISIG:    u32 = 1;
+const ICANON:  u32 = 2;
+const ECHO:    u32 = 8;
+const ECHOE:   u32 = 16;
+const ECHOK:   u32 = 32;
+const ECHONL:  u32 = 64;
+const NOFLSH:  u32 = 128;
+const TOSTOP:  u32 = 256;
+const IEXTEN:  u32 = 32768;
+
+// c_cflag (OR'd; CSIZE / CS5..CS8 are a mask + values)
+const CSIZE:  u32 = 48;
+const CS5:    u32 = 0;
+const CS6:    u32 = 16;
+const CS7:    u32 = 32;
+const CS8:    u32 = 48;
+const CSTOPB: u32 = 64;
+const CREAD:  u32 = 128;
+const PARENB: u32 = 256;
+const PARODD: u32 = 512;
+const HUPCL:  u32 = 1024;
+const CLOCAL: u32 = 2048;
+
+/// `tcsetattr` apply timing. Mutually exclusive.
+type enum TcAction : i32 {
+    TCSANOW   = 0;
+    TCSADRAIN = 1;
+    TCSAFLUSH = 2;
+}
+
+/// `tcflush` queue selector. Mutually exclusive.
+type enum TcQueue : i32 {
+    TCIFLUSH  = 0;
+    TCOFLUSH  = 1;
+    TCIOFLUSH = 2;
+}
+
+/// `tcflow` action. Mutually exclusive.
+type enum TcFlow : i32 {
+    TCOOFF = 0;
+    TCOON  = 1;
+    TCIOFF = 2;
+    TCION  = 3;
+}
+
+// Baud rates (B0..B4000000) — only the common subset listed.
+const B0:       u32 = 0;
+const B50:      u32 = 1;
+const B75:      u32 = 2;
+const B110:     u32 = 3;
+const B134:     u32 = 4;
+const B150:     u32 = 5;
+const B200:     u32 = 6;
+const B300:     u32 = 7;
+const B600:     u32 = 8;
+const B1200:    u32 = 9;
+const B1800:    u32 = 10;
+const B2400:    u32 = 11;
+const B4800:    u32 = 12;
+const B9600:    u32 = 13;
+const B19200:   u32 = 14;
+const B38400:   u32 = 15;
+const B57600:   u32 = 4097;
+const B115200:  u32 = 4098;
+const B230400:  u32 = 4099;
+const B460800:  u32 = 4100;
+const B500000:  u32 = 4101;
+const B576000:  u32 = 4102;
+const B921600:  u32 = 4103;
+const B1000000: u32 = 4104;
+
+extern "C" {
+    function tcgetattr(fd: i32, termios_p: u8*)                          -> i32;
+    function tcsetattr(fd: i32, optional_actions: TcAction, termios_p: u8*) -> i32;
+    function tcsendbreak(fd: i32, duration: i32)                         -> i32;
+    function tcdrain(fd: i32)                                            -> i32;
+    function tcflush(fd: i32, queue_selector: TcQueue)                   -> i32;
+    function tcflow(fd: i32, action: TcFlow)                             -> i32;
+    function cfmakeraw(termios_p: u8*)                                   -> void;
+    function cfgetispeed(termios_p: u8*)                                 -> u32;
+    function cfgetospeed(termios_p: u8*)                                 -> u32;
+    function cfsetispeed(termios_p: u8*, speed: u32)                     -> i32;
+    function cfsetospeed(termios_p: u8*, speed: u32)                     -> i32;
+    function cfsetspeed(termios_p: u8*, speed: u32)                      -> i32;
+}
+
+// ============================================================================
+// sys/ioctl.h — device control
+// ============================================================================
+
+// TIOCGWINSZ / TIOCSWINSZ argument: `struct winsize`.
+type struct winsize {
+    ws_row:    u16;
+    ws_col:    u16;
+    ws_xpixel: u16;
+    ws_ypixel: u16;
+}
+
+const TIOCGWINSZ: u64 = 21523;
+const TIOCSWINSZ: u64 = 21524;
+const TIOCSCTTY:  u64 = 21518;
+const TIOCNOTTY:  u64 = 21538;
+const TIOCGPGRP:  u64 = 21519;
+const TIOCSPGRP:  u64 = 21520;
+const FIONBIO:    u64 = 21537;
+const FIONREAD:   u64 = 21531;
+const FIOCLEX:    u64 = 21585;
+const FIONCLEX:   u64 = 21584;
+
+extern "C" {
+    function ioctl(fd: i32, request: u64, arg: u8*) -> i32;
+}
+
+// ============================================================================
+// locale.h — locale categories
+// ============================================================================
+
+/// `setlocale` category. Mutually exclusive.
+type enum LocaleCategory : i32 {
+    LC_CTYPE          = 0;
+    LC_NUMERIC        = 1;
+    LC_TIME           = 2;
+    LC_COLLATE        = 3;
+    LC_MONETARY       = 4;
+    LC_MESSAGES       = 5;
+    LC_ALL            = 6;
+    LC_PAPER          = 7;
+    LC_NAME           = 8;
+    LC_ADDRESS        = 9;
+    LC_TELEPHONE      = 10;
+    LC_MEASUREMENT    = 11;
+    LC_IDENTIFICATION = 12;
+}
+
+extern "C" {
+    function setlocale(category: LocaleCategory, locale: u8*) -> u8*;
+    function localeconv() -> u8*;
+    function newlocale(category_mask: i32, locale: u8*, base: void*) -> void*;
+    function uselocale(newloc: void*)              -> void*;
+    function freelocale(locobj: void*)             -> void;
+    function duplocale(locobj: void*)              -> void*;
+}
+
+// ============================================================================
+// pwd.h — password database
+// ============================================================================
+//
+// `struct passwd` layout is stable: pointer / pointer / uid / gid /
+// pointer / pointer / pointer. 48 bytes on x86_64.
+
+const SIZEOF_PASSWD: u64 = 48;
+
+extern "C" {
+    function getpwuid(uid: u32)                                       -> u8*;
+    function getpwnam(name: u8*)                                      -> u8*;
+    function getpwuid_r(uid: u32, pwd: u8*, buf: u8*,
+                        buflen: u64, result: u8**)                    -> i32;
+    function getpwnam_r(name: u8*, pwd: u8*, buf: u8*,
+                        buflen: u64, result: u8**)                    -> i32;
+    function setpwent() -> void;
+    function getpwent() -> u8*;
+    function endpwent() -> void;
+}
+
+// ============================================================================
+// grp.h — group database
+// ============================================================================
+
+const SIZEOF_GROUP: u64 = 32;
+
+extern "C" {
+    function getgrgid(gid: u32)                                       -> u8*;
+    function getgrnam(name: u8*)                                      -> u8*;
+    function getgrgid_r(gid: u32, grp: u8*, buf: u8*,
+                        buflen: u64, result: u8**)                    -> i32;
+    function getgrnam_r(name: u8*, grp: u8*, buf: u8*,
+                        buflen: u64, result: u8**)                    -> i32;
+    function setgrent() -> void;
+    function getgrent() -> u8*;
+    function endgrent() -> void;
+}
+
+// ============================================================================
+// regex.h — POSIX regular expressions
+// ============================================================================
+//
+// `regex_t` is opaque; allocate `u8[SIZEOF_REGEX_T]`. `regmatch_t`
+// has stable layout (two `regoff_t` / `i64`).
+
+const SIZEOF_REGEX_T:    u64 = 64;
+const SIZEOF_REGMATCH_T: u64 = 16;
+
+/// Match-range output from `regexec` — `-1` for both fields means
+/// "this capture did not participate".
+type struct regmatch_t {
+    rm_so: i64;
+    rm_eo: i64;
+}
+
+// regcomp flags (OR'd)
+const REG_EXTENDED: i32 = 1;
+const REG_ICASE:    i32 = 2;
+const REG_NOSUB:    i32 = 4;
+const REG_NEWLINE:  i32 = 8;
+
+// regexec flags (OR'd)
+const REG_NOTBOL: i32 = 1;
+const REG_NOTEOL: i32 = 2;
+
+// Return codes
+const REG_NOMATCH:  i32 = 1;
+const REG_BADPAT:   i32 = 2;
+const REG_ECOLLATE: i32 = 3;
+const REG_ECTYPE:   i32 = 4;
+const REG_EESCAPE:  i32 = 5;
+const REG_ESUBREG:  i32 = 6;
+const REG_EBRACK:   i32 = 7;
+const REG_EPAREN:   i32 = 8;
+const REG_EBRACE:   i32 = 9;
+const REG_BADBR:    i32 = 10;
+const REG_ERANGE:   i32 = 11;
+const REG_ESPACE:   i32 = 12;
+const REG_BADRPT:   i32 = 13;
+
+extern "C" {
+    function regcomp(preg: u8*, regex: u8*, cflags: i32) -> i32;
+    function regexec(preg: u8*, str: u8*, nmatch: u64,
+                     pmatch: regmatch_t*, eflags: i32)   -> i32;
+    function regerror(errcode: i32, preg: u8*,
+                      errbuf: u8*, errbuf_size: u64)     -> u64;
+    function regfree(preg: u8*)                          -> void;
 }
 
 // ============================================================================
@@ -194,42 +1981,184 @@ extern "C" {
 // ============================================================================
 
 extern "C" {
-    function sqrt(value: f64) -> f64;
-    function sqrtf(value: f32) -> f32;
-    function cbrt(value: f64) -> f64;
-    function pow(base: f64, exponent: f64) -> f64;
+    // Roots & powers
+    function sqrt(value: f64)               -> f64;
+    function sqrtf(value: f32)              -> f32;
+    function cbrt(value: f64)               -> f64;
+    function cbrtf(value: f32)              -> f32;
+    function pow(base: f64, exponent: f64)  -> f64;
     function powf(base: f32, exponent: f32) -> f32;
+    function hypot(x: f64, y: f64)          -> f64;
+    function hypotf(x: f32, y: f32)         -> f32;
 
-    function exp(value: f64) -> f64;
-    function expf(value: f32) -> f32;
-    function exp2(value: f64) -> f64;
-    function log(value: f64) -> f64;
-    function logf(value: f32) -> f32;
-    function log2(value: f64) -> f64;
+    // Exponentials & logarithms
+    function exp(value: f64)   -> f64;
+    function expf(value: f32)  -> f32;
+    function exp2(value: f64)  -> f64;
+    function exp2f(value: f32) -> f32;
+    function exp10(value: f64) -> f64;
+    function expm1(value: f64) -> f64;
+    function log(value: f64)   -> f64;
+    function logf(value: f32)  -> f32;
+    function log2(value: f64)  -> f64;
+    function log2f(value: f32) -> f32;
     function log10(value: f64) -> f64;
+    function log10f(value: f32) -> f32;
+    function log1p(value: f64) -> f64;
+    function logb(value: f64)  -> f64;
+    function ilogb(value: f64) -> i32;
+    function ldexp(x: f64, exp_: i32)  -> f64;
+    function frexp(x: f64, exp_: i32*) -> f64;
+    function modf(x: f64, iptr: f64*)  -> f64;
+    function scalbn(x: f64, n: i32)    -> f64;
+    function scalbln(x: f64, n: i64)   -> f64;
 
-    function sin(value: f64) -> f64;
-    function cos(value: f64) -> f64;
-    function tan(value: f64) -> f64;
-    function asin(value: f64) -> f64;
-    function acos(value: f64) -> f64;
-    function atan(value: f64) -> f64;
-    function atan2(y: f64, x: f64) -> f64;
+    // Trigonometry
+    function sin(value: f64)        -> f64;
+    function cos(value: f64)        -> f64;
+    function tan(value: f64)        -> f64;
+    function sinf(value: f32)       -> f32;
+    function cosf(value: f32)       -> f32;
+    function tanf(value: f32)       -> f32;
+    function asin(value: f64)       -> f64;
+    function acos(value: f64)       -> f64;
+    function atan(value: f64)       -> f64;
+    function atan2(y: f64, x: f64)  -> f64;
+    function asinf(value: f32)      -> f32;
+    function acosf(value: f32)      -> f32;
+    function atanf(value: f32)      -> f32;
+    function atan2f(y: f32, x: f32) -> f32;
+    function sincos(x: f64, sin_out: f64*, cos_out: f64*) -> void;
 
+    // Hyperbolic
     function sinh(value: f64) -> f64;
     function cosh(value: f64) -> f64;
     function tanh(value: f64) -> f64;
+    function asinh(value: f64) -> f64;
+    function acosh(value: f64) -> f64;
+    function atanh(value: f64) -> f64;
 
+    // Rounding & sign
     function floor(value: f64) -> f64;
-    function ceil(value: f64) -> f64;
+    function ceil(value: f64)  -> f64;
     function round(value: f64) -> f64;
     function trunc(value: f64) -> f64;
-    function fabs(value: f64) -> f64;
-    function fabsf(value: f32) -> f32;
+    function rint(value: f64)  -> f64;
+    function nearbyint(value: f64) -> f64;
+    function lround(value: f64)  -> i64;
+    function llround(value: f64) -> i64;
+    function lrint(value: f64)   -> i64;
+    function fabs(value: f64)    -> f64;
+    function fabsf(value: f32)   -> f32;
+    function copysign(magnitude: f64, sign: f64)  -> f64;
+    function copysignf(magnitude: f32, sign: f32) -> f32;
+    function fmod(x: f64, y: f64)      -> f64;
+    function fmodf(x: f32, y: f32)     -> f32;
+    function remainder(x: f64, y: f64) -> f64;
+    function fma(x: f64, y: f64, z: f64) -> f64;
+    function fdim(x: f64, y: f64) -> f64;
+    function fmin(x: f64, y: f64) -> f64;
+    function fmax(x: f64, y: f64) -> f64;
 
-    function fmod(x: f64, y: f64) -> f64;
-    function copysign(magnitude: f64, sign: f64) -> f64;
+    // Special functions
+    function erf(x: f64)    -> f64;
+    function erfc(x: f64)   -> f64;
+    function tgamma(x: f64) -> f64;
+    function lgamma(x: f64) -> f64;
+    function j0(x: f64)     -> f64;
+    function j1(x: f64)     -> f64;
+    function jn(n: i32, x: f64) -> f64;
+    function y0(x: f64)     -> f64;
+    function y1(x: f64)     -> f64;
+    function yn(n: i32, x: f64) -> f64;
 
-    function __isnan(value: f64) -> i32;
-    function __isinf(value: f64) -> i32;
+    // Classification — glibc primitives behind the FP_* macros.
+    function __isnan(value: f64)        -> i32;
+    function __isinf(value: f64)        -> i32;
+    function __finite(value: f64)       -> i32;
+    function __signbit(value: f64)      -> i32;
+    function __fpclassify(value: f64)   -> i32;
 }
+
+// FP classification macros' integer returns (glibc).
+const FP_NAN:       i32 = 0;
+const FP_INFINITE:  i32 = 1;
+const FP_ZERO:      i32 = 2;
+const FP_SUBNORMAL: i32 = 3;
+const FP_NORMAL:    i32 = 4;
+
+// ============================================================================
+// dlfcn.h — runtime dynamic linking
+// ============================================================================
+
+const RTLD_LAZY:         i32 = 1;
+const RTLD_NOW:          i32 = 2;
+const RTLD_BINDING_MASK: i32 = 3;
+const RTLD_NOLOAD:       i32 = 4;
+const RTLD_DEEPBIND:     i32 = 8;
+const RTLD_GLOBAL:       i32 = 256;
+const RTLD_LOCAL:        i32 = 0;
+const RTLD_NODELETE:     i32 = 4096;
+
+extern "C" {
+    function dlopen(filename: u8*, flag: i32) -> void*;
+    function dlsym(handle: void*, symbol: u8*) -> void*;
+    function dlclose(handle: void*)            -> i32;
+    function dlerror()                         -> u8*;
+}
+
+// ============================================================================
+// sys/resource.h — rlimit / rusage / priority
+// ============================================================================
+
+/// `resource` argument to `getrlimit` / `setrlimit` / `prlimit`.
+type enum Resource : i32 {
+    RLIMIT_CPU        = 0;
+    RLIMIT_FSIZE      = 1;
+    RLIMIT_DATA       = 2;
+    RLIMIT_STACK      = 3;
+    RLIMIT_CORE       = 4;
+    RLIMIT_RSS        = 5;
+    RLIMIT_NPROC      = 6;
+    RLIMIT_NOFILE     = 7;
+    RLIMIT_MEMLOCK    = 8;
+    RLIMIT_AS         = 9;
+    RLIMIT_LOCKS      = 10;
+    RLIMIT_SIGPENDING = 11;
+    RLIMIT_MSGQUEUE   = 12;
+    RLIMIT_NICE       = 13;
+    RLIMIT_RTPRIO     = 14;
+    RLIMIT_RTTIME     = 15;
+}
+
+/// `who` argument to `getrusage`.
+type enum RusageWho : i32 {
+    RUSAGE_CHILDREN = -1;
+    RUSAGE_SELF     = 0;
+    RUSAGE_THREAD   = 1;
+}
+
+/// `which` argument to `getpriority` / `setpriority`.
+type enum PriorityWhich : i32 {
+    PRIO_PROCESS = 0;
+    PRIO_PGRP    = 1;
+    PRIO_USER    = 2;
+}
+
+/// `struct rlimit` is two u64s (`rlim_t` is `unsigned long`).
+type struct rlimit {
+    rlim_cur: u64;
+    rlim_max: u64;
+}
+
+extern "C" {
+    function getrlimit(resource: Resource, rlim: rlimit*)               -> i32;
+    function setrlimit(resource: Resource, rlim: rlimit*)               -> i32;
+    function prlimit(pid: i32, resource: Resource,
+                     new_limit: rlimit*, old_limit: rlimit*)            -> i32;
+    function getrusage(who: RusageWho, usage: u8*)                      -> i32;
+    function getpriority(which: PriorityWhich, who: u32)                -> i32;
+    function setpriority(which: PriorityWhich, who: u32, prio: i32)     -> i32;
+}
+
+const RLIM_INFINITY: u64 = 18446744073709551615;   // (rlim_t)-1
