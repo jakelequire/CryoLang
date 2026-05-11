@@ -2,7 +2,7 @@
   <img src="./assets/cryo-logo-1.png" alt="Cryo" width="180"/>
   <h1>The Cryo Programming Language</h1>
   <p><i>A statically-typed, compiled systems language with a self-hosted compiler and an LLVM 20 backend.</i></p>
-  <h3><b>1.0.0-alpha</b></h3>
+  <h3><b>1.0.0</b></h3>
 </div>
 
 ---
@@ -18,7 +18,7 @@ function main() -> int {
 
 Cryo gives systems programmers explicit control over memory and data layout (manual allocation, raw pointers, no GC) alongside the language constructs that make modern programs tractable: generics, algebraic enums, pattern matching, traits, single-inheritance classes, and a module system. Generics are monomorphised, so the abstractions compile down to the same code you would write by hand.
 
-The compiler is **self-hosted**: every line of Cryo you compile is compiled by Cryo. The standard library is written in Cryo. The bundled HTTP server, JSON parser, hash maps, and test framework are written in Cryo. A frozen C++ bootstrap is kept around for emergency rebuilds and lives in [`legacy/bootstrap/`](./legacy/bootstrap/).
+The compiler is **self-hosted**: every line of Cryo you compile is compiled by Cryo. The standard library is written in Cryo. The bundled HTTP server, JSON parser, hash maps, and test framework are written in Cryo. Every build target drives off the pinned compiler at `bin/cryo` (committed to the repo).
 
 > **The full language reference lives at [`docs/cryo.md`](./docs/cryo.md).** This README is the thirty-second tour and the install / build instructions.
 
@@ -50,7 +50,7 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
 | **Algebraic data types** | `type enum` with payload variants and exhaustive pattern matching. |
 | **Traits** | `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `Display`, `Read`/`Write`, `Allocator`, `Drop`, `Clone`, `Default`, … with `where T: ...` bounds. |
 | **Single-inheritance classes** | `virtual` / `override`, vtable dispatch, RAII via `~ClassName()`. |
-| **Self-hosted** | The compiler is written in Cryo. The C++ bootstrap is kept in `legacy/`. |
+| **Self-hosted** | The compiler is written in Cryo and builds itself. |
 | **LLVM 20 backend** | Optimising compilation to native x86-64 / ARM64. |
 | **Production-shaped stdlib** | `Array<T>` / `String` / `HashMap<K, V>`, allocator-generic; `Box<T>`, `Arena`, `Rc<T>`; buffered I/O over `Read` / `Write`; `fs`, `process`, `env`, `math`, `json`; TCP and an HTTP/1.1 server + client + router under `net::http`. |
 | **First-class testing** | Discoverable with `![test]`; fork-per-test runner; `![ignore]` and `![should_panic]` directives. |
@@ -436,21 +436,11 @@ make test              # run the repo-level test suite
 make lsp               # build the Cryo-language LSP (bin/cryolsp)
 make pin-cryo          # refresh bin/cryo from compiler/build/bin/cryo
 make clean             # remove compiler + stdlib build outputs
-make distclean         # also clean legacy bootstrap
-make legacy-bootstrap  # rebuild the C++ bootstrap (archaeology)
 ```
 
 Day-to-day flow: `make cryo`. Pre-tag / pre-merge gate: `make selfhost-check`.
 
-If `bin/cryo` does not exist (e.g. you checked out a revision without the pin):
-
-```bash
-make legacy-bootstrap
-( cd compiler && ../legacy/bootstrap/bin/cryo build )
-make pin-cryo
-```
-
-Then resume normal operation.
+The pinned binary at `bin/cryo` is required — every build target drives off it. If the pin is missing, check out a revision that has it committed.
 
 ---
 
@@ -493,7 +483,7 @@ CryoLang/
 │   ├── CryoFormat        Formatter
 │   └── CryoAnalyzer      Semantic analyser
 ├── legacy/
-│   └── bootstrap/        Frozen C++23 bootstrap; builds via `make legacy-bootstrap`
+│   └── bootstrap/        Retired C++23 bootstrap; kept for historical reference only
 ├── docs/                 Language reference (cryo.md), grammar, mangling spec
 ├── examples/             Standalone example projects
 │   ├── sqlite-import     Git-deps demo (links libsqlite3 via cqlite)
@@ -513,31 +503,33 @@ CryoLang/
 
 ## Status & Roadmap
 
-Cryo is **pre-0.1.0**. The compiler self-hosts and the standard library is in active use, but the public surface is not frozen. Compatibility breaks are still possible.
+Cryo is at **1.0.0**. The compiler self-hosts, the standard library is stable,
+and the public surface is frozen under semver. See [CHANGELOG.md](./CHANGELOG.md)
+for the full 1.0 release notes.
 
-**What's done:**
+**What's in 1.0:**
 
 - Self-hosted compiler with byte-identical 3-round selfhost check.
 - Trait system with `where`-bound generics, monomorphisation, and trait impls on primitives.
 - Single-inheritance classes with virtual dispatch and destructors.
-- Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, range, or-patterns).
+- Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, range, or-patterns, guard clauses).
+- Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`.
 - I/O over `Read` / `Write` traits with buffered wrappers.
-- HTTP/1.1 server, client, router. JSON parser and serializer.
+- HTTP/1.1 server (keep-alive, read timeouts), client, router. JSON parser and serializer.
 - POSIX subprocess spawning with `fork + execve`.
 - Git-backed dependencies with a lockfile and content-addressed cache.
 - Built-in test framework with `cryo test`, `![test]`, `![ignore]`, `![should_panic]`.
-- Language Server Protocol implementation.
+- Language Server Protocol implementation (`make lsp`).
 
-**On the roadmap to 0.1.0:**
+**Beyond 1.0 (post-stable):**
 
-- Automatic drop synthesis (the analyser is wired up; synthesis is gated off pending the consuming-method attribute).
-- Promote the move-check warnings to errors.
+- Async / await / coroutines (currently parser-only).
 - Range expressions (`a..b`, `a..=b`) in expression position.
 - Optional chaining (`?.`), null coalescing (`??`), pipe (`|>`).
-- Async / await / coroutines (currently parser-only).
 - Windows support for `process::Command`.
-- TLS for `net::http`.
+- TLS, UDP, HTTP/2, and WebSocket for `net::http`.
+- Cross-compilation.
 
 A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax).
 

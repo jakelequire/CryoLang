@@ -1,7 +1,7 @@
 # Contributing to Cryo
 
-Thanks for your interest in Cryo. The project is in pre-0.1.0 development —
-expect rough edges and ongoing churn.
+Thanks for your interest in Cryo. Releases follow semver from 1.0.0 onward;
+expect ongoing development on top of a stable surface.
 
 ## Repository layout
 
@@ -9,9 +9,10 @@ expect rough edges and ongoing churn.
 |---|---|
 | `compiler/` | Self-hosted compiler (written in Cryo). **Active.** |
 | `stdlib/` | Standard library (written in Cryo). **Active.** |
-| `legacy/bootstrap/` | Original C++23 bootstrap. **Frozen.** Don't extend or fix non-blocking issues here. |
+| `legacy/bootstrap/` | Retired C++23 bootstrap, kept in the tree for historical reference only. **Do not modify.** It will not build against the current language. |
 | `experimental/stdlib-next/` | Parked stdlib rewrite. **Don't depend on this.** |
-| `tools/` | Out-of-tree LSP / formatter / analyzer. Not built or shipped for 0.1. |
+| `tools/CryoLSP/` | Language Server Protocol implementation. Built via `make lsp`. **Active.** |
+| `tools/CryoFormat/`, `tools/CryoAnalyzer/`, `tools/NewCryoLSP/` | Exploratory; not built by default. |
 
 ## Building
 
@@ -28,9 +29,8 @@ To run the resulting compiler from anywhere on your `PATH`, run
 
 `bin/cryo` is a known-good self-hosted compiler committed to the repo. Every
 build target — `make cryo`, `make selfhost-check`, `make test` — drives off
-this pin. The C++ bootstrap in `legacy/bootstrap/` is no longer on any
-default path; build it explicitly with `make legacy-bootstrap` if you need
-to reproduce a from-source bootstrap.
+this pin. There is no longer a path back to a C++ bootstrap: the compiler
+is the pin, and the pin is the compiler.
 
 The pin is **stale** by design — it understands the dialect of `compiler/src/`
 at the moment it was committed, nothing more. When `compiler/src/` adopts new
@@ -61,8 +61,7 @@ Use the GitHub issue tracker. The bug-report template asks for:
 ## Submitting changes
 
 1. Fork the repo and branch off `main`.
-2. Make your change. **Don't touch `legacy/bootstrap/`** unless you're
-   genuinely blocked on a 0.1.0 ship issue.
+2. Make your change. **Don't touch `legacy/bootstrap/`** — it's retired.
 3. Run `make selfhost-check` locally — your change must preserve the
    stage-3 / stage-4 byte-identical fixed point.
 4. Open a PR using the provided template; explain *why* in the description.
@@ -73,17 +72,23 @@ A few conventions worth knowing:
 
 - Prefer fixes at the root cause over workarounds.
 - Don't add backwards-compatibility shims for code that's never shipped.
-- If a change in `compiler/` or `stdlib/` exposes a bootstrap bug, work
-  around it in `compiler/` or `stdlib/` rather than touching the bootstrap.
+- If a change in `compiler/` exposes a bug in the pinned binary
+  (`bin/cryo` rejects or miscompiles new source), work around it in
+  `compiler/` or `stdlib/` until you can refresh the pin from the
+  fixed compiler in a follow-up.
 - New compiler-side helpers belong in `CodegenContext` /
   `DeclarationIndex` / `InternTable` — not as inline string manipulation
   inside codegen.
 
-## Known limitations (pre-0.1.0)
+## Known limitations
 
-- The compiler hard-codes `<project_root>/../stdlib` for stdlib resolution.
-  Your project must live as a sibling of `stdlib/` (typically inside this
-  repo's tree). System-wide install isn't supported yet.
-- No package manager.
-- No cross-compilation.
-- The LSP, formatter, and analyzer in `tools/` are not built or shipped.
+- Stdlib resolution looks at `$CRYO_HOME/stdlib` (set by `install.sh`) or
+  the `stdlib_root` key in `cryoconfig`, with `<repo>/stdlib` as the
+  in-tree fallback. There is no system package path.
+- Async / await / coroutines parse but do not lower.
+- No package registry. Dependencies resolve via git URL with a lockfile
+  and content-addressed cache.
+- No cross-compilation; the host toolchain is the target.
+- `process::Command` is POSIX-only.
+- `tools/CryoFormat`, `tools/CryoAnalyzer`, and `tools/NewCryoLSP` are
+  exploratory and not built by default. Only `tools/CryoLSP` ships.
