@@ -1,4 +1,5 @@
-///! HTTP server — blocking, connection-per-request.
+///! HTTP server — blocking, one connection at a time, HTTP/1.1
+///! keep-alive within a connection.
 ///!
 ///! Two public entry-points:
 ///!
@@ -18,24 +19,44 @@
 ///! before the first `accept` — use it to log the listening address or
 ///! signal a readiness probe.
 ///!
+///! `.with_read_timeout(secs)` caps the time the server will block
+///! waiting for request bytes on an accepted connection. Defaults to
+///! 30 seconds; pass 0 to disable.  Without a cap a single slow peer
+///! sending one byte at a time pins the accept loop indefinitely.
+///!
 ///! `.run()` blocks indefinitely, returning only on a fatal listener-level
 ///! error (e.g. EMFILE). Per-connection failures (parse errors, client
 ///! hangups, write errors) are swallowed — instrument the handler or router
 ///! callbacks for request-level telemetry.
 ///!
-///! Connection-per-request is intentional: no keep-alive, no pipelining,
-///! trivial to reason about, sufficient for dev servers and simple tooling.
+///! Each accepted connection is reused for follow-up requests until
+///! the client sends `Connection: close`, the HTTP version is below
+///! 1.1 (which defaults to close), the read times out, or the
+///! `MAX_REQUESTS_PER_CONNECTION` cap is hit.  Pipelining is not
+///! supported — one request, one response, sequential.
 namespace std::net::http::server;
 
 import core::option;
 import core::result;
 import io::error;
+import collections::str;
+import collections::string;
 import net::socket_addr;
 import net::tcp;
 import net::http::request;
 import net::http::response;
 import net::http::status;
 import net::http::router;
+
+/// Hard cap on requests served per accepted connection.  Without this
+/// a misbehaving client could hold a connection open indefinitely with
+/// trivial keep-alive traffic and exhaust server file descriptors.
+const MAX_REQUESTS_PER_CONNECTION: u64 = 100;
+
+/// Default `set_read_timeout` on every accepted connection.  Chosen to
+/// be long enough for slow consumer networks but short enough that a
+/// single slow-loris peer can't pin the accept loop.
+const DEFAULT_READ_TIMEOUT_SECS: i64 = 30;
 
 // ============================================================================
 // HttpServer
@@ -67,6 +88,9 @@ type struct HttpServer {
     /// Owned by the caller — the Router must outlive this server.
     router:   Router*;
     on_ready: Option<() -> void>;
+    /// Per-accepted-connection `SO_RCVTIMEO` (whole seconds).  Zero
+    /// disables; defaults to `DEFAULT_READ_TIMEOUT_SECS`.
+    read_timeout_secs: i64;
 
     // ── construction ─────────────────────────────────────────────────────────
 
@@ -75,10 +99,11 @@ type struct HttpServer {
     /// lives inside the handler.
     static new(addr: SocketAddr, handler: (Request) -> Response) -> HttpServer {
         return HttpServer {
-            addr:     addr,
-            handler:  Option::Some(handler),
-            router:   null,
-            on_ready: Option::None
+            addr:              addr,
+            handler:           Option::Some(handler),
+            router:            null,
+            on_ready:          Option::None,
+            read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS
         };
     }
 
@@ -86,10 +111,11 @@ type struct HttpServer {
     /// router must outlive the server (declare both in the same scope).
     static with_router(addr: SocketAddr, router: mut &Router) -> HttpServer {
         return HttpServer {
-            addr:     addr,
-            handler:  Option::None,
-            router:   router,
-            on_ready: Option::None
+            addr:              addr,
+            handler:           Option::None,
+            router:            router,
+            on_ready:          Option::None,
+            read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS
         };
     }
 
@@ -101,6 +127,16 @@ type struct HttpServer {
     /// or signal an external health-check.
     with_ready(mut &this, cb: () -> void) -> &HttpServer {
         this.on_ready = Option::Some(cb);
+        return &this;
+    }
+
+    /// Override the per-connection read timeout.  `secs == 0` disables;
+    /// the default is `DEFAULT_READ_TIMEOUT_SECS`.  Applies to both the
+    /// initial request line and the inter-request idle window when
+    /// keep-alive is in effect — the latter is what bounds a
+    /// well-behaved client's idle-connection lifetime.
+    with_read_timeout(mut &this, secs: i64) -> &HttpServer {
+        this.read_timeout_secs = secs;
         return &this;
     }
 
@@ -146,35 +182,81 @@ type struct HttpServer {
                 mut req_drop: Request = req;
                 return Response::text(
                     StatusCode::internal_server_error(),
-                    Str::from_raw("no handler configured", 20)
+                    Str::from_raw("no handler configured", 21)
                 );
             }
         }
     }
 
-    /// Parse one request, dispatch it, write the response. A parse
-    /// failure writes a canned 400; a write failure (peer gone) is
-    /// silently dropped. The accept loop always continues.
+    /// Serve requests on `stream` until the client (or this server)
+    /// signals close, the read times out, or
+    /// `MAX_REQUESTS_PER_CONNECTION` is reached.  A parse failure on
+    /// the FIRST request writes a canned 400; failures on follow-up
+    /// requests are taken as "peer gave up" and close silently.  Write
+    /// failures (peer gone) end the connection.  The accept loop
+    /// always continues.
     handle_connection(&this, stream: mut &TcpStream) -> void {
-        match (Request::parse(stream)) {
-            Result::Ok(req) => {
-                mut request_local: Request = req;
-                mut response: Response = this.dispatch(request_local);
-                match (response.write_to(stream)) {
-                    Result::Ok(_) => { }
-                    Result::Err(_) => { }
-                }
+        if (this.read_timeout_secs > 0) {
+            match (stream.set_read_timeout(this.read_timeout_secs, 0)) {
+                Result::Ok(_) => { }
+                Result::Err(_) => { }
             }
-            Result::Err(_) => {
-                mut bad: Response = Response::text(
-                    StatusCode::bad_request(),
-                    Str::from_raw("Bad Request", 11)
-                );
-                match (bad.write_to(stream)) {
-                    Result::Ok(_) => { }
-                    Result::Err(_) => { }
+        }
+        mut served: u64 = 0;
+        loop {
+            served = served + 1;
+            match (Request::parse(stream)) {
+                Result::Ok(req) => {
+                    mut request_local: Request = req;
+                    const keep_alive: boolean = should_keep_alive(&request_local, served);
+                    mut response: Response = this.dispatch(request_local);
+                    if (!keep_alive) {
+                        response.headers.insert(
+                            Str::from_raw("Connection", 10),
+                            Str::from_raw("close", 5)
+                        );
+                    }
+                    match (response.write_to(stream)) {
+                        Result::Ok(_) => { }
+                        Result::Err(_) => { return; }
+                    }
+                    if (!keep_alive) { return; }
+                }
+                Result::Err(_) => {
+                    if (served == 1) {
+                        mut bad: Response = Response::text(
+                            StatusCode::bad_request(),
+                            Str::from_raw("Bad Request", 11)
+                        );
+                        match (bad.write_to(stream)) {
+                            Result::Ok(_) => { }
+                            Result::Err(_) => { }
+                        }
+                    }
+                    return;
                 }
             }
         }
+    }
+}
+
+/// Decide whether to reuse this connection for another request.
+///
+/// HTTP/1.1 defaults to keep-alive; the client opts out with
+/// `Connection: close`.  The per-connection cap also forces close.
+/// HTTP/1.0 isn't distinguished here — every served version that
+/// reaches us is treated as 1.1; downgrades go through the keep-alive
+/// default and rely on the client to send `Connection: close` if it
+/// can't reuse the socket.
+function should_keep_alive(req: &Request, served: u64) -> boolean {
+    if (served >= MAX_REQUESTS_PER_CONNECTION) {
+        return false;
+    }
+    match (req.headers.get(Str::from_raw("connection", 10))) {
+        Option::Some(mut conn) => {
+            mut lowered: String = conn.as_str().to_ascii_lowercase();
+            return !lowered.as_str().equals(Str::from_raw("close", 5));
+        }
+        Option::None => { return true; }
     }
 }

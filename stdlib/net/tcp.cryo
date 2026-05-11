@@ -26,6 +26,41 @@ import net::socket_addr;
 // Socket-domain / type / level / option / shutdown constants and
 // the `ShutdownHow` enum live in `ffi::libc`.
 
+/// Apply a `SO_RCVTIMEO` / `SO_SNDTIMEO` to a socket fd.  Packs the
+/// 16-byte `struct timeval` (host byte order, two `i64`s) into a
+/// stack buffer rather than passing the struct by pointer — keeps
+/// the same shape as `pack_sockaddr_in` and avoids depending on the
+/// compiler emitting `&struct as u8*` as a literal byte-addressable
+/// pointer.
+function apply_so_timeout(fd: i32, optname: i32, secs: i64, usecs: i64) -> Result<(), IoError> {
+    mut buf: u8[16];
+    pack_i64_le(&buf[0], secs);
+    pack_i64_le(&buf[8], usecs);
+    const rc: i32 = libc::setsockopt(fd,
+                                      libc::SocketLevel::SOL_SOCKET,
+                                      optname,
+                                      &buf[0], 16);
+    if (rc < 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+    return Result::Ok(());
+}
+
+/// Little-endian pack of an `i64` into 8 bytes at `out`.  Linux
+/// x86_64 / arm64 are LE; the host-order assumption matches every
+/// other libc struct field in this module.
+function pack_i64_le(out: u8*, value: i64) -> void {
+    const v: u64 = value as u64;
+    out[0] = (v       ) as u8;
+    out[1] = (v >> 8  ) as u8;
+    out[2] = (v >> 16 ) as u8;
+    out[3] = (v >> 24 ) as u8;
+    out[4] = (v >> 32 ) as u8;
+    out[5] = (v >> 40 ) as u8;
+    out[6] = (v >> 48 ) as u8;
+    out[7] = (v >> 56 ) as u8;
+}
+
 /// Pack a `SocketAddr` into a 16-byte `sockaddr_in` buffer. Returns
 /// the number of bytes written (always 16 for IPv4). Panics on IPv6
 /// — the v6 path will want a 28-byte `sockaddr_in6` packer.
@@ -96,6 +131,21 @@ type struct TcpStream {
             return Result::Err(IoError::from_errno(libc::errno()));
         }
         return Result::Ok(());
+    }
+
+    /// Cap blocking-`read` latency.  After `secs` + `usecs` of no data
+    /// the next `read()` returns `WouldBlock` (errno `EAGAIN`).  Pass
+    /// 0/0 to clear an existing timeout.  Pairs with
+    /// `set_write_timeout` for full slow-loris coverage.
+    set_read_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
+        return apply_so_timeout(this.fd, libc::SO_RCVTIMEO, secs, usecs);
+    }
+
+    /// Cap blocking-`write` latency.  After `secs` + `usecs` of no
+    /// progress the next `write()` returns `WouldBlock` (errno
+    /// `EAGAIN`).  Pass 0/0 to clear.
+    set_write_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
+        return apply_so_timeout(this.fd, libc::SO_SNDTIMEO, secs, usecs);
     }
 
     /// Close both halves. Ownership obligation: every TcpStream must

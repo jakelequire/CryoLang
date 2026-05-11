@@ -60,11 +60,20 @@ type struct Client {
 }
 
 /// Open a connection, write the request, parse one response, close.
+/// Emits `Connection: close` (RFC 7230 §6.1) so the server knows this
+/// is a one-shot exchange and can free its half of the socket as soon
+/// as the response is written.  Without this header, servers that
+/// default to HTTP/1.1 keep-alive will sit holding the connection open
+/// until their idle timeout fires.
 function send(addr: SocketAddr, req: Request) -> Result<Response, IoError> {
+    mut request_local: Request = req;
+    request_local.headers.insert(
+        Str::from_raw("Connection", 10),
+        Str::from_raw("close", 5)
+    );
     match (TcpStream::connect(addr)) {
         Result::Ok(stream) => {
             mut s: TcpStream = stream;
-            mut request_local: Request = req;
             match (request_local.write_to(&s)) {
                 Result::Ok(_) => { }
                 Result::Err(err) => {
@@ -78,7 +87,6 @@ function send(addr: SocketAddr, req: Request) -> Result<Response, IoError> {
             return Response::parse(&s);
         }
         Result::Err(err) => {
-            mut request_local: Request = req;
             return Result::Err(err);
         }
     }
