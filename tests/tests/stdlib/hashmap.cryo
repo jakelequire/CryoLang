@@ -221,3 +221,162 @@ function string_keys_insert_replaces_existing() -> Result<(), TestError> {
     }
     return expect_eq(new_val.unwrap_or(-1), 20);
 }
+
+// ============================================================================
+// Remove correctness — cross-key and chain scenarios
+//
+// These tests pin the "cursor-remove" contract: after removing one key from
+// a map, every OTHER previously-inserted key must still be accessible.
+// The old `previous.next = node.next` remove implementation could silently
+// break the bucket chain when two keys shared a bucket (same bucket index),
+// making the surviving sibling unreachable.  The cursor rewrite fixes this.
+// ============================================================================
+
+![test]
+function remove_sibling_still_accessible() -> Result<(), TestError> {
+    // Insert two keys.  Depending on the FNV hash, they may land in the same
+    // bucket.  Either way, after removing k1, k2 must still be findable via
+    // get() — not just "length is 1".
+    mut map: HashMap<u32, i32> = HashMap::new();
+    const k1: u32 = 1;
+    const k2: u32 = 2;
+    map.insert(k1, 100);
+    map.insert(k2, 200);
+    map.remove(&k1);
+    const got: Option<i32> = map.get(&k2);
+    map.drop();
+    return expect_eq(got.unwrap_or(-1), 200);
+}
+
+![test]
+function remove_does_not_corrupt_other_key_in_chain() -> Result<(), TestError> {
+    // Use 8 keys so birthday-paradox guarantees bucket collisions with the
+    // 8-bucket initial table.  Remove every other key and verify the rest
+    // are still reachable.
+    mut map: HashMap<u32, i32> = HashMap::new();
+
+    // Insert keys 1..8
+    const a1: u32 = 1;  map.insert(a1, 1);
+    const a2: u32 = 2;  map.insert(a2, 2);
+    const a3: u32 = 3;  map.insert(a3, 3);
+    const a4: u32 = 4;  map.insert(a4, 4);
+    const a5: u32 = 5;  map.insert(a5, 5);
+    const a6: u32 = 6;  map.insert(a6, 6);
+    const a7: u32 = 7;  map.insert(a7, 7);
+    const a8: u32 = 8;  map.insert(a8, 8);
+
+    // Remove the even-indexed keys
+    map.remove(&a2);
+    map.remove(&a4);
+    map.remove(&a6);
+    map.remove(&a8);
+
+    // All odd keys must still be accessible
+    const g1: i32 = map.get(&a1).unwrap_or(-1);
+    const g3: i32 = map.get(&a3).unwrap_or(-1);
+    const g5: i32 = map.get(&a5).unwrap_or(-1);
+    const g7: i32 = map.get(&a7).unwrap_or(-1);
+    const len: u64 = map.length();
+    map.drop();
+
+    match (expect_eq(g1, 1)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g3, 3)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g5, 5)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g7, 7)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const want_len: u64 = 4;
+    return expect_eq(len, want_len);
+}
+
+![test]
+function remove_head_then_lookup_tail_in_same_chain() -> Result<(), TestError> {
+    // If two keys collide into the same bucket, the second-inserted key
+    // becomes the chain HEAD (prepend-on-insert).  Remove the HEAD and
+    // verify the tail (first-inserted) is still findable.
+    //
+    // We can't force a collision without knowing the hash in advance, so we
+    // insert 8 different keys and check every one of them after the removes.
+    // If any pair ended up in a chain, this exercises both "remove head" and
+    // "sibling lookup" code paths.
+    mut map: HashMap<u32, i32> = HashMap::new();
+    const k1: u32 = 10;  map.insert(k1, 10);
+    const k2: u32 = 20;  map.insert(k2, 20);
+    const k3: u32 = 30;  map.insert(k3, 30);
+    const k4: u32 = 40;  map.insert(k4, 40);
+    const k5: u32 = 50;  map.insert(k5, 50);
+    const k6: u32 = 60;  map.insert(k6, 60);
+    const k7: u32 = 70;  map.insert(k7, 70);
+    const k8: u32 = 80;  map.insert(k8, 80);
+
+    // Remove the latest-inserted set (chain heads if collisions exist)
+    map.remove(&k5);
+    map.remove(&k6);
+    map.remove(&k7);
+    map.remove(&k8);
+
+    const g1: i32 = map.get(&k1).unwrap_or(-1);
+    const g2: i32 = map.get(&k2).unwrap_or(-1);
+    const g3: i32 = map.get(&k3).unwrap_or(-1);
+    const g4: i32 = map.get(&k4).unwrap_or(-1);
+    map.drop();
+
+    match (expect_eq(g1, 10)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g2, 20)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g3, 30)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g4, 40);
+}
+
+![test]
+function remove_all_then_reinsert() -> Result<(), TestError> {
+    // After removing every entry from a map it must be in a consistent
+    // empty state; subsequent inserts and lookups must work normally.
+    mut map: HashMap<u32, i32> = HashMap::new();
+    const k1: u32 = 1;  map.insert(k1, 11);
+    const k2: u32 = 2;  map.insert(k2, 22);
+    const k3: u32 = 3;  map.insert(k3, 33);
+
+    map.remove(&k1);
+    map.remove(&k2);
+    map.remove(&k3);
+
+    const empty: boolean = map.is_empty();
+
+    // Re-insert with different values
+    map.insert(k1, 111);
+    map.insert(k2, 222);
+
+    const g1: i32 = map.get(&k1).unwrap_or(-1);
+    const g2: i32 = map.get(&k2).unwrap_or(-1);
+    const g3: Option<i32> = map.get(&k3);  // k3 was not re-inserted
+    const has_k3: boolean = g3.is_some();
+    const len: u64 = map.length();
+    map.drop();
+
+    match (expect(empty, Str::new("map should be empty after removing all entries"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g1, 111)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g2, 222)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(has_k3, Str::new("k3 should not be in map"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const want_len: u64 = 2;
+    return expect_eq(len, want_len);
+}

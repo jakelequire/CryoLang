@@ -221,6 +221,13 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     /// caller (who is responsible for dropping it when done).  The
     /// `where K: Drop` bound makes the K-drop sound across owning
     /// (`String`) and POD (`u32`, no-op) instantiations alike.
+    ///
+    /// Implementation: indirect-pointer (cursor) traversal so both the
+    /// head-removal and mid-chain-removal cases reduce to a single
+    /// `*cursor = node.next` store.  This avoids the `previous.next =
+    /// node.next` write-through-struct-pointer pattern that was
+    /// unreliable in earlier codegen paths and documented in the
+    /// drop_insertion pass as "bootstrap HashMap remove corruption".
     remove(mut &this, key: &K) -> Option<V>
     where K: Hash + Eq + Drop {
         if (this.bucket_count == 0) {
@@ -228,24 +235,24 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         }
         const h: u64 = hash_key(key);
         const index: u64 = h & (this.bucket_count - 1);
-        mut previous: Entry<K, V>* = null;
-        mut node: Entry<K, V>* = this.buckets[index];
+
+        // `cursor` always points to the pointer-slot that links to the
+        // current node: either this.buckets[index] (for the head) or
+        // prev_node.next (for interior entries).  Writing *cursor
+        // correctly unlinks the node without a branch.
+        mut cursor: Entry<K, V>** = &this.buckets[index];
         loop {
+            const node: Entry<K, V>* = *cursor;
             if (node == null) { break; }
             if (node.hash == h && node.key.equals(key)) {
-                if (previous == null) {
-                    this.buckets[index] = node.next;
-                } else {
-                    previous.next = node.next;
-                }
+                *cursor = node.next;               // unlink: single store
                 const removed: V = node.value;
                 node.key.drop();
                 free_entry(this, node);
                 this.length = this.length - 1;
                 return Option::Some(removed);
             }
-            previous = node;
-            node = node.next;
+            cursor = &node.next;
         }
         return Option::None;
     }

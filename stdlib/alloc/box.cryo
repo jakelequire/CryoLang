@@ -79,12 +79,23 @@ type struct Box<T> {
 
 }
 
-/// Release the heap storage. Ownership obligation: every `Box` must
-/// have `drop` called exactly once before it goes out of scope. If
-/// `T` itself owns resources, call its `drop` through
-/// `*this.as_ptr()` first — `Box` does not drop the pointee.
-implement<T> trait Drop for struct Box<T> {
+/// Release the heap storage. Calls `T::drop()` on the owned value first
+/// so that any resources held by `T` (heap buffers, file descriptors, etc.)
+/// are released before the allocation is returned to the allocator.
+/// Ownership obligation: every `Box` must have `drop` called exactly once
+/// before it goes out of scope.
+///
+/// Note: `into_raw` and `leak` transfer ownership of both the value and
+/// the allocation to the caller, so T's drop is NOT called for those paths.
+implement<T> trait Drop for struct Box<T>
+where T: Drop {
     drop(mut &this) -> void {
+        // Drop the owned T in place through the raw pointer before the
+        // allocation is freed.  `(*t_ptr).drop()` borrows the T in place
+        // so T's drop impl runs on the heap-resident value, not on a copy.
+        const t_ptr: T* = this.ptr.as_ptr();
+        (*t_ptr).drop();
+        // Release the allocation.
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const block: Layout = Layout::of<T>();
         alloc.deallocate(this.ptr.cast<u8>(), block);
