@@ -20,6 +20,7 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::MangledName;
 import Compiler::Resolver::QualifiedName;
+import std::collections::pair;
 
 
 // ============================================================================
@@ -47,31 +48,29 @@ import Compiler::Resolver::QualifiedName;
 // globals are robust in the bootstrap.
 
 type struct TypeMapperCache {
-    keys:   u64[];
-    values: void*[];
+    cache: Pair<u64, void*>[];
 
     static new() -> TypeMapperCache {
-        return TypeMapperCache { keys: [], values: [] };
+        return TypeMapperCache { cache: [] };
     }
 
     lookup(&this, id: u64) -> LType {
-        for (mut i: i64 = 0; i < this.keys.length; i++) {
-            if (this.keys[i] == id) {
-                return LType { raw: this.values[i] };
+        for (mut i: i64 = 0; i < this.cache.length; i++) {
+            if (this.cache[i].first == id) {
+                return LType { raw: this.cache[i].second };
             }
         }
         return LType::null();
     }
 
     store(mut &this, id: u64, ty: LType) -> void {
-        for (mut i: i64 = 0; i < this.keys.length; i++) {
-            if (this.keys[i] == id) {
-                this.values[i] = ty.raw;
+        for (mut i: i64 = 0; i < this.cache.length; i++) {
+            if (this.cache[i].first == id) {
+                this.cache[i].second = ty.raw;
                 return;
             }
         }
-        this.keys.push(id);
-        this.values.push(ty.raw);
+        this.cache.push(Pair::new(id, ty.raw));
     }
 }
 
@@ -102,20 +101,13 @@ function reset_shared_type_cache() -> void {
 // ============================================================================
 
 type struct TypeMapper {
-    // Cache: TypeRef.id -> LLVMTypeRef raw pointer.
-    // Parallel arrays (same pattern as DeclarationIndex, ModuleGraph).
-    cache_keys:   u64[];
-    cache_values: void*[];
-
     arena:  TypeArena*;
     intern: InternTable*;
 
     static new(arena: TypeArena*, intern: InternTable*) -> TypeMapper {
         return TypeMapper {
-            cache_keys:   [],
-            cache_values: [],
-            arena:        arena,
-            intern:       intern,
+            arena:  arena,
+            intern: intern,
         };
     }
 
@@ -622,10 +614,7 @@ type struct TypeMapper {
 
     /// Cache reads / writes go through the module-level shared cache so
     /// every module's TypeMapper participates in one cross-module dedup
-    /// pool.  The per-instance cache_keys / cache_values arrays are kept
-    /// only to preserve TypeMapper's struct shape (the bootstrap is
-    /// sensitive to layout shifts on heavily-used types) — they are no
-    /// longer read or written.
+    /// pool.
     lookup_cache(&this, id: u64) -> LType {
         const cache: TypeMapperCache* = get_shared_type_cache();
         return cache.lookup(id);

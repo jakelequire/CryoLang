@@ -180,10 +180,9 @@ type struct GenericRegistry {
     // -- Trait-impl registry (Phase B.3) --
     // Maps `(trait_name, target_name)` → ImplBlockNode*. Populated during
     // TemplateRegistration when an ImplBlockNode carries a trait_annotation.
-    // Key is `(trait_name.id << 32) | (target_name.id & 0xFFFFFFFF)`.
-    // Parallel arrays for ordered iteration; trait_impl_index for O(1) lookup.
-    trait_impl_keys:    u64[];
-    trait_impl_blocks:  ImplBlockNode*[];
+    // Trait-impl registry — keyed by (trait_name.id << 32) | (target_name.id & 0xFFFFFFFF).
+    // Ordered iteration via the array; O(1) lookup via trait_impl_index.
+    trait_impls:      Pair<u64, ImplBlockNode*>[];  // .first = key, .second = impl block
     trait_impl_index:   HashMap<u64, i64>;
 
     // -- Trait-decl registry (Phase B.6) --
@@ -226,8 +225,7 @@ type struct GenericRegistry {
             cache_index:       HashMap<string, i64>::new(),
             mono_set:          HashMap<string, boolean>::new(),
             demand:            [],
-            trait_impl_keys:   [],
-            trait_impl_blocks: [],
+            trait_impls:       [],
             trait_impl_index:  HashMap<u64, i64>::new(),
             trait_decl_index:  HashMap<u32, i64>::new(),
             trait_decl_nodes:  [],
@@ -305,12 +303,11 @@ type struct GenericRegistry {
         if (existing.is_some()) {
             // Latest impl wins — matches register_template's overwrite policy.
             const idx: i64 = existing.unwrap();
-            this.trait_impl_blocks[idx] = block;
+            this.trait_impls[idx].second = block;
             return;
         }
-        const idx: i64 = this.trait_impl_keys.length;
-        this.trait_impl_keys.push(key);
-        this.trait_impl_blocks.push(block);
+        const idx: i64 = this.trait_impls.length;
+        this.trait_impls.push(Pair::new(key, block));
         this.trait_impl_index.insert(key, idx);
     }
 
@@ -321,14 +318,14 @@ type struct GenericRegistry {
         const key: u64 = GenericRegistry::trait_impl_key(trait_name, target_name);
         const opt: Option<i64> = this.trait_impl_index.get(&key);
         if (opt.is_some()) {
-            return this.trait_impl_blocks[opt.unwrap()];
+            return this.trait_impls[opt.unwrap()].second;
         }
         return null;
     }
 
     /// Number of registered trait impls. Useful for debug prints and tests.
     trait_impl_count(&this) -> i64 {
-        return this.trait_impl_blocks.length;
+        return this.trait_impls.length;
     }
 
     /// Return the list of trait names for which `target_name` has a
@@ -339,8 +336,8 @@ type struct GenericRegistry {
         mut result: SymbolStr[] = [];
         if (!target_name.is_valid()) { return result; }
         const target_lo: u64 = (target_name.id as u64) & 0xFFFFFFFF;
-        for (mut i: i64 = 0; i < this.trait_impl_keys.length; i++) {
-            const key: u64 = this.trait_impl_keys[i];
+        for (mut i: i64 = 0; i < this.trait_impls.length; i++) {
+            const key: u64 = this.trait_impls[i].first;
             if ((key & 0xFFFFFFFF) != target_lo) { continue; }
             const trait_id: u32 = (key >> 32) as u32;
             result.push(SymbolStr::from_id(trait_id));
