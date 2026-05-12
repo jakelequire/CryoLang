@@ -10,6 +10,7 @@ import Compiler::Resolver::SymbolStr;
 import std::core::option;
 import Compiler::Types::TypeRef;
 import std::collections::hashmap;
+import std::collections::pair;
 
 
 // ============================================================================
@@ -67,20 +68,17 @@ type struct ModuleTypeRegistry {
     // Flat list of all registered type entries with a module key per entry.
     // NOTE: Cannot use TypeRegistryEntry[][] — C++ codegen mishandles T[][]
     // (inner array descriptor lowered to ptr instead of {ptr,i64,i64}).
-    entry_list:       TypeRegistryEntry[];  // all entries flat
-    entry_module_ids: i64[];                // parallel: module index per entry
+    entries: Pair<TypeRegistryEntry, i64>[];  // .first = entry, .second = module index
 
     // Module name registry (module_name → index)
     module_names:     string[];
     module_index:     HashMap<string, i64>;
 
-    // Type aliases: alias SymbolStr.id → target TypeRef (parallel arrays)
-    alias_names:    SymbolStr[];
-    alias_targets:  TypeRef[];
+    // Type aliases: alias SymbolStr.id → target TypeRef
+    aliases:      Pair<SymbolStr, TypeRef>[];    // .first = alias name, .second = target
 
     // Alias base name tracking for chain resolution
-    alias_base_names: SymbolStr[];
-    alias_base_refs:  SymbolStr[];
+    alias_bases:  Pair<SymbolStr, SymbolStr>[];  // .first = alias name, .second = base name
 
     // HashMap indices for O(1) lookup
     alias_index:      HashMap<u32, i64>;     // alias SymbolStr.id → index
@@ -88,14 +86,11 @@ type struct ModuleTypeRegistry {
 
     static new() -> ModuleTypeRegistry {
         return ModuleTypeRegistry {
-            entry_list:       [],
-            entry_module_ids: [],
+            entries:          [],
             module_names:     [],
             module_index:     HashMap<string, i64>::new(),
-            alias_names:      [],
-            alias_targets:    [],
-            alias_base_names: [],
-            alias_base_refs:  [],
+            aliases:          [],
+            alias_bases:      [],
             alias_index:      HashMap<u32, i64>::new(),
             alias_base_index: HashMap<u32, i64>::new(),
         };
@@ -123,8 +118,7 @@ type struct ModuleTypeRegistry {
         }
 
         // Append entry with its module id
-        this.entry_list.push(entry);
-        this.entry_module_ids.push(mod_idx);
+        this.entries.push(Pair::new(entry, mod_idx));
     }
 
 
@@ -137,10 +131,10 @@ type struct ModuleTypeRegistry {
         const opt: Option<i64> = this.module_index.get(&module);
         if (opt.is_some()) {
             const mod_idx: i64 = opt.unwrap();
-            for (mut j: i64 = 0; j < this.entry_list.length; j++) {
-                if (this.entry_module_ids[j] == mod_idx &&
-                    this.entry_list[j].local_name.equals(name)) {
-                    return this.entry_list[j].entry_type;
+            for (mut j: i64 = 0; j < this.entries.length; j++) {
+                if (this.entries[j].second == mod_idx &&
+                    this.entries[j].first.local_name.equals(name)) {
+                    return this.entries[j].first.entry_type;
                 }
             }
         }
@@ -153,11 +147,11 @@ type struct ModuleTypeRegistry {
             const opt: Option<i64> = this.module_index.get(&imports[i]);
             if (opt.is_some()) {
                 const mod_idx: i64 = opt.unwrap();
-                for (mut k: i64 = 0; k < this.entry_list.length; k++) {
-                    if (this.entry_module_ids[k] == mod_idx &&
-                        this.entry_list[k].local_name.equals(name) &&
-                        this.entry_list[k].visibility.is_public()) {
-                        return this.entry_list[k].entry_type;
+                for (mut k: i64 = 0; k < this.entries.length; k++) {
+                    if (this.entries[k].second == mod_idx &&
+                        this.entries[k].first.local_name.equals(name) &&
+                        this.entries[k].first.visibility.is_public()) {
+                        return this.entries[k].first.entry_type;
                     }
                 }
             }
@@ -171,9 +165,9 @@ type struct ModuleTypeRegistry {
         const opt: Option<i64> = this.module_index.get(&module);
         if (opt.is_some()) {
             const mod_idx: i64 = opt.unwrap();
-            for (mut j: i64 = 0; j < this.entry_list.length; j++) {
-                if (this.entry_module_ids[j] == mod_idx) {
-                    result.push(this.entry_list[j]);
+            for (mut j: i64 = 0; j < this.entries.length; j++) {
+                if (this.entries[j].second == mod_idx) {
+                    result.push(this.entries[j].first);
                 }
             }
         }
@@ -186,10 +180,10 @@ type struct ModuleTypeRegistry {
         const opt: Option<i64> = this.module_index.get(&module);
         if (opt.is_some()) {
             const mod_idx: i64 = opt.unwrap();
-            for (mut j: i64 = 0; j < this.entry_list.length; j++) {
-                if (this.entry_module_ids[j] == mod_idx &&
-                    this.entry_list[j].visibility.is_public()) {
-                    result.push(this.entry_list[j]);
+            for (mut j: i64 = 0; j < this.entries.length; j++) {
+                if (this.entries[j].second == mod_idx &&
+                    this.entries[j].first.visibility.is_public()) {
+                    result.push(this.entries[j].first);
                 }
             }
         }
@@ -206,12 +200,11 @@ type struct ModuleTypeRegistry {
         const h: u64 = hash_int(alias.id as u64);
         const opt: Option<i64> = this.alias_index.get(&alias.id);
         if (opt.is_some()) {
-            this.alias_targets[opt.unwrap()] = target;
+            this.aliases[opt.unwrap()].second = target;
             return;
         }
-        const idx: i64 = this.alias_names.length;
-        this.alias_names.push(alias);
-        this.alias_targets.push(target);
+        const idx: i64 = this.aliases.length;
+        this.aliases.push(Pair::new(alias, target));
         this.alias_index.insert(alias.id, idx);
     }
 
@@ -219,7 +212,7 @@ type struct ModuleTypeRegistry {
     lookup_alias(&this, name: SymbolStr) -> TypeRef {
         const opt: Option<i64> = this.alias_index.get(&name.id);
         if (opt.is_some()) {
-            return this.alias_targets[opt.unwrap()];
+            return this.aliases[opt.unwrap()].second;
         }
         return TypeRef::invalid();
     }
@@ -233,7 +226,7 @@ type struct ModuleTypeRegistry {
         for (mut depth: i64 = 0; depth < max_depth; depth = depth + 1) {
             const opt: Option<i64> = this.alias_base_index.get(&current.id);
             if (opt.is_some()) {
-                current = this.alias_base_refs[opt.unwrap()];
+                current = this.alias_bases[opt.unwrap()].second;
             } else {
                 break;
             }
@@ -247,12 +240,11 @@ type struct ModuleTypeRegistry {
         const h: u64 = hash_int(alias.id as u64);
         const opt: Option<i64> = this.alias_base_index.get(&alias.id);
         if (opt.is_some()) {
-            this.alias_base_refs[opt.unwrap()] = base_name;
+            this.alias_bases[opt.unwrap()].second = base_name;
             return;
         }
-        const idx: i64 = this.alias_base_names.length;
-        this.alias_base_names.push(alias);
-        this.alias_base_refs.push(base_name);
+        const idx: i64 = this.alias_bases.length;
+        this.alias_bases.push(Pair::new(alias, base_name));
         this.alias_base_index.insert(alias.id, idx);
     }
 
