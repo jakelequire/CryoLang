@@ -22,7 +22,6 @@ type enum CommandKind {
     Test;
     Check;
     Raw;
-    Project; // TODO: remove this and just use `build` with auto-detection of cryoconfig
     Demangle;
     Fetch;
     Update;
@@ -40,7 +39,6 @@ implement enum CommandKind {
             CommandKind::Test    => { "test"    }
             CommandKind::Check   => { "check"   }
             CommandKind::Raw     => { "raw"     }
-            CommandKind::Project  => { "project"  }
             CommandKind::Demangle => { "demangle" }
             CommandKind::Fetch    => { "fetch"    }
             CommandKind::Update   => { "update"   }
@@ -53,12 +51,11 @@ implement enum CommandKind {
             CommandKind::Help     => { "Display help information"                      }
             CommandKind::Version  => { "Display version information"                   }
             CommandKind::Init     => { "Scaffold a new Cryo project (cryoconfig + main.cryo)" }
-            CommandKind::Build    => { "Build a source file (single-file)"            }
+            CommandKind::Build    => { "Build a file or cryoconfig project"                    }
             CommandKind::Run      => { "Build the project and run the resulting binary" }
             CommandKind::Test     => { "Build and run the project's tests"             }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
             CommandKind::Raw      => { "Compile without stdlib or prelude"            }
-            CommandKind::Project  => { "Build a multi-module project from cryoconfig" }
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
             CommandKind::Update   => { "Re-resolve every dependency, ignoring the lockfile" }
@@ -71,12 +68,11 @@ implement enum CommandKind {
             CommandKind::Help     => { "cryo help [command]"              }
             CommandKind::Version  => { "cryo version"                     }
             CommandKind::Init     => { "cryo init [dir]"                  }
-            CommandKind::Build    => { "cryo build <file> [flags]"       }
+            CommandKind::Build    => { "cryo build [file|dir] [flags]"  }
             CommandKind::Run      => { "cryo run [flags]"                 }
             CommandKind::Test     => { "cryo test [pattern] [flags]"       }
             CommandKind::Check    => { "cryo check <file> [flags]"       }
             CommandKind::Raw      => { "cryo raw <file> [flags]"         }
-            CommandKind::Project  => { "cryo project [dir] [flags]"      }
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::Fetch    => { "cryo fetch"                        }
             CommandKind::Update   => { "cryo update"                       }
@@ -116,9 +112,6 @@ type struct Executor {
         const raw: CommandKind = CommandKind::Raw;
         runner.add_command(Command::new(raw.name(), raw.description(), raw.usage()));
 
-        const project: CommandKind = CommandKind::Project;
-        runner.add_command(Command::new(project.name(), project.description(), project.usage()));
-
         const demangle: CommandKind = CommandKind::Demangle;
         runner.add_command(Command::new(demangle.name(), demangle.description(), demangle.usage()));
 
@@ -139,7 +132,6 @@ type struct Executor {
         if (name == "test")     { return CommandKind::Test; }
         if (name == "check")    { return CommandKind::Check; }
         if (name == "raw")      { return CommandKind::Raw; }
-        if (name == "project")  { return CommandKind::Project; }
         if (name == "demangle") { return CommandKind::Demangle; }
         if (name == "fetch")    { return CommandKind::Fetch; }
         if (name == "update")   { return CommandKind::Update; }
@@ -163,7 +155,6 @@ type struct Executor {
             CommandKind::Test    => { return Executor::cmd_test(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
             CommandKind::Raw     => { return Executor::cmd_raw(args); }
-            CommandKind::Project  => { return Executor::cmd_project(args); }
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
             CommandKind::Fetch    => { return Executor::cmd_fetch(args); }
             CommandKind::Update   => { return Executor::cmd_update(args); }
@@ -335,9 +326,12 @@ type struct Executor {
         return true;
     }
 
-    /// `cryo build [file]` — single-file or project compilation.
-    /// If no file is given, looks for a cryoconfig in the current directory.
-    /// If a cryoconfig is found, runs project compilation; otherwise errors.
+    /// `cryo build [file|dir]` — single-file or project compilation.
+    ///
+    /// - `cryo build <file.cryo>` — compile a single source file.
+    /// - `cryo build [dir]`       — find the cryoconfig in `dir` (default: `.`)
+    ///                              and run a full project build.
+    /// - `cryo build`             — same as above with dir = `.`.
     static cmd_build(args: ParsedArgs) -> int {
         if (args.has_flag("debug")) {
             Logger::enable_debug();
@@ -346,20 +340,70 @@ type struct Executor {
         cdebug("[Build] Starting build process.\n");
 
         const file: string = args.input_file();
-        if (file == "" || strlen(file) == 0) {
-            // No file specified — check for cryoconfig in current directory
-            const config_path: string = find_cryoconfig(".");
-            if (strlen(config_path) > 0) {
-                // Found a project config — delegate to project compilation
-                cdebug("[Build] No input file specified, but found cryoconfig. Assuming project build.\n");
-                return Executor::cmd_project(args);
+
+        // If the positional arg looks like a .cryo source file, compile it
+        // directly as a single-file build.
+        if (strlen(file) > 0) {
+            const flen: i64 = strlen(file) as i64;
+            // Check for a .cryo extension: last five chars are ".cryo".
+            if (flen > 5) {
+                const ext_start: i64 = flen - 5;
+                const ext: string = ptr_add(file as void*, ext_start) as string;
+                if (strcmp(ext, ".cryo") == 0) {
+                    return Executor::compile_file(file, args);
+                }
             }
-            fprintf(g_stderr, "Error: No input file specified and no cryoconfig found.\n");
-            fprintf(g_stderr, "Usage: cryo build <file> [flags]\n");
-            fprintf(g_stderr, "   or: run from a directory containing a cryoconfig\n");
+            // Positional arg is not a .cryo file — treat it as a directory.
+        }
+
+        // Project build: find cryoconfig in the given dir (or ".").
+        const dir: string = if (strlen(file) > 0) { file } else { "." };
+        const config_path: string = find_cryoconfig(dir);
+        if (strlen(config_path) == 0) {
+            if (strlen(file) > 0) {
+                fprintf(g_stderr, "Error: '%s' is not a .cryo file and no cryoconfig was found in that directory.\n", file);
+            } else {
+                fprintf(g_stderr, "Error: No input file specified and no cryoconfig found in '.'.\n");
+            }
+            fprintf(g_stderr, "Usage: cryo build <file.cryo> [flags]\n");
+            fprintf(g_stderr, "   or: cryo build [dir]         (dir must contain a cryoconfig)\n");
             return 1;
         }
-        return Executor::compile_file(file, args);
+
+        cdebug("[Build] Found cryoconfig: %s\n", config_path);
+
+        mut config: CompilerConfig = CompilerConfig::default();
+        if (args.has_flag("debug")) {
+            config = CompilerConfig::debug_config();
+        }
+        if (args.has_flag("ast")) {
+            config.show_ast = true;
+        }
+        if (args.has_flag("emit-llvm")) {
+            config.emit_llvm = true;
+        }
+        if (args.has_arg("build-dir")) {
+            config.output_dir_override = args.get_value("build-dir");
+        }
+        if (args.has_arg("stdlib")) {
+            config.stdlib_path_override = args.get_value("stdlib");
+        }
+        if (args.has_arg("target")) {
+            config.target_triple_override = args.get_value("target");
+        }
+
+        mut compiler: CompilerInstance = CompilerInstance::new(config);
+        cdebug("[Build] Compiling project from config: %s\n", config_path);
+        const result: CompilationResult = compiler.compile_project(config_path);
+
+        if (result.success) {
+            printf("Project compilation succeeded.\n");
+            return 0;
+        }
+
+        printf("Project compilation failed (%u errors, %u warnings)\n",
+            result.error_count, result.warning_count);
+        return 1;
     }
 
     /// `cryo run` — build the project in CWD, then execute the produced
@@ -586,70 +630,11 @@ type struct Executor {
         return 1;
     }
 
-    /// `cryo project [dir]` — multi-module project compilation.
-    /// Looks for a cryoconfig file in the given directory (or CWD).
-    static cmd_project(args: ParsedArgs) -> int {
-        if (args.has_flag("debug")) {
-            Logger::enable_debug();
-        }
-
-        cdebug("[Project] Starting project build.\n");
-
-        // Determine project directory: first positional arg, or "."
-        const dir: string = if (args.positional_count() > 0) {
-            args.input_file()
-        } else {
-            "."
-        };
-
-        // Find cryoconfig in the directory
-        const config_path: string = find_cryoconfig(dir);
-        if (strcmp(config_path, "") == 0) {
-            fprintf(g_stderr, "Error: No cryoconfig found in '%s' or parent directories.\n", dir);
-            fprintf(g_stderr, "Usage: cryo project [directory] [flags]\n");
-            return 1;
-        }
-
-        if (args.has_flag("debug")) {
-            cdebug("[Project] Found cryoconfig: %s\n", config_path);
-        }
-
-        mut config: CompilerConfig = CompilerConfig::default();
-        if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
-        }
-        if (args.has_flag("ast")) {
-            config.show_ast = true;
-        }
-        if (args.has_flag("emit-llvm")) {
-            config.emit_llvm = true;
-        }
-        // `--build-dir=PATH` overrides cryoconfig's output_dir.  Empty
-        // when the flag isn't provided; CompilerInstance treats "" as
-        // "use the config value".
-        if (args.has_arg("build-dir")) {
-            config.output_dir_override = args.get_value("build-dir");
-        }
-        if (args.has_arg("stdlib")) {
-            config.stdlib_path_override = args.get_value("stdlib");
-        }
-        if (args.has_arg("target")) {
-            config.target_triple_override = args.get_value("target");
-        }
-
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        cdebug("[Project] Compiling project from config: %s\n", config_path);
-        const result: CompilationResult = compiler.compile_project(config_path);
-
-        if (result.success) {
-            printf("Project compilation succeeded.\n");
-            return 0;
-        }
-
-        printf("Project compilation failed (%u errors, %u warnings)\n",
-            result.error_count, result.warning_count);
-        return 1;
-    }
+    /// Removed: `cryo project` has been unified into `cryo build`.
+    /// `cryo build [dir]` detects a cryoconfig and runs a project build;
+    /// `cryo build <file.cryo>` runs a single-file build.
+    /// This stub is intentionally absent — dispatch routing no longer
+    /// references cmd_project.
 
     /// `cryo demangle <symbol>` — decode a v0.2-mangled symbol to its
     /// source-level form (per docs/cryo-mangling-spec.md §10).  With no

@@ -50,14 +50,22 @@ function into_raw_then_from_raw_round_trip() -> Result<(), TestError> {
 }
 
 // Boxing a struct to confirm composite-T payloads also round-trip.
-type struct Point {
+// Named `BoxStruct` (not `Point`) to avoid polluting the trait-impl registry
+// with a bare-name key that would shadow the `Point` types defined in other
+// test modules (e.g. tests/lang/structs.cryo, tests/lang/visibility.cryo).
+// Requires a Drop impl so Box<BoxStruct> satisfies `where T: Drop`.
+type struct BoxStruct {
     x: i32;
     y: i32;
 }
 
+implement trait Drop for struct BoxStruct {
+    drop(mut &this) -> void {}
+}
+
 ![test]
 function box_holds_struct_by_value() -> Result<(), TestError> {
-    mut b: Box<Point> = Box::new(Point { x: 3, y: 4 });
+    mut b: Box<BoxStruct> = Box::new(BoxStruct { x: 3, y: 4 });
     const sx: i32 = (*b.as_ptr()).x;
     const sy: i32 = (*b.as_ptr()).y;
     b.drop();
@@ -70,4 +78,44 @@ function box_holds_struct_by_value() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     return Result::Ok(());
+}
+
+// ============================================================================
+// Pointee-drop test
+//
+// A `Wrapper` type whose `drop` writes a sentinel (99) through a raw pointer
+// proves that Box::drop now calls T's destructor before freeing the memory.
+// Before the fix, the sentinel was never written because Box::drop bypassed
+// the pointee's Drop impl.
+// ============================================================================
+
+type struct Wrapper {
+    // Raw pointer to a stack-resident i32.  Box::drop must call
+    // Wrapper::drop before freeing the allocation; Wrapper::drop writes
+    // the sentinel through this pointer.  We read it back on the stack
+    // after b.drop() to confirm the write happened.
+    sentinel_ptr: i32*;
+}
+
+implement trait Drop for struct Wrapper {
+    drop(mut &this) -> void {
+        // Write sentinel value so the test can observe this was called.
+        *this.sentinel_ptr = 99;
+    }
+}
+
+![test]
+function box_drop_calls_pointee_drop() -> Result<(), TestError> {
+    mut sentinel: i32 = 0;
+    mut b: Box<Wrapper> = Box::new(Wrapper { sentinel_ptr: &sentinel });
+    // Before drop: sentinel is 0 (Wrapper::drop not yet called).
+    const before: i32 = sentinel;
+    b.drop();
+    // After drop: Wrapper::drop must have written 99 through sentinel_ptr.
+    const after: i32 = sentinel;
+    match (expect_eq(before, 0)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(after, 99);
 }
