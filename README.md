@@ -122,6 +122,8 @@ cryo init hello
 cd hello
 ```
 
+`cryo init` is interactive — pressing Enter accepts every default. When invoked as `cryo init <dir>` the directory becomes the default project name, so `cryo init hello && echo | head` is effectively non-interactive.
+
 This produces:
 
 ```
@@ -137,7 +139,7 @@ hello/
 namespace Hello;
 
 function main() -> int {
-    println("Hello, world!");
+    printf("Hello, world!\n");
     return 0;
 }
 ```
@@ -355,7 +357,6 @@ Run with `cryo test`. See [`docs/cryo.md` § 20](./docs/cryo.md#20-testing).
 | `cryo check <file>` | Type-check without code generation. |
 | `cryo fetch` | Resolve `[dependencies]`; write `cryoconfig.lock`. |
 | `cryo update` | Re-resolve dependencies, ignoring the lock. |
-| `cryo project [dir]` | Build a multi-module project from `cryoconfig`. |
 | `cryo demangle <symbol>` | Decode a mangled Cryo symbol. |
 | `cryo version` | Print version info. |
 

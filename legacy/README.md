@@ -1,30 +1,23 @@
 # `legacy/`
 
-Code in this directory is **frozen**. It is kept for historical reference and
-as a fallback bootstrap path until a self-hosted `cryo` binary ships with the
-repo. Do not extend, refactor, or fix non-blocking bugs here.
+Code in this directory is **frozen**. It is kept for historical reference
+only. Do not modify, extend, refactor, or fix bugs here.
 
 ## What's in here
 
 ### `legacy/bootstrap/`
 
-The original C++23 implementation of the Cryo compiler. It was used to
-bootstrap the self-hosted compiler in `compiler/` and is no longer the
-project's primary toolchain.
+The original C++23 implementation of the Cryo compiler. It served as the
+bootstrap for the now-shipping self-hosted compiler in `compiler/` and has
+been fully retired.
 
-- It still builds: `make bootstrap` from the repo root.
-- It still has two known harmless codegen quirks (dead `@FILE.str` globals,
-  unmangled `@panic` calls in `std__prelude.o`) that bake into stage-3 IR but
-  don't affect runtime. The 8-stage `make selfhost-check` chain handles them.
-- **These quirks will not be fixed.** They go away when the bootstrap is
-  retired.
+- **It does not build.** No Makefile target produces it; it is not part of
+  any current build path.
+- **It has no effect on the modern compiler.** Behavior of the self-hosted
+  compiler is not influenced by anything in this directory. Bugs that
+  existed in the C++ implementation are not reasons to do anything in the
+  modern toolchain.
+- It is preserved purely so the project's history is inspectable.
 
-## When does `legacy/bootstrap/` go away?
-
-Once a known-good `cryo` binary is committed (or attached to a GitHub Release)
-as the new starting point for builds, the bootstrap becomes unnecessary. At
-that point this directory will either be deleted or moved out of the main
-branch into a long-term archive.
-
-Until then, it's the only way to build Cryo from source on a machine that
-doesn't already have a `cryo` binary.
+The shipping compiler lives at `compiler/`, with the pinned binary at
+`bin/cryo` and the stdlib at `stdlib/`.
