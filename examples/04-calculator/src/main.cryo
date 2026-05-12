@@ -1,0 +1,252 @@
+///! RPN Calculator — structs, enums, methods, and error handling.
+///!
+///! A reverse-Polish-notation calculator that walks through a list
+///! of expressions, executes each one, and prints the result. Each
+///! expression is a space-separated string of operands (integers)
+///! and operators (`+ - * /`).
+///!
+///! What this example demonstrates:
+///!   • A `Stack` struct backed by `Array<i64>`, with `push` / `pop`
+///!     methods.
+///!   • A `CalcError` enum for the three failure modes (empty stack,
+///!     div-by-zero, parse failure) — propagated via `Result`.
+///!   • Tokenizing input with `Str::sub_bytes` rather than allocating
+///!     a heap split.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::array;
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+type enum CalcError {
+    EmptyStack;
+    DivisionByZero;
+    UnknownToken;
+    BadNumber;
+}
+
+function describe_error(e: CalcError) -> string {
+    match (e) {
+        CalcError::EmptyStack     => { return "empty stack"; }
+        CalcError::DivisionByZero => { return "division by zero"; }
+        CalcError::UnknownToken   => { return "unknown token"; }
+        CalcError::BadNumber      => { return "bad number"; }
+    }
+}
+
+// ============================================================================
+// Stack — fixed-element-type wrapper over Array<i64>
+// ============================================================================
+
+type struct Stack {
+    data: Array<i64>;
+
+    static new() -> Stack {
+        return Stack { data: Array::new() };
+    }
+
+    push(mut &this, value: i64) -> void {
+        this.data.push(value);
+    }
+
+    pop(mut &this) -> Result<i64, CalcError> {
+        match (this.data.pop()) {
+            Option::Some(value) => { return Result::Ok(value); }
+            Option::None        => { return Result::Err(CalcError::EmptyStack); }
+        }
+    }
+
+    length(&this) -> u64 {
+        return this.data.length();
+    }
+
+    drop(mut &this) -> void {
+        this.data.drop();
+    }
+}
+
+// ============================================================================
+// Tokenization & parsing
+// ============================================================================
+
+function is_digit(b: u8) -> boolean {
+    return b >= 0x30 && b <= 0x39;
+}
+
+function is_space(b: u8) -> boolean {
+    return b == 0x20 || b == 0x09;
+}
+
+/// Try to parse `token` as a signed integer. Accepts an optional
+/// leading `-`. Returns `Err(BadNumber)` on any non-digit char.
+function parse_number(token: Str) -> Result<i64, CalcError> {
+    const len: u64 = token.length();
+    if (len == 0) { return Result::Err(CalcError::BadNumber); }
+
+    mut negative: boolean = false;
+    mut i: u64 = 0;
+    match (token.byte_at(0)) {
+        Option::Some(first) => {
+            if (first == 0x2D) {   // '-'
+                negative = true;
+                i = 1;
+            }
+        }
+        Option::None => { return Result::Err(CalcError::BadNumber); }
+    }
+
+    if (i >= len) { return Result::Err(CalcError::BadNumber); }
+
+    mut value: i64 = 0;
+    while (i < len) {
+        match (token.byte_at(i)) {
+            Option::Some(byte) => {
+                if (!is_digit(byte)) {
+                    return Result::Err(CalcError::BadNumber);
+                }
+                value = value * 10 + (byte - 0x30) as i64;
+            }
+            Option::None => { return Result::Err(CalcError::BadNumber); }
+        }
+        i = i + 1;
+    }
+
+    if (negative) { value = -value; }
+    return Result::Ok(value);
+}
+
+/// Apply a single token to the stack. The token may be a number
+/// (pushed) or one of the four operators (consumed from the stack).
+function apply_token(stack: mut &Stack, token: Str) -> Result<(), CalcError> {
+    if (token.length() == 1) {
+        match (token.byte_at(0)) {
+            Option::Some(op) => {
+                if (op == 0x2B || op == 0x2D || op == 0x2A || op == 0x2F) {
+                    // Binary op: pop b, then a; push f(a, b).
+                    match (stack.pop()) {
+                        Result::Ok(b) => {
+                            match (stack.pop()) {
+                                Result::Ok(a) => {
+                                    if (op == 0x2B) { stack.push(a + b); return Result::Ok(()); }
+                                    if (op == 0x2D) { stack.push(a - b); return Result::Ok(()); }
+                                    if (op == 0x2A) { stack.push(a * b); return Result::Ok(()); }
+                                    if (b == 0) { return Result::Err(CalcError::DivisionByZero); }
+                                    stack.push(a / b);
+                                    return Result::Ok(());
+                                }
+                                Result::Err(e) => { return Result::Err(e); }
+                            }
+                        }
+                        Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+            }
+            Option::None => { return Result::Err(CalcError::UnknownToken); }
+        }
+    }
+
+    match (parse_number(token)) {
+        Result::Ok(n) => { stack.push(n); return Result::Ok(()); }
+        Result::Err(_) => { return Result::Err(CalcError::UnknownToken); }
+    }
+}
+
+/// Evaluate a whole expression. The final result lives on top of
+/// the stack — if the stack has more than one value at the end, the
+/// expression was malformed (extra operands).
+function evaluate(expr: Str) -> Result<i64, CalcError> {
+    mut stack: Stack = Stack::new();
+    const len: u64 = expr.length();
+    mut i: u64 = 0;
+
+    while (i < len) {
+        // Skip whitespace.
+        match (expr.byte_at(i)) {
+            Option::Some(b) => {
+                if (is_space(b)) { i = i + 1; continue; }
+            }
+            Option::None => { break; }
+        }
+
+        // Walk a non-whitespace run.
+        const start: u64 = i;
+        loop {
+            if (i >= len) { break; }
+            match (expr.byte_at(i)) {
+                Option::Some(b) => {
+                    if (is_space(b)) { break; }
+                    i = i + 1;
+                }
+                Option::None => { break; }
+            }
+        }
+
+        const token: Str = expr.sub_bytes(start, i);
+        match (apply_token(&stack, token)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                stack.drop();
+                return Result::Err(e);
+            }
+        }
+    }
+
+    if (stack.length() != 1) {
+        stack.drop();
+        return Result::Err(CalcError::EmptyStack);
+    }
+
+    match (stack.pop()) {
+        Result::Ok(value) => {
+            stack.drop();
+            return Result::Ok(value);
+        }
+        Result::Err(e) => {
+            stack.drop();
+            return Result::Err(e);
+        }
+    }
+}
+
+// ============================================================================
+// Demo driver
+// ============================================================================
+
+function run_one(expr: string) -> void {
+    const view: Str = Str::new(expr);
+    match (evaluate(view)) {
+        Result::Ok(result) => {
+            intrinsics::printf("  %-30s = %ld\n", expr, result);
+        }
+        Result::Err(e) => {
+            intrinsics::printf("  %-30s ! %s\n", expr, describe_error(e));
+        }
+    }
+}
+
+function main() -> int {
+    intrinsics::printf("RPN calculator — postfix arithmetic.\n\n");
+
+    run_one("3 4 +");
+    run_one("10 2 -");
+    run_one("7 8 *");
+    run_one("20 5 /");
+    run_one("2 3 + 4 *");          // (2 + 3) * 4 = 20
+    run_one("100 3 8 * -");        // 100 - 24    = 76
+    run_one("-5 10 +");            // negative operand
+    run_one("8 0 /");              // div-by-zero
+    run_one("1 +");                // empty stack
+    run_one("1 2 3");              // leftover operands
+    run_one("3 hello +");          // bad token
+
+    return 0;
+}

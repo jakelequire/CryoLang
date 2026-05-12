@@ -1,0 +1,242 @@
+///! Word count — file I/O, byte-level scanning, and HashMap.
+///!
+///! Reads a text file, walks every byte to extract whitespace-delimited
+///! words (lowercased, ASCII punctuation stripped), counts the
+///! occurrences of each, and prints the top ten in descending order.
+///!
+///! What this example demonstrates:
+///!   • `fs::file::read(Path)` — load file contents into `Array<u8>`.
+///!   • `HashMap<String, u64>` — index into a parallel `WordCount`
+///!     array so we keep one owned `String` per unique word.
+///!   • Manual selection-sort over the result array to pick the top
+///!     `K` entries (the stdlib does not yet have a `sort` helper).
+///!   • Careful ownership: every `String` lives in exactly one place
+///!     (`words[i].text`), and the HashMap key is a borrowing alias —
+///!     a fresh `String` made from the same bytes — so the dropping
+///!     of `words` plus the dropping of the map's keys is symmetric.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::collections::hashmap;
+import std::fs::path;
+import std::fs::file;
+import std::io::error;
+
+// ============================================================================
+// WordCount — one entry per unique word
+// ============================================================================
+
+type struct WordCount {
+    text: String;
+    count: u64;
+}
+
+implement trait Drop for struct WordCount {
+    drop(mut &this) -> void {
+        this.text.drop();
+    }
+}
+
+// ============================================================================
+// Byte classification — ASCII fast path
+// ============================================================================
+
+function is_word_byte(b: u8) -> boolean {
+    if (b >= 0x41 && b <= 0x5A) { return true; }   // A-Z
+    if (b >= 0x61 && b <= 0x7A) { return true; }   // a-z
+    if (b >= 0x30 && b <= 0x39) { return true; }   // 0-9
+    if (b == 0x27) { return true; }                // '
+    return false;
+}
+
+function to_lower(b: u8) -> u8 {
+    if (b >= 0x41 && b <= 0x5A) { return b + 32; }
+    return b;
+}
+
+// ============================================================================
+// Tokenize + tally
+// ============================================================================
+
+/// Extract a lowercased word starting at `start` from `bytes`. Returns
+/// the next byte index to resume scanning at. Walks past every
+/// in-word byte and appends each to `out`.
+function take_word(bytes: &Array<u8>, start: u64, out: mut &String) -> u64 {
+    const n: u64 = bytes.length();
+    mut i: u64 = start;
+    while (i < n) {
+        match (bytes.get(i)) {
+            Option::Some(byte) => {
+                if (!is_word_byte(byte)) { break; }
+                out.push_byte(to_lower(byte));
+                i = i + 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    return i;
+}
+
+/// Skip every non-word byte starting at `start`. Returns the next
+/// in-word byte index (or `bytes.length()` at end-of-input).
+function skip_non_word(bytes: &Array<u8>, start: u64) -> u64 {
+    const n: u64 = bytes.length();
+    mut i: u64 = start;
+    while (i < n) {
+        match (bytes.get(i)) {
+            Option::Some(byte) => {
+                if (is_word_byte(byte)) { break; }
+                i = i + 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    return i;
+}
+
+/// Walk `bytes` and append a `WordCount` row for every unique word.
+/// Repeat occurrences bump the existing row's `count`.
+function tally(bytes: &Array<u8>, words: mut &Array<WordCount>) -> u64 {
+    mut index: HashMap<String, u64> = HashMap::new();
+    mut total: u64 = 0;
+
+    mut i: u64 = 0;
+    const n: u64 = bytes.length();
+    while (i < n) {
+        i = skip_non_word(bytes, i);
+        if (i >= n) { break; }
+
+        mut word: String = String::new();
+        i = take_word(bytes, i, &word);
+        if (word.is_empty()) {
+            word.drop();
+            continue;
+        }
+        total = total + 1;
+
+        match (index.get(&word)) {
+            Option::Some(existing_idx) => {
+                // Word already counted — bump the array slot in place.
+                const slot: WordCount* = words.as_ptr();
+                slot[existing_idx].count = slot[existing_idx].count + 1;
+                word.drop();
+            }
+            Option::None => {
+                // New word. Take a separate String for the map key so
+                // the array's String and the map's String are
+                // independent allocations.
+                const new_idx: u64 = words.length();
+                mut key: String = String::from_str(word.as_str());
+                words.push(WordCount { text: word, count: 1 });
+                index.insert(key, new_idx);
+            }
+        }
+    }
+
+    index.drop();
+    return total;
+}
+
+// ============================================================================
+// Top-N — selection sort over `count` (descending). Stops once
+// we've placed the top `k` entries.
+// ============================================================================
+
+function rank_top(words: mut &Array<WordCount>, k: u64) -> void {
+    const n: u64 = words.length();
+    const limit: u64 = if (k < n) { k } else { n };
+    const slot: WordCount* = words.as_ptr();
+
+    mut i: u64 = 0;
+    while (i < limit) {
+        mut max_idx: u64 = i;
+        mut j: u64 = i + 1;
+        while (j < n) {
+            if (slot[j].count > slot[max_idx].count) {
+                max_idx = j;
+            }
+            j = j + 1;
+        }
+        if (max_idx != i) {
+            // Swap fields field-by-field — strings are pointers
+            // we move around without dropping.
+            const tmp_text: String = slot[i].text;
+            const tmp_count: u64   = slot[i].count;
+            slot[i].text  = slot[max_idx].text;
+            slot[i].count = slot[max_idx].count;
+            slot[max_idx].text  = tmp_text;
+            slot[max_idx].count = tmp_count;
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// Output
+// ============================================================================
+
+function print_report(words: &Array<WordCount>, top_k: u64, total: u64) -> void {
+    intrinsics::printf("--- word count report ---\n");
+    intrinsics::printf("  total words:  %lu\n", total);
+    intrinsics::printf("  unique words: %lu\n", words.length());
+    intrinsics::printf("  top %lu:\n", top_k);
+
+    const n: u64 = words.length();
+    const limit: u64 = if (top_k < n) { top_k } else { n };
+    mut i: u64 = 0;
+    while (i < limit) {
+        match (words.get(i)) {
+            Option::Some(entry) => {
+                intrinsics::printf(
+                    "    %4lu  %.*s\n",
+                    entry.count,
+                    entry.text.length() as i32,
+                    entry.text.as_ptr()
+                );
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    // The path is relative to the cwd `cryo run` uses, which is the
+    // project root.  Adjust if running the binary by hand.
+    const path: Path = Path::from_str(Str::new("data/sample.txt"));
+
+    match (file::read(path)) {
+        Result::Ok(bytes) => {
+            mut buffer: Array<u8> = bytes;
+            mut words: Array<WordCount> = Array::new();
+            const total: u64 = tally(&buffer, &words);
+            buffer.drop();
+
+            rank_top(&words, 10);
+            print_report(&words, 10, total);
+
+            words.drop();
+            return 0;
+        }
+        Result::Err(_) => {
+            intrinsics::printf(
+                "error: could not read 'data/sample.txt' "
+                "(run from the project root with `cryo run`)\n"
+            );
+            return 1;
+        }
+    }
+}

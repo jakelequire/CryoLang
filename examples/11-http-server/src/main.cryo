@@ -1,0 +1,159 @@
+///! HTTP server — `std::net::http` with a router and four routes.
+///!
+///! Binds to `127.0.0.1:8080`, accepts connection-per-request, and
+///! exposes a handful of routes:
+///!
+///!   GET  /                  — plain text greeting
+///!   GET  /health            — JSON health probe
+///!   GET  /greet/:name       — path-parameter echo
+///!   POST /echo              — echoes the request body back
+///!
+///! What this example demonstrates:
+///!   • `Router::new()` + chained `.get()` / `.post()` / `.del()` —
+///!     fluent registration of route handlers.
+///!   • Free-function handlers with the signature
+///!     `(Request) -> Response` — Cryo's first-class function values.
+///!   • `Response::text` / `Response::json` constructors, and the
+///!     drop discipline at the end of every handler.
+///!   • `HttpServer::with_router(addr, &router)` + `.run()`.
+///!
+///! Run with:  cryo run    then  curl http://127.0.0.1:8080/
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::net::http;
+import std::net::socket_addr;
+
+// ============================================================================
+// Handlers
+// ============================================================================
+
+function handle_root(req: Request) -> Response {
+    req.drop();
+    return Response::text(
+        StatusCode::ok(),
+        Str::new("Hello from the Cryo HTTP server!\n")
+    );
+}
+
+function handle_health(req: Request) -> Response {
+    req.drop();
+    const body_text: Str = Str::new("{\"status\":\"ok\"}");
+    mut body: Array<u8> = Array::with_capacity(body_text.length());
+    body.push_slice(body_text.as_bytes());
+    return Response::json(StatusCode::ok(), body);
+}
+
+/// GET /greet/:name — pull the `:name` segment out of `req.params`
+/// and bake it into a personalized response.
+///
+/// We use `params.get_ptr` to take a *borrow* of the captured value
+/// rather than a copy — the captured String stays owned by the
+/// request's HashMap and is released by `req_local.drop()`.
+function handle_greet(req: Request) -> Response {
+    mut req_local: Request = req;
+    const key: String = String::from_str(Str::new("name"));
+    const looked_up: Option<String*> = req_local.params.get_ptr(&key);
+    // `key` is a local String — auto-dropped on scope exit.
+
+    match (looked_up) {
+        Option::Some(name_ptr) => {
+            mut body: Array<u8> = Array::with_capacity(64);
+            body.push_slice(Str::new("Hello, ").as_bytes());
+            body.push_slice(name_ptr.as_str().as_bytes());
+            body.push_slice(Str::new("!\n").as_bytes());
+            const resp: Response = Response::text(
+                StatusCode::ok(),
+                Str::from_raw(body.as_ptr(), body.length())
+            );
+            body.drop();
+            req_local.drop();
+            return resp;
+        }
+        Option::None => {
+            req_local.drop();
+            return Response::text(
+                StatusCode::internal_server_error(),
+                Str::new("missing :name param\n")
+            );
+        }
+    }
+}
+
+/// POST /echo — mirror the request body back as text/plain.
+function handle_echo(req: Request) -> Response {
+    mut req_local: Request = req;
+    const body_view: Str = Str::from_raw(
+        req_local.body.as_ptr(),
+        req_local.body.length()
+    );
+    const resp: Response = Response::text(StatusCode::ok(), body_view);
+    req_local.drop();
+    return resp;
+}
+
+function handle_not_found(req: Request) -> Response {
+    req.drop();
+    return Response::text(
+        StatusCode::not_found(),
+        Str::new("404 Not Found\n  Try GET /, /health, /greet/:name, or POST /echo\n")
+    );
+}
+
+function handle_method_not_allowed(req: Request) -> Response {
+    req.drop();
+    return Response::text(
+        StatusCode::method_not_allowed(),
+        Str::new("405 Method Not Allowed\n")
+    );
+}
+
+// ============================================================================
+// One-shot startup banner
+// ============================================================================
+
+function on_ready() -> void {
+    intrinsics::printf("listening on http://127.0.0.1:8080\n");
+    intrinsics::printf("  GET  /              -> greeting\n");
+    intrinsics::printf("  GET  /health        -> {\"status\":\"ok\"}\n");
+    intrinsics::printf("  GET  /greet/:name   -> personalized greeting\n");
+    intrinsics::printf("  POST /echo          -> echoes the body\n");
+    intrinsics::printf("  (Ctrl-C to stop)\n");
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    const addr: SocketAddr = SocketAddr::localhost_v4(8080);
+
+    mut router: Router = Router::new();
+    router.get(Str::new("/"),               handle_root)
+          .get(Str::new("/health"),         handle_health)
+          .get(Str::new("/greet/:name"),    handle_greet)
+          .post(Str::new("/echo"),          handle_echo)
+          .on_not_found(handle_not_found)
+          .on_method_not_allowed(handle_method_not_allowed);
+
+    mut server: HttpServer = HttpServer::with_router(addr, &router);
+    server.with_ready(on_ready);
+
+    match (server.run()) {
+        Result::Ok(_) => { }
+        Result::Err(_) => {
+            intrinsics::printf("server error: could not bind 127.0.0.1:8080\n");
+            router.drop();
+            return 1;
+        }
+    }
+
+    router.drop();
+    return 0;
+}
