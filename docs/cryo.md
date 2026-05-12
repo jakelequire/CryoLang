@@ -1499,7 +1499,9 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." Currently, the compiler **does not yet automatically synthesise drop calls at scope exit**; owning types in the standard library expose a public `drop(mut &this)` method that the caller is expected to invoke. Automatic drop insertion is on the roadmap (see [§ 21](#21-reserved-syntax)).
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings — the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`). Manual `binding.drop()` remains valid and idiomatic: the analyzer detects it as a move and the synthesizer skips bindings that are already consumed.
+
+Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access — explicit `.drop()` is still required in those positions.
 
 ### 16.3 Move Checking
 
@@ -1662,7 +1664,7 @@ The standard library follows a small set of conventions that user code is encour
 
 - **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`. The translation between Cryo strings and C strings happens at the boundary in `ffi::cstr`.
 - **`Result` for fallible operations, `panic` for broken invariants.** A function returns `Result<T, E>` whenever failure is part of its contract; it panics only when the contract truly cannot be preserved (e.g., an out-of-bounds index on a function whose contract excludes it).
-- **Explicit resource management.** Every owning type exposes a `drop(mut &this)` method, and its docstring identifies who is responsible for calling it. (Once automatic drop synthesis lands, these calls become implicit.)
+- **Explicit resource management.** Every owning type exposes a `drop(mut &this)` method, and its docstring identifies the ownership obligation. In practice the compiler synthesises these drops at scope exit (see [§ 16.2](#162-the-drop-trait)); manual `.drop()` remains valid for early release.
 - **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAlloc`.
 
 ---
@@ -1691,9 +1693,10 @@ function expensive_integration_test() -> Result<(), TestError> {
 
 ![test]
 ![should_panic]
-function divides_by_zero() -> Result<(), TestError> {
-    let _ = 1 / 0;
-    return bail("should have panicked");
+function unwrap_none_panics() -> Result<(), TestError> {
+    const empty: Option<int> = Option::None;
+    const _value: int = empty.unwrap();   // panics
+    return bail("unwrap should have panicked");
 }
 ```
 
@@ -1731,7 +1734,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
-| Automatic drop synthesis | Implemented. The analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`; non-`Copy` let-bindings are auto-dropped at every scope-exit point in reverse declaration order. Manual `binding.drop()` calls remain valid — the analyzer detects them as moves and the synthesizer skips already-consumed bindings. Pattern bindings (`match` arms) and field/indexed accesses are not registered, so explicit drops in those positions are still required. |
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.

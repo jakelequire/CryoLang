@@ -1,5 +1,9 @@
 (* ================================================================ *)
 (*  Cryo Language Grammar  -  W3C EBNF                              *)
+(*                                                                  *)
+(*  This file is the formal counterpart to `docs/cryo.md`.  When    *)
+(*  the two disagree, the parser at                                 *)
+(*  `compiler/src/compiler/parser/` is the source of truth.         *)
 (* ================================================================ *)
 
 
@@ -9,12 +13,15 @@ Program            ::= Directive* Namespace? TopLevelItem*
 Namespace          ::= "namespace" QualName ";"
 
 TopLevelItem       ::= Import | ModuleDecl | VarDecl | FunctionDecl
-                     | ExternDecl | IntrinsicDecl
-                     | AggregateDecl | EnumDecl | TypeAlias | ImplBlock
-
-Statement          ::= VarDecl | FunctionDecl | AggregateDecl | EnumDecl
+                     | ExternDecl | CHeaderImport | IntrinsicDecl
+                     | AggregateDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock
-                     | If | While | For | "loop" Block | Match | Switch
+
+Statement          ::= VarDecl | FunctionDecl
+                     | AggregateDecl | EnumDecl | TraitDecl
+                     | TypeAlias | ImplBlock
+                     | If | While | For | "loop" Block | DoWhile
+                     | Match | Switch
                      | "break" ";" | "continue" ";" | Return
                      | "unsafe" Block | Block | Expr ";"
 
@@ -26,17 +33,21 @@ Return             ::= "return" Expr? ";"
 
 ModuleDecl         ::= "public"? "module" ModulePath ";"
 Import             ::= "import" ImportForm ";"
-ImportForm         ::= "*" "from" ModulePath
-                     | Ident ("," Ident)* "from" ModulePath
-                     | ModulePath "as" Ident
+ImportForm         ::= ModulePath "::" "*"
                      | ModulePath "::" "{" Ident ("," Ident)* "}"
+                     | ModulePath "as" Ident
                      | ModulePath
 ModulePath         ::= Ident ("::" Ident)*
 QualName           ::= Ident ("::" Ident)*
 
-Directive          ::= "#" "[" Ident DirectiveArgs? "]"
+(*  Directives use the bang-bracket form `![name(...)]`.  The leading
+    `!` is part of a single `![` token produced by the lexer, so no
+    whitespace is permitted between `!` and `[`.                       *)
+Directive          ::= "!" "[" Ident DirectiveArgs? "]"
 DirectiveArgs      ::= "(" (DirectiveArg ("," DirectiveArg)*)? ")"
-DirectiveArg       ::= StringLit | Ident | NumLit
+DirectiveArg       ::= StringLit | Ident | NumLit | BoolLit
+                     | Ident "=" DirectiveArg
+                     | Ident "(" (DirectiveArg ("," DirectiveArg)*)? ")"
 
 
 (*  Declarations =============================================== *)
@@ -50,8 +61,16 @@ FunctionDecl       ::= Visibility? "function" Ident Generics?
 ExternDecl         ::= "extern" "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
                      | "extern" StringLit "{" ExternFn* "}"
-ExternFn           ::= "extern" "function" Ident
+ExternFn           ::= "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
+
+(*  C-header import — a named-namespace form of `extern "C"` that
+    asks the compiler to invoke clang on the listed headers and pull
+    the resulting declarations into the named namespace.            *)
+CHeaderImport      ::= Ident ":=" "extern" StringLit
+                       "{" CIncludeLine+ "}"
+CIncludeLine       ::= "#include" ( "<" /* path */ ">"
+                                  | StringLit )
 
 IntrinsicDecl      ::= "intrinsic" "function" Ident
                        "(" ParamList? ")" ("->" Type)? (Block | ";")
@@ -62,15 +81,18 @@ ParamList          ::= Param ("," Param)* ("," VariadicParam)?
 Param              ::= Ident ":" Type | "&this" | "mut" "&this"
 VariadicParam      ::= Ident ":" Type "..."
 
-WhereClause        ::= Ident ":" Ident ("," Ident ":" Ident)*
+WhereClause        ::= Ident ":" Ident ("+" Ident)*
+                       ("," Ident ":" Ident ("+" Ident)*)*
 Visibility         ::= "public" | "private" | "protected"
 
 
-(*  Aggregates (struct/class), Enums, Type Aliases ============= *)
+(*  Aggregates (struct/class), Enums, Traits, Type Aliases ===== *)
 
 (* Structs and classes share a single rule; the keyword and a few
    class-only members (constructors, destructors, virtual/override)
-   are the only differences.                                        *)
+   are the only differences.  The leading `type` keyword is the
+   canonical form (`type struct Foo { ... }`); the bare `struct Foo`
+   form is also accepted.                                            *)
 
 AggregateDecl      ::= "type"? AggregateKind Ident Generics?
                        (":" Ident)?                  (* base class  *)
@@ -82,10 +104,12 @@ Member             ::= Visibility? "static"?
 
 Field              ::= Ident ":" Type ("=" Expr)? ";"
 Method             ::= ("virtual" | "override")? Ident Generics?
-                       "(" ParamList? ")" ("->" Type)? (Block | ";")
+                       "(" ParamList? ")" ("->" Type)?
+                       ("where" WhereClause)?
+                       (Block | ";")
 Constructor        ::= Ident "(" ParamList? ")"
                        (":" Ident "(" ArgList? ")")? Block
-Destructor         ::= "~" Ident "(" ")" ("->" Type)? Block
+Destructor         ::= "~" Ident "(" ")" Block
 
 EnumDecl           ::= "type"? "enum" Ident Generics?
                        "{" (EnumVariant ("," | ";"))* "}"
@@ -93,16 +117,39 @@ EnumVariant        ::= Ident
                      | Ident "=" NumLit
                      | Ident "(" Type ("," Type)* ")"
 
+TraitDecl          ::= "type" "trait" Ident Generics?
+                       (":" TraitBound ("," TraitBound)*)?  (* super-traits *)
+                       "{" TraitMember* "}"
+TraitBound         ::= Ident GenericArgs?
+TraitMember        ::= Ident Generics?
+                       "(" ParamList? ")" ("->" Type)?
+                       ("where" WhereClause)?
+                       (Block | ";")     (* body = default impl    *)
+
 TypeAlias          ::= "type" Ident Generics? "=" Type ";"
 
 
 (*  Implementation Blocks & Generics =========================== *)
 
-ImplBlock          ::= "implement" ("enum" | "struct" | "class")?
-                       QualName GenericArgs?
+(*  Two shapes: inherent impl (no `trait ... for`) and trait impl
+    (with `trait ... for`).  Both may carry leading `<T, ...>`
+    generic parameters on the impl head, an optional kind tag
+    (`struct`/`enum`/`class`) on the target, and generic arguments
+    on the target type.                                              *)
+
+ImplBlock          ::= "implement" Generics?
+                       ( "trait" Type "for" )?
+                       ("enum" | "struct" | "class")?
+                       TargetType
                        "{" MethodImpl* "}"
-MethodImpl         ::= "static"? Ident Generics?
-                       "(" ParamList? ")" ("->" Type)? Block
+TargetType         ::= QualName GenericArgs?
+                     | Primitive
+                     | "()"                              (* unit type *)
+
+MethodImpl         ::= ("virtual" | "override")? "static"?
+                       Ident Generics?
+                       "(" ParamList? ")" ("->" Type)?
+                       ("where" WhereClause)? Block
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
 GenericParam       ::= Ident (":" Ident ("+" Ident)*)?
@@ -111,7 +158,7 @@ GenericArgs        ::= "<" Type ("," Type)* ">"
 
 (*  Expressions ================================================ *)
 
-(* Operators and their precedence/associativity are defined in §10. *)
+(* Operators and their precedence/associativity are summarised below. *)
 
 Expr               ::= Assign
 Assign             ::= Conditional (AssignOp Assign)?
@@ -130,7 +177,8 @@ UnaryOp            ::= "-" | "!" | "&" | "*" | "~" | "++" | "--"
 PostfixExpr        ::= Primary PostfixOp*
 PostfixOp          ::= "(" ArgList? ")"
                      | "[" Expr "]"
-                     | ("." | "->" | "?.") Ident
+                     | ("." | "->") Ident GenericArgs?
+                     | "::" Ident GenericArgs?
                      | "++" | "--"
 
 ArgList            ::= Expr ("," Expr)*
@@ -146,18 +194,19 @@ Primary            ::= Literal
                      | NewExpr
                      | "sizeof"  "(" Type ")"
                      | "alignof" "(" Type ")"
+                     | "typeof"  "(" Expr ")"
                      | IfExpr
                      | Match
-                     | Expr "|>" Expr
-                     | Expr "??" Expr
                      | "(" Expr ")"
 
 StructLit          ::= Ident GenericArgs?
-                       "{" Ident ":" Expr ("," Ident ":" Expr)* "}"
+                       "{" Ident ":" Expr ("," Ident ":" Expr)* ","? "}"
 ArrayLit           ::= "[" (Expr ("," Expr)*)? "]"
                      | "[" Expr ";" Expr "]"
 NewExpr            ::= "new" Type ("(" ArgList? ")")?
                      | "new" Type "[" Expr "]"
+                     | "new" Type "{" Ident ":" Expr
+                                  ("," Ident ":" Expr)* ","? "}"
 IfExpr             ::= "if" "(" Expr ")" "{" Expr "}" "else" "{" Expr "}"
 
 
@@ -167,11 +216,12 @@ If                 ::= "if" "(" Expr ")" Block
                        ("else" "if" "(" Expr ")" Block)*
                        ("else" Block)?
 While              ::= "while" "(" Expr ")" Block
+DoWhile            ::= "do" Block "while" "(" Expr ")" ";"
 For                ::= "for" "(" ForInit Expr ";" Expr ")" Block
 ForInit            ::= VarDecl | Ident ":" Type ("=" Expr)? ";"
 
 Match              ::= "match" "("? Expr ")"? "{" MatchArm* "}"
-MatchArm           ::= Pattern ("|" Pattern)* "=>" (Block | Expr)
+MatchArm           ::= Pattern ("|" Pattern)* "=>" (Block | Expr ","?)
 
 Switch             ::= "switch" "(" Expr ")" "{" CaseClause* "}"
 CaseClause         ::= ("case" Expr | "default") ":" Statement*
@@ -179,24 +229,28 @@ CaseClause         ::= ("case" Expr | "default") ":" Statement*
 
 (*  Patterns =================================================== *)
 
+(* Or-patterns are written at the arm level (see MatchArm) — a
+   single Pattern node never contains `|` itself.                  *)
+
 Pattern            ::= "_"
                      | Literal
-                     | Ident
-                     | Ident "::" Ident ("(" PatElem ("," PatElem)* ")")?
-                     | Literal ".." Literal
-PatElem            ::= Ident | "_" | Literal
+                     | Ident                              (* binding *)
+                     | QualName ("(" PatElem ("," PatElem)* ")")?  (* enum *)
+                     | Literal ".." Literal               (* range  *)
+PatElem            ::= "_" | Ident | Literal | "mut" Ident
 
 
 (*  Types & Literals =========================================== *)
 
 Type               ::= BaseType "*"+                       (* pointer *)
                      | "&" "mut"? Type                     (* reference *)
+                     | "mut" "&" Type                      (* mut-ref alt form *)
                      | BaseType ("[" NumLit? "]")+         (* array *)
-                     | "(" Type ("," Type)* ")"            (* tuple *)
+                     | "[" Type ("," Type)* "]"            (* tuple *)
                      | "(" (Type ("," Type)*)? ")" "->" Type  (* fn *)
                      | "()"                                (* unit *)
                      | BaseType
-BaseType           ::= Primitive | Ident GenericArgs?
+BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"
                      | "int"  | "i8" | "i16" | "i32" | "i64" | "i128"
                      | "uint" | "u8" | "u16" | "u32" | "u64" | "u128"
@@ -237,15 +291,27 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*   12   * / %                              left                   *)
 (*   13   as                                 left                   *)
 (*   14   - ! & * ~ ++ -- (prefix)           right                  *)
-(*   15   () [] . -> ?. ++ -- (postfix)      left                   *)
+(*   15   () [] . -> :: ++ -- (postfix)      left                   *)
 
 
 (*   Reserved Keywords =========================================    *)
 (*                                                                  *)
-(*  alignof  as       break    case      class    const             *)
-(*  continue default  else     enum      extern   false             *)
-(*  for      from     function if        implement import           *)
-(*  intrinsic loop    match    module    mut      namespace         *)
-(*  new      null     override private   protected public           *)
-(*  return   sizeof   static   struct    switch   this              *)
-(*  true     type     unsafe   virtual   void     where  while      *)
+(*  These names are reserved by the lexer and may not be used as    *)
+(*  identifiers.  Some (e.g. `from`, `async`, `await`, `yield`)     *)
+(*  are lexed but not yet wired into the parser — see § 21 of       *)
+(*  `cryo.md` for the reserved-syntax table.                        *)
+(*                                                                  *)
+(*  alignof    any        as        async     auto       await     *)
+(*  boolean    break      case      char      class      const     *)
+(*  continue   default    delete    do        double     else      *)
+(*  enum       export     extern    f32       f64        false     *)
+(*  float      for        from      function  generic    i8        *)
+(*  i16        i32        i64       i128      if         implement *)
+(*  import     in         inline    int       intrinsic  loop      *)
+(*  match      module     mut       mutable   namespace  new       *)
+(*  null       optional   override  private   protected  public    *)
+(*  return     sizeof     static    string    struct     switch    *)
+(*  this       This       trait     true      tuple      type      *)
+(*  typeof     u8         u16       u32       u64        u128      *)
+(*  uint       unsafe     unsigned  virtual   void       where     *)
+(*  while      with       yield                                    *)

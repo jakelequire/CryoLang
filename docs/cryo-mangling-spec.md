@@ -1,7 +1,7 @@
 # Cryo Name Mangling Specification
 
 **Version:** 0.2 
-**Status:** Design specification for implementation in `cryoc`
+**Status:** Implemented in `compiler/src/compiler/resolver/`
 
 ---
 
@@ -744,7 +744,7 @@ implement Demangler {
   change silently introduces a quoted-symbol regression.
 
 ### 13.4 Migration from v0.1 / Current Scheme
-The current `cryoc` mangler joins qualified names with `__` and
+The current mangler joins qualified names with `__` and
 produces names like `Compiler__AST__FunctionAnnotation`. The migration
 path:
 

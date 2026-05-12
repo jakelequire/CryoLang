@@ -178,10 +178,14 @@ type struct Executor {
     ///   <dir>/cryoconfig
     ///   <dir>/<source_dir>/main.cryo  (Hello-world boilerplate)
     ///
-    /// With no positional arg, scaffolds in CWD.  Pressing Enter at any
-    /// prompt accepts the default in brackets.
+    /// With no positional arg, scaffolds in CWD.  When `cryo init <dir>` is
+    /// passed, the directory is created and offered as the default for the
+    /// project-name prompt — pressing Enter at any prompt accepts the
+    /// default in brackets, so `cryo init hello && (echo; echo; echo)` is
+    /// effectively non-interactive.
     static cmd_init(args: ParsedArgs) -> int {
-        const target_dir: string = if (args.positional_count() > 0) {
+        const has_positional: boolean = args.positional_count() > 0;
+        const target_dir: string = if (has_positional) {
             args.input_file()
         } else {
             "."
@@ -205,7 +209,14 @@ type struct Executor {
 
         printf("Initializing Cryo project in %s\n\n", target_dir);
 
-        const name: string = Executor::prompt_required(in_stream, "Project name");
+        // When the user passed `cryo init <dir>`, offer the directory name
+        // as the default project name — `cryo init hello` + Enter at every
+        // prompt is the documented shortcut path.
+        const name: string = if (has_positional) {
+            Executor::prompt_default(in_stream, "Project name", target_dir)
+        } else {
+            Executor::prompt_required(in_stream, "Project name")
+        };
         if (strlen(name) == 0) {
             fprintf(g_stderr, "Error: project name is required\n");
             return 1;
@@ -234,7 +245,8 @@ type struct Executor {
         }
 
         const main_path: string = format("%s/main.cryo", src_path);
-        if (!Executor::write_main_cryo(main_path)) { return 1; }
+        const ns_name: string = Executor::derive_namespace(name);
+        if (!Executor::write_main_cryo(main_path, ns_name)) { return 1; }
 
         const config_path: string = format("%s/cryoconfig", target_dir);
         if (!Executor::write_cryoconfig(config_path, name, src_dir, out_dir, ttype)) { return 1; }
@@ -282,19 +294,78 @@ type struct Executor {
         return strdup(&buf[0] as string) as string;
     }
 
-    static write_main_cryo(path: string) -> boolean {
+    static write_main_cryo(path: string, ns_name: string) -> boolean {
         const f: void* = fopen(path, "w");
         if (f == null) {
             fprintf(g_stderr, "Error: cannot open %s for writing\n", path);
             return false;
         }
-        fputs("namespace Main;\n\n", f);
+        const header: string = format("namespace %s;\n\n", ns_name);
+        fputs(header, f);
         fputs("function main() -> int {\n", f);
         fputs("    printf(\"Hello, world!\\n\");\n", f);
         fputs("    return 0;\n", f);
         fputs("}\n", f);
         fclose(f);
         return true;
+    }
+
+    /// Derive a PascalCase namespace identifier from a project name.
+    ///
+    /// Examples:  `hello` → `Hello`, `my-app` → `My_app`,
+    /// `123foo` → `Foo` (leading non-letters dropped),
+    /// `--` → `Main` (no usable chars → fallback).
+    ///
+    /// The first emitted byte is always an ASCII letter; subsequent bytes
+    /// keep letters/digits/underscores and rewrite `-` / space to `_`.
+    /// Anything else is dropped.  The output compiles as-is even when the
+    /// input contains characters the Cryo parser would reject in an
+    /// identifier.
+    static derive_namespace(name: string) -> string {
+        const n: u64 = strlen(name);
+        if (n == 0) { return "Main"; }
+
+        const buf: i8* = malloc(n + 1);
+        mut j: u64 = 0;
+        for (mut i: u64 = 0; i < n; i++) {
+            const ch: i8 = name[i];
+            const is_upper: boolean = ch >= 65 && ch <= 90;
+            const is_lower: boolean = ch >= 97 && ch <= 122;
+            const is_digit: boolean = ch >= 48 && ch <= 57;
+
+            if (j == 0) {
+                // First byte: only letters allowed; lowercase gets upcased.
+                if (is_upper) {
+                    const p: i8* = ptr_add(buf as void*, j as i64) as i8*;
+                    *p = ch;
+                    j = j + 1;
+                } else if (is_lower) {
+                    const p: i8* = ptr_add(buf as void*, j as i64) as i8*;
+                    *p = (ch - 32) as i8;
+                    j = j + 1;
+                }
+                // Digits / symbols / hyphens at the start are skipped.
+            } else {
+                const p: i8* = ptr_add(buf as void*, j as i64) as i8*;
+                if (is_upper || is_lower || is_digit || ch == 95) {
+                    *p = ch;
+                    j = j + 1;
+                } else if (ch == 45 || ch == 32) {
+                    // '-' or ' ' becomes '_'.
+                    *p = 95 as i8;
+                    j = j + 1;
+                }
+                // Other bytes dropped.
+            }
+        }
+
+        if (j == 0) {
+            free(buf as void*);
+            return "Main";
+        }
+        const term: i8* = ptr_add(buf as void*, j as i64) as i8*;
+        *term = 0 as i8;
+        return buf as string;
     }
 
     static write_cryoconfig(path: string, name: string, src_dir: string,
