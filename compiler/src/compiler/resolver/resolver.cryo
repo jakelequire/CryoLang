@@ -17,6 +17,7 @@ import Compiler::Resolver::Symbol;
 import Compiler::Resolver::Scope;
 import Compiler::Resolver::ResolutionMap;
 import Compiler::Diag;
+import std::collections::pair;
 import Utils::Logger;
 
 
@@ -41,16 +42,14 @@ type struct Resolver {
     // Resolution map
     resolution_map:     ResolutionMap;
 
-    // Cross-module exports — flat parallel arrays.
+    // Cross-module exports — Pair<SymbolID, u64>[] avoids T[][] codegen issues.
     // NOTE: Cannot use SymbolID[][] or HashMap<K, SymbolID[]> — the C++
     // codegen mishandles T[] as a generic type argument (inner array
-    // descriptor is corrupted on store/load).  Flat arrays with a module
-    // key per entry avoid all generic-over-array codegen paths.
-    export_sym_ids:       SymbolID[];   // exported symbol
-    export_module_keys:   u64[];        // which module it belongs to (SymbolStr.id)
+    // descriptor is corrupted on store/load).  Pair<A,B>[] avoids all
+    // generic-over-array codegen paths.
+    exports:              Pair<SymbolID, u64>[];  // .first = exported symbol, .second = module key (SymbolStr.id)
 
-    import_alias_names:   SymbolStr[];
-    import_alias_ids:     SymbolID[];
+    import_aliases:       Pair<SymbolStr, SymbolID>[];  // .first = alias name, .second = sym_id
 
     // Current context
     current_module:     SymbolStr;
@@ -78,10 +77,8 @@ type struct Resolver {
             global_scope:         global_id,
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
-            export_sym_ids:       [],
-            export_module_keys:   [],
-            import_alias_names:   [],
-            import_alias_ids:     [],
+            exports:              [],
+            import_aliases:       [],
             current_module:       SymbolStr::empty(),
         };
     }
@@ -368,17 +365,16 @@ type struct Resolver {
 
     /// Register a symbol as exported from the current module.
     export_symbol(mut &this, sym_id: SymbolID) -> void {
-        this.export_sym_ids.push(sym_id);
-        this.export_module_keys.push(this.current_module.id as u64);
+        this.exports.push(Pair<SymbolID, u64>::new(sym_id, this.current_module.id as u64));
     }
 
     /// Get all exported symbols from a module.
     get_exports(&this, module: SymbolStr) -> SymbolID[] {
         const mod_key: u64 = module.id as u64;
         mut result: SymbolID[] = [];
-        for (mut i: i64 = 0; i < this.export_sym_ids.length; i++) {
-            if (this.export_module_keys[i] == mod_key) {
-                result.push(this.export_sym_ids[i]);
+        for (mut i: i64 = 0; i < this.exports.length; i++) {
+            if (this.exports[i].second == mod_key) {
+                result.push(this.exports[i].first);
             }
         }
         return result;
@@ -387,11 +383,11 @@ type struct Resolver {
     /// Look up a specific name in a module's exports.
     lookup_in_module(&this, module: SymbolStr, name: SymbolStr) -> SymbolID {
         const mod_key: u64 = module.id as u64;
-        for (mut i: i64 = 0; i < this.export_sym_ids.length; i++) {
-            if (this.export_module_keys[i] == mod_key) {
-                const sym: Symbol = this.get_symbol(this.export_sym_ids[i]);
+        for (mut i: i64 = 0; i < this.exports.length; i++) {
+            if (this.exports[i].second == mod_key) {
+                const sym: Symbol = this.get_symbol(this.exports[i].first);
                 if (sym.name.equals(name) && sym.visibility.is_public()) {
-                    return this.export_sym_ids[i];
+                    return this.exports[i].first;
                 }
             }
         }
@@ -400,15 +396,14 @@ type struct Resolver {
 
     /// Register an import alias (e.g., `import Foo as Bar` maps "Bar" → sym_id).
     register_import_alias(mut &this, alias: SymbolStr, sym_id: SymbolID) -> void {
-        this.import_alias_names.push(alias);
-        this.import_alias_ids.push(sym_id);
+        this.import_aliases.push(Pair<SymbolStr, SymbolID>::new(alias, sym_id));
     }
 
     /// Look up an import alias.
     lookup_import_alias(&this, alias: SymbolStr) -> SymbolID {
-        for (mut i: i64 = 0; i < this.import_alias_names.length; i++) {
-            if (this.import_alias_names[i].equals(alias)) {
-                return this.import_alias_ids[i];
+        for (mut i: i64 = 0; i < this.import_aliases.length; i++) {
+            if (this.import_aliases[i].first.equals(alias)) {
+                return this.import_aliases[i].second;
             }
         }
         return SymbolID::invalid();
@@ -575,8 +570,7 @@ type struct Resolver {
     reset_for_next_module(mut &this) -> void {
         this.current_scope = this.global_scope;
         this.current_module = SymbolStr::empty();
-        this.import_alias_names = [];
-        this.import_alias_ids = [];
+        this.import_aliases = [];
     }
 
     /// Switch to a specific module.  Creates a fresh Module scope
@@ -590,8 +584,7 @@ type struct Resolver {
         this.current_scope = this.create_scope(
             ScopeKind::Module, this.global_scope,
             mod_str, mod_str, SourceSpan::none());
-        this.import_alias_names = [];
-        this.import_alias_ids = [];
+        this.import_aliases = [];
     }
 
     /// Switch to a module and restore a previously saved scope.
@@ -603,8 +596,7 @@ type struct Resolver {
         } else {
             this.current_scope = this.global_scope;
         }
-        this.import_alias_names = [];
-        this.import_alias_ids = [];
+        this.import_aliases = [];
     }
 
     /// Get the current scope ID as a raw u64 (for saving/restoring).
@@ -623,7 +615,7 @@ type struct Resolver {
         for (mut i: i64 = 0; i < this.scopes.length; i++) {
             if (this.scopes[i].kind == ScopeKind::Module) {
                 if (strcmp(this.scopes[i].owner_name, module_name) == 0) {
-                    const count: i64 = this.scopes[i].symbol_names.length;
+                    const count: i64 = this.scopes[i].symbols.length;
                     if (count > best_count) {
                         best_count = count;
                         best_id = this.scopes[i].id.id;
@@ -649,12 +641,12 @@ type struct Resolver {
                 sym.id.id, name, sym.scope_id.id, sym.source_module);
         }
 
-        cdebug("Exports: %lld symbols\n", this.export_sym_ids.length);
+        cdebug("Exports: %lld symbols\n", this.exports.length);
 
         cdebug("Import Aliases:\n");
-        for (mut i: i64 = 0; i < this.import_alias_names.length; i++) {
-            const alias: string = this.intern_table.resolve(this.import_alias_names[i]);
-            const sym: Symbol = this.get_symbol(this.import_alias_ids[i]);
+        for (mut i: i64 = 0; i < this.import_aliases.length; i++) {
+            const alias: string = this.intern_table.resolve(this.import_aliases[i].first);
+            const sym: Symbol = this.get_symbol(this.import_aliases[i].second);
             const name: string = this.intern_table.resolve(sym.name);
             cdebug("  %s -> [%lu] %s (scope %u)\n",
                 alias, sym.id.id, name, sym.scope_id.id);

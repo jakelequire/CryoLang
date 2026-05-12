@@ -15,6 +15,7 @@ import Compiler::Diag;
 import Utils::Logger;
 
 import std::collections::hashmap;
+import std::collections::pair;
 
 
 // ============================================================================
@@ -99,17 +100,14 @@ type struct Scope {
     owner_name:      string;
     span:            SourceSpan;
 
-    // Symbols declared in this scope (parallel arrays for iteration)
-    symbol_names:    SymbolStr[];
-    symbol_ids:      SymbolID[];
+    // Symbols declared in this scope
+    symbols:         Pair<SymbolStr, SymbolID>[];
 
-    // Fast lookup index: SymbolStr.id → index in symbol_ids[]
+    // Fast lookup index: SymbolStr.id → index in symbols[]
     symbol_index:    HashMap<u32, i64>;
 
-    // Overloaded names — flat parallel arrays.
-    // NOTE: Cannot use SymbolID[][] — C++ codegen mishandles T[][].
-    overload_sym_ids:   SymbolID[];   // all overloaded symbols flat
-    overload_name_keys: u32[];        // parallel: SymbolStr.id each belongs to
+    // Overloaded names — flat array of (name_key, SymbolID) pairs.
+    overloads:       Pair<u32, SymbolID>[];
 
     // Child scopes
     child_scope_ids: ScopeID[];
@@ -132,11 +130,9 @@ type struct Scope {
             module_name:        module,
             owner_name:         owner,
             span:               span,
-            symbol_names:       [],
-            symbol_ids:         [],
+            symbols:            [],
             symbol_index:       HashMap<u32, i64>::new(),
-            overload_sym_ids:   [],
-            overload_name_keys: [],
+            overloads:          [],
             child_scope_ids:    [],
             ambig_name_ids:     [],
             ambig_module_a:     [],
@@ -150,12 +146,12 @@ type struct Scope {
         LOG_DEBUG(LogComponent::General,
             "[Scope] find('%s' id=%u) hash=%llu in scope '%s' (syms=%lld, map_len=%llu)",
             "<name>", name.id, h, this.owner_name,
-            this.symbol_ids.length, this.symbol_index.length());
+            this.symbols.length, this.symbol_index.length());
         const opt: Option<i64> = this.symbol_index.get(&name.id);
         if (opt.is_some()) {
             const idx: i64 = opt.unwrap();
             LOG_DEBUG(LogComponent::General, "[Scope] find() found at idx=%lld in scope '%s'", idx, this.owner_name);
-            return this.symbol_ids[idx];
+            return this.symbols[idx].second;
         }
         LOG_DEBUG(LogComponent::General, "[Scope] find() NOT found in scope '%s'", this.owner_name);
         return SymbolID::invalid();
@@ -176,9 +172,8 @@ type struct Scope {
             return false;
         }
 
-        const idx: i64 = this.symbol_ids.length;
-        this.symbol_names.push(name);
-        this.symbol_ids.push(sym_id);
+        const idx: i64 = this.symbols.length;
+        this.symbols.push(Pair<SymbolStr, SymbolID>::new(name, sym_id));
         this.symbol_index.insert(name.id, idx);
         return true;
     }
@@ -206,9 +201,8 @@ type struct Scope {
             return true;
         }
         // No existing entry — insert normally
-        const idx: i64 = this.symbol_ids.length;
-        this.symbol_names.push(name);
-        this.symbol_ids.push(sym_id);
+        const idx: i64 = this.symbols.length;
+        this.symbols.push(Pair<SymbolStr, SymbolID>::new(name, sym_id));
         this.symbol_index.insert(name.id, idx);
         return true;
     }
@@ -236,8 +230,7 @@ type struct Scope {
 
     /// Add a symbol to the overload set for the given name.
     add_overload(mut &this, name: SymbolStr, sym_id: SymbolID) -> void {
-        this.overload_sym_ids.push(sym_id);
-        this.overload_name_keys.push(name.id);
+        this.overloads.push(Pair<u32, SymbolID>::new(name.id, sym_id));
     }
 
     /// Get all overloads for a name (including the primary symbol).
@@ -248,13 +241,13 @@ type struct Scope {
         const h: u64 = hash_int(name.id as u64);
         const opt: Option<i64> = this.symbol_index.get(&name.id);
         if (opt.is_some()) {
-            result.push(this.symbol_ids[opt.unwrap()]);
+            result.push(this.symbols[opt.unwrap()].second);
         }
 
         // Overloaded symbols
-        for (mut i: i64 = 0; i < this.overload_sym_ids.length; i++) {
-            if (this.overload_name_keys[i] == name.id) {
-                result.push(this.overload_sym_ids[i]);
+        for (mut i: i64 = 0; i < this.overloads.length; i++) {
+            if (this.overloads[i].first == name.id) {
+                result.push(this.overloads[i].second);
             }
         }
 
