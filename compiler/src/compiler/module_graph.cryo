@@ -15,6 +15,7 @@ import Compiler::Types::Compound;
 import Compiler::Types::Arena;
 import Compiler::DeclIndex;
 import Utils::Logger;
+import std::collections::hashmap;
 
 
 // ============================================================================
@@ -126,9 +127,8 @@ type struct ModuleGraph {
     module_ast_cap: u32;         // capacity (== modules.length)
     module_sources: string[];
 
-    // Module name -> index lookup (SymbolStr.id -> module index)
-    name_index_keys: u32[];
-    name_index_vals: u32[];
+    // Module name → index lookup (SymbolStr.id → module index)
+    name_index: HashMap<u32, u32>;
 
     // Saved resolver scope per module — raw pointer to avoid array[i]=x codegen bug
     // Parallel with modules[]. 0 means "not saved yet".
@@ -153,8 +153,7 @@ type struct ModuleGraph {
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
             module_sources:   [],
-            name_index_keys:  [],
-            name_index_vals:  [],
+            name_index:       HashMap<u32, u32>::new(),
             module_scope_buf: scope_buf,
             module_scope_cap: initial_cap,
         };
@@ -163,8 +162,7 @@ type struct ModuleGraph {
     /// Register a module for compilation.
     add_module(mut &this, info: ModuleInfo) -> void {
         const idx: u32 = this.modules.length as u32;
-        this.name_index_keys.push(info.name.id);
-        this.name_index_vals.push(idx);
+        this.name_index.insert(info.name.id, idx);
         this.modules.push(info);
         this.module_sources.push(info.file_path);
 
@@ -208,12 +206,10 @@ type struct ModuleGraph {
     /// Find a module's index by its name SymbolStr.  Returns -1 if not found.
     find_module_index(&this, name: SymbolStr) -> i64 {
         const key: u32 = name.id;
-        for (mut i: i64 = 0; i < this.name_index_keys.length; i++) {
-            if (this.name_index_keys[i] == key) {
-                return this.name_index_vals[i] as i64;
-            }
-        }
-        return -1;
+        return match (this.name_index.get(&key)) {
+            Option::Some(val) => { val as i64 }
+            Option::None      => { -1 }
+        };
     }
 
     /// Find a module's index by its file path (case-insensitive).

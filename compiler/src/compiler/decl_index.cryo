@@ -27,6 +27,7 @@ import Compiler::Types::Compound;
 import Compiler::Types::Arena;
 import Compiler::Types;
 import std::collections::hashmap;
+import std::collections::pair;
 
 
 // ============================================================================
@@ -120,14 +121,12 @@ type struct DeclarationIndex {
     // Reverse: TypeRef.id → SymbolStr.id (for looking up a type's name)
     type_reverse:   HashMap<u64, u32>;
 
-    // Per-module declaration ownership (parallel arrays).
+    // Per-module declaration ownership.
     // Used by codegen to enumerate "all functions/types defined in Module X".
     // The global maps above remain the fast-path for lookup during sema;
     // these arrays are the slow-path for per-module enumeration.
-    module_func_keys:    u32[];       // SymbolStr.id of function
-    module_func_modules: u32[];       // SymbolStr.id of defining module
-    module_type_keys:    u32[];       // SymbolStr.id of type
-    module_type_modules: u32[];       // SymbolStr.id of defining module
+    module_funcs:        Pair<u32, u32>[];    // .first = SymbolStr.id of function, .second = SymbolStr.id of module
+    module_types:        Pair<u32, u32>[];    // .first = SymbolStr.id of type, .second = SymbolStr.id of module
     module_global_keys:       u32[];  // SymbolStr.id of global variable
     module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
     module_global_namespaces: u32[];  // SymbolStr.id of defining namespace (e.g.,
@@ -165,16 +164,9 @@ type struct DeclarationIndex {
     overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
     overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
 
-    // Bare-name → all qualified names ever registered for it.  Parallel
-    // arrays: `bare_alt_keys[i]` is the bare SymbolStr.id, `bare_alt_quals[i]`
-    // is one qualified name registered under that bare.  Populated by
-    // `register_name_mapping`.  Used by codegen to detect ambiguous calls
-    // through the bare-name fallback (E0154): when the same simple name
-    // backs multiple sibling-namespace free functions, dispatching via the
-    // bare overload slot is last-write-wins; the diagnostic prevents that
-    // silent misdispatch.
-    bare_alt_keys:  u32[];
-    bare_alt_quals: u32[];
+    // Bare-name → all qualified names ever registered for it.
+    // Populated by `register_name_mapping`.
+    bare_alts:           Pair<u32, u32>[];    // .first = bare SymbolStr.id, .second = qualified SymbolStr.id
 
 
     static new() -> DeclarationIndex {
@@ -186,10 +178,8 @@ type struct DeclarationIndex {
             global_vars:         HashMap<u32, TypeRef>::new(),
             type_reverse:        HashMap<u64, u32>::new(),
             array_elem_to_type:  HashMap<u64, u32>::new(),
-            module_func_keys:    [],
-            module_func_modules: [],
-            module_type_keys:    [],
-            module_type_modules: [],
+            module_funcs:        [],
+            module_types:        [],
             module_global_keys:       [],
             module_global_modules:    [],
             module_global_namespaces: [],
@@ -198,8 +188,7 @@ type struct DeclarationIndex {
             overload_func_keys:    [],
             overload_func_types:   [],
             overload_func_mangled: [],
-            bare_alt_keys:  [],
-            bare_alt_quals: [],
+            bare_alts:      [],
         };
     }
 
@@ -504,16 +493,15 @@ type struct DeclarationIndex {
             // pair was already added by a prior overload — multiple
             // overloads of the same method share one per-module entry.
             mut already_listed: boolean = false;
-            for (mut mi: i64 = 0; mi < this.module_func_keys.length; mi++) {
-                if (this.module_func_keys[mi] == combined_sym.id &&
-                    this.module_func_modules[mi] == module.id) {
+            for (mut mi: i64 = 0; mi < this.module_funcs.length; mi++) {
+                if (this.module_funcs[mi].first == combined_sym.id &&
+                    this.module_funcs[mi].second == module.id) {
                     already_listed = true;
                     break;
                 }
             }
             if (!already_listed) {
-                this.module_func_keys.push(combined_sym.id);
-                this.module_func_modules.push(module.id);
+                this.module_funcs.push(Pair<u32, u32>::new(combined_sym.id, module.id));
             }
         }
     }
@@ -587,8 +575,7 @@ type struct DeclarationIndex {
     register_function_with_module(mut &this, name: SymbolStr, return_type: TypeRef,
                                   module: SymbolStr) -> void {
         this.register_function(name, return_type);
-        this.module_func_keys.push(name.id);
-        this.module_func_modules.push(module.id);
+        this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
     }
 
     /// Register a function type with its defining module for per-module enumeration.
@@ -622,16 +609,14 @@ type struct DeclarationIndex {
         // whichever was registered last).
         this.register_overload_mangled(name, func_type_ref, mangled.value);
 
-        this.module_func_keys.push(name.id);
-        this.module_func_modules.push(module.id);
+        this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
     }
 
     /// Register a type with its defining module for per-module enumeration.
     register_type_with_module(mut &this, qualified_name: SymbolStr, ty: TypeRef,
                               module: SymbolStr) -> void {
         this.register_type(qualified_name, ty);
-        this.module_type_keys.push(qualified_name.id);
-        this.module_type_modules.push(module.id);
+        this.module_types.push(Pair<u32, u32>::new(qualified_name.id, module.id));
     }
 
 
@@ -660,14 +645,13 @@ type struct DeclarationIndex {
         this.bare_to_qualified.insert(bare.id, qualified.id);
 
         // Append to alternatives list, deduped by (bare, qualified) pair.
-        for (mut i: i64 = 0; i < this.bare_alt_keys.length; i++) {
-            if (this.bare_alt_keys[i] == bare.id &&
-                this.bare_alt_quals[i] == qualified.id) {
+        for (mut i: i64 = 0; i < this.bare_alts.length; i++) {
+            if (this.bare_alts[i].first == bare.id &&
+                this.bare_alts[i].second == qualified.id) {
                 return;
             }
         }
-        this.bare_alt_keys.push(bare.id);
-        this.bare_alt_quals.push(qualified.id);
+        this.bare_alts.push(Pair<u32, u32>::new(bare.id, qualified.id));
     }
 
     /// Resolve a bare name to its qualified form.
@@ -688,9 +672,9 @@ type struct DeclarationIndex {
     /// (ambiguous call) instead of silently misrouting.
     lookup_qualified_alternatives(&this, bare: SymbolStr) -> SymbolStr[] {
         mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.bare_alt_keys.length; i++) {
-            if (this.bare_alt_keys[i] == bare.id) {
-                result.push(SymbolStr::from_id(this.bare_alt_quals[i]));
+        for (mut i: i64 = 0; i < this.bare_alts.length; i++) {
+            if (this.bare_alts[i].first == bare.id) {
+                result.push(SymbolStr::from_id(this.bare_alts[i].second));
             }
         }
         return result;
@@ -703,9 +687,9 @@ type struct DeclarationIndex {
     /// Get all function names defined in a specific module.
     get_functions_in_module(&this, module: SymbolStr) -> SymbolStr[] {
         mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.module_func_keys.length; i++) {
-            if (this.module_func_modules[i] == module.id) {
-                result.push(SymbolStr::from_id(this.module_func_keys[i]));
+        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
+            if (this.module_funcs[i].second == module.id) {
+                result.push(SymbolStr::from_id(this.module_funcs[i].first));
             }
         }
         return result;
@@ -714,9 +698,9 @@ type struct DeclarationIndex {
     /// Get all type names defined in a specific module.
     get_types_in_module(&this, module: SymbolStr) -> SymbolStr[] {
         mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.module_type_keys.length; i++) {
-            if (this.module_type_modules[i] == module.id) {
-                result.push(SymbolStr::from_id(this.module_type_keys[i]));
+        for (mut i: i64 = 0; i < this.module_types.length; i++) {
+            if (this.module_types[i].second == module.id) {
+                result.push(SymbolStr::from_id(this.module_types[i].first));
             }
         }
         return result;
@@ -735,9 +719,9 @@ type struct DeclarationIndex {
 
     /// Check if a function is defined in a specific module.
     is_function_in_module(&this, name: SymbolStr, module: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < this.module_func_keys.length; i++) {
-            if (this.module_func_keys[i] == name.id &&
-                this.module_func_modules[i] == module.id) {
+        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
+            if (this.module_funcs[i].first == name.id &&
+                this.module_funcs[i].second == module.id) {
                 return true;
             }
         }
@@ -746,9 +730,9 @@ type struct DeclarationIndex {
 
     /// Get the defining module for a function. Returns empty SymbolStr if not found.
     get_function_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_func_keys.length; i++) {
-            if (this.module_func_keys[i] == name.id) {
-                return SymbolStr::from_id(this.module_func_modules[i]);
+        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
+            if (this.module_funcs[i].first == name.id) {
+                return SymbolStr::from_id(this.module_funcs[i].second);
             }
         }
         return SymbolStr::empty();
@@ -756,9 +740,9 @@ type struct DeclarationIndex {
 
     /// Get the defining module for a type. Returns empty SymbolStr if not found.
     get_type_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_type_keys.length; i++) {
-            if (this.module_type_keys[i] == name.id) {
-                return SymbolStr::from_id(this.module_type_modules[i]);
+        for (mut i: i64 = 0; i < this.module_types.length; i++) {
+            if (this.module_types[i].first == name.id) {
+                return SymbolStr::from_id(this.module_types[i].second);
             }
         }
         return SymbolStr::empty();
