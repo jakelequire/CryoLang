@@ -1,0 +1,140 @@
+///! Guessing game — stdin reading, randomness, and a loop.
+///!
+///! Picks a secret number between 1 and 100 (seeded from the system
+///! clock) and asks the user to guess. After each guess the program
+///! prints "higher" or "lower" until the user finds it.
+///!
+///! What this example demonstrates:
+///!   • `io::stdio::stdin()` + `Stdin::line()` — read one line of
+///!     user input, with `\n` stripped.
+///!   • `u32::from_str(s)` for parsing integer input safely.
+///!   • Calling into `ffi::libc::time` + `srand` / `rand` for
+///!     seeded pseudo-random number generation.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::io::stdio;
+import std::ffi::libc;
+
+const LOWER_BOUND: i32 = 1;
+const UPPER_BOUND: i32 = 100;
+
+// ============================================================================
+// Random number generation — thin wrappers over libc rand
+// ============================================================================
+
+function seed_rng() -> void {
+    const now: i64 = libc::time(null);
+    libc::srand(now as u32);
+}
+
+/// Return a uniformly-distributed integer in [lo, hi] inclusive.
+function rand_range(lo: i32, hi: i32) -> i32 {
+    const span: i32 = hi - lo + 1;
+    return lo + (libc::rand() % span);
+}
+
+// ============================================================================
+// One round
+// ============================================================================
+
+type enum GuessOutcome {
+    TooLow;
+    TooHigh;
+    Correct;
+    InvalidInput;
+}
+
+function classify(guess: i32, secret: i32) -> GuessOutcome {
+    if (guess < secret) { return GuessOutcome::TooLow; }
+    if (guess > secret) { return GuessOutcome::TooHigh; }
+    return GuessOutcome::Correct;
+}
+
+function read_one_guess(handle: mut &Stdin) -> Option<i32> {
+    match (handle.line()) {
+        Result::Ok(maybe_line) => {
+            match (maybe_line) {
+                Option::Some(line) => {
+                    match (i32::from_str(line.as_str())) {
+                        Result::Ok(n)  => { return Option::Some(n); }
+                        Result::Err(_) => { return Option::None; }
+                    }
+                }
+                Option::None => {
+                    // EOF — treat as "give up".
+                    intrinsics::printf("\n(stdin closed)\n");
+                    return Option::None;
+                }
+            }
+        }
+        Result::Err(_) => { return Option::None; }
+    }
+}
+
+// ============================================================================
+// Game loop
+// ============================================================================
+
+function play_round(secret: i32) -> boolean {
+    mut handle: Stdin = stdin();
+    mut attempts: i32 = 0;
+    intrinsics::printf("Guess a number between %d and %d.\n",
+                       LOWER_BOUND, UPPER_BOUND);
+
+    loop {
+        intrinsics::printf("> ");
+        // Stdout is unbuffered at this layer, but in case it is
+        // buffered up the pipe, flush before reading the reply.
+        libc::fflush(null);
+
+        match (read_one_guess(&handle)) {
+            Option::Some(guess) => {
+                attempts = attempts + 1;
+                match (classify(guess, secret)) {
+                    GuessOutcome::TooLow => {
+                        intrinsics::printf("  %d is too low.\n", guess);
+                    }
+                    GuessOutcome::TooHigh => {
+                        intrinsics::printf("  %d is too high.\n", guess);
+                    }
+                    GuessOutcome::Correct => {
+                        intrinsics::printf(
+                            "  %d is correct! Solved in %d guess%s.\n",
+                            guess,
+                            attempts,
+                            if (attempts == 1) { "" } else { "es" }
+                        );
+                        return true;
+                    }
+                    GuessOutcome::InvalidInput => { }
+                }
+            }
+            Option::None => { return false; }
+        }
+    }
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    seed_rng();
+    const secret: i32 = rand_range(LOWER_BOUND, UPPER_BOUND);
+
+    intrinsics::printf("guessing-game — pick the secret number.\n\n");
+
+    if (!play_round(secret)) {
+        intrinsics::printf("The number was %d.\n", secret);
+        return 1;
+    }
+    return 0;
+}

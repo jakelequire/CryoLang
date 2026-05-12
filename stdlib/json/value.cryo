@@ -337,11 +337,87 @@ implement enum JsonValue {
         };
     }
 
+    /// Borrow the array under `key`, or `None` if absent / not an
+    /// array. Convenience composite around `get(key)` + `as_array`.
+    get_array(&this, key: Str) -> Option<Array<JsonValue>*> {
+        match (this.get(key)) {
+            Option::Some(value_ptr) => { return value_ptr.as_array(); }
+            Option::None            => { return Option::None; }
+        }
+    }
+
+    /// Borrow the object under `key`. Convenience composite around
+    /// `get(key)` + `as_object`.
+    get_object(&this, key: Str) -> Option<JsonObject*> {
+        match (this.get(key)) {
+            Option::Some(value_ptr) => { return value_ptr.as_object(); }
+            Option::None            => { return Option::None; }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Teardown
     // ------------------------------------------------------------------
 
 }
+
+// ============================================================================
+// FromJson — trait that backs the generic `get_as_or<T>` getter.
+//
+// Each implementation says "here is how to extract a `T` from a
+// `JsonValue` borrow." Implementations return `None` when the
+// variant doesn't match (e.g. asking for `i64` from a `Bool`) or
+// when the value can't be represented as `T` without loss
+// (`UInt(u64::MAX)` requested as `i64`).
+//
+// Third-party types can implement `FromJson` to participate in
+// `get_as_or` without touching the stdlib.
+// ============================================================================
+
+type trait FromJson {
+    static from_json(value: &JsonValue) -> Option<This>;
+}
+
+implement trait FromJson for boolean {
+    static from_json(value: &JsonValue) -> Option<boolean> {
+        return value.as_bool();
+    }
+}
+
+implement trait FromJson for i64 {
+    static from_json(value: &JsonValue) -> Option<i64> {
+        return value.as_i64();
+    }
+}
+
+implement trait FromJson for u64 {
+    static from_json(value: &JsonValue) -> Option<u64> {
+        return value.as_u64();
+    }
+}
+
+implement trait FromJson for f64 {
+    static from_json(value: &JsonValue) -> Option<f64> {
+        return value.as_f64();
+    }
+}
+
+/// `Str` is a non-owning view into the JsonValue's owned `String`
+/// (or, in the `_or` form, into the fallback's bytes). Valid for
+/// the lifetime of the parent `JsonValue`.
+implement trait FromJson for Str {
+    static from_json(value: &JsonValue) -> Option<Str> {
+        return value.as_str();
+    }
+}
+
+// Note: a generic `get_or<T>(parent, key, fallback)` free function
+// would belong here, routing through `T::from_json(...)`. Today the
+// Cryo monomorphizer doesn't reliably emit generic free functions
+// from a stdlib module when the only call sites are in a downstream
+// project; until that lands, callers define a one-liner local helper
+// alongside their own code (see `examples/09-json-config/src/main.cryo`
+// for the pattern).
 
 /// Recursively drop every value, then the keys, then the index.
 /// `Array<T>::drop` and `HashMap<K, V>::drop` walk their elements when

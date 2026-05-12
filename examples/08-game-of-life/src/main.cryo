@@ -1,0 +1,284 @@
+///! Conway's Game of Life — 2D simulation on a torus.
+///!
+///! Demonstrates direct buffer management for a fixed-size grid:
+///!
+///!   • Allocator-backed `Array<u8>` for the cell buffers — one for
+///!     the current generation, one for the next.
+///!   • Index arithmetic `row * width + col` to flatten 2D coords.
+///!   • Torus boundary conditions via modular arithmetic so gliders
+///!     wrap.
+///!   • A handful of classic patterns seeded by name (glider, blinker,
+///!     toad, pulsar) so the demo has something interesting to show.
+///!
+///! The default is a 30x12 board, 24 generations.  Pass two args to
+///! pick a pattern and a generation count:  `cryo run -- glider 40`.
+///!
+///! Run with:  cryo run
+///!     or:    cryo run -- pulsar 16
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::env;
+import std::ffi::libc;
+
+// ============================================================================
+// Grid
+// ============================================================================
+
+type struct Grid {
+    width: u32;
+    height: u32;
+    cells: Array<u8>;     // 0 = dead, 1 = alive
+
+    static new(width: u32, height: u32) -> Grid {
+        const total: u64 = width as u64 * height as u64;
+        mut cells: Array<u8> = Array::with_capacity(total);
+        mut i: u64 = 0;
+        while (i < total) { cells.push(0); i = i + 1; }
+        return Grid { width: width, height: height, cells: cells };
+    }
+
+    index(&this, row: i32, col: i32) -> u64 {
+        // Wrap to a torus: negative or overflow indices map back
+        // into [0, width) / [0, height).
+        const h: i32 = this.height as i32;
+        const w: i32 = this.width as i32;
+        const r: i32 = ((row % h) + h) % h;
+        const c: i32 = ((col % w) + w) % w;
+        return (r as u64) * (this.width as u64) + (c as u64);
+    }
+
+    get(&this, row: i32, col: i32) -> u8 {
+        match (this.cells.get(this.index(row, col))) {
+            Option::Some(byte) => { return byte; }
+            Option::None       => { return 0; }
+        }
+    }
+
+    set(mut &this, row: i32, col: i32, value: u8) -> void {
+        const idx: u64 = this.index(row, col);
+        const slot: u8* = this.cells.as_ptr();
+        slot[idx] = value;
+    }
+
+    /// Count the live neighbours of (row, col). Excludes the center.
+    live_neighbours(&this, row: i32, col: i32) -> u8 {
+        mut total: u8 = 0;
+        mut dr: i32 = -1;
+        while (dr <= 1) {
+            mut dc: i32 = -1;
+            while (dc <= 1) {
+                if (!(dr == 0 && dc == 0)) {
+                    total = total + this.get(row + dr, col + dc);
+                }
+                dc = dc + 1;
+            }
+            dr = dr + 1;
+        }
+        return total;
+    }
+}
+
+implement trait Drop for struct Grid {
+    drop(mut &this) -> void {
+        this.cells.drop();
+    }
+}
+
+// ============================================================================
+// Step + render
+// ============================================================================
+
+/// Apply the rules of Life: a live cell with 2 or 3 live neighbours
+/// stays alive; a dead cell with exactly 3 live neighbours is born;
+/// everything else dies or remains dead.
+function step(current: &Grid, next: mut &Grid) -> void {
+    const h: i32 = current.height as i32;
+    const w: i32 = current.width as i32;
+    mut row: i32 = 0;
+    while (row < h) {
+        mut col: i32 = 0;
+        while (col < w) {
+            const alive: u8 = current.get(row, col);
+            const n: u8 = current.live_neighbours(row, col);
+            mut new_state: u8 = 0;
+            if (alive == 1) {
+                if (n == 2 || n == 3) { new_state = 1; }
+            } else {
+                if (n == 3) { new_state = 1; }
+            }
+            next.set(row, col, new_state);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+function render(grid: &Grid, generation: u32) -> void {
+    intrinsics::printf("\x1b[H\x1b[2J");  // clear screen
+    intrinsics::printf("Game of Life — generation %u\n", generation);
+    mut row: i32 = 0;
+    const h: i32 = grid.height as i32;
+    const w: i32 = grid.width as i32;
+    while (row < h) {
+        mut col: i32 = 0;
+        while (col < w) {
+            if (grid.get(row, col) == 1) {
+                intrinsics::printf("\xe2\x96\x88");   // U+2588 FULL BLOCK
+            } else {
+                intrinsics::printf(" ");
+            }
+            col = col + 1;
+        }
+        intrinsics::printf("\n");
+        row = row + 1;
+    }
+}
+
+// ============================================================================
+// Seed patterns
+// ============================================================================
+
+function seed_glider(grid: mut &Grid, row: i32, col: i32) -> void {
+    grid.set(row,     col + 1, 1);
+    grid.set(row + 1, col + 2, 1);
+    grid.set(row + 2, col,     1);
+    grid.set(row + 2, col + 1, 1);
+    grid.set(row + 2, col + 2, 1);
+}
+
+function seed_blinker(grid: mut &Grid, row: i32, col: i32) -> void {
+    grid.set(row, col,     1);
+    grid.set(row, col + 1, 1);
+    grid.set(row, col + 2, 1);
+}
+
+function seed_toad(grid: mut &Grid, row: i32, col: i32) -> void {
+    grid.set(row,     col + 1, 1);
+    grid.set(row,     col + 2, 1);
+    grid.set(row,     col + 3, 1);
+    grid.set(row + 1, col,     1);
+    grid.set(row + 1, col + 1, 1);
+    grid.set(row + 1, col + 2, 1);
+}
+
+function seed_pulsar(grid: mut &Grid, row: i32, col: i32) -> void {
+    // The classic period-3 pulsar oscillator — 13x13 bounding box,
+    // four mirrored triples of cells per quadrant. Coordinates are
+    // dr/dc offsets from `row`/`col`.
+    mut dr: i32[3]; dr[0] = 0; dr[1] = 5; dr[2] = 6;
+    mut dc: i32[3]; dc[0] = 2; dc[1] = 3; dc[2] = 4;
+    mut i: u64 = 0;
+    while (i < 3) {
+        mut j: u64 = 0;
+        while (j < 3) {
+            const r1: i32 = dr[i];
+            const c1: i32 = dc[j];
+            // Mirror across both axes for full pulsar symmetry.
+            grid.set(row + r1,      col + c1,      1);
+            grid.set(row + r1,      col + 12 - c1, 1);
+            grid.set(row + 12 - r1, col + c1,      1);
+            grid.set(row + 12 - r1, col + 12 - c1, 1);
+            // Also swap row/col axes for the perpendicular set.
+            grid.set(row + c1,      col + r1,      1);
+            grid.set(row + c1,      col + 12 - r1, 1);
+            grid.set(row + 12 - c1, col + r1,      1);
+            grid.set(row + 12 - c1, col + 12 - r1, 1);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+function apply_seed(grid: mut &Grid, pattern: string) -> void {
+    const view: Str = Str::new(pattern);
+    if (view.equals(&Str::new("glider"))) {
+        seed_glider(grid, 1, 1);
+    } else if (view.equals(&Str::new("blinker"))) {
+        seed_blinker(grid, grid.height as i32 / 2, grid.width as i32 / 2 - 1);
+    } else if (view.equals(&Str::new("toad"))) {
+        seed_toad(grid, grid.height as i32 / 2, grid.width as i32 / 2 - 2);
+    } else if (view.equals(&Str::new("pulsar"))) {
+        seed_pulsar(grid, 0, 0);
+    } else {
+        // Default — sprinkle a couple of patterns so something
+        // interesting happens.
+        seed_glider(grid, 1, 1);
+        seed_blinker(grid, grid.height as i32 - 3, grid.width as i32 - 5);
+        seed_toad(grid, grid.height as i32 / 2, 4);
+    }
+}
+
+// ============================================================================
+// Argument parsing
+// ============================================================================
+
+function parse_args(args: &Array<String>, pattern_buf: mut &Array<u8>, gens: mut &u32) -> void {
+    if (args.length() >= 2) {
+        match (args.get(1)) {
+            Option::Some(v) => {
+                pattern_buf.push_slice(v.as_bytes());
+            }
+            Option::None => { }
+        }
+    }
+    if (args.length() >= 3) {
+        match (args.get(2)) {
+            Option::Some(v) => {
+                match (u32::from_str(v.as_str())) {
+                    Result::Ok(n) => { *gens = n; }
+                    Result::Err(_) => { }
+                }
+            }
+            Option::None => { }
+        }
+    }
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    const WIDTH: u32  = 30;
+    const HEIGHT: u32 = 12;
+
+    mut args: Array<String> = env::args();
+    mut pattern_buf: Array<u8> = Array::new();
+    mut gens: u32 = 24;
+    parse_args(&args, &pattern_buf, &gens);
+    args.drop();
+
+    // Resolve the pattern name (may be empty → default).
+    pattern_buf.push(0);  // NUL-terminate so we can pass it as `string`.
+    const pattern_name: string = pattern_buf.as_ptr() as string;
+
+    mut current: Grid = Grid::new(WIDTH, HEIGHT);
+    mut next:    Grid = Grid::new(WIDTH, HEIGHT);
+    apply_seed(&current, pattern_name);
+
+    mut g: u32 = 0;
+    while (g <= gens) {
+        render(&current, g);
+        step(&current, &next);
+        // Swap the two grids by swapping their cell buffers.
+        const tmp_cells: Array<u8> = current.cells;
+        current.cells = next.cells;
+        next.cells    = tmp_cells;
+        g = g + 1;
+        // Brief pause so the animation is visible. 60ms ≈ 16 fps.
+        libc::usleep(60000);
+    }
+
+    pattern_buf.drop();
+    current.drop();
+    next.drop();
+    return 0;
+}

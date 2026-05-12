@@ -1,0 +1,217 @@
+///! Todo list — `Array<T>` of owned structs, with `Option`-based lookup.
+///!
+///! Drives a tiny in-memory todo list through `add`, `complete`, and
+///! `remove` operations. The whole thing is a single batch — no stdin
+///! loop — so the example stays focused on:
+///!
+///!   • `Array<Todo>` ownership: when an item is removed, its `String`
+///!     fields drop with it; when the whole list drops at the end, so
+///!     does every remaining item.
+///!   • `Status` as a unit enum used in display formatting.
+///!   • `Option<u64>` for "find item by id" lookups — the result is
+///!     `None` when the id doesn't exist.
+///!   • `implement trait Drop for struct ...` — the bound `Array<T>`
+///!     needs in order to release its elements.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::drop;
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+
+// ============================================================================
+// Status — unit enum, trivially Drop
+// ============================================================================
+
+type enum Status {
+    Pending;
+    Done;
+}
+
+implement trait Drop for enum Status {
+    drop(mut &this) -> void { }
+}
+
+function status_marker(s: Status) -> string {
+    match (s) {
+        Status::Pending => { return "[ ]"; }
+        Status::Done    => { return "[x]"; }
+    }
+}
+
+// ============================================================================
+// Todo — owns its description String
+// ============================================================================
+
+type struct Todo {
+    id: u32;
+    description: String;
+    status: Status;
+
+    static new(id: u32, description: Str) -> Todo {
+        return Todo {
+            id: id,
+            description: String::from_str(description),
+            status: Status::Pending
+        };
+    }
+}
+
+implement trait Drop for struct Todo {
+    drop(mut &this) -> void {
+        this.description.drop();
+    }
+}
+
+// ============================================================================
+// TodoList — small wrapper that keeps id allocation honest
+// ============================================================================
+
+type struct TodoList {
+    items: Array<Todo>;
+    next_id: u32;
+
+    static new() -> TodoList {
+        return TodoList {
+            items: Array::new(),
+            next_id: 1
+        };
+    }
+
+    add(mut &this, description: Str) -> u32 {
+        const id: u32 = this.next_id;
+        this.next_id = this.next_id + 1;
+        this.items.push(Todo::new(id, description));
+        return id;
+    }
+
+    /// Find the array index of a todo by its id, or `None` if no
+    /// item matches. Linear scan — fine for a demo list.
+    find_index(&this, id: u32) -> Option<u64> {
+        const n: u64 = this.items.length();
+        mut i: u64 = 0;
+        while (i < n) {
+            match (this.items.get(i)) {
+                Option::Some(item) => {
+                    if (item.id == id) { return Option::Some(i); }
+                }
+                Option::None => { }
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// Flip status to Done. We can't pop-and-rebuild without
+    /// duplicating the description pointer, which would double-free
+    /// at drop time — so we mutate the array slot in place via its
+    /// raw pointer.
+    complete(mut &this, id: u32) -> boolean {
+        match (this.find_index(id)) {
+            Option::Some(index) => {
+                const slot: Todo* = this.items.as_ptr();
+                slot[index].status = Status::Done;
+                return true;
+            }
+            Option::None => { return false; }
+        }
+    }
+
+    remove(mut &this, id: u32) -> boolean {
+        match (this.find_index(id)) {
+            Option::Some(index) => {
+                mut victim: Todo = this.items.swap_remove(index);
+                victim.drop();
+                return true;
+            }
+            Option::None => { return false; }
+        }
+    }
+
+    length(&this) -> u64 {
+        return this.items.length();
+    }
+
+    /// Display the list in id-ascending order. Because `swap_remove`
+    /// reorders the backing array, we walk the id range rather than
+    /// relying on insertion order.
+    show(&this) -> void {
+        if (this.items.length() == 0) {
+            intrinsics::printf("  (empty)\n");
+            return;
+        }
+        mut id: u32 = 1;
+        while (id < this.next_id) {
+            match (this.find_index(id)) {
+                Option::Some(idx) => {
+                    match (this.items.get(idx)) {
+                        Option::Some(item) => {
+                            intrinsics::printf(
+                                "  #%-2u %s %.*s\n",
+                                item.id,
+                                status_marker(item.status),
+                                item.description.length() as i32,
+                                item.description.as_ptr()
+                            );
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+            id = id + 1;
+        }
+    }
+}
+
+implement trait Drop for struct TodoList {
+    drop(mut &this) -> void {
+        // `Array<Todo>::drop` walks the live prefix and calls
+        // `Todo::drop` on each element, so we just hand off.
+        this.items.drop();
+    }
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    intrinsics::printf("todo-cli — in-memory task list demo.\n\n");
+
+    mut list: TodoList = TodoList::new();
+
+    const id_a: u32 = list.add(Str::new("write Cryo examples"));
+    const id_b: u32 = list.add(Str::new("review pull requests"));
+    const id_c: u32 = list.add(Str::new("buy groceries"));
+    list.add(Str::new("clean the keyboard"));
+
+    intrinsics::printf("After adding four items:\n");
+    list.show();
+
+    intrinsics::printf("\nMarking #%u and #%u complete...\n", id_a, id_c);
+    list.complete(id_a);
+    list.complete(id_c);
+    list.show();
+
+    intrinsics::printf("\nRemoving #%u...\n", id_b);
+    list.remove(id_b);
+    list.show();
+
+    const removed_missing: boolean = list.remove(999);
+    if (removed_missing) {
+        intrinsics::printf("\nRemoving #999 returned true (unexpected!)\n");
+    } else {
+        intrinsics::printf("\nRemoving #999 returned false (id not found).\n");
+    }
+    intrinsics::printf("Final count: %lu item(s).\n", list.length());
+
+    list.drop();
+    return 0;
+}

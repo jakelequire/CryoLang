@@ -1,0 +1,439 @@
+///! Expression interpreter — lexer + recursive-descent parser + evaluator.
+///!
+///! Handles infix arithmetic with `+ - * /`, parenthesized grouping,
+///! unary minus, and integer literals.  The pipeline:
+///!
+///!   bytes  ──lex──▶  Token[]  ──parse──▶  Expr  ──eval──▶  i64
+///!
+///! What this example shows off:
+///!   • `type enum Token` and `type enum Expr` with payloaded variants —
+///!     the canonical "tagged union" pattern.
+///!   • Recursive `Box<Expr>` to express the nested AST shape — the
+///!     prelude makes `Box<T>` visible without an explicit import.
+///!   • Recursive-descent parsing implemented on a small `Parser`
+///!     struct.
+///!   • Result-typed errors (`InterpError`) that carry the offending
+///!     position so messages can point at the right column.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::collections::str;
+import std::collections::array;
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+type enum InterpError {
+    UnexpectedChar(u32);
+    UnexpectedToken(u32);
+    UnexpectedEnd;
+    DivisionByZero;
+}
+
+function describe(e: InterpError) -> string {
+    match (e) {
+        InterpError::UnexpectedChar(_)  => { return "unexpected character"; }
+        InterpError::UnexpectedToken(_) => { return "unexpected token"; }
+        InterpError::UnexpectedEnd      => { return "unexpected end of input"; }
+        InterpError::DivisionByZero     => { return "division by zero"; }
+    }
+}
+
+function error_position(e: InterpError) -> i32 {
+    match (e) {
+        InterpError::UnexpectedChar(p)  => { return p as i32; }
+        InterpError::UnexpectedToken(p) => { return p as i32; }
+        _                                => { return -1; }
+    }
+}
+
+// ============================================================================
+// Tokens
+// ============================================================================
+
+type enum Token {
+    Number(i64);
+    Plus;
+    Minus;
+    Star;
+    Slash;
+    LeftParen;
+    RightParen;
+    Eof;
+}
+
+implement trait Drop for enum Token {
+    drop(mut &this) -> void { }
+}
+
+// ============================================================================
+// Lexer
+// ============================================================================
+
+function is_digit(b: u8) -> boolean {
+    return b >= 0x30 && b <= 0x39;
+}
+
+function is_space(b: u8) -> boolean {
+    return b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D;
+}
+
+/// Tokenize `source` into a stream that always ends in `Token::Eof`.
+/// Unknown bytes surface as `UnexpectedChar`.
+function lex(source: Str) -> Result<Array<Token>, InterpError> {
+    mut out: Array<Token> = Array::new();
+    const n: u64 = source.length();
+    mut i: u64 = 0;
+
+    while (i < n) {
+        match (source.byte_at(i)) {
+            Option::Some(b) => {
+                if (is_space(b)) { i = i + 1; continue; }
+                if (is_digit(b)) {
+                    // Walk a number, accumulating into an i64.
+                    mut value: i64 = 0;
+                    while (i < n) {
+                        match (source.byte_at(i)) {
+                            Option::Some(d) => {
+                                if (!is_digit(d)) { break; }
+                                value = value * 10 + (d - 0x30) as i64;
+                                i = i + 1;
+                            }
+                            Option::None => { break; }
+                        }
+                    }
+                    out.push(Token::Number(value));
+                    continue;
+                }
+                if (b == 0x2B) { out.push(Token::Plus);       i = i + 1; continue; }
+                if (b == 0x2D) { out.push(Token::Minus);      i = i + 1; continue; }
+                if (b == 0x2A) { out.push(Token::Star);       i = i + 1; continue; }
+                if (b == 0x2F) { out.push(Token::Slash);      i = i + 1; continue; }
+                if (b == 0x28) { out.push(Token::LeftParen);  i = i + 1; continue; }
+                if (b == 0x29) { out.push(Token::RightParen); i = i + 1; continue; }
+                out.drop();
+                return Result::Err(InterpError::UnexpectedChar(i as u32));
+            }
+            Option::None => { break; }
+        }
+    }
+    out.push(Token::Eof);
+    return Result::Ok(out);
+}
+
+// ============================================================================
+// AST
+// ============================================================================
+
+type enum Expr {
+    Lit(i64);
+    Neg(Box<Expr>);
+    Add(Box<Expr>, Box<Expr>);
+    Sub(Box<Expr>, Box<Expr>);
+    Mul(Box<Expr>, Box<Expr>);
+    Div(Box<Expr>, Box<Expr>);
+}
+
+implement trait Drop for enum Expr {
+    drop(mut &this) -> void {
+        // `Box<T>::drop` releases the heap cell. Match destructures
+        // the variants so each Box is dropped exactly once.
+        match (&this) {
+            Expr::Lit(_)       => { }
+            Expr::Neg(mut e)   => { e.drop(); }
+            Expr::Add(mut l, mut r) => { l.drop(); r.drop(); }
+            Expr::Sub(mut l, mut r) => { l.drop(); r.drop(); }
+            Expr::Mul(mut l, mut r) => { l.drop(); r.drop(); }
+            Expr::Div(mut l, mut r) => { l.drop(); r.drop(); }
+        }
+    }
+}
+
+// ============================================================================
+// Parser (recursive descent)
+//
+//   expr   := term (('+' | '-') term)*
+//   term   := factor (('*' | '/') factor)*
+//   factor := '-' factor
+//          |  '(' expr ')'
+//          |  NUMBER
+// ============================================================================
+
+type struct Parser {
+    tokens: Array<Token>;
+    pos: u64;
+
+    static new(tokens: Array<Token>) -> Parser {
+        return Parser { tokens: tokens, pos: 0 };
+    }
+
+    peek(&this) -> Token {
+        match (this.tokens.get(this.pos)) {
+            Option::Some(t) => { return t; }
+            Option::None    => { return Token::Eof; }
+        }
+    }
+
+    advance(mut &this) -> Token {
+        const t: Token = this.peek();
+        this.pos = this.pos + 1;
+        return t;
+    }
+}
+
+implement trait Drop for struct Parser {
+    drop(mut &this) -> void {
+        this.tokens.drop();
+    }
+}
+
+function parse_expr(p: mut &Parser) -> Result<Expr, InterpError> {
+    match (parse_term(p)) {
+        Result::Ok(left_value) => {
+            mut left: Expr = left_value;
+            loop {
+                const t: Token = p.peek();
+                match (t) {
+                    Token::Plus => {
+                        p.advance();
+                        match (parse_term(p)) {
+                            Result::Ok(right) => {
+                                left = Expr::Add(Box::new(left), Box::new(right));
+                            }
+                            Result::Err(e) => { left.drop(); return Result::Err(e); }
+                        }
+                    }
+                    Token::Minus => {
+                        p.advance();
+                        match (parse_term(p)) {
+                            Result::Ok(right) => {
+                                left = Expr::Sub(Box::new(left), Box::new(right));
+                            }
+                            Result::Err(e) => { left.drop(); return Result::Err(e); }
+                        }
+                    }
+                    _ => { return Result::Ok(left); }
+                }
+            }
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+function parse_term(p: mut &Parser) -> Result<Expr, InterpError> {
+    match (parse_factor(p)) {
+        Result::Ok(left_value) => {
+            mut left: Expr = left_value;
+            loop {
+                const t: Token = p.peek();
+                match (t) {
+                    Token::Star => {
+                        p.advance();
+                        match (parse_factor(p)) {
+                            Result::Ok(right) => {
+                                left = Expr::Mul(Box::new(left), Box::new(right));
+                            }
+                            Result::Err(e) => { left.drop(); return Result::Err(e); }
+                        }
+                    }
+                    Token::Slash => {
+                        p.advance();
+                        match (parse_factor(p)) {
+                            Result::Ok(right) => {
+                                left = Expr::Div(Box::new(left), Box::new(right));
+                            }
+                            Result::Err(e) => { left.drop(); return Result::Err(e); }
+                        }
+                    }
+                    _ => { return Result::Ok(left); }
+                }
+            }
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+function parse_factor(p: mut &Parser) -> Result<Expr, InterpError> {
+    const t: Token = p.peek();
+    match (t) {
+        Token::Minus => {
+            const start: u64 = p.pos;
+            p.advance();
+            match (parse_factor(p)) {
+                Result::Ok(inner) => {
+                    return Result::Ok(Expr::Neg(Box::new(inner)));
+                }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Token::LeftParen => {
+            p.advance();
+            match (parse_expr(p)) {
+                Result::Ok(expr_value) => {
+                    mut expr: Expr = expr_value;
+                    const closing: Token = p.advance();
+                    match (closing) {
+                        Token::RightParen => { return Result::Ok(expr); }
+                        _ => {
+                            expr.drop();
+                            return Result::Err(InterpError::UnexpectedToken(p.pos as u32));
+                        }
+                    }
+                }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Token::Number(n) => {
+            p.advance();
+            return Result::Ok(Expr::Lit(n));
+        }
+        Token::Eof => {
+            return Result::Err(InterpError::UnexpectedEnd);
+        }
+        _ => {
+            return Result::Err(InterpError::UnexpectedToken(p.pos as u32));
+        }
+    }
+}
+
+// ============================================================================
+// Evaluator
+// ============================================================================
+
+function eval(e: Expr*) -> Result<i64, InterpError> {
+    match (e) {
+        Expr::Lit(n) => { return Result::Ok(n); }
+        Expr::Neg(inner) => {
+            match (eval(inner.as_ptr())) {
+                Result::Ok(v) => { return Result::Ok(-v); }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        Expr::Add(l, r) => {
+            match (eval(l.as_ptr())) {
+                Result::Ok(lv) => {
+                    match (eval(r.as_ptr())) {
+                        Result::Ok(rv) => { return Result::Ok(lv + rv); }
+                        Result::Err(err) => { return Result::Err(err); }
+                    }
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        Expr::Sub(l, r) => {
+            match (eval(l.as_ptr())) {
+                Result::Ok(lv) => {
+                    match (eval(r.as_ptr())) {
+                        Result::Ok(rv) => { return Result::Ok(lv - rv); }
+                        Result::Err(err) => { return Result::Err(err); }
+                    }
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        Expr::Mul(l, r) => {
+            match (eval(l.as_ptr())) {
+                Result::Ok(lv) => {
+                    match (eval(r.as_ptr())) {
+                        Result::Ok(rv) => { return Result::Ok(lv * rv); }
+                        Result::Err(err) => { return Result::Err(err); }
+                    }
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+        Expr::Div(l, r) => {
+            match (eval(l.as_ptr())) {
+                Result::Ok(lv) => {
+                    match (eval(r.as_ptr())) {
+                        Result::Ok(rv) => {
+                            if (rv == 0) {
+                                return Result::Err(InterpError::DivisionByZero);
+                            }
+                            return Result::Ok(lv / rv);
+                        }
+                        Result::Err(err) => { return Result::Err(err); }
+                    }
+                }
+                Result::Err(err) => { return Result::Err(err); }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Driver
+// ============================================================================
+
+function run_one(source: string) -> void {
+    const view: Str = Str::new(source);
+
+    match (lex(view)) {
+        Result::Ok(tokens_value) => {
+            mut parser: Parser = Parser::new(tokens_value);
+            match (parse_expr(&parser)) {
+                Result::Ok(expr_value) => {
+                    mut expr: Expr = expr_value;
+                    // After parse_expr returns, the next token should be Eof.
+                    const trailing: Token = parser.peek();
+                    match (trailing) {
+                        Token::Eof => {
+                            match (eval(&expr as Expr*)) {
+                                Result::Ok(value) => {
+                                    intrinsics::printf("  %-30s = %ld\n", source, value);
+                                }
+                                Result::Err(e) => {
+                                    intrinsics::printf("  %-30s ! %s\n", source, describe(e));
+                                }
+                            }
+                        }
+                        _ => {
+                            intrinsics::printf("  %-30s ! trailing tokens\n", source);
+                        }
+                    }
+                    expr.drop();
+                }
+                Result::Err(e) => {
+                    const col: i32 = error_position(e);
+                    if (col >= 0) {
+                        intrinsics::printf("  %-30s ! %s near token %d\n",
+                                           source, describe(e), col);
+                    } else {
+                        intrinsics::printf("  %-30s ! %s\n", source, describe(e));
+                    }
+                }
+            }
+            parser.drop();
+        }
+        Result::Err(e) => {
+            const col: i32 = error_position(e);
+            intrinsics::printf("  %-30s ! %s at byte %d\n", source, describe(e), col);
+        }
+    }
+}
+
+function main() -> int {
+    intrinsics::printf("expr-interpreter — recursive descent over arithmetic.\n\n");
+
+    run_one("1 + 2");
+    run_one("3 + 4 * 5");          // 23 (precedence)
+    run_one("(3 + 4) * 5");        // 35
+    run_one("100 - 6 * 7");        // 58
+    run_one("- 8");                // -8 (unary)
+    run_one("-3 + -4");            // -7
+    run_one("2 * (3 + 4) - 1");    // 13
+    run_one("1000 / (10 - 5)");    // 200
+    run_one("48 / 6 / 2");         // 4 (left-assoc)
+    run_one("8 / 0");              // DivisionByZero
+    run_one("1 + ");               // UnexpectedEnd
+    run_one("3 + (4 * 2");         // missing )
+    run_one("@");                  // UnexpectedChar
+    return 0;
+}

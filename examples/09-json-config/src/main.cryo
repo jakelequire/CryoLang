@@ -1,0 +1,252 @@
+///! JSON config — `std::json` parsing with a generic `FromJson` getter.
+///!
+///! Loads `data/server.json`, parses it into a `JsonValue`, and walks
+///! the tree to extract a small set of fields into a strongly-typed
+///! `ServerConfig`.
+///!
+///! What this example demonstrates:
+///!   • `json::parse(Str)` returns `Result<JsonValue, JsonError>`.
+///!   • `std::json::value::FromJson` — a trait the stdlib implements
+///!     for `boolean`, `i64`, `u64`, `f64`, and `Str`. Third-party
+///!     types can implement it to slot into the same machinery.
+///!   • A single generic `get_or<T>` / `get_or_in<T>` helper —
+///!     defined locally because Cryo's monomorphizer doesn't yet
+///!     emit cross-module generic free functions from stdlib — that
+///!     replaces the per-scalar `read_string_field` / `read_bool_field`
+///!     / `read_u64_field` ladder with one call site shape:
+///!         get_or(&root, key, fallback)              -> T
+///!         get_or_in(&server, key, fallback)         -> T
+///!     `T` is inferred from `fallback`.
+///!   • Walking a JSON array of strings via `get_array` + raw indexing.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::collections::hashmap;
+import std::fs::path;
+import std::fs::file;
+import std::io::error;
+import std::json;
+import std::json::value;
+import std::json::parser;
+
+// ============================================================================
+// The typed shape we want
+// ============================================================================
+
+type struct ServerConfig {
+    service: String;
+    host: String;
+    port: u16;
+    tls: boolean;
+    max_connections: u32;
+    timeout_seconds: u32;
+    features: Array<String>;
+}
+
+implement trait Drop for struct ServerConfig {
+    drop(mut &this) -> void {
+        this.service.drop();
+        this.host.drop();
+        this.features.drop();
+    }
+}
+
+// ============================================================================
+// Generic getters — one helper covers every scalar/Str field type.
+//
+// Both call `T::from_json(value_ptr)` where the substituter rewrites
+// `T` to a concrete impl (`boolean::from_json`, `u64::from_json`,
+// `Str::from_json`, ...) at monomorphization time. The `FromJson`
+// trait + its primitive impls live in `std::json::value`.
+// ============================================================================
+
+function get_or<T>(parent: &JsonValue, key: Str, fallback: T) -> T
+where T: FromJson {
+    match (parent.get(key)) {
+        Option::Some(value_ptr) => {
+            return T::from_json(value_ptr).unwrap_or(fallback);
+        }
+        Option::None => { return fallback; }
+    }
+}
+
+function get_or_in<T>(parent: &JsonObject, key: Str, fallback: T) -> T
+where T: FromJson {
+    match (parent.get(key)) {
+        Option::Some(value_ptr) => {
+            return T::from_json(value_ptr).unwrap_or(fallback);
+        }
+        Option::None => { return fallback; }
+    }
+}
+
+// ============================================================================
+// Read an array of strings into an owned `Array<String>`. Returns an
+// empty array if `key` is missing or not a string array.
+// ============================================================================
+
+function read_string_array(parent: &JsonValue, key: Str) -> Array<String> {
+    mut out: Array<String> = Array::new();
+    match (parent.get_array(key)) {
+        Option::Some(arr_ptr) => {
+            const n: u64 = arr_ptr.length();
+            mut i: u64 = 0;
+            while (i < n) {
+                // Index straight into the underlying T* — `Array::get`
+                // would copy the JsonValue and double-free at scope
+                // exit on owning variants.
+                const element_ptr: JsonValue* = &arr_ptr.ptr[i];
+                match (element_ptr.as_str()) {
+                    Option::Some(view) => {
+                        out.push(String::from_str(view));
+                    }
+                    Option::None => { }
+                }
+                i = i + 1;
+            }
+        }
+        Option::None => { }
+    }
+    return out;
+}
+
+// ============================================================================
+// Build the typed config from the parsed value
+// ============================================================================
+
+function build_config(root: &JsonValue) -> ServerConfig {
+    // Top-level scalar — one line. `T` is inferred from the
+    // fallback's type (here, `Str`).
+    mut service: String = String::from_str(
+        get_or(root, Str::new("service"), Str::new("unknown"))
+    );
+
+    // Nested `server` block — descend once, then read fields off
+    // the borrowed JsonObject via `get_or_in`.
+    mut host: String;
+    mut port: u16;
+    mut tls:  boolean;
+    match (root.get_object(Str::new("server"))) {
+        Option::Some(server) => {
+            host = String::from_str(
+                get_or_in(server, Str::new("host"), Str::new("127.0.0.1"))
+            );
+            port = get_or_in(server, Str::new("port"), 8080 as u64) as u16;
+            tls  = get_or_in(server, Str::new("tls"), false);
+        }
+        Option::None => {
+            intrinsics::printf("  (warn) 'server' block missing; using defaults\n");
+            host = String::from_str(Str::new("127.0.0.1"));
+            port = 8080;
+            tls  = false;
+        }
+    }
+
+    mut max_connections: u32;
+    mut timeout_seconds: u32;
+    match (root.get_object(Str::new("limits"))) {
+        Option::Some(limits) => {
+            max_connections = get_or_in(limits, Str::new("max_connections"), 64 as u64) as u32;
+            timeout_seconds = get_or_in(limits, Str::new("timeout_seconds"), 30 as u64) as u32;
+        }
+        Option::None => {
+            intrinsics::printf("  (warn) 'limits' block missing; using defaults\n");
+            max_connections = 64;
+            timeout_seconds = 30;
+        }
+    }
+
+    mut features: Array<String> = read_string_array(root, Str::new("features"));
+
+    return ServerConfig {
+        service: service,
+        host: host,
+        port: port,
+        tls: tls,
+        max_connections: max_connections,
+        timeout_seconds: timeout_seconds,
+        features: features
+    };
+}
+
+// ============================================================================
+// Pretty-print
+// ============================================================================
+
+function print_config(c: &ServerConfig) -> void {
+    intrinsics::printf("\nLoaded config:\n");
+    intrinsics::printf("  service          : %.*s\n",
+                       c.service.length() as i32, c.service.as_ptr());
+    intrinsics::printf("  host:port        : %.*s:%u\n",
+                       c.host.length() as i32, c.host.as_ptr(), c.port);
+    if (c.tls) {
+        intrinsics::printf("  tls              : enabled\n");
+    } else {
+        intrinsics::printf("  tls              : disabled\n");
+    }
+    intrinsics::printf("  max_connections  : %u\n", c.max_connections);
+    intrinsics::printf("  timeout_seconds  : %u\n", c.timeout_seconds);
+
+    intrinsics::printf("  features         : [");
+    const n: u64 = c.features.length();
+    mut i: u64 = 0;
+    while (i < n) {
+        match (c.features.get(i)) {
+            Option::Some(feat) => {
+                if (i > 0) { intrinsics::printf(", "); }
+                intrinsics::printf("%.*s",
+                    feat.length() as i32, feat.as_ptr());
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    intrinsics::printf("]\n");
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function main() -> int {
+    const path: Path = Path::from_str(Str::new("data/server.json"));
+    intrinsics::printf("Reading %s...\n", "data/server.json");
+
+    match (file::read(path)) {
+        Result::Ok(bytes) => {
+            mut buf: Array<u8> = bytes;
+            const source: Str = Str::from_raw(buf.as_ptr(), buf.length());
+
+            intrinsics::printf("Parsing...\n");
+            match (json::parser::parse(source)) {
+                Result::Ok(value) => {
+                    mut root: JsonValue = value;
+                    mut cfg: ServerConfig = build_config(&root);
+                    print_config(&cfg);
+                    cfg.drop();
+                    root.drop();
+                    buf.drop();
+                    return 0;
+                }
+                Result::Err(_) => {
+                    intrinsics::printf("error: failed to parse JSON\n");
+                    buf.drop();
+                    return 1;
+                }
+            }
+        }
+        Result::Err(_) => {
+            intrinsics::printf("error: could not read data/server.json\n");
+            return 1;
+        }
+    }
+}
