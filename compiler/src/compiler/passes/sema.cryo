@@ -4211,9 +4211,39 @@ public:
     }
 
     resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
+        // Bidirectional inference: if the surrounding context expects an
+        // `Array<E>` / `[E; N]`, push `E` as the expected_type while
+        // resolving each element so that polymorphic literals (integer /
+        // float defaults) adopt `E` instead of falling back to `i32` /
+        // `f64`.  Without this, `mut buf: u8[4] = [10, 20, 30, 40]`
+        // resolved every element to `i32`, which propagated through to
+        // codegen as a `[4 x i32]` literal and a bulk
+        // `store [4 x i32] %v, ptr %buf, align 1` over a 4-byte slot —
+        // 12 bytes of stack clobber.  Mirrors the save-restore pattern
+        // used at var-decl entry and `return` (see the `expected_type`
+        // wiring around lines 1056-1064 and 1303-1308).
+        mut elem_expected: TypeRef = TypeRef::invalid();
+        if (this.expected_type.is_valid()) {
+            mut exp_t: Type* = this.arena.lookup(this.expected_type.id);
+            if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = exp_t as InstantiatedType*;
+                if (inst.has_resolved_type()) {
+                    exp_t = this.arena.lookup(inst.resolved_type.id);
+                }
+            }
+            if (exp_t != null && exp_t.kind == TypeKind::Array) {
+                const exp_arr: ArrayType* = exp_t as ArrayType*;
+                elem_expected = exp_arr.element;
+            }
+        }
+        const saved_expected: TypeRef = this.expected_type;
         mut elem_type: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < arr.elements.length; i++) {
+            if (elem_expected.is_valid()) {
+                this.expected_type = elem_expected;
+            }
             const t: TypeRef = this.resolve_expr(arr.elements[i]);
+            this.expected_type = saved_expected;
             if (!elem_type.is_valid() && t.is_valid()) {
                 elem_type = t;
             }
