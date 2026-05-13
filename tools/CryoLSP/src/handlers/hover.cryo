@@ -338,15 +338,91 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             }
 
             if (type_sym.is_valid()) {
-                const m: MethodNode* = NodeLocator::find_method_in_modules(
-                    ctx.module_graph, ctx.intern_table, type_sym, ma.member);
-                if (m != null && m.func != null) {
-                    content  = format_method_signature(m, owner_display, ctx.type_arena);
-                    doc_text = m.documentation;
+                // Disambiguate field vs. method when both names exist
+                // on the carrier type.  `is_member_access_callee`
+                // walks the file's AST looking for a CallExpression
+                // whose callee is THIS member access — true when the
+                // user wrote `obj.member(...)`, false for bare
+                // `obj.member`.  Without this check we'd always
+                // render the method, even on a field read like
+                // `return this.length;` where `length` is the field
+                // and the enclosing function `length()` is unrelated.
+                const is_call: boolean = NodeLocator::is_member_access_callee(
+                    ctx.module_graph, ma);
+
+                // Generic-param receiver fallback: when the carrier
+                // type-sym resolves to a generic parameter name (e.g.
+                // `T` from `value: &T` in `println<T>(value: &T)
+                // where T: Display`), there's no struct named `T` to
+                // look methods up on.  Walk back to the enclosing
+                // function's trait bounds, look up the named trait,
+                // and render the trait method instead.  Done before
+                // the regular method/field path so trait method docs
+                // win when both exist (which is rare anyway).
+                const trait_m: FunctionDeclNode* = trait_method_for_generic_receiver(
+                    ctx, ma.span.file, ma.span.start_line, ma.span.start_col,
+                    type_sym, ma.member);
+                if (trait_m != null) {
+                    const trait_owner: SymbolStr =
+                        NodeLocator::find_trait_for_function(
+                            ctx.module_graph, trait_m);
+                    const owner_str: string = if (trait_owner.is_valid()) {
+                        leaf_after_separator(
+                            ctx.intern_table.resolve(trait_owner))
+                    } else { "" };
+                    content  = format_trait_method_signature(
+                        trait_m, owner_str, ctx.type_arena);
+                    doc_text = trait_m.documentation;
                     if (NodeLocator::span_contains(
                             ma.member_span, cursor_line, cursor_char)) {
                         hover_span = ma.member_span;
                     }
+                }
+
+                if (content != "") {
+                    // Trait-method fallback above already filled
+                    // content; skip the struct-method/field lookup.
+                } else if (is_call) {
+                    // Method-first lookup — the parens commit to a
+                    // callable.  Fall back to a field of the same
+                    // name only if no method matches (rare; would be
+                    // a function-pointer-typed field).
+                    const m: MethodNode* = NodeLocator::find_method_in_modules(
+                        ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                    if (m != null && m.func != null) {
+                        content  = format_method_signature(m, owner_display, ctx.type_arena);
+                        doc_text = m.documentation;
+                    } else {
+                        const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                            ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                        if (fld != null) {
+                            content  = format_field_decl(fld, ctx.type_arena);
+                            doc_text = fld.documentation;
+                        }
+                    }
+                } else {
+                    // Field-first lookup — bare `.member` access.
+                    // Methods can also be referenced bare (e.g.
+                    // function-pointer assignment of a method) but
+                    // the field reading is far more common.
+                    const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                        ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                    if (fld != null) {
+                        content  = format_field_decl(fld, ctx.type_arena);
+                        doc_text = fld.documentation;
+                    } else {
+                        const m: MethodNode* = NodeLocator::find_method_in_modules(
+                            ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                        if (m != null && m.func != null) {
+                            content  = format_method_signature(m, owner_display, ctx.type_arena);
+                            doc_text = m.documentation;
+                        }
+                    }
+                }
+
+                if (content != "" && NodeLocator::span_contains(
+                        ma.member_span, cursor_line, cursor_char)) {
+                    hover_span = ma.member_span;
                 }
             }
         }
@@ -530,7 +606,64 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     const v: VarDeclNode* = var_decl_at_span(
                         ctx.module_graph, sym.declaring_span);
                     if (v != null) { doc_text = v.documentation; }
+
+                    // Generic-body fallback: when sema didn't stamp a
+                    // valid resolved_type on the identifier (the param
+                    // type involves an unresolved generic param like
+                    // `T` or `&T`), `format_identifier_use` renders
+                    // `value: ?`.  Recover by formatting the source
+                    // type annotation as text — `value: &T` reads
+                    // exactly the way it was written, even when sema
+                    // couldn't lower it through the type arena yet.
+                    if (v != null && v.type_annotation != null
+                            && contains_unknown_type(content)) {
+                        const ann_str: string = format_annotation(
+                            v.type_annotation, ctx.intern_table);
+                        if (ann_str != "" && ann_str != "?") {
+                            content = rebuild_identifier_use_with_annotation(
+                                sym, ann_str, init_str, ctx.intern_table);
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    // Where-clause cursor: hovering a trait name inside a function or
+    // method's `where T: Trait + Trait2` clause.  The locator stops
+    // at the FunctionDeclaration / MethodDeclaration node (the where
+    // clause sits between params and body, neither of which the
+    // descent reaches).  Scan trait_bounds[] for a TraitRef whose
+    // span covers the cursor; render its declaring trait.
+    if (content == "") {
+        const trait_ref_match: SymbolStr = trait_ref_at_cursor(
+            node, cursor_line, cursor_char);
+        if (trait_ref_match.is_valid()) {
+            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                ctx.module_graph, ctx.intern_table, trait_ref_match);
+            if (decl != null) {
+                content    = format_type_decl(decl, ctx.type_arena);
+                doc_text   = (decl as DeclarationNode*).documentation;
+                hover_span = trait_ref_span_at_cursor(node, cursor_line, cursor_char);
+            }
+        }
+    }
+
+    // Where-clause type-parameter side: hovering `A` in `where A:
+    // Allocator`.  TraitBound.type_parameter is a bare SymbolStr with
+    // no dedicated span, so the param's span is derived as
+    // `[bound.span.start, first_trait_ref.span.start)` — same line in
+    // every case the parser produces.
+    if (content == "") {
+        const param_span: SourceSpan = type_param_span_at_cursor(
+            node, cursor_line, cursor_char);
+        if (param_span.has_location()) {
+            const param_name: SymbolStr = type_param_at_cursor(
+                node, cursor_line, cursor_char);
+            if (param_name.is_valid()) {
+                content    = format_generic_param_at(
+                    node, param_name, ctx.intern_table);
+                hover_span = param_span;
             }
         }
     }
@@ -981,6 +1114,134 @@ function annotation_span_at_cursor(node: ASTNode*, line: u32, ch: u32) -> Source
 /// expressions, struct/class/enum bodies).  Mirrors the same lookup
 /// `definition.cryo` does — kept duplicated rather than shared until
 /// a third handler needs it.
+/// Scan a FunctionDeclNode or MethodNode's `trait_bounds[]` for a
+/// TraitRef whose span covers `(line, character)`.  Returns the
+/// leaf SymbolStr of the trait reference's qualified path (e.g.
+/// `FmtWrite` from `where W: FmtWrite`) — that's the name the
+/// `find_type_decl_in_modules` lookup keys on.  Returns
+/// `SymbolStr::empty()` when the cursor isn't on any trait ref.
+function trait_ref_at_cursor(node: ASTNode*, line: u32, character: u32) -> SymbolStr {
+    const bounds: TraitBound[] = bounds_of_decl(node);
+    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+        const b: TraitBound = bounds[bi];
+        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+            const tref: TraitRef = b.trait_refs[ti];
+            if (!NodeLocator::span_contains(tref.span, line, character)) { continue; }
+            if (tref.path.length == 0) { continue; }
+            return tref.path[tref.path.length - 1];
+        }
+    }
+    return SymbolStr::empty();
+}
+
+/// Companion to `trait_ref_at_cursor` — returns the span of the
+/// matching TraitRef so the hover can highlight the exact lexeme.
+function trait_ref_span_at_cursor(node: ASTNode*, line: u32, character: u32) -> SourceSpan {
+    const bounds: TraitBound[] = bounds_of_decl(node);
+    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+        const b: TraitBound = bounds[bi];
+        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+            const tref: TraitRef = b.trait_refs[ti];
+            if (NodeLocator::span_contains(tref.span, line, character)) {
+                return tref.span;
+            }
+        }
+    }
+    return SourceSpan::none();
+}
+
+/// Approximate span of the type-parameter portion of a `where`
+/// bound.  TraitBound stamps a single span over the whole `A:
+/// Trait + Trait2` lexeme and a separate span on each TraitRef; the
+/// type-parameter sits between `bound.span.start` and the first
+/// trait_ref's start.  Returns `SourceSpan::none()` when the cursor
+/// isn't on any param.
+function type_param_span_at_cursor(node: ASTNode*, line: u32, character: u32) -> SourceSpan {
+    const bounds: TraitBound[] = bounds_of_decl(node);
+    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+        const b: TraitBound = bounds[bi];
+        if (b.trait_refs.length == 0) { continue; }
+        const first: TraitRef = b.trait_refs[0];
+        // Build a synthetic span: same start as the bound, end at the
+        // first trait ref's start (i.e. the position of `:`).
+        const param_span: SourceSpan = SourceSpan::new(
+            b.span.file,
+            b.span.start_line, b.span.start_col,
+            first.span.start_line, first.span.start_col);
+        if (NodeLocator::span_contains(param_span, line, character)) {
+            return param_span;
+        }
+    }
+    return SourceSpan::none();
+}
+
+function type_param_at_cursor(node: ASTNode*, line: u32, character: u32) -> SymbolStr {
+    const bounds: TraitBound[] = bounds_of_decl(node);
+    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+        const b: TraitBound = bounds[bi];
+        if (b.trait_refs.length == 0) { continue; }
+        const first: TraitRef = b.trait_refs[0];
+        const param_span: SourceSpan = SourceSpan::new(
+            b.span.file,
+            b.span.start_line, b.span.start_col,
+            first.span.start_line, first.span.start_col);
+        if (NodeLocator::span_contains(param_span, line, character)) {
+            return b.type_parameter;
+        }
+    }
+    return SymbolStr::empty();
+}
+
+/// Render `<param_name>: <Bound1> + <Bound2>` for the generic param
+/// on `node`.  Walks every bound on the decl whose `type_parameter`
+/// matches `param_name` and joins their trait-ref leaves with `+` —
+/// mirrors how `format_where_clause` renders the source side.
+function format_generic_param_at(node: ASTNode*, param_name: SymbolStr,
+                                  intern: InternTable*) -> string {
+    if (intern == null || !param_name.is_valid()) { return ""; }
+    mut s: string = intern.resolve(param_name);
+    const bounds: TraitBound[] = bounds_of_decl(node);
+    mut first_ref: boolean = true;
+    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+        const b: TraitBound = bounds[bi];
+        if (!b.type_parameter.equals(param_name)) { continue; }
+        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+            if (first_ref) {
+                s = s + ": " + format_trait_ref(b.trait_refs[ti], intern);
+                first_ref = false;
+            } else {
+                s = s + " + " + format_trait_ref(b.trait_refs[ti], intern);
+            }
+        }
+    }
+    return s;
+}
+
+/// Extract the `trait_bounds[]` (or impl-level `where_bounds[]`)
+/// slice from a decl whose head can carry a `where` clause.
+/// FunctionDeclNode owns its own bounds; MethodNode delegates to its
+/// inner `func`; ImplBlockNode keeps its head-level where clause in
+/// `where_bounds[]` rather than a per-method array.  Empty array for
+/// any other node kind.
+function bounds_of_decl(node: ASTNode*) -> TraitBound[] {
+    const empty: TraitBound[] = [];
+    if (node == null) { return empty; }
+    if (node.kind == NodeKind::FunctionDeclaration) {
+        const f: FunctionDeclNode* = node as FunctionDeclNode*;
+        return f.trait_bounds;
+    }
+    if (node.kind == NodeKind::MethodDeclaration) {
+        const m: MethodNode* = node as MethodNode*;
+        if (m.func == null) { return empty; }
+        return m.func.trait_bounds;
+    }
+    if (node.kind == NodeKind::ImplementationBlock) {
+        const b: ImplBlockNode* = node as ImplBlockNode*;
+        return b.where_bounds;
+    }
+    return empty;
+}
+
 function annotation_for_decl(node: ASTNode*) -> TypeAnnotation* {
     if (node == null) { return null; }
     if (node.kind == NodeKind::FunctionDeclaration) {
@@ -1014,6 +1275,49 @@ function annotation_for_decl(node: ASTNode*) -> TypeAnnotation* {
 /// reconstruct it from the name lexeme.
 function format_receiver(v: VarDeclNode*, arena: TypeArena*) -> string {
     return "this: " + arena.resolve_display_name_short(v.resolved_type.id);
+}
+
+/// True when `s` ends in the `: ?` placeholder the arena uses for
+/// invalid type IDs.  Used by the hover handler to detect a sema
+/// miss (generic body, partial compile) and trigger the annotation
+/// fallback.
+function contains_unknown_type(s: string) -> boolean {
+    const len: i64 = strlen(s) as i64;
+    if (len < 3) { return false; }
+    return s[len - 3] == ':' && s[len - 2] == ' ' && s[len - 1] == '?';
+}
+
+/// Re-render an identifier use with an explicit type-annotation
+/// string instead of the arena's short display.  Mirrors
+/// `format_identifier_use`'s per-SymbolKind formatting so the
+/// fallback shape stays consistent with the primary path.
+function rebuild_identifier_use_with_annotation(sym: Symbol, type_str: string,
+                                                 init_str: string,
+                                                 intern: InternTable*) -> string {
+    const name_str: string = if (intern != null) {
+        intern.resolve(sym.name)
+    } else {
+        ""
+    };
+    const init_suffix: string = if (init_str != "") { " = " + init_str } else { "" };
+
+    return match (sym.kind) {
+        SymbolKind::Variable  => {
+            const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
+            prefix + name_str + ": " + type_str + init_suffix
+        }
+        SymbolKind::Constant  => {
+            "const " + name_str + ": " + type_str + init_suffix
+        }
+        SymbolKind::Parameter => {
+            const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
+            prefix + name_str + ": " + type_str
+        }
+        SymbolKind::Field     => {
+            "field " + name_str + ": " + type_str
+        }
+        _                     => { type_str }
+    };
 }
 
 /// Render an identifier use as the declaration form of the symbol it
@@ -1194,6 +1498,54 @@ function var_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> VarDecl
 /// whether it sits at the top level or inside a TraitDeclaration.
 /// Returns `null` when the symbol's source isn't reachable (cross-
 /// module compile failed, edited buffer, etc.).
+/// When a receiver's carrier resolves to a generic parameter name
+/// (`T`, `W`, …), method lookup on the bare param fails because no
+/// struct named `T` exists.  Find the enclosing function, scan its
+/// `trait_bounds[]` for the param, and look up `method_name` on the
+/// bounded trait.  Returns the trait method's FunctionDeclNode, or
+/// null when no trait bound carries that method.
+///
+/// The hover handler treats null as "fall through to normal method/
+/// field lookup" — for non-generic receivers this returns null
+/// immediately because no trait_bound's `type_parameter` matches.
+function trait_method_for_generic_receiver(ctx: CompilationContext*,
+                                            file_path: string,
+                                            line: u32,
+                                            character: u32,
+                                            carrier: SymbolStr,
+                                            method_name: SymbolStr) -> FunctionDeclNode* {
+    if (ctx == null || !carrier.is_valid())     { return null; }
+    if (!method_name.is_valid())                { return null; }
+
+    const fdecl: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+        ctx.module_graph, file_path, line, character);
+    if (fdecl == null) { return null; }
+
+    // Walk this function's trait bounds + every enclosing method's
+    // bounds (where-clause on an outer impl/method) to find one whose
+    // type_parameter equals the carrier.  For the common case the
+    // immediate function carries the bound — we only need the local
+    // scan.
+    for (mut bi: i64 = 0; bi < fdecl.trait_bounds.length; bi++) {
+        const b: TraitBound = fdecl.trait_bounds[bi];
+        if (!b.type_parameter.equals(carrier)) { continue; }
+        // Walk the bound's traits left-to-right.  First match wins;
+        // a multi-bound (`T: Display + Debug`) where both traits
+        // declare `fmt` is unusual but the leftmost is the most
+        // direct read of source order.
+        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+            const tref: TraitRef = b.trait_refs[ti];
+            if (tref.path.length == 0) { continue; }
+            const trait_leaf: SymbolStr = tref.path[tref.path.length - 1];
+            const f: FunctionDeclNode* = NodeLocator::find_trait_method_in_modules(
+                ctx.module_graph, ctx.intern_table, trait_leaf, method_name);
+            if (f != null) { return f; }
+        }
+    }
+    return null;
+}
+
+
 /// AST-side companion to `unwrap_to_carrier`.  Recover the receiver's
 /// carrier-type SymbolStr from the AST when sema didn't stamp a usable
 /// resolved_type — primarily for member-access hovers inside generic

@@ -917,6 +917,411 @@ function method_body_contains_at(arr: MethodNode*[], line: u32, character: u32) 
 }
 
 
+/// Find a method named `method_name` on a trait named `trait_name`.
+/// Trait methods are stored as `FunctionDeclNode*[]` (no MethodNode
+/// wrapper), so this is a sibling to `find_method_in_modules` that
+/// scans `TraitDeclNode.methods` instead.  Used by the LSP hover to
+/// resolve `value.fmt()` when `value` has a generic param type bound
+/// by the relevant trait — `where T: Display` means `T::fmt` resolves
+/// to `Display::fmt`.
+public function find_trait_method_in_modules(graph: ModuleGraph*,
+                                              intern: InternTable*,
+                                              trait_name: SymbolStr,
+                                              method_name: SymbolStr) -> FunctionDeclNode* {
+    if (graph == null) { return null; }
+    const trait_leaf: string = if (intern != null) {
+        leaf_segment_str(intern.resolve(trait_name))
+    } else { "" };
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::TraitDeclaration) { continue; }
+            const td: TraitDeclNode* = stmt as TraitDeclNode*;
+            if (!type_name_matches(intern, td.name, trait_name, trait_leaf)) {
+                continue;
+            }
+            for (mut fi: i64 = 0; fi < td.methods.length; fi++) {
+                const f: FunctionDeclNode* = td.methods[fi];
+                if (f != null && f.name.equals(method_name)) { return f; }
+            }
+        }
+    }
+    return null;
+}
+
+
+/// Reverse-walk the module graph to find the function whose body span
+/// contains `(line, character)` in `file_path`.  Returns the inner
+/// `FunctionDeclNode*` (for method bodies, the wrapping MethodNode's
+/// `.func`) so callers can inspect its `trait_bounds` array directly.
+///
+/// Used by the LSP hover to disambiguate generic-param receivers:
+/// when `obj.method(...)` has a receiver typed `T` (a generic param),
+/// the carrier's trait bounds give us the trait to look the method up
+/// on.  Returns `null` when no enclosing function covers the position.
+public function find_enclosing_function(graph: ModuleGraph*,
+                                         file_path: string,
+                                         line: u32,
+                                         character: u32) -> FunctionDeclNode* {
+    if (graph == null || file_path == "") { return null; }
+    if (strlen(file_path) == 0 as u64)    { return null; }
+
+    const mod_idx: i64 = graph.find_module_by_path(file_path);
+    if (mod_idx < 0) { return null; }
+    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return null; }
+
+    for (mut si: i64 = 0; si < ast.statements.length; si++) {
+        const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+        if (stmt == null) { continue; }
+        const found: FunctionDeclNode* = enclosing_function_in(
+            stmt, line, character);
+        if (found != null) { return found; }
+    }
+    return null;
+}
+
+function enclosing_function_in(stmt: ASTNode*, line: u32, character: u32) -> FunctionDeclNode* {
+    if (stmt == null) { return null; }
+    if (stmt.kind == NodeKind::FunctionDeclaration) {
+        const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+        if (f.body != null && span_contains(f.body.span, line, character)) {
+            return f;
+        }
+        return null;
+    }
+    if (stmt.kind == NodeKind::StructDeclaration) {
+        const d: StructDeclNode* = stmt as StructDeclNode*;
+        return enclosing_function_in_methods(d.methods, line, character);
+    }
+    if (stmt.kind == NodeKind::ClassDeclaration) {
+        const d: ClassDeclNode* = stmt as ClassDeclNode*;
+        return enclosing_function_in_methods(d.methods, line, character);
+    }
+    if (stmt.kind == NodeKind::ImplementationBlock) {
+        const d: ImplBlockNode* = stmt as ImplBlockNode*;
+        return enclosing_function_in_methods(d.methods, line, character);
+    }
+    if (stmt.kind == NodeKind::TraitDeclaration) {
+        const d: TraitDeclNode* = stmt as TraitDeclNode*;
+        for (mut i: i64 = 0; i < d.methods.length; i++) {
+            const f: FunctionDeclNode* = d.methods[i];
+            if (f != null && f.body != null
+                    && span_contains(f.body.span, line, character)) {
+                return f;
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+function enclosing_function_in_methods(arr: MethodNode*[], line: u32, character: u32) -> FunctionDeclNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const m: MethodNode* = arr[i];
+        if (m == null || m.func == null || m.func.body == null) { continue; }
+        if (span_contains(m.func.body.span, line, character)) {
+            return m.func;
+        }
+    }
+    return null;
+}
+
+
+/// True when `target` is the `callee` of some `CallExprNode` reachable
+/// from the AST root in `target.span.file`.  Used by the LSP hover
+/// handler to disambiguate `obj.member(...)` (method call) from
+/// `obj.member` (field read) when the same name appears as both a
+/// field and a method on the same type — without a parent pointer in
+/// the AST we have to scan to find the enclosing CallExpression.
+///
+/// Returns `false` when the file isn't reachable in the graph or no
+/// CallExpression in the file references `target` as its callee — the
+/// caller treats `false` as "field-or-bare-access, prefer field
+/// lookup."
+public function is_member_access_callee(graph: ModuleGraph*,
+                                         target: MemberAccessNode*) -> boolean {
+    if (graph == null || target == null) { return false; }
+    if (target.span.file == "")          { return false; }
+
+    const mod_idx: i64 = graph.find_module_by_path(target.span.file);
+    if (mod_idx < 0) { return false; }
+    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return false; }
+
+    for (mut si: i64 = 0; si < ast.statements.length; si++) {
+        if (node_contains_callee(ast.statements[si], target)) { return true; }
+    }
+    return false;
+}
+
+/// DFS over the AST looking for a `CallExprNode` whose `callee` is
+/// `target`.  Per-kind dispatch over the structural children — adding
+/// a new node kind that owns expression children means adding a case
+/// here, otherwise the search just stops at that branch.
+function node_contains_callee(node: ASTNode*, target: MemberAccessNode*) -> boolean {
+    if (node == null) { return false; }
+
+    if (node.kind == NodeKind::CallExpression) {
+        const c: CallExprNode* = node as CallExprNode*;
+        if (c.callee == target as ExpressionNode*) { return true; }
+        if (node_contains_callee(c.callee as ASTNode*, target)) { return true; }
+        for (mut i: i64 = 0; i < c.arguments.length; i++) {
+            if (node_contains_callee(c.arguments[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::MemberAccess) {
+        const m: MemberAccessNode* = node as MemberAccessNode*;
+        return node_contains_callee(m.object as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::ArrayAccess) {
+        const a: ArrayAccessNode* = node as ArrayAccessNode*;
+        if (node_contains_callee(a.array as ASTNode*, target)) { return true; }
+        return node_contains_callee(a.index as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = node as BinaryExprNode*;
+        if (node_contains_callee(b.left as ASTNode*, target)) { return true; }
+        return node_contains_callee(b.right as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = node as UnaryExprNode*;
+        return node_contains_callee(u.operand as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::TernaryExpression) {
+        const t: TernaryExprNode* = node as TernaryExprNode*;
+        if (node_contains_callee(t.condition as ASTNode*, target))  { return true; }
+        if (node_contains_callee(t.true_expr as ASTNode*, target))  { return true; }
+        return node_contains_callee(t.false_expr as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::IfExpression) {
+        const i: IfExprNode* = node as IfExprNode*;
+        if (node_contains_callee(i.condition as ASTNode*, target)) { return true; }
+        if (node_contains_callee(i.then_expr as ASTNode*, target)) { return true; }
+        return node_contains_callee(i.else_expr as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::CastExpression) {
+        const e: CastExprNode* = node as CastExprNode*;
+        return node_contains_callee(e.expression as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::DeleteExpression) {
+        const e: DeleteExprNode* = node as DeleteExprNode*;
+        return node_contains_callee(e.operand as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::TypeofExpression) {
+        const e: TypeofExprNode* = node as TypeofExprNode*;
+        return node_contains_callee(e.operand as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::ArrayLiteral) {
+        const a: ArrayLiteralNode* = node as ArrayLiteralNode*;
+        for (mut i: i64 = 0; i < a.elements.length; i++) {
+            if (node_contains_callee(a.elements[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::TupleLiteral) {
+        const t: TupleLiteralNode* = node as TupleLiteralNode*;
+        for (mut i: i64 = 0; i < t.elements.length; i++) {
+            if (node_contains_callee(t.elements[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::StructLiteral) {
+        const s: StructLiteralNode* = node as StructLiteralNode*;
+        for (mut i: i64 = 0; i < s.field_inits.length; i++) {
+            if (node_contains_callee(s.field_inits[i].value as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::NewExpression) {
+        const n: NewExprNode* = node as NewExprNode*;
+        for (mut i: i64 = 0; i < n.arguments.length; i++) {
+            if (node_contains_callee(n.arguments[i] as ASTNode*, target)) { return true; }
+        }
+        if (n.array_size != null) {
+            if (node_contains_callee(n.array_size as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::MatchExpression) {
+        const m: MatchExprNode* = node as MatchExprNode*;
+        if (node_contains_callee(m.subject as ASTNode*, target)) { return true; }
+        for (mut i: i64 = 0; i < m.arms.length; i++) {
+            const arm: MatchArmNode* = m.arms[i];
+            if (arm != null && node_contains_callee(arm.body as ASTNode*, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Statements that own expressions / nested blocks
+    if (node.kind == NodeKind::BlockStatement) {
+        const b: BlockStmtNode* = node as BlockStmtNode*;
+        for (mut i: i64 = 0; i < b.statements.length; i++) {
+            if (node_contains_callee(b.statements[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::UnsafeBlockStatement) {
+        const u: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
+        return node_contains_callee(u.block as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::ReturnStatement) {
+        const r: ReturnStmtNode* = node as ReturnStmtNode*;
+        return node_contains_callee(r.expression as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::IfStatement) {
+        const s: IfStmtNode* = node as IfStmtNode*;
+        if (node_contains_callee(s.condition as ASTNode*, target)) { return true; }
+        if (node_contains_callee(s.then_stmt as ASTNode*, target)) { return true; }
+        return node_contains_callee(s.else_stmt as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::WhileStatement) {
+        const s: WhileStmtNode* = node as WhileStmtNode*;
+        if (node_contains_callee(s.condition as ASTNode*, target)) { return true; }
+        return node_contains_callee(s.body as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::DoWhileStatement) {
+        const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
+        if (node_contains_callee(s.body as ASTNode*, target)) { return true; }
+        return node_contains_callee(s.condition as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::ForStatement) {
+        const s: ForStmtNode* = node as ForStmtNode*;
+        if (node_contains_callee(s.init, target)) { return true; }
+        if (node_contains_callee(s.condition as ASTNode*, target)) { return true; }
+        if (node_contains_callee(s.update as ASTNode*, target)) { return true; }
+        return node_contains_callee(s.body as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::LoopStatement) {
+        const s: LoopStmtNode* = node as LoopStmtNode*;
+        return node_contains_callee(s.body as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::ExpressionStatement) {
+        const s: ExprStmtNode* = node as ExprStmtNode*;
+        return node_contains_callee(s.expression as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::DeclarationStatement) {
+        const s: DeclStmtNode* = node as DeclStmtNode*;
+        return node_contains_callee(s.declaration as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::MatchStatement) {
+        const s: MatchStmtNode* = node as MatchStmtNode*;
+        if (node_contains_callee(s.subject as ASTNode*, target)) { return true; }
+        for (mut i: i64 = 0; i < s.arms.length; i++) {
+            const arm: MatchArmNode* = s.arms[i];
+            if (arm != null && node_contains_callee(arm.body as ASTNode*, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Declarations whose bodies own expressions
+    if (node.kind == NodeKind::VariableDeclaration) {
+        const v: VarDeclNode* = node as VarDeclNode*;
+        return node_contains_callee(v.initializer as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::FunctionDeclaration) {
+        const f: FunctionDeclNode* = node as FunctionDeclNode*;
+        return node_contains_callee(f.body as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::MethodDeclaration) {
+        const m: MethodNode* = node as MethodNode*;
+        if (m.func == null) { return false; }
+        return node_contains_callee(m.func.body as ASTNode*, target);
+    }
+    if (node.kind == NodeKind::StructDeclaration) {
+        const d: StructDeclNode* = node as StructDeclNode*;
+        for (mut i: i64 = 0; i < d.methods.length; i++) {
+            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::ClassDeclaration) {
+        const d: ClassDeclNode* = node as ClassDeclNode*;
+        for (mut i: i64 = 0; i < d.methods.length; i++) {
+            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::ImplementationBlock) {
+        const d: ImplBlockNode* = node as ImplBlockNode*;
+        for (mut i: i64 = 0; i < d.methods.length; i++) {
+            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::TraitDeclaration) {
+        const d: TraitDeclNode* = node as TraitDeclNode*;
+        for (mut i: i64 = 0; i < d.methods.length; i++) {
+            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+        }
+        return false;
+    }
+
+    return false;
+}
+
+
+/// Find a field declaration on a user-defined struct/class by name.
+/// Mirrors `find_method_in_modules`'s name-matching but searches the
+/// `fields[]` array instead.  Used by the LSP hover to render field
+/// lookups (`obj.field`) when the same name doesn't shadow a method.
+public function find_field_in_modules(graph: ModuleGraph*,
+                                       intern: InternTable*,
+                                       type_name: SymbolStr,
+                                       field_name: SymbolStr) -> FieldDeclNode* {
+    if (graph == null) { return null; }
+    const type_leaf: string = if (intern != null) {
+        leaf_segment_str(intern.resolve(type_name))
+    } else { "" };
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            const found: FieldDeclNode* = match_fields_on_type(
+                stmt, intern, type_name, type_leaf, field_name);
+            if (found != null) { return found; }
+        }
+    }
+    return null;
+}
+
+function match_fields_on_type(stmt: ASTNode*, intern: InternTable*,
+                               type_name: SymbolStr, type_leaf: string,
+                               field_name: SymbolStr) -> FieldDeclNode* {
+    if (stmt.kind == NodeKind::StructDeclaration) {
+        const d: StructDeclNode* = stmt as StructDeclNode*;
+        if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+        for (mut i: i64 = 0; i < d.fields.length; i++) {
+            const f: FieldDeclNode* = d.fields[i];
+            if (f != null && f.name.equals(field_name)) { return f; }
+        }
+        return null;
+    }
+    if (stmt.kind == NodeKind::ClassDeclaration) {
+        const d: ClassDeclNode* = stmt as ClassDeclNode*;
+        if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+        for (mut i: i64 = 0; i < d.fields.length; i++) {
+            const f: FieldDeclNode* = d.fields[i];
+            if (f != null && f.name.equals(field_name)) { return f; }
+        }
+        return null;
+    }
+    return null;
+}
+
+
 /// Reverse-walk the module graph to find the trait that declares
 /// `func` as one of its methods.  Trait methods are stored bare as
 /// `FunctionDeclNode*` (not `MethodNode*`), so the regular
