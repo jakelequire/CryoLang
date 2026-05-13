@@ -1,7 +1,13 @@
-///! Box<T> — single-owner heap allocation.
+///! Box<T, A> — single-owner heap allocation.
 ///!
-///! A `Box<T>` owns exactly one heap-allocated value. Move semantics
-///! transfer ownership; the final holder calls `drop` to release.
+///! A `Box<T, A>` owns exactly one heap-allocated value plus the
+///! allocator instance that produced it.  Move semantics transfer
+///! ownership; the final holder calls `drop`, which runs `T::drop()`
+///! and returns the storage through `this.alloc`.
+///!
+///! `A` defaults to `GlobalAlloc`, so the bare `Box<T>` spelling keeps
+///! its meaning across the stdlib.  Callers that want a different
+///! allocator use the `*_in` constructors.
 
 namespace std::alloc::box;
 
@@ -12,13 +18,14 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 
-type struct Box<T> {
-    ptr: NonNull<T>;
+type struct Box<T, A = GlobalAlloc> {
+    ptr:   NonNull<T>;
+    alloc: A;
 
-    /// Allocate heap storage and move `value` into it. Panics if the
-    /// allocator refuses the request — use `try_new` to recover from
-    /// out-of-memory.
-    static new(value: T) -> Box<T> {
+    /// Allocate heap storage via `GlobalAlloc` and move `value` into it.
+    /// Panics if the allocator refuses the request — use `try_new` to
+    /// recover from out-of-memory.
+    static new(value: T) -> Box<T, GlobalAlloc> {
         match (Box::try_new(value)) {
             Result::Ok(b) => { return b; }
             Result::Err(_) => {
@@ -27,9 +34,29 @@ type struct Box<T> {
         }
     }
 
-    /// Fallible constructor. Returns `Err(AllocError)` if the allocator
-    /// refuses the request (out of memory, zero-sized `T`, etc.).
-    static try_new(value: T) -> Result<Box<T>, AllocError> {
+    /// Allocate with a caller-supplied allocator.  Panics on allocation
+    /// failure; use `try_new_in` for fallible construction.
+    static new_in(value: T, alloc: A) -> Box<T, A> {
+        match (Box::try_new_in(value, alloc)) {
+            Result::Ok(b) => { return b; }
+            Result::Err(_) => {
+                intrinsics::panic("Box::new_in: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible constructor backed by `GlobalAlloc`.  Returns
+    /// `Err(AllocError)` if the allocator refuses the request (out of
+    /// memory, zero-sized `T`, etc.).
+    ///
+    /// Inlined rather than dispatched to `try_new_in` because the
+    /// bootstrap monomorphizer occasionally produces two arena-distinct
+    /// copies of the same `Result<Box<T, GlobalAlloc>, AllocError>` when
+    /// a generic `<T>` method calls a generic `<T, A>` method and binds
+    /// `A = GlobalAlloc` at the call site (E0200 false positive).
+    /// Keeping each non-`_in` static method self-contained sidesteps
+    /// the issue without giving up the allocator-generic surface.
+    static try_new(value: T) -> Result<Box<T, GlobalAlloc>, AllocError> {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const block: Layout = Layout::of<T>();
         match (alloc.allocate(block)) {
@@ -37,35 +64,60 @@ type struct Box<T> {
                 const typed: NonNull<T> = raw.cast<T>();
                 const typed_ptr: T* = typed.as_ptr();
                 *typed_ptr = value;
-                return Result::Ok(Box<T> { ptr: typed });
+                return Result::Ok(Box<T, GlobalAlloc> { ptr: typed, alloc: alloc });
             }
             Result::Err(err) => { return Result::Err(err); }
         }
     }
 
-    /// Re-wrap a pointer previously produced by `into_raw`. The pointer
-    /// must have come from `Box::into_raw` (same type, same allocator)
-    /// and must not have been freed.
-    static from_raw(raw: T*) -> Box<T> {
-        return Box<T> { ptr: NonNull::new(raw) };
+    /// Fallible constructor with a caller-supplied allocator.  The
+    /// allocator instance is stored in the resulting `Box` and is used
+    /// to free the storage on drop.
+    static try_new_in(value: T, alloc: A) -> Result<Box<T, A>, AllocError> {
+        mut a: A = alloc;
+        const block: Layout = Layout::of<T>();
+        match (a.allocate(block)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<T> = raw.cast<T>();
+                const typed_ptr: T* = typed.as_ptr();
+                *typed_ptr = value;
+                return Result::Ok(Box<T, A> { ptr: typed, alloc: a });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
     }
 
+    /// Re-wrap a pointer previously produced by `into_raw` (or `leak`).
+    /// The pointer must have come from a `Box<T, GlobalAlloc>` — using
+    /// this constructor on a pointer that was allocated by a different
+    /// allocator yields a `Box` that will free with the wrong allocator
+    /// on drop.  Custom-allocator users that need this round-trip
+    /// should reconstitute the allocator + pointer themselves and
+    /// build `Box<T, A> { ptr: ..., alloc: ... }` directly.
+    static from_raw(raw: T*) -> Box<T, GlobalAlloc> {
+        return Box<T, GlobalAlloc> {
+            ptr:   NonNull::new(raw),
+            alloc: GlobalAlloc::new()
+        };
+    }
 
-    /// Raw pointer to the owned value. The pointer is valid for the
-    /// lifetime of the `Box`; dereferencing after `drop` is undefined.
+    /// Raw pointer to the owned value.  Valid for the lifetime of the
+    /// `Box`; dereferencing after `drop` is undefined.
     as_ptr(&this) -> T* {
         return this.ptr.as_ptr();
     }
 
-    /// Give up ownership and return the raw pointer. The caller becomes
+    /// Give up ownership and return the raw pointer.  The caller becomes
     /// responsible for freeing the memory (typically via
     /// `Box::from_raw`); dropping this box afterwards would double-free.
     ///
     /// Takes `this` by value (consumes the receiver) and destructures
     /// the Box so the move-checker treats it as fully consumed —
-    /// auto-drop is suppressed on both caller and callee sides.
+    /// auto-drop is suppressed on both caller and callee sides.  The
+    /// allocator instance is destructured out and dropped at the end of
+    /// this function; for `GlobalAlloc` that's a no-op.
     into_raw(mut this) -> T* {
-        const { ptr }: Box<T> = this;
+        const { ptr, alloc }: Box<T, A> = this;
         return ptr.as_ptr();
     }
 
@@ -73,31 +125,31 @@ type struct Box<T> {
     /// new stdlib can still spell "leak this allocation."  Same behavior:
     /// give up ownership and return the raw pointer.
     leak(mut this) -> T* {
-        const { ptr }: Box<T> = this;
+        const { ptr, alloc }: Box<T, A> = this;
         return ptr.as_ptr();
     }
 
 }
 
-/// Release the heap storage. Calls `T::drop()` on the owned value first
-/// so that any resources held by `T` (heap buffers, file descriptors, etc.)
-/// are released before the allocation is returned to the allocator.
-/// Ownership obligation: every `Box` must have `drop` called exactly once
-/// before it goes out of scope.
+/// Release the heap storage.  Calls `T::drop()` on the owned value first
+/// so that any resources held by `T` (heap buffers, file descriptors,
+/// etc.) are released before the allocation is returned via
+/// `this.alloc.deallocate(...)`.  The allocator instance itself lives in
+/// the `Box` struct (caller's stack), not in the heap allocation we're
+/// freeing.
+///
+/// Ownership obligation: every `Box` must have `drop` called exactly
+/// once before it goes out of scope.
 ///
 /// Note: `into_raw` and `leak` transfer ownership of both the value and
-/// the allocation to the caller, so T's drop is NOT called for those paths.
-implement<T> trait Drop for struct Box<T>
-where T: Drop {
+/// the allocation to the caller, so T's drop is NOT called for those
+/// paths.
+implement<T, A> trait Drop for struct Box<T, A>
+where T: Drop, A: Allocator {
     drop(mut &this) -> void {
-        // Drop the owned T in place through the raw pointer before the
-        // allocation is freed.  `(*t_ptr).drop()` borrows the T in place
-        // so T's drop impl runs on the heap-resident value, not on a copy.
         const t_ptr: T* = this.ptr.as_ptr();
         (*t_ptr).drop();
-        // Release the allocation.
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
         const block: Layout = Layout::of<T>();
-        alloc.deallocate(this.ptr.cast<u8>(), block);
+        this.alloc.deallocate(this.ptr.cast<u8>(), block);
     }
 }
