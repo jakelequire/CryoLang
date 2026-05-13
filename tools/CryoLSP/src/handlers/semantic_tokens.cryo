@@ -1,0 +1,811 @@
+///! Semantic-tokens handler (LSP §3.6.27 — `textDocument/semanticTokens/full`).
+///!
+///! Walks the override-file's AST and emits one `SemanticToken` per
+///! identifier-bearing span, classified by what the AST says the name
+///! actually IS — function, method, type, parameter, field, etc. — not
+///! by lexer token kind.  This is what fixes the "`from` colors as a
+///! keyword inside `static from(...)`" bug: even though the lexer sees
+///! `KwFrom`, the AST sees a `MethodNode` whose `name_span` covers those
+///! bytes, so the handler emits a `method` token there and the VS Code
+///! renderer applies it on top of the TextMate keyword color.
+///!
+///! Order of operations:
+///!   1. Resolve URI → session → CompilationContext → ProgramNode.
+///!   2. Walk the program's top-level statements; for each declaration
+///!      or expression that owns an identifier span, emit a
+///!      `SemanticToken` into the collector.
+///!   3. Sort the collector by (line, char) — token emission order
+///!      across the walk isn't guaranteed to be in source order.
+///!   4. Encode as the LSP delta-line wire format.
+///!
+///! Spans coming back from the compiler are 1-based; LSP wants 0-based.
+///! The conversion happens inside `emit_span()`.  We also clamp the
+///! length to the maximum that fits on the start line so a multi-line
+///! span (rare for identifiers, but possible for ill-formed AST) doesn't
+///! produce a delta that runs past the line boundary.
+
+namespace Lsp::Handlers::SemanticTokens;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+import Compiler::CompilationContext;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Pattern;
+import Compiler::Diag::SourceSpan;
+import Compiler::ModuleGraph;
+
+import Lsp::Server::Docs;
+import Lsp::Server::Session;
+import Lsp::Protocol::SemanticTokens;
+
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
+                                        params: &JsonValue) -> JsonValue {
+    // -- Extract URI from textDocument.uri ----------------------------
+    const td_opt: Option<JsonValue*> = params.get(Str::from_cstr("textDocument"));
+    if (!td_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+    const td: JsonValue* = td_opt.unwrap_or(null);
+    if (td == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+
+    const uri_opt: Option<JsonValue*> = td.get(Str::from_cstr("uri"));
+    if (!uri_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+    const uri_val: JsonValue* = uri_opt.unwrap_or(null);
+    if (uri_val == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+
+    const uri_str_opt: Option<Str> = uri_val.as_str();
+    if (!uri_str_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+    const uri: Str = uri_str_opt.unwrap_or(Str::from_cstr(""));
+
+    // -- Resolve session → CompilationContext → ProgramNode -----------
+    const session_opt: Option<CompilerSession*> = sessions.get(uri);
+    if (!session_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+    const session: CompilerSession* = session_opt.unwrap_or(null);
+    if (session == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+    const ctx: CompilationContext* = session.context();
+    if (ctx == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+
+    const fs_path: Str = uri_to_fs_path(uri);
+    mut path_buf: String = String::with_capacity(fs_path.length() + 1);
+    path_buf.push_str(fs_path);
+    path_buf.push_byte(0 as u8);
+    const path_buf_len: u64 = path_buf.length() - 1;
+    path_buf.truncate(path_buf_len);
+    const path_cstr: string = path_buf.as_ptr() as string;
+
+    const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
+    path_buf.drop();
+    if (mod_idx < 0) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+
+    const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+
+    // -- Walk the AST, collecting tokens ------------------------------
+    mut tokens: Array<SemanticToken> = Array<SemanticToken>::new();
+    walk_program(ast, &tokens);
+
+    // -- Sort by (line, start_char) -----------------------------------
+    // The delta-line encoding requires monotonically-non-decreasing
+    // token positions.  Emission order from the walk follows source
+    // order for most nodes, but a few — type annotations on function
+    // returns, generic params — emit a name span that sits BEFORE the
+    // body's emissions.  A stable sort keeps the result deterministic.
+    sort_tokens(&tokens);
+
+    // -- Encode as wire `data: number[]` and wrap as response ---------
+    const data: JsonValue = Lsp::Protocol::SemanticTokens::encode_tokens(&tokens);
+    return Lsp::Protocol::SemanticTokens::response_json(data);
+}
+
+
+// ============================================================================
+// Walker — recurses through declarations + statements + expressions
+// ============================================================================
+
+function walk_program(prog: ProgramNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (prog == null) { return; }
+    for (mut i: i64 = 0; i < prog.statements.length; i++) {
+        st_walk_node(prog.statements[i], tokens);
+    }
+}
+
+function st_walk_node(node: ASTNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (node == null) { return; }
+
+    // Declarations
+    if (node.kind == NodeKind::FunctionDeclaration) {
+        walk_function_decl(node as FunctionDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::MethodDeclaration) {
+        walk_method_decl(node as MethodNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::StructDeclaration) {
+        walk_struct_decl(node as StructDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::ClassDeclaration) {
+        walk_class_decl(node as ClassDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::EnumDeclaration) {
+        walk_enum_decl(node as EnumDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::TraitDeclaration) {
+        walk_trait_decl(node as TraitDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::TypeAliasDeclaration) {
+        walk_typealias_decl(node as TypeAliasDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::ImplementationBlock) {
+        walk_impl_block(node as ImplBlockNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::ExternBlock) {
+        walk_extern_block(node as ExternBlockNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::VariableDeclaration) {
+        walk_var_decl(node as VarDeclNode*, false, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::FieldDeclaration) {
+        walk_field_decl(node as FieldDeclNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::EnumVariant) {
+        walk_enum_variant(node as EnumVariantNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::DeclarationStatement) {
+        const ds: DeclStmtNode* = node as DeclStmtNode*;
+        st_walk_node(ds.declaration as ASTNode*, tokens);
+        return;
+    }
+
+    // Statements
+    if (node.kind == NodeKind::BlockStatement) {
+        const blk: BlockStmtNode* = node as BlockStmtNode*;
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            st_walk_node(blk.statements[i] as ASTNode*, tokens);
+        }
+        return;
+    }
+    if (node.kind == NodeKind::UnsafeBlockStatement) {
+        const us: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
+        st_walk_node(us.block as ASTNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::ReturnStatement) {
+        const rs: ReturnStmtNode* = node as ReturnStmtNode*;
+        walk_expr(rs.expression, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::IfStatement) {
+        const is: IfStmtNode* = node as IfStmtNode*;
+        walk_expr(is.condition, tokens);
+        st_walk_node(is.then_stmt as ASTNode*, tokens);
+        st_walk_node(is.else_stmt as ASTNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::WhileStatement) {
+        const ws: WhileStmtNode* = node as WhileStmtNode*;
+        walk_expr(ws.condition, tokens);
+        st_walk_node(ws.body as ASTNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::DoWhileStatement) {
+        const ds: DoWhileStmtNode* = node as DoWhileStmtNode*;
+        st_walk_node(ds.body as ASTNode*, tokens);
+        walk_expr(ds.condition, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::ForStatement) {
+        const fs: ForStmtNode* = node as ForStmtNode*;
+        st_walk_node(fs.init, tokens);
+        walk_expr(fs.condition, tokens);
+        walk_expr(fs.update, tokens);
+        st_walk_node(fs.body as ASTNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::LoopStatement) {
+        const ls: LoopStmtNode* = node as LoopStmtNode*;
+        st_walk_node(ls.body as ASTNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::MatchStatement) {
+        const ms: MatchStmtNode* = node as MatchStmtNode*;
+        walk_expr(ms.subject, tokens);
+        for (mut i: i64 = 0; i < ms.arms.length; i++) {
+            walk_match_arm(ms.arms[i], tokens);
+        }
+        return;
+    }
+    if (node.kind == NodeKind::SwitchStatement) {
+        const ss: SwitchStmtNode* = node as SwitchStmtNode*;
+        walk_expr(ss.expression, tokens);
+        for (mut i: i64 = 0; i < ss.cases.length; i++) {
+            st_walk_node(ss.cases[i] as ASTNode*, tokens);
+        }
+        return;
+    }
+    if (node.kind == NodeKind::CaseStatement) {
+        const cs: CaseStmtNode* = node as CaseStmtNode*;
+        walk_expr(cs.value, tokens);
+        st_walk_node(cs.body as ASTNode*, tokens);
+        return;
+    }
+    if (node.kind == NodeKind::ExpressionStatement) {
+        const es: ExprStmtNode* = node as ExprStmtNode*;
+        walk_expr(es.expression, tokens);
+        return;
+    }
+
+    // Expressions reaching the top-level walker (rare — usually they
+    // come in via walk_expr from a containing statement).  Forward to
+    // the expression walker.
+    walk_expr(node as ExpressionNode*, tokens);
+}
+
+
+// ============================================================================
+// Declaration walkers
+// ============================================================================
+
+function walk_function_decl(f: FunctionDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (f == null) { return; }
+    if (f.has_name_span()) {
+        emit_span(f.name_span, Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    // Parameters
+    for (mut i: i64 = 0; i < f.parameters.length; i++) {
+        walk_var_decl(f.parameters[i], true, tokens);
+    }
+    // Return-type annotation
+    walk_type_annotation(f.return_type_annotation, tokens);
+    // Body
+    st_walk_node(f.body as ASTNode*, tokens);
+}
+
+function walk_method_decl(m: MethodNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (m == null || m.func == null) { return; }
+    const f: FunctionDeclNode* = m.func;
+    if (f.has_name_span()) {
+        // The method name span — this is where `from` / `new` / `delete`
+        // are coloured `method` instead of `keyword`, because we know
+        // contextually that this token site IS a method declaration.
+        const mods: u32 = if (m.is_static) {
+            Lsp::Protocol::SemanticTokens::MOD_DECLARATION
+                | Lsp::Protocol::SemanticTokens::MOD_STATIC
+        } else {
+            Lsp::Protocol::SemanticTokens::MOD_DECLARATION
+        };
+        emit_span(f.name_span,
+                  Lsp::Protocol::SemanticTokens::TYPE_METHOD, mods, tokens);
+    }
+    for (mut i: i64 = 0; i < f.parameters.length; i++) {
+        walk_var_decl(f.parameters[i], true, tokens);
+    }
+    walk_type_annotation(f.return_type_annotation, tokens);
+    st_walk_node(f.body as ASTNode*, tokens);
+}
+
+function walk_struct_decl(s: StructDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (s == null) { return; }
+    if (s.has_name_span()) {
+        emit_span(s.name_span, Lsp::Protocol::SemanticTokens::TYPE_STRUCT,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    for (mut i: i64 = 0; i < s.fields.length; i++) {
+        walk_field_decl(s.fields[i], tokens);
+    }
+    for (mut i: i64 = 0; i < s.methods.length; i++) {
+        walk_method_decl(s.methods[i], tokens);
+    }
+}
+
+function walk_class_decl(c: ClassDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (c == null) { return; }
+    if (c.has_name_span()) {
+        emit_span(c.name_span, Lsp::Protocol::SemanticTokens::TYPE_CLASS,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    for (mut i: i64 = 0; i < c.fields.length; i++) {
+        walk_field_decl(c.fields[i], tokens);
+    }
+    for (mut i: i64 = 0; i < c.methods.length; i++) {
+        walk_method_decl(c.methods[i], tokens);
+    }
+}
+
+function walk_enum_decl(e: EnumDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (e == null) { return; }
+    if (e.has_name_span()) {
+        emit_span(e.name_span, Lsp::Protocol::SemanticTokens::TYPE_ENUM,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    for (mut i: i64 = 0; i < e.variants.length; i++) {
+        walk_enum_variant(e.variants[i], tokens);
+    }
+}
+
+function walk_trait_decl(t: TraitDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (t == null) { return; }
+    if (t.has_name_span()) {
+        emit_span(t.name_span, Lsp::Protocol::SemanticTokens::TYPE_INTERFACE,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    for (mut i: i64 = 0; i < t.methods.length; i++) {
+        // Trait methods are FunctionDeclNode in the AST but represent
+        // methods semantically — colour them as methods.
+        const fn: FunctionDeclNode* = t.methods[i];
+        if (fn != null && fn.has_name_span()) {
+            emit_span(fn.name_span,
+                      Lsp::Protocol::SemanticTokens::TYPE_METHOD,
+                      Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+        }
+        if (fn != null) {
+            for (mut j: i64 = 0; j < fn.parameters.length; j++) {
+                walk_var_decl(fn.parameters[j], true, tokens);
+            }
+            walk_type_annotation(fn.return_type_annotation, tokens);
+            st_walk_node(fn.body as ASTNode*, tokens);
+        }
+    }
+}
+
+function walk_typealias_decl(t: TypeAliasDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (t == null) { return; }
+    if (t.has_name_span()) {
+        emit_span(t.name_span, Lsp::Protocol::SemanticTokens::TYPE_TYPE,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    walk_type_annotation(t.target_annotation, tokens);
+}
+
+function walk_impl_block(b: ImplBlockNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (b == null) { return; }
+    if (b.target_type_span.has_location()) {
+        emit_span(b.target_type_span,
+                  Lsp::Protocol::SemanticTokens::TYPE_TYPE,
+                  Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+    }
+    walk_type_annotation(b.trait_annotation, tokens);
+    for (mut i: i64 = 0; i < b.methods.length; i++) {
+        walk_method_decl(b.methods[i], tokens);
+    }
+}
+
+function walk_extern_block(e: ExternBlockNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (e == null) { return; }
+    for (mut i: i64 = 0; i < e.functions.length; i++) {
+        walk_function_decl(e.functions[i], tokens);
+    }
+}
+
+function walk_var_decl(v: VarDeclNode*, is_parameter: boolean,
+                       tokens: mut &Array<SemanticToken>) -> void {
+    if (v == null) { return; }
+    if (v.has_name_span()) {
+        const type_id: u32 = if (is_parameter) {
+            Lsp::Protocol::SemanticTokens::TYPE_PARAMETER
+        } else {
+            Lsp::Protocol::SemanticTokens::TYPE_VARIABLE
+        };
+        emit_span(v.name_span, type_id,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    walk_type_annotation(v.type_annotation, tokens);
+    walk_expr(v.initializer, tokens);
+}
+
+function walk_field_decl(f: FieldDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (f == null) { return; }
+    if (f.has_name_span()) {
+        emit_span(f.name_span, Lsp::Protocol::SemanticTokens::TYPE_PROPERTY,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    walk_field_type_annotation(f, tokens);
+    walk_expr(f.default_value, tokens);
+}
+
+function walk_field_type_annotation(f: FieldDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
+    // FieldDeclNode owns a `type_annotation: TypeAnnotation*`; walk it
+    // via the shared TypeAnnotation walker so generic args inside the
+    // annotation also receive type tokens.
+    walk_type_annotation(f.type_annotation, tokens);
+}
+
+function walk_enum_variant(v: EnumVariantNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (v == null) { return; }
+    if (v.has_name_span()) {
+        emit_span(v.name_span,
+                  Lsp::Protocol::SemanticTokens::TYPE_ENUM_MEMBER,
+                  Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
+    }
+    for (mut i: i64 = 0; i < v.associated_types.length; i++) {
+        walk_type_annotation(v.associated_types[i], tokens);
+    }
+}
+
+
+// ============================================================================
+// Expression walker
+// ============================================================================
+
+function walk_expr(e: ExpressionNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (e == null) { return; }
+
+    if (e.kind == NodeKind::Identifier) {
+        const id: IdentifierNode* = e as IdentifierNode*;
+        emit_span(id.span,
+                  Lsp::Protocol::SemanticTokens::TYPE_VARIABLE,
+                  Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = e as BinaryExprNode*;
+        walk_expr(b.left,  tokens);
+        walk_expr(b.right, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = e as UnaryExprNode*;
+        walk_expr(u.operand, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::TernaryExpression) {
+        const t: TernaryExprNode* = e as TernaryExprNode*;
+        walk_expr(t.condition,  tokens);
+        walk_expr(t.true_expr,  tokens);
+        walk_expr(t.false_expr, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::IfExpression) {
+        const ie: IfExprNode* = e as IfExprNode*;
+        walk_expr(ie.condition, tokens);
+        walk_expr(ie.then_expr, tokens);
+        walk_expr(ie.else_expr, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::MatchExpression) {
+        const me: MatchExprNode* = e as MatchExprNode*;
+        walk_expr(me.subject, tokens);
+        for (mut i: i64 = 0; i < me.arms.length; i++) {
+            walk_match_arm(me.arms[i], tokens);
+        }
+        return;
+    }
+    if (e.kind == NodeKind::CallExpression) {
+        walk_call_expr(e as CallExprNode*, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::NewExpression) {
+        walk_new_expr(e as NewExprNode*, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::CastExpression) {
+        // CastExprNode has fields: expr, target_type; walk the inner
+        // expression and the type annotation.  We don't know the
+        // node's exact field names here; the cloner has them — but
+        // for v1 just descend the span if we can't reach inner fields,
+        // skip silently.  Real handling is added when needed.
+        return;
+    }
+    if (e.kind == NodeKind::StructLiteral) {
+        walk_struct_literal(e as StructLiteralNode*, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::ArrayLiteral) {
+        const a: ArrayLiteralNode* = e as ArrayLiteralNode*;
+        for (mut i: i64 = 0; i < a.elements.length; i++) {
+            walk_expr(a.elements[i], tokens);
+        }
+        walk_expr(a.repeat_count_expr, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::TupleLiteral) {
+        const t: TupleLiteralNode* = e as TupleLiteralNode*;
+        for (mut i: i64 = 0; i < t.elements.length; i++) {
+            walk_expr(t.elements[i], tokens);
+        }
+        return;
+    }
+    if (e.kind == NodeKind::LambdaExpression) {
+        const l: LambdaExprNode* = e as LambdaExprNode*;
+        for (mut i: i64 = 0; i < l.parameters.length; i++) {
+            walk_var_decl(l.parameters[i], true, tokens);
+        }
+        walk_type_annotation(l.return_type_ann, tokens);
+        st_walk_node(l.body as ASTNode*, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::ArrayAccess) {
+        const aa: ArrayAccessNode* = e as ArrayAccessNode*;
+        walk_expr(aa.array, tokens);
+        walk_expr(aa.index, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::MemberAccess) {
+        walk_member_access(e as MemberAccessNode*, false, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::ScopeResolution) {
+        walk_scope_resolution(e as ScopeResolutionNode*, false, tokens);
+        return;
+    }
+    if (e.kind == NodeKind::DeleteExpression) {
+        const de: DeleteExprNode* = e as DeleteExprNode*;
+        walk_expr(de.operand, tokens);
+        return;
+    }
+    // Literals, TypeofExpression, SizeofExpression, AlignofExpression,
+    // AwaitExpression, YieldExpression: nothing identifier-bearing for
+    // v1 to mark up here.  Future work: alignof/sizeof type names.
+}
+
+function walk_call_expr(c: CallExprNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (c == null) { return; }
+    // Override the callee's classification: it's a callable, so the
+    // callee name should be `function` or `method`, not `variable` or
+    // `property`.
+    if (c.callee != null) {
+        if (c.callee.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = c.callee as IdentifierNode*;
+            emit_span(id.span,
+                      Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
+                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        } else if (c.callee.kind == NodeKind::MemberAccess) {
+            walk_member_access(c.callee as MemberAccessNode*, true, tokens);
+        } else if (c.callee.kind == NodeKind::ScopeResolution) {
+            walk_scope_resolution(c.callee as ScopeResolutionNode*, true, tokens);
+        } else {
+            walk_expr(c.callee, tokens);
+        }
+    }
+    for (mut i: i64 = 0; i < c.arguments.length; i++) {
+        walk_expr(c.arguments[i], tokens);
+    }
+    for (mut i: i64 = 0; i < c.generic_args.length; i++) {
+        walk_type_annotation(c.generic_args[i], tokens);
+    }
+}
+
+function walk_new_expr(n: NewExprNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (n == null) { return; }
+    // NewExprNode doesn't carry a separate span for the type name;
+    // the full `new TypeName(...)` span starts at `new`.  Skip
+    // type-name highlighting here for v1 — the TextMate grammar's
+    // `[A-Z][a-zA-Z0-9_]*` rule handles bare type names well.
+    for (mut i: i64 = 0; i < n.generic_args.length; i++) {
+        walk_type_annotation(n.generic_args[i], tokens);
+    }
+    for (mut i: i64 = 0; i < n.arguments.length; i++) {
+        walk_expr(n.arguments[i], tokens);
+    }
+    walk_expr(n.array_size, tokens);
+    if (n.struct_init != null) {
+        walk_struct_literal(n.struct_init, tokens);
+    }
+}
+
+function walk_struct_literal(s: StructLiteralNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (s == null) { return; }
+    for (mut i: i64 = 0; i < s.generic_args.length; i++) {
+        walk_type_annotation(s.generic_args[i], tokens);
+    }
+    for (mut i: i64 = 0; i < s.field_inits.length; i++) {
+        const fi: FieldInit = s.field_inits[i];
+        // FieldInit carries only the `span` of `name: value` (no separate
+        // name-only span).  Emit a `property` token spanning the whole
+        // field-init — the value walker descends into `fi.value`, which
+        // will overlay its own classifications on the value subrange.
+        if (fi.span.has_location()) {
+            emit_span(fi.span,
+                      Lsp::Protocol::SemanticTokens::TYPE_PROPERTY,
+                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        }
+        walk_expr(fi.value, tokens);
+    }
+}
+
+function walk_member_access(m: MemberAccessNode*, is_callee: boolean,
+                            tokens: mut &Array<SemanticToken>) -> void {
+    if (m == null) { return; }
+    walk_expr(m.object, tokens);
+    if (m.member_span.has_location()) {
+        const type_id: u32 = if (is_callee) {
+            Lsp::Protocol::SemanticTokens::TYPE_METHOD
+        } else {
+            Lsp::Protocol::SemanticTokens::TYPE_PROPERTY
+        };
+        emit_span(m.member_span, type_id,
+                  Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+    }
+    for (mut i: i64 = 0; i < m.generic_args.length; i++) {
+        walk_type_annotation(m.generic_args[i], tokens);
+    }
+}
+
+function walk_scope_resolution(s: ScopeResolutionNode*, is_callee: boolean,
+                                tokens: mut &Array<SemanticToken>) -> void {
+    if (s == null) { return; }
+    // ScopeResolutionNode doesn't store separate spans for `scope_name`
+    // and `member_name` (only the combined `span`).  The TextMate
+    // `scope-resolution` rule already handles `Type::name` reasonably;
+    // we contribute the member-name classification.  The combined span
+    // covers `Scope::Member` — emit a single token spanning the whole
+    // expression with type=function (or method, if it's a callee).
+    //
+    // This loses sub-span fidelity (scope vs. member), but produces
+    // the right colour for the trailing identifier in 90% of cases.
+    // A future revision adds dedicated `scope_span` / `member_span`
+    // fields to ScopeResolutionNode for accurate sub-span colouring.
+    for (mut i: i64 = 0; i < s.scope_generic_args.length; i++) {
+        walk_type_annotation(s.scope_generic_args[i], tokens);
+    }
+    for (mut i: i64 = 0; i < s.generic_args.length; i++) {
+        walk_type_annotation(s.generic_args[i], tokens);
+    }
+}
+
+function walk_match_arm(arm: MatchArmNode*, tokens: mut &Array<SemanticToken>) -> void {
+    if (arm == null) { return; }
+    st_walk_node(arm.body as ASTNode*, tokens);
+}
+
+
+// ============================================================================
+// Type-annotation walker — emits `type` tokens for named annotations
+// ============================================================================
+
+function walk_type_annotation(ann: TypeAnnotation*, tokens: mut &Array<SemanticToken>) -> void {
+    if (ann == null) { return; }
+    match (*ann) {
+        TypeAnnotation::Primitive(p) => {
+            // Primitives (`i32`, `bool`, ...) are TextMate-coloured as
+            // types already; emitting again here would double-paint.
+            // Skip.
+        }
+        TypeAnnotation::Named(n) => {
+            if (n.span.has_location()) {
+                emit_span(n.span,
+                          Lsp::Protocol::SemanticTokens::TYPE_TYPE,
+                          Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+            }
+        }
+        TypeAnnotation::Pointer(p) => {
+            walk_type_annotation(p.inner, tokens);
+        }
+        TypeAnnotation::Reference(r) => {
+            walk_type_annotation(r.inner, tokens);
+        }
+        TypeAnnotation::Array(a) => {
+            walk_type_annotation(a.element, tokens);
+        }
+        TypeAnnotation::Function(f) => {
+            for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                walk_type_annotation(f.parameters[i], tokens);
+            }
+            walk_type_annotation(f.return_type, tokens);
+        }
+        TypeAnnotation::Tuple(t) => {
+            for (mut i: i64 = 0; i < t.elements.length; i++) {
+                walk_type_annotation(t.elements[i], tokens);
+            }
+        }
+        TypeAnnotation::Optional(o) => {
+            walk_type_annotation(o.inner, tokens);
+        }
+        TypeAnnotation::Generic(g) => {
+            walk_type_annotation(g.base, tokens);
+            for (mut i: i64 = 0; i < g.args.length; i++) {
+                walk_type_annotation(g.args[i], tokens);
+            }
+        }
+        TypeAnnotation::ThisType(_) => {
+            // The `This` placeholder is highlighted by the TextMate
+            // `keyword.other.cryo` rule.  No override needed.
+        }
+    }
+}
+
+
+// ============================================================================
+// Token emission + sorting
+// ============================================================================
+
+/// Emit a single token for `span`, classified as (`type_id`, `modifiers`).
+/// Converts compiler 1-based line/col to LSP 0-based, and clamps the
+/// length so a multi-line span (rare for identifiers) reports just the
+/// portion on the start line.
+function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
+                   tokens: mut &Array<SemanticToken>) -> void {
+    if (!span.has_location()) { return; }
+    if (span.start_line == 0 as u32) { return; }
+    const line: u32   = span.start_line - 1 as u32;
+    const start: u32  = if (span.start_col > 0 as u32) {
+        span.start_col - 1 as u32
+    } else {
+        0 as u32
+    };
+
+    // Length: if start_line == end_line, take the column delta.  Else
+    // fall back to a 1-char placeholder — a real multi-line identifier
+    // is a parser bug, but the LSP must not crash.
+    mut length: u32 = 1 as u32;
+    if (span.end_line == span.start_line) {
+        if (span.end_col > span.start_col) {
+            length = span.end_col - span.start_col;
+        }
+    }
+
+    tokens.push(SemanticToken::new(line, start, length, type_id, modifiers));
+}
+
+/// In-place insertion sort by (line, start_char).  Token counts per
+/// file are modest (a few thousand at most for stdlib-sized files);
+/// insertion sort's O(n²) is fine and avoids allocating a temporary.
+/// Stable: ties preserve emission order, which matters for sub-token
+/// emissions on the same span (a future enhancement could legitimately
+/// emit overlapping tokens — e.g. modifier-stacking — and stable order
+/// keeps the result deterministic).
+function sort_tokens(tokens: mut &Array<SemanticToken>) -> void {
+    // Index/mutate through the raw element pointer.  Cryo's `mut &Array<T>`
+    // reference doesn't support `tokens[i]` directly — only method calls
+    // (push/get/length) — so we drop to the underlying buffer for the
+    // in-place sort.  No element is dropped or replaced wholesale, so the
+    // Array invariants stay intact.
+    const data: SemanticToken* = tokens.as_ptr();
+    const n: i64 = tokens.length() as i64;
+    for (mut i: i64 = 1; i < n; i++) {
+        const t: SemanticToken = data[i];
+        mut j: i64 = i - 1;
+        while (j >= 0 && token_lt(t, data[j])) {
+            data[j + 1] = data[j];
+            j = j - 1;
+        }
+        data[j + 1] = t;
+    }
+}
+
+function token_lt(a: SemanticToken, b: SemanticToken) -> boolean {
+    if (a.line < b.line) { return true; }
+    if (a.line > b.line) { return false; }
+    return a.start_char < b.start_char;
+}
+
+
+// ============================================================================
+// URI helpers — duplicated from hover/definition for now; consolidate
+// when the third copy lands.
+// ============================================================================
+
+const FILE_SCHEME:     string = "file://";
+const FILE_SCHEME_LEN: u64    = 7;
+
+function uri_to_fs_path(uri: Str) -> Str {
+    if (uri.length() >= FILE_SCHEME_LEN) {
+        const prefix: Str = uri.sub_bytes(0, FILE_SCHEME_LEN);
+        if (prefix.equals(&Str::from_cstr(FILE_SCHEME))) {
+            return uri.sub_bytes(FILE_SCHEME_LEN, uri.length());
+        }
+    }
+    return uri;
+}

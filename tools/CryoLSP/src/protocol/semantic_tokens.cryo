@@ -1,0 +1,227 @@
+///! Semantic-token wire types (LSP 3.17 §3.6.27).
+///!
+///! Per-document semantic-token responses carry a flat `data: number[]`
+///! array of 5-tuples (deltaLine, deltaStartChar, length, tokenType,
+///! tokenModifiers).  Tokens MUST be sorted by absolute (line, char)
+///! before encoding; the delta form is computed against the previous
+///! token's absolute position, except `deltaStartChar` resets to the
+///! current token's absolute column when `deltaLine != 0`.
+///!
+///! Token types and modifiers are referenced by INDEX into the legend
+///! advertised in `initialize`.  Indexes here MUST match the order of
+///! the arrays returned by `token_types_legend()` and
+///! `token_modifiers_legend()` below.
+///!
+///! Modifiers are a bitmask: bit `i` set means "modifier `i` applies."
+///! Use `MOD_NONE` for no modifiers.
+
+namespace Lsp::Protocol::SemanticTokens;
+
+import std::core::option;
+import std::core::drop;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+
+// ============================================================================
+// Token type indexes — must match `token_types_legend()` ordering
+// ============================================================================
+
+public const TYPE_NAMESPACE:    u32 = 0 as u32;
+public const TYPE_TYPE:         u32 = 1 as u32;
+public const TYPE_CLASS:        u32 = 2 as u32;
+public const TYPE_ENUM:         u32 = 3 as u32;
+public const TYPE_INTERFACE:    u32 = 4 as u32;
+public const TYPE_STRUCT:       u32 = 5 as u32;
+public const TYPE_TYPE_PARAM:   u32 = 6 as u32;
+public const TYPE_PARAMETER:    u32 = 7 as u32;
+public const TYPE_VARIABLE:     u32 = 8 as u32;
+public const TYPE_PROPERTY:     u32 = 9 as u32;
+public const TYPE_ENUM_MEMBER:  u32 = 10 as u32;
+public const TYPE_FUNCTION:     u32 = 11 as u32;
+public const TYPE_METHOD:       u32 = 12 as u32;
+public const TYPE_MACRO:        u32 = 13 as u32;
+public const TYPE_KEYWORD:      u32 = 14 as u32;
+
+
+// ============================================================================
+// Token modifier bit positions — must match `token_modifiers_legend()`
+// ============================================================================
+
+public const MOD_NONE:           u32 = 0 as u32;
+public const MOD_DECLARATION:    u32 = 1 as u32;        // 1 << 0
+public const MOD_DEFINITION:     u32 = 2 as u32;        // 1 << 1
+public const MOD_STATIC:         u32 = 4 as u32;        // 1 << 2
+public const MOD_DEFAULT_LIBRARY:u32 = 8 as u32;        // 1 << 3
+
+
+// ============================================================================
+// SemanticToken — one identifier-bearing span with its classification
+// ============================================================================
+
+/// A single semantic token in 0-based LSP coordinates.  `length` is in
+/// UTF-16 code units (LSP §3.17 spec); for ASCII source this matches
+/// byte length, which is what the compiler hands us via SourceSpan.
+public type struct SemanticToken {
+    line:           u32;
+    start_char:     u32;
+    length:         u32;
+    token_type:     u32;
+    token_modifiers:u32;
+
+    static new(line: u32, start_char: u32, length: u32,
+               token_type: u32, token_modifiers: u32) -> SemanticToken {
+        return SemanticToken {
+            line:            line,
+            start_char:      start_char,
+            length:          length,
+            token_type:      token_type,
+            token_modifiers: token_modifiers,
+        };
+    }
+}
+
+/// SemanticToken owns nothing on the heap — the explicit `drop` impl is
+/// required so `Array<SemanticToken>::drop` (gated on `T: Drop`) can
+/// monomorphize.  Without it the compiler reports E0636 at the call
+/// site that allocates the array.
+implement trait Drop for SemanticToken {
+    drop(mut &this) -> void { }
+}
+
+
+// ============================================================================
+// Legend builders — feed `initialize`'s capability registration
+// ============================================================================
+
+/// Array of token-type names, indexed by the `TYPE_*` constants above.
+/// Order must stay in lockstep with the constants — clients reference
+/// types by index, not name.
+public function token_types_legend() -> JsonValue {
+    mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(16);
+    arr.push(string_jv("namespace"));
+    arr.push(string_jv("type"));
+    arr.push(string_jv("class"));
+    arr.push(string_jv("enum"));
+    arr.push(string_jv("interface"));
+    arr.push(string_jv("struct"));
+    arr.push(string_jv("typeParameter"));
+    arr.push(string_jv("parameter"));
+    arr.push(string_jv("variable"));
+    arr.push(string_jv("property"));
+    arr.push(string_jv("enumMember"));
+    arr.push(string_jv("function"));
+    arr.push(string_jv("method"));
+    arr.push(string_jv("macro"));
+    arr.push(string_jv("keyword"));
+    return JsonValue::Array(arr);
+}
+
+/// Array of modifier names, indexed by bit position.  `MOD_DECLARATION`
+/// is bit 0 → mask `1`; `MOD_STATIC` is bit 2 → mask `4`; etc.
+public function token_modifiers_legend() -> JsonValue {
+    mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(4);
+    arr.push(string_jv("declaration"));
+    arr.push(string_jv("definition"));
+    arr.push(string_jv("static"));
+    arr.push(string_jv("defaultLibrary"));
+    return JsonValue::Array(arr);
+}
+
+/// Build the `semanticTokensProvider` capability object for the
+/// `initialize` response.  Advertises full-document support only;
+/// range and delta are not implemented yet.
+public function provider_capability() -> JsonValue {
+    mut legend: JsonObject = JsonObject::new();
+    legend.insert(String::from_str(Str::from_cstr("tokenTypes")),
+                  token_types_legend());
+    legend.insert(String::from_str(Str::from_cstr("tokenModifiers")),
+                  token_modifiers_legend());
+
+    mut provider: JsonObject = JsonObject::new();
+    provider.insert(String::from_str(Str::from_cstr("legend")),
+                    JsonValue::Object(legend));
+    provider.insert(String::from_str(Str::from_cstr("full")),
+                    JsonValue::Bool(true));
+    return JsonValue::Object(provider);
+}
+
+
+// ============================================================================
+// Encoding — sort + delta-line transform → wire `data: number[]`
+// ============================================================================
+
+/// Encode a sorted token list into the LSP wire format.  The caller
+/// MUST sort `tokens` by (line, start_char) before passing — the
+/// transform produces deltas relative to the previous token and
+/// negative deltas would corrupt the stream.
+///
+/// Output is the `data` array; wrap it in `{ "data": [...] }` at the
+/// call site to form the full SemanticTokens response.
+public function encode_tokens(tokens: &Array<SemanticToken>) -> JsonValue {
+    const n: u64 = tokens.length();
+    mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(n * 5);
+
+    mut prev_line:  u32 = 0 as u32;
+    mut prev_start: u32 = 0 as u32;
+
+    // Index through the raw element pointer — `&Array<T>` doesn't expose
+    // `tokens[i]` directly, only method-style access via `get(i)`.  The
+    // sort caller has already laid the buffer out monotonically, so a
+    // raw read is the cheapest way to drive the delta-line transform.
+    const data: SemanticToken* = tokens.as_ptr();
+    for (mut i: u64 = 0; i < n; i++) {
+        const t: SemanticToken = data[i];
+
+        const delta_line: u32 = t.line - prev_line;
+        const delta_start: u32 = if (delta_line == 0 as u32) {
+            t.start_char - prev_start
+        } else {
+            t.start_char
+        };
+
+        arr.push(u32_jv(delta_line));
+        arr.push(u32_jv(delta_start));
+        arr.push(u32_jv(t.length));
+        arr.push(u32_jv(t.token_type));
+        arr.push(u32_jv(t.token_modifiers));
+
+        prev_line  = t.line;
+        prev_start = t.start_char;
+    }
+
+    return JsonValue::Array(arr);
+}
+
+/// Wrap an encoded `data` array as a full SemanticTokens response:
+/// `{ "data": [ ... ] }`.  Spec also allows an optional `resultId`,
+/// but only `delta` requests need it — full-document responses can
+/// omit it without breaking clients.
+public function response_json(data: JsonValue) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_cstr("data")), data);
+    return JsonValue::Object(o);
+}
+
+/// Empty response for early-return paths (no session, no AST yet).
+/// LSP clients treat an empty `data` array as "no tokens here,"
+/// which lets the TextMate grammar take over.
+public function empty_response() -> JsonValue {
+    mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(0 as u64);
+    return response_json(JsonValue::Array(arr));
+}
+
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function string_jv(cs: string) -> JsonValue {
+    return JsonValue::String(String::from_str(Str::from_cstr(cs)));
+}
+
+function u32_jv(v: u32) -> JsonValue {
+    return JsonValue::Number(JsonNumber::Int(v as i64));
+}

@@ -14,6 +14,7 @@ namespace Compiler::Instance;
 import Compiler::CompileMode;
 import Compiler::CompilationContext;
 import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
 import Compiler::Artifacts;
 import Compiler::Passes::PassID;
 import Compiler::Passes::PassRegistry;
@@ -177,7 +178,7 @@ function resolve_stdlib_root(cli_override: string,
                              project_root: string,
                              tried_out: string[]*) -> string {
     // 0. CLI override.
-    if (strlen(cli_override) > 0) {
+    if (intrinsics::strlen(cli_override) > 0) {
         if (File::exists(cli_override + "/lib.cryo")) {
             return cli_override;
         }
@@ -187,7 +188,7 @@ function resolve_stdlib_root(cli_override: string,
     }
 
     // 1. Explicit env var.
-    const env_raw: i8* = getenv("CRYO_STDLIB") as i8*;
+    const env_raw: i8* = intrinsics::getenv("CRYO_STDLIB") as i8*;
     if (env_raw != null) {
         const env_path: string = env_raw as string;
         if (File::exists(env_path + "/lib.cryo")) {
@@ -203,7 +204,7 @@ function resolve_stdlib_root(cli_override: string,
     // `<CRYO_HOME>/stdlib` (the simple layout install.sh creates today)
     // or `<CRYO_HOME>/share/cryo/stdlib` (FHS layout, in case packagers
     // pick that).  Cross-platform — does not depend on /proc/self/exe.
-    const home_raw: i8* = getenv("CRYO_HOME") as i8*;
+    const home_raw: i8* = intrinsics::getenv("CRYO_HOME") as i8*;
     if (home_raw != null) {
         const home_path: string = home_raw as string;
         const cand_home_simple: string = home_path + "/stdlib";
@@ -225,8 +226,8 @@ function resolve_stdlib_root(cli_override: string,
     // 4. + 5. Binary-relative via /proc/self/exe.  Single 4 KiB scratch
     // buffer is leaked once per compile — same pattern as the path
     // concatenations below, and only happens once per `cryo build`.
-    mut exe_buf: i8* = malloc(4096) as i8*;
-    const exe_len: i64 = readlink("/proc/self/exe", exe_buf, 4096);
+    mut exe_buf: i8* = intrinsics::malloc(4096) as i8*;
+    const exe_len: i64 = intrinsics::readlink("/proc/self/exe", exe_buf, 4096);
     if (exe_len > 0 && exe_len < 4096) {
         exe_buf[exe_len as u64] = 0;
         const exe_path: string = exe_buf as string;
@@ -260,9 +261,9 @@ function resolve_stdlib_root(cli_override: string,
     // relative paths resolved against project_root so a project nested
     // anywhere in the filesystem can still reach a sibling stdlib via
     // `stdlib_root = "../shared-stdlib"`.
-    if (strlen(cryoconfig_override) > 0) {
+    if (intrinsics::strlen(cryoconfig_override) > 0) {
         mut cand_cfg: string = cryoconfig_override;
-        if (cryoconfig_override[0] != '/' && strlen(project_root) > 0) {
+        if (cryoconfig_override[0] != '/' && intrinsics::strlen(project_root) > 0) {
             cand_cfg = project_root + "/" + cryoconfig_override;
         }
         if (File::exists(cand_cfg + "/lib.cryo")) {
@@ -294,7 +295,7 @@ function resolve_stdlib_root(cli_override: string,
 
 /// Path to the lockfile next to a given cryoconfig.
 function lock_path_for(consumer_root: string) -> string {
-    if (strlen(consumer_root) == 0 || strcmp(consumer_root, ".") == 0) {
+    if (intrinsics::strlen(consumer_root) == 0 || intrinsics::strcmp(consumer_root, ".") == 0) {
         return "cryoconfig.lock";
     }
     return format("%s/cryoconfig.lock", consumer_root);
@@ -361,9 +362,9 @@ type struct CompilerInstance {
             const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                 ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
             if (ll_ok == 0) {
-                printf("[Compiler] LLVM IR emitted: %s\n", ll_path);
+                intrinsics::printf("[Compiler] LLVM IR emitted: %s\n", ll_path);
             } else if (ll_err != null) {
-                printf("[Compiler] Warning: failed to write %s: %s\n",
+                intrinsics::printf("[Compiler] Warning: failed to write %s: %s\n",
                        ll_path, ll_err as string);
                 llvm::LLVMDisposeMessage(ll_err as void*);
             }
@@ -531,11 +532,11 @@ type struct CompilerInstance {
         ctx.lsp_override_content = override_content;
         mut config: ProjectConfig = ProjectConfig::parse(config_path);
         if (this.config.output_dir_override != ""
-                && strlen(this.config.output_dir_override) > 0) {
+                && intrinsics::strlen(this.config.output_dir_override) > 0) {
             config.output_dir = this.config.output_dir_override;
         }
         if (this.config.target_triple_override != ""
-                && strlen(this.config.target_triple_override) > 0) {
+                && intrinsics::strlen(this.config.target_triple_override) > 0) {
             config.target_triple = this.config.target_triple_override;
         }
         // Multi-target projects ([lib] + [[bin]]) need a single view
@@ -556,7 +557,7 @@ type struct CompilerInstance {
             for (mut bi: int = 0; bi < config.bins.length; bi++) {
                 const bin_full: string = format("%s/%s",
                     config.project_root, config.bins[bi].entry_point);
-                if (strcmp(bin_full, override_path) == 0) {
+                if (intrinsics::strcmp(bin_full, override_path) == 0) {
                     chosen = bi;
                     break;
                 }
@@ -580,7 +581,7 @@ type struct CompilerInstance {
         ctx.switch_to_module(mod_idx as i64);
         // Load AST from local buffer
         if (ast_buf != null && mod_idx < mod_count) {
-            const slot: void** = ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
+            const slot: void** = intrinsics::ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
             const ast: ProgramNode* = *slot as ProgramNode*;
             if (ast != null) {
                 const info: ModuleInfo = ctx.module_graph.modules[mod_idx];
@@ -600,7 +601,7 @@ type struct CompilerInstance {
         CompilerInstance::load_module(ctx, intern, ast_buf, mod_idx, mod_count);
         // Restore saved scope
         if (scope_buf != null && mod_idx < mod_count && ctx.resolver != null) {
-            const sc_slot: u64* = ptr_add(scope_buf, (mod_idx * 8) as i64) as u64*;
+            const sc_slot: u64* = intrinsics::ptr_add(scope_buf, (mod_idx * 8) as i64) as u64*;
             const saved_scope: u64 = *sc_slot;
             if (saved_scope > 0) {
                 const info: ModuleInfo = ctx.module_graph.modules[mod_idx];
@@ -628,13 +629,13 @@ type struct CompilerInstance {
         // reads it.  Required for self-host fixed-point testing
         // (S3 → S4 vs S4 → S5) where each stage needs its own output tree.
         if (this.config.output_dir_override != ""
-                && strlen(this.config.output_dir_override) > 0) {
+                && intrinsics::strlen(this.config.output_dir_override) > 0) {
             config.output_dir = this.config.output_dir_override;
         }
         // CLI `--target=TRIPLE` overrides the cryoconfig `target` key.
         // Empty string in either slot means "build for the host".
         if (this.config.target_triple_override != ""
-                && strlen(this.config.target_triple_override) > 0) {
+                && intrinsics::strlen(this.config.target_triple_override) > 0) {
             config.target_triple = this.config.target_triple_override;
         }
 
@@ -685,7 +686,7 @@ type struct CompilerInstance {
             const bin_view: ProjectConfig = make_bin_view(base, base.bins[i]);
             const r: CompilationResult = this.compile_project_with_config(bin_view);
             if (!r.success) { return r; }
-            if (strlen(r.output_path) > 0) { last_output = r.output_path; }
+            if (intrinsics::strlen(r.output_path) > 0) { last_output = r.output_path; }
         }
 
         return CompilationResult::ok(last_output);
@@ -702,10 +703,10 @@ type struct CompilerInstance {
 
         if (!File::exists(root_path)) {
             if (config.requires_entry_point()) {
-                printf("[Compiler] Error: Entry point not found: %s\n", root_path);
+                intrinsics::printf("[Compiler] Error: Entry point not found: %s\n", root_path);
             } else {
-                printf("[Compiler] Error: Library root not found: %s\n", root_path);
-                printf("[Compiler] Expected lib.cryo in source_dir '%s'\n", config.source_dir);
+                intrinsics::printf("[Compiler] Error: Library root not found: %s\n", root_path);
+                intrinsics::printf("[Compiler] Expected lib.cryo in source_dir '%s'\n", config.source_dir);
             }
             return CompilationResult::failed(1, 0);
         }
@@ -780,31 +781,31 @@ type struct CompilerInstance {
                 config.stdlib_root,
                 config.project_root,
                 &tried);
-            if (strlen(stdlib_root) > 0) {
+            if (intrinsics::strlen(stdlib_root) > 0) {
                 cdebug("[Compiler] Stdlib root: %s\n", stdlib_root);
             } else {
                 // No prelude available: hard-fail rather than silently
                 // compile a project that can't see `Result`, `String`,
                 // etc.  Pass `--no-std` (or set `no_std = true` in
                 // cryoconfig) for genuinely freestanding builds.
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "error: cannot locate the Cryo standard library\n");
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "  none of the candidate paths contained a 'lib.cryo':\n");
                 for (mut ti: i64 = 0; ti < tried.length; ti++) {
-                    fprintf(g_stderr, "    %s\n", tried[ti]);
+                    intrinsics::fprintf(g_stderr, "    %s\n", tried[ti]);
                 }
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "  fix one of:\n");
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "    --stdlib=PATH                            (one-off override)\n");
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
-                fprintf(g_stderr,
+                intrinsics::fprintf(g_stderr,
                     "    --no-std                                 (build without the standard library)\n");
                 return CompilationResult::failed(1, 0);
             }
@@ -845,7 +846,7 @@ type struct CompilerInstance {
         // *now* — not whatever's on disk.  Without this, a freshly
         // typed `import std::collections::str` is invisible to the
         // discovery walk and `Str::from_cstr` fails to resolve.
-        if (strlen(ctx.lsp_override_path) > 0) {
+        if (intrinsics::strlen(ctx.lsp_override_path) > 0) {
             loader.set_lsp_override(
                 ctx.lsp_override_path, ctx.lsp_override_content);
         }
@@ -855,7 +856,28 @@ type struct CompilerInstance {
             root_path, this.config.debug);
 
         if (!discovery_ok) {
-            printf("[Compiler] Module discovery failed\n");
+            // Flush deferred diagnostics so the user actually SEES the
+            // reason discovery failed (E0500 module-not-found, parse
+            // errors during quick-scan, etc.).  Without this, the
+            // normal end-of-pipeline flush at line ~395 never runs
+            // because we early-return here, and the user gets only
+            // the bare "Module discovery failed" line with no
+            // underlying cause.  Mode-gated like the main flush:
+            // LSP mode owns stdout for JSON-RPC, so we skip rendering
+            // there and let the LSP's diagnostic-publish path surface
+            // the same diagnostics through `textDocument/publishDiagnostics`.
+            const skip_flush_disc: boolean = match (ctx.mode) {
+                CompileMode::Lsp => { true }
+                _                => { false }
+            };
+            if (!skip_flush_disc) {
+                ctx.diagnostics.flush();
+                if (ctx.diag_renderer != null) {
+                    ctx.diag_renderer.print_summary(
+                        ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
+                }
+            }
+            intrinsics::printf("[Compiler] Module discovery failed\n");
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
@@ -863,7 +885,7 @@ type struct CompilerInstance {
         // auto-imports are enabled.  Module discovery runs before AutoImport
         // injects the synthetic `import std::prelude`, so prelude submodules
         // wouldn't otherwise be discovered.
-        if (ctx.mode.auto_imports_enabled() && !config.no_std && strlen(stdlib_root) > 0) {
+        if (ctx.mode.auto_imports_enabled() && !config.no_std && intrinsics::strlen(stdlib_root) > 0) {
             const prelude_path: string = stdlib_root + "/prelude.cryo";
             if (File::exists(prelude_path)) {
                 loader.discover_module(
@@ -892,7 +914,7 @@ type struct CompilerInstance {
                 cdebug("[Compiler] tests/ directory not found at %s — running with no tests\n",
                     tests_dir);
             }
-            if (!config.no_std && strlen(stdlib_root) > 0) {
+            if (!config.no_std && intrinsics::strlen(stdlib_root) > 0) {
                 const env_path: string = format("%s/env/_module.cryo", stdlib_root);
                 if (File::exists(env_path)) {
                     loader.discover_module(
@@ -913,7 +935,7 @@ type struct CompilerInstance {
         cdebug("[Compiler] name_index.length=%u\n", ctx.module_graph.name_index.length());
 
         if (ctx.module_graph.module_count() == 0) {
-            printf("[Compiler] No modules discovered\n");
+            intrinsics::printf("[Compiler] No modules discovered\n");
             return CompilationResult::failed(1, 0);
         }
 
@@ -939,10 +961,10 @@ type struct CompilerInstance {
         // Using local variables avoids deep nested struct field assignment
         // (ctx.module_graph.field = x) which the codegen may not persist.
         const buf_size: u64 = n as u64 * 8;
-        const ast_buf: void* = malloc(buf_size);
-        memset(ast_buf, 0, buf_size);
-        const scope_buf: void* = malloc(buf_size);
-        memset(scope_buf, 0, buf_size);
+        const ast_buf: void* = intrinsics::malloc(buf_size);
+        intrinsics::memset(ast_buf, 0, buf_size);
+        const scope_buf: void* = intrinsics::malloc(buf_size);
+        intrinsics::memset(scope_buf, 0, buf_size);
 
         // Phase 2: Frontend — lex, parse, validate all modules in topo order
         cdebug("[Compiler] Phase 2: Building frontend pipeline...\n");
@@ -963,12 +985,12 @@ type struct CompilerInstance {
             cdebug("[Compiler] Phase 2: Module %u path='%s'\n", i, ctx.source_file);
             cdebug("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
             if (!pipeline.run_all(ctx)) {
-                printf("[Compiler] Phase 2: run_all FAILED for module %u:\n", i);
+                intrinsics::printf("[Compiler] Phase 2: run_all FAILED for module %u:\n", i);
                 return this.project_failure(ctx);
             }
             cdebug("[Compiler] Phase 2: Module %u succeeded\n", i);
             // Save the parsed AST using local buffer
-            const ast_slot: void** = ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
+            const ast_slot: void** = intrinsics::ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
             *ast_slot = ctx.artifacts.ast.root as void*;
             // Mirror into the module_graph's per-module AST table so
             // out-of-band consumers (the LSP for hover/definition) can
@@ -1001,7 +1023,7 @@ type struct CompilerInstance {
                 const scope_val: u64 = ctx.resolver.get_current_scope_id();
                 const sc_idx: u32 = ctx.active_module_index as u32;
                 if (sc_idx < n) {
-                    const sc_slot: u64* = ptr_add(scope_buf, (sc_idx * 8) as i64) as u64*;
+                    const sc_slot: u64* = intrinsics::ptr_add(scope_buf, (sc_idx * 8) as i64) as u64*;
                     *sc_slot = scope_val;
                 }
             }
@@ -1215,11 +1237,11 @@ type struct CompilerInstance {
             for (mut i: u32 = 0; i < n; i++) {
                 const mi: u32 = order[i];
                 if (mi < n && ast_buf != null) {
-                    const dump_slot: void** = ptr_add(ast_buf, (mi * 8) as i64) as void**;
+                    const dump_slot: void** = intrinsics::ptr_add(ast_buf, (mi * 8) as i64) as void**;
                     const dump_ast: ProgramNode* = *dump_slot as ProgramNode*;
                     if (dump_ast != null) {
                         const mod_info: ModuleInfo = ctx.module_graph.modules[mi];
-                        printf("\n=== AST: %s ===\n", mod_info.file_path);
+                        intrinsics::printf("\n=== AST: %s ===\n", mod_info.file_path);
                         ASTDumper::dump(dump_ast, ctx.intern_table);
                     }
                 }
@@ -1308,9 +1330,9 @@ type struct CompilerInstance {
                     // Write .ll text file when --emit-llvm is set
                     // (either via CLI flag or cryoconfig args).
                     if (this.config.emit_llvm || config.emit_llvm) {
-                        const mn_len: u64 = strlen(mod_name);
-                        const mn_buf: i8* = malloc(mn_len + 1) as i8*;
-                        memcpy(mn_buf as void*, mod_name as void*, mn_len);
+                        const mn_len: u64 = intrinsics::strlen(mod_name);
+                        const mn_buf: i8* = intrinsics::malloc(mn_len + 1) as i8*;
+                        intrinsics::memcpy(mn_buf as void*, mod_name as void*, mn_len);
                         mn_buf[mn_len] = 0;
                         for (mut k: u64 = 0; k < mn_len; k++) {
                             if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
@@ -1321,11 +1343,11 @@ type struct CompilerInstance {
                         const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                             ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
                         if (ll_ok != 0 && ll_err != null) {
-                            printf("[Compiler] Warning: failed to write %s: %s\n",
+                            intrinsics::printf("[Compiler] Warning: failed to write %s: %s\n",
                                    ll_path, ll_err as string);
                             llvm::LLVMDisposeMessage(ll_err as void*);
                         }
-                        free(mn_buf as void*);
+                        intrinsics::free(mn_buf as void*);
                     }
 
                     if (pipeline_ok) {
@@ -1334,7 +1356,7 @@ type struct CompilerInstance {
                         cdebug("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
                     }
                 } else if (!pipeline_ok) {
-                    printf("[Compiler] Phase 7: Codegen FAILED for module %u\n", i);
+                    intrinsics::printf("[Compiler] Phase 7: Codegen FAILED for module %u\n", i);
                 }
 
                 // Dispose the LLVM module to free LLVM global context memory.
@@ -1356,7 +1378,7 @@ type struct CompilerInstance {
                 cdebug("[Compiler] Phase 7b: Synthesizing test main\n");
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
-                    printf("[Compiler] Phase 7b: test-main synthesis FAILED\n");
+                    intrinsics::printf("[Compiler] Phase 7b: test-main synthesis FAILED\n");
                 }
             }
 
@@ -1368,7 +1390,7 @@ type struct CompilerInstance {
                     ctx.artifacts.object_files.length);
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
-                    printf("[Compiler] Phase 8: Linking FAILED\n");
+                    intrinsics::printf("[Compiler] Phase 8: Linking FAILED\n");
                 }
             }
         }

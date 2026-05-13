@@ -84,7 +84,7 @@ function parse_int_lexeme(s: string) -> u64 {
 /// codegen trusts that and just uses this to recover the slot number.
 function parse_tuple_member_index(s: string) -> i64 {
     if (s == null) { return -1; }
-    const len: i64 = strlen(s) as i64;
+    const len: i64 = intrinsics::strlen(s) as i64;
     if (len == 0) { return -1; }
     mut acc: i64 = 0;
     for (mut i: i64 = 0; i < len; i++) {
@@ -134,7 +134,7 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
     } else if (kind == LiteralKind::Float) {
         if (!ty.is_valid()) { ty = LType::f64(); }
         mut val: f64 = 0.0;
-        sscanf(node.value, "%lf", &val);
+        intrinsics::sscanf(node.value, "%lf", &val);
         *out_value = LType::const_real(ty, val);
     } else if (kind == LiteralKind::String) {
         *out_value = cg.get_or_create_string_literal(node.value);
@@ -146,7 +146,7 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
         // this, every character-literal escape in cryoc source is wrong
         // (e.g., `c == '\n'` in skip_whitespace never matches).
         mut char_val: u64 = 0;
-        const len: i64 = strlen(node.value) as i64;
+        const len: i64 = intrinsics::strlen(node.value) as i64;
         if (len >= 2 && node.value[0] == '\\') {
             const esc: char = node.value[1];
             if      (esc == 'n')  { char_val = 10; }
@@ -206,16 +206,16 @@ function codegen_identifier(cg: CodegenContext*, node: IdentifierNode*,
     // the identifier reference.  These match the C++ reference compiler's
     // behavior (ExpressionCodegen.cpp handles `FILE` / `LINE` specially).
     const name_str: string = cg.resolve(node.name);
-    if (strcmp(name_str, "FILE") == 0) {
+    if (intrinsics::strcmp(name_str, "FILE") == 0) {
         mut filename: string = node.span.file;
-        if (filename == null || strlen(filename) == 0) {
+        if (filename == null || intrinsics::strlen(filename) == 0) {
             filename = "<unknown>";
         }
         *out_value = cg.builder.build_global_string_ptr(filename, "FILE.str");
         *out_is_lvalue = false;
         return;
     }
-    if (strcmp(name_str, "LINE") == 0) {
+    if (intrinsics::strcmp(name_str, "LINE") == 0) {
         const line: u64 = node.span.start_line as u64;
         *out_value = LType::const_int(LType::i32(), line, false);
         *out_is_lvalue = false;
@@ -295,12 +295,12 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
                 // string + int → GEP i8 for pointer arithmetic.  Caller
                 // uses this idiom for substring-from-offset, C-string
                 // walking, etc.
-                const buf: void* = malloc(8);
+                const buf: void* = intrinsics::malloc(8);
                 const slots: void** = buf as void**;
                 slots[0] = rhs_val.raw;
                 *out_value = cg.builder.build_gep(
                     LType::i8(), lhs_val, buf, 1, "ptradv");
-                free(buf);
+                intrinsics::free(buf);
                 return;
             }
             // string + string → call std::core::primitives::string::append.
@@ -425,12 +425,12 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             if (op_kind == TokenType::Minus) {
                 idx = cg.builder.build_neg(rhs_val, "gep.neg");
             }
-            const buf: void* = malloc(8);
+            const buf: void* = intrinsics::malloc(8);
             const slots: void** = buf as void**;
             slots[0] = idx.raw;
             *out_value = cg.builder.build_gep(
                 pointee_lty, lhs_val, buf, 1, "ptradv");
-            free(buf);
+            intrinsics::free(buf);
             return;
         }
     }
@@ -652,12 +652,12 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
     mut expected_count: u32 = llvm::LLVMCountParamTypes(callee_type.raw);
     mut param_types_buf: void* = null;
     if (expected_count > 0 && expected_count <= 64) {
-        param_types_buf = malloc(expected_count as u64 * 8);
+        param_types_buf = intrinsics::malloc(expected_count as u64 * 8);
         llvm::LLVMGetParamTypes(callee_type.raw, param_types_buf);
     }
 
     // Build argument array, coercing integer widths where needed.
-    const buf: void* = malloc(n as u64 * 8);
+    const buf: void* = intrinsics::malloc(n as u64 * 8);
     const slots: void** = buf as void**;
     const param_types: void** = param_types_buf as void**;
     for (mut i: u32 = 0; i < n; i++) {
@@ -783,10 +783,10 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
         }
         slots[i] = arg_val.raw;
     }
-    if (param_types_buf != null) { free(param_types_buf); }
+    if (param_types_buf != null) { intrinsics::free(param_types_buf); }
 
     *out_value = cg.builder.build_call(callee_type, callee, buf, n, name);
-    free(buf);
+    intrinsics::free(buf);
 }
 
 
@@ -1202,11 +1202,11 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
             const ptr_ty: LType = LType::pointer_to(elem_ty);
             data_ptr = cg.builder.build_load(ptr_ty, array_val, "ptrload");
         }
-        const buf: void* = malloc(8);
+        const buf: void* = intrinsics::malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
         const gep: LValue = cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
-        free(buf);
+        intrinsics::free(buf);
         *out_value = gep;
         *out_is_lvalue = true;
         return;
@@ -1231,11 +1231,11 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
             const i8_ptr_ty: LType = LType::pointer_to(i8_ty);
             data_ptr = cg.builder.build_load(i8_ptr_ty, array_val, "strptr");
         }
-        const buf: void* = malloc(8);
+        const buf: void* = intrinsics::malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
         const byte_ptr: LValue = cg.builder.build_gep(i8_ty, data_ptr, buf, 1, "charptr");
-        free(buf);
+        intrinsics::free(buf);
         *out_value = byte_ptr;
         *out_is_lvalue = true;
         return;
@@ -1279,12 +1279,12 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         const arr_ty: LType = cg.type_mapper.map_type(array_type);
         // Build indices: [0, index]
         const zero: LValue = LType::const_int(LType::i64(), 0, false);
-        const buf: void* = malloc(16);
+        const buf: void* = intrinsics::malloc(16);
         const slots: void** = buf as void**;
         slots[0] = zero.raw;
         slots[1] = index_val.raw;
         const gep: LValue = cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
-        free(buf);
+        intrinsics::free(buf);
         *out_value = gep;
         *out_is_lvalue = true;
     } else {
@@ -1299,11 +1299,11 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
             struct_val = cg.builder.build_load(arr_ty, array_val, "arrload");
         }
         const data_ptr: LValue = cg.builder.build_extract_value(struct_val, 0, "data");
-        const buf: void* = malloc(8);
+        const buf: void* = intrinsics::malloc(8);
         const slots: void** = buf as void**;
         slots[0] = index_val.raw;
         const gep: LValue = cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
-        free(buf);
+        intrinsics::free(buf);
         *out_value = gep;
         *out_is_lvalue = true;
     }
@@ -1373,13 +1373,13 @@ function coerce_fixed_array_to_fat_ptr(cg: CodegenContext*, val: LValue,
     // Build the fat-pointer struct: { data_ptr, count, count }.
     const elem_ptr_lty: LType = LType::pointer_to(elem_lty);
     const i64_ty: LType = LType::i64();
-    const buf: void* = malloc(24);
+    const buf: void* = intrinsics::malloc(24);
     const slots: void** = buf as void**;
     slots[0] = elem_ptr_lty.raw;
     slots[1] = i64_ty.raw;
     slots[2] = i64_ty.raw;
     const fat_ty: LType = LType::literal_struct(buf, 3, false);
-    free(buf);
+    intrinsics::free(buf);
 
     const fat: LValue = cg.create_entry_alloca(fn_val, "arrlit.fat", fat_ty);
     const ptr_slot: LValue = cg.builder.build_struct_gep(fat_ty, fat, 0, "fat.ptr");
@@ -1575,24 +1575,24 @@ function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
     mut strcmp_fn: LValue = resolve_function(cg, strcmp_sym);
     if (!strcmp_fn.is_valid()) {
         const i8_ptr: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = malloc(16);
+        const param_buf: void* = intrinsics::malloc(16);
         const params: void** = param_buf as void**;
         params[0] = i8_ptr.raw;
         params[1] = i8_ptr.raw;
         const strcmp_ty: LType = LType::function_type(LType::i32(), param_buf, 2, false);
-        free(param_buf);
+        intrinsics::free(param_buf);
         strcmp_fn = cg.llvm_module.add_function(strcmp_name, strcmp_ty);
         cg.register_function(strcmp_sym, strcmp_fn);
     }
 
     // Call strcmp(lhs, rhs).
     const strcmp_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(strcmp_fn.raw) };
-    const arg_buf: void* = malloc(16);
+    const arg_buf: void* = intrinsics::malloc(16);
     const args: void** = arg_buf as void**;
     args[0] = lhs.raw;
     args[1] = rhs.raw;
     const cmp_result: LValue = cg.builder.build_call(strcmp_ty, strcmp_fn, arg_buf, 2, "strcmp");
-    free(arg_buf);
+    intrinsics::free(arg_buf);
 
     // strcmp returns 0 when equal.
     const zero: LValue = LType::const_int(LType::i32(), 0, false);
