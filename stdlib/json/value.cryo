@@ -19,6 +19,7 @@ import core::result;
 import core::hash;
 import core::cmp;
 import core::drop;
+import core::convert;
 import collections::array;
 import collections::hashmap;
 import collections::string;
@@ -362,57 +363,82 @@ implement enum JsonValue {
 }
 
 // ============================================================================
-// FromJson — trait that backs the generic `get_as_or<T>` getter.
+// TryFrom<&JsonValue> — extract typed scalars from a JsonValue borrow.
 //
 // Each implementation says "here is how to extract a `T` from a
-// `JsonValue` borrow." Implementations return `None` when the
-// variant doesn't match (e.g. asking for `i64` from a `Bool`) or
-// when the value can't be represented as `T` without loss
+// `JsonValue` borrow." Implementations return `Err(ConversionError)`
+// when the variant doesn't match (e.g. asking for `i64` from a
+// `Bool`) or when the value can't be represented as `T` without loss
 // (`UInt(u64::MAX)` requested as `i64`).
 //
-// Third-party types can implement `FromJson` to participate in
-// `get_as_or` without touching the stdlib.
+// Third-party types can implement `TryFrom<&JsonValue>` to slot into
+// generic `T::try_from(&json)` getters without touching the stdlib.
 // ============================================================================
 
-type trait FromJson {
-    static from_json(value: &JsonValue) -> Option<This>;
-}
-
-implement trait FromJson for boolean {
-    static from_json(value: &JsonValue) -> Option<boolean> {
-        return value.as_bool();
+implement trait TryFrom<&JsonValue> for boolean {
+    static try_from(value: &JsonValue) -> Result<boolean, ConversionError> {
+        match (value.as_bool()) {
+            Option::Some(b) => { return Result::Ok(b); }
+            Option::None    => {
+                return Result::Err(ConversionError::new(
+                    "JsonValue is not a Bool"));
+            }
+        }
     }
 }
 
-implement trait FromJson for i64 {
-    static from_json(value: &JsonValue) -> Option<i64> {
-        return value.as_i64();
+implement trait TryFrom<&JsonValue> for i64 {
+    static try_from(value: &JsonValue) -> Result<i64, ConversionError> {
+        match (value.as_i64()) {
+            Option::Some(n) => { return Result::Ok(n); }
+            Option::None    => {
+                return Result::Err(ConversionError::new(
+                    "JsonValue is not representable as i64"));
+            }
+        }
     }
 }
 
-implement trait FromJson for u64 {
-    static from_json(value: &JsonValue) -> Option<u64> {
-        return value.as_u64();
+implement trait TryFrom<&JsonValue> for u64 {
+    static try_from(value: &JsonValue) -> Result<u64, ConversionError> {
+        match (value.as_u64()) {
+            Option::Some(n) => { return Result::Ok(n); }
+            Option::None    => {
+                return Result::Err(ConversionError::new(
+                    "JsonValue is not representable as u64"));
+            }
+        }
     }
 }
 
-implement trait FromJson for f64 {
-    static from_json(value: &JsonValue) -> Option<f64> {
-        return value.as_f64();
+implement trait TryFrom<&JsonValue> for f64 {
+    static try_from(value: &JsonValue) -> Result<f64, ConversionError> {
+        match (value.as_f64()) {
+            Option::Some(n) => { return Result::Ok(n); }
+            Option::None    => {
+                return Result::Err(ConversionError::new(
+                    "JsonValue is not a Number"));
+            }
+        }
     }
 }
 
-/// `Str` is a non-owning view into the JsonValue's owned `String`
-/// (or, in the `_or` form, into the fallback's bytes). Valid for
-/// the lifetime of the parent `JsonValue`.
-implement trait FromJson for Str {
-    static from_json(value: &JsonValue) -> Option<Str> {
-        return value.as_str();
+/// `Str` is a non-owning view into the JsonValue's owned `String`.
+/// Valid for the lifetime of the parent `JsonValue`.
+implement trait TryFrom<&JsonValue> for Str {
+    static try_from(value: &JsonValue) -> Result<Str, ConversionError> {
+        match (value.as_str()) {
+            Option::Some(s) => { return Result::Ok(s); }
+            Option::None    => {
+                return Result::Err(ConversionError::new(
+                    "JsonValue is not a String"));
+            }
+        }
     }
 }
 
 // Note: a generic `get_or<T>(parent, key, fallback)` free function
-// would belong here, routing through `T::from_json(...)`. Today the
+// would belong here, routing through `T::try_from(...)`. Today the
 // Cryo monomorphizer doesn't reliably emit generic free functions
 // from a stdlib module when the only call sites are in a downstream
 // project; until that lands, callers define a one-liner local helper
