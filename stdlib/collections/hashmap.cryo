@@ -19,8 +19,10 @@ import core::result;
 import core::cmp;
 import core::hash;
 import core::drop;
+import core::iter;
 import alloc::layout;
 import alloc::allocator;
+import collections::pair;
 
 const INITIAL_BUCKETS: u64 = 8;
 
@@ -101,6 +103,25 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     get_bucket(&this, index: u64) -> Entry<K, V>* {
         if (this.buckets == null || index >= this.bucket_count) { return null; }
         return this.buckets[index];
+    }
+
+    /// Iterate over every entry, yielding `Pair<K, V>` (key first,
+    /// value second). Iteration order is bucket-major and undefined
+    /// across resizes — do not rely on it.
+    ///
+    /// Yielded keys and values are bitcopies of the live entries; the
+    /// iterator is a borrow-style view, so do not drop the yielded
+    /// pair's members for owning `K` / `V` (the storage still belongs
+    /// to the map). The iterator is invalidated by any mutation that
+    /// inserts, removes, or resizes — same contract as `as_ptr` /
+    /// `get_ptr`.
+    iter(&this) -> HashMapIter<K, V> {
+        return HashMapIter<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
     }
 
     // ========================================================================
@@ -332,6 +353,42 @@ type struct HashMap<K, V, A = GlobalAlloc> {
                 return Result::Ok(());
             }
             Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+}
+
+// ============================================================================
+// HashMapIter — bucket-major forward iterator over a HashMap
+//
+// State machine: `current` walks the active chain; when it reaches null
+// the iterator advances `bucket_index` until it finds a non-empty
+// bucket or exhausts the table.  Holds raw pointers into the live map's
+// storage, so any mutation that resizes or removes invalidates it.
+// ============================================================================
+
+type struct HashMapIter<K, V> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    bucket_index: u64;
+    current: Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<Pair<K, V>> for struct HashMapIter<K, V> {
+    next(mut &this) -> Option<Pair<K, V>> {
+        loop {
+            if (this.current != null) {
+                const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(Pair<K, V> {
+                    first: entry.key,
+                    second: entry.value
+                });
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
         }
     }
 }
