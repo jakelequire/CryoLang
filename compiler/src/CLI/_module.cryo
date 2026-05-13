@@ -318,6 +318,17 @@ public:
         // Try command dispatch first (build, check, raw, project, help, version)
         const resolved: CommandKind = CLI::Commands::Executor::resolve(first_arg);
         if (resolved != CommandKind::Unknown) {
+            // Per-subcommand `--help`/`-h` intercept.  Without this, each
+            // command's `args.has_flag("help")` boolean was set but no command
+            // body checked it — `cryo build --help` returned "No input file",
+            // `cryo init --help` started the interactive prompt.
+            for (mut hi: int = 2; hi < argc; hi++) {
+                const t: string = argv[hi];
+                if (strcmp(t, "--help") == 0 || strcmp(t, "-h") == 0) {
+                    this.print_command_help(first_arg);
+                    return 0;
+                }
+            }
             const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
             return this.dispatch(first_arg, args);
         }
@@ -387,6 +398,23 @@ public:
 
     print_version(&this) -> void {
         printf("%s version %s\n", this.program_name, this.version);
+    }
+
+    /// Per-subcommand help: usage line, one-line description, and a
+    /// pointer to the global flag list.  Called when the user types
+    /// `cryo <subcmd> --help` (or `-h`).
+    print_command_help(&this, cmd_name: string) -> void {
+        match (this.commands.get(&cmd_name)) {
+            Option::Some(cmd) => {
+                printf("%s\n\n", cmd.description);
+                printf("Usage: %s\n\n", cmd.usage);
+            }
+            Option::None => {
+                printf("Unknown command '%s'.\n\n", cmd_name);
+            }
+        }
+        printf("Run `%s --help` for the full flag list and stdlib lookup order.\n",
+            this.program_name);
     }
 
 private:

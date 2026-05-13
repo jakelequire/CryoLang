@@ -104,12 +104,12 @@ If the pinned binary is missing or you want to rebuild from source, see [Buildin
 
 | Dependency | Version | Why |
 | --- | --- | --- |
-| `clang` | 20 | Used for header preprocessing and as a linker driver. |
-| `LLVM` | 20 | Required only if you rebuild the compiler from source. |
+| `clang` | 20 | Linker driver invoked at compile time. |
+| `LLVM` | 20 (runtime + dev) | `bin/cryo` dynamically links `libLLVM.so.20.1`. The `-dev` package is additionally required to rebuild the compiler from source. |
 | `make` | 4.0+ | Top-level build orchestration. |
 | `python3` | 3.8+ | Drives `make selfhost-check`. |
 
-A pre-built `bin/cryo` makes `clang` 20 the only hard runtime dependency.
+The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev`. The first install also runs `make stdlib` to produce `stdlib/.bin/libcryo.a` (which is gitignored), so a clean checkout needs the build toolchain even when using the pinned binary.
 
 ---
 
@@ -122,7 +122,7 @@ cryo init hello
 cd hello
 ```
 
-`cryo init` is interactive — pressing Enter accepts every default. When invoked as `cryo init <dir>` the directory becomes the default project name, so `cryo init hello && echo | head` is effectively non-interactive.
+`cryo init` is interactive — pressing Enter accepts every default. When invoked as `cryo init <dir>` the directory becomes the default project name; piping empty lines (`yes "" | cryo init hello`) accepts every prompt non-interactively.
 
 This produces:
 

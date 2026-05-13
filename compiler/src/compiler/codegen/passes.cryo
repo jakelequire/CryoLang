@@ -27,6 +27,46 @@ import Utils::Logger;
 
 
 // ============================================================================
+// Shell-quoting helper
+// ============================================================================
+
+/// POSIX-shell-safe quote a path or argument for use in `system()` /
+/// `sh -c` commands.  Wraps the input in single quotes and rewrites any
+/// embedded single quote as the four-byte sequence `'\''` — single-quoted
+/// strings are not interpreted by `/bin/sh` at all, so this neutralises
+/// every shell metacharacter (spaces, $, `, *, ;, !, &, etc).
+///
+/// libc's `system(3)` runs the command through `sh -c`, so any
+/// interpolated user-controlled path needs this treatment.  Without it,
+/// a working directory with a space breaks linking, and a path containing
+/// shell metacharacters is an arbitrary-command-execution hazard.
+function shell_quote(s: string) -> string {
+    const len: u64 = intrinsics::strlen(s);
+    // Worst case: every byte is a single quote, expanding to 4 bytes,
+    // plus two outer quotes and a NUL terminator.
+    const cap: u64 = len * 4 + 3;
+    const buf: i8* = intrinsics::malloc(cap) as i8*;
+    mut o: u64 = 0;
+    buf[o] = '\''; o = o + 1;
+    const sb: i8* = s as i8*;
+    for (mut i: u64 = 0; i < len; i++) {
+        const ch: i8 = sb[i];
+        if (ch == '\'') {
+            buf[o] = '\''; o = o + 1;
+            buf[o] = '\\'; o = o + 1;
+            buf[o] = '\''; o = o + 1;
+            buf[o] = '\''; o = o + 1;
+        } else {
+            buf[o] = ch; o = o + 1;
+        }
+    }
+    buf[o] = '\''; o = o + 1;
+    buf[o] = 0;
+    return buf as string;
+}
+
+
+// ============================================================================
 // Cascade-strip helper
 // ============================================================================
 
@@ -641,19 +681,22 @@ type struct CodegenPasses {
             format("%s/%s", bin_dir, cfg.project_name)
         };
 
-        // Build the link command.  Use string accumulation via format so
-        // the arg list stays on one process-level invocation — libc's
-        // system(3) runs `sh -c` so shell quoting rules apply.
-        mut cmd: string = format("cc -o %s", exe_path);
+        // Build the link command.  libc's system(3) runs `sh -c`, so
+        // every interpolated path must be shell-quoted — without it, a
+        // working directory with a space breaks the link, and a path
+        // containing shell metacharacters is a command-injection hazard.
+        mut cmd: string = format("cc -o %s", shell_quote(exe_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, ctx.artifacts.object_files[i]);
+            cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
         }
-        // Project-configured -L paths and -l libs.
+        // Project-configured -L paths and -l libs.  -L and -l are
+        // single-token args with the value glued to the flag, so the
+        // quoting goes around the value only.
         for (mut i: i64 = 0; i < cfg.link_paths.length; i++) {
-            cmd = format("%s -L%s", cmd, cfg.link_paths[i]);
+            cmd = format("%s -L%s", cmd, shell_quote(cfg.link_paths[i]));
         }
         for (mut i: i64 = 0; i < cfg.link_libs.length; i++) {
-            cmd = format("%s -l%s", cmd, cfg.link_libs[i]);
+            cmd = format("%s -l%s", cmd, shell_quote(cfg.link_libs[i]));
         }
         // Stdlib archive: cryoc emits `<stdlib_root>/.bin/libcryo.a`
         // when it batch-builds the stdlib (see bundle_archive); pull
@@ -665,7 +708,7 @@ type struct CodegenPasses {
         if (!cfg.no_std && intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
-            cmd = format("%s %s", cmd, stdlib_archive);
+            cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
         }
         // Cryo runtime support is fully inline-lowered by cryoc itself —
         // every bare-name intrinsic (i32_to_i64, ptr_add, format, bswap*,
@@ -699,8 +742,12 @@ type struct CodegenPasses {
         // pollute the user's terminal in the silent default mode.
         const ll_path: string = format("%s.ll", exe_path);
         const obj_dir: string = format("%s/obj", output_dir);
+        // Shell-quote obj_dir but leave `/*.ll` unquoted so the glob still
+        // expands.  Adjacent shell tokens concatenate, so the result of
+        // `'<dir>'/*.ll` is exactly the expansion the linker needs.
         const ll_cmd: string = format(
-            "llvm-link-20 -S %s/*.ll -o %s 2>/dev/null", obj_dir, ll_path);
+            "llvm-link-20 -S %s/*.ll -o %s 2>/dev/null",
+            shell_quote(obj_dir), shell_quote(ll_path));
         const ll_rc: i32 = system(ll_cmd);
         if (ll_rc == 0) {
             cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
@@ -725,9 +772,9 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        mut cmd: string = format("cc -o %s", exe_path);
+        mut cmd: string = format("cc -o %s", shell_quote(exe_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, ctx.artifacts.object_files[i]);
+            cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
         }
         // Stdlib archive — same lookup as the project link path.  Empty
         // stdlib_root means single-file mode never resolved one (e.g.
@@ -737,7 +784,7 @@ type struct CodegenPasses {
         if (intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
-            cmd = format("%s %s", cmd, stdlib_archive);
+            cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
         }
         cmd = format("%s -lm -lstdc++", cmd);
 
@@ -780,9 +827,10 @@ type struct CodegenPasses {
         // pay only one process spawn.  `r` replaces stale members on
         // re-bundle, `c` suppresses the empty-archive warning, `s` writes
         // the symbol index that `ld` consults to satisfy references.
-        mut cmd: string = format("ar rcs %s", archive_path);
+        // Every interpolated path is shell-quoted — `system(3)` runs `sh -c`.
+        mut cmd: string = format("ar rcs %s", shell_quote(archive_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, ctx.artifacts.object_files[i]);
+            cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
         }
 
         if (ctx.debug_mode) {

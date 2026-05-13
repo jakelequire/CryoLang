@@ -131,6 +131,15 @@ type struct CompilationResult {
         };
     }
 
+    static ok_with_warnings(output_path: string, warnings: u32) -> CompilationResult {
+        return CompilationResult {
+            success:       true,
+            error_count:   0,
+            warning_count: warnings,
+            output_path:   output_path,
+        };
+    }
+
     static failed(errors: u32, warnings: u32) -> CompilationResult {
         return CompilationResult {
             success:       false,
@@ -362,10 +371,12 @@ type struct CompilerInstance {
             const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                 ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
             if (ll_ok == 0) {
-                intrinsics::printf("[Compiler] LLVM IR emitted: %s\n", ll_path);
+                intrinsics::fprintf(g_stderr,
+                    "[Compiler] LLVM IR emitted: %s\n", ll_path);
             } else if (ll_err != null) {
-                intrinsics::printf("[Compiler] Warning: failed to write %s: %s\n",
-                       ll_path, ll_err as string);
+                intrinsics::fprintf(g_stderr,
+                    "warning: failed to write %s: %s\n",
+                    ll_path, ll_err as string);
                 llvm::LLVMDisposeMessage(ll_err as void*);
             }
         }
@@ -414,7 +425,8 @@ type struct CompilerInstance {
             ctx.source_file, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
 
         if (success) {
-            return CompilationResult::ok(output_path);
+            return CompilationResult::ok_with_warnings(
+                output_path, ctx.diagnostics.warning_count);
         }
         return CompilationResult::failed(
             ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
@@ -473,6 +485,27 @@ type struct CompilerInstance {
         ctx.output_kind          = this.config.output_kind;
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
+    }
+
+    /// Compile for `cryo check`: frontend + semantic analysis, no codegen,
+    /// but with normal diagnostic flush so the user sees warnings/errors.
+    /// `compile_for_lsp` cannot serve this path because `CompileMode::Lsp`
+    /// suppresses the end-of-pipeline flush (the LSP surfaces diagnostics
+    /// via JSON-RPC instead), which made `cryo check` silently swallow
+    /// every warning including the unknown-directive warning.
+    compile_for_check(&this, source: string) -> CompilationResult {
+        if (!File::exists(source)) {
+            intrinsics::fprintf(g_stderr,
+                "error: file not found: %s\n", source);
+            return CompilationResult::failed(1, 0);
+        }
+
+        mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
+        ctx.debug_mode = this.config.debug;
+        mut tried: string[] = [];
+        ctx.stdlib_root = resolve_stdlib_root(this.config.stdlib_path_override, "", "", &tried);
+        mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
+        return this.run_pipeline(&ctx, &pipeline, "");
     }
 
     /// Compile for LSP: frontend + semantic analysis, no codegen.
@@ -702,11 +735,18 @@ type struct CompilerInstance {
             config.project_name, config.target_type.label(), root_path, config.no_std as int);
 
         if (!File::exists(root_path)) {
+            // Route to stderr: stdout in LSP mode owns the JSON-RPC stream;
+            // any stray byte desynchronises Content-Length framing.  These
+            // fire before a CompilationContext exists, so we can't route
+            // through ctx.diagnostics yet.
             if (config.requires_entry_point()) {
-                intrinsics::printf("[Compiler] Error: Entry point not found: %s\n", root_path);
+                intrinsics::fprintf(g_stderr,
+                    "error: entry point not found: %s\n", root_path);
             } else {
-                intrinsics::printf("[Compiler] Error: Library root not found: %s\n", root_path);
-                intrinsics::printf("[Compiler] Expected lib.cryo in source_dir '%s'\n", config.source_dir);
+                intrinsics::fprintf(g_stderr,
+                    "error: library root not found: %s\n", root_path);
+                intrinsics::fprintf(g_stderr,
+                    "  expected lib.cryo in source_dir '%s'\n", config.source_dir);
             }
             return CompilationResult::failed(1, 0);
         }
@@ -877,7 +917,11 @@ type struct CompilerInstance {
                         ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
                 }
             }
-            intrinsics::printf("[Compiler] Module discovery failed\n");
+            // Diagnostics carrying the actual failure reason were already
+            // flushed above (gated on non-LSP mode).  This trailing marker
+            // goes to stderr — never stdout — to avoid corrupting the
+            // LSP JSON-RPC stream when the daemon embeds the compiler.
+            intrinsics::fprintf(g_stderr, "error: module discovery failed\n");
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
@@ -935,7 +979,7 @@ type struct CompilerInstance {
         cdebug("[Compiler] name_index.length=%u\n", ctx.module_graph.name_index.length());
 
         if (ctx.module_graph.module_count() == 0) {
-            intrinsics::printf("[Compiler] No modules discovered\n");
+            intrinsics::fprintf(g_stderr, "error: no modules discovered\n");
             return CompilationResult::failed(1, 0);
         }
 
@@ -985,7 +1029,8 @@ type struct CompilerInstance {
             cdebug("[Compiler] Phase 2: Module %u path='%s'\n", i, ctx.source_file);
             cdebug("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
             if (!pipeline.run_all(ctx)) {
-                intrinsics::printf("[Compiler] Phase 2: run_all FAILED for module %u:\n", i);
+                intrinsics::fprintf(g_stderr,
+                    "error: frontend pipeline failed for module %u\n", i);
                 return this.project_failure(ctx);
             }
             cdebug("[Compiler] Phase 2: Module %u succeeded\n", i);
@@ -1343,8 +1388,9 @@ type struct CompilerInstance {
                         const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                             ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
                         if (ll_ok != 0 && ll_err != null) {
-                            intrinsics::printf("[Compiler] Warning: failed to write %s: %s\n",
-                                   ll_path, ll_err as string);
+                            intrinsics::fprintf(g_stderr,
+                                "warning: failed to write %s: %s\n",
+                                ll_path, ll_err as string);
                             llvm::LLVMDisposeMessage(ll_err as void*);
                         }
                         intrinsics::free(mn_buf as void*);
@@ -1356,7 +1402,8 @@ type struct CompilerInstance {
                         cdebug("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
                     }
                 } else if (!pipeline_ok) {
-                    intrinsics::printf("[Compiler] Phase 7: Codegen FAILED for module %u\n", i);
+                    intrinsics::fprintf(g_stderr,
+                        "error: codegen failed for module %u\n", i);
                 }
 
                 // Dispose the LLVM module to free LLVM global context memory.
@@ -1378,7 +1425,8 @@ type struct CompilerInstance {
                 cdebug("[Compiler] Phase 7b: Synthesizing test main\n");
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
-                    intrinsics::printf("[Compiler] Phase 7b: test-main synthesis FAILED\n");
+                    intrinsics::fprintf(g_stderr,
+                        "error: test-main synthesis failed\n");
                 }
             }
 
@@ -1390,7 +1438,8 @@ type struct CompilerInstance {
                     ctx.artifacts.object_files.length);
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
-                    intrinsics::printf("[Compiler] Phase 8: Linking FAILED\n");
+                    intrinsics::fprintf(g_stderr,
+                        "error: linking failed\n");
                 }
             }
         }
