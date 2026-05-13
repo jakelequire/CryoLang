@@ -1,12 +1,14 @@
-///! HashMap<K, V> — insert/get/contains_key/remove/length.
+///! HashMap<K, V> — insert/get/contains_key/remove/length/iter.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::HashMapT;
 
 import std::core::result;
 import std::core::option;
+import std::core::iter;
 import std::collections::hashmap;
 import std::collections::str;
+import std::collections::pair;
 import std::test::error;
 import std::test::assert;
 
@@ -379,4 +381,112 @@ function remove_all_then_reinsert() -> Result<(), TestError> {
     }
     const want_len: u64 = 2;
     return expect_eq(len, want_len);
+}
+
+// ============================================================================
+// iter() — bucket-major traversal yields every entry exactly once
+// ============================================================================
+
+![test]
+function iter_empty_map_yields_none() -> Result<(), TestError> {
+    // Empty (never-allocated) map: bucket_count == 0, buckets == null.
+    // The iterator must handle that without dereferencing.
+    mut map: HashMap<u32, i32> = HashMap::new();
+    mut it: HashMapIter<u32, i32> = map.iter();
+    const first: Option<Pair<u32, i32>> = it.next();
+    map.drop();
+    return expect_none(&first,
+        Str::new("iter on empty HashMap should be None on the first next()"));
+}
+
+![test]
+function iter_visits_every_entry_exactly_once() -> Result<(), TestError> {
+    // Insert N entries, iterate, expect to see N entries with the
+    // correct value-for-key correspondence. Order is undefined, so
+    // accumulate via key-sum and value-sum and pin those.
+    mut map: HashMap<u32, i32> = HashMap::new();
+    map.insert(1, 10);
+    map.insert(2, 20);
+    map.insert(3, 30);
+    map.insert(4, 40);
+
+    mut it: HashMapIter<u32, i32> = map.iter();
+    mut visited: u64 = 0;
+    mut key_sum: u32 = 0;
+    mut value_sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(p) => {
+                visited = visited + 1;
+                key_sum = key_sum + p.first;
+                value_sum = value_sum + p.second;
+            }
+            Option::None => { break; }
+        }
+    }
+    map.drop();
+
+    const want_visited: u64 = 4;
+    match (expect_eq(visited, want_visited)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // 1+2+3+4 == 10
+    const want_keys: u32 = 10;
+    match (expect_eq(key_sum, want_keys)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // 10+20+30+40 == 100
+    return expect_eq(value_sum, 100);
+}
+
+![test]
+function iter_count_default_walks_to_exhaustion() -> Result<(), TestError> {
+    // HashMapIter does not override count — verify the trait default
+    // walks next() until None and returns the right length.
+    mut map: HashMap<u32, i32> = HashMap::new();
+    map.insert(1, 100);
+    map.insert(2, 200);
+    map.insert(3, 300);
+
+    mut it: HashMapIter<u32, i32> = map.iter();
+    const got: u64 = it.count();
+    map.drop();
+    const want: u64 = 3;
+    return expect_eq(got, want);
+}
+
+![test]
+function iter_spans_multiple_buckets_after_resize() -> Result<(), TestError> {
+    // Force a resize by inserting past the initial 8-bucket threshold
+    // (HashMap doubles when length >= bucket_count). The iterator
+    // must still visit every entry — i.e., bucket-advance logic works
+    // across bucket_count > 1.
+    mut map: HashMap<u32, i32> = HashMap::new();
+    mut i: u32 = 0;
+    while (i < 20) {
+        map.insert(i, (i as i32) * 2);
+        i = i + 1;
+    }
+
+    mut it: HashMapIter<u32, i32> = map.iter();
+    mut visited: u64 = 0;
+    mut value_sum: i64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(p) => {
+                visited = visited + 1;
+                value_sum = value_sum + (p.second as i64);
+            }
+            Option::None => { break; }
+        }
+    }
+    map.drop();
+
+    const want_visited: u64 = 20;
+    match (expect_eq(visited, want_visited)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // 2 * (0 + 1 + ... + 19) == 2 * 190 == 380
+    const want_sum: i64 = 380;
+    return expect_eq(value_sum, want_sum);
 }

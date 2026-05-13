@@ -3458,7 +3458,66 @@ public:
         if (strlen(scope_str) == 0 || strlen(member_str) == 0) { return; }
         const combined: string = format("%s::%s", scope_str, member_str);
         const sym: SymbolStr = this.intern.intern(combined);
+
+        // When several trait impls register the same method name on the
+        // same target type (e.g. `TryFrom<i64> for u64` AND
+        // `TryFrom<Str> for u64` — both expose `u64::try_from`), the
+        // combined-name pin is ambiguous: codegen would pick whichever
+        // overload `resolve_function` happens to discover first.
+        // Match on arg types when available and pin the chosen overload's
+        // mangled LLVM symbol; this is the static-method peer of
+        // `try_pin_overload_mangled_callee` for direct calls.
+        if (this.try_pin_static_method_overload(call, sym)) { return; }
+
         call.set_resolved_callee(sym);
+    }
+
+    /// Static-method overload selection by argument type.  When the
+    /// combined `Type::method` symbol has multiple FunctionType overloads
+    /// registered (multi-impl situation above), walk them and pick the
+    /// one whose declared param types match the call's argument types.
+    /// On a unique match, pin the overload-specific mangled name and
+    /// return true.  Returns false for any non-uniquely-resolvable case
+    /// (no overloads, single overload, unresolved arg types, zero or
+    /// multiple matches) — the caller falls back to combined-name pinning.
+    try_pin_static_method_overload(mut &this, call: CallExprNode*,
+                                    combined_sym: SymbolStr) -> boolean {
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const overloads: TypeRef[] = di.lookup_func_type_overloads(combined_sym);
+        if (overloads.length < 2) { return false; }
+
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return false; }
+            arg_types.push(arg.resolved_type);
+        }
+
+        mut matched: i64 = -1;
+        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+            const ot: Type* = this.arena.lookup(overloads[oi].id);
+            if (ot == null || ot.kind != TypeKind::Function) { continue; }
+            const fn_ty: FunctionType* = ot as FunctionType*;
+            if (fn_ty.param_types.length != arg_types.length) { continue; }
+            mut all_match: boolean = true;
+            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
+                if (!this.overload_param_matches_arg(
+                        fn_ty.param_types[pi], arg_types[pi])) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (!all_match) { continue; }
+            if (matched != -1) { return false; }
+            matched = oi;
+        }
+        if (matched < 0) { return false; }
+
+        const mangled: SymbolStr = di.lookup_overload_mangled(
+            combined_sym, overloads[matched]);
+        if (!mangled.is_valid()) { return false; }
+        call.set_resolved_callee(mangled);
+        return true;
     }
 
     /// Pin `resolved_callee` to a pre-built qualified callee symbol (used
