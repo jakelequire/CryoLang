@@ -27,6 +27,7 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Diag;
 import Compiler::Diag::SourceSpan;
+import std::collections::pair;
 
 
 // ============================================================================
@@ -329,9 +330,9 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             const this_ty: LType = LType::pointer_to(LType::i8());
             const this_slot: LValue = cg.builder.build_alloca(this_ty, "strcat.this");
             cg.builder.build_store(lhs_val, this_slot);
-            mut args: LValue[] = [];
-            args.push(this_slot);
-            args.push(rhs_val);
+            mut args: Pair<LValue, TypeRef>[] = [];
+            args.push(Pair<LValue, TypeRef>::new(this_slot, TypeRef::invalid()));
+            args.push(Pair<LValue, TypeRef>::new(rhs_val, TypeRef::invalid()));
             codegen_call(cg, fn_val, fn_ty, args, "strcat", out_value);
             return;
         }
@@ -626,8 +627,15 @@ function codegen_unary(cg: CodegenContext*, operand: LValue, op_kind: TokenType,
 /// Generate IR for a function call.
 /// Coerces integer argument widths to match the callee's LLVM parameter
 /// types (e.g., i8→i32 for memset, i32→i64 for u64 params).
+///
+/// Each `args[i]` carries the LLVM value (`.first`) and the Cryo-level
+/// type of that arg (`.second`).  The Cryo type drives the sext-vs-zext
+/// choice when the formal param is wider than the supplied value.  Use
+/// `TypeRef::invalid()` for slots where the type isn't known (low-level
+/// callers wiring up malloc/free/abort with already-matched widths);
+/// invalid slots fall back to `zext`.
 function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
-                      args: LValue[], name: string,
+                      args: Pair<LValue, TypeRef>[], name: string,
                       out_value: LValue*) -> void {
     const n: u32 = args.length as u32;
 
@@ -653,7 +661,8 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
     const slots: void** = buf as void**;
     const param_types: void** = param_types_buf as void**;
     for (mut i: u32 = 0; i < n; i++) {
-        mut arg_val: LValue = args[i];
+        mut arg_val: LValue = args[i as i64].first;
+        const arg_ty_ref: TypeRef = args[i as i64].second;
         if (arg_val.is_valid() && param_types_buf != null && i < expected_count) {
             const expected_ty: void* = param_types[i];
             const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
@@ -742,12 +751,30 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
                 }
             } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
-                // Both integers — coerce widths if needed.
+                // Both integers — coerce widths if needed.  Picking sext
+                // vs zext from the *source* Cryo type's signedness is
+                // load-bearing: an i32 holding `-1` (0xFFFFFFFF) widened
+                // to i64 must become 0xFFFFFFFFFFFFFFFF (sext), not
+                // 0x00000000FFFFFFFF (zext).  Defaulting to zext silently
+                // corrupted any negative signed-narrow arg passed to a
+                // wider parameter.
                 const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
                 const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
                 if (aw < ew) {
                     const target: LType = LType { raw: expected_ty };
-                    arg_val = cg.builder.build_zext(arg_val, target, "arg.widen");
+                    mut src_signed: boolean = false;
+                    if (arg_ty_ref.is_valid()) {
+                        const at_t: Type* = cg.lookup_type_by_id(arg_ty_ref.id);
+                        if (at_t != null && at_t.kind == TypeKind::Int) {
+                            const it: IntType* = at_t as IntType*;
+                            src_signed = it.int_kind.is_signed();
+                        }
+                    }
+                    if (src_signed) {
+                        arg_val = cg.builder.build_sext(arg_val, target, "arg.widen");
+                    } else {
+                        arg_val = cg.builder.build_zext(arg_val, target, "arg.widen");
+                    }
                 } else if (aw > ew) {
                     const target: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_trunc(arg_val, target, "arg.trunc");
@@ -1332,8 +1359,8 @@ function coerce_fixed_array_to_fat_ptr(cg: CodegenContext*, val: LValue,
     const malloc_fn: LValue = resolve_function(cg, cg.intern_str("malloc"));
     if (!malloc_fn.is_valid()) { return val; }
     const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-    mut malloc_args: LValue[] = [];
-    malloc_args.push(total_bytes_val);
+    mut malloc_args: Pair<LValue, TypeRef>[] = [];
+    malloc_args.push(Pair<LValue, TypeRef>::new(total_bytes_val, TypeRef::invalid()));
     mut data_ptr: LValue = LValue::null();
     codegen_call(cg, malloc_fn, malloc_ty, malloc_args, "arrlit.heap", &data_ptr);
     if (!data_ptr.is_valid()) { return val; }
@@ -1611,8 +1638,8 @@ function heap_box_enum_variant(cg: CodegenContext*, et: EnumType*,
     }
 
     const size_val: LValue = LType::const_int(LType::i64(), size, false);
-    mut malloc_args: LValue[] = [];
-    malloc_args.push(size_val);
+    mut malloc_args: Pair<LValue, TypeRef>[] = [];
+    malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
     mut raw_ptr: LValue = LValue::null();
     codegen_call(cg, malloc_fn, malloc_ty, malloc_args, "newenum", &raw_ptr);
 

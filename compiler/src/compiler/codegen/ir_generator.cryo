@@ -43,6 +43,7 @@ import Compiler::Resolver::InternTable;
 import Compiler::Resolver::QualifiedName;
 import Compiler::Resolver::MangledName;
 import Utils::Logger;
+import std::collections::pair;
 
 
 // ============================================================================
@@ -471,8 +472,8 @@ public:
         // `this` is LLVM param 0 of the enclosing constructor.
         const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
 
-        mut ctor_args: LValue[] = [];
-        ctor_args.push(this_arg);
+        mut ctor_args: Pair<LValue, TypeRef>[] = [];
+        ctor_args.push(Pair<LValue, TypeRef>::new(this_arg, base_type));
         mut any_arg_invalid: boolean = false;
         for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
             const arg_node: ExpressionNode* = node.base_ctor_args[i];
@@ -520,7 +521,7 @@ public:
                     }
                 }
             }
-            ctor_args.push(arg);
+            ctor_args.push(Pair<LValue, TypeRef>::new(arg, arg_node.resolved_type));
         }
         if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
 
@@ -868,7 +869,7 @@ public:
             this.cg.builder.position_at_end(no_match_bb);
             const abort_fn: LValue = get_or_decl_abort(this.cg);
             const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-            mut a_args: LValue[] = [];
+            mut a_args: Pair<LValue, TypeRef>[] = [];
             mut a_res: LValue = LValue::null();
             codegen_call(this.cg, abort_fn, abort_ty, a_args, "", &a_res);
             this.cg.builder.build_unreachable();
@@ -1519,8 +1520,28 @@ public:
             };
             mut result: LValue = LValue::null();
             codegen_binary(this.cg, lhs_loaded, rhs, base_op, node.resolved_type, &result);
-            this.cg.builder.build_store(result, addr);
-            this.last_value = result;
+            // Narrow-store fix: codegen_binary normalizes operand widths to
+            // the wider of lhs/rhs, so when the LHS slot is a narrow int
+            // (char / i8 / u8) and the RHS is wider, `result` is wider than
+            // the destination.  `store` writes the full result width — left
+            // unfixed, `buf[k] += '_'` over an i8 slot clobbers the next
+            // 3 bytes, the same class of bug that produced the chartrunc
+            // path on the plain `=` branch above.  Truncate when the
+            // stored type's LLVM width exceeds the destination slot's.
+            mut store_val: LValue = result;
+            if (result.is_valid()) {
+                const res_ty: void* = llvm::LLVMTypeOf(result.raw);
+                if (type_kind_of(res_ty) == LTypeKind::Integer &&
+                    type_kind_of(lhs_ty.raw) == LTypeKind::Integer) {
+                    const res_w: u32 = llvm::LLVMGetIntTypeWidth(res_ty);
+                    const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty.raw);
+                    if (res_w > lhs_w) {
+                        store_val = this.cg.builder.build_trunc(result, lhs_ty, "compound.trunc");
+                    }
+                }
+            }
+            this.cg.builder.build_store(store_val, addr);
+            this.last_value = store_val;
             this.last_is_lvalue = false;
             return;
         }
@@ -1619,12 +1640,48 @@ public:
                 return;
             }
             const old: LValue = this.cg.builder.build_load(ty, addr, "incdec.old");
-            const one: LValue = LType::const_int(ty, 1, false);
-            const updated: LValue = if (op == TokenType::PlusPlus) {
-                this.cg.builder.build_add(old, one, "inctmp")
+            // Pointer ++/-- must lower to a GEP over the pointee, not an
+            // integer add — LLVM rejects `add ptr, i64`.  `++p` advances
+            // one pointee-sized slot; `--p` retreats one.  Mirrors the
+            // `ptr + int` path in codegen_binary (expr_codegen.cryo).
+            const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
+            mut is_ptr: boolean = false;
+            mut elem_ty_ref: TypeRef = TypeRef::invalid();
+            if (op_t != null) {
+                if (op_t.kind == TypeKind::Pointer) {
+                    is_ptr = true;
+                    const ptr_t: PointerType* = op_t as PointerType*;
+                    elem_ty_ref = ptr_t.pointee;
+                } else if (op_t.kind == TypeKind::Reference) {
+                    is_ptr = true;
+                    const ref_t: ReferenceType* = op_t as ReferenceType*;
+                    elem_ty_ref = ref_t.referent;
+                }
+            }
+            mut updated: LValue = LValue::null();
+            if (is_ptr) {
+                const pointee_lty: LType = this.cg.type_mapper.map_type(elem_ty_ref);
+                if (!pointee_lty.is_valid()) {
+                    this.last_value = LValue::null();
+                    this.last_is_lvalue = false;
+                    return;
+                }
+                const step: i64 = if (op == TokenType::PlusPlus) { 1 } else { -1 };
+                const idx_val: LValue = LType::const_int(LType::i64(), step as u64, true);
+                const buf: void* = malloc(8);
+                const slots: void** = buf as void**;
+                slots[0] = idx_val.raw;
+                updated = this.cg.builder.build_gep(
+                    pointee_lty, old, buf, 1, "incdec.gep");
+                free(buf);
             } else {
-                this.cg.builder.build_sub(old, one, "dectmp")
-            };
+                const one: LValue = LType::const_int(ty, 1, false);
+                updated = if (op == TokenType::PlusPlus) {
+                    this.cg.builder.build_add(old, one, "inctmp")
+                } else {
+                    this.cg.builder.build_sub(old, one, "dectmp")
+                };
+            }
             this.cg.builder.build_store(updated, addr);
             this.last_value = old;
             this.last_is_lvalue = false;
@@ -1781,10 +1838,11 @@ public:
                             }
                             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
                             if (ctor_ty.is_valid() && type_kind_of(ctor_ty.raw) == LTypeKind::Function) {
-                                mut ctor_args: LValue[] = [];
-                                ctor_args.push(obj_alloca);
+                                mut ctor_args: Pair<LValue, TypeRef>[] = [];
+                                ctor_args.push(Pair<LValue, TypeRef>::new(obj_alloca, node.resolved_type));
                                 for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
-                                    ctor_args.push(this.codegen_rvalue(node.arguments[ci]));
+                                    const carg: LValue = this.codegen_rvalue(node.arguments[ci]);
+                                    ctor_args.push(Pair<LValue, TypeRef>::new(carg, node.arguments[ci].resolved_type));
                                 }
                                 mut ctor_res: LValue = LValue::null();
                                 codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_res);
@@ -1859,9 +1917,10 @@ public:
                         const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
                         const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, "fn.ptr.load");
                         // Codegen arguments.
-                        mut call_args: LValue[] = [];
+                        mut call_args: Pair<LValue, TypeRef>[] = [];
                         for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                            call_args.push(this.codegen_rvalue(node.arguments[ai]));
+                            const av: LValue = this.codegen_rvalue(node.arguments[ai]);
+                            call_args.push(Pair<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
                         }
                         // Build the call.
                         const void_ty: LType = LType::void_type();
@@ -2195,9 +2254,10 @@ public:
                 }
                 // Codegen user args (no implicit `this` — the fn-pointer field
                 // is a plain function, not a bound method).
-                mut fnp_args: LValue[] = [];
+                mut fnp_args: Pair<LValue, TypeRef>[] = [];
                 for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                    fnp_args.push(this.codegen_rvalue(node.arguments[ai]));
+                    const av: LValue = this.codegen_rvalue(node.arguments[ai]);
+                    fnp_args.push(Pair<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
                 }
                 const void_ty: LType = LType::void_type();
                 const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
@@ -2417,7 +2477,12 @@ public:
             return;
         }
 
-        mut args: LValue[] = [];
+        // `Pair<LValue, TypeRef>` per arg — the type drives sext-vs-zext
+        // when codegen_call needs to widen a narrow integer to the formal
+        // param's LLVM width.  Receivers are pointer/reference-typed and
+        // never hit the integer-widening path, but we record the receiver
+        // type anyway to keep the array meaningful end-to-end.
+        mut args: Pair<LValue, TypeRef>[] = [];
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             // For pointer/reference receivers (e.g. `runner: Runner*`),
@@ -2432,11 +2497,11 @@ public:
             } else {
                 obj = this.codegen_lvalue(ma.object);
             }
-            args.push(obj);
+            args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             const arg: LValue = this.codegen_rvalue(node.arguments[i]);
-            args.push(arg);
+            args.push(Pair<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
         }
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
@@ -2454,11 +2519,11 @@ public:
         // function — it describes the correct signature for `LLVMBuildCall2`
         // and matches whatever override got installed in the slot at
         // runtime (since all overrides share the base's signature).
-        if (vtable_dispatch && args.length > 0 && args[0].is_valid() && vtable_obj_ref.is_valid()) {
+        if (vtable_dispatch && args.length > 0 && args[0].first.is_valid() && vtable_obj_ref.is_valid()) {
             const class_lty: LType = this.cg.type_mapper.map_type(vtable_obj_ref);
             if (class_lty.is_valid()) {
                 const vptr_slot: LValue = this.cg.builder.build_struct_gep(
-                    class_lty, args[0], 0, "vptr.slot");
+                    class_lty, args[0].first, 0, "vptr.slot");
                 if (vptr_slot.is_valid()) {
                     const i8_ptr_ty: LType = LType::pointer_to(LType::i8());
                     const i8_ptr_ptr_ty: LType = LType::pointer_to(i8_ptr_ty);
@@ -2747,8 +2812,8 @@ public:
                 return;
             }
             const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            mut malloc_args: LValue[] = [];
-            malloc_args.push(byte_count);
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
             codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "arrdata", &data_ptr);
             if (!data_ptr.is_valid()) {
                 this.last_value = LValue::null();
@@ -2888,8 +2953,8 @@ public:
                 return;
             }
             const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            mut malloc_args: LValue[] = [];
-            malloc_args.push(byte_count);
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
             mut data_ptr: LValue = LValue::null();
             codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "filldata", &data_ptr);
             if (!data_ptr.is_valid()) {
@@ -3459,7 +3524,7 @@ public:
             this.cg.builder.position_at_end(default_bb);
             const abort_fn_e: LValue = get_or_decl_abort(this.cg);
             const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
-            mut a_args_e: LValue[] = [];
+            mut a_args_e: Pair<LValue, TypeRef>[] = [];
             mut a_res_e: LValue = LValue::null();
             codegen_call(this.cg, abort_fn_e, abort_ty_e, a_args_e, "", &a_res_e);
             this.cg.builder.build_unreachable();
@@ -3618,8 +3683,8 @@ public:
         // `args.length` (e.g., `codegen_call`) then feeds the garbage into
         // `LLVMBuildCall2` as NumArgs → `bad_alloc`.  `push` on an empty
         // array initializes the struct correctly.
-        mut malloc_args: LValue[] = [];
-        malloc_args.push(size_val);
+        mut malloc_args: Pair<LValue, TypeRef>[] = [];
+        malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
         mut raw_ptr: LValue = LValue::null();
         codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "newtmp", &raw_ptr);
 
@@ -3732,11 +3797,11 @@ public:
             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
             if (ctor_ty.is_valid() && type_kind_of(ctor_ty.raw) == LTypeKind::Function) {
                 // Same single-element-literal bug applies here — use push.
-                mut ctor_args: LValue[] = [];
-                ctor_args.push(obj_ptr);
+                mut ctor_args: Pair<LValue, TypeRef>[] = [];
+                ctor_args.push(Pair<LValue, TypeRef>::new(obj_ptr, node.resolved_type));
                 for (mut i: i64 = 0; i < node.arguments.length; i++) {
                     const arg_val: LValue = this.codegen_rvalue(node.arguments[i]);
-                    ctor_args.push(arg_val);
+                    ctor_args.push(Pair<LValue, TypeRef>::new(arg_val, node.arguments[i].resolved_type));
                 }
                 mut ctor_result: LValue = LValue::null();
                 codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
@@ -3802,8 +3867,10 @@ public:
                 ptr, LType::pointer_to(LType::i8()), "delcast");
             const free_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(free_fn.raw) };
             if (free_ty.is_valid()) {
+                mut free_args: Pair<LValue, TypeRef>[] = [];
+                free_args.push(Pair<LValue, TypeRef>::new(void_ptr, TypeRef::invalid()));
                 mut result: LValue = LValue::null();
-                codegen_call(this.cg, free_fn, free_ty, [void_ptr], "", &result);
+                codegen_call(this.cg, free_fn, free_ty, free_args, "", &result);
             } else {
                 this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                     "codegen: 'delete' expression — failed to retrieve free function type",
