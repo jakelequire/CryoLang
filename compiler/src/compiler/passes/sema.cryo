@@ -3695,6 +3695,54 @@ public:
             arg_refs.push(arg_ref);
         }
 
+        // Fill in trailing template defaults (e.g. `Box<T, A = GlobalAlloc>`)
+        // so that a short call site like `Box<MyT>::new(...)` mangles to
+        // the same spec key the ASTSpecializer / monomorphizer registered
+        // under (`Box<MyT, GlobalAlloc>::new`).  Without this, the spec
+        // lookup misses and sema falls through to E0233 before the
+        // monomorphizer's late-binding path can rescue the call —
+        // any allocator-generic type (Box, Rc, Array, HashMap, String,
+        // CString, PathBuf, ...) used at a fresh `Type<T>::method(...)`
+        // call site would otherwise force callers to spell the full
+        // `Type<T, GlobalAlloc>::method(...)` form just to compile.
+        //
+        // Templates index by qualified name (e.g. `std::alloc::box::Box`),
+        // not bare `Box`, so resolve through `lookup_type_by_sym` first to
+        // pick up the cross-module scope chain — same path other sema
+        // helpers use to find a type from a bare name.
+        if (this.ctx.generic_registry != null) {
+            // Look up the template entry.  Templates register under their
+            // fully qualified name (e.g. `std::alloc::box::Box`), but call
+            // sites use the bare name (`Box`).  The decl_index keeps a
+            // bare→qualified mapping (populated by `register_name_mapping`
+            // for every type declaration), so consult that first.  Fall
+            // back to ctx-qualification and the resolver scope chain.
+            mut entry: TemplateEntry* =
+                this.ctx.generic_registry.get_template(base_name);
+            if (entry == null) {
+                const di_qual: SymbolStr = this.ctx.decl_index.resolve_qualified(base_name);
+                if (di_qual.is_valid() && !di_qual.equals(base_name)) {
+                    entry = this.ctx.generic_registry.get_template(di_qual);
+                }
+            }
+            if (entry == null) {
+                const qualified: SymbolStr = this.ctx.qualify_symbol_sym(base_name);
+                if (!qualified.equals(base_name)) {
+                    entry = this.ctx.generic_registry.get_template(qualified);
+                }
+            }
+            if (entry == null) {
+                const cross_sym: SymbolStr = this.resolve_cross_module_name(base_name);
+                if (cross_sym.is_valid()) {
+                    entry = this.ctx.generic_registry.get_template(cross_sym);
+                }
+            }
+            if (entry != null && arg_refs.length < entry.param_count) {
+                arg_refs = this.ctx.type_resolver.expand_default_type_args(
+                    entry, arg_refs, &res_ctx);
+            }
+        }
+
         // Centralized specialized-identifier mangling — same encoding the
         // ASTSpecializer used when registering the clone, so lookups match.
         const base_qname: QualifiedName = QualifiedName::from_symbol(base_name);
