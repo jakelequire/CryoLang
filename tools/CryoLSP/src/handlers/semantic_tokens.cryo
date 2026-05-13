@@ -41,10 +41,34 @@ import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
 import Compiler::Diag::SourceSpan;
 import Compiler::ModuleGraph;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
 
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
 import Lsp::Protocol::SemanticTokens;
+
+
+// ============================================================================
+// Per-request statics for receiver-name skip
+// ============================================================================
+//
+// Receiver parameters and the bare `this` expression land here as
+// VarDeclNodes / IdentifierNodes with names "this", "&this", "mut &this",
+// or "&mut this" — the parser stamps the literal source bytes as the
+// param name (parser.cryo:1138).  Emitting a `parameter` or `variable`
+// semantic token at those spans overlays the wrong colour onto the
+// `this` keyword (themes render `this` as `keyword`, but `parameter` /
+// `variable` paint over it).
+//
+// Interning the receiver-name strings once per request and comparing
+// SymbolStr equality is O(1) per check; doing the string compare every
+// time would be measurably slower on large stdlib files.
+
+mut g_sym_this:        SymbolStr = SymbolStr::empty();
+mut g_sym_amp_this:    SymbolStr = SymbolStr::empty();
+mut g_sym_mut_this:    SymbolStr = SymbolStr::empty();
+mut g_sym_amp_mut_this:SymbolStr = SymbolStr::empty();
 
 
 // ============================================================================
@@ -90,6 +114,18 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
 
     const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
     if (ast == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+
+    // Pre-intern the receiver-name strings so the walker can skip
+    // emission for `this` / `&this` / `mut &this` / `&mut this` with an
+    // O(1) SymbolStr equality check.  Repopulated each request because
+    // the InternTable is per-CompilationContext and a recompile
+    // recreates it.
+    if (ctx.intern_table != null) {
+        g_sym_this         = ctx.intern_table.intern("this");
+        g_sym_amp_this     = ctx.intern_table.intern("&this");
+        g_sym_mut_this     = ctx.intern_table.intern("mut &this");
+        g_sym_amp_mut_this = ctx.intern_table.intern("&mut this");
+    }
 
     // -- Walk the AST, collecting tokens ------------------------------
     mut tokens: Array<SemanticToken> = Array<SemanticToken>::new();
@@ -402,7 +438,13 @@ function walk_extern_block(e: ExternBlockNode*, tokens: mut &Array<SemanticToken
 function walk_var_decl(v: VarDeclNode*, is_parameter: boolean,
                        tokens: mut &Array<SemanticToken>) -> void {
     if (v == null) { return; }
-    if (v.has_name_span()) {
+    const is_receiver: boolean = is_receiver_name(v.name);
+    // Receiver parameters (`&this`, `mut &this`, `this`, ...) keep the
+    // literal source bytes as the parameter name.  Don't emit a
+    // `parameter` semantic token for them — the underlying TextMate
+    // grammar already renders `this` as a keyword, and our overlay
+    // would replace that with the parameter colour.
+    if (v.has_name_span() && !is_receiver) {
         const type_id: u32 = if (is_parameter) {
             Lsp::Protocol::SemanticTokens::TYPE_PARAMETER
         } else {
@@ -411,8 +453,31 @@ function walk_var_decl(v: VarDeclNode*, is_parameter: boolean,
         emit_span(v.name_span, type_id,
                   Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
     }
-    walk_type_annotation(v.type_annotation, tokens);
+    // For receivers, also skip the type annotation: the parser
+    // synthesises a `Reference(Named(<EnclosingType>))` annotation
+    // whose Named.span covers the WHOLE `mut &this` source lexeme
+    // (parser.cryo:670-687).  Walking it emits a `type` semantic token
+    // across the entire `&this` / `mut &this`, overlaying the `this`
+    // keyword with the type colour.  The source has no user-written
+    // type annotation here anyway, so there's nothing to highlight.
+    if (!is_receiver) {
+        walk_type_annotation(v.type_annotation, tokens);
+    }
     walk_expr(v.initializer, tokens);
+}
+
+/// True when `name` matches one of the receiver-parameter forms the
+/// parser stamps for the implicit-self argument:
+/// `this`, `&this`, `mut &this`, `&mut this`.  Symbol comparison is
+/// O(1) because the SymbolStrs were pre-interned at the top of the
+/// handler.
+function is_receiver_name(name: SymbolStr) -> boolean {
+    if (!name.is_valid()) { return false; }
+    if (g_sym_this.is_valid()         && name.equals(g_sym_this))         { return true; }
+    if (g_sym_amp_this.is_valid()     && name.equals(g_sym_amp_this))     { return true; }
+    if (g_sym_mut_this.is_valid()     && name.equals(g_sym_mut_this))     { return true; }
+    if (g_sym_amp_mut_this.is_valid() && name.equals(g_sym_amp_mut_this)) { return true; }
+    return false;
 }
 
 function walk_field_decl(f: FieldDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
@@ -454,9 +519,16 @@ function walk_expr(e: ExpressionNode*, tokens: mut &Array<SemanticToken>) -> voi
 
     if (e.kind == NodeKind::Identifier) {
         const id: IdentifierNode* = e as IdentifierNode*;
-        emit_span(id.span,
-                  Lsp::Protocol::SemanticTokens::TYPE_VARIABLE,
-                  Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        // `this` in expression position is parsed as an IdentifierNode
+        // (expr_parser.cryo:317) with name "this".  Skip the
+        // `variable` overlay so the TextMate grammar's keyword colour
+        // stands.  Same check covers the rare `&this` / `mut &this`
+        // forms that surface as identifiers.
+        if (!is_receiver_name(id.name)) {
+            emit_span(id.span,
+                      Lsp::Protocol::SemanticTokens::TYPE_VARIABLE,
+                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        }
         return;
     }
     if (e.kind == NodeKind::BinaryExpression) {
@@ -568,9 +640,14 @@ function walk_call_expr(c: CallExprNode*, tokens: mut &Array<SemanticToken>) -> 
     if (c.callee != null) {
         if (c.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = c.callee as IdentifierNode*;
-            emit_span(id.span,
-                      Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
-                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+            // Don't overlay `function` on a bare `this` call site —
+            // the AST shape `this(args)` is unusual but parses
+            // legally and would otherwise paint over the keyword.
+            if (!is_receiver_name(id.name)) {
+                emit_span(id.span,
+                          Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
+                          Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+            }
         } else if (c.callee.kind == NodeKind::MemberAccess) {
             walk_member_access(c.callee as MemberAccessNode*, true, tokens);
         } else if (c.callee.kind == NodeKind::ScopeResolution) {
