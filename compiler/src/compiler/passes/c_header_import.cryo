@@ -13,6 +13,7 @@ import Compiler::Passes::PassID;
 import Compiler::Diag::Snapshot;
 import Compiler::Diag::Sink;
 import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Diagnostic;
 import Compiler::Diag;
 import Compiler::Artifacts;
 import Compiler::CompilationContext;
@@ -87,7 +88,7 @@ function run(ctx: CompilationContext*) -> PassResult {
 
 /// Extract directory component from a file path.
 function get_directory(path: string) -> string {
-    const len: u64 = strlen(path);
+    const len: u64 = intrinsics::strlen(path);
     mut last_sep: i64 = -1;
     for (mut i: u64 = 0; i < len; i++) {
         if (path[i] == '/' || path[i] == '\\') {
@@ -97,8 +98,8 @@ function get_directory(path: string) -> string {
     if (last_sep < 0) {
         return ".";
     }
-    const dir: i8* = malloc((last_sep + 1) as u64) as i8*;
-    memcpy(dir as void*, path as void*, last_sep as u64);
+    const dir: i8* = intrinsics::malloc((last_sep + 1) as u64) as i8*;
+    intrinsics::memcpy(dir as void*, path as void*, last_sep as u64);
     dir[last_sep] = 0;
     return dir as string;
 }
@@ -106,22 +107,22 @@ function get_directory(path: string) -> string {
 /// Resolve an include path relative to a source directory.
 /// Returns the resolved path if the file exists, empty string otherwise.
 function resolve_include_path(source_dir: string, include_path: string) -> string {
-    const src_len: u64 = strlen(source_dir);
-    const inc_len: u64 = strlen(include_path);
+    const src_len: u64 = intrinsics::strlen(source_dir);
+    const inc_len: u64 = intrinsics::strlen(include_path);
     const total: u64 = src_len + 1 + inc_len + 1;
-    const buf: i8* = malloc(total) as i8*;
-    memcpy(buf as void*, source_dir as void*, src_len);
+    const buf: i8* = intrinsics::malloc(total) as i8*;
+    intrinsics::memcpy(buf as void*, source_dir as void*, src_len);
     buf[src_len] = '/';
-    memcpy((buf + src_len + 1) as void*, include_path as void*, inc_len);
+    intrinsics::memcpy((buf + src_len + 1) as void*, include_path as void*, inc_len);
     buf[src_len + 1 + inc_len] = 0;
 
-    const f: void* = fopen(buf as string, "r");
+    const f: void* = intrinsics::fopen(buf as string, "r");
     if (f != null) {
-        fclose(f);
+        intrinsics::fclose(f);
         return buf as string;
     }
 
-    free(buf as void*);
+    intrinsics::free(buf as void*);
     return "";
 }
 
@@ -134,10 +135,10 @@ function resolve_include_path(source_dir: string, include_path: string) -> strin
 /// `clang-20`.  Returned pointer is the env value (caller must NOT
 /// free) when set, otherwise the static default literal.
 function pick_c_preprocessor() -> string {
-    const env_raw: i8* = getenv("CRYO_CC") as i8*;
+    const env_raw: i8* = intrinsics::getenv("CRYO_CC") as i8*;
     if (env_raw != null) {
         const env_val: string = env_raw as string;
-        if (strlen(env_val) > 0) { return env_val; }
+        if (intrinsics::strlen(env_val) > 0) { return env_val; }
     }
     return "clang-20";
 }
@@ -151,54 +152,54 @@ function pick_c_preprocessor() -> string {
 function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
                           ctx: CompilationContext*) -> i32 {
     const cc: string = pick_c_preprocessor();
-    const cc_len: u64 = strlen(cc);
-    const path_len: u64 = strlen(resolved_path);
+    const cc_len: u64 = intrinsics::strlen(cc);
+    const path_len: u64 = intrinsics::strlen(resolved_path);
     const flags: string = " -E -P \"";
     const tail:  string = "\"";
-    const flags_len: u64 = strlen(flags);
-    const tail_len:  u64 = strlen(tail);
+    const flags_len: u64 = intrinsics::strlen(flags);
+    const tail_len:  u64 = intrinsics::strlen(tail);
     const cmd_len: u64 = cc_len + flags_len + path_len + tail_len + 1;
-    const cmd: i8* = malloc(cmd_len) as i8*;
-    memcpy(cmd as void*, cc as void*, cc_len);
-    memcpy((cmd + cc_len) as void*, flags as void*, flags_len);
-    memcpy((cmd + cc_len + flags_len) as void*, resolved_path as void*, path_len);
-    memcpy((cmd + cc_len + flags_len + path_len) as void*, tail as void*, tail_len);
+    const cmd: i8* = intrinsics::malloc(cmd_len) as i8*;
+    intrinsics::memcpy(cmd as void*, cc as void*, cc_len);
+    intrinsics::memcpy((cmd + cc_len) as void*, flags as void*, flags_len);
+    intrinsics::memcpy((cmd + cc_len + flags_len) as void*, resolved_path as void*, path_len);
+    intrinsics::memcpy((cmd + cc_len + flags_len + path_len) as void*, tail as void*, tail_len);
     cmd[cc_len + flags_len + path_len + tail_len] = 0;
 
     if (ctx.debug_mode) {
         cdebug("[CHeaderImport] Running preprocessor: %s\n", cmd);
     }
 
-    const pipe: void* = popen(cmd as string, "r");
+    const pipe: void* = intrinsics::popen(cmd as string, "r");
     if (pipe == null) {
         ctx.diagnostics.emit(Diagnostic::error(
             ErrorCode::E0806_HEADER_PREPROC_FAILED,
             format("failed to launch C preprocessor '%s' for header '%s' (popen returned null)",
                 cc, resolved_path)));
-        free(cmd as void*);
+        intrinsics::free(cmd as void*);
         return 0;
     }
 
     // Read all preprocessor output
-    mut output_buf: i8* = malloc(65536) as i8*;
+    mut output_buf: i8* = intrinsics::malloc(65536) as i8*;
     mut output_len: u64 = 0;
     mut output_cap: u64 = 65536;
     mut line_buf: i8[4096];
 
-    while (fgets(&line_buf[0], 4096, pipe) != null) {
-        const line_len: u64 = strlen(&line_buf[0] as string);
+    while (intrinsics::fgets(&line_buf[0], 4096, pipe) != null) {
+        const line_len: u64 = intrinsics::strlen(&line_buf[0] as string);
         if (output_len + line_len >= output_cap) {
             output_cap = output_cap * 2;
-            const new_buf: i8* = malloc(output_cap) as i8*;
-            memcpy(new_buf as void*, output_buf as void*, output_len);
-            free(output_buf as void*);
+            const new_buf: i8* = intrinsics::malloc(output_cap) as i8*;
+            intrinsics::memcpy(new_buf as void*, output_buf as void*, output_len);
+            intrinsics::free(output_buf as void*);
             output_buf = new_buf;
         }
-        memcpy((output_buf + output_len) as void*, &line_buf[0] as void*, line_len);
+        intrinsics::memcpy((output_buf + output_len) as void*, &line_buf[0] as void*, line_len);
         output_len = output_len + line_len;
     }
     output_buf[output_len] = 0;
-    const exit_code: i32 = pclose(pipe);
+    const exit_code: i32 = intrinsics::pclose(pipe);
 
     // pclose returns the wait(2) status; non-zero means the preprocessor
     // exited with an error (or was killed, or the shell couldn't find it
@@ -210,19 +211,19 @@ function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
             ErrorCode::E0806_HEADER_PREPROC_FAILED,
             format("C preprocessor '%s' failed for header '%s' (exit status %d) — set $CRYO_CC if your clang binary is named differently",
                 cc, resolved_path, exit_code)));
-        free(cmd as void*);
-        free(output_buf as void*);
+        intrinsics::free(cmd as void*);
+        intrinsics::free(output_buf as void*);
         return 0;
     }
-    free(cmd as void*);
+    intrinsics::free(cmd as void*);
 
     if (output_len == 0) {
-        free(output_buf as void*);
+        intrinsics::free(output_buf as void*);
         return 0;
     }
 
     const count: i32 = parse_c_functions(output_buf as string, output_len as i64, extern_node, ctx);
-    free(output_buf as void*);
+    intrinsics::free(output_buf as void*);
     return count;
 }
 
@@ -388,8 +389,8 @@ function try_parse_c_func(source: string, source_len: i64, start: i64,
 
             if (pname == "") {
                 const idx: i32 = params.length as i32;
-                const arg_buf: i8* = malloc(16) as i8*;
-                sprintf(arg_buf as string, "arg%d", idx);
+                const arg_buf: i8* = intrinsics::malloc(16) as i8*;
+                intrinsics::sprintf(arg_buf as string, "arg%d", idx);
                 pname = arg_buf as string;
             }
 
@@ -431,7 +432,7 @@ function try_parse_c_func(source: string, source_len: i64, start: i64,
 function make_prim_annotation(name: string, ctx: CompilationContext*) -> TypeAnnotation* {
     const sym: SymbolStr = ctx.intern_table.intern(name);
     const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
-    const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
     *ann = TypeAnnotation::Primitive(prim);
     return ann;
 }
@@ -439,7 +440,7 @@ function make_prim_annotation(name: string, ctx: CompilationContext*) -> TypeAnn
 /// Allocate a PointerAnnotation wrapped in a heap TypeAnnotation.
 function make_ptr_annotation(inner: TypeAnnotation*) -> TypeAnnotation* {
     const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, span: SourceSpan::none() };
-    const ann: TypeAnnotation* = malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
     *ann = TypeAnnotation::Pointer(ptr);
     return ann;
 }
@@ -459,10 +460,10 @@ function c_type_to_annotation(c_type: string, ctx: CompilationContext*) -> TypeA
     if (starts_with_at(type_str, 0, "signed "))   { type_str = type_str + 7; }
 
     // Check for pointer (ends with *)
-    const tlen: u64 = strlen(type_str);
+    const tlen: u64 = intrinsics::strlen(type_str);
     if (tlen > 0 && type_str[tlen - 1] == '*') {
-        const inner_buf: i8* = malloc(tlen) as i8*;
-        memcpy(inner_buf as void*, type_str as void*, tlen - 1);
+        const inner_buf: i8* = intrinsics::malloc(tlen) as i8*;
+        intrinsics::memcpy(inner_buf as void*, type_str as void*, tlen - 1);
         inner_buf[tlen - 1] = 0;
         mut end: i64 = (tlen as i64) - 2;
         while (end >= 0 && (inner_buf[end] == ' ' || inner_buf[end] == '\t')) {
@@ -470,7 +471,7 @@ function c_type_to_annotation(c_type: string, ctx: CompilationContext*) -> TypeA
             end = end - 1;
         }
         const inner: TypeAnnotation* = c_type_to_annotation(inner_buf as string, ctx);
-        free(inner_buf as void*);
+        intrinsics::free(inner_buf as void*);
         return make_ptr_annotation(inner);
     }
 
@@ -539,8 +540,8 @@ function skip_ws(source: string, source_len: i64, start: i64) -> i64 {
 }
 
 function starts_with_at(s: string, pos: i64, prefix: string) -> boolean {
-    const plen: u64 = strlen(prefix);
-    const slen: u64 = strlen(s);
+    const plen: u64 = intrinsics::strlen(prefix);
+    const slen: u64 = intrinsics::strlen(s);
     if (pos as u64 + plen > slen) { return false; }
     for (mut i: u64 = 0; i < plen; i++) {
         if (s[pos + i] != prefix[i]) { return false; }
@@ -601,22 +602,22 @@ function extract_trimmed(source: string, start: i64, end: i64) -> string {
     while (e > s && is_whitespace(source[e - 1])) { e = e - 1; }
     const len: i64 = e - s;
     if (len <= 0) { return "void"; }
-    const buf: i8* = malloc((len + 1) as u64) as i8*;
-    memcpy(buf as void*, (source + s) as void*, len as u64);
+    const buf: i8* = intrinsics::malloc((len + 1) as u64) as i8*;
+    intrinsics::memcpy(buf as void*, (source + s) as void*, len as u64);
     buf[len] = 0;
     return buf as string;
 }
 
 function intern_slice(source: string, start: i64, end: i64, ctx: CompilationContext*) -> SymbolStr {
     const len: i64 = end - start;
-    const buf: i8* = malloc((len + 1) as u64) as i8*;
-    memcpy(buf as void*, (source + start) as void*, len as u64);
+    const buf: i8* = intrinsics::malloc((len + 1) as u64) as i8*;
+    intrinsics::memcpy(buf as void*, (source + start) as void*, len as u64);
     buf[len] = 0;
     const sym: SymbolStr = ctx.intern_table.intern(buf as string);
-    free(buf as void*);
+    intrinsics::free(buf as void*);
     return sym;
 }
 
 function str_eq(a: string, b: string) -> boolean {
-    return strcmp(a, b) == 0;
+    return intrinsics::strcmp(a, b) == 0;
 }

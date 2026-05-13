@@ -107,7 +107,7 @@ function run_test_main_codegen(ctx: CompilationContext*) -> PassResult {
     // function's mangled symbol so the linker resolves it later.
     mut entries_buf: void* = null;
     if (test_count > 0) {
-        entries_buf = malloc(test_count * 8);
+        entries_buf = intrinsics::malloc(test_count * 8);
     }
     mut entries: void** = entries_buf as void**;
     mut i: u64 = 0;
@@ -133,7 +133,7 @@ function run_test_main_codegen(ctx: CompilationContext*) -> PassResult {
         // a null buffer (the LLVM-C API accepts this for zero-length).
         arr_init = LType::const_array(desc_ty, null, 0);
     }
-    if (entries_buf != null) { free(entries_buf); }
+    if (entries_buf != null) { intrinsics::free(entries_buf); }
 
     const arr_global: LValue = test_mod.add_global(arr_ty, "__cryo_test_descriptors");
     llvm::LLVMSetInitializer(arr_global.raw, arr_init.raw);
@@ -150,7 +150,7 @@ function run_test_main_codegen(ctx: CompilationContext*) -> PassResult {
 
     // Emit to disk and register with the linker artifacts.
     const obj_path: string = emit_object(ctx, test_mod, tm);
-    if (strlen(obj_path) == 0) {
+    if (intrinsics::strlen(obj_path) == 0) {
         if (tm.is_valid()) { tm.dispose(); }
         test_mod.dispose();
         return PassResult::failure(1);
@@ -185,7 +185,7 @@ function collect_tests(ctx: CompilationContext*) -> TestEntry[] {
     while (i < reg.records.length) {
         const rec: DirectiveRecord = reg.records[i];
         i = i + 1;
-        if (strcmp(rec.kind, "test") != 0) { continue; }
+        if (intrinsics::strcmp(rec.kind, "test") != 0) { continue; }
         if (rec.decl == null) { continue; }
         if (rec.decl.kind != NodeKind::FunctionDeclaration) { continue; }
         const fn_decl: FunctionDeclNode* = rec.decl as FunctionDeclNode*;
@@ -214,15 +214,15 @@ function collect_tests(ctx: CompilationContext*) -> TestEntry[] {
             const d: DirectiveNode* = fn_decl.attached_directives[j];
             j = j + 1;
             if (d == null) { continue; }
-            if (strcmp(d.directive_kind, "ignore")       == 0) { ignored      = true; }
-            if (strcmp(d.directive_kind, "should_panic") == 0) { should_panic = true; }
+            if (intrinsics::strcmp(d.directive_kind, "ignore")       == 0) { ignored      = true; }
+            if (intrinsics::strcmp(d.directive_kind, "should_panic") == 0) { should_panic = true; }
         }
 
         const display: string = intern.resolve(qualified);
         const mangled_str: string = intern.resolve(mangled);
         out.push(TestEntry {
             display_name: display,
-            display_len:  strlen(display),
+            display_len:  intrinsics::strlen(display),
             mangled_name: mangled_str,
             ignored:      ignored,
             should_panic: should_panic,
@@ -240,7 +240,7 @@ function collect_tests(ctx: CompilationContext*) -> TestEntry[] {
 /// matches `stdlib/test/descriptor.cryo`'s `TestDescriptor`.
 function make_descriptor_struct_type(ptr_ty: LType, i64_ty: LType,
                                       i1_ty: LType) -> LType {
-    const buf: void* = malloc(5 * 8);
+    const buf: void* = intrinsics::malloc(5 * 8);
     const slots: void** = buf as void**;
     slots[0] = ptr_ty.raw;
     slots[1] = i64_ty.raw;
@@ -248,7 +248,7 @@ function make_descriptor_struct_type(ptr_ty: LType, i64_ty: LType,
     slots[3] = i1_ty.raw;
     slots[4] = i1_ty.raw;
     const ty: LType = LType::literal_struct(buf, 5, false);
-    free(buf);
+    intrinsics::free(buf);
     return ty;
 }
 
@@ -294,7 +294,7 @@ function build_descriptor_const(desc_ty: LType,
     // global of array type IS a ptr value at the constant level, so
     // we can use `name_global` directly.  Same for `fn_decl` (function
     // values are pointer-typed).
-    const buf: void* = malloc(5 * 8);
+    const buf: void* = intrinsics::malloc(5 * 8);
     const slots: void** = buf as void**;
     slots[0] = name_global.raw;
     slots[1] = LType::const_int(LType::i64(), name_len, false).raw;
@@ -304,7 +304,7 @@ function build_descriptor_const(desc_ty: LType,
     slots[3] = LType::const_int(LType::i1(), ig_v, false).raw;
     slots[4] = LType::const_int(LType::i1(), sp_v, false).raw;
     const v: LValue = LType::const_named_struct(desc_ty, buf, 5);
-    free(buf);
+    intrinsics::free(buf);
     return v;
 }
 
@@ -374,30 +374,30 @@ function build_test_main(ctx: CompilationContext*,
 
     // call set_args(argc, argv)
     {
-        const args_buf: void* = malloc(2 * 8);
+        const args_buf: void* = intrinsics::malloc(2 * 8);
         const slots: void** = args_buf as void**;
         slots[0] = argc.raw;
         slots[1] = argv.raw;
         builder.build_call(set_args_ty, set_args_fn, args_buf, 2, "");
-        free(args_buf);
+        intrinsics::free(args_buf);
     }
 
     // ptr_to_first = getelementptr [N x %Desc], @descriptors, i64 0, i64 0
     // → equivalent to bitcasting the array global to ptr-to-element-0.
     mut first_ptr: LValue = arr_global;
     if (test_count > 0) {
-        const idx_buf: void* = malloc(2 * 8);
+        const idx_buf: void* = intrinsics::malloc(2 * 8);
         const idx_slots: void** = idx_buf as void**;
         const zero_64: LValue = LType::const_int(i64_ty, 0, false);
         idx_slots[0] = zero_64.raw;
         idx_slots[1] = zero_64.raw;
         first_ptr = builder.build_gep(arr_ty, arr_global, idx_buf, 2, "test.first");
-        free(idx_buf);
+        intrinsics::free(idx_buf);
     }
 
     // call run_all(argc, argv, first_ptr, count)
     const count_const: LValue = LType::const_int(i64_ty, test_count, false);
-    const args_buf: void* = malloc(4 * 8);
+    const args_buf: void* = intrinsics::malloc(4 * 8);
     const args_slots: void** = args_buf as void**;
     args_slots[0] = argc.raw;
     args_slots[1] = argv.raw;
@@ -405,7 +405,7 @@ function build_test_main(ctx: CompilationContext*,
     args_slots[3] = count_const.raw;
     const rc: LValue = builder.build_call(
         run_all_ty, run_all_fn, args_buf, 4, "test.rc");
-    free(args_buf);
+    intrinsics::free(args_buf);
 
     builder.build_ret(rc);
     builder.dispose();
@@ -414,26 +414,26 @@ function build_test_main(ctx: CompilationContext*,
 
 /// Helper: build a `(p1, p2) -> ret` LLVM function type.
 function make_function_type_2(ret: LType, p1: LType, p2: LType) -> LType {
-    const buf: void* = malloc(2 * 8);
+    const buf: void* = intrinsics::malloc(2 * 8);
     const slots: void** = buf as void**;
     slots[0] = p1.raw;
     slots[1] = p2.raw;
     const ty: LType = LType::function_type(ret, buf, 2, false);
-    free(buf);
+    intrinsics::free(buf);
     return ty;
 }
 
 /// Helper: build a `(p1, p2, p3, p4) -> ret` LLVM function type.
 function make_function_type_4(ret: LType, p1: LType, p2: LType,
                                p3: LType, p4: LType) -> LType {
-    const buf: void* = malloc(4 * 8);
+    const buf: void* = intrinsics::malloc(4 * 8);
     const slots: void** = buf as void**;
     slots[0] = p1.raw;
     slots[1] = p2.raw;
     slots[2] = p3.raw;
     slots[3] = p4.raw;
     const ty: LType = LType::function_type(ret, buf, 4, false);
-    free(buf);
+    intrinsics::free(buf);
     return ty;
 }
 

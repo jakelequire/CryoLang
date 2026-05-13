@@ -120,11 +120,11 @@ function declare_va_start(cg: CodegenContext*) -> LValue {
     mut fn: LValue = cg.llvm_module.get_named_function("llvm.va_start.p0");
     if (fn.is_valid()) { return fn; }
     const ptr_ty: LType = LType::pointer_to(LType::i8());
-    const buf: void* = malloc(8);
+    const buf: void* = intrinsics::malloc(8);
     const slots: void** = buf as void**;
     slots[0] = ptr_ty.raw;
     const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
-    free(buf);
+    intrinsics::free(buf);
     fn = cg.llvm_module.add_function("llvm.va_start.p0", fty);
     return fn;
 }
@@ -134,11 +134,11 @@ function declare_va_end(cg: CodegenContext*) -> LValue {
     mut fn: LValue = cg.llvm_module.get_named_function("llvm.va_end.p0");
     if (fn.is_valid()) { return fn; }
     const ptr_ty: LType = LType::pointer_to(LType::i8());
-    const buf: void* = malloc(8);
+    const buf: void* = intrinsics::malloc(8);
     const slots: void** = buf as void**;
     slots[0] = ptr_ty.raw;
     const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
-    free(buf);
+    intrinsics::free(buf);
     fn = cg.llvm_module.add_function("llvm.va_end.p0", fty);
     return fn;
 }
@@ -364,16 +364,16 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
         // below).  User source still writes `function main() -> int`;
         // we silently widen the LLVM signature to take argc/argv.
         const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
-        const buf: void* = malloc(2 * 8);
+        const buf: void* = intrinsics::malloc(2 * 8);
         const slots: void** = buf as void**;
         slots[0] = LType::i32().raw;
         slots[1] = argv_ty.raw;
         fn_type = LType::function_type(ret_ty, buf, 2, false);
-        free(buf);
+        intrinsics::free(buf);
     } else if (param_count == 0) {
         fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
     } else {
-        const buf: void* = malloc(param_count as u64 * 8);
+        const buf: void* = intrinsics::malloc(param_count as u64 * 8);
         const slots: void** = buf as void**;
         mut all_valid: boolean = true;
         for (mut i: u32 = 0; i < param_count; i++) {
@@ -386,11 +386,11 @@ function declare_function(cg: CodegenContext*, node: FunctionDeclNode*) -> void 
             slots[i] = param_ty.raw;
         }
         if (!all_valid) {
-            free(buf);
+            intrinsics::free(buf);
             return;
         }
         fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
-        free(buf);
+        intrinsics::free(buf);
     }
 
     // Add the function to the LLVM module.
@@ -422,7 +422,7 @@ function declare_impl_block(cg: CodegenContext*, node: ImplBlockNode*) -> void {
         qualified_target = node.qualified_target_name;
     } else {
         const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
-        if (strstr(target_str, "::") != null) {
+        if (intrinsics::strstr(target_str, "::") != null) {
             qualified_target = node.target_type;
         } else if (ctx_ptr.decl_index.lookup_type(node.target_type).is_valid()) {
             qualified_target = node.target_type;
@@ -571,7 +571,7 @@ function param_types_equal_structural(arena: TypeArena*, intern: InternTable*,
         // names are the canonical source-level identity for these types.
         const sa: string = arena.format_display(ta);
         const sb: string = arena.format_display(tb);
-        if (strcmp(sa, sb) != 0) { return false; }
+        if (intrinsics::strcmp(sa, sb) != 0) { return false; }
     }
     return true;
 }
@@ -767,13 +767,13 @@ function codegen_vtable_for_class(cg: CodegenContext*, cls: ClassType*) -> void 
     const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
     const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
 
-    const buf: void* = malloc(n as u64 * 8);
+    const buf: void* = intrinsics::malloc(n as u64 * 8);
     const slot_ptrs: void** = buf as void**;
     for (mut i: u32 = 0; i < n; i++) {
         slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
     }
     const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
-    free(buf);
+    intrinsics::free(buf);
 
     const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name);
     const mangled: string = MangledName::for_vtable(intern, qname).resolve(intern);
@@ -845,11 +845,11 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         const pp0: VarDeclNode* = func.parameters[pc0];
         if (pp0 == null) { continue; }
         const pn: string = intern.resolve(pp0.name);
-        if (strcmp(pn, "&this") == 0) {
+        if (intrinsics::strcmp(pn, "&this") == 0) {
             explicit_self_name = "&this";
             break;
         }
-        if (strcmp(pn, "this") == 0) {
+        if (intrinsics::strcmp(pn, "this") == 0) {
             // Distinguish parser-synthesized by-value `this` (no annotation)
             // from user-written `this: Lexer*` (explicit annotation).  Both
             // count as "self" so we skip the implicit-prefix synthesis, but
@@ -879,7 +879,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
             // get a real LLVM declaration.  Detected by the literal `()`
             // suffix on the qualified target name.
             const target_str: string = intern.resolve(target_type);
-            const tlen: u64 = strlen(target_str);
+            const tlen: u64 = intrinsics::strlen(target_str);
             if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
                           && target_str[tlen - 1] == 0x29 /* ')' */) {
                 target_ref = arena.get_unit();
@@ -896,7 +896,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         }
     }
 
-    const prepend_implicit_this: boolean = is_instance && strlen(explicit_self_name) == 0;
+    const prepend_implicit_this: boolean = is_instance && intrinsics::strlen(explicit_self_name) == 0;
 
     // Count user parameters.  `&this` contributes a ptr slot via the
     // existing param; by-value `this` contributes a struct slot via the
@@ -911,7 +911,7 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     }
     const total_params: u32 = user_param_count + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
 
-    const buf: void* = malloc(total_params as u64 * 8);
+    const buf: void* = intrinsics::malloc(total_params as u64 * 8);
     const slots: void** = buf as void**;
 
     mut idx: u32 = 0;
@@ -934,9 +934,9 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
         // — a user-written explicit annotation on a param named `this`
         // — is just a regular typed parameter; map via resolved_type.
         mut mapped_param: LType = LType::null();
-        if (strcmp(param_name, "&this") == 0 && this_ty.is_valid()) {
+        if (intrinsics::strcmp(param_name, "&this") == 0 && this_ty.is_valid()) {
             mapped_param = this_ty;
-        } else if (strcmp(param_name, "this") == 0 && target_mapped.is_valid()
+        } else if (intrinsics::strcmp(param_name, "this") == 0 && target_mapped.is_valid()
                    && param.type_annotation == null) {
             mapped_param = target_mapped;
         } else {
@@ -951,12 +951,12 @@ function declare_method(cg: CodegenContext*, node: MethodNode*, target_type: Sym
     }
 
     if (!params_valid) {
-        free(buf);
+        intrinsics::free(buf);
         return;
     }
 
     const fn_type: LType = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
-    free(buf);
+    intrinsics::free(buf);
 
     const fn_val: LValue = cg.llvm_module.add_function(fn_name, fn_type);
 
@@ -993,7 +993,7 @@ function declare_intrinsic(cg: CodegenContext*, node: IntrinsicDeclNode*) -> voi
     if (param_count == 0) {
         fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
     } else {
-        const buf: void* = malloc(param_count as u64 * 8);
+        const buf: void* = intrinsics::malloc(param_count as u64 * 8);
         const slots: void** = buf as void**;
         mut all_valid: boolean = true;
         for (mut i: u32 = 0; i < param_count; i++) {
@@ -1006,11 +1006,11 @@ function declare_intrinsic(cg: CodegenContext*, node: IntrinsicDeclNode*) -> voi
             slots[i] = param_ty.raw;
         }
         if (!all_valid) {
-            free(buf);
+            intrinsics::free(buf);
             return;
         }
         fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
-        free(buf);
+        intrinsics::free(buf);
     }
 
     // C linkage: use bare name.
@@ -1053,7 +1053,7 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
         if (param_count == 0) {
             fn_type = LType::function_type(ret_ty, null, 0, func.is_variadic);
         } else {
-            const buf: void* = malloc(param_count as u64 * 8);
+            const buf: void* = intrinsics::malloc(param_count as u64 * 8);
             const slots: void** = buf as void**;
             mut params_ok: boolean = true;
             for (mut j: u32 = 0; j < param_count; j++) {
@@ -1069,11 +1069,11 @@ function declare_extern_block(cg: CodegenContext*, node: ExternBlockNode*) -> vo
                 slots[j] = mapped_ep.raw;
             }
             if (!params_ok) {
-                free(buf);
+                intrinsics::free(buf);
                 continue;
             }
             fn_type = LType::function_type(ret_ty, buf, param_count, func.is_variadic);
-            free(buf);
+            intrinsics::free(buf);
         }
 
         // Use bare name for C linkage.
@@ -1176,7 +1176,7 @@ function codegen_global_var(cg: CodegenContext*, node: VarDeclNode*) -> void {
         } else if (lit.literal_kind == LiteralKind::Float
                    && (tk == LTypeKind::Float || tk == LTypeKind::Double)) {
             mut fval: f64 = 0.0;
-            sscanf(lit.value, "%lf", &fval);
+            intrinsics::sscanf(lit.value, "%lf", &fval);
             init = LType::const_real(ty, fval);
         } else if (lit.literal_kind == LiteralKind::Null && tk == LTypeKind::Pointer) {
             init = LType::const_pointer_null(ty);
@@ -1458,8 +1458,8 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
         const pp: VarDeclNode* = func.parameters[pc];
         if (pp == null) { continue; }
         const pn: string = cg.resolve(pp.name);
-        if (strcmp(pn, "&this") == 0) { explicit_ref_idx = pc; break; }
-        if (strcmp(pn, "this") == 0) {
+        if (intrinsics::strcmp(pn, "&this") == 0) { explicit_ref_idx = pc; break; }
+        if (intrinsics::strcmp(pn, "this") == 0) {
             if (pp.type_annotation == null) {
                 explicit_val_idx = pc;
             } else {
@@ -1489,7 +1489,7 @@ function codegen_method_prologue(cg: CodegenContext*, node: MethodNode*,
             // Detected by the literal `()` suffix on the qualified target
             // name; mirrors the fallback in declare_method.
             const target_str: string = cg.resolve(target_type);
-            const tlen: u64 = strlen(target_str);
+            const tlen: u64 = intrinsics::strlen(target_str);
             if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
                           && target_str[tlen - 1] == 0x29 /* ')' */) {
                 target_ref = cg.get_arena().get_unit();
