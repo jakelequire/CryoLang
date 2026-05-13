@@ -305,6 +305,152 @@ function const_init_from_call_with_f64_arg() -> Result<(), TestError> {
 }
 
 // ============================================================================
+// Prefix / postfix `++` and `--`
+// ============================================================================
+//
+// Both forms mutate the variable; the difference is what the expression
+// evaluates to.  Pre-fix to round-3 audit, both forms returned the
+// pre-update value because UnaryExprNode had no prefix/postfix
+// discriminator — `const x: int = ++a;` bound x to a's old value.
+
+![test]
+function postfix_inc_returns_old_value() -> Result<(), TestError> {
+    mut a: i32 = 5;
+    const v: i32 = a++;
+    match (expect_eq(a, 6)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(v, 5);
+}
+
+![test]
+function prefix_inc_returns_new_value() -> Result<(), TestError> {
+    mut a: i32 = 5;
+    const v: i32 = ++a;
+    match (expect_eq(a, 6)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(v, 6);
+}
+
+![test]
+function postfix_dec_returns_old_value() -> Result<(), TestError> {
+    mut a: i32 = 5;
+    const v: i32 = a--;
+    match (expect_eq(a, 4)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(v, 5);
+}
+
+![test]
+function prefix_dec_returns_new_value() -> Result<(), TestError> {
+    mut a: i32 = 5;
+    const v: i32 = --a;
+    match (expect_eq(a, 4)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(v, 4);
+}
+
+![test]
+function inc_dec_in_for_loop_iterates_full_range() -> Result<(), TestError> {
+    // `i++` in the for-loop step is the most common use site.  If it
+    // ever regresses to "no-op" the loop hangs forever — pin it.
+    mut sum: i32 = 0;
+    for (mut i: i32 = 1; i <= 10; i++) {
+        sum = sum + i;
+    }
+    return expect_eq(sum, 55);
+}
+
+// ============================================================================
+// Unary `-` (negation)
+// ============================================================================
+
+![test]
+function unary_minus_negates_positive_int() -> Result<(), TestError> {
+    const x: i32 = 7;
+    return expect_eq(-x, -7);
+}
+
+![test]
+function unary_minus_negates_negative_int_back_to_positive() -> Result<(), TestError> {
+    const x: i32 = -42;
+    return expect_eq(-x, 42);
+}
+
+![test]
+function unary_minus_on_zero_is_zero() -> Result<(), TestError> {
+    const x: i32 = 0;
+    return expect_eq(-x, 0);
+}
+
+![test]
+function unary_minus_on_f64() -> Result<(), TestError> {
+    const x: f64 = 3.5;
+    return expect_close_f64(-x, -3.5, 0.0001);
+}
+
+![test]
+function unary_minus_on_i64_large_magnitude() -> Result<(), TestError> {
+    // 10^15 is well inside i64 range but outside i32 — pins the wider
+    // path that codegen_unary takes when the source operand is i64.
+    const x: i64 = 1000000000000000;
+    const want: i64 = -1000000000000000;
+    return expect_eq(-x, want);
+}
+
+// ============================================================================
+// Conditional expressions — `if` as rvalue and C-style ternary
+// ============================================================================
+
+![test]
+function if_expression_picks_then_branch() -> Result<(), TestError> {
+    const x: i32 = if (true) { 100 } else { 200 };
+    return expect_eq(x, 100);
+}
+
+![test]
+function if_expression_picks_else_branch() -> Result<(), TestError> {
+    const x: i32 = if (false) { 100 } else { 200 };
+    return expect_eq(x, 200);
+}
+
+![test]
+function nested_if_expression() -> Result<(), TestError> {
+    const n: i32 = 0;
+    const sign: i32 = if (n > 0) { 1 } else { if (n < 0) { -1 } else { 0 } };
+    return expect_eq(sign, 0);
+}
+
+![test]
+function ternary_picks_then_branch() -> Result<(), TestError> {
+    const x: i32 = true ? 100 : 200;
+    return expect_eq(x, 100);
+}
+
+![test]
+function ternary_picks_else_branch() -> Result<(), TestError> {
+    const x: i32 = false ? 100 : 200;
+    return expect_eq(x, 200);
+}
+
+![test]
+function ternary_nests_right_associative() -> Result<(), TestError> {
+    // `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
+    const n: i32 = -3;
+    const sign: i32 = n > 0 ? 1 : n < 0 ? -1 : 0;
+    return expect_eq(sign, -1);
+}
+
+mut g_ternary_side_effect: i32 = 0;
+
+function ternary_bump_and_return(value: i32) -> i32 {
+    g_ternary_side_effect = g_ternary_side_effect + 1;
+    return value;
+}
+
+![test]
+function ternary_evaluates_only_chosen_branch() -> Result<(), TestError> {
+    g_ternary_side_effect = 0;
+    const _x: i32 = true ? ternary_bump_and_return(1) : ternary_bump_and_return(2);
+    return expect_eq(g_ternary_side_effect, 1);
+}
+
+// ============================================================================
 // Operator precedence — bitwise vs shift vs comparison
 // ============================================================================
 
