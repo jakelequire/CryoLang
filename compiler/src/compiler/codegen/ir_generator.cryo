@@ -1483,10 +1483,21 @@ public:
             return;
         }
 
-        // Compound assignment
-        if (op == TokenType::PlusEqual || op == TokenType::MinusEqual ||
-            op == TokenType::StarEqual || op == TokenType::SlashEqual ||
-            op == TokenType::PercentEqual) {
+        // Compound assignment.  Each compound op (`+=`, `-=`, `*=`, `/=`,
+        // `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) loads the LHS, computes the
+        // arithmetic / bitwise / shift result using its base operator, then
+        // stores the narrowed result back.  Bitwise (`&=`/`|=`/`^=`) and
+        // shift (`<<=`/`>>=`) were silently miscompiled before — the
+        // BinaryExprNode fell through to the "regular binary" path below,
+        // which calls codegen_rvalue(left) (a load) and codegen_binary
+        // with the compound op kind, producing an expression result but
+        // never storing it back.
+        if (op == TokenType::PlusEqual    || op == TokenType::MinusEqual ||
+            op == TokenType::StarEqual    || op == TokenType::SlashEqual ||
+            op == TokenType::PercentEqual ||
+            op == TokenType::AmpEqual     || op == TokenType::PipeEqual  ||
+            op == TokenType::CaretEqual   ||
+            op == TokenType::LessLessEqual || op == TokenType::GreaterGreaterEqual) {
             const addr: LValue = this.codegen_lvalue(node.left);
             if (!addr.is_valid()) {
                 mut diag: Diagnostic = Diagnostic::error(
@@ -1511,12 +1522,17 @@ public:
             const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
             const rhs: LValue = this.codegen_rvalue(node.right);
             const base_op: TokenType = match (op) {
-                TokenType::PlusEqual    => { TokenType::Plus }
-                TokenType::MinusEqual   => { TokenType::Minus }
-                TokenType::StarEqual    => { TokenType::Star }
-                TokenType::SlashEqual   => { TokenType::Slash }
-                TokenType::PercentEqual => { TokenType::Percent }
-                _                       => { TokenType::Plus }
+                TokenType::PlusEqual          => { TokenType::Plus    }
+                TokenType::MinusEqual         => { TokenType::Minus   }
+                TokenType::StarEqual          => { TokenType::Star    }
+                TokenType::SlashEqual         => { TokenType::Slash   }
+                TokenType::PercentEqual       => { TokenType::Percent }
+                TokenType::AmpEqual           => { TokenType::Amp     }
+                TokenType::PipeEqual          => { TokenType::Pipe    }
+                TokenType::CaretEqual         => { TokenType::Caret   }
+                TokenType::LessLessEqual      => { TokenType::LessLess }
+                TokenType::GreaterGreaterEqual => { TokenType::GreaterGreater }
+                _                             => { TokenType::Plus }
             };
             mut result: LValue = LValue::null();
             codegen_binary(this.cg, lhs_loaded, rhs, base_op, node.resolved_type, &result);
@@ -1683,7 +1699,12 @@ public:
                 };
             }
             this.cg.builder.build_store(updated, addr);
-            this.last_value = old;
+            // Postfix `a++` / `a--` returns the pre-update value; prefix
+            // `++a` / `--a` returns the updated value.  Without this
+            // branch (and the matching is_postfix discriminator on
+            // UnaryExprNode), every form returned the old value, so
+            // `const x: int = ++b;` bound x to b's pre-increment value.
+            this.last_value = if (node.is_postfix) { old } else { updated };
             this.last_is_lvalue = false;
             return;
         }
