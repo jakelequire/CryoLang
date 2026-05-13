@@ -1,4 +1,5 @@
-///! JSON config — `std::json` parsing with a generic `FromJson` getter.
+///! JSON config — `std::json` parsing with a generic
+///! `TryFrom<&JsonValue>` getter.
 ///!
 ///! Loads `data/server.json`, parses it into a `JsonValue`, and walks
 ///! the tree to extract a small set of fields into a strongly-typed
@@ -6,17 +7,15 @@
 ///!
 ///! What this example demonstrates:
 ///!   • `json::parse(Str)` returns `Result<JsonValue, JsonError>`.
-///!   • `std::json::value::FromJson` — a trait the stdlib implements
-///!     for `boolean`, `i64`, `u64`, `f64`, and `Str`. Third-party
-///!     types can implement it to slot into the same machinery.
-///!   • A single generic `get_or<T>` / `get_or_in<T>` helper —
-///!     defined locally because Cryo's monomorphizer doesn't yet
-///!     emit cross-module generic free functions from stdlib — that
-///!     replaces the per-scalar `read_string_field` / `read_bool_field`
-///!     / `read_u64_field` ladder with one call site shape:
-///!         get_or(&root, key, fallback)              -> T
-///!         get_or_in(&server, key, fallback)         -> T
-///!     `T` is inferred from `fallback`.
+///!   • `TryFrom<&JsonValue>` — the stdlib implements it for
+///!     `boolean`, `i64`, `u64`, `f64`, and `Str`. Third-party types
+///!     can implement it to slot into the same machinery.
+///!   • Generic `get_or<T>` / `get_or_in<T>` for numeric/bool fields;
+///!     a dedicated `get_str_or` / `get_str_or_in` for `Str` fields
+///!     (the generic version on struct-typed `T` hits a current mono
+///!     limitation — see comment near the helpers).
+///!         get_or(&root, key, fallback)              -> T   (numeric/bool)
+///!         get_str_or(&root, key, fallback)          -> Str
 ///!   • Walking a JSON array of strings via `get_array` + raw indexing.
 ///!
 ///! Run with:  cryo run
@@ -27,6 +26,7 @@ import std::core::intrinsics;
 import std::core::option;
 import std::core::result;
 import std::core::drop;
+import std::core::convert;
 import std::collections::str;
 import std::collections::string;
 import std::collections::array;
@@ -61,29 +61,59 @@ implement trait Drop for struct ServerConfig {
 }
 
 // ============================================================================
-// Generic getters — one helper covers every scalar/Str field type.
+// Getters
 //
-// Both call `T::from_json(value_ptr)` where the substituter rewrites
-// `T` to a concrete impl (`boolean::from_json`, `u64::from_json`,
-// `Str::from_json`, ...) at monomorphization time. The `FromJson`
-// trait + its primitive impls live in `std::json::value`.
+// `get_or<T>` / `get_or_in<T>` cover numeric and boolean field types
+// via `TryFrom<&JsonValue>`.  The substituter rewrites `T::try_from`
+// to the concrete impl (`boolean::try_from`, `u64::try_from`, …) at
+// monomorphization time; the primitive impls live in
+// `std::json::value`.
+//
+// `Str` fields go through `get_str_or` / `get_str_or_in` instead.
+// They do the same lookup but inline the `as_str()` call, sidestepping
+// a monomorphizer limitation that affects struct-typed `T` (Str is a
+// struct) for the `T::try_from(...).unwrap_or(fallback)` shape.
 // ============================================================================
 
 function get_or<T>(parent: &JsonValue, key: Str, fallback: T) -> T
-where T: FromJson {
+where T: TryFrom<&JsonValue> {
     match (parent.get(key)) {
         Option::Some(value_ptr) => {
-            return T::from_json(value_ptr).unwrap_or(fallback);
+            return T::try_from(value_ptr).unwrap_or(fallback);
         }
         Option::None => { return fallback; }
     }
 }
 
 function get_or_in<T>(parent: &JsonObject, key: Str, fallback: T) -> T
-where T: FromJson {
+where T: TryFrom<&JsonValue> {
     match (parent.get(key)) {
         Option::Some(value_ptr) => {
-            return T::from_json(value_ptr).unwrap_or(fallback);
+            return T::try_from(value_ptr).unwrap_or(fallback);
+        }
+        Option::None => { return fallback; }
+    }
+}
+
+function get_str_or(parent: &JsonValue, key: Str, fallback: Str) -> Str {
+    match (parent.get(key)) {
+        Option::Some(value_ptr) => {
+            match (value_ptr.as_str()) {
+                Option::Some(s) => { return s; }
+                Option::None    => { return fallback; }
+            }
+        }
+        Option::None => { return fallback; }
+    }
+}
+
+function get_str_or_in(parent: &JsonObject, key: Str, fallback: Str) -> Str {
+    match (parent.get(key)) {
+        Option::Some(value_ptr) => {
+            match (value_ptr.as_str()) {
+                Option::Some(s) => { return s; }
+                Option::None    => { return fallback; }
+            }
         }
         Option::None => { return fallback; }
     }
@@ -124,21 +154,21 @@ function read_string_array(parent: &JsonValue, key: Str) -> Array<String> {
 // ============================================================================
 
 function build_config(root: &JsonValue) -> ServerConfig {
-    // Top-level scalar — one line. `T` is inferred from the
-    // fallback's type (here, `Str`).
+    // Top-level Str field — direct extractor.
     mut service: String = String::from_str(
-        get_or(root, Str::new("service"), Str::new("unknown"))
+        get_str_or(root, Str::new("service"), Str::new("unknown"))
     );
 
     // Nested `server` block — descend once, then read fields off
-    // the borrowed JsonObject via `get_or_in`.
+    // the borrowed JsonObject.  Numeric/bool fields use the generic
+    // `get_or_in<T>`; the Str field uses the dedicated extractor.
     mut host: String;
     mut port: u16;
     mut tls:  boolean;
     match (root.get_object(Str::new("server"))) {
         Option::Some(server) => {
             host = String::from_str(
-                get_or_in(server, Str::new("host"), Str::new("127.0.0.1"))
+                get_str_or_in(server, Str::new("host"), Str::new("127.0.0.1"))
             );
             port = get_or_in(server, Str::new("port"), 8080 as u64) as u16;
             tls  = get_or_in(server, Str::new("tls"), false);
