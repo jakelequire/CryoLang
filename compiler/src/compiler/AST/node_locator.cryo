@@ -301,6 +301,16 @@ function first_covering_child(node: ASTNode*,
             const d: EnumDeclNode* = node as EnumDeclNode*;
             return pick_array_variant(d.variants, line, character);
         }
+        NodeKind::TraitDeclaration => {
+            // Trait methods are stored as bare `FunctionDeclNode*` (no
+            // `MethodNode` wrapper, since trait decls have no instance
+            // bodies in the inherent-method sense).  Without this
+            // descent the locator stops at TraitDeclaration and any
+            // hover inside a trait method's signature renders the
+            // trait head instead of the method.
+            const d: TraitDeclNode* = node as TraitDeclNode*;
+            return pick_array_function(d.methods, line, character);
+        }
         NodeKind::ImplementationBlock => {
             // `synthesize_default_trait_methods` (TypeResolution) clones
             // default-bodied trait methods INTO this impl's `methods`
@@ -373,6 +383,19 @@ function pick_array_var(arr: VarDeclNode*[], line: u32, character: u32) -> ASTNo
 function pick_array_method(arr: MethodNode*[], line: u32, character: u32) -> ASTNode* {
     for (mut i: i64 = 0; i < arr.length; i++) {
         const elem: MethodNode* = arr[i];
+        if (elem != null && span_contains(elem.span, line, character)) {
+            return elem as ASTNode*;
+        }
+    }
+    return null;
+}
+
+/// Bare-function variant — `TraitDeclNode.methods` is a
+/// `FunctionDeclNode*[]` rather than `MethodNode*[]`, so it can't go
+/// through `pick_array_method`.
+function pick_array_function(arr: FunctionDeclNode*[], line: u32, character: u32) -> ASTNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const elem: FunctionDeclNode* = arr[i];
         if (elem != null && span_contains(elem.span, line, character)) {
             return elem as ASTNode*;
         }
@@ -810,6 +833,114 @@ function methods_contains(arr: MethodNode*[], target: MethodNode*) -> boolean {
         if (arr[i] == target) { return true; }
     }
     return false;
+}
+
+
+/// Reverse-walk the module graph to find the struct/class/impl/trait
+/// whose method body contains the position `(line, character)` in
+/// `file_path`.  Returns the owner's name as SymbolStr — useful for
+/// resolving `this.field` hovers where the receiver expression's
+/// resolved_type didn't survive sema (generic bodies, partial
+/// compiles) but the cursor position is still inside a method body.
+///
+/// Returns `SymbolStr::empty()` when no enclosing method covers the
+/// position.  Caller treats that as "fall through to the regular
+/// type-lookup path."
+public function find_enclosing_method_owner(graph: ModuleGraph*,
+                                             file_path: string,
+                                             line: u32,
+                                             character: u32) -> SymbolStr {
+    if (graph == null || file_path == "") { return SymbolStr::empty(); }
+    if (strlen(file_path) == 0 as u64)    { return SymbolStr::empty(); }
+
+    const mod_idx: i64 = graph.find_module_by_path(file_path);
+    if (mod_idx < 0) { return SymbolStr::empty(); }
+    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return SymbolStr::empty(); }
+
+    for (mut si: i64 = 0; si < ast.statements.length; si++) {
+        const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+        if (stmt == null) { continue; }
+        const owner: SymbolStr = enclosing_owner_of(stmt, line, character);
+        if (owner.is_valid()) { return owner; }
+    }
+    return SymbolStr::empty();
+}
+
+function enclosing_owner_of(stmt: ASTNode*, line: u32, character: u32) -> SymbolStr {
+    match (stmt.kind) {
+        NodeKind::StructDeclaration => {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            if (method_body_contains_at(d.methods, line, character)) {
+                return d.name;
+            }
+            return SymbolStr::empty();
+        }
+        NodeKind::ClassDeclaration => {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            if (method_body_contains_at(d.methods, line, character)) {
+                return d.name;
+            }
+            return SymbolStr::empty();
+        }
+        NodeKind::ImplementationBlock => {
+            const d: ImplBlockNode* = stmt as ImplBlockNode*;
+            if (method_body_contains_at(d.methods, line, character)) {
+                return d.target_type;
+            }
+            return SymbolStr::empty();
+        }
+        NodeKind::TraitDeclaration => {
+            // Trait method bodies (default impls) — for the `Self`
+            // hover case.  Trait methods are FunctionDeclNode here.
+            const d: TraitDeclNode* = stmt as TraitDeclNode*;
+            for (mut fi: i64 = 0; fi < d.methods.length; fi++) {
+                const f: FunctionDeclNode* = d.methods[fi];
+                if (f != null && f.body != null
+                        && span_contains(f.body.span, line, character)) {
+                    return d.name;
+                }
+            }
+            return SymbolStr::empty();
+        }
+        _ => { return SymbolStr::empty(); }
+    }
+}
+
+function method_body_contains_at(arr: MethodNode*[], line: u32, character: u32) -> boolean {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const m: MethodNode* = arr[i];
+        if (m == null || m.func == null || m.func.body == null) { continue; }
+        if (span_contains(m.func.body.span, line, character)) { return true; }
+    }
+    return false;
+}
+
+
+/// Reverse-walk the module graph to find the trait that declares
+/// `func` as one of its methods.  Trait methods are stored bare as
+/// `FunctionDeclNode*` (not `MethodNode*`), so the regular
+/// `find_method_owner` doesn't reach them.  Returns the trait's name
+/// (`Display`, `Hash`, ...) or `SymbolStr::empty()` when `func`
+/// belongs to no trait — the caller treats that as a free function.
+public function find_trait_for_function(graph: ModuleGraph*,
+                                         func: FunctionDeclNode*) -> SymbolStr {
+    if (graph == null || func == null) { return SymbolStr::empty(); }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::TraitDeclaration) { continue; }
+            const td: TraitDeclNode* = stmt as TraitDeclNode*;
+            for (mut fi: i64 = 0; fi < td.methods.length; fi++) {
+                if (td.methods[fi] == func) { return td.name; }
+            }
+        }
+    }
+    return SymbolStr::empty();
 }
 
 

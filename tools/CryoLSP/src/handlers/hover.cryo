@@ -40,6 +40,10 @@ import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Arena;
+import Compiler::Types;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
 import Compiler::ModuleGraph;
 
 import Lsp::Server::Docs;
@@ -148,7 +152,19 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     // like the source line and matches how editors show signatures.
     if (on_decl_name && node.kind == NodeKind::FunctionDeclaration) {
         const f: FunctionDeclNode* = node as FunctionDeclNode*;
-        content    = format_function_signature(f, ctx.type_arena);
+        // Trait methods are stored as bare `FunctionDeclNode*` on
+        // `TraitDeclNode.methods`, not as `MethodNode*`.  Detect that
+        // case by reverse-walking the module graph; when found, render
+        // as `Trait::name(...)` instead of the free-function form.
+        const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
+            ctx.module_graph, f);
+        if (trait_owner.is_valid()) {
+            const owner_str: string = leaf_after_separator(
+                ctx.intern_table.resolve(trait_owner));
+            content = format_trait_method_signature(f, owner_str, ctx.type_arena);
+        } else {
+            content = format_function_signature(f, ctx.type_arena);
+        }
         hover_span = name_span;
         doc_text   = f.documentation;
     } else if (on_decl_name && node.kind == NodeKind::MethodDeclaration) {
@@ -283,21 +299,53 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // locator's leaf-aware matcher compares against.
         const ma: MemberAccessNode* = node as MemberAccessNode*;
         if (ma.object != null && ctx.decl_index != null) {
-            const recv_ty: TypeRef = ma.object.resolved_type;
+            // -- Path 1: resolved-type route --------------------------
+            // The receiver expression's resolved_type after sema is
+            // often `&Formatter<W>` or `mut &String` (parser keeps the
+            // borrow form), but method declarations register against
+            // the underlying struct's TypeRef.  Unwrap Reference /
+            // Pointer / InstantiatedType wrappers so `lookup_type_name`
+            // hits the carrier's entry in the reverse map.
+            mut type_sym: SymbolStr = SymbolStr::empty();
+            mut owner_display: string = "";
+            const recv_ty: TypeRef = unwrap_to_carrier(
+                ma.object.resolved_type, ctx.type_arena);
             if (recv_ty.is_valid()) {
-                const type_sym: SymbolStr = ctx.decl_index.lookup_type_name(recv_ty);
+                type_sym = ctx.decl_index.lookup_type_name(recv_ty);
                 if (type_sym.is_valid()) {
-                    const m: MethodNode* = NodeLocator::find_method_in_modules(
-                        ctx.module_graph, ctx.intern_table, type_sym, ma.member);
-                    if (m != null && m.func != null) {
-                        const owner_str: string = ctx.type_arena.resolve_display_name_short(
-                            recv_ty.id);
-                        content  = format_method_signature(m, owner_str, ctx.type_arena);
-                        doc_text = m.documentation;
-                        if (NodeLocator::span_contains(
-                                ma.member_span, cursor_line, cursor_char)) {
-                            hover_span = ma.member_span;
-                        }
+                    owner_display = ctx.type_arena.resolve_display_name_short(
+                        recv_ty.id);
+                }
+            }
+
+            // -- Path 2: annotation fallback -------------------------
+            // Inside a generic function body sema may not have stamped
+            // a valid resolved_type on identifier expressions (the
+            // template body is type-checked once with unresolved
+            // generic params, so a `mut &Formatter<W>` parameter
+            // reference can land here as `?`).  Recover by walking
+            // through the parameter declaration's source annotation:
+            // `Formatter<W>` → take `Formatter` as the carrier name,
+            // then run the method lookup by name.
+            if (!type_sym.is_valid()) {
+                const annot_name: SymbolStr = receiver_carrier_name_from_annotation(
+                    ma.object, ctx);
+                if (annot_name.is_valid()) {
+                    type_sym = annot_name;
+                    owner_display = leaf_after_separator(
+                        ctx.intern_table.resolve(annot_name));
+                }
+            }
+
+            if (type_sym.is_valid()) {
+                const m: MethodNode* = NodeLocator::find_method_in_modules(
+                    ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                if (m != null && m.func != null) {
+                    content  = format_method_signature(m, owner_display, ctx.type_arena);
+                    doc_text = m.documentation;
+                    if (NodeLocator::span_contains(
+                            ma.member_span, cursor_line, cursor_char)) {
+                        hover_span = ma.member_span;
                     }
                 }
             }
@@ -426,21 +474,64 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // Walks back through the symbol's declaring span to find the
         // VarDeclNode and reads its initializer.
         const id_node: IdentifierNode* = node as IdentifierNode*;
-        const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
-        if (sym_id.is_valid()) {
-            const sym: Symbol = ctx.resolver.get_symbol(sym_id);
-            const init_str: string = const_initializer_text(
-                ctx.module_graph, sym.declaring_span);
-            content = format_identifier_use(
-                sym, id_node.resolved_type, ctx.type_arena, init_str);
-            // Pull doc from the symbol's source decl, if reachable.
-            // Covers `const ENOENT: i32 = 2` use sites and free
-            // function references; method/field/parameter uses fall
-            // through with empty doc (parameters carry no doc and
-            // method/field hovers go through dedicated branches).
-            const v: VarDeclNode* = var_decl_at_span(
-                ctx.module_graph, sym.declaring_span);
-            if (v != null) { doc_text = v.documentation; }
+
+        // `this` is parsed as an Identifier but isn't resolver-tracked.
+        // Render it as `this: <EnclosingType>` by finding the method
+        // body that contains the cursor and reading its owner.
+        if (id_node.name.is_valid() && ctx.intern_table != null) {
+            const this_sym: SymbolStr = ctx.intern_table.intern("this");
+            if (id_node.name.equals(this_sym)) {
+                const owner: SymbolStr = NodeLocator::find_enclosing_method_owner(
+                    ctx.module_graph, id_node.span.file,
+                    id_node.span.start_line, id_node.span.start_col);
+                if (owner.is_valid()) {
+                    const owner_str: string = leaf_after_separator(
+                        ctx.intern_table.resolve(owner));
+                    content    = "this: " + owner_str;
+                    hover_span = id_node.span;
+                }
+            }
+        }
+        if (content == "") {
+            const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
+            if (sym_id.is_valid()) {
+                const sym: Symbol = ctx.resolver.get_symbol(sym_id);
+
+                // Free-function call site (`foo` in `foo(x)`) — render the
+                // full signature instead of the function's own type, which
+                // round-trips through the arena as `?` for arrow types.
+                // Trait-method detection mirrors the decl-name dispatch above.
+                if (sym.kind == SymbolKind::Function) {
+                    const fdecl: FunctionDeclNode* = function_decl_at_span(
+                        ctx.module_graph, sym.declaring_span);
+                    if (fdecl != null) {
+                        const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
+                            ctx.module_graph, fdecl);
+                        if (trait_owner.is_valid()) {
+                            const owner_str: string = leaf_after_separator(
+                                ctx.intern_table.resolve(trait_owner));
+                            content = format_trait_method_signature(
+                                fdecl, owner_str, ctx.type_arena);
+                        } else {
+                            content = format_function_signature(fdecl, ctx.type_arena);
+                        }
+                        doc_text = fdecl.documentation;
+                    }
+                }
+
+                if (content == "") {
+                    const init_str: string = const_initializer_text(
+                        ctx.module_graph, sym.declaring_span);
+                    content = format_identifier_use(
+                        sym, id_node.resolved_type, ctx.type_arena, init_str);
+                    // Pull doc from the symbol's source decl, if reachable.
+                    // Covers `const ENOENT: i32 = 2` use sites; method/field/
+                    // parameter uses fall through with empty doc.
+                    const v: VarDeclNode* = var_decl_at_span(
+                        ctx.module_graph, sym.declaring_span);
+                    if (v != null) { doc_text = v.documentation; }
+                }
+            }
         }
     }
 
@@ -532,14 +623,37 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
 // `TypeRef::invalid()` and render as `?`.
 // ============================================================================
 
+/// Render a trait method as `<Trait>::<name><generics>(<params>) -> <ret>
+///     where <bounds>`.  `owner_display` is the trait's leaf name
+/// (`Display` rather than `std::fmt::display::Display`).  No `function`
+/// keyword — trait method declarations omit it in source too.
+function format_trait_method_signature(func: FunctionDeclNode*,
+                                        owner_display: string,
+                                        arena: TypeArena*) -> string {
+    if (func == null) { return ""; }
+    mut sig: string = "";
+    if (owner_display != "") {
+        sig = sig + owner_display + "::";
+    }
+    sig = sig + arena.intern_table.resolve(func.name);
+    sig = sig + format_generic_params(func.generic_params, arena.intern_table);
+    sig = sig + format_params(func.parameters, arena);
+    sig = sig + " -> ";
+    sig = sig + arena.resolve_display_name_short(func.resolved_return_type.id);
+    sig = sig + format_where_clause(func.trait_bounds, arena.intern_table);
+    return sig;
+}
+
 function format_function_signature(func: FunctionDeclNode*,
                                     arena: TypeArena*) -> string {
     if (func == null) { return ""; }
     mut sig: string = "function ";
     sig = sig + arena.intern_table.resolve(func.name);
+    sig = sig + format_generic_params(func.generic_params, arena.intern_table);
     sig = sig + format_params(func.parameters, arena);
     sig = sig + " -> ";
     sig = sig + arena.resolve_display_name_short(func.resolved_return_type.id);
+    sig = sig + format_where_clause(func.trait_bounds, arena.intern_table);
     return sig;
 }
 
@@ -571,9 +685,11 @@ function format_method_signature(method: MethodNode*, owner_display: string,
         sig = sig + owner_display + "::";
     }
     sig = sig + arena.intern_table.resolve(f.name);
+    sig = sig + format_generic_params(f.generic_params, arena.intern_table);
     sig = sig + format_params(f.parameters, arena);
     sig = sig + " -> ";
     sig = sig + arena.resolve_display_name_short(f.resolved_return_type.id);
+    sig = sig + format_where_clause(f.trait_bounds, arena.intern_table);
     return sig;
 }
 
@@ -739,6 +855,53 @@ function format_generic_params(params: GenericParamNode*[],
         }
     }
     return s + ">";
+}
+
+/// Render a function/method's trait bounds as a `where` clause on a
+/// new indented line.  Mirrors the source spelling:
+///
+///     hash<H>(&this, hasher: mut &H) -> void
+///         where H: Hasher
+///
+///     foo<T, U>(...) -> ...
+///         where T: Default + Clone, U: Eq
+///
+/// Each `TraitBound` carries the type-parameter name plus one or more
+/// `TraitRef`s; multi-trait bounds join with `+`, multi-param bounds
+/// join with `, `.  Empty bound list returns "" so callers can
+/// unconditionally concatenate.
+function format_where_clause(bounds: TraitBound[], intern: InternTable*) -> string {
+    if (bounds.length == 0) { return ""; }
+    mut s: string = "\n    where ";
+    for (mut i: i64 = 0; i < bounds.length; i++) {
+        if (i > 0) { s = s + ", "; }
+        const b: TraitBound = bounds[i];
+        s = s + intern.resolve(b.type_parameter);
+        s = s + ": ";
+        for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
+            if (j > 0) { s = s + " + "; }
+            s = s + format_trait_ref(b.trait_refs[j], intern);
+        }
+    }
+    return s;
+}
+
+/// Render a `TraitRef` as `<leaf>[<args>]`.  Multi-segment paths
+/// (`io::Write`) collapse to their leaf — the hover already names the
+/// enclosing context, so the prefix would just be noise.
+function format_trait_ref(tref: TraitRef, intern: InternTable*) -> string {
+    if (tref.path.length == 0) { return "?"; }
+    const leaf_sym: SymbolStr = tref.path[tref.path.length - 1];
+    mut s: string = intern.resolve(leaf_sym);
+    if (tref.type_args.length > 0) {
+        s = s + "<";
+        for (mut i: i64 = 0; i < tref.type_args.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            s = s + format_annotation(tref.type_args[i], intern);
+        }
+        s = s + ">";
+    }
+    return s;
 }
 
 /// Render a `TypeAnnotation*` as a one-line string.  Handles the
@@ -1022,6 +1185,151 @@ function var_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> VarDecl
     if (node == null) { return null; }
     if (node.kind != NodeKind::VariableDeclaration) { return null; }
     return node as VarDeclNode*;
+}
+
+/// Locate a `FunctionDeclNode` at the start position of `decl_span`.
+/// The resolver records the function's name span as `declaring_span`
+/// for `SymbolKind::Function` symbols; the locator descends from the
+/// program root and lands on the inner FunctionDeclNode regardless of
+/// whether it sits at the top level or inside a TraitDeclaration.
+/// Returns `null` when the symbol's source isn't reachable (cross-
+/// module compile failed, edited buffer, etc.).
+/// AST-side companion to `unwrap_to_carrier`.  Recover the receiver's
+/// carrier-type SymbolStr from the AST when sema didn't stamp a usable
+/// resolved_type — primarily for member-access hovers inside generic
+/// function bodies where `f.resolved_type` is invalid because sema
+/// type-checked the body with unresolved generic params.
+///
+/// Path:
+///   1. `recv` must be an IdentifierNode.
+///   2. Look up the resolver symbol for that identifier.
+///   3. Find the declaring VarDeclNode (parameter or local).
+///   4. Walk the TypeAnnotation, peeling Reference/Pointer/Generic
+///      wrappers, and return the SymbolStr of the leaf Named node.
+///
+/// Returns `SymbolStr::empty()` when any step misses.  All callers
+/// treat an empty result as "no fallback available" and skip the
+/// method lookup.
+function receiver_carrier_name_from_annotation(
+        recv: ExpressionNode*, ctx: CompilationContext*) -> SymbolStr {
+    if (recv == null || ctx == null) { return SymbolStr::empty(); }
+    if (recv.kind != NodeKind::Identifier) { return SymbolStr::empty(); }
+    if (ctx.resolver == null) { return SymbolStr::empty(); }
+
+    const id: IdentifierNode* = recv as IdentifierNode*;
+
+    // `this` is parsed as an IdentifierNode but the resolver has no
+    // symbol entry for it (it's the synthesised receiver, not a
+    // user-bound name).  Recover the carrier type by scanning the
+    // module graph for the method whose body span covers `this`'s
+    // position — that method's owner IS the carrier type.
+    if (id.name.is_valid() && ctx.intern_table != null) {
+        const this_sym: SymbolStr = ctx.intern_table.intern("this");
+        if (id.name.equals(this_sym) && id.span.has_location()) {
+            return NodeLocator::find_enclosing_method_owner(
+                ctx.module_graph, id.span.file,
+                id.span.start_line, id.span.start_col);
+        }
+    }
+
+    const sym_id: SymbolID = ctx.resolver.resolve(id.span);
+    if (!sym_id.is_valid()) { return SymbolStr::empty(); }
+    const sym: Symbol = ctx.resolver.get_symbol(sym_id);
+
+    const v: VarDeclNode* = var_decl_at_span(
+        ctx.module_graph, sym.declaring_span);
+    if (v == null) { return SymbolStr::empty(); }
+    if (v.type_annotation == null) { return SymbolStr::empty(); }
+    return annotation_carrier_name(v.type_annotation);
+}
+
+/// Walk a `TypeAnnotation*`, peeling Reference/Pointer/Array/Optional/
+/// Generic wrappers, and return the SymbolStr of the innermost `Named`
+/// (or `Primitive`) annotation.  Empty SymbolStr if the leaf isn't a
+/// named carrier — function types, tuples, and ThisType don't have a
+/// single SymbolStr the DI can key on.
+function annotation_carrier_name(ann: TypeAnnotation*) -> SymbolStr {
+    if (ann == null) { return SymbolStr::empty(); }
+    mut cur: TypeAnnotation* = ann;
+    mut hops: i64 = 0;
+    while (hops < 6) {
+        const result: SymbolStr = match (*cur) {
+            TypeAnnotation::Named(n)     => { n.name }
+            TypeAnnotation::Primitive(p) => { p.name }
+            _                            => { SymbolStr::empty() }
+        };
+        if (result.is_valid()) { return result; }
+
+        const next: TypeAnnotation* = match (*cur) {
+            TypeAnnotation::Reference(r) => { r.inner }
+            TypeAnnotation::Pointer(p)   => { p.inner }
+            TypeAnnotation::Array(a)     => { a.element }
+            TypeAnnotation::Optional(o)  => { o.inner }
+            TypeAnnotation::Generic(g)   => { g.base }
+            _                            => { null }
+        };
+        if (next == null) { return SymbolStr::empty(); }
+        cur = next;
+        hops = hops + 1;
+    }
+    return SymbolStr::empty();
+}
+
+
+/// Strip Reference, Pointer, and InstantiatedType wrappers from `ty`
+/// until a "carrier" type — the actual struct / class / enum the
+/// receiver names — is reached.  Method declarations register against
+/// the carrier's TypeRef, never against the borrow form or the spec
+/// instantiation wrapper, so any DI lookup that expects to find
+/// `Foo::bar` from a `&Foo<T>` receiver must unwrap first.
+///
+/// Caps the chain at 6 hops as a safety net against malformed type
+/// arenas — a self-referential pointer would otherwise loop forever.
+function unwrap_to_carrier(ty: TypeRef, arena: TypeArena*) -> TypeRef {
+    if (arena == null) { return ty; }
+    mut cur: TypeRef = ty;
+    mut hops: i64 = 0;
+    while (hops < 6) {
+        if (!cur.is_valid()) { return cur; }
+        const t: Type* = arena.lookup(cur.id);
+        if (t == null) { return cur; }
+        if (t.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = t as ReferenceType*;
+            cur = rt.referent;
+        } else if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            cur = pt.pointee;
+        } else if (t.kind == TypeKind::InstantiatedType) {
+            // `Formatter<W>` → unwrap to the bare `Formatter` template.
+            // Methods are declared on the template's TypeRef; the
+            // monomorphized spec re-registers them but the bare base
+            // is what the DI's reverse map keys on for hover.
+            const it: InstantiatedType* = t as InstantiatedType*;
+            cur = it.generic_base;
+        } else {
+            return cur;
+        }
+        hops = hops + 1;
+    }
+    return cur;
+}
+
+function function_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> FunctionDeclNode* {
+    if (graph == null)                       { return null; }
+    if (decl_span.file == "")                { return null; }
+    if (strlen(decl_span.file) == 0 as u64)  { return null; }
+    if (!decl_span.has_location())           { return null; }
+
+    const mod_idx: i64 = graph.find_module_by_path(decl_span.file);
+    if (mod_idx < 0) { return null; }
+    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return null; }
+
+    const node: ASTNode* = NodeLocator::find_innermost_node_at(
+        ast, decl_span.start_line, decl_span.start_col);
+    if (node == null) { return null; }
+    if (node.kind != NodeKind::FunctionDeclaration) { return null; }
+    return node as FunctionDeclNode*;
 }
 
 // ============================================================================
