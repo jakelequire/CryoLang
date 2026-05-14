@@ -14,6 +14,7 @@
 namespace CryoTests::Tests::Lang::Operators;
 
 import std::core::result;
+import std::core::cmp;
 import std::collections::str;
 import std::test::error;
 import std::test::assert;
@@ -467,4 +468,182 @@ function comparison_lower_precedence_than_arithmetic() -> Result<(), TestError> 
     // comparison bound tighter than `+`, we'd get `2 + (3 < 6)` which
     // wouldn't type-check.
     return expect_true(2 + 3 < 6, Str::new("2 + 3 < 6 should be true"));
+}
+
+// ============================================================================
+// Three-way comparison `<=>`
+// ============================================================================
+//
+// `a <=> b` desugars in the parser to `a.compare(&b)` — sugar for the
+// `Ord` trait method — and yields an `Ordering`.  Collapsed to an i32
+// here so the assertion helper can compare it.
+
+function ord_to_int(o: Ordering) -> i32 {
+    match (o) {
+        Ordering::Less    => { return -1; }
+        Ordering::Equal   => { return 0; }
+        Ordering::Greater => { return 1; }
+    }
+}
+
+![test]
+function spaceship_less() -> Result<(), TestError> {
+    const o: Ordering = 3 <=> 7;
+    return expect_eq(ord_to_int(o), -1);
+}
+
+![test]
+function spaceship_equal() -> Result<(), TestError> {
+    const o: Ordering = 42 <=> 42;
+    return expect_eq(ord_to_int(o), 0);
+}
+
+![test]
+function spaceship_greater() -> Result<(), TestError> {
+    const o: Ordering = 9 <=> 2;
+    return expect_eq(ord_to_int(o), 1);
+}
+
+![test]
+function spaceship_on_chars() -> Result<(), TestError> {
+    const o: Ordering = 'a' <=> 'b';
+    return expect_eq(ord_to_int(o), -1);
+}
+
+![test]
+function spaceship_binds_tighter_than_equality() -> Result<(), TestError> {
+    // `(1 <=> 2)` is `Ordering::Less`; pinning that `<=>` is its own
+    // expression and doesn't get tangled with a neighbouring `==`.
+    const o: Ordering = 1 <=> 2;
+    match (o) {
+        Ordering::Less    => { return Result::Ok(()); }
+        Ordering::Equal   => { return bail(Str::new("1 <=> 2 should be Less")); }
+        Ordering::Greater => { return bail(Str::new("1 <=> 2 should be Less")); }
+    }
+}
+
+// ============================================================================
+// Null-coalescing `??`
+// ============================================================================
+//
+// `a ?? b` desugars to `match (a) { Option::Some(v) => { v }
+// Option::None => { b } }` — `a` is evaluated exactly once (as the match
+// scrutinee) and `b` only when `a` is `None`.
+
+mut g_coalesce_lhs_evals: i32 = 0;
+mut g_coalesce_rhs_evals: i32 = 0;
+
+function coalesce_tracked_some() -> Option<i32> {
+    g_coalesce_lhs_evals = g_coalesce_lhs_evals + 1;
+    return Option::Some(7);
+}
+
+function coalesce_tracked_none() -> Option<i32> {
+    g_coalesce_lhs_evals = g_coalesce_lhs_evals + 1;
+    return Option::None;
+}
+
+function coalesce_tracked_default() -> i32 {
+    g_coalesce_rhs_evals = g_coalesce_rhs_evals + 1;
+    return -1;
+}
+
+![test]
+function null_coalesce_some_yields_inner() -> Result<(), TestError> {
+    const a: Option<i32> = Option::Some(42);
+    return expect_eq(a ?? 0, 42);
+}
+
+![test]
+function null_coalesce_none_yields_default() -> Result<(), TestError> {
+    const a: Option<i32> = Option::None;
+    return expect_eq(a ?? 99, 99);
+}
+
+![test]
+function null_coalesce_evaluates_lhs_once() -> Result<(), TestError> {
+    g_coalesce_lhs_evals = 0;
+    g_coalesce_rhs_evals = 0;
+    const v: i32 = coalesce_tracked_some() ?? coalesce_tracked_default();
+    match (expect_eq(v, 7)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // LHS ran once, RHS not at all (Some short-circuits the default).
+    match (expect_eq(g_coalesce_lhs_evals, 1)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_coalesce_rhs_evals, 0);
+}
+
+![test]
+function null_coalesce_evaluates_rhs_only_on_none() -> Result<(), TestError> {
+    g_coalesce_lhs_evals = 0;
+    g_coalesce_rhs_evals = 0;
+    const v: i32 = coalesce_tracked_none() ?? coalesce_tracked_default();
+    match (expect_eq(v, -1)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g_coalesce_lhs_evals, 1)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_coalesce_rhs_evals, 1);
+}
+
+![test]
+function null_coalesce_chains_right_associative() -> Result<(), TestError> {
+    // `a ?? b ?? c` is `a ?? (b ?? c)`: each `??` is `Option<T> ?? T -> T`,
+    // so only the rightmost operand is the bare fallback.
+    const a: Option<i32> = Option::None;
+    const b: Option<i32> = Option::None;
+    match (expect_eq(a ?? b ?? 555, 555)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const c: Option<i32> = Option::None;
+    const d: Option<i32> = Option::Some(13);
+    return expect_eq(c ?? d ?? 555, 13);
+}
+
+// ============================================================================
+// Pipe operators `|>` and `<|`
+// ============================================================================
+//
+// `x |> f` desugars to `f(x)` (piped value prepended to f's args);
+// `f <| x` desugars to `f(x)` (piped value appended).  Pure parser sugar.
+
+function pipe_double(x: i32) -> i32 { return x * 2; }
+function pipe_add(a: i32, b: i32) -> i32 { return a + b; }
+function pipe_triple_sum(a: i32, b: i32, c: i32) -> i32 { return a + b + c; }
+
+![test]
+function pipe_forward_bare_callable() -> Result<(), TestError> {
+    return expect_eq(5 |> pipe_double, 10);
+}
+
+![test]
+function pipe_forward_prepends_to_call_args() -> Result<(), TestError> {
+    // `7 |> pipe_add(100)` => `pipe_add(7, 100)`.
+    return expect_eq(7 |> pipe_add(100), 107);
+}
+
+![test]
+function pipe_forward_chains_left_associative() -> Result<(), TestError> {
+    // `3 |> pipe_double |> pipe_double` => `pipe_double(pipe_double(3))`.
+    return expect_eq(3 |> pipe_double |> pipe_double, 12);
+}
+
+![test]
+function pipe_backward_bare_callable() -> Result<(), TestError> {
+    return expect_eq(pipe_double <| 8, 16);
+}
+
+![test]
+function pipe_backward_appends_to_call_args() -> Result<(), TestError> {
+    // `pipe_add(100) <| 5` => `pipe_add(100, 5)`.
+    return expect_eq(pipe_add(100) <| 5, 105);
+}
+
+![test]
+function pipe_forward_into_multi_arg_call() -> Result<(), TestError> {
+    // `10 |> pipe_triple_sum(20, 30)` => `pipe_triple_sum(10, 20, 30)`.
+    return expect_eq(10 |> pipe_triple_sum(20, 30), 60);
 }

@@ -35,6 +35,11 @@ function lexeme_first_dot(s: string) -> i64 {
     return -1;
 }
 
+// Monotonic counter for synthetic `??`-desugar binding names.  Match-arm
+// bindings are arm-scoped so a fixed name would already be collision-free,
+// but a unique suffix keeps nested `??` readable in AST dumps and the LSP.
+mut g_coalesce_counter: u32 = 0;
+
 
 // ============================================================================
 // ExprParser — Expression + Type Annotation Parsing
@@ -65,9 +70,9 @@ public:
     }
 
     /// Parse assignment expression (right-associative).
-    /// assignment = conditional ( ( '=' | '+=' | ... ) assignment )?
+    /// assignment = pipe ( ( '=' | '+=' | ... ) assignment )?
     parse_assignment() -> ExpressionNode* {
-        mut left: ExpressionNode* = this.parse_conditional();
+        mut left: ExpressionNode* = this.parse_pipe();
         if (left == null || this.panic_mode) { return left; }
 
         if (this.current().kind.is_assignment_op()) {
@@ -83,6 +88,138 @@ public:
         }
 
         return left;
+    }
+
+    /// Pipe + null-coalescing precedence level — sits between assignment
+    /// and the ternary conditional, lower-binding than every arithmetic and
+    /// logical operator.  So `a + b |> f` is `(a + b) |> f` and `x ?? y + z`
+    /// is `x ?? (y + z)`.  All three operators are pure syntactic sugar and
+    /// are desugared here, so sema and codegen never see `|>`, `<|`, or `??`:
+    ///
+    ///   x |> f          =>  f(x)
+    ///   x |> f(a, b)    =>  f(x, a, b)     (piped value prepended)
+    ///   f <| x          =>  f(x)
+    ///   f(a, b) <| x    =>  f(a, b, x)     (piped value appended)
+    ///   a ?? b          =>  match (a) { Option::Some(v) => { v }
+    ///                                  Option::None    => { b } }
+    ///
+    /// Pipes are left-associative (`x |> f |> g` is `g(f(x))`).  `??` is
+    /// right-associative and lower-binding than the pipes, so `a ?? b ?? c`
+    /// is `a ?? (b ?? c)` — which is what makes the chain type-check:
+    /// each `??` is `Option<T> ?? T -> T`, so the rightmost operand is the
+    /// bare `T` fallback and every operand to its left is an `Option<T>`.
+    parse_pipe() -> ExpressionNode* {
+        mut left: ExpressionNode* = this.parse_conditional();
+        if (left == null || this.panic_mode) { return left; }
+
+        // Left-associative pipe chain.
+        while (this.check(TokenType::PipeGreater)
+                || this.check(TokenType::LessPipe)) {
+            const op: Token = this.advance();
+            const right: ExpressionNode* = this.parse_conditional();
+            if (right == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    format("expected expression after '%s'", op.lexeme));
+                return left;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            if (op.kind == TokenType::PipeGreater) {
+                // x |> f : f is `right`, piped value is `left`, prepend.
+                left = this.desugar_pipe(right, left, true, span);
+            } else {
+                // f <| x : f is `left`, piped value is `right`, append.
+                left = this.desugar_pipe(left, right, false, span);
+            }
+        }
+
+        // Right-associative `??`: recurse on the RHS so `a ?? b ?? c`
+        // nests as `a ?? (b ?? c)`.
+        if (this.check(TokenType::QuestionQuestion)) {
+            this.advance();
+            const right: ExpressionNode* = this.parse_pipe();
+            if (right == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    "expected expression after '??'");
+                return left;
+            }
+            const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
+            left = this.desugar_null_coalesce(left, right, span);
+        }
+        return left;
+    }
+
+    /// Build a call from a pipe operator.  `callable` is the function side
+    /// (an existing CallExprNode whose argument list we extend, or a bare
+    /// callable — identifier / member access / scope resolution — that we
+    /// wrap in a fresh call).  `value` is the piped operand; `prepend` puts
+    /// it first (`|>`), otherwise last (`<|`).
+    desugar_pipe(callable: ExpressionNode*, value: ExpressionNode*,
+                 prepend: boolean, span: SourceSpan) -> ExpressionNode* {
+        if (callable.kind == NodeKind::CallExpression) {
+            mut call: CallExprNode* = callable as CallExprNode*;
+            mut new_args: ExpressionNode*[] = [];
+            if (prepend) {
+                new_args.push(value);
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    new_args.push(call.arguments[i]);
+                }
+            } else {
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    new_args.push(call.arguments[i]);
+                }
+                new_args.push(value);
+            }
+            call.arguments = new_args;
+            call.span = span;
+            return call as ExpressionNode*;
+        }
+        // Bare callable — wrap it in a fresh call with the piped value as
+        // the sole argument.
+        mut call: CallExprNode* = new CallExprNode(callable, span);
+        call.add_argument(value);
+        return call as ExpressionNode*;
+    }
+
+    /// `a ?? b` => `match (a) { Option::Some(v) => { v } Option::None => { b } }`.
+    /// `a` becomes the match scrutinee so it is evaluated exactly once, and
+    /// `b` lands in the `None` arm so it is only evaluated when `a` is `None`.
+    desugar_null_coalesce(left: ExpressionNode*, right: ExpressionNode*,
+                          span: SourceSpan) -> ExpressionNode* {
+        g_coalesce_counter = g_coalesce_counter + 1;
+        const bind_str:  string    = format("__cryo_coalesce_%u", g_coalesce_counter);
+        const bind_name: SymbolStr = this.ctx.intern(bind_str);
+
+        mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
+
+        // Some(v) => { v }
+        mut some_pat: EnumPatternNode* = new EnumPatternNode(span);
+        some_pat.set_enum_name(this.ctx.intern("Option"));
+        some_pat.set_variant_name(this.ctx.intern("Some"));
+        const pb: PatternBinding* = new PatternBinding { name: bind_name, span: span };
+        some_pat.add_element(PatternElement::Binding(pb));
+        some_pat.add_binding(bind_name, span, 0);
+        mut some_arm: MatchArmNode* = new MatchArmNode(span);
+        some_arm.add_pattern(some_pat as PatternNode*);
+        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, span);
+        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, span);
+        mut some_block: BlockStmtNode* = new BlockStmtNode(span);
+        some_block.add_statement(some_stmt as StatementNode*);
+        some_arm.set_body(some_block as StatementNode*);
+        match_expr.add_arm(some_arm);
+
+        // None => { b }
+        mut none_pat: EnumPatternNode* = new EnumPatternNode(span);
+        none_pat.set_enum_name(this.ctx.intern("Option"));
+        none_pat.set_variant_name(this.ctx.intern("None"));
+        mut none_arm: MatchArmNode* = new MatchArmNode(span);
+        none_arm.add_pattern(none_pat as PatternNode*);
+        const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
+        mut none_block: BlockStmtNode* = new BlockStmtNode(right.span);
+        none_block.add_statement(none_stmt as StatementNode*);
+        none_arm.set_body(none_block as StatementNode*);
+        match_expr.add_arm(none_arm);
+
+        return match_expr as ExpressionNode*;
     }
 
     /// Parse ternary conditional (right-associative).
@@ -133,7 +270,26 @@ public:
                 return left;
             }
             const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
-            left = new BinaryExprNode(op, left, right, span);
+            if (op.kind == TokenType::Spaceship) {
+                // `a <=> b` => `a.compare(&b)`.  Three-way comparison is
+                // sugar for the `Ord` trait method, so sema and codegen
+                // never see `<=>` — they just see an ordinary method call
+                // that resolves to the concrete `Ord` impl and yields an
+                // `Ordering`.  `&b` matches `compare`'s `other: &This`.
+                const amp_tok: Token = Token::new(
+                    TokenType::Amp, "&", op.line, op.column);
+                const ref_right: ExpressionNode* =
+                    new UnaryExprNode(amp_tok, right, right.span);
+                const compare_name: SymbolStr = this.ctx.intern("compare");
+                const member: MemberAccessNode* = new MemberAccessNode(
+                    left, compare_name, this.span_from_token(op), span);
+                mut call: CallExprNode* =
+                    new CallExprNode(member as ExpressionNode*, span);
+                call.add_argument(ref_right);
+                left = call as ExpressionNode*;
+            } else {
+                left = new BinaryExprNode(op, left, right, span);
+            }
         }
 
         return left;
