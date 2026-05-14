@@ -647,3 +647,199 @@ function pipe_forward_into_multi_arg_call() -> Result<(), TestError> {
     // `10 |> pipe_triple_sum(20, 30)` => `pipe_triple_sum(10, 20, 30)`.
     return expect_eq(10 |> pipe_triple_sum(20, 30), 60);
 }
+
+// ============================================================================
+// Try operator `?`
+// ============================================================================
+//
+// `expr?` is the postfix error/absence-propagation operator.  On a
+// `Result<T, E>` it yields `T` for `Ok(v)` and otherwise early-returns
+// `Result::Err(e)` from the enclosing function; on an `Option<T>` it yields
+// `T` for `Some(v)` and early-returns `Option::None` for `None`.  Unlike
+// `??`/`|>`, it cannot be a pure parser desugar — the desugar shape depends
+// on the operand's type — so sema lowers it to the equivalent `match`.
+
+/// Returns `Ok(n)` as a `Result<i32, TestError>` — the error type matches a
+/// `![test]` function's, so `?` can be exercised directly inside a test.
+function try_ok(n: i32) -> Result<i32, TestError> {
+    return Result::Ok(n);
+}
+
+/// `?`-propagates: unwraps `Ok` and continues (adding 100, so a caller can
+/// see the continuation ran), or early-returns the `Err` unchanged.
+function try_result_chain(input: Result<i32, i32>) -> Result<i32, i32> {
+    const v: i32 = input?;
+    return Result::Ok(v + 100);
+}
+
+/// `?`-propagates an `Option`: unwraps `Some` and continues, or early-returns
+/// `None`.
+function try_option_chain(input: Option<i32>) -> Option<i32> {
+    const v: i32 = input?;
+    return Option::Some(v + 100);
+}
+
+![test]
+function try_result_ok_yields_inner() -> Result<(), TestError> {
+    // `?` on `Ok` unwraps the payload and execution continues past it.
+    const v: i32 = try_ok(7)?;
+    return expect_eq(v, 7);
+}
+
+![test]
+function try_result_ok_chains() -> Result<(), TestError> {
+    // Two `?` in one body, both on `Ok` — both unwrap, the body runs to end.
+    const a: i32 = try_ok(10)?;
+    const b: i32 = try_ok(20)?;
+    return expect_eq(a + b, 30);
+}
+
+![test]
+function try_result_err_propagates_unchanged() -> Result<(), TestError> {
+    // `?` on `Err` early-returns from `try_result_chain` before the `+ 100`
+    // continuation runs, and the original error code 42 is preserved.
+    const out: Result<i32, i32> = try_result_chain(Result::Err(42));
+    match (out) {
+        Result::Ok(_)  => { return bail(Str::new("expected `?` to propagate Err")); }
+        Result::Err(e) => { return expect_eq(e, 42); }
+    }
+}
+
+![test]
+function try_result_ok_runs_continuation() -> Result<(), TestError> {
+    // `?` on `Ok` does NOT early-return — `try_result_chain` runs its `+ 100`.
+    const out: Result<i32, i32> = try_result_chain(Result::Ok(5));
+    match (out) {
+        Result::Ok(v)  => { return expect_eq(v, 105); }
+        Result::Err(_) => { return bail(Str::new("expected `?` on Ok to continue")); }
+    }
+}
+
+![test]
+function try_option_some_yields_inner() -> Result<(), TestError> {
+    // `?` on `Some` unwraps the payload; the continuation runs.
+    const out: Option<i32> = try_option_chain(Option::Some(5));
+    match (out) {
+        Option::Some(v) => { return expect_eq(v, 105); }
+        Option::None    => { return bail(Str::new("expected `?` on Some to continue")); }
+    }
+}
+
+![test]
+function try_option_none_propagates() -> Result<(), TestError> {
+    // `?` on `None` early-returns `Option::None` before the continuation.
+    const out: Option<i32> = try_option_chain(Option::None);
+    match (out) {
+        Option::Some(_) => { return bail(Str::new("expected `?` to propagate None")); }
+        Option::None    => { return Result::Ok(()); }
+    }
+}
+
+// --- Disambiguation: postfix try `?` vs ternary `?` -------------------------
+
+/// A real ternary — its `?` is followed by an expression, so the parser must
+/// NOT treat it as a try.
+function ternary_pick(flag: boolean) -> i32 {
+    return flag ? 100 : 200;
+}
+
+/// A ternary whose true-branch starts with unary minus.  `?` is followed by
+/// `-`, which can begin a unary expression, so this stays a ternary.
+function ternary_negate(flag: boolean, x: i32) -> i32 {
+    return flag ? -x : x;
+}
+
+![test]
+function try_disambig_ternary_unaffected() -> Result<(), TestError> {
+    expect_eq(ternary_pick(true), 100)?;
+    expect_eq(ternary_pick(false), 200)?;
+    return Result::Ok(());
+}
+
+![test]
+function try_disambig_ternary_with_unary_minus() -> Result<(), TestError> {
+    expect_eq(ternary_negate(true, 5), -5)?;
+    expect_eq(ternary_negate(false, 5), 5)?;
+    return Result::Ok(());
+}
+
+![test]
+function try_disambig_try_as_statement() -> Result<(), TestError> {
+    // `expr?;` — the `?` is followed by `;`, so it parses as a try.  On `Ok`
+    // the unwrapped value is discarded and execution continues.
+    try_ok(1)?;
+    return Result::Ok(());
+}
+
+![test]
+function try_disambig_try_then_binary() -> Result<(), TestError> {
+    // `try_ok(41)? + 1` — the `?` is followed by `+` (a binary operator that
+    // cannot start a unary expression), so it is a try; `+ 1` then applies
+    // to the unwrapped value.
+    const sum: i32 = try_ok(41)? + 1;
+    return expect_eq(sum, 42);
+}
+
+![test]
+function try_disambig_try_in_call_arg() -> Result<(), TestError> {
+    // `try_ok(21)?` as a call argument — the `?` is followed by `)`, so it
+    // is a try, and the unwrapped `i32` is passed to `pipe_double`.
+    const doubled: i32 = pipe_double(try_ok(21)?);
+    return expect_eq(doubled, 42);
+}
+
+// --- Drop insertion across the `?` early-return path ------------------------
+//
+// `expr?` desugars to a `match` whose failure arm is an early `return`.
+// drop_insertion must give that synthetic `return` the cumulative drops of
+// every live local — otherwise a droppable local live across `expr?` would
+// leak on the error path.  `TryDropProbe` makes that observable: its `drop`
+// bumps a global, so a test can count how many times it ran.
+
+mut g_try_drop_count: i32 = 0;
+
+type struct TryDropProbe {
+    tag: i32;
+}
+
+implement trait Drop for struct TryDropProbe {
+    drop(mut &this) -> void {
+        g_try_drop_count = g_try_drop_count + 1;
+    }
+}
+
+/// Declares a droppable local, then `?`-propagates `input`.  `probe` is
+/// used after the `?` (so it is genuinely live across it) — on the error
+/// path the `?` early-returns and `probe` must still be dropped.
+function try_with_live_local(input: Result<i32, i32>) -> Result<i32, i32> {
+    const probe: TryDropProbe = TryDropProbe { tag: 1 };
+    const v: i32 = input?;
+    return Result::Ok(v + probe.tag);
+}
+
+![test]
+function try_drops_live_local_on_error_path() -> Result<(), TestError> {
+    // `?` takes the error path: `try_with_live_local` early-returns before
+    // the `+ probe.tag` line, but `probe` was live across the `?` and must
+    // be dropped exactly once on the way out.
+    g_try_drop_count = 0;
+    const out: Result<i32, i32> = try_with_live_local(Result::Err(7));
+    match (out) {
+        Result::Ok(_)  => { return bail(Str::new("expected `?` to take the error path")); }
+        Result::Err(_) => { }
+    }
+    return expect_eq(g_try_drop_count, 1);
+}
+
+![test]
+function try_keeps_live_local_through_ok_path() -> Result<(), TestError> {
+    // `?` takes the ok path: execution continues, `probe` reaches the
+    // helper's normal scope exit and is dropped exactly once — the
+    // error-path drops we added must not double-drop it.
+    g_try_drop_count = 0;
+    const out: Result<i32, i32> = try_with_live_local(Result::Ok(40));
+    match (out) {
+        Result::Ok(v)  => { return expect_eq(v + g_try_drop_count, 42); }
+        Result::Err(_) => { return bail(Str::new("expected `?` to take the ok path")); }
+    }
+}

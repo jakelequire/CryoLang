@@ -79,3 +79,35 @@ function get_binary_precedence(kind: TokenType) -> int {
     };
 }
 
+/// Disambiguates the postfix try operator `expr?` from the ternary `?`.
+/// `parse_postfix` runs *inside* `parse_conditional`, so a greedy `?` would
+/// swallow the ternary's `?`.  The rule: a ternary's `?` is always followed
+/// by an expression (the true-branch); the try `?` is always followed by a
+/// token that *cannot* begin one.  So treat the `?` as a try operator iff
+/// the next token is a terminator (`;`, `)`, `]`, `}`, `,`, EOF), another
+/// postfix `?`/`?.`/`??`, an `as` cast, a pipe, or a binary/assignment
+/// operator — but NOT an operator that can also start a unary expression
+/// (`-`, `*`, `&`), since `cond ? -x : y` must stay a ternary.
+function try_question_terminates(next: TokenType) -> boolean {
+    return match (next) {
+        TokenType::Semicolon        => { true }
+        TokenType::RParen           => { true }
+        TokenType::RBrace           => { true }
+        TokenType::RSquare          => { true }
+        TokenType::Comma            => { true }
+        TokenType::EOF              => { true }
+        TokenType::Question         => { true }
+        TokenType::QuestionQuestion => { true }
+        TokenType::QuestionDot      => { true }
+        TokenType::KwAs             => { true }
+        TokenType::PipeGreater      => { true }
+        TokenType::LessPipe         => { true }
+        _ => {
+            // Binary/assignment operators terminate the try operand, but
+            // exclude unary-prefix-capable ones (`-`, `*`, `&`) — those
+            // can start a ternary true-branch.
+            get_binary_precedence(next) > 0 && !next.is_unary_prefix_op()
+        }
+    };
+}
+
