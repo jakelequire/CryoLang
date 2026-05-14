@@ -88,30 +88,36 @@ function decode_char_lexeme(s: string) -> u64 {
     const len: i64 = intrinsics::strlen(s) as i64;
     if (len >= 2 && s[0] == '\\') {
         const esc: char = s[1];
-        if      (esc == 'n')  { return 10; }
-        else if (esc == 't')  { return 9; }
-        else if (esc == 'r')  { return 13; }
-        else if (esc == '0')  { return 0; }
-        else if (esc == '\\') { return 92; }
-        else if (esc == '\'') { return 39; }
-        else if (esc == '"')  { return 34; }
-        else if (esc == 'a')  { return 7; }
-        else if (esc == 'b')  { return 8; }
-        else if (esc == 'f')  { return 12; }
-        else if (esc == 'v')  { return 11; }
-        else if (esc == 'x' && len >= 4) {
-            // `\xHH`: two hex digits
-            mut hi: u64 = 0;
-            const c2: char = s[2];
-            if (c2 >= '0' && c2 <= '9') { hi = (c2 - '0') as u64; }
-            else if (c2 >= 'a' && c2 <= 'f') { hi = (c2 - 'a' + 10) as u64; }
-            else if (c2 >= 'A' && c2 <= 'F') { hi = (c2 - 'A' + 10) as u64; }
-            mut lo: u64 = 0;
-            const c3: char = s[3];
-            if (c3 >= '0' && c3 <= '9') { lo = (c3 - '0') as u64; }
-            else if (c3 >= 'a' && c3 <= 'f') { lo = (c3 - 'a' + 10) as u64; }
-            else if (c3 >= 'A' && c3 <= 'F') { lo = (c3 - 'A' + 10) as u64; }
-            return hi * 16 + lo;
+        match (esc) {
+            'n'  => { return 10; }
+            't'  => { return 9; }
+            'r'  => { return 13; }
+            '0'  => { return 0; }
+            '\\' => { return 92; }
+            '\'' => { return 39; }
+            '"'  => { return 34; }
+            'a'  => { return 7; }
+            'b'  => { return 8; }
+            'f'  => { return 12; }
+            'v'  => { return 11; }
+            'x'  => {
+                // `\xHH`: two hex digits.  A short `\x` (len < 4) is
+                // malformed — fall through to the bare-escape default.
+                if (len >= 4) {
+                    mut hi: u64 = 0;
+                    const c2: char = s[2];
+                    if (c2 >= '0' && c2 <= '9') { hi = (c2 - '0') as u64; }
+                    else if (c2 >= 'a' && c2 <= 'f') { hi = (c2 - 'a' + 10) as u64; }
+                    else if (c2 >= 'A' && c2 <= 'F') { hi = (c2 - 'A' + 10) as u64; }
+                    mut lo: u64 = 0;
+                    const c3: char = s[3];
+                    if (c3 >= '0' && c3 <= '9') { lo = (c3 - '0') as u64; }
+                    else if (c3 >= 'a' && c3 <= 'f') { lo = (c3 - 'a' + 10) as u64; }
+                    else if (c3 >= 'A' && c3 <= 'F') { lo = (c3 - 'A' + 10) as u64; }
+                    return hi * 16 + lo;
+                }
+            }
+            _ => { }
         }
         return esc as u64;
     }
@@ -500,106 +506,114 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
         }
     }
 
-    // Arithmetic
-    if (op_kind == TokenType::Plus) {
-        *out_value = if (is_float) {
-            cg.builder.build_fadd(lhs, rhs, "addtmp")
-        } else {
-            cg.builder.build_add(lhs, rhs, "addtmp")
-        };
-    } else if (op_kind == TokenType::Minus) {
-        *out_value = if (is_float) {
-            cg.builder.build_fsub(lhs, rhs, "subtmp")
-        } else {
-            cg.builder.build_sub(lhs, rhs, "subtmp")
-        };
-    } else if (op_kind == TokenType::Star) {
-        *out_value = if (is_float) {
-            cg.builder.build_fmul(lhs, rhs, "multmp")
-        } else {
-            cg.builder.build_mul(lhs, rhs, "multmp")
-        };
-    } else if (op_kind == TokenType::Slash) {
-        *out_value = if (is_float) {
-            cg.builder.build_fdiv(lhs, rhs, "divtmp")
-        } else { if (is_signed) {
-            cg.builder.build_sdiv(lhs, rhs, "divtmp")
-        } else {
-            cg.builder.build_udiv(lhs, rhs, "divtmp")
-        } };
-    } else if (op_kind == TokenType::Percent) {
-        *out_value = if (is_float) {
-            cg.builder.build_frem(lhs, rhs, "remtmp")
-        } else { if (is_signed) {
-            cg.builder.build_srem(lhs, rhs, "remtmp")
-        } else {
-            cg.builder.build_urem(lhs, rhs, "remtmp")
-        } };
+    match (op_kind) {
+        // Arithmetic
+        TokenType::Plus => {
+            *out_value = if (is_float) {
+                cg.builder.build_fadd(lhs, rhs, "addtmp")
+            } else {
+                cg.builder.build_add(lhs, rhs, "addtmp")
+            };
+        }
+        TokenType::Minus => {
+            *out_value = if (is_float) {
+                cg.builder.build_fsub(lhs, rhs, "subtmp")
+            } else {
+                cg.builder.build_sub(lhs, rhs, "subtmp")
+            };
+        }
+        TokenType::Star => {
+            *out_value = if (is_float) {
+                cg.builder.build_fmul(lhs, rhs, "multmp")
+            } else {
+                cg.builder.build_mul(lhs, rhs, "multmp")
+            };
+        }
+        TokenType::Slash => {
+            *out_value = if (is_float) {
+                cg.builder.build_fdiv(lhs, rhs, "divtmp")
+            } else { if (is_signed) {
+                cg.builder.build_sdiv(lhs, rhs, "divtmp")
+            } else {
+                cg.builder.build_udiv(lhs, rhs, "divtmp")
+            } };
+        }
+        TokenType::Percent => {
+            *out_value = if (is_float) {
+                cg.builder.build_frem(lhs, rhs, "remtmp")
+            } else { if (is_signed) {
+                cg.builder.build_srem(lhs, rhs, "remtmp")
+            } else {
+                cg.builder.build_urem(lhs, rhs, "remtmp")
+            } };
+        }
 
-    // Comparison
-    } else if (op_kind == TokenType::EqualEqual) {
-        *out_value = if (is_float) {
-            cg.builder.build_fcmp(LRealPredicate::OEQ, lhs, rhs, "eqtmp")
-        } else {
-            cg.builder.build_icmp(LIntPredicate::EQ, lhs, rhs, "eqtmp")
-        };
-    } else if (op_kind == TokenType::ExclaimEqual) {
-        *out_value = if (is_float) {
-            cg.builder.build_fcmp(LRealPredicate::ONE, lhs, rhs, "netmp")
-        } else {
-            cg.builder.build_icmp(LIntPredicate::NE, lhs, rhs, "netmp")
-        };
-    } else if (op_kind == TokenType::LAngle) {
-        *out_value = if (is_float) {
-            cg.builder.build_fcmp(LRealPredicate::OLT, lhs, rhs, "lttmp")
-        } else { if (is_signed) {
-            cg.builder.build_icmp(LIntPredicate::SLT, lhs, rhs, "lttmp")
-        } else {
-            cg.builder.build_icmp(LIntPredicate::ULT, lhs, rhs, "lttmp")
-        } };
-    } else if (op_kind == TokenType::RAngle) {
-        *out_value = if (is_float) {
-            cg.builder.build_fcmp(LRealPredicate::OGT, lhs, rhs, "gttmp")
-        } else { if (is_signed) {
-            cg.builder.build_icmp(LIntPredicate::SGT, lhs, rhs, "gttmp")
-        } else {
-            cg.builder.build_icmp(LIntPredicate::UGT, lhs, rhs, "gttmp")
-        } };
-    } else if (op_kind == TokenType::LessEqual) {
-        *out_value = if (is_float) {
-            cg.builder.build_fcmp(LRealPredicate::OLE, lhs, rhs, "letmp")
-        } else { if (is_signed) {
-            cg.builder.build_icmp(LIntPredicate::SLE, lhs, rhs, "letmp")
-        } else {
-            cg.builder.build_icmp(LIntPredicate::ULE, lhs, rhs, "letmp")
-        } };
-    } else if (op_kind == TokenType::GreaterEqual) {
-        *out_value = if (is_float) {
-            cg.builder.build_fcmp(LRealPredicate::OGE, lhs, rhs, "getmp")
-        } else { if (is_signed) {
-            cg.builder.build_icmp(LIntPredicate::SGE, lhs, rhs, "getmp")
-        } else {
-            cg.builder.build_icmp(LIntPredicate::UGE, lhs, rhs, "getmp")
-        } };
+        // Comparison
+        TokenType::EqualEqual => {
+            *out_value = if (is_float) {
+                cg.builder.build_fcmp(LRealPredicate::OEQ, lhs, rhs, "eqtmp")
+            } else {
+                cg.builder.build_icmp(LIntPredicate::EQ, lhs, rhs, "eqtmp")
+            };
+        }
+        TokenType::ExclaimEqual => {
+            *out_value = if (is_float) {
+                cg.builder.build_fcmp(LRealPredicate::ONE, lhs, rhs, "netmp")
+            } else {
+                cg.builder.build_icmp(LIntPredicate::NE, lhs, rhs, "netmp")
+            };
+        }
+        TokenType::LAngle => {
+            *out_value = if (is_float) {
+                cg.builder.build_fcmp(LRealPredicate::OLT, lhs, rhs, "lttmp")
+            } else { if (is_signed) {
+                cg.builder.build_icmp(LIntPredicate::SLT, lhs, rhs, "lttmp")
+            } else {
+                cg.builder.build_icmp(LIntPredicate::ULT, lhs, rhs, "lttmp")
+            } };
+        }
+        TokenType::RAngle => {
+            *out_value = if (is_float) {
+                cg.builder.build_fcmp(LRealPredicate::OGT, lhs, rhs, "gttmp")
+            } else { if (is_signed) {
+                cg.builder.build_icmp(LIntPredicate::SGT, lhs, rhs, "gttmp")
+            } else {
+                cg.builder.build_icmp(LIntPredicate::UGT, lhs, rhs, "gttmp")
+            } };
+        }
+        TokenType::LessEqual => {
+            *out_value = if (is_float) {
+                cg.builder.build_fcmp(LRealPredicate::OLE, lhs, rhs, "letmp")
+            } else { if (is_signed) {
+                cg.builder.build_icmp(LIntPredicate::SLE, lhs, rhs, "letmp")
+            } else {
+                cg.builder.build_icmp(LIntPredicate::ULE, lhs, rhs, "letmp")
+            } };
+        }
+        TokenType::GreaterEqual => {
+            *out_value = if (is_float) {
+                cg.builder.build_fcmp(LRealPredicate::OGE, lhs, rhs, "getmp")
+            } else { if (is_signed) {
+                cg.builder.build_icmp(LIntPredicate::SGE, lhs, rhs, "getmp")
+            } else {
+                cg.builder.build_icmp(LIntPredicate::UGE, lhs, rhs, "getmp")
+            } };
+        }
 
-    // Bitwise
-    } else if (op_kind == TokenType::Amp) {
-        *out_value = cg.builder.build_and(lhs, rhs, "andtmp");
-    } else if (op_kind == TokenType::Pipe) {
-        *out_value = cg.builder.build_or(lhs, rhs, "ortmp");
-    } else if (op_kind == TokenType::Caret) {
-        *out_value = cg.builder.build_xor(lhs, rhs, "xortmp");
-    } else if (op_kind == TokenType::LessLess) {
-        *out_value = cg.builder.build_shl(lhs, rhs, "shltmp");
-    } else if (op_kind == TokenType::GreaterGreater) {
-        *out_value = if (is_signed) {
-            cg.builder.build_ashr(lhs, rhs, "shrtmp")
-        } else {
-            cg.builder.build_lshr(lhs, rhs, "shrtmp")
-        };
+        // Bitwise
+        TokenType::Amp            => { *out_value = cg.builder.build_and(lhs, rhs, "andtmp"); }
+        TokenType::Pipe           => { *out_value = cg.builder.build_or(lhs, rhs, "ortmp"); }
+        TokenType::Caret          => { *out_value = cg.builder.build_xor(lhs, rhs, "xortmp"); }
+        TokenType::LessLess       => { *out_value = cg.builder.build_shl(lhs, rhs, "shltmp"); }
+        TokenType::GreaterGreater => {
+            *out_value = if (is_signed) {
+                cg.builder.build_ashr(lhs, rhs, "shrtmp")
+            } else {
+                cg.builder.build_lshr(lhs, rhs, "shrtmp")
+            };
+        }
 
-    } else {
-        *out_value = LValue::null();
+        _ => { *out_value = LValue::null(); }
     }
 }
 
@@ -615,18 +629,17 @@ function codegen_unary(cg: CodegenContext*, operand: LValue, op_kind: TokenType,
     if (t != null) { t_kind = t.kind; }
     const is_float: boolean = t_kind == TypeKind::Float;
 
-    if (op_kind == TokenType::Minus) {
-        *out_value = if (is_float) {
-            cg.builder.build_fneg(operand, "negtmp")
-        } else {
-            cg.builder.build_neg(operand, "negtmp")
-        };
-    } else if (op_kind == TokenType::Exclaim) {
-        *out_value = cg.builder.build_not(operand, "nottmp");
-    } else if (op_kind == TokenType::Tilde) {
-        *out_value = cg.builder.build_not(operand, "bnottmp");
-    } else {
-        *out_value = LValue::null();
+    match (op_kind) {
+        TokenType::Minus => {
+            *out_value = if (is_float) {
+                cg.builder.build_fneg(operand, "negtmp")
+            } else {
+                cg.builder.build_neg(operand, "negtmp")
+            };
+        }
+        TokenType::Exclaim => { *out_value = cg.builder.build_not(operand, "nottmp"); }
+        TokenType::Tilde   => { *out_value = cg.builder.build_not(operand, "bnottmp"); }
+        _                  => { *out_value = LValue::null(); }
     }
 }
 
