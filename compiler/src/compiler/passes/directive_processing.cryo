@@ -141,47 +141,35 @@ public:
 /// Unknown names are accepted by the pass but get no validation or
 /// side-effects; they're still registered so user tooling can read them.
 function is_known_builtin(name: string) -> boolean {
-    return strcmp(name, "inline") == 0
-        || strcmp(name, "noinline") == 0
-        || strcmp(name, "entry") == 0
-        || strcmp(name, "test") == 0
-        || strcmp(name, "ignore") == 0
-        || strcmp(name, "should_panic") == 0
-        || strcmp(name, "config") == 0
-        || strcmp(name, "deprecated") == 0
-        || strcmp(name, "align") == 0
-        || strcmp(name, "repr") == 0
-        || strcmp(name, "link") == 0
-        || strcmp(name, "target") == 0
-        || strcmp(name, "allow") == 0
-        || strcmp(name, "warn") == 0
-        || strcmp(name, "deny") == 0
-        || strcmp(name, "derive") == 0
+    return match (name) {
+        "inline" | "noinline" | "entry" | "test" | "ignore"
+        | "should_panic" | "config" | "deprecated" | "align"
+        | "repr" | "link" | "target" | "allow" | "warn" | "deny"
+        | "derive"
         // `![consumes_self]`: marks a method as consuming its receiver.
         // Tells move-check / drop-insertion to treat the call as moving
         // the receiver, even when the receiver is syntactically `&this`
         // or `mut &this`.  Used for methods that semantically take
         // ownership but want the borrow-style call ergonomics.
-        || strcmp(name, "consumes_self") == 0
+        | "consumes_self"
         // Bare-atom forms of the cfg/config gate.  These are sugar for
         // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
-        || strcmp(name, "windows") == 0
-        || strcmp(name, "linux") == 0
-        || strcmp(name, "macos") == 0
-        || strcmp(name, "unix") == 0
+        | "windows" | "linux" | "macos" | "unix"
         // Top-level negation form: `![not(<atom>)]`.  Mirrors the
         // nested `not(...)` form recognised inside `config(...)`.
-        || strcmp(name, "not") == 0;
+        | "not" => { true }
+        _       => { false }
+    };
 }
 
 /// Local copy of the OS-atom predicate so the validator can extend
 /// `config(...)` arg-shape checking without cross-importing the
 /// ConfigGating pass.  Kept in sync with config_gating.cryo's atom set.
 function is_cfg_os_atom(name: string) -> boolean {
-    return strcmp(name, "windows") == 0
-        || strcmp(name, "linux") == 0
-        || strcmp(name, "macos") == 0
-        || strcmp(name, "unix") == 0;
+    return match (name) {
+        "windows" | "linux" | "macos" | "unix" => { true }
+        _                                      => { false }
+    };
 }
 
 
@@ -256,292 +244,265 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
     const name: string = dir.directive_kind;
     const argc: i64 = dir.args.length;
 
-    if (strcmp(name, "inline") == 0 || strcmp(name, "noinline") == 0) {
-        if (argc != 0) {
-            emit_arity_error(ctx, dir, name, 0, argc);
-        }
-        if (target != DirectiveTarget::Function) {
-            emit_placement_error(ctx, dir, name, "function", target);
-        }
-        return;
-    }
-
-    if (strcmp(name, "entry") == 0 || strcmp(name, "test") == 0) {
-        if (argc != 0) {
-            emit_arity_error(ctx, dir, name, 0, argc);
-        }
-        if (target != DirectiveTarget::Function) {
-            emit_placement_error(ctx, dir, name, "function", target);
-        }
-        return;
-    }
-
-    // `![ignore]` and `![should_panic]` are siblings of `![test]`: zero
-    // args, function-target.  Cross-directive coupling (e.g. requiring
-    // `![test]` to be present alongside `![ignore]`) is enforced later
-    // by the test-mode validator pass; directive_processing only checks
-    // each directive's own shape and target.
-    if (strcmp(name, "ignore") == 0 || strcmp(name, "should_panic") == 0) {
-        if (argc != 0) {
-            emit_arity_error(ctx, dir, name, 0, argc);
-        }
-        if (target != DirectiveTarget::Function) {
-            emit_placement_error(ctx, dir, name, "function", target);
-        }
-        return;
-    }
-
-    // `![consumes_self]`: zero args; method-target only.  Static-method
-    // and missing-receiver checks need the MethodNode and its
-    // FunctionDeclNode, so they live in the per-decl loop in
-    // run_directive_processing where we already have the decl pointer.
-    if (strcmp(name, "consumes_self") == 0) {
-        if (argc != 0) {
-            emit_arity_error(ctx, dir, name, 0, argc);
-        }
-        if (target != DirectiveTarget::Method) {
-            emit_placement_error(ctx, dir, name, "method", target);
-        }
-        return;
-    }
-
-    // `![config(<flavor>)]` marks an entire file's namespace as a special
-    // build mode.  Today the only recognised flavor is `testing`, which
-    // gates the file in/out under `cryo test`.  Future flavors (e.g. a
-    // `bench` flavor for benchmarks) plug in here.
-    if (strcmp(name, "config") == 0) {
-        if (argc != 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        const a: DirectiveArg = dir.args[0];
-
-        // Nested call shape: `config(not(<atom>))` etc.  Only `not(...)`
-        // is recognised today; vocabulary expansion (any/all) plugs in
-        // here.  Placement is unrestricted; platform gates can attach
-        // to any decl.
-        if (a.kind == DirectiveArgKind::Nested) {
-            if (a.nested == null
-                    || strcmp(a.nested.directive_kind, "not") != 0) {
-                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-                const msg: string =
-                    "directive `![config(...)]`: nested calls must be `not(<atom>)`";
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
-                diag = diag.at(dir.span);
-                ctx.emit_diagnostic(diag);
+    match (name) {
+        // Zero args, function-target.  `![ignore]` / `![should_panic]` are
+        // siblings of `![test]`; cross-directive coupling (e.g. requiring
+        // `![test]` alongside `![ignore]`) is enforced later by the
+        // test-mode validator — directive_processing only checks each
+        // directive's own shape and target.
+        "inline" | "noinline" | "entry" | "test"
+        | "ignore" | "should_panic" => {
+            if (argc != 0) {
+                emit_arity_error(ctx, dir, name, 0, argc);
             }
-            return;
-        }
-
-        if (a.kind != DirectiveArgKind::Ident) {
-            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-            return;
-        }
-
-        // OS-atom flavor: `config(windows)` etc.  No placement
-        // restriction; these gate any declaration.
-        if (is_cfg_os_atom(a.name)) {
-            return;
-        }
-
-        // Build-mode flavor: today only `testing` is recognised, and it
-        // must live on a namespace.  Misspelled flavors fall through to
-        // the catch-all error.
-        if (strcmp(a.name, "testing") == 0) {
-            if (target != DirectiveTarget::Module) {
-                emit_placement_error(ctx, dir, name, "namespace", target);
+            if (target != DirectiveTarget::Function) {
+                emit_placement_error(ctx, dir, name, "function", target);
             }
-            return;
         }
 
-        const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-        const msg: string = format(
-            "directive `![config]`: unknown flavor `%s` (expected `testing`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
-            a.name);
-        mut diag: Diagnostic = Diagnostic::error(code, msg);
-        diag = diag.at(dir.span);
-        ctx.emit_diagnostic(diag);
-        return;
-    }
+        // `![consumes_self]`: zero args; method-target only.  Static-method
+        // and missing-receiver checks need the MethodNode and its
+        // FunctionDeclNode, so they live in the per-decl loop in
+        // run_directive_processing where we already have the decl pointer.
+        "consumes_self" => {
+            if (argc != 0) {
+                emit_arity_error(ctx, dir, name, 0, argc);
+            }
+            if (target != DirectiveTarget::Method) {
+                emit_placement_error(ctx, dir, name, "method", target);
+            }
+        }
 
-    // Bare-atom forms: `![windows]`, `![linux]`, `![macos]`, `![unix]`.
-    // Sugar for `![config(<atom>)]`; identical semantics, evaluated by
-    // the ConfigGating pass.  Zero args, unrestricted placement.
-    if (is_cfg_os_atom(name)) {
-        if (argc != 0) {
-            emit_arity_error(ctx, dir, name, 0, argc);
-        }
-        return;
-    }
+        // `![config(<flavor>)]` marks an entire file's namespace as a special
+        // build mode.  Today the only recognised flavor is `testing`, which
+        // gates the file in/out under `cryo test`.  Future flavors (e.g. a
+        // `bench` flavor for benchmarks) plug in here.
+        "config" => {
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            const a: DirectiveArg = dir.args[0];
 
-    // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
-    // form recognised inside `config(...)`.
-    if (strcmp(name, "not") == 0) {
-        if (argc != 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        const a: DirectiveArg = dir.args[0];
-        if (a.kind != DirectiveArgKind::Ident) {
-            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-            return;
-        }
-        if (!is_cfg_os_atom(a.name)) {
+            // Nested call shape: `config(not(<atom>))` etc.  Only `not(...)`
+            // is recognised today; vocabulary expansion (any/all) plugs in
+            // here.  Placement is unrestricted; platform gates can attach
+            // to any decl.
+            if (a.kind == DirectiveArgKind::Nested) {
+                if (a.nested == null
+                        || strcmp(a.nested.directive_kind, "not") != 0) {
+                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                    const msg: string =
+                        "directive `![config(...)]`: nested calls must be `not(<atom>)`";
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                }
+                return;
+            }
+
+            if (a.kind != DirectiveArgKind::Ident) {
+                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                return;
+            }
+
+            // OS-atom flavor: `config(windows)` etc.  No placement
+            // restriction; these gate any declaration.
+            if (is_cfg_os_atom(a.name)) {
+                return;
+            }
+
+            // Build-mode flavor: today only `testing` is recognised, and it
+            // must live on a namespace.  Misspelled flavors fall through to
+            // the catch-all error.
+            if (strcmp(a.name, "testing") == 0) {
+                if (target != DirectiveTarget::Module) {
+                    emit_placement_error(ctx, dir, name, "namespace", target);
+                }
+                return;
+            }
+
             const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
             const msg: string = format(
-                "directive `![not]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, or `unix`)",
+                "directive `![config]`: unknown flavor `%s` (expected `testing`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
                 a.name);
             mut diag: Diagnostic = Diagnostic::error(code, msg);
             diag = diag.at(dir.span);
             ctx.emit_diagnostic(diag);
         }
-        return;
-    }
 
-    if (strcmp(name, "deprecated") == 0) {
-        // Optional single string-literal message.
-        if (argc > 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
+        // Bare-atom forms: `![windows]`, `![linux]`, `![macos]`, `![unix]`.
+        // Sugar for `![config(<atom>)]`; identical semantics, evaluated by
+        // the ConfigGating pass.  Zero args, unrestricted placement.
+        "windows" | "linux" | "macos" | "unix" => {
+            if (argc != 0) {
+                emit_arity_error(ctx, dir, name, 0, argc);
+            }
         }
-        if (argc == 1) {
+
+        // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
+        // form recognised inside `config(...)`.
+        "not" => {
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            const a: DirectiveArg = dir.args[0];
+            if (a.kind != DirectiveArgKind::Ident) {
+                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                return;
+            }
+            if (!is_cfg_os_atom(a.name)) {
+                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                const msg: string = format(
+                    "directive `![not]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, or `unix`)",
+                    a.name);
+                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                diag = diag.at(dir.span);
+                ctx.emit_diagnostic(diag);
+            }
+        }
+
+        "deprecated" => {
+            // Optional single string-literal message.
+            if (argc > 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+            }
+            if (argc == 1) {
+                const a: DirectiveArg = dir.args[0];
+                if (a.kind != DirectiveArgKind::StringLit) {
+                    emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                }
+            }
+        }
+
+        "align" => {
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            const a: DirectiveArg = dir.args[0];
+            if (a.kind != DirectiveArgKind::IntLit) {
+                emit_arg_kind_error(ctx, dir, name, 0, "an integer literal");
+                return;
+            }
+            if (target != DirectiveTarget::Struct
+                && target != DirectiveTarget::Class
+                && target != DirectiveTarget::Variable) {
+                emit_placement_error(ctx, dir, name, "struct/class/variable", target);
+            }
+        }
+
+        "repr" => {
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            const a: DirectiveArg = dir.args[0];
+            if (a.kind != DirectiveArgKind::Ident) {
+                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                return;
+            }
+            if (target != DirectiveTarget::Struct
+                && target != DirectiveTarget::Class
+                && target != DirectiveTarget::Enum) {
+                emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+            }
+        }
+
+        "link" => {
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
             const a: DirectiveArg = dir.args[0];
             if (a.kind != DirectiveArgKind::StringLit) {
                 emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
             }
         }
-        return;
-    }
 
-    if (strcmp(name, "align") == 0) {
-        if (argc != 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        const a: DirectiveArg = dir.args[0];
-        if (a.kind != DirectiveArgKind::IntLit) {
-            emit_arg_kind_error(ctx, dir, name, 0, "an integer literal");
-            return;
-        }
-        if (target != DirectiveTarget::Struct
-            && target != DirectiveTarget::Class
-            && target != DirectiveTarget::Variable) {
-            emit_placement_error(ctx, dir, name, "struct/class/variable", target);
-        }
-        return;
-    }
-
-    if (strcmp(name, "repr") == 0) {
-        if (argc != 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        const a: DirectiveArg = dir.args[0];
-        if (a.kind != DirectiveArgKind::Ident) {
-            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-            return;
-        }
-        if (target != DirectiveTarget::Struct
-            && target != DirectiveTarget::Class
-            && target != DirectiveTarget::Enum) {
-            emit_placement_error(ctx, dir, name, "struct/class/enum", target);
-        }
-        return;
-    }
-
-    if (strcmp(name, "link") == 0) {
-        if (argc != 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        const a: DirectiveArg = dir.args[0];
-        if (a.kind != DirectiveArgKind::StringLit) {
-            emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
-        }
-        return;
-    }
-
-    // `![target(<atom>)]` is an alias for `![config(<atom>)]` for
-    // platform-gate purposes.  Accepts the same vocabulary: bare OS
-    // atom or `not(<atom>)`.  The legacy `![cfg]` spelling has been
-    // retired in favor of `config`.
-    if (strcmp(name, "target") == 0) {
-        if (argc != 1) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        const a: DirectiveArg = dir.args[0];
-        if (a.kind == DirectiveArgKind::Nested) {
-            if (a.nested == null
-                    || strcmp(a.nested.directive_kind, "not") != 0) {
+        // `![target(<atom>)]` is an alias for `![config(<atom>)]` for
+        // platform-gate purposes.  Accepts the same vocabulary: bare OS
+        // atom or `not(<atom>)`.  The legacy `![cfg]` spelling has been
+        // retired in favor of `config`.
+        "target" => {
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            const a: DirectiveArg = dir.args[0];
+            if (a.kind == DirectiveArgKind::Nested) {
+                if (a.nested == null
+                        || strcmp(a.nested.directive_kind, "not") != 0) {
+                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                    const msg: string =
+                        "directive `![target(...)]`: nested calls must be `not(<atom>)`";
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                }
+                return;
+            }
+            if (a.kind != DirectiveArgKind::Ident) {
+                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                return;
+            }
+            if (!is_cfg_os_atom(a.name)) {
                 const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-                const msg: string =
-                    "directive `![target(...)]`: nested calls must be `not(<atom>)`";
+                const msg: string = format(
+                    "directive `![target]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
+                    a.name);
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
                 ctx.emit_diagnostic(diag);
             }
-            return;
         }
-        if (a.kind != DirectiveArgKind::Ident) {
-            emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-            return;
+
+        "allow" | "warn" | "deny" => {
+            if (argc == 0) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            for (mut i: i64 = 0; i < argc; i++) {
+                const a: DirectiveArg = dir.args[i];
+                if (a.kind != DirectiveArgKind::Ident) {
+                    emit_arg_kind_error(ctx, dir, name, i, "an identifier");
+                }
+            }
         }
-        if (!is_cfg_os_atom(a.name)) {
-            const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+
+        "derive" => {
+            if (argc == 0) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+            for (mut i: i64 = 0; i < argc; i++) {
+                const a: DirectiveArg = dir.args[i];
+                if (a.kind != DirectiveArgKind::Ident) {
+                    emit_arg_kind_error(ctx, dir, name, i, "a trait name (identifier)");
+                }
+            }
+            if (target != DirectiveTarget::Struct
+                && target != DirectiveTarget::Class
+                && target != DirectiveTarget::Enum) {
+                emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+            }
+        }
+
+        // Unrecognised directive name: warn so that typos like `![packed]`
+        // (a directive documented in `docs/cryo.md` §17.1 but never implemented)
+        // surface instead of silently no-opping.  Warning, not error, so user
+        // tooling that registers custom inert directives keeps compiling.
+        _ => {
+            const code: ErrorCode = ErrorCode::E0153_DIRECTIVE_UNKNOWN;
             const msg: string = format(
-                "directive `![target]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
-                a.name);
-            mut diag: Diagnostic = Diagnostic::error(code, msg);
+                "unknown directive `![%s]`: no built-in with that name; the directive is recorded but has no effect",
+                name);
+            mut diag: Diagnostic = Diagnostic::warning(code, msg);
             diag = diag.at(dir.span);
             ctx.emit_diagnostic(diag);
         }
-        return;
     }
-
-    if (strcmp(name, "allow") == 0 || strcmp(name, "warn") == 0 || strcmp(name, "deny") == 0) {
-        if (argc == 0) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        for (mut i: i64 = 0; i < argc; i++) {
-            const a: DirectiveArg = dir.args[i];
-            if (a.kind != DirectiveArgKind::Ident) {
-                emit_arg_kind_error(ctx, dir, name, i, "an identifier");
-            }
-        }
-        return;
-    }
-
-    if (strcmp(name, "derive") == 0) {
-        if (argc == 0) {
-            emit_arity_error(ctx, dir, name, 1, argc);
-            return;
-        }
-        for (mut i: i64 = 0; i < argc; i++) {
-            const a: DirectiveArg = dir.args[i];
-            if (a.kind != DirectiveArgKind::Ident) {
-                emit_arg_kind_error(ctx, dir, name, i, "a trait name (identifier)");
-            }
-        }
-        if (target != DirectiveTarget::Struct
-            && target != DirectiveTarget::Class
-            && target != DirectiveTarget::Enum) {
-            emit_placement_error(ctx, dir, name, "struct/class/enum", target);
-        }
-        return;
-    }
-
-    // Unrecognised directive name: warn so that typos like `![packed]`
-    // (a directive documented in `docs/cryo.md` §17.1 but never implemented)
-    // surface instead of silently no-opping.  Warning, not error, so user
-    // tooling that registers custom inert directives keeps compiling.
-    const code: ErrorCode = ErrorCode::E0153_DIRECTIVE_UNKNOWN;
-    const msg: string = format(
-        "unknown directive `![%s]`: no built-in with that name; the directive is recorded but has no effect",
-        name);
-    mut diag: Diagnostic = Diagnostic::warning(code, msg);
-    diag = diag.at(dir.span);
-    ctx.emit_diagnostic(diag);
 }
 
 
