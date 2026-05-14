@@ -742,91 +742,11 @@ public:
                 next_bb = LBasicBlock::append(current_fn, format("match.test%lld", i + 1));
             }
 
-            // Check each pattern in this arm (multiple patterns = OR).
-            mut matched: boolean = false;
-            for (mut p: i64 = 0; p < arm.patterns.length; p++) {
-                const pat: PatternNode* = arm.patterns[p];
-                if (pat == null) { continue; }
-
-                if (pat.pattern_kind == PatternKind::Wildcard) {
-                    // Wildcard: unconditional branch to this arm.
-                    this.cg.builder.build_br(arm_bbs[i]);
-                    matched = true;
-                    break;
-                } else if (pat.pattern_kind == PatternKind::Literal) {
-                    // For string subjects, build the pattern as a global
-                    // string pointer and compare via strcmp.  The default
-                    // `codegen_pattern_value` treats every literal as an
-                    // `atoi`-parsed i32 which is correct for int/char
-                    // matches but produces `const i32 0` for any string
-                    // pattern — neither typed nor useful for content
-                    // comparison against a string subject.
-                    mut cmp: LValue = LValue::null();
-                    if (is_string_subj) {
-                        const pat_text: string = this.cg.resolve(pat.value);
-                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
-                        codegen_string_compare(this.cg, subject, pat_val,
-                            TokenType::EqualEqual, &cmp);
-                    } else {
-                        const pat_val: LValue = this.codegen_pattern_value(pat);
-                        if (pat_val.is_valid()) {
-                            const pat_val_coerced: LValue =
-                                coerce_icmp_operands(this.cg, subject, pat_val);
-                            cmp = this.cg.builder.build_icmp(
-                                LIntPredicate::EQ, subject, pat_val_coerced, "match.cmp");
-                        }
-                    }
-                    if (cmp.is_valid()) {
-                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
-                        matched = true;
-                        break;
-                    }
-                } else if (pat.pattern_kind == PatternKind::Identifier) {
-                    mut cmp: LValue = LValue::null();
-                    if (is_string_subj) {
-                        const pat_text: string = this.cg.resolve(pat.value);
-                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
-                        codegen_string_compare(this.cg, subject, pat_val,
-                            TokenType::EqualEqual, &cmp);
-                    } else {
-                        const pat_val: LValue = this.codegen_pattern_value(pat);
-                        if (pat_val.is_valid()) {
-                            const pat_val_coerced: LValue =
-                                coerce_icmp_operands(this.cg, subject, pat_val);
-                            cmp = this.cg.builder.build_icmp(
-                                LIntPredicate::EQ, subject, pat_val_coerced, "match.cmp");
-                        }
-                    }
-                    if (cmp.is_valid()) {
-                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
-                        matched = true;
-                        break;
-                    }
-                } else if (pat.pattern_kind == PatternKind::Enum) {
-                    // Enum pattern: compare subject's tag to the variant's tag.
-                    if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
-                        const epat: EnumPatternNode* = pat as EnumPatternNode*;
-                        const variant: EnumVariantInfo* = minfo.enum_type.get_variant(epat.variant_name);
-                        if (variant != null) {
-                            const pat_val: LValue = LType::const_int(
-                                LType::i32(), variant.tag_value, false);
-                            const cmp: LValue = this.cg.builder.build_icmp(
-                                LIntPredicate::EQ, minfo.tag_val, pat_val, "match.cmp");
-                            this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // If no pattern matched (codegen failure), fall through.
-            if (!matched) {
-                const cur: LBasicBlock = this.cg.builder.get_insert_block();
-                if (cur.is_valid() && !cur.has_terminator()) {
-                    this.cg.builder.build_br(next_bb);
-                }
-            }
+            // Emit the OR-pattern comparison chain for this arm.  A hit on
+            // any pattern branches to arm_bbs[i]; a full miss falls through
+            // to next_bb.
+            this.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
+                minfo, is_string_subj, subject, current_fn, "match");
 
             // Position at next_bb for the next test (if not the last arm).
             if (i + 1 < num_arms) {
@@ -1057,6 +977,112 @@ public:
             // Only bind for the first enum pattern in this arm (multi-pattern
             // arms with different variants can't share bindings anyway).
             return;
+        }
+    }
+
+    /// Emit the comparison chain for one match arm into the current block.
+    /// Handles OR-patterns (`a | b | c => ...`): every pattern is tested in
+    /// turn, each branching to `arm_bb` on a hit; a miss falls through to the
+    /// next pattern's test, and the final miss falls through to `next_bb`.
+    /// A wildcard pattern branches unconditionally (later OR alternatives are
+    /// dead).  `name_prefix` namespaces the synthesised intermediate blocks
+    /// ("match" for statement matches, "mexpr" for expression matches).
+    ///
+    /// Shared by `visit(MatchStmtNode*)` and `visit(MatchExprNode*)`: the
+    /// per-pattern lowering is identical between them — only the block-name
+    /// prefix differs.  On return the builder is positioned at whichever
+    /// block emitted the last test (always terminated); the caller is free to
+    /// reposition to `next_bb` for the following arm.
+    emit_match_arm_comparison(mut &this, arm: MatchArmNode*,
+            arm_bb: LBasicBlock, next_bb: LBasicBlock,
+            minfo: MatchSubjectInfo, is_string_subj: boolean,
+            subject: LValue, current_fn: LValue,
+            name_prefix: string) -> void {
+        const npat: i64 = arm.patterns.length;
+        for (mut p: i64 = 0; p < npat; p++) {
+            const pat: PatternNode* = arm.patterns[p];
+            if (pat == null) { continue; }
+
+            // Where control goes if THIS pattern doesn't match: the next
+            // pattern's test for an OR-arm, otherwise the next arm's test
+            // (`next_bb`).  Each non-final OR alternative gets its own block
+            // so a miss on `a` still reaches the test for `b` in `a | b`.
+            const is_last: boolean = (p + 1 >= npat);
+            mut miss_bb: LBasicBlock = next_bb;
+            if (!is_last) {
+                miss_bb = LBasicBlock::append(current_fn,
+                    format("%s.or", name_prefix));
+            }
+
+            if (pat.pattern_kind == PatternKind::Wildcard) {
+                // Wildcard matches unconditionally — branch straight to the
+                // arm body; any later OR alternatives are unreachable.
+                this.cg.builder.build_br(arm_bb);
+                return;
+            }
+
+            mut cmp: LValue = LValue::null();
+            if (pat.pattern_kind == PatternKind::Literal
+                || pat.pattern_kind == PatternKind::Identifier) {
+                // For string subjects, build the pattern as a global string
+                // pointer and compare via strcmp — `codegen_pattern_value`
+                // lowers every literal to an i32 and would compare pointer
+                // bits, not content.
+                if (is_string_subj) {
+                    const pat_text: string = this.cg.resolve(pat.value);
+                    const pat_val: LValue =
+                        this.cg.get_or_create_string_literal(pat_text);
+                    codegen_string_compare(this.cg, subject, pat_val,
+                        TokenType::EqualEqual, &cmp);
+                } else {
+                    const pat_val: LValue = this.codegen_pattern_value(pat);
+                    if (pat_val.is_valid()) {
+                        const pat_val_coerced: LValue =
+                            coerce_icmp_operands(this.cg, subject, pat_val);
+                        cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
+                            subject, pat_val_coerced,
+                            format("%s.cmp", name_prefix));
+                    }
+                }
+            } else if (pat.pattern_kind == PatternKind::Enum) {
+                // Enum pattern: compare the subject's tag to the variant tag.
+                if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
+                    const epat: EnumPatternNode* = pat as EnumPatternNode*;
+                    const variant: EnumVariantInfo* =
+                        minfo.enum_type.get_variant(epat.variant_name);
+                    if (variant != null) {
+                        const pat_val: LValue = LType::const_int(
+                            LType::i32(), variant.tag_value, false);
+                        cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
+                            minfo.tag_val, pat_val,
+                            format("%s.cmp", name_prefix));
+                    }
+                }
+            }
+
+            if (cmp.is_valid()) {
+                this.cg.builder.build_cond_br(cmp, arm_bb, miss_bb);
+            } else {
+                // Pattern produced no comparison (a codegen gap) — treat it
+                // as an unconditional miss so control still reaches the rest
+                // of the chain rather than leaving the block unterminated.
+                const cur: LBasicBlock = this.cg.builder.get_insert_block();
+                if (cur.is_valid() && !cur.has_terminator()) {
+                    this.cg.builder.build_br(miss_bb);
+                }
+            }
+
+            if (!is_last) {
+                this.cg.builder.position_at_end(miss_bb);
+            }
+        }
+
+        // No pattern terminated the current block (empty / all-null pattern
+        // list, or a trailing pattern that produced no comparison) — fall
+        // through to the next arm so the IR stays well-formed.
+        const tail: LBasicBlock = this.cg.builder.get_insert_block();
+        if (tail.is_valid() && !tail.has_terminator()) {
+            this.cg.builder.build_br(next_bb);
         }
     }
 
@@ -3409,78 +3435,10 @@ public:
                 next_bb = LBasicBlock::append(current_fn, format("mexpr.test%lld", i + 1));
             }
 
-            mut matched: boolean = false;
-            for (mut p: i64 = 0; p < arm.patterns.length; p++) {
-                const pat: PatternNode* = arm.patterns[p];
-                if (pat == null) { continue; }
-
-                if (pat.pattern_kind == PatternKind::Wildcard) {
-                    this.cg.builder.build_br(arm_bbs[i]);
-                    matched = true;
-                    break;
-                } else if (pat.pattern_kind == PatternKind::Literal) {
-                    mut cmp: LValue = LValue::null();
-                    if (is_string_subj_e) {
-                        const pat_text: string = this.cg.resolve(pat.value);
-                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
-                        codegen_string_compare(this.cg, subject, pat_val,
-                            TokenType::EqualEqual, &cmp);
-                    } else {
-                        const pat_val: LValue = this.codegen_pattern_value(pat);
-                        if (pat_val.is_valid()) {
-                            const pat_val_coerced: LValue =
-                                coerce_icmp_operands(this.cg, subject, pat_val);
-                            cmp = this.cg.builder.build_icmp(LIntPredicate::EQ, subject, pat_val_coerced, "mexpr.cmp");
-                        }
-                    }
-                    if (cmp.is_valid()) {
-                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
-                        matched = true;
-                        break;
-                    }
-                } else if (pat.pattern_kind == PatternKind::Identifier) {
-                    mut cmp: LValue = LValue::null();
-                    if (is_string_subj_e) {
-                        const pat_text: string = this.cg.resolve(pat.value);
-                        const pat_val: LValue = this.cg.get_or_create_string_literal(pat_text);
-                        codegen_string_compare(this.cg, subject, pat_val,
-                            TokenType::EqualEqual, &cmp);
-                    } else {
-                        const pat_val: LValue = this.codegen_pattern_value(pat);
-                        if (pat_val.is_valid()) {
-                            const pat_val_coerced: LValue =
-                                coerce_icmp_operands(this.cg, subject, pat_val);
-                            cmp = this.cg.builder.build_icmp(LIntPredicate::EQ, subject, pat_val_coerced, "mexpr.cmp");
-                        }
-                    }
-                    if (cmp.is_valid()) {
-                        this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
-                        matched = true;
-                        break;
-                    }
-                } else if (pat.pattern_kind == PatternKind::Enum) {
-                    if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
-                        const epat: EnumPatternNode* = pat as EnumPatternNode*;
-                        const variant: EnumVariantInfo* = minfo.enum_type.get_variant(epat.variant_name);
-                        if (variant != null) {
-                            const pat_val: LValue = LType::const_int(
-                                LType::i32(), variant.tag_value, false);
-                            const cmp: LValue = this.cg.builder.build_icmp(
-                                LIntPredicate::EQ, minfo.tag_val, pat_val, "mexpr.cmp");
-                            this.cg.builder.build_cond_br(cmp, arm_bbs[i], next_bb);
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (!matched) {
-                const cur: LBasicBlock = this.cg.builder.get_insert_block();
-                if (cur.is_valid() && !cur.has_terminator()) {
-                    this.cg.builder.build_br(next_bb);
-                }
-            }
+            // Emit the OR-pattern comparison chain for this arm (see
+            // visit(MatchStmtNode*) — identical lowering, "mexpr" prefix).
+            this.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
+                minfo, is_string_subj_e, subject, current_fn, "mexpr");
 
             if (i + 1 < num_arms) {
                 this.cg.builder.position_at_end(next_bb);

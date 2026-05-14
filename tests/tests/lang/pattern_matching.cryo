@@ -288,3 +288,127 @@ function char_literal_pattern() -> Result<(), TestError> {
     expect_eq(char_lit_expr('\n'), 3)?;
     return expect_eq(char_lit_expr('z'), 0);
 }
+
+// ============================================================================
+// String literal patterns
+// ============================================================================
+//
+// A string subject can't be compared with `icmp` — that would compare the
+// i8* pointer bits, not the content.  Codegen detects a string-typed subject
+// and lowers each string-literal pattern to a `strcmp`-based equality test.
+// This is what lets a flag-name dispatch be a `match` instead of a chain of
+// `strcmp(name, "...") == 0` ifs.
+
+function str_class_expr(name: string) -> int {
+    return match (name) {
+        "help"    => { 1 }
+        "version" => { 2 }
+        "debug"   => { 3 }
+        _         => { 99 }
+    };
+}
+
+![test]
+function string_literal_pattern_expr() -> Result<(), TestError> {
+    expect_eq(str_class_expr("help"), 1)?;
+    expect_eq(str_class_expr("version"), 2)?;
+    expect_eq(str_class_expr("debug"), 3)?;
+    // A string equal in content but not in identity must still match —
+    // confirms content comparison, not pointer comparison.
+    const built: string = strcat_two("hel", "p");
+    expect_eq(str_class_expr(built), 1)?;
+    return expect_eq(str_class_expr("missing"), 99);
+}
+
+![test]
+function string_literal_pattern_stmt() -> Result<(), TestError> {
+    mut out: int = -1;
+    const name: string = "beta";
+    match (name) {
+        "alpha" => { out = 10; }
+        "beta"  => { out = 20; }
+        _       => { out = 0; }
+    }
+    return expect_eq(out, 20);
+}
+
+// Build a fresh heap string so the subject is not pointer-identical to any
+// pattern literal — `str_class_expr` must still match it by content.
+function strcat_two(a: string, b: string) -> string {
+    const la: u64 = intrinsics::strlen(a);
+    const lb: u64 = intrinsics::strlen(b);
+    const buf: void* = intrinsics::malloc(la + lb + 1);
+    intrinsics::memcpy(buf, a as void*, la);
+    intrinsics::memcpy(intrinsics::ptr_add(buf, la), b as void*, lb);
+    const tail: i8* = intrinsics::ptr_add(buf, la + lb) as i8*;
+    tail[0] = 0 as i8;
+    return buf as string;
+}
+
+// ============================================================================
+// OR-patterns — `a | b => ...`
+// ============================================================================
+//
+// Every alternative in an arm is tested in turn; a hit on any one runs the
+// arm.  Each non-final alternative gets its own comparison block so a miss on
+// the first still reaches the test for the rest.  Exercised here for string,
+// integer, and enum subjects, and for the 3-way `a | b | c` form.
+
+// The motivating case: flag-name dispatch, short and long names in one arm.
+function flag_kind(name: string) -> int {
+    return match (name) {
+        "help" | "h"    => { 1 }
+        "version" | "v" => { 2 }
+        "output" | "o"  => { 3 }
+        "debug"         => { 4 }
+        _               => { 99 }
+    };
+}
+
+![test]
+function or_pattern_string() -> Result<(), TestError> {
+    expect_eq(flag_kind("help"), 1)?;
+    expect_eq(flag_kind("h"), 1)?;        // second alternative must match
+    expect_eq(flag_kind("version"), 2)?;
+    expect_eq(flag_kind("v"), 2)?;
+    expect_eq(flag_kind("o"), 3)?;
+    expect_eq(flag_kind("debug"), 4)?;    // single-pattern arm still works
+    return expect_eq(flag_kind("zzz"), 99);
+}
+
+function int_or_expr(n: i32) -> i32 {
+    return match (n) {
+        0 | 1 | 2 => { 100 }              // 3-way OR
+        7 | 9     => { 200 }
+        _         => { 0 }
+    };
+}
+
+![test]
+function or_pattern_int() -> Result<(), TestError> {
+    expect_eq(int_or_expr(0), 100)?;
+    expect_eq(int_or_expr(1), 100)?;
+    expect_eq(int_or_expr(2), 100)?;      // last alternative of a 3-way arm
+    expect_eq(int_or_expr(7), 200)?;
+    expect_eq(int_or_expr(9), 200)?;
+    return expect_eq(int_or_expr(5), 0);
+}
+
+![test]
+function or_pattern_enum() -> Result<(), TestError> {
+    mut out: i32 = -1;
+    match (Token::Plus) {
+        Token::Plus | Token::Minus => { out = 1; }
+        Token::Number(_)           => { out = 2; }
+        Token::EndOfInput          => { out = 3; }
+    }
+    expect_eq(out, 1)?;
+
+    // The second alternative of the OR arm must fire too.
+    match (Token::Minus) {
+        Token::Plus | Token::Minus => { out = 11; }
+        Token::Number(_)           => { out = 12; }
+        Token::EndOfInput          => { out = 13; }
+    }
+    return expect_eq(out, 11);
+}
