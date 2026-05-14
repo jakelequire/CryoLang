@@ -1966,16 +1966,23 @@ function clean_doc_for_hover(raw: string) -> string {
 
 /// Format an `i64` as a heap-leased decimal `string`.  Routes through
 /// `i64.to_decimal_buf` so the digit logic stays in one place; the
-/// underlying buffer outlives this call (same pattern as the other
-/// `format_*` helpers in this file — the leak is per-hover-request
-/// and acceptable until the LSP grows a per-call arena).
+/// returned buffer is a bare `malloc` that outlives this call (same
+/// pattern as the other `format_*` helpers in this file — the leak is
+/// per-hover-request and acceptable until the LSP grows a per-call
+/// arena).
+///
+/// The buffer must NOT be a `String`: `String` is `Drop`, so a local
+/// one is freed on scope exit and `as_ptr()` would hand back dangling
+/// memory.  That UAF surfaced as garbage byte-counts in string-literal
+/// hovers (`string("…")[<garbage>]`).
 function i64_to_text(value: i64) -> string {
     mut scratch: u8[21];
     const n: u64 = value.to_decimal_buf(&scratch[0]);
-    mut buf: String = String::with_capacity(n + 1);
-    buf.push_str(Str::from_raw(&scratch[0], n));
-    buf.push_byte(0 as u8);
-    return buf.as_ptr() as string;
+    const src: u8*  = &scratch[0];
+    const buf: i8*  = malloc(n + 1 as u64) as i8*;
+    for (mut i: i64 = 0; i < n as i64; i++) { buf[i] = src[i] as i8; }
+    buf[n as i64] = 0 as i8;
+    return buf as string;
 }
 
 
@@ -2017,43 +2024,57 @@ function format_string_literal(lit: LiteralNode*) -> string {
 
 /// Re-escape `\n`/`\r`/`\t`/`"`/`\` in `s` so the hover renders the
 /// source-level appearance (newlines wouldn't survive markdown
-/// otherwise).  Truncates with `…` past 60 visible chars to keep the
+/// otherwise).  Truncates with `...` past 60 visible chars to keep the
 /// hover panel one line.
+///
+/// Writes into a bare `malloc` rather than a `String` builder: a local
+/// `String` is `Drop`, so returning `out.as_ptr()` handed back a freed
+/// buffer — the UAF that rendered string-literal hovers as garbage
+/// (`string("<garbage>")[…]`).  Worst case every input byte escapes to
+/// two output bytes, plus a trailing `...` and NUL — `2*len + 4`.
 function escape_for_hover(s: string) -> string {
     const len: i64 = strlen(s) as i64;
     const max_show: i64 = 60;
-    mut out: String = String::new();
+    const buf: i8* = malloc((2 * len + 4) as u64) as i8*;
+    mut wi: i64 = 0;
     mut shown: i64 = 0;
     mut i: i64 = 0;
     while (i < len) {
         if (shown >= max_show) {
-            out.push_cstr("...");
+            buf[wi] = '.' as i8;  wi = wi + 1;
+            buf[wi] = '.' as i8;  wi = wi + 1;
+            buf[wi] = '.' as i8;  wi = wi + 1;
             break;
         }
         const c: i8 = s[i];
         if (c == '\n' as i8) {
-            out.push_cstr("\\n");
+            buf[wi] = '\\' as i8; wi = wi + 1;
+            buf[wi] = 'n' as i8;  wi = wi + 1;
             shown = shown + 2;
         } else if (c == '\r' as i8) {
-            out.push_cstr("\\r");
+            buf[wi] = '\\' as i8; wi = wi + 1;
+            buf[wi] = 'r' as i8;  wi = wi + 1;
             shown = shown + 2;
         } else if (c == '\t' as i8) {
-            out.push_cstr("\\t");
+            buf[wi] = '\\' as i8; wi = wi + 1;
+            buf[wi] = 't' as i8;  wi = wi + 1;
             shown = shown + 2;
         } else if (c == '"' as i8) {
-            out.push_cstr("\\\"");
+            buf[wi] = '\\' as i8; wi = wi + 1;
+            buf[wi] = '"' as i8;  wi = wi + 1;
             shown = shown + 2;
         } else if (c == '\\' as i8) {
-            out.push_cstr("\\\\");
+            buf[wi] = '\\' as i8; wi = wi + 1;
+            buf[wi] = '\\' as i8; wi = wi + 1;
             shown = shown + 2;
         } else {
-            out.push_byte(c as u8);
+            buf[wi] = c; wi = wi + 1;
             shown = shown + 1;
         }
         i = i + 1;
     }
-    out.push_byte(0 as u8);
-    return out.as_ptr() as string;
+    buf[wi] = 0 as i8;
+    return buf as string;
 }
 
 
