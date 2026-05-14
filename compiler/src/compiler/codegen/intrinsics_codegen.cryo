@@ -7,9 +7,9 @@
 /// undefined-symbol references that used to require `runtime/cryort.c`.
 ///
 /// Layout:
-///   - `IntrinsicKind`         — one variant per recognized intrinsic.
-///   - `lookup_intrinsic_kind` — name → kind (single source of truth).
-///   - `try_emit_intrinsic_call` — kind-driven LLVM IR emission.
+///   - `IntrinsicKind`:          one variant per recognized intrinsic.
+///   - `lookup_intrinsic_kind`:  name to kind (single source of truth).
+///   - `try_emit_intrinsic_call`: kind-driven LLVM IR emission.
 ///
 /// Adding a new intrinsic: add an enum variant, one row in
 /// `lookup_intrinsic_kind`, one match arm in the dispatcher.
@@ -24,7 +24,7 @@ import std::collections::pair;
 
 
 // ============================================================================
-// IntrinsicKind — every intrinsic the dispatcher knows how to emit
+// IntrinsicKind: every intrinsic the dispatcher knows how to emit
 // ============================================================================
 
 type enum IntrinsicKind {
@@ -38,7 +38,7 @@ type enum IntrinsicKind {
     SExt16To32; SExt16To64;
     SExt32To64;
 
-    // Signed integer narrowing (trunc) — same primitive used for unsigned
+    // Signed integer narrowing (trunc); same primitive used for unsigned
     Trunc64To32; Trunc64To16; Trunc64To8;
     Trunc32To16; Trunc32To8;
     Trunc16To8;
@@ -48,7 +48,7 @@ type enum IntrinsicKind {
     ZExt16To32; ZExt16To64;
     ZExt32To64;
 
-    // Unsigned narrowing — distinct variants so the dispatcher's name-to-IR
+    // Unsigned narrowing: distinct variants so the dispatcher's name-to-IR
     // mapping stays explicit; emitted IR is the same `trunc`.
     UTrunc64To32; UTrunc64To16; UTrunc64To8;
     UTrunc32To16; UTrunc32To8;
@@ -83,7 +83,7 @@ type enum IntrinsicKind {
     Clz32; Clz64; Ctz32; Ctz64;
     Rotl32; Rotl64; Rotr32; Rotr64;
 
-    // Memory ordering — `fence seq_cst`.  cryort.c's atomic_fence took
+    // Memory ordering: `fence seq_cst`.  cryort.c's atomic_fence took
     // an order arg but always used SeqCst; we keep the same semantics.
     AtomicFence;
 
@@ -96,8 +96,8 @@ type enum IntrinsicKind {
     DirentName;
     DirentType;
 
-    // `intrinsic function panic(message: string, file: string, line: u32)`
-    // — direct call to the `@panic` runtime symbol emitted by
+    // `intrinsic function panic(message: string, file: string, line: u32)`:
+    // direct call to the `@panic` runtime symbol emitted by
     // `emit_panic_runtime`.  Callers like `core::panic::panic` invoke
     // `intrinsics::panic(...)` to reach the runtime; without this
     // intrinsic kind the ScopeResolution callee path resolves
@@ -114,101 +114,103 @@ type enum IntrinsicKind {
 // ============================================================================
 
 function lookup_intrinsic_kind(name: string) -> IntrinsicKind {
-    // Pointer arithmetic
-    if (name == "ptr_add")  { return IntrinsicKind::PtrAdd; }
-    if (name == "ptr_sub")  { return IntrinsicKind::PtrSub; }
-    if (name == "ptr_diff") { return IntrinsicKind::PtrDiff; }
+    return match (name) {
+        // Pointer arithmetic
+        "ptr_add"  => { IntrinsicKind::PtrAdd }
+        "ptr_sub"  => { IntrinsicKind::PtrSub }
+        "ptr_diff" => { IntrinsicKind::PtrDiff }
 
-    // Signed widening
-    if (name == "i8_to_i16")  { return IntrinsicKind::SExt8To16; }
-    if (name == "i8_to_i32")  { return IntrinsicKind::SExt8To32; }
-    if (name == "i8_to_i64")  { return IntrinsicKind::SExt8To64; }
-    if (name == "i16_to_i32") { return IntrinsicKind::SExt16To32; }
-    if (name == "i16_to_i64") { return IntrinsicKind::SExt16To64; }
-    if (name == "i32_to_i64") { return IntrinsicKind::SExt32To64; }
+        // Signed widening
+        "i8_to_i16"  => { IntrinsicKind::SExt8To16 }
+        "i8_to_i32"  => { IntrinsicKind::SExt8To32 }
+        "i8_to_i64"  => { IntrinsicKind::SExt8To64 }
+        "i16_to_i32" => { IntrinsicKind::SExt16To32 }
+        "i16_to_i64" => { IntrinsicKind::SExt16To64 }
+        "i32_to_i64" => { IntrinsicKind::SExt32To64 }
 
-    // Signed narrowing
-    if (name == "i64_to_i32") { return IntrinsicKind::Trunc64To32; }
-    if (name == "i64_to_i16") { return IntrinsicKind::Trunc64To16; }
-    if (name == "i64_to_i8")  { return IntrinsicKind::Trunc64To8; }
-    if (name == "i32_to_i16") { return IntrinsicKind::Trunc32To16; }
-    if (name == "i32_to_i8")  { return IntrinsicKind::Trunc32To8; }
-    if (name == "i16_to_i8")  { return IntrinsicKind::Trunc16To8; }
+        // Signed narrowing
+        "i64_to_i32" => { IntrinsicKind::Trunc64To32 }
+        "i64_to_i16" => { IntrinsicKind::Trunc64To16 }
+        "i64_to_i8"  => { IntrinsicKind::Trunc64To8 }
+        "i32_to_i16" => { IntrinsicKind::Trunc32To16 }
+        "i32_to_i8"  => { IntrinsicKind::Trunc32To8 }
+        "i16_to_i8"  => { IntrinsicKind::Trunc16To8 }
 
-    // Unsigned widening
-    if (name == "u8_to_u16")  { return IntrinsicKind::ZExt8To16; }
-    if (name == "u8_to_u32")  { return IntrinsicKind::ZExt8To32; }
-    if (name == "u8_to_u64")  { return IntrinsicKind::ZExt8To64; }
-    if (name == "u16_to_u32") { return IntrinsicKind::ZExt16To32; }
-    if (name == "u16_to_u64") { return IntrinsicKind::ZExt16To64; }
-    if (name == "u32_to_u64") { return IntrinsicKind::ZExt32To64; }
+        // Unsigned widening
+        "u8_to_u16"  => { IntrinsicKind::ZExt8To16 }
+        "u8_to_u32"  => { IntrinsicKind::ZExt8To32 }
+        "u8_to_u64"  => { IntrinsicKind::ZExt8To64 }
+        "u16_to_u32" => { IntrinsicKind::ZExt16To32 }
+        "u16_to_u64" => { IntrinsicKind::ZExt16To64 }
+        "u32_to_u64" => { IntrinsicKind::ZExt32To64 }
 
-    // Unsigned narrowing
-    if (name == "u64_to_u32") { return IntrinsicKind::UTrunc64To32; }
-    if (name == "u64_to_u16") { return IntrinsicKind::UTrunc64To16; }
-    if (name == "u64_to_u8")  { return IntrinsicKind::UTrunc64To8; }
-    if (name == "u32_to_u16") { return IntrinsicKind::UTrunc32To16; }
-    if (name == "u32_to_u8")  { return IntrinsicKind::UTrunc32To8; }
-    if (name == "u16_to_u8")  { return IntrinsicKind::UTrunc16To8; }
+        // Unsigned narrowing
+        "u64_to_u32" => { IntrinsicKind::UTrunc64To32 }
+        "u64_to_u16" => { IntrinsicKind::UTrunc64To16 }
+        "u64_to_u8"  => { IntrinsicKind::UTrunc64To8 }
+        "u32_to_u16" => { IntrinsicKind::UTrunc32To16 }
+        "u32_to_u8"  => { IntrinsicKind::UTrunc32To8 }
+        "u16_to_u8"  => { IntrinsicKind::UTrunc16To8 }
 
-    // Same-width sign conversions
-    if (name == "i32_to_u32" || name == "u32_to_i32") { return IntrinsicKind::SignBitcast32; }
-    if (name == "i64_to_u64" || name == "u64_to_i64") { return IntrinsicKind::SignBitcast64; }
-    if (name == "i8_to_u8"   || name == "u8_to_i8")   { return IntrinsicKind::SignBitcast8; }
+        // Same-width sign conversions
+        "i32_to_u32" | "u32_to_i32" => { IntrinsicKind::SignBitcast32 }
+        "i64_to_u64" | "u64_to_i64" => { IntrinsicKind::SignBitcast64 }
+        "i8_to_u8"   | "u8_to_i8"   => { IntrinsicKind::SignBitcast8 }
 
-    // Float widening / narrowing
-    if (name == "f32_to_f64") { return IntrinsicKind::FpExt32To64; }
-    if (name == "f64_to_f32") { return IntrinsicKind::FpTrunc64To32; }
+        // Float widening / narrowing
+        "f32_to_f64" => { IntrinsicKind::FpExt32To64 }
+        "f64_to_f32" => { IntrinsicKind::FpTrunc64To32 }
 
-    // Signed int → float
-    if (name == "i32_to_f32") { return IntrinsicKind::SiToF32; }
-    if (name == "i32_to_f64") { return IntrinsicKind::SiToF64Fromi32; }
-    if (name == "i64_to_f64") { return IntrinsicKind::SiToF64Fromi64; }
+        // Signed int → float
+        "i32_to_f32" => { IntrinsicKind::SiToF32 }
+        "i32_to_f64" => { IntrinsicKind::SiToF64Fromi32 }
+        "i64_to_f64" => { IntrinsicKind::SiToF64Fromi64 }
 
-    // Unsigned int → float
-    if (name == "u32_to_f32") { return IntrinsicKind::UiToF32; }
-    if (name == "u32_to_f64") { return IntrinsicKind::UiToF64Fromu32; }
-    if (name == "u64_to_f64") { return IntrinsicKind::UiToF64Fromu64; }
+        // Unsigned int → float
+        "u32_to_f32" => { IntrinsicKind::UiToF32 }
+        "u32_to_f64" => { IntrinsicKind::UiToF64Fromu32 }
+        "u64_to_f64" => { IntrinsicKind::UiToF64Fromu64 }
 
-    // Float → signed int
-    if (name == "f32_to_i32") { return IntrinsicKind::FpToSi32Fromf32; }
-    if (name == "f64_to_i32") { return IntrinsicKind::FpToSi32Fromf64; }
-    if (name == "f64_to_i64") { return IntrinsicKind::FpToSi64Fromf64; }
+        // Float → signed int
+        "f32_to_i32" => { IntrinsicKind::FpToSi32Fromf32 }
+        "f64_to_i32" => { IntrinsicKind::FpToSi32Fromf64 }
+        "f64_to_i64" => { IntrinsicKind::FpToSi64Fromf64 }
 
-    // Float → unsigned int
-    if (name == "f32_to_u32") { return IntrinsicKind::FpToUi32Fromf32; }
-    if (name == "f64_to_u32") { return IntrinsicKind::FpToUi32Fromf64; }
-    if (name == "f64_to_u64") { return IntrinsicKind::FpToUi64Fromf64; }
+        // Float → unsigned int
+        "f32_to_u32" => { IntrinsicKind::FpToUi32Fromf32 }
+        "f64_to_u32" => { IntrinsicKind::FpToUi32Fromf64 }
+        "f64_to_u64" => { IntrinsicKind::FpToUi64Fromf64 }
 
-    // Bit ops
-    if (name == "bswap16") { return IntrinsicKind::Bswap16; }
-    if (name == "bswap32") { return IntrinsicKind::Bswap32; }
-    if (name == "bswap64") { return IntrinsicKind::Bswap64; }
-    if (name == "popcount32") { return IntrinsicKind::Popcount32; }
-    if (name == "popcount64") { return IntrinsicKind::Popcount64; }
-    if (name == "clz32") { return IntrinsicKind::Clz32; }
-    if (name == "clz64") { return IntrinsicKind::Clz64; }
-    if (name == "ctz32") { return IntrinsicKind::Ctz32; }
-    if (name == "ctz64") { return IntrinsicKind::Ctz64; }
-    if (name == "rotl32") { return IntrinsicKind::Rotl32; }
-    if (name == "rotl64") { return IntrinsicKind::Rotl64; }
-    if (name == "rotr32") { return IntrinsicKind::Rotr32; }
-    if (name == "rotr64") { return IntrinsicKind::Rotr64; }
+        // Bit ops
+        "bswap16"    => { IntrinsicKind::Bswap16 }
+        "bswap32"    => { IntrinsicKind::Bswap32 }
+        "bswap64"    => { IntrinsicKind::Bswap64 }
+        "popcount32" => { IntrinsicKind::Popcount32 }
+        "popcount64" => { IntrinsicKind::Popcount64 }
+        "clz32"      => { IntrinsicKind::Clz32 }
+        "clz64"      => { IntrinsicKind::Clz64 }
+        "ctz32"      => { IntrinsicKind::Ctz32 }
+        "ctz64"      => { IntrinsicKind::Ctz64 }
+        "rotl32"     => { IntrinsicKind::Rotl32 }
+        "rotl64"     => { IntrinsicKind::Rotl64 }
+        "rotr32"     => { IntrinsicKind::Rotr32 }
+        "rotr64"     => { IntrinsicKind::Rotr64 }
 
-    // Memory ordering / float predicate / dirent
-    if (name == "atomic_fence") { return IntrinsicKind::AtomicFence; }
-    if (name == "isfinite")     { return IntrinsicKind::IsFinite; }
-    if (name == "dirent_name")  { return IntrinsicKind::DirentName; }
-    if (name == "dirent_type")  { return IntrinsicKind::DirentType; }
+        // Memory ordering / float predicate / dirent
+        "atomic_fence" => { IntrinsicKind::AtomicFence }
+        "isfinite"     => { IntrinsicKind::IsFinite }
+        "dirent_name"  => { IntrinsicKind::DirentName }
+        "dirent_type"  => { IntrinsicKind::DirentType }
 
-    // Runtime panic — see comment on IntrinsicKind::Panic for why
-    // this routes through the dispatcher rather than name-resolution.
-    if (name == "panic")        { return IntrinsicKind::Panic; }
+        // Runtime panic: see comment on IntrinsicKind::Panic for why
+        // this routes through the dispatcher rather than name-resolution.
+        "panic"        => { IntrinsicKind::Panic }
 
-    return IntrinsicKind::NotIntrinsic;
+        _ => { IntrinsicKind::NotIntrinsic }
+    };
 }
 
-/// Fast prefilter for the call site — avoids paying argument-codegen cost
+/// Fast prefilter for the call site: avoids paying argument-codegen cost
 /// for normal (non-intrinsic) function calls.  Just delegates to the kind
 /// lookup so the recognized-name set has exactly one definition.
 function is_intrinsic_name(name: string) -> boolean {
@@ -224,7 +226,7 @@ function is_intrinsic_name(name: string) -> boolean {
 // ============================================================================
 //
 // Stdlib code (primitives.cryo) routinely calls these intrinsics with
-// `&this` rather than `this` — passing a primitive by reference instead
+// `&this` rather than `this`, passing a primitive by reference instead
 // of by value.  The C++ bootstrap auto-deref'd that pattern; we need to
 // match it.  When an intrinsic expects an integer/float value but the
 // caller passed a pointer, load through the pointer first.
@@ -239,7 +241,7 @@ function auto_deref_to(cg: CodegenContext*, val: LValue, expected: LType) -> LVa
     return val;
 }
 
-/// Source-type lookup for the unary cast / bit-op intrinsics — used by
+/// Source-type lookup for the unary cast / bit-op intrinsics: used by
 /// the dispatcher to auto-deref `&this`-style pointer args before
 /// emitting the LLVM cast/intrinsic.
 function intrinsic_src_type(kind: IntrinsicKind) -> LType {
@@ -285,7 +287,7 @@ function intrinsic_src_type(kind: IntrinsicKind) -> LType {
         IntrinsicKind::FpToUi32Fromf32 => { LType::f32() }
         IntrinsicKind::FpToUi32Fromf64 => { LType::f64() }
         IntrinsicKind::FpToUi64Fromf64 => { LType::f64() }
-        // Bit ops — source is the same width as the operation
+        // Bit ops: source is the same width as the operation
         IntrinsicKind::Bswap16    => { LType::i16() }
         IntrinsicKind::Bswap32    => { LType::i32() }
         IntrinsicKind::Bswap64    => { LType::i64() }
@@ -306,7 +308,7 @@ function intrinsic_src_type(kind: IntrinsicKind) -> LType {
         // isfinite consumes an f64 by value
         IntrinsicKind::IsFinite      => { LType::f64() }
         // Pointer args (atomic_fence's i32 order, dirent's void*): no
-        // auto-deref needed — handled directly by the match arm.
+        // auto-deref needed; handled directly by the match arm.
         _ => { LType::null() }
     };
 }
@@ -473,7 +475,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
                                  out_value: LValue*) -> boolean {
     const kind: IntrinsicKind = lookup_intrinsic_kind(name);
 
-    // Argument-count checks — every recognized intrinsic has a fixed
+    // Argument-count checks: every recognized intrinsic has a fixed
     // arity, so this is a single guard.
     const expected: i64 = match (kind) {
         IntrinsicKind::NotIntrinsic => { -1 }
@@ -486,14 +488,14 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         IntrinsicKind::Rotr64       => { 2 }
         // panic(message: string, file: string, line: u32)
         IntrinsicKind::Panic        => { 3 }
-        // atomic_fence(order: i32) — single arg.  isfinite, dirent_*
+        // atomic_fence(order: i32): single arg.  isfinite, dirent_*
         // also single arg, so they fall through to the default below.
         _                           => { 1 }
     };
     if (expected < 0)            { return false; }
     if (args.length != expected) { return false; }
 
-    // Auto-deref pointer args for value-arg intrinsics — handles the
+    // Auto-deref pointer args for value-arg intrinsics: handles the
     // pervasive `intrinsic(&this)` pattern in stdlib's primitives.cryo
     // that the C++ bootstrap silently coerced via `codegen_call`'s
     // pointer-vs-value mismatch path.  No-op for the pointer-arg
@@ -504,7 +506,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
     if (src_ty.is_valid()) {
         a0 = auto_deref_to(cg, a0, src_ty);
     }
-    // Second argument (rotate count) is i32 — auto-deref if pointer.
+    // Second argument (rotate count) is i32; auto-deref if pointer.
     mut a1: LValue = if (args.length >= 2) { args[1] } else { LValue::null() };
     const is_rotate: boolean = match (kind) {
         IntrinsicKind::Rotl32 => { true }
@@ -520,7 +522,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
     *out_value = match (kind) {
         IntrinsicKind::NotIntrinsic => { LValue::null() }   // unreachable
 
-        // -- Pointer arithmetic (no auto-deref of args[0] — these
+        // -- Pointer arithmetic (no auto-deref of args[0]; these
         //    intentionally accept and produce pointers). --
         IntrinsicKind::PtrAdd  => { emit_ptr_offset(cg, args[0], args[1], "ptr.add") }
         IntrinsicKind::PtrSub  => {
@@ -553,7 +555,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         IntrinsicKind::ZExt16To64  => { cg.builder.build_zext(a0, LType::i64(), "zext") }
         IntrinsicKind::ZExt32To64  => { cg.builder.build_zext(a0, LType::i64(), "zext") }
 
-        // -- Unsigned narrowing (trunc — LLVM doesn't distinguish signed
+        // -- Unsigned narrowing (trunc; LLVM doesn't distinguish signed
         //    from unsigned at the type level, so this emits the same
         //    instruction as the signed variants above) --
         IntrinsicKind::UTrunc64To32 => { cg.builder.build_trunc(a0, LType::i32(), "trunc") }
@@ -607,7 +609,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         IntrinsicKind::Rotr32 => { emit_rotate(cg, "llvm.fshr.i32", LType::i32(), a0, a1) }
         IntrinsicKind::Rotr64 => { emit_rotate(cg, "llvm.fshr.i64", LType::i64(), a0, a1) }
 
-        // -- atomic_fence(order) — emit `fence seq_cst`.  cryort.c
+        // -- atomic_fence(order): emit `fence seq_cst`.  cryort.c
         //    ignored the order arg and always used SeqCst, matching that
         //    here.  Returns void; we synthesize a void value.  The
         //    Ordering enum value 7 = SequentiallyConsistent. --
@@ -616,7 +618,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
             LValue::null()
         }
 
-        // -- isfinite(x) → fcmp oeq (x - x), 0 — true iff x is finite.
+        // -- isfinite(x): fcmp oeq (x - x), 0; true iff x is finite.
         //    NaN/±inf produce NaN in `x - x`, and oeq with NaN is false. --
         IntrinsicKind::IsFinite => {
             const diff: LValue = cg.builder.build_fsub(a0, a0, "is_fin.diff");
@@ -634,7 +636,7 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         //    then build_unreachable since panic diverges.  The dispatcher's
         //    early return in visit_call_expr bypasses the post-call
         //    divergent-name check, so the unreachable must be emitted here.
-        //    Returns LValue::null() — panic returns void. --
+        //    Returns LValue::null() (panic returns void). --
         IntrinsicKind::Panic       => { emit_panic_call(cg, args[0], args[1], args[2]) }
     };
 
@@ -783,7 +785,7 @@ function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
 // emits an equivalent definition into every module that's compiled.  With
 // linkonce_odr linkage the linker keeps one copy across all 100+ modules.
 //
-// Body (vasprintf-based — single call, no va_copy gymnastics):
+// Body (vasprintf-based: single call, no va_copy gymnastics):
 //
 //   define linkonce_odr ptr @format(ptr %fmt, ...) {
 //   entry:
@@ -852,7 +854,7 @@ function get_or_decl_abort(cg: CodegenContext*) -> LValue {
 /// Emit the `@panic(msg, file, line)` runtime function into the current
 /// module if it hasn't been emitted yet.  Idempotent.  Backs the bare
 /// `intrinsics::panic` calls emitted by `std::prelude::panic` and the
-/// `Option::unwrap`/`Result::unwrap` family — those produce a direct
+/// `Option::unwrap`/`Result::unwrap` family; those produce a direct
 /// `call @panic(...)` with no body; without this, the linker fails on
 /// `undefined reference to 'panic'`.
 ///
@@ -881,7 +883,7 @@ function emit_panic_runtime(cg: CodegenContext*) -> void {
     }
     if (!panic_fn.is_valid()) { return; }
 
-    // linkonce_odr — every module gets a copy; linker collapses them.
+    // linkonce_odr: every module gets a copy; linker collapses them.
     panic_fn.set_linkage(LLinkage::LinkOnceODR);
 
     const saved_bb: LBasicBlock = cg.builder.get_insert_block();
@@ -924,7 +926,7 @@ function emit_format_runtime(cg: CodegenContext*) -> void {
     }
     if (!fmt_fn.is_valid()) { return; }
 
-    // linkonce_odr — all copies emitted across modules merge to one.
+    // linkonce_odr: all copies emitted across modules merge to one.
     fmt_fn.set_linkage(LLinkage::LinkOnceODR);
 
     // Save & restore the builder's insertion position so we don't
@@ -934,7 +936,7 @@ function emit_format_runtime(cg: CodegenContext*) -> void {
     const entry_bb: LBasicBlock = LBasicBlock::append(fmt_fn, "entry");
     cg.builder.position_at_end(entry_bb);
 
-    // Allocate va_list (24 bytes — System V x86-64 layout) and the
+    // Allocate va_list (24 bytes, System V x86-64 layout) and the
     // string out-pointer.
     const va_list_ty: LType = LType::array_of(LType::i8(), 24);
     const va_alloca: LValue = cg.builder.build_alloca(va_list_ty, "va");

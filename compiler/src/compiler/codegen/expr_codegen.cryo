@@ -37,12 +37,12 @@ import std::collections::pair;
 /// Parse an integer literal lexeme into a u64.  Recognises C-style hex
 /// (`0x`, `0X`), octal (`0`-prefix), binary (`0b`, `0B`) and decimal,
 /// and skips an optional leading sign or `_` digit separators.  Returns
-/// 0 on a malformed lexeme — the parser should already have rejected
+/// 0 on a malformed lexeme; the parser should already have rejected
 /// those, so this is a defensive fallback rather than a real diagnostic.
 ///
 /// `atoi` (the stdlib intrinsic the codegen used previously) ignores
 /// any prefix that isn't a decimal digit, so `atoi("0x80")` returns 0
-/// — which silently miscompiled every hex constant in the lexer (e.g.
+/// This silently miscompiled every hex constant in the lexer (e.g.
 /// `0x80 as u8` → `i8 0`, breaking UTF-8 byte classification entirely).
 function parse_int_lexeme(s: string) -> u64 {
     if (s == null) { return 0; }
@@ -78,8 +78,8 @@ function parse_int_lexeme(s: string) -> u64 {
     return acc;
 }
 
-/// Decode a character-literal lexeme — the raw text *between* the quotes,
-/// as the lexer hands it over — to its code-point value.  `'\n'` arrives
+/// Decode a character-literal lexeme: the raw text *between* the quotes,
+/// as the lexer hands it over, to its code-point value.  `'\n'` arrives
 /// as the two-char string "\n" (backslash + n), not 0x0A, so the C-style
 /// escapes are resolved here.  Shared by `codegen_literal` (char literal
 /// expressions) and `codegen_pattern_value` (char literal patterns).
@@ -100,7 +100,7 @@ function decode_char_lexeme(s: string) -> u64 {
         else if (esc == 'f')  { return 12; }
         else if (esc == 'v')  { return 11; }
         else if (esc == 'x' && len >= 4) {
-            // `\xHH` — two hex digits
+            // `\xHH`: two hex digits
             mut hi: u64 = 0;
             const c2: char = s[2];
             if (c2 >= '0' && c2 <= '9') { hi = (c2 - '0') as u64; }
@@ -155,7 +155,7 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
         // integer types we have to pass false: a u64 literal whose bit
         // pattern exceeds i64::MAX (e.g. 0x9000000000000000) is otherwise
         // sign-extended into a negative APInt, and a later inline `>` against
-        // 0 is lowered as a *signed* compare against a negative constant —
+        // 0 is lowered as a *signed* compare against a negative constant,
         // i.e. the literal silently flips negative.  Chase InstantiatedType
         // wrappers the same way codegen_binary does at line 246 so generic
         // contexts behave identically to concrete ones.
@@ -183,7 +183,7 @@ function codegen_literal(cg: CodegenContext*, node: LiteralNode*,
         *out_value = cg.get_or_create_string_literal(node.value);
     } else if (kind == LiteralKind::Char) {
         // Char is stored as i32.  The lexer hands us the raw lexeme between
-        // the surrounding quotes — for `'\n'` that's the two-char string
+        // the surrounding quotes; for `'\n'` that's the two-char string
         // "\\n" (backslash + n), not the resolved 0x0A.  `decode_char_lexeme`
         // resolves the standard C-style escapes so `'\n' == 10`, `'\0' == 0`,
         // etc.  Without this, every character-literal escape in cryoc source
@@ -348,7 +348,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             return;
         }
         // Ordered comparison between two strings (i.e. raw `char*`
-        // buffer walking — `this.current >= this.buffer_end`).  LLVM
+        // buffer walking (`this.current >= this.buffer_end`).  LLVM
         // allows `icmp` directly on matching pointer types; treat as
         // unsigned since address space is unsigned.  Without this,
         // `codegen_binary` fell through to the null-return below and
@@ -380,7 +380,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             // Check if this is an ADT enum (struct type in LLVM) or simple (i32).
             const lhs_llvm_ty: void* = llvm::LLVMTypeOf(lhs_val.raw);
             if (lhs_llvm_ty != null && type_kind_of(lhs_llvm_ty) == LTypeKind::Struct) {
-                // ADT enum — extract the discriminant tag at field 0
+                // ADT enum: extract the discriminant tag at field 0
                 // before comparing.  Skipping this would feed the full
                 // struct to icmp and trip "icmp requires integer
                 // operands" at verify time.
@@ -401,7 +401,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
     // Bail out if the operand type is not numeric, pointer/reference, or
     // function.  Operating on void/error/unresolved types crashes LLVM.
     // Function types are included so that `fn_ptr != null` and
-    // `fn_ptr == fn_ptr` checks reach the icmp path below — both lower
+    // `fn_ptr == fn_ptr` checks reach the icmp path below; both lower
     // to LLVM `ptr`, so the existing pointer-comparison logic works
     // unchanged.  Reference is included so that `&arr[i] + offset`
     // (which sema types as `&T`, not `T*`) reaches the GEP path below.
@@ -486,7 +486,7 @@ function codegen_binary(cg: CodegenContext*, lhs_val: LValue, rhs_val: LValue,
             }
         } else if (lhs_ty != null && rhs_ty != null &&
                    lhs_kind == LTypeKind::Integer && rhs_kind == LTypeKind::Pointer) {
-            // int <op> ptr — coerce int to ptr so icmp on two pointers
+            // int <op> ptr: coerce int to ptr so icmp on two pointers
             // succeeds.  Mirrors the bootstrap's ensure_compatible_types
             // path; address comparisons in stdlib (e.g., aligned_addr <
             // base + offset where the int side holds a ptrtoint'd address)
@@ -677,7 +677,7 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
         if (arg_val.is_valid() && param_types_buf != null && i < expected_count) {
             const expected_ty: void* = param_types[i];
             const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
-            // Compare by type kind — void* pointer equality is broken in the
+            // Compare by type kind; void* pointer equality is broken in the
             // Cryo compiler (always returns true), so we cannot rely on
             // expected_ty != actual_ty to detect mismatches.
             const ek: LTypeKind = type_kind_of(expected_ty);
@@ -688,7 +688,7 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     // `codegen_rvalue` loading through some lvalue.  If we can
                     // recover that pre-load address (`val` is a Load whose
                     // only operand is the original pointer), use it directly
-                    // — that preserves identity so callees that mutate the
+                    // that preserves identity so callees that mutate the
                     // struct see the caller's memory.  Otherwise fall back
                     // to a fresh temp alloca + store + addr-of.
                     // LLVMOpcode::Load = 27.
@@ -719,13 +719,13 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                 } else if ((ek == LTypeKind::Float || ek == LTypeKind::Double) && ak == LTypeKind::Pointer) {
                     // Expected float/double, actual ptr: load the float
                     // through the pointer.  Happens for by-value primitive
-                    // receivers — e.g. `f64::trunc(this) -> f64` called as
+                    // receivers, e.g. `f64::trunc(this) -> f64` called as
                     // `(&this).trunc()` where `&this` is a ptr to f64.
                     const ft: LType = LType { raw: expected_ty };
                     arg_val = cg.builder.build_load(ft, arg_val, "arg.deref");
                 } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer && expected_count > 0 && i == 0) {
                     // Expected integer, actual ptr for the receiver slot:
-                    // same scenario — by-value primitive `this` on an
+                    // same scenario: by-value primitive `this` on an
                     // integer-kind type.  Load the integer.  We restrict
                     // to i==0 (the receiver slot) to avoid colliding with
                     // the legitimate ptrtoint coercion for non-receiver args.
@@ -735,7 +735,7 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     // Expected ptr, actual integer.
                     //
                     // For the receiver slot (i==0) this is a primitive method
-                    // on an rvalue — `this.current().kind.is_unary_prefix_op()`
+                    // on an rvalue: `this.current().kind.is_unary_prefix_op()`
                     // extracts the `kind` i32 from the returned Token, and the
                     // method's `&this` parameter wants the address of that i32,
                     // not the i32 value itself.  Spill to a stack temp and pass
@@ -746,7 +746,7 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     // into and segfaulting.
                     //
                     // For non-receiver args we still want the legitimate
-                    // ptrtoint-style cast — keep inttoptr there.
+                    // ptrtoint-style cast; keep inttoptr there.
                     if (i == 0) {
                         const slot_lty: LType = LType { raw: actual_ty };
                         const slot: LValue = cg.builder.build_alloca(slot_lty, "recv.slot");
@@ -762,7 +762,7 @@ function codegen_call(cg: CodegenContext*, callee: LValue, callee_type: LType,
                     arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
                 }
             } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
-                // Both integers — coerce widths if needed.  Picking sext
+                // Both integers: coerce widths if needed.  Picking sext
                 // vs zext from the *source* Cryo type's signedness is
                 // load-bearing: an i32 holding `-1` (0xFFFFFFFF) widened
                 // to i64 must become 0xFFFFFFFFFFFFFFFF (sext), not
@@ -814,11 +814,11 @@ function codegen_sizeof(cg: CodegenContext*, type_ref: TypeRef,
             *out_value = LType::const_int(LType::i64(), cryo_size, false);
             return;
         }
-        // size_bytes() returned 0 — typically because TypeLowering hasn't
+        // size_bytes() returned 0; typically because TypeLowering hasn't
         // computed the layout for this Type (common for InstantiatedType
         // wrappers like `HashMapEntry<K, V>` that route through a resolved
         // StructType but the wrapper's computed_size never gets propagated).
-        // Fall back to LLVM's authoritative size — `LLVMSizeOf` returns a
+        // Fall back to LLVM's authoritative size: `LLVMSizeOf` returns a
         // ConstantExpr with the data-layout-correct byte count, which is
         // exactly what `calloc(N, sizeof(T))` needs.
         const lty: LType = cg.type_mapper.map_type(type_ref);
@@ -839,7 +839,7 @@ function codegen_alignof(cg: CodegenContext*, type_ref: TypeRef,
             *out_value = LType::const_int(LType::i64(), cryo_align, false);
             return;
         }
-        // alignment() returned 0 — TypeLowering didn't compute a layout
+        // alignment() returned 0; TypeLowering didn't compute a layout
         // for this Type (typically InstantiatedType wrappers like
         // `Array<T>` whose computed_align never gets propagated through
         // the spec'd struct).  Fall back to LLVM's authoritative
@@ -875,7 +875,7 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
 
     const from_kind: TypeKind = src_type.kind;
     const to_kind: TypeKind = dst_type.kind;
-    // Treat Char and Bool as integer-like for cast purposes — both are
+    // Treat Char and Bool as integer-like for cast purposes; both are
     // integer types at the LLVM level (i32 and i1 respectively).  Without
     // including Char here, casts like `s[i] as u64` (where `s[i]: char`)
     // fall through to the bitcast fallback and LLVM rejects
@@ -884,7 +884,7 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
     const from_float: boolean = from_kind == TypeKind::Float;
     const to_int: boolean = to_kind == TypeKind::Int || to_kind == TypeKind::Char;
     const to_float: boolean = to_kind == TypeKind::Float;
-    // Treat `String` as a pointer type for cast classification — strings
+    // Treat `String` as a pointer type for cast classification; strings
     // are `i8*` at the LLVM level, so `string as i64` is semantically a
     // ptrtoint (not a bitcast, which requires same-size operands and
     // LLVM rejects for pointer ↔ integer).  Same for `i64 as string`
@@ -901,7 +901,7 @@ function codegen_cast(cg: CodegenContext*, val: LValue,
     // cryo-level type where possible (IntType's `int_kind.bit_width()`);
     // Char is stored as i32 at the LLVM level but is its own TypeKind,
     // so fall back to 32 bits for it without dereferencing `val.raw`
-    // (which may be null on upstream codegen failures — LLVMTypeOf would
+    // (which may be null on upstream codegen failures; LLVMTypeOf would
     // segfault on a null operand).  The target width comes from LLVM
     // since `dest_ty` was freshly mapped above and guaranteed non-null
     // when both kinds are int-like.
@@ -1003,13 +1003,13 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
     // stored in an alloca), load the pointer value so we can GEP into the struct.
     // This matches C/Rust behavior where `node.field` on a pointer is an implicit
-    // deref.  Applied once per call — GEP'd field pointers stay as struct pointers.
+    // deref.  Applied once per call; GEP'd field pointers stay as struct pointers.
     mut obj_ptr: LValue = object_ptr;
     mut obj_type: TypeRef = object_type;
     mut t: Type* = cg.lookup_type_by_id(obj_type.id);
 
     // Unwrap InstantiatedType to its concrete resolved form before kind-based
-    // dispatch.  Sema does the same in `check_field_access` — without this,
+    // dispatch.  Sema does the same in `check_field_access`; without this,
     // a `Pair<string>` resolves to an `InstantiatedType` whose kind isn't
     // Struct/Class/Array, and every field/length access silently returns null.
     mut inst_depth: i32 = 0;
@@ -1034,7 +1034,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
         // Load the pointer value through the alloca (only when `object_ptr`
         // really is an lvalue pointing at a ptr slot). Under opaque pointers
         // every value has LLVM type `ptr`, so the kind check alone can't
-        // distinguish a slot from a raw rvalue — the previous version
+        // distinguish a slot from a raw rvalue; the previous version
         // ALWAYS loaded, which over-derefed any pointer rvalue (e.g. the
         // result of `obj.as_ptr().count` where `as_ptr()` already returned
         // the pointer value, not a slot containing it). Threading the
@@ -1140,7 +1140,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     const struct_ty: LType = cg.type_mapper.map_type(obj_type);
     if (!struct_ty.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-            "codegen: member access — failed to map object type to LLVM type",
+            "codegen: member access: failed to map object type to LLVM type",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1148,7 +1148,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
     }
     if (!obj_ptr.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-            "codegen: member access — object pointer is null",
+            "codegen: member access: object pointer is null",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1181,7 +1181,7 @@ function codegen_member_access(cg: CodegenContext*, object_ptr: LValue,
 /// span of the access expression in the caller; used for diagnostics.
 /// `array_is_lvalue` distinguishes a pointer to storage holding the
 /// array/ptr (load before GEP) from a direct value (GEP straight off
-/// it).  Common rvalue case: `f()[i]` where `f` returns `T*` — the call
+/// it).  Common rvalue case: `f()[i]` where `f` returns `T*`; the call
 /// hands back the pointer itself, not a slot containing it.
 function codegen_array_access(cg: CodegenContext*, array_val: LValue,
                               array_type: TypeRef, array_is_lvalue: boolean,
@@ -1223,12 +1223,12 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
         return;
     }
 
-    // String indexing (`s[i]`) — treat the string as `i8*` at the LLVM
+    // String indexing (`s[i]`): treat the string as `i8*` at the LLVM
     // level.  Return the byte's address as an lvalue so it can be used
     // on both sides of an assignment (`c = s[i]` AND `s[i] = c`).  The
     // `char` (i32) vs byte (i8) size mismatch is resolved by the callers
     // (`codegen_rvalue` load-and-zext for reads, the assignment path
-    // trunc-and-store for writes — both look for the `TypeKind::String`
+    // trunc-and-store for writes; both look for the `TypeKind::String`
     // source type to detect this case).
     if (t.kind == TypeKind::String) {
         if (!array_val.is_valid() || !index_val.is_valid()) {
@@ -1262,7 +1262,7 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
     const elem_ty: LType = cg.type_mapper.map_type(arr.element);
     if (!elem_ty.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
-            "codegen: array access — failed to map element type",
+            "codegen: array access: failed to map element type",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1270,7 +1270,7 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
     }
     if (!array_val.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
-            "codegen: array access — array value is null",
+            "codegen: array access: array value is null",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1278,7 +1278,7 @@ function codegen_array_access(cg: CodegenContext*, array_val: LValue,
     }
     if (!index_val.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
-            "codegen: array access — index value is null",
+            "codegen: array access: index value is null",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1419,7 +1419,7 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
     const current_bb: LBasicBlock = cg.builder.get_insert_block();
     if (!current_bb.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-            "codegen: struct literal — builder has no insert block",
+            "codegen: struct literal: builder has no insert block",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1428,7 +1428,7 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
     const current_fn: LValue = current_bb.get_parent();
     if (!current_fn.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-            "codegen: struct literal — insert block has no parent function",
+            "codegen: struct literal: insert block has no parent function",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1439,7 +1439,7 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
 
     // Store each field value at its GEP index.  If a field expects a
     // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a
-    // fixed LLVM array (`[N x T]` — happens when the source literal
+    // fixed LLVM array (`[N x T]`; happens when the source literal
     // `[a, b, c]` resolved to a fixed ArrayType but the field is
     // dynamic), convert by malloc'ing a buffer, memcpy'ing the literal
     // contents, and packaging into a fat pointer.  Without this, the
@@ -1460,7 +1460,7 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                     // arrives with each `0` as `i32 0` (codegen_literal defaults
                     // integer literals to i32 when sema doesn't propagate the
                     // expected type) but `len`/`cap`/`deleted` are u64 fields
-                    // — a direct `store i32` writes only the low 4 bytes,
+                    // a direct `store i32` writes only the low 4 bytes,
                     // leaving the high 4 uninitialised.  Mirrors the same fix
                     // in stmt_codegen.cryo:codegen_local_var so subsequent
                     // i64 reads through the field don't see stack garbage in
@@ -1474,7 +1474,7 @@ function codegen_struct_literal(cg: CodegenContext*, struct_type: TypeRef,
                         const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
                         const field_lty: LType = LType { raw: field_llvm_ty };
                         if (want_bits > got_bits) {
-                            // Widen with the field's signedness — using zext
+                            // Widen with the field's signedness; using zext
                             // for a signed i64 field stored a negative i32
                             // literal (`-1`) as `0x00000000FFFFFFFF`, which
                             // is `4294967295` not `-1`.  This is what made
@@ -1527,7 +1527,7 @@ function codegen_tuple_literal(cg: CodegenContext*, tuple_type: TypeRef,
     const current_bb: LBasicBlock = cg.builder.get_insert_block();
     if (!current_bb.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-            "codegen: tuple literal — builder has no insert block",
+            "codegen: tuple literal: builder has no insert block",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1536,7 +1536,7 @@ function codegen_tuple_literal(cg: CodegenContext*, tuple_type: TypeRef,
     const current_fn: LValue = current_bb.get_parent();
     if (!current_fn.is_valid()) {
         cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-            "codegen: tuple literal — insert block has no parent function",
+            "codegen: tuple literal: insert block has no parent function",
             site_span);
         *out_value = LValue::null();
         *out_is_lvalue = false;
@@ -1566,7 +1566,7 @@ function codegen_tuple_literal(cg: CodegenContext*, tuple_type: TypeRef,
 /// Returns i1: true if equal (==) or not equal (!=).
 function codegen_string_compare(cg: CodegenContext*, lhs: LValue, rhs: LValue,
                                  op_kind: TokenType, out_value: LValue*) -> void {
-    // `string == null` / `string != null` must NOT call strcmp — strcmp
+    // `string == null` / `string != null` must NOT call strcmp; strcmp
     // dereferences both operands, so passing a null operand is undefined
     // behaviour (typically a segfault).  Detect the null-literal case and
     // lower it as a pointer-equality icmp instead.  LLVMIsNull returns 1
