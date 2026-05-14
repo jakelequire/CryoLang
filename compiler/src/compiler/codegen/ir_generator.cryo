@@ -1063,15 +1063,31 @@ public:
     /// Evaluate a pattern to an LLVM value for comparison.
     codegen_pattern_value(mut &this, pat: PatternNode*) -> LValue {
         if (pat.pattern_kind == PatternKind::Literal) {
-            // The pattern's value SymbolStr contains the literal text.
+            // `pat.literal_kind` (set by the parser) says how to read the
+            // interned `value` text.  It can't be guessed from the text:
+            // `0` (Integer) and `'0'` (Char) both intern to "0", and
+            // `true`/`false` intern to "true"/"false".  The old length
+            // heuristic ("1 char ⇒ char literal") mis-emitted every
+            // single-digit integer pattern as a char and every boolean
+            // pattern as 0 — so e.g. `match (n) { 0 => ... }` never fired.
             const intern: InternTable* = this.cg.get_intern();
             const text: string = intern.resolve(pat.value);
-            // Check if it's a character literal (single char in quotes).
-            if (intrinsics::strlen(text) == 1) {
-                return LType::const_int(LType::i32(), text[0] as u64, false);
+            if (pat.literal_kind == LiteralKind::Char) {
+                return LType::const_int(LType::i32(),
+                                        decode_char_lexeme(text), false);
             }
-            const ival: u64 = parse_int_lexeme(text);
-            return LType::const_int(LType::i32(), ival, true);
+            if (pat.literal_kind == LiteralKind::Boolean) {
+                const bval: u64 = if (text == "true") { 1 } else { 0 };
+                return LType::const_int(LType::i1(), bval, false);
+            }
+            if (pat.literal_kind == LiteralKind::Integer) {
+                return LType::const_int(LType::i32(), parse_int_lexeme(text), true);
+            }
+            // String / Float literal patterns don't lower to an `icmp`
+            // operand here: a string pattern is routed through the caller's
+            // string-compare branch before reaching this, and a float
+            // literal pattern is not currently supported.
+            return LValue::null();
         } else if (pat.pattern_kind == PatternKind::Identifier) {
             // Identifier pattern — could be an enum variant name.
             // Look it up as a named value or try to resolve as an enum discriminant.

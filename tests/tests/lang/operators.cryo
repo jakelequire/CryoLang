@@ -843,3 +843,56 @@ function try_keeps_live_local_through_ok_path() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("expected `?` to take the ok path")); }
     }
 }
+
+// --- Drop insertion across a general match-expression arm ------------------
+//
+// The `?` desugar is one match expression; the same routing now covers
+// hand-written ones.  An early `return` inside any match-*expression* arm
+// gets the cumulative drops of every live local — without that, a
+// droppable local live across the match would leak on the early-return
+// path (drop insertion used to treat match expressions as a black box).
+// (Enum-pattern subjects are used here: integer-literal patterns in a
+// match *expression* are mis-selected by a separate pre-existing codegen
+// bug, unrelated to drop insertion.)
+
+/// A match expression with an early `return` inside an arm.  `probe` is
+/// live across the match; the `None` arm's `return` must drop it.
+function match_expr_early_return(pick: Option<i32>) -> i32 {
+    const probe: TryDropProbe = TryDropProbe { tag: 3 };
+    const chosen: i32 = match (pick) {
+        Option::None    => { return 0; }
+        Option::Some(n) => { probe.tag + n }
+    };
+    return chosen;
+}
+
+/// A match-expression arm that declares a droppable local and yields it.
+/// The yielded local becomes the match result — it must be dropped once
+/// (at the use site), not double-freed by arm-scope drop synthesis.
+function match_expr_yield_local(pick: Option<i32>) -> i32 {
+    const probe: TryDropProbe = match (pick) {
+        Option::None    => { const made: TryDropProbe = TryDropProbe { tag: 4 }; made }
+        Option::Some(_) => { TryDropProbe { tag: 8 } }
+    };
+    return probe.tag;
+}
+
+![test]
+function match_expr_arm_return_drops_live_local() -> Result<(), TestError> {
+    // The `None` arm does `return 0;`; `probe` was live across the match
+    // and must be dropped on that early-return path.
+    g_try_drop_count = 0;
+    const got: i32 = match_expr_early_return(Option::None);
+    expect_eq(got, 0)?;
+    return expect_eq(g_try_drop_count, 1);
+}
+
+![test]
+function match_expr_arm_yields_local_dropped_once() -> Result<(), TestError> {
+    // The `None` arm declares `made` and yields it as the arm value; it
+    // becomes `probe` and is dropped exactly once — not double-freed.
+    g_try_drop_count = 0;
+    const tag: i32 = match_expr_yield_local(Option::None);
+    expect_eq(tag, 4)?;
+    return expect_eq(g_try_drop_count, 1);
+}
