@@ -65,7 +65,7 @@ implement enum CommandKind {
 
     usage(&this) -> string {
         return match (this) {
-            CommandKind::Help     => { "cryo help [command]"              }
+            CommandKind::Help     => { "cryo help [command|flag]"         }
             CommandKind::Version  => { "cryo version"                     }
             CommandKind::Init     => { "cryo init [dir]"                  }
             CommandKind::Build    => { "cryo build [file|dir] [flags]"  }
@@ -78,6 +78,254 @@ implement enum CommandKind {
             CommandKind::Update   => { "cryo update"                       }
             _ => { "" }
         };
+    }
+
+    /// Long-form help for `cryo help <command>` — an expanded description,
+    /// the usage forms, and the flags the command honours.  Mirrors the
+    /// `printf`-driven layout of `Runner::print_help`.
+    print_details(&this) -> void {
+        printf("%s - %s\n\n", this.name(), this.description());
+        printf("Usage: %s\n\n", this.usage());
+        match (this) {
+            CommandKind::Help => {
+                printf("With no argument, prints an overview of every command and global\n");
+                printf("flag.  With a command or flag name, prints this detailed view.\n\n");
+                printf("Examples:\n");
+                printf("  cryo help              Overview of commands and flags\n");
+                printf("  cryo help build        Detailed help for the `build` command\n");
+                printf("  cryo help --emit-llvm  Detailed help for the `--emit-llvm` flag\n");
+            }
+            CommandKind::Version => {
+                printf("Prints the compiler's name and version string, then exits.\n");
+                printf("Equivalent to the global `--version` / `-v` flag.\n");
+            }
+            CommandKind::Init => {
+                printf("Interactively scaffolds a new Cryo project.  Prompts for the\n");
+                printf("project name, source directory (default: src), output directory\n");
+                printf("(default: build) and target type (executable/library/stdlib),\n");
+                printf("then writes a `cryoconfig` and a starter `main.cryo`.\n\n");
+                printf("With a [dir] argument the directory is created if needed and its\n");
+                printf("name is offered as the default project name.  Pressing Enter at\n");
+                printf("every prompt accepts the bracketed default.\n");
+            }
+            CommandKind::Build => {
+                printf("  cryo build <file.cryo>   Compile a single source file directly.\n");
+                printf("  cryo build [dir]         Build the project whose cryoconfig lives\n");
+                printf("                           in [dir] (default: the current directory).\n\n");
+                printf("Flags:\n");
+                printf("  --debug            Enable debug logging and verbose output\n");
+                printf("  --ast              Dump the AST after parsing\n");
+                printf("  --emit-llvm        Emit LLVM IR (.ll) alongside the object output\n");
+                printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
+                printf("  --stdlib=PATH      Standard library root for this run\n");
+                printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
+                printf("  -o, --output PATH  Redirect output (single-file builds only)\n");
+            }
+            CommandKind::Run => {
+                printf("Builds the project in the current directory (or [dir]) and then\n");
+                printf("executes the resulting binary, forwarding its exit code.  Only\n");
+                printf("works for executable targets - library and stdlib targets produce\n");
+                printf("no binary to run.\n\n");
+                printf("Flags:\n");
+                printf("  --debug            Enable debug logging and verbose output\n");
+                printf("  --ast              Dump the AST after parsing\n");
+                printf("  --emit-llvm        Emit LLVM IR (.ll) alongside the object output\n");
+                printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
+                printf("  --stdlib=PATH      Standard library root for this run\n");
+                printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
+            }
+            CommandKind::Test => {
+                printf("Builds the project's tests and runs them.  Behaves like `run`\n");
+                printf("but suppresses the user's `main` and drives every `![test]`\n");
+                printf("function from a synthesized test main.\n\n");
+                printf("An optional [pattern] positional filters which tests run.\n\n");
+                printf("Flags:\n");
+                printf("  --debug            Enable debug logging and verbose output\n");
+                printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
+                printf("  --stdlib=PATH      Standard library root for this run\n");
+                printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
+                printf("  --ignored          Run only tests marked ignored\n");
+                printf("  --list             List matching tests without running them\n");
+                printf("  --exact            Match [pattern] exactly instead of by substring\n");
+                printf("  -q, --quiet        Reduce test-runner output\n");
+            }
+            CommandKind::Check => {
+                printf("Runs the frontend and semantic analysis on <file> and reports\n");
+                printf("errors and warnings, but emits no code.  Faster than a full\n");
+                printf("build when you only want to validate a source file.\n\n");
+                printf("Flags:\n");
+                printf("  --debug          Enable debug logging and verbose output\n");
+                printf("  --ast            Dump the AST after parsing\n");
+                printf("  --stdlib=PATH    Standard library root for this run\n");
+                printf("  --target=TRIPLE  Cross-compile for the given LLVM target triple\n");
+            }
+            CommandKind::Raw => {
+                printf("Compiles <file> without the standard library or the auto-imported\n");
+                printf("prelude.  Intended for low-level tests and bootstrapping work that\n");
+                printf("must not pull in stdlib symbols.\n\n");
+                printf("Flags:\n");
+                printf("  --debug   Enable debug logging and verbose output\n");
+                printf("  --ast     Dump the AST after parsing\n");
+            }
+            CommandKind::Demangle => {
+                printf("Decodes a v0.2-mangled symbol back to its source-level form.\n");
+                printf("With a <mangled-symbol> argument, decodes that symbol; with no\n");
+                printf("argument, reads newline-separated symbols from stdin.\n\n");
+                printf("Note: wrap mangled names in SINGLE quotes so the shell does not\n");
+                printf("expand `$`-segments (`$F`, `$L`, ...) into empty strings.\n");
+            }
+            CommandKind::Fetch => {
+                printf("Resolves every dependency declared in cryoconfig against its\n");
+                printf("remote, materializes missing checkouts, and writes\n");
+                printf("`cryoconfig.lock`.  Reuses existing lockfile entries when the\n");
+                printf("cryoconfig spec is unchanged.\n");
+            }
+            CommandKind::Update => {
+                printf("Like `fetch`, but ignores the existing lockfile and re-resolves\n");
+                printf("every dependency from scratch - use it to bump pinned git SHAs\n");
+                printf("to the latest tag or branch tip.\n");
+            }
+            _ => {}
+        }
+        printf("\nSee 'cryo help' for all commands, or 'cryo help <flag>' for flag details.\n");
+    }
+}
+
+// ============================================================================
+// Flag Kind
+// ============================================================================
+
+/// Enumerates the documented command-line flags so `cryo help <flag>` can
+/// print detailed, per-flag help.  Mirrors the `CommandKind` design.
+type enum FlagKind {
+    Help;
+    Version;
+    Debug;
+    Ast;
+    EmitLlvm;
+    Stdlib;
+    BuildDir;
+    Target;
+    Output;
+    Ignored;
+    List;
+    Exact;
+    Quiet;
+    Unknown;
+}
+
+implement enum FlagKind {
+    /// Resolves a user-typed topic to a FlagKind.  Accepts the flag with or
+    /// without leading dashes and honours the short aliases (`-h`, `-v`,
+    /// `-q`, `-o`), so `cryo help --debug`, `cryo help debug` and
+    /// `cryo help -h` all land on the right entry.
+    static resolve(topic: string) -> FlagKind {
+        const name: string = ArgumentParser::normalize_flag_name(topic);
+        if (strcmp(name, "help") == 0    || strcmp(name, "h") == 0) { return FlagKind::Help; }
+        if (strcmp(name, "version") == 0 || strcmp(name, "v") == 0) { return FlagKind::Version; }
+        if (strcmp(name, "debug") == 0)                            { return FlagKind::Debug; }
+        if (strcmp(name, "ast") == 0)                              { return FlagKind::Ast; }
+        if (strcmp(name, "emit-llvm") == 0)                        { return FlagKind::EmitLlvm; }
+        if (strcmp(name, "stdlib") == 0)                           { return FlagKind::Stdlib; }
+        if (strcmp(name, "build-dir") == 0)                        { return FlagKind::BuildDir; }
+        if (strcmp(name, "target") == 0)                           { return FlagKind::Target; }
+        if (strcmp(name, "output") == 0  || strcmp(name, "o") == 0) { return FlagKind::Output; }
+        if (strcmp(name, "ignored") == 0)                          { return FlagKind::Ignored; }
+        if (strcmp(name, "list") == 0)                             { return FlagKind::List; }
+        if (strcmp(name, "exact") == 0)                            { return FlagKind::Exact; }
+        if (strcmp(name, "quiet") == 0   || strcmp(name, "q") == 0) { return FlagKind::Quiet; }
+        return FlagKind::Unknown;
+    }
+
+    /// Long-form help for `cryo help <flag>`.
+    print_details(&this) -> void {
+        match (this) {
+            FlagKind::Help => {
+                printf("--help, -h - Display help information\n\n");
+                printf("  cryo --help            Overview of every command and global flag.\n");
+                printf("  cryo <command> --help  Brief usage for a single command.\n");
+                printf("  cryo help <topic>      Detailed help for a command or flag.\n");
+            }
+            FlagKind::Version => {
+                printf("--version, -v - Display version information\n\n");
+                printf("Prints the compiler's name and version string, then exits.\n");
+                printf("Equivalent to the `version` command.\n");
+            }
+            FlagKind::Debug => {
+                printf("--debug - Enable debug logging and verbose output\n\n");
+                printf("Flips the compiler debug gate before any pass runs, so the\n");
+                printf("verbose trace output sprinkled across the lexer, parser, resolver\n");
+                printf("and codegen passes is printed.  Off by default.\n\n");
+                printf("Accepted by: build, run, test, check, raw\n");
+            }
+            FlagKind::Ast => {
+                printf("--ast - Dump the AST after parsing\n\n");
+                printf("Prints the parsed abstract syntax tree before semantic analysis.\n");
+                printf("Useful for debugging parser behaviour.\n\n");
+                printf("Accepted by: build, run, check, raw\n");
+            }
+            FlagKind::EmitLlvm => {
+                printf("--emit-llvm - Emit LLVM IR (.ll) alongside the object output\n\n");
+                printf("Writes a human-readable LLVM IR file next to the normal object\n");
+                printf("or executable output, for inspecting codegen.\n\n");
+                printf("Accepted by: build, run\n");
+            }
+            FlagKind::Stdlib => {
+                printf("--stdlib=PATH - Standard library root for this run\n\n");
+                printf("Uses PATH as the standard library root, overriding every other\n");
+                printf("source.  This is the highest-priority entry in the stdlib lookup\n");
+                printf("order, ahead of $CRYO_STDLIB, $CRYO_HOME/stdlib, the\n");
+                printf("binary-relative path and any cryoconfig setting.\n\n");
+                printf("Accepted by: build, run, test, check\n");
+            }
+            FlagKind::BuildDir => {
+                printf("--build-dir=PATH - Override cryoconfig's output_dir\n\n");
+                printf("Writes build artifacts to PATH instead of the output_dir declared\n");
+                printf("in cryoconfig.\n\n");
+                printf("Accepted by: build, run, test\n");
+            }
+            FlagKind::Target => {
+                printf("--target=TRIPLE - Cross-compile for an LLVM target triple\n\n");
+                printf("Cross-compiles for the given LLVM target triple (for example\n");
+                printf("x86_64-pc-windows-gnu), overriding cryoconfig's `target` setting.\n");
+                printf("Produces object files only - link them manually.\n\n");
+                printf("Accepted by: build, run, test, check\n");
+            }
+            FlagKind::Output => {
+                printf("-o, --output PATH - Redirect single-file build output\n\n");
+                printf("Writes the output of a single-file build to PATH.  The file\n");
+                printf("extension selects the emission kind:\n");
+                printf("  .o          object file\n");
+                printf("  .asm, .s    assembly\n");
+                printf("  .ll         LLVM IR text\n");
+                printf("  other/none  linked executable\n\n");
+                printf("Paths starting with '-' must use the `-o=PATH` form.\n");
+                printf("Single-file builds only - not used for project builds.\n");
+            }
+            FlagKind::Ignored => {
+                printf("--ignored - Run only ignored tests\n\n");
+                printf("Test-runner flag: runs only the tests marked ignored.\n\n");
+                printf("Accepted by: test\n");
+            }
+            FlagKind::List => {
+                printf("--list - List tests without running them\n\n");
+                printf("Test-runner flag: prints the matching tests instead of running\n");
+                printf("them.\n\n");
+                printf("Accepted by: test\n");
+            }
+            FlagKind::Exact => {
+                printf("--exact - Match the test pattern exactly\n\n");
+                printf("Test-runner flag: treats the [pattern] positional as an exact\n");
+                printf("match instead of a substring match.\n\n");
+                printf("Accepted by: test\n");
+            }
+            FlagKind::Quiet => {
+                printf("-q, --quiet - Reduce test-runner output\n\n");
+                printf("Test-runner flag: prints a more compact test report.\n\n");
+                printf("Accepted by: test\n");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -163,6 +411,26 @@ type struct Executor {
                 return 1;
             }
         }
+        return 1;
+    }
+
+    /// `cryo help <topic>` — detailed help for a single command or flag.
+    /// The topic is resolved as a command first, then as a flag (with or
+    /// without leading dashes).  Returns 0 when the topic resolved, 1 for
+    /// an unrecognized topic.
+    static help_topic(topic: string) -> int {
+        const cmd: CommandKind = Executor::resolve(topic);
+        if (cmd != CommandKind::Unknown) {
+            cmd.print_details();
+            return 0;
+        }
+        const flag: FlagKind = FlagKind::resolve(topic);
+        if (flag != FlagKind::Unknown) {
+            flag.print_details();
+            return 0;
+        }
+        fprintf(g_stderr, "Error: no help topic for '%s'.\n", topic);
+        fprintf(g_stderr, "Run 'cryo help' for the list of commands and flags.\n");
         return 1;
     }
 
