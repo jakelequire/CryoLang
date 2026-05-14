@@ -1886,56 +1886,67 @@ type struct Monomorphizer {
                                     types: TypeRef[]) -> void {
         if (expr == null) { return; }
         const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::CallExpression) {
-            const call: CallExprNode* = expr as CallExprNode*;
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                this.discover_inferred_calls_in_expr(call.arguments[i], res_ctx, subst, names, types);
+        match (node.kind) {
+            NodeKind::CallExpression => {
+                const call: CallExprNode* = expr as CallExprNode*;
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.discover_inferred_calls_in_expr(call.arguments[i], res_ctx, subst, names, types);
+                }
+                if (call.callee != null) {
+                    this.discover_inferred_calls_in_expr(call.callee, res_ctx, subst, names, types);
+                }
+                this.try_infer_function_call(call, res_ctx, subst, names, types);
+                this.try_infer_method_call(call, subst, names, types);
             }
-            if (call.callee != null) {
-                this.discover_inferred_calls_in_expr(call.callee, res_ctx, subst, names, types);
+            NodeKind::BinaryExpression => {
+                const be: BinaryExprNode* = expr as BinaryExprNode*;
+                this.discover_inferred_calls_in_expr(be.left, res_ctx, subst, names, types);
+                this.discover_inferred_calls_in_expr(be.right, res_ctx, subst, names, types);
             }
-            this.try_infer_function_call(call, res_ctx, subst, names, types);
-            this.try_infer_method_call(call, subst, names, types);
-        } else if (node.kind == NodeKind::BinaryExpression) {
-            const be: BinaryExprNode* = expr as BinaryExprNode*;
-            this.discover_inferred_calls_in_expr(be.left, res_ctx, subst, names, types);
-            this.discover_inferred_calls_in_expr(be.right, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::UnaryExpression) {
-            const ue: UnaryExprNode* = expr as UnaryExprNode*;
-            this.discover_inferred_calls_in_expr(ue.operand, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::TryExpression) {
-            // `expr?`: mono runs before sema lowers `?`, so only the source
-            // operand exists.  Recurse into it so a generic free-function
-            // call used as the `?` operand (`expect_eq(a, b)?`) still gets
-            // its specialization discovered and `resolved_callee` pinned.
-            const te: TryExprNode* = expr as TryExprNode*;
-            this.discover_inferred_calls_in_expr(te.operand, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::MemberAccess) {
-            const ma: MemberAccessNode* = expr as MemberAccessNode*;
-            this.discover_inferred_calls_in_expr(ma.object, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::ArrayAccess) {
-            const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-            this.discover_inferred_calls_in_expr(aa.array, res_ctx, subst, names, types);
-            this.discover_inferred_calls_in_expr(aa.index, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::CastExpression) {
-            const ce: CastExprNode* = expr as CastExprNode*;
-            this.discover_inferred_calls_in_expr(ce.expression, res_ctx, subst, names, types);
-        } else if (node.kind == NodeKind::StructLiteral) {
-            // `Slice { ptr: mem::offset(...), ... }`: without recursing
-            // into field initializer values, generic free-fn calls inside
-            // struct ctors never get pinned and codegen mangles them
-            // against the unspecialized template's `1T` placeholder.
-            const sl: StructLiteralNode* = expr as StructLiteralNode*;
-            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                this.discover_inferred_calls_in_expr(
-                    sl.field_inits[i].value, res_ctx, subst, names, types);
+            NodeKind::UnaryExpression => {
+                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                this.discover_inferred_calls_in_expr(ue.operand, res_ctx, subst, names, types);
             }
-        } else if (node.kind == NodeKind::ArrayLiteral) {
-            const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
-            for (mut i: i64 = 0; i < al.elements.length; i++) {
-                this.discover_inferred_calls_in_expr(
-                    al.elements[i], res_ctx, subst, names, types);
+            NodeKind::TryExpression => {
+                // `expr?`: mono runs before sema lowers `?`, so only the source
+                // operand exists.  Recurse into it so a generic free-function
+                // call used as the `?` operand (`expect_eq(a, b)?`) still gets
+                // its specialization discovered and `resolved_callee` pinned.
+                const te: TryExprNode* = expr as TryExprNode*;
+                this.discover_inferred_calls_in_expr(te.operand, res_ctx, subst, names, types);
             }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                this.discover_inferred_calls_in_expr(ma.object, res_ctx, subst, names, types);
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                this.discover_inferred_calls_in_expr(aa.array, res_ctx, subst, names, types);
+                this.discover_inferred_calls_in_expr(aa.index, res_ctx, subst, names, types);
+            }
+            NodeKind::CastExpression => {
+                const ce: CastExprNode* = expr as CastExprNode*;
+                this.discover_inferred_calls_in_expr(ce.expression, res_ctx, subst, names, types);
+            }
+            NodeKind::StructLiteral => {
+                // `Slice { ptr: mem::offset(...), ... }`: without recursing
+                // into field initializer values, generic free-fn calls inside
+                // struct ctors never get pinned and codegen mangles them
+                // against the unspecialized template's `1T` placeholder.
+                const sl: StructLiteralNode* = expr as StructLiteralNode*;
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    this.discover_inferred_calls_in_expr(
+                        sl.field_inits[i].value, res_ctx, subst, names, types);
+                }
+            }
+            NodeKind::ArrayLiteral => {
+                const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
+                for (mut i: i64 = 0; i < al.elements.length; i++) {
+                    this.discover_inferred_calls_in_expr(
+                        al.elements[i], res_ctx, subst, names, types);
+                }
+            }
+            _ => { }
         }
     }
 
