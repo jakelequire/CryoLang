@@ -648,10 +648,32 @@ type struct DropInserter {
 
     walk_match(mut &this, m: MatchStmtNode*) -> boolean {
         if (m == null) { return false; }
-        if (m.subject != null) { this.walk_expr_read(m.subject); }
+        return this.walk_match_arms(m.subject, m.arms);
+    }
+
+    /// Walk a match's subject and arms as N independent control-flow
+    /// paths (intersection/union move-join, generalised over N arms —
+    /// the same shape as `walk_if`).  Shared by match *statements*
+    /// (`walk_match`) and the match *expression* the `?` operator
+    /// desugars to: routing the `?` desugar through here is what gives
+    /// an early `return` in its failure arm the cumulative drops of
+    /// every live local, so a droppable local live across `expr?` is
+    /// freed on the error path instead of leaked.
+    ///
+    /// Deliberately NOT wired to the general `MatchExpression` arm of
+    /// `walk_expr_read`: a hand-written match *expression* can
+    /// declare-and-yield a local in an arm (`A => { const t = ...; t }`)
+    /// and `walk_block`'s end-of-scope synthesis would then double-free
+    /// it.  The `?`/`??` desugars never do that — their arms hold only a
+    /// pattern binding, a bare fallback expression, or a `return` — so
+    /// the `?` desugar is safe to route here; general match expressions
+    /// need the value-block work first.
+    walk_match_arms(mut &this, subject: ExpressionNode*,
+                    arms: MatchArmNode*[]) -> boolean {
+        if (subject != null) { this.walk_expr_read(subject); }
         // Each arm is a separate control-flow path; same
         // intersection/union join as walk_if, generalised over N arms.
-        if (m.arms.length == 0) { return false; }
+        if (arms.length == 0) { return false; }
         const snap: i64 = this.snapshot_moves();
         // Snapshot the outer-scope binding set so we can ignore moves
         // of arm-local bindings (pattern bindings or `let` inside the
@@ -668,12 +690,12 @@ type struct DropInserter {
         mut all_keys:    u32[] = [];
         mut all_lines:   i32[] = [];
         mut all_counts:  i64[] = [];
-        const arm_count: i64 = m.arms.length;
+        const arm_count: i64 = arms.length;
         mut live_arms:   i64 = 0;
         mut diverge_count: i64 = 0;
 
         for (mut a: i64 = 0; a < arm_count; a++) {
-            const arm: MatchArmNode* = m.arms[a];
+            const arm: MatchArmNode* = arms[a];
             if (arm == null || arm.body == null) { continue; }
             arm.body = this.wrap_early_exit(arm.body);
             const arm_div: boolean = this.walk_stmt_in_place(arm.body);
@@ -979,6 +1001,21 @@ type struct DropInserter {
             NodeKind::TernaryExpression  => { this.read_ternary(expr as TernaryExprNode*);             }
             NodeKind::IfExpression       => { this.read_if_expr(expr as IfExprNode*);                  }
             NodeKind::NewExpression      => { this.read_new(expr as NewExprNode*);                     }
+            NodeKind::TryExpression      => {
+                // `expr?` is lowered by sema to a `match` whose failure
+                // arm is an early `return`.  Route it through the shared
+                // match-arm walker so that `return` gets the cumulative
+                // drops of every live local — a droppable local live
+                // across `expr?` must be freed on the error path, not
+                // leaked.  (`desugared` is null only when sema rejected
+                // the operand, in which case a diagnostic already fired.)
+                const te: TryExprNode* = expr as TryExprNode*;
+                if (te.desugared != null &&
+                    te.desugared.kind == NodeKind::MatchExpression) {
+                    const me: MatchExprNode* = te.desugared as MatchExprNode*;
+                    this.walk_match_arms(me.subject, me.arms);
+                }
+            }
             _ => {}
         }
     }

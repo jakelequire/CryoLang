@@ -50,6 +50,12 @@ import std::collections::hashmap;
 import Utils::Logger;
 
 
+// Monotonic counter for the synthetic bindings introduced when lowering the
+// `?` operator to a `match` (`resolve_try_expr`).  Match-arm bindings are
+// arm-scoped so a fixed name would already be collision-free, but a unique
+// suffix keeps nested `?` readable in AST dumps and the LSP.
+mut g_try_counter: u32 = 0;
+
 
 // ============================================================================
 // TypeCheckVisitor — Visitor-based function body type checker
@@ -1544,6 +1550,7 @@ public:
                 this.resolve_expr(de.operand);
                 this.arena.get_void()
             }
+            NodeKind::TryExpression     => { this.resolve_try_expr(expr as TryExprNode*) }
             _ => { TypeRef::invalid() }
         };
 
@@ -4140,6 +4147,170 @@ public:
             return outer_expected;
         }
         return result_type;
+    }
+
+    // ================================================================
+    // Try operator (`expr?`) lowering
+    // ================================================================
+
+    /// Classify a type for the `?` operator: returns 1 if `ty` unwraps to a
+    /// `Result`-shaped enum (variants `Ok` + `Err`), 2 if it unwraps to an
+    /// `Option`-shaped enum (`Some` + `None`), 0 otherwise.  Shape is keyed
+    /// on variant names rather than the enum's (possibly mangled or
+    /// specialized) name, so it works for `Result_i32_string` etc.
+    enum_try_shape(&this, ty: TypeRef) -> i32 {
+        const e: Type* = this.unwrap_to_enum(ty);
+        if (e == null || e.kind != TypeKind::Enum) { return 0; }
+        const et: EnumType* = e as EnumType*;
+        if (et.get_variant(this.intern.intern("Ok")) != null
+                && et.get_variant(this.intern.intern("Err")) != null) {
+            return 1;
+        }
+        if (et.get_variant(this.intern.intern("Some")) != null
+                && et.get_variant(this.intern.intern("None")) != null) {
+            return 2;
+        }
+        return 0;
+    }
+
+    /// Build the `match` AST that `expr?` desugars to.  `is_result` picks
+    /// the `Result` (Ok/Err) shape over the `Option` (Some/None) shape.
+    ///
+    ///   match (operand) {
+    ///       Result::Ok(v)  => { v }
+    ///       Result::Err(e) => { return Result::Err(e); }
+    ///   }
+    ///
+    /// The operand becomes the match scrutinee (so it is evaluated exactly
+    /// once); the failure arm early-returns from the enclosing function.
+    build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean) -> MatchExprNode* {
+        const span: SourceSpan = node.span;
+        g_try_counter = g_try_counter + 1;
+
+        const enum_name: SymbolStr =
+            this.intern.intern(if (is_result) { "Result" } else { "Option" });
+        const ok_variant: SymbolStr =
+            this.intern.intern(if (is_result) { "Ok" } else { "Some" });
+        const err_variant: SymbolStr =
+            this.intern.intern(if (is_result) { "Err" } else { "None" });
+        const ok_bind: SymbolStr =
+            this.intern.intern(format("__cryo_try_%u", g_try_counter));
+
+        mut match_expr: MatchExprNode* = new MatchExprNode(node.operand, span);
+
+        // Success arm:  Ok(v) => { v }   /   Some(v) => { v }
+        mut ok_pat: EnumPatternNode* = new EnumPatternNode(span);
+        ok_pat.set_enum_name(enum_name);
+        ok_pat.set_variant_name(ok_variant);
+        const ok_pb: PatternBinding* = new PatternBinding { name: ok_bind, span: span };
+        ok_pat.add_element(PatternElement::Binding(ok_pb));
+        ok_pat.add_binding(ok_bind, span, 0);
+        mut ok_arm: MatchArmNode* = new MatchArmNode(span);
+        ok_arm.add_pattern(ok_pat as PatternNode*);
+        const ok_ident: IdentifierNode* = new IdentifierNode(ok_bind, span);
+        const ok_stmt: ExprStmtNode* = new ExprStmtNode(ok_ident as ExpressionNode*, span);
+        mut ok_block: BlockStmtNode* = new BlockStmtNode(span);
+        ok_block.add_statement(ok_stmt as StatementNode*);
+        ok_arm.set_body(ok_block as StatementNode*);
+        match_expr.add_arm(ok_arm);
+
+        // Failure arm:  Err(e) => { return Result::Err(e); }
+        //          /    None    => { return Option::None; }
+        mut err_pat: EnumPatternNode* = new EnumPatternNode(span);
+        err_pat.set_enum_name(enum_name);
+        err_pat.set_variant_name(err_variant);
+        mut ret_value: ExpressionNode* = null;
+        if (is_result) {
+            const err_bind: SymbolStr =
+                this.intern.intern(format("__cryo_try_err_%u", g_try_counter));
+            const err_pb: PatternBinding* =
+                new PatternBinding { name: err_bind, span: span };
+            err_pat.add_element(PatternElement::Binding(err_pb));
+            err_pat.add_binding(err_bind, span, 0);
+            // return Result::Err(e)
+            const err_scope: ScopeResolutionNode* =
+                new ScopeResolutionNode(enum_name, err_variant, span);
+            mut err_call: CallExprNode* =
+                new CallExprNode(err_scope as ExpressionNode*, span);
+            err_call.add_argument(
+                new IdentifierNode(err_bind, span) as ExpressionNode*);
+            ret_value = err_call as ExpressionNode*;
+        } else {
+            // return Option::None
+            ret_value = new ScopeResolutionNode(enum_name, err_variant, span)
+                as ExpressionNode*;
+        }
+        mut err_arm: MatchArmNode* = new MatchArmNode(span);
+        err_arm.add_pattern(err_pat as PatternNode*);
+        const ret_stmt: ReturnStmtNode* = new ReturnStmtNode(ret_value, span);
+        mut err_block: BlockStmtNode* = new BlockStmtNode(span);
+        err_block.add_statement(ret_stmt as StatementNode*);
+        err_arm.set_body(err_block as StatementNode*);
+        match_expr.add_arm(err_arm);
+
+        return match_expr;
+    }
+
+    /// Lower the postfix try operator `expr?` and return the type it
+    /// evaluates to (the `Ok`/`Some` payload `T`).
+    ///
+    /// The parser cannot pick the desugar shape — it depends on whether the
+    /// operand is a `Result` or an `Option`, and on the enclosing function's
+    /// return type — so it emits a `TryExprNode` verbatim and we lower it
+    /// here.  The synthetic `match` is built once the operand type is known,
+    /// stored on `node.desugared`, and resolved through the ordinary match
+    /// path: that gives codegen / drop-insertion / move-check a plain
+    /// `MatchExprNode` to consume, and type-checks the failure arm's early
+    /// `return` against the enclosing function for free.
+    resolve_try_expr(mut &this, node: TryExprNode*) -> TypeRef {
+        // 1. Resolve the operand with no expected-type hint — it is the
+        //    Result/Option container, not the `T` the `?` evaluates to.
+        const saved_expected: TypeRef = this.expected_type;
+        this.expected_type = TypeRef::invalid();
+        const operand_type: TypeRef = this.resolve_expr(node.operand);
+        this.expected_type = saved_expected;
+        if (!operand_type.is_valid()) {
+            // The operand failed to resolve; its own diagnostic already fired.
+            return TypeRef::invalid();
+        }
+
+        // 2. Classify the operand: 1 = Result-shaped, 2 = Option-shaped.
+        const operand_shape: i32 = this.enum_try_shape(operand_type);
+        if (operand_shape == 0) {
+            const ot: Type* = this.arena.lookup(operand_type.id);
+            const disp: string = if (ot != null) {
+                this.arena.format_display(ot)
+            } else {
+                "?"
+            };
+            this.ctx.emit_error_at(ErrorCode::E0234_INVALID_TRY_OPERAND,
+                format("the `?` operator requires a `Result` or `Option` value, but the operand has type '%s'",
+                    disp),
+                node.span);
+            return TypeRef::invalid();
+        }
+
+        // 3. The enclosing function must return the same shape, so the
+        //    failure arm's early `return` is well-typed.
+        const fn_shape: i32 = this.enum_try_shape(this.return_type);
+        if (fn_shape != operand_shape) {
+            const want: string = if (operand_shape == 1) { "Result" } else { "Option" };
+            this.ctx.emit_error_at(ErrorCode::E0235_TRY_OUTSIDE_RESULT_FN,
+                format("the `?` operator can only be used in a function that returns `%s`",
+                    want),
+                node.span);
+            return TypeRef::invalid();
+        }
+
+        // 4. Build the desugared `match` and resolve it through the normal
+        //    path.  resolve_match_expr binds `v`/`e`, type-checks the
+        //    failure arm's `return` against the enclosing function, and
+        //    yields the success arm's payload type — which is the type of
+        //    the whole `expr?` expression.
+        mut desugared: MatchExprNode* =
+            this.build_try_desugar(node, operand_shape == 1);
+        node.set_desugared(desugared as ExpressionNode*);
+        return this.resolve_expr(desugared as ExpressionNode*);
     }
 
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
