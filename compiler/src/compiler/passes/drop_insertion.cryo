@@ -1,11 +1,11 @@
-///! Drop Insertion Pass — Phase 1 of auto-drop.
+///! Drop Insertion Pass: Phase 1 of auto-drop.
 ///!
 ///! Runs after MoveCheck and before TypeLowering.  Performs flow-sensitive
 ///! ownership analysis with proper branch-join semantics:
 ///! - `if`/`match`: definitely-moved is the intersection of the per-branch
 ///!   moved-sets, possibly-moved is the symmetric difference.  Diverging
 ///!   branches (those that always `return`/`break`/`continue`) are
-///!   excluded from the join — their moves don't escape.
+///!   excluded from the join; their moves don't escape.
 ///! - Possibly-moved bindings emit `E0456_CONDITIONAL_MOVE` and are
 ///!   treated as moved going forward to keep cascade noise down.
 ///! - Loop bodies snapshot/restore: body-internal moves don't propagate
@@ -73,7 +73,7 @@ type struct DropInserter {
     /// HashMap::remove was rewritten with a cursor idiom in stdlib
     /// (fixing the historical chain-corruption bug); however parallel
     /// arrays remain preferable here because scope-pop removes a
-    /// contiguous suffix by index, not individual keys — a pattern
+    /// contiguous suffix by index, not individual keys; a pattern
     /// that maps naturally onto array truncation.
     /// Linear search is fine for typical function sizes.
     types_keys:  u32[];
@@ -97,7 +97,7 @@ type struct DropInserter {
     loop_boundary: i64[];
 
     /// Moved-set on the current control-flow path, encoded the same way
-    /// as MoveCheck — parallel-array (key, line) so snapshot/restore is
+    /// as MoveCheck: parallel-array (key, line) so snapshot/restore is
     /// just an array-length checkpoint.  Branch-join builds a snapshot,
     /// walks each branch independently, and merges via intersection.
     moved_keys:  u32[];
@@ -136,13 +136,13 @@ type struct DropInserter {
     pop_scope(mut &this) -> void {
         const top: i64 = this.scope_start_idx.length;
         if (top == 0) { return; }
-        // Read by index then truncate via pop() — `pop()`'s return
+        // Read by index then truncate via pop(). `pop()`'s return
         // value is unreliable for `i64[]` in the bootstrap codegen
         // (we get garbage back), so we never rely on it.  The push
         // does decrement length correctly, which is what we need.
         const start: i64 = this.scope_start_idx[top - 1];
         this.scope_start_idx.pop();
-        // Bindings declared in this scope go out of lexical scope —
+        // Bindings declared in this scope go out of lexical scope;
         // truncate them out of types_* and binding_*.  We assume
         // bindings are pushed onto types_* in the same order as
         // binding_*, which holds because register_binding is the only
@@ -347,7 +347,7 @@ type struct DropInserter {
     /// synthesized `binding.drop();` calls at end of scope and before
     /// any early-exit statements (`return`, `break`, `continue`).
     /// Returns true when the block always diverges on every control-flow
-    /// path through it — used by the if/match join to ignore branches
+    /// path through it; used by the if/match join to ignore branches
     /// that can't fall through.
     walk_block(mut &this, block: BlockStmtNode*) -> boolean {
         if (block == null) { return false; }
@@ -361,20 +361,20 @@ type struct DropInserter {
     /// two ways, both because the block's trailing expression statement is
     /// the arm's *value* (it flows out as the match result rather than
     /// being discarded):
-    ///   1. that trailing expression is walked in *move* context — a bare
+    ///   1. that trailing expression is walked in *move* context: a bare
     ///      binding yielded from the arm (`A => { x }`) is then marked
     ///      moved, so the cross-arm join and the enclosing scope don't
     ///      also drop it (which would double-free the match result);
     ///   2. no end-of-scope drops are synthesized for the arm's own
-    ///      bindings — a `let` local declared *and not yielded* in a match
+    ///      bindings; a `let` local declared *and not yielded* in a match
     ///      arm is therefore still not auto-dropped (it leaks, exactly as
     ///      before this routing existed).  Doing that correctly needs the
     ///      drop to run *after* the value expression (which may read the
     ///      local) while keeping the value statement last for codegen's
-    ///      arm-value extraction — a coordinated drop/codegen change left
+    ///      arm-value extraction; a coordinated drop/codegen change left
     ///      as follow-up work.
     /// Early-exit statements (`return`/`break`/`continue`) inside the arm
-    /// still get their cumulative drops via `walk_stmt_into` — that is the
+    /// still get their cumulative drops via `walk_stmt_into`; that is the
     /// part that makes a droppable local live across `expr?` get freed on
     /// the error path.
     walk_value_block(mut &this, block: BlockStmtNode*) -> boolean {
@@ -394,7 +394,7 @@ type struct DropInserter {
     }
 
     /// Shared block-body walker.  `value_block` is true only for a
-    /// match-expression arm body — see `walk_value_block` for what that
+    /// match-expression arm body; see `walk_value_block` for what that
     /// changes.  For ordinary blocks (`value_block == false`) this is the
     /// original `walk_block_body` behavior unchanged.
     walk_block_body_impl(mut &this, block: BlockStmtNode*,
@@ -446,7 +446,7 @@ type struct DropInserter {
         // been moved on this path.  Suppressed when the block was
         // unconditionally terminated (drops were already emitted right
         // before the early-exit), and for value blocks (a match-arm
-        // value statement must stay last — see `walk_value_block`).
+        // value statement must stay last; see `walk_value_block`).
         if (!terminated && !value_block) {
             this.append_top_scope_drops(&new_stmts);
         }
@@ -614,8 +614,8 @@ type struct DropInserter {
         // Branch join.  A diverging branch's moves don't escape the if
         // (control never reaches post-if on that path), so we drop its
         // contribution from the join entirely.  An if without an else
-        // has an implicit fall-through else-branch — non-diverging,
-        // empty moved-set — making any then-only move conditional.
+        // has an implicit fall-through else-branch: non-diverging,
+        // empty moved-set, making any then-only move conditional.
         const has_else: boolean = it.else_stmt != null;
         const both_diverge: boolean = then_diverges && has_else && else_diverges;
         this.merge_branches(snap,
@@ -648,7 +648,7 @@ type struct DropInserter {
         // either doesn't happen (0 iterations) or may set up a
         // use-after-move on the next iteration.  Phase 1 conservative
         // model: snapshot/restore so the post-loop state matches the
-        // pre-loop state — a body-internal move is invisible past the
+        // pre-loop state; a body-internal move is invisible past the
         // loop.  Phase 3 fixes this with proper fixed-point analysis.
         const snap: i64 = this.snapshot_moves();
         this.loop_boundary.push(this.scope_start_idx.length);
@@ -676,7 +676,7 @@ type struct DropInserter {
     walk_for(mut &this, f: ForStmtNode*) -> void {
         if (f == null) { return; }
         // The init clause typically declares a loop variable like
-        // `mut i: i64 = 0` — its scope is the for-statement, not the
+        // `mut i: i64 = 0`; its scope is the for-statement, not the
         // enclosing block.  Push a scope so the init binding is dropped
         // when the for finishes.
         this.push_scope();
@@ -714,18 +714,18 @@ type struct DropInserter {
     }
 
     /// Walk a match's subject and arms as N independent control-flow
-    /// paths (intersection/union move-join, generalised over N arms —
+    /// paths (intersection/union move-join, generalised over N arms;
     /// the same shape as `walk_if`).  Shared by match *statements*
     /// (`walk_match`, `is_expr == false`) and match *expressions*
     /// (`walk_expr_read`'s `MatchExpression`/`TryExpression` arms,
-    /// `is_expr == true` — this is what the `?` and `??` operators
+    /// `is_expr == true`; this is what the `?` and `??` operators
     /// desugar to).
     ///
     /// For a match expression each arm body is a *value block* (see
     /// `walk_value_block`): its trailing expression is the arm's yielded
     /// value, walked in move context.  Routing match expressions through
-    /// here is what gives an early `return` inside an arm — in particular
-    /// the failure arm of the `?` desugar — the cumulative drops of every
+    /// here is what gives an early `return` inside an arm (in particular
+    /// the failure arm of the `?` desugar) the cumulative drops of every
     /// live local, so a droppable local live across `expr?` is freed on
     /// the error path instead of leaked.
     walk_match_arms(mut &this, subject: ExpressionNode*,
@@ -815,12 +815,12 @@ type struct DropInserter {
         return false;
     }
 
-    /// Walk a statement in place — used by control-flow walkers that
+    /// Walk a statement in place; used by control-flow walkers that
     /// don't rebuild a parent statement list.  For block statements
     /// this recurses into walk_block; for non-block statements we wrap
     /// it in a 1-element list and let walk_stmt_into route correctly.
     /// Walk a statement that lives as a child of a control-flow node
-    /// (then/else of an if, body of a while, arm of a match, …) without
+    /// (then/else of an if, body of a while, arm of a match, ...) without
     /// rebuilding a parent statement list.  Returns the divergence flag
     /// of the statement.  Bare early-exit branches should already have
     /// been wrapped in a synthesized BlockStmtNode by walk_if/etc. via
@@ -864,7 +864,7 @@ type struct DropInserter {
     // ---- branch-join helpers --------------------------------------------
 
     /// True iff `key` matches an id that's currently in `binding_names`
-    /// — i.e. the binding is live at the point of the if/match join.
+    /// i.e. the binding is live at the point of the if/match join.
     /// Used to discard moves of branch-local bindings from the join,
     /// which otherwise produce false `E0456_CONDITIONAL_MOVE` reports.
     binding_in_outer_scope(&this, key: u32) -> boolean {
@@ -878,7 +878,7 @@ type struct DropInserter {
                    then_keys: u32[], then_lines: i32[], then_diverges: boolean,
                    else_keys: u32[], else_lines: i32[],
                    has_else: boolean, else_diverges: boolean) -> void {
-        // A diverging branch's moves don't escape — drop its
+        // A diverging branch's moves don't escape; drop its
         // contribution from the join.  This eliminates the
         // `if (c) { use(b); return; }` false-positive where `b` would
         // otherwise look conditionally moved.
@@ -894,7 +894,7 @@ type struct DropInserter {
         }
         if (live_then && !live_else) {
             // Only the then-branch falls through.  Its moves apply
-            // unconditionally past the if-stmt — there's no other
+            // unconditionally past the if-stmt; there's no other
             // surviving path to compare against.
             this.set_moves_tail(snap, then_keys, then_lines);
             return;
@@ -946,7 +946,7 @@ type struct DropInserter {
 
     emit_conditional_move_by_id(mut &this, key: u32, line: i32) -> void {
         // Phase 1.5: emit as a warning rather than an error.  The
-        // analysis is over-eager — it reports any binding moved on
+        // analysis is over-eager: it reports any binding moved on
         // some control-flow paths but not others, even when the
         // binding's scope ends before the divergence becomes
         // observable (e.g. declared inside a loop body that resets
@@ -1001,17 +1001,17 @@ type struct DropInserter {
     }
 
     /// Drops for every live scope, innermost first.  Used before
-    /// `return` — the function exits, so every scope gets dropped.
+    /// `return`: the function exits, so every scope gets dropped.
     append_cumulative_drops(mut &this, out: StatementNode*[]*) -> void {
         this.append_drops_to_depth(out, 0);
     }
 
     /// Drops for scopes inside the current loop body.  Used before
-    /// `break`/`continue` — those exit the enclosing loop only, so
+    /// `break`/`continue`: those exit the enclosing loop only, so
     /// bindings declared OUTSIDE the loop must NOT be dropped here.
     append_loop_exit_drops(mut &this, out: StatementNode*[]*) -> void {
         if (this.loop_boundary.length == 0) {
-            // No enclosing loop — `break`/`continue` outside a loop
+            // No enclosing loop; `break`/`continue` outside a loop
             // would be a sema error already; emit nothing.
             return;
         }
@@ -1027,7 +1027,7 @@ type struct DropInserter {
         if (this.is_copy(ty))      { return; }
         // The binding's type might lack a drop method (rare for non-Copy
         // types, but possible for primitives that escape Copy through
-        // an alias).  Skip in that case — emitting a `.drop()` on a
+        // an alias).  Skip in that case; emitting a `.drop()` on a
         // type without a drop method would fail at codegen.
         if (!OwnershipQuery::has_inherent_drop(this.arena, this.registry,
                                                 this.intern, ty) &&
@@ -1044,7 +1044,7 @@ type struct DropInserter {
     }
 
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).
-    /// The synthesized nodes must carry resolved types — codegen runs
+    /// The synthesized nodes must carry resolved types; codegen runs
     /// after this pass and won't re-run type resolution, so an
     /// unresolved `binding.drop()` would lower to `<unknown>.drop()`
     /// and fail E0156 method lookup.
@@ -1088,7 +1088,7 @@ type struct DropInserter {
             NodeKind::IfExpression       => { this.read_if_expr(expr as IfExprNode*);                  }
             NodeKind::NewExpression      => { this.read_new(expr as NewExprNode*);                     }
             NodeKind::MatchExpression    => {
-                // A match used as an expression — including the desugars
+                // A match used as an expression, including the desugars
                 // of `?` and `??`.  Route through the shared arm walker
                 // in expression mode so an early `return` inside an arm
                 // (the failure arm of a `?`) gets the cumulative drops of
@@ -1099,7 +1099,7 @@ type struct DropInserter {
             NodeKind::TryExpression      => {
                 // `expr?` is lowered by sema to a `match` expression;
                 // route through the same path.  (`desugared` is null only
-                // when sema rejected the operand — a diagnostic already
+                // when sema rejected the operand; a diagnostic already
                 // fired in that case.)
                 const te: TryExprNode* = expr as TryExprNode*;
                 if (te.desugared != null) { this.walk_expr_read(te.desugared); }
@@ -1139,7 +1139,7 @@ type struct DropInserter {
         // General consuming-method case: any method whose receiver is
         // by-value (`mut this` / `this`) or that carries
         // `![consumes_self]` consumes the LHS at the call site.
-        // Walk the receiver in move context — that mirrors what the
+        // Walk the receiver in move context; that mirrors what the
         // explicit `.drop()` arm above does, but for any consuming
         // method (e.g. `Box::into_raw`).  This tells the synthesiser
         // not to emit a drop for the consumed binding.
@@ -1170,7 +1170,7 @@ type struct DropInserter {
             // `lhs = rhs` moves rhs into lhs.  Walk the rhs in move
             // context so a bare-ident rhs of a non-Copy type is marked
             // moved.  Compound assigns (`+=`, `-=`, etc.) read both
-            // sides and write the result, so they aren't moves —
+            // sides and write the result, so they aren't moves;
             // restrict the move semantics to plain `=`.
             if (b.op.kind == TokenType::Equal) {
                 this.walk_expr_move(b.right);
