@@ -86,6 +86,32 @@ mut g_intern: InternTable* = null;
 // region than to paint at the wrong position.
 mut g_line_index: LineIndex* = null;
 
+// Raw source text of the current editor buffer.  Used to translate the
+// parser's TAB-EXPANDED column numbers into BYTE columns before emitting
+// LSP tokens.  The Cryo lexer advances columns to the next multiple of 4
+// on tab, so `\tstatic` reports `static` at column 5 (visual cell), while
+// the LSP wire format wants character offset 1 (byte position after the
+// tab).  Without translation, a tab-indented identifier emits a token at
+// the wrong column AND with a clamped length — the editor renders the
+// trailing bytes via TextMate fallback, producing the split-color
+// "{semantic-color}sta{textmate}tic" artefact the user reports.
+mut g_doc_text:        string = "";
+mut g_doc_text_length: u64    = 0 as u64;
+
+// Absolute path of the file whose tokens we're emitting.  The
+// monomorphization pass (passes/specialization.cryo) APPENDS specialized
+// AST nodes from generic-instantiation sites — many of them originating
+// in stdlib templates — onto the *current* file's ProgramNode.  Those
+// injected nodes carry the TEMPLATE's source span (pointing into stdlib),
+// not the consumer's.  Without filtering by file, the walker emits
+// tokens at line/col positions that don't correspond to anything in the
+// editor's open document — VS Code then paints those spans onto
+// whatever happens to sit at those coordinates in the live buffer,
+// producing the catastrophic "random colors mid-identifier" artefact
+// the user is seeing.  emit_span drops every span whose file string
+// doesn't match this path.
+mut g_doc_file: string = "";
+
 
 // ============================================================================
 // Entry point
@@ -125,8 +151,7 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     const path_cstr: string = path_buf.as_ptr() as string;
 
     const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
-    path_buf.drop();
-    if (mod_idx < 0) { return Lsp::Protocol::SemanticTokens::empty_response(); }
+    if (mod_idx < 0) { path_buf.drop(); return Lsp::Protocol::SemanticTokens::empty_response(); }
 
     const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
     if (ast == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
@@ -150,9 +175,16 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     // point past the current end of file or past a now-shorter line —
     // emit_span drops them.
     g_line_index = null;
+    g_doc_text = "";
+    g_doc_text_length = 0 as u64;
+    g_doc_file = path_cstr;
     match (docs.get(uri)) {
         Option::Some(doc) => {
-            if (doc != null) { g_line_index = &doc.line_index; }
+            if (doc != null) {
+                g_line_index = &doc.line_index;
+                g_doc_text = doc.text.as_ptr() as string;
+                g_doc_text_length = doc.text.length();
+            }
         }
         Option::None => { }
     }
@@ -186,7 +218,13 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
 
     // -- Encode as wire `data: number[]` and wrap as response ---------
     const data: JsonValue = Lsp::Protocol::SemanticTokens::encode_tokens(&tokens);
-    return Lsp::Protocol::SemanticTokens::response_json(data);
+    const resp: JsonValue = Lsp::Protocol::SemanticTokens::response_json(data);
+    // path_buf backed g_doc_file for the duration of the walk; release
+    // it now that token emission is done.  g_doc_file dangles after
+    // this point but no further reads happen until the next handler
+    // invocation re-binds it.
+    path_buf.drop();
+    return resp;
 }
 
 
@@ -923,33 +961,42 @@ function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
                    tokens: mut &Array<SemanticToken>) -> void {
     if (!span.has_location()) { return; }
     if (span.start_line == 0 as u32) { return; }
+    // Reject spans whose source file isn't the one we're currently
+    // rendering tokens for.  The specialization pass appends
+    // monomorphized AST nodes from generic templates (often in stdlib)
+    // onto whatever ProgramNode triggered the instantiation, so a
+    // ProgramNode for `main.cryo` ends up containing nodes whose spans
+    // point into `option.cryo`, `array.cryo`, etc.  Without this guard
+    // the walker emits tokens at those line/col positions in the open
+    // editor buffer, which lands them on entirely unrelated source —
+    // exactly the catastrophic mis-coloring (e.g., a struct token
+    // landing on `int = 5;`) the user reported.
+    if (g_doc_file != "" && span.file != "" && !file_paths_equal(span.file, g_doc_file)) {
+        return;
+    }
     const line: u32   = span.start_line - 1 as u32;
-    const start: u32  = if (span.start_col > 0 as u32) {
+
+    // The lexer reports columns as TAB-EXPANDED visual cells (tab advances
+    // to the next multiple of 4, see `SourceLocation::increment_char`),
+    // but the LSP wire format wants character offsets (= bytes for ASCII
+    // source).  Walk the line content to translate.  Without the buffer,
+    // fall back to byte=cell which is correct for tab-free lines.
+    mut start_byte: u32 = if (span.start_col > 0 as u32) {
         span.start_col - 1 as u32
     } else {
         0 as u32
     };
+    mut end_byte_opt: u32 = if (span.end_line == span.start_line
+                                 && span.end_col > span.start_col) {
+        span.end_col - 1 as u32
+    } else {
+        start_byte + 1 as u32
+    };
 
-    // Length: if start_line == end_line, take the column delta.  Else
-    // fall back to a 1-char placeholder — a real multi-line identifier
-    // is a parser bug, but the LSP must not crash.
-    mut length: u32 = 1 as u32;
-    if (span.end_line == span.start_line) {
-        if (span.end_col > span.start_col) {
-            length = span.end_col - span.start_col;
-        }
-    }
-
-    // Validate against the live buffer.  Reject tokens whose target
-    // line is past the current EOF, or whose horizontal extent runs
-    // past the end of the line.  Clamp the length when only the tail
-    // overflows so the highlighted prefix still renders correctly.
-    if (g_line_index != null) {
+    if (g_line_index != null && g_doc_text != "") {
         if (line as u64 >= g_line_index.line_count()) { return; }
         const line_start: u64 = g_line_index.line_start(line);
         const line_end:   u64 = g_line_index.line_end(line);
-        // line_end is the start of the next line; subtract 1 for the
-        // trailing newline byte except on the final (newline-less) line.
         mut line_bytes: u64 = if (line_end > line_start) {
             line_end - line_start
         } else {
@@ -958,15 +1005,81 @@ function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
         if (line_bytes > 0 && line as u64 + 1 < g_line_index.line_count()) {
             line_bytes = line_bytes - 1;            // strip trailing \n
         }
-        if (start as u64 >= line_bytes && line_bytes > 0) { return; }
-        if (start as u64 + length as u64 > line_bytes) {
-            const clamped: u64 = line_bytes - start as u64;
-            length = clamped as u32;
-            if (length == 0 as u32) { return; }
+        // Trim a trailing \r if present (CRLF input — line_index counts
+        // \n only, so the \r sits inside line_bytes).
+        if (line_bytes > 0 as u64 && (line_start + line_bytes - 1) < g_doc_text_length) {
+            const last_byte: u8 = g_doc_text[(line_start + line_bytes - 1) as i64] as u8;
+            if (last_byte == 13 as u8) { line_bytes = line_bytes - 1; }
+        }
+
+        // Translate cell-columns to byte-columns by walking the line.
+        const line_ptr: string = g_doc_text + line_start as i64;
+        start_byte = cell_col_to_byte_col(line_ptr, line_bytes, span.start_col);
+        if (span.end_line == span.start_line && span.end_col > span.start_col) {
+            end_byte_opt = cell_col_to_byte_col(line_ptr, line_bytes, span.end_col);
+        } else {
+            end_byte_opt = start_byte + 1 as u32;
+        }
+
+        // Validate the resolved byte range against the live line length.
+        if (start_byte as u64 >= line_bytes && line_bytes > 0 as u64) { return; }
+        if ((end_byte_opt as u64) > line_bytes) {
+            end_byte_opt = line_bytes as u32;
         }
     }
 
-    tokens.push(SemanticToken::new(line, start, length, type_id, modifiers));
+    mut length: u32 = if (end_byte_opt > start_byte) {
+        end_byte_opt - start_byte
+    } else {
+        1 as u32
+    };
+    if (length == 0 as u32) { return; }
+
+    tokens.push(SemanticToken::new(line, start_byte, length, type_id, modifiers));
+}
+
+/// Byte-compare two NUL-terminated C strings.  Both `g_doc_file` and a
+/// span's `file` are raw `string` (`char*`) handles from the parser's
+/// intern table or the request's URI conversion; pointer-equality is
+/// NOT reliable (different code paths produce different copies of the
+/// same logical path), so we walk and compare bytes until a NUL.
+function file_paths_equal(a: string, b: string) -> boolean {
+    if (a == b) { return true; }                      // same pointer
+    mut i: u64 = 0;
+    loop {
+        const ca: u8 = a[i as i64] as u8;
+        const cb: u8 = b[i as i64] as u8;
+        if (ca != cb) { return false; }
+        if (ca == 0 as u8) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Walk `line` (byte length `line_bytes`) counting tab-expanded visual
+/// cells and return the 0-indexed BYTE offset corresponding to the
+/// 1-indexed cell column `target_cell`.  Mirrors the lexer's column
+/// accounting (`SourceLocation::increment_char`): tab jumps to the
+/// next multiple of 4 (1-indexed → 1, 5, 9, ...), every other byte
+/// advances one cell.  This is the inverse used by the LSP to map
+/// parser-reported columns back to wire-format character offsets.
+function cell_col_to_byte_col(line: string, line_bytes: u64, target_cell: u32) -> u32 {
+    if (target_cell <= 1 as u32) { return 0 as u32; }
+    mut cell: u32 = 1 as u32;
+    mut byte: u32 = 0 as u32;
+    while ((byte as u64) < line_bytes && cell < target_cell) {
+        const b: u8 = line[byte as i64] as u8;
+        if (b == 9 as u8) {
+            // tab: jump to next 4-cell stop (1-indexed: 5, 9, 13, ...).
+            const cell_zero: u32 = cell - 1 as u32;
+            const next_stop: u32 = ((cell_zero / 4 as u32) + 1 as u32) * 4 as u32 + 1 as u32;
+            cell = next_stop;
+        } else {
+            cell = cell + 1 as u32;
+        }
+        byte = byte + 1 as u32;
+    }
+    return byte;
 }
 
 /// In-place insertion sort by (line, start_char).  Token counts per
