@@ -19,7 +19,9 @@ import std::json::value;
 import Compiler::Diag;
 import Compiler::Diag::Severity;
 import Compiler::Diag::SourceSpan;
+import Compiler::Diag::SpanLabel;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Renderer;
 
 
 /// Build a `Range` JSON object from a 1-based compiler `SourceSpan`.
@@ -85,10 +87,15 @@ public function severity_int_from(sev: Severity) -> i64 {
 /// from sibling files at made-up positions in the active buffer.
 public function build_publish_params(uri: Str, diags: Diagnostic[]) -> JsonValue {
     const fs_path: Str = uri_to_fs_path(uri);
+    // One renderer for the whole batch.  It caches source files across
+    // diagnostics, so reusing it holds each publish to a single read per
+    // file.  `plain()` config: no ANSI, no leading rule — the rendered
+    // text lands in an LSP `message`, not a terminal.
+    mut renderer: DiagRenderer = DiagRenderer::new(RenderConfig::plain());
     mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(diags.length as u64);
     for (mut i: i64 = 0; i < diags.length; i++) {
         if (diag_is_for_path(&diags[i], fs_path)) {
-            arr.push(diag_to_json(&diags[i]));
+            arr.push(diag_to_json(&diags[i], &renderer));
         }
     }
 
@@ -137,8 +144,113 @@ function diag_is_for_path(diag: &Diagnostic, fs_path: Str) -> boolean {
 }
 
 
-/// Render one compiler diagnostic as an LSP `Diagnostic` JSON object.
-public function diag_to_json(diag: &Diagnostic) -> JsonValue {
+// ============================================================================
+// Rich diagnostic fields
+//
+// The wire `Diagnostic` carries far more than range + message.  We populate:
+//   - `message`            the full rendered report (header, source snippet
+//                          with carets, secondary labels, notes, suggestions)
+//   - `relatedInformation` every secondary span and located child, as a
+//                          clickable navigation target
+//   - `codeDescription`    a docs link the editor opens from the code
+//   - `tags`               fade unused/dead code, strike deprecated
+// so the editor surfaces the same diagnostic the terminal compiler prints.
+// ============================================================================
+
+/// The documentation URL an editor opens when the user clicks a
+/// diagnostic's code.  There is no per-code reference page yet, so this
+/// points at the language reference; swap in a per-code anchor when one
+/// exists.
+const ERROR_DOC_URL: string =
+    "https://github.com/jakelequire/CryoLang/blob/main/docs/cryo.md";
+
+/// Reconstruct a `file://` URI from the absolute filesystem path the
+/// compiler stamps onto every span — the inverse of `uri_to_fs_path`.
+function uri_string_from_fs_path(file: string) -> String {
+    mut s: String = String::with_capacity(strlen(file) + FILE_SCHEME_LEN);
+    s.push_cstr(FILE_SCHEME);
+    s.push_cstr(file);
+    return s;
+}
+
+/// Build one `DiagnosticRelatedInformation` entry: a `{ location, message }`
+/// pair the editor renders as a clickable jump target beneath the
+/// diagnostic.
+function related_info_json(file: string, span: SourceSpan,
+                           message: string) -> JsonValue {
+    mut loc: JsonObject = JsonObject::new();
+    loc.insert(String::from_str(Str::from_cstr("uri")),
+               JsonValue::String(uri_string_from_fs_path(file)));
+    loc.insert(String::from_str(Str::from_cstr("range")),
+               range_json_from_span(span));
+
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_cstr("location")),
+             JsonValue::Object(loc));
+    mut msg: String = String::new();
+    msg.push_cstr(message);
+    o.insert(String::from_str(Str::from_cstr("message")),
+             JsonValue::String(msg));
+    return JsonValue::Object(o);
+}
+
+/// Collect a diagnostic's secondary span labels and located child
+/// diagnostics into an LSP `relatedInformation` array.  Primary labels
+/// are skipped — the diagnostic's own `range` already covers the primary
+/// site — and so are spanless children: they have no editor position,
+/// but the rendered `message` still carries their text.
+function related_information_array(diag: &Diagnostic) -> Array<JsonValue> {
+    mut arr: Array<JsonValue> = Array<JsonValue>::new();
+
+    for (mut i: i64 = 0; i < diag.labels.length; i++) {
+        const label: SpanLabel = diag.labels[i];
+        if (label.is_primary)            { continue; }
+        if (!label.span.has_location())  { continue; }
+        arr.push(related_info_json(label.span.file, label.span, label.message));
+    }
+
+    for (mut i: i64 = 0; i < diag.children.length; i++) {
+        const child: Diagnostic = diag.children[i];
+        if (!child.span.has_location()) { continue; }
+        const text: string =
+            format("%s: %s", child.severity.label(), child.message);
+        arr.push(related_info_json(child.span.file, child.span, text));
+    }
+
+    return arr;
+}
+
+/// LSP `DiagnosticTag` values for a code.  `Unnecessary` (1) fades the
+/// span — the right affordance for unused/dead code; `Deprecated` (2)
+/// strikes it through.  Codes with no tag yield an empty array.
+function diagnostic_tags_array(code: ErrorCode) -> Array<JsonValue> {
+    mut arr: Array<JsonValue> = Array<JsonValue>::new();
+    match (code) {
+        ErrorCode::W0001_UNUSED_VARIABLE => { arr.push(JsonValue::Number(JsonNumber::Int(1))); }
+        ErrorCode::W0002_UNUSED_FUNCTION => { arr.push(JsonValue::Number(JsonNumber::Int(1))); }
+        ErrorCode::W0003_UNUSED_IMPORT   => { arr.push(JsonValue::Number(JsonNumber::Int(1))); }
+        ErrorCode::W0009_DEAD_CODE       => { arr.push(JsonValue::Number(JsonNumber::Int(1))); }
+        ErrorCode::W0007_DEPRECATED      => { arr.push(JsonValue::Number(JsonNumber::Int(2))); }
+        _                                => { }
+    }
+    return arr;
+}
+
+/// `{ "href": <docs url> }` — makes the diagnostic's code a clickable
+/// link in the editor's problems panel and hover.
+function code_description_json() -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+    o.insert(String::from_str(Str::from_cstr("href")),
+             JsonValue::String(String::from_str(Str::from_cstr(ERROR_DOC_URL))));
+    return JsonValue::Object(o);
+}
+
+
+/// Render one compiler diagnostic as a fully-populated LSP `Diagnostic`
+/// JSON object.  `renderer` produces the `message` body and is shared
+/// across the publish batch so its source-file cache is reused.
+public function diag_to_json(diag: &Diagnostic,
+                             renderer: DiagRenderer*) -> JsonValue {
     mut o: JsonObject = JsonObject::new();
     o.insert(String::from_str(Str::from_cstr("range")),
              range_json_from_span(diag.span));
@@ -151,13 +263,29 @@ public function diag_to_json(diag: &Diagnostic) -> JsonValue {
     o.insert(String::from_str(Str::from_cstr("code")),
              JsonValue::String(code_str));
 
+    // codeDescription: turns the code into a clickable docs link.
+    o.insert(String::from_str(Str::from_cstr("codeDescription")),
+             code_description_json());
+
     o.insert(String::from_str(Str::from_cstr("source")),
              JsonValue::String(String::from_str(Str::from_cstr("cryoc"))));
 
-    mut msg: String = String::new();
-    msg.push_cstr(diag.message);
+    // message: the full rendered report — header, source snippet with
+    // carets, secondary labels, notes, and suggestions — so the editor
+    // shows the same diagnostic the terminal compiler would print.
     o.insert(String::from_str(Str::from_cstr("message")),
-             JsonValue::String(msg));
+             JsonValue::String(renderer.render_to_string(*diag)));
+
+    // tags: fade unused/dead code, strike deprecated.  An empty array is
+    // a valid no-op; emitting it unconditionally keeps the move/ownership
+    // story simple.
+    o.insert(String::from_str(Str::from_cstr("tags")),
+             JsonValue::Array(diagnostic_tags_array(diag.code)));
+
+    // relatedInformation: clickable navigation to every secondary span
+    // and located child diagnostic.
+    o.insert(String::from_str(Str::from_cstr("relatedInformation")),
+             JsonValue::Array(related_information_array(diag)));
 
     return JsonValue::Object(o);
 }

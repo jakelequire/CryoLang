@@ -41,25 +41,6 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
 
 ---
 
-## Highlights
-
-|  |  |
-| --- | --- |
-| **Strong static typing** | Explicit annotations, no implicit numeric conversions, no inference on declarations. |
-| **Monomorphic generics** | Compile-time specialisation. Zero boxing, no vtables for parametric types, no type erasure. |
-| **Algebraic data types** | `type enum` with payload variants and exhaustive pattern matching. |
-| **Traits** | `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `Display`, `Read`/`Write`, `Allocator`, `Drop`, `Clone`, `Default`, … with `where T: ...` bounds. |
-| **Single-inheritance classes** | `virtual` / `override`, vtable dispatch, RAII via `~ClassName()`. |
-| **Self-hosted** | The compiler is written in Cryo and builds itself. |
-| **LLVM 20 backend** | Optimising compilation to native x86-64 / ARM64. |
-| **Production-shaped stdlib** | `Array<T>` / `String` / `HashMap<K, V>`, allocator-generic; `Box<T>`, `Arena`, `Rc<T>`; buffered I/O over `Read` / `Write`; `fs`, `process`, `env`, `math`, `json`; TCP and an HTTP/1.1 server + client + router under `net::http`. |
-| **First-class testing** | Discoverable with `![test]`; fork-per-test runner; `![ignore]` and `![should_panic]` directives. |
-| **Git-backed dependencies** | `[dependencies]` accepts `git = "..."` with version / tag / branch / rev pins, lockfile and content-addressed cache. |
-
-For the full feature list and semantics, see [`docs/cryo.md`](./docs/cryo.md).
-
----
-
 ## Installing
 
 The repo ships a committed self-hosted compiler binary at `bin/cryo` and a stdlib at `stdlib/`. The installer symlinks them into your `$PATH`. **No build step is required.**
@@ -76,17 +57,6 @@ By default this creates:
 /usr/local/bin/cryo                  →  <repo>/bin/cryo
 /usr/local/share/cryo/stdlib         →  <repo>/stdlib
 ```
-
-**Standard library lookup**, first match wins:
-
-| Source | Notes |
-| --- | --- |
-| `--stdlib=PATH` | One-off CLI override for the current invocation. |
-| `$CRYO_STDLIB` | Direct stdlib path. |
-| `$CRYO_HOME/stdlib` (or `/share/cryo/stdlib`) | Install-root pointer. **Cross-platform — recommended for non-Linux installs and CI.** `install.sh` prints the line to add to your shell profile. |
-| `<bindir>/../stdlib` | Auto-detected via `/proc/self/exe`. **Linux only.** Works out of the box for the symlink layout above. |
-| `[project] stdlib_root = "..."` in `cryoconfig` | Per-project pin. Relative paths resolve against the project root. Useful for vendored stdlibs or version-pinned tests. |
-| `<project_root>/../stdlib`, `../stdlib` | Legacy in-tree fallbacks. |
 
 **Custom prefix:**
 ```bash
@@ -527,8 +497,6 @@ for the full 1.0 release notes.
 
 - Async / await / coroutines (currently parser-only).
 - Range expressions (`a..b`, `a..=b`) in expression position.
-- Optional chaining (`?.`), null coalescing (`??`), pipe (`|>`).
-- Windows support for `process::Command`.
 - TLS, UDP, HTTP/2, and WebSocket for `net::http`.
 - Cross-compilation.
 
