@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { LanguageClient } from 'vscode-languageclient/node';
+import { DiagnosticDecorationManager } from './diagnosticDecorations';
 
 /**
  * Virtual-document scheme that the LSP server-side code action targets.
@@ -83,6 +84,12 @@ export function registerDiagnosticView(
             provider
         )
     );
+
+    // Decoration layer: applies guaranteed colors (via ThemeColor refs
+    // declared in package.json) on top of the TextMate grammar.  The
+    // manager keeps stable decoration-type handles for the life of the
+    // extension and refreshes on editor / document change events.
+    new DiagnosticDecorationManager(context);
 
     context.subscriptions.push(
         vscode.commands.registerCommand(

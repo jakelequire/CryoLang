@@ -4939,6 +4939,74 @@ public:
             }
         }
         this.expected_type = saved_expected;
+
+        // Completeness check: every declared field of the target struct/class
+        // must appear in the literal.  Without this, partial literals like
+        // `Foo { bar: 1 }` silently leave `baz` uninitialized and slip through
+        // sema; the only signal downstream is an undef LLVM store.  Skip when
+        // the type didn't resolve or hasn't finished sema-population yet (the
+        // monomorphizer fills fields after instantiation; see
+        // [[project_pipeline_phases]]).
+        if (struct_t != null &&
+            (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
+            mut fields_ptr: FieldInfo[] = [];
+            mut is_complete: boolean = false;
+            if (struct_t.kind == TypeKind::Struct) {
+                const st: StructType* = struct_t as StructType*;
+                fields_ptr = st.fields;
+                is_complete = st.is_complete;
+            } else {
+                const ct: ClassType* = struct_t as ClassType*;
+                fields_ptr = ct.fields;
+                is_complete = ct.is_complete;
+            }
+            if (is_complete && fields_ptr.length > 0) {
+                mut missing_names: SymbolStr[] = [];
+                for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+                    const decl_name: SymbolStr = fields_ptr[k].name;
+                    mut covered: boolean = false;
+                    for (mut fi: i64 = 0; fi < lit.field_inits.length; fi++) {
+                        if (lit.field_inits[fi].field_name.id == decl_name.id) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (!covered) { missing_names.push(decl_name); }
+                }
+                if (missing_names.length > 0) {
+                    // Build a capped, comma-quoted name list, mirroring the
+                    // non-exhaustive-match diagnostic above.
+                    mut names_str: string = "";
+                    const cap: i64 = if (missing_names.length < 4) {
+                        missing_names.length
+                    } else { 4 };
+                    for (mut i: i64 = 0; i < cap; i++) {
+                        const n: string = this.intern.resolve(missing_names[i]);
+                        if (i == 0) { names_str = format("`%s`", n); }
+                        else { names_str = format("%s, `%s`", names_str, n); }
+                    }
+                    if (missing_names.length > cap) {
+                        names_str = format("%s, and %lld more",
+                            names_str, missing_names.length - cap);
+                    }
+                    const ty_sym: SymbolStr = this.intern.intern(this.arena.format_display(struct_t));
+                    const ty_name: string = this.intern.resolve(ty_sym);
+                    mut diag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0355_MISSING_FIELD_INIT,
+                        format("missing field%s %s in initializer of `%s`",
+                            if (missing_names.length == 1) { "" } else { "s" },
+                            names_str, ty_name));
+                    diag = diag.at_with_label(lit.span,
+                        if (missing_names.length == 1) {
+                            format("missing field %s", names_str)
+                        } else {
+                            format("missing fields %s", names_str)
+                        });
+                    this.ctx.emit_diagnostic(diag);
+                }
+            }
+        }
+
         return struct_ref;
     }
 
