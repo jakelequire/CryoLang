@@ -1,0 +1,68 @@
+///! In-memory cache of rendered diagnostic reports.
+///!
+///! Each LSP `publish` populates this cache with one entry per
+///! diagnostic, keyed by a stable id derived from the diagnostic's
+///! (file, line, column, code).  The id is also stamped onto the LSP
+///! `Diagnostic.data` field so the editor extension can fetch the
+///! rendered text by id via the `cryo/renderedDiagnostic` custom
+///! request — opening it in a virtual document tab, which is the
+///! rust-analyzer-style "diagnostics view" UX.
+///!
+///! Cache grows for the LSP-process lifetime: each entry is a small
+///! string and a typical editing session accumulates a few thousand
+///! at most.  Eviction can land later when long-lived sessions
+///! justify it.
+
+namespace Lsp::Server::DiagRenderCache;
+
+import std::core::option;
+import std::core::drop;
+import std::collections::str;
+import std::collections::string;
+import std::collections::hashmap;
+
+
+type struct DiagRenderCache {
+    by_id: HashMap<String, String>;
+
+    static new() -> DiagRenderCache {
+        return DiagRenderCache {
+            by_id: HashMap<String, String>::new(),
+        };
+    }
+
+    /// Store the rendered text for `id`.  Both arguments are consumed.
+    /// A pre-existing entry under the same id is dropped — diagnostic
+    /// ids are stable across publishes of the *same* diagnostic, so the
+    /// replacement always carries the freshest rendering.
+    insert(mut &this, id: String, text: String) -> void {
+        match (this.by_id.insert(id, text)) {
+            Option::Some(prev) => { mut p: String = prev; p.drop(); }
+            Option::None       => { }
+        }
+    }
+
+    /// Borrow the rendered text for `id`, or `None` if the id is
+    /// unknown.  The returned `Str` is valid until the next `insert`
+    /// for the same id (which may drop the entry).
+    get(&this, id: Str) -> Option<Str> {
+        const probe: String = String::from_str(id);
+        const result: Option<String*> = this.by_id.get_ptr(&probe);
+        mut owned: String = probe;
+        owned.drop();
+        match (result) {
+            Option::Some(s_ptr) => { return Option::Some(s_ptr.as_str()); }
+            Option::None        => { return Option::None; }
+        }
+    }
+}
+
+
+// HashMap<String, String>::drop runs `drop` on every value; the bound
+// check requires the trait-impl form rather than an inherent method.
+// See `Lsp::Server::Docs` for the same pattern on `Document`.
+implement trait Drop for DiagRenderCache {
+    drop(mut &this) -> void {
+        this.by_id.drop();
+    }
+}

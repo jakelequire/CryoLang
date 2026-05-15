@@ -14,6 +14,7 @@ import std::core::option;
 import std::collections::str;
 import std::collections::string;
 import std::collections::array;
+import std::collections::hashmap;
 import std::json::value;
 
 import Compiler::Diag;
@@ -22,6 +23,8 @@ import Compiler::Diag::SourceSpan;
 import Compiler::Diag::SpanLabel;
 import Compiler::Diag::Diagnostic;
 import Compiler::Diag::Renderer;
+
+import Lsp::Server::DiagRenderCache;
 
 
 /// Build a `Range` JSON object from a 1-based compiler `SourceSpan`.
@@ -85,7 +88,8 @@ public function severity_int_from(sev: Severity) -> i64 {
 /// `publishDiagnostics` notification is per-URI on the wire.  Without
 /// the filter, an editor showing `main.cryo` would render diagnostics
 /// from sibling files at made-up positions in the active buffer.
-public function build_publish_params(uri: Str, diags: Diagnostic[]) -> JsonValue {
+public function build_publish_params(uri: Str, diags: Diagnostic[],
+                                     cache: DiagRenderCache*) -> JsonValue {
     const fs_path: Str = uri_to_fs_path(uri);
     // One renderer for the whole batch.  It caches source files across
     // diagnostics, so reusing it holds each publish to a single read per
@@ -95,7 +99,7 @@ public function build_publish_params(uri: Str, diags: Diagnostic[]) -> JsonValue
     mut arr: Array<JsonValue> = Array<JsonValue>::with_capacity(diags.length as u64);
     for (mut i: i64 = 0; i < diags.length; i++) {
         if (diag_is_for_path(&diags[i], fs_path)) {
-            arr.push(diag_to_json(&diags[i], &renderer));
+            arr.push(diag_to_json(&diags[i], &renderer, cache));
         }
     }
 
@@ -119,7 +123,7 @@ const FILE_SCHEME_LEN: u64    = 7;
 
 /// Strip the `file://` scheme from a URI to get the absolute
 /// filesystem path the compiler stores in `SourceSpan::file`.
-function uri_to_fs_path(uri: Str) -> Str {
+public function uri_to_fs_path(uri: Str) -> Str {
     if (uri.length() >= FILE_SCHEME_LEN) {
         const prefix: Str = uri.sub_bytes(0, FILE_SCHEME_LEN);
         if (prefix.equals(&Str::from_cstr(FILE_SCHEME))) {
@@ -136,7 +140,7 @@ function uri_to_fs_path(uri: Str) -> Str {
 /// whatever stale line/col the span happened to carry over) and
 /// confuse the user.  A future pass can route them into the LSP
 /// output channel instead.
-function diag_is_for_path(diag: &Diagnostic, fs_path: Str) -> boolean {
+public function diag_is_for_path(diag: &Diagnostic, fs_path: Str) -> boolean {
     const span_file: string = diag.span.file;
     if (span_file == "") { return false; }
     if (strlen(span_file) == 0 as u64) { return false; }
@@ -246,11 +250,30 @@ function code_description_json() -> JsonValue {
 }
 
 
+/// Build a stable id for `diag` — a 16-char hex hash of the
+/// diagnostic's (file, start_line, start_col, code) tuple.  Same
+/// diagnostic across publishes => same id; different diagnostics get
+/// distinct ids with FNV-1a's collision profile (negligible for
+/// per-session use).  The id is URI-path-safe (hex digits only) so it
+/// embeds cleanly in a `cryo-diagnostic:/<id>.cryo-diag` URI.
+public function build_diag_id(diag: &Diagnostic) -> string {
+    const code_str: string = diag.code.format();
+    const key: string = format("%s:%u:%u:%s",
+        diag.span.file, diag.span.start_line, diag.span.start_col, code_str);
+    const h: u64 = hash_str(key);
+    return format("%016llx", h);
+}
+
+
 /// Render one compiler diagnostic as a fully-populated LSP `Diagnostic`
-/// JSON object.  `renderer` produces the `message` body and is shared
-/// across the publish batch so its source-file cache is reused.
+/// JSON object.  `renderer` produces the `message` body; `cache`
+/// receives a side copy of that rendered text keyed by a stable
+/// `diagId` that's also stamped on the diagnostic's `data` field, so
+/// the editor's "open rendered diagnostic" code action can fetch the
+/// full report back later.
 public function diag_to_json(diag: &Diagnostic,
-                             renderer: DiagRenderer*) -> JsonValue {
+                             renderer: DiagRenderer*,
+                             cache: DiagRenderCache*) -> JsonValue {
     mut o: JsonObject = JsonObject::new();
     o.insert(String::from_str(Str::from_cstr("range")),
              range_json_from_span(diag.span));
@@ -270,11 +293,32 @@ public function diag_to_json(diag: &Diagnostic,
     o.insert(String::from_str(Str::from_cstr("source")),
              JsonValue::String(String::from_str(Str::from_cstr("cryoc"))));
 
-    // message: the full rendered report — header, source snippet with
-    // carets, secondary labels, notes, and suggestions — so the editor
-    // shows the same diagnostic the terminal compiler would print.
+    // Render once; ship a copy to the editor (inline in `message`) and
+    // a second copy to the cache (fetched on demand by the
+    // `cryo/renderedDiagnostic` request when the user opens a virtual
+    // diagnostic tab).
+    mut rendered: String = renderer.render_to_string(*diag);
+    mut rendered_for_msg: String = String::from_str(rendered.as_str());
+
     o.insert(String::from_str(Str::from_cstr("message")),
-             JsonValue::String(renderer.render_to_string(*diag)));
+             JsonValue::String(rendered_for_msg));
+
+    // diagId: stable across publishes; the cache key + the value
+    // the editor extension passes to `cryo/renderedDiagnostic`.
+    const id_cstr: string = build_diag_id(diag);
+    mut id_for_cache: String = String::new();
+    id_for_cache.push_cstr(id_cstr);
+    cache.insert(id_for_cache, rendered);
+
+    // data: { "diagId": "<id>" } — picked up by the code-action
+    // handler to build a "Show full Cryo diagnostic" lightbulb item.
+    mut id_for_data: String = String::new();
+    id_for_data.push_cstr(id_cstr);
+    mut data_obj: JsonObject = JsonObject::new();
+    data_obj.insert(String::from_str(Str::from_cstr("diagId")),
+                    JsonValue::String(id_for_data));
+    o.insert(String::from_str(Str::from_cstr("data")),
+             JsonValue::Object(data_obj));
 
     // tags: fade unused/dead code, strike deprecated.  An empty array is
     // a valid no-op; emitting it unconditionally keeps the move/ownership

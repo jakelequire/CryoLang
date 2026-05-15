@@ -1,0 +1,124 @@
+///! `textDocument/codeLens`: a clickable "Show full diagnostic" link
+///! that VS Code renders directly above every diagnostic line.
+///!
+///! Unlike code actions (which the user has to invoke via Ctrl+. or
+///! the lightbulb), code lenses are always visible — no keybind, no
+///! menu.  Each lens fires the same `cryo.openRenderedDiagnostic`
+///! client-side command the code action does, so both paths funnel
+///! into the same `cryo-diagnostic:` virtual document.
+///!
+///! Source of truth is the live compilation context attached to the
+///! URI's session: walk its diagnostic sink, filter to entries whose
+///! `span.file` matches this URI, and emit one lens per match.  No
+///! caching beyond what already lives in the sink — the diag-render
+///! cache is queried separately, by id, when the user actually opens
+///! the virtual doc.
+
+namespace Lsp::Handlers::CodeLens;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+import Compiler::CompilationContext;
+import Compiler::Diag::Diagnostic;
+
+import Lsp::Server::Session;
+import Lsp::Protocol::Conv;
+
+
+/// Handle a `textDocument/codeLens` request and return the JSON
+/// array to put in the response's `result` field.  An empty array
+/// (no session, no compile, no diagnostics for this URI) is a valid
+/// non-result.
+public function handle_code_lens(sessions: &SessionMap,
+                                  params: &JsonValue) -> JsonValue {
+    mut lenses: Array<JsonValue> = Array<JsonValue>::new();
+
+    // params.textDocument.uri  → the document we're lensing
+    const uri: String = uri_from_params(params);
+    if (uri.length() == 0) {
+        return JsonValue::Array(lenses);
+    }
+
+    // session ↔ context lookup mirrors hover.cryo / definition.cryo.
+    const session_opt: Option<CompilerSession*> = sessions.get(uri.as_str());
+    if (!session_opt.is_some()) {
+        return JsonValue::Array(lenses);
+    }
+    const session: CompilerSession* = session_opt.unwrap_or(null);
+    if (session == null) {
+        return JsonValue::Array(lenses);
+    }
+    const ctx: CompilationContext* = session.context();
+    if (ctx == null) {
+        return JsonValue::Array(lenses);
+    }
+
+    // Filter to diagnostics whose span belongs to this URI — the
+    // session's sink may carry cross-module diagnostics from compile
+    // dependencies, and emitting a lens against the wrong file would
+    // surface it on whatever line happens to share coordinates here.
+    const fs_path: Str = Conv::uri_to_fs_path(uri.as_str());
+    const diags: Diagnostic[] = ctx.diagnostics.diagnostics;
+    for (mut i: i64 = 0; i < diags.length; i++) {
+        if (!Conv::diag_is_for_path(&diags[i], fs_path)) { continue; }
+        if (!diags[i].span.has_location())               { continue; }
+        const id: string = Conv::build_diag_id(&diags[i]);
+        lenses.push(build_lens(&diags[i], id));
+    }
+
+    return JsonValue::Array(lenses);
+}
+
+
+/// Extract `params.textDocument.uri` as an owned `String`.  Returns
+/// an empty string when the field is missing or wrong-typed — the
+/// caller then short-circuits to an empty lens array.
+function uri_from_params(params: &JsonValue) -> String {
+    match (params.get(Str::from_cstr("textDocument"))) {
+        Option::Some(td) => {
+            match (td.get(Str::from_cstr("uri"))) {
+                Option::Some(uri_v) => {
+                    match (uri_v.as_str()) {
+                        Option::Some(s) => { return String::from_str(s); }
+                        Option::None    => { return String::new(); }
+                    }
+                }
+                Option::None => { return String::new(); }
+            }
+        }
+        Option::None => { return String::new(); }
+    }
+}
+
+
+/// Build one CodeLens JSON object — `{ range, command }`.  The
+/// `range` is the diagnostic's primary span; the `command` fires
+/// the client-side `cryo.openRenderedDiagnostic` with the
+/// diagnostic id as a single argument.
+function build_lens(diag: &Diagnostic, id: string) -> JsonValue {
+    const title:  string = "Show full diagnostic";
+    const cmd_id: string = "cryo.openRenderedDiagnostic";
+
+    // command.arguments = ["<diagId>"]
+    mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
+    args.push(JsonValue::String(String::from_str(Str::from_cstr(id))));
+
+    mut cmd: JsonObject = JsonObject::new();
+    cmd.insert(String::from_str(Str::from_cstr("title")),
+               JsonValue::String(String::from_str(Str::from_cstr(title))));
+    cmd.insert(String::from_str(Str::from_cstr("command")),
+               JsonValue::String(String::from_str(Str::from_cstr(cmd_id))));
+    cmd.insert(String::from_str(Str::from_cstr("arguments")),
+               JsonValue::Array(args));
+
+    mut lens: JsonObject = JsonObject::new();
+    lens.insert(String::from_str(Str::from_cstr("range")),
+                Conv::range_json_from_span(diag.span));
+    lens.insert(String::from_str(Str::from_cstr("command")),
+                JsonValue::Object(cmd));
+    return JsonValue::Object(lens);
+}
