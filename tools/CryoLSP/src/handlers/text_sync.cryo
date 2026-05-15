@@ -26,6 +26,8 @@ import Lsp::Server::Docs;
 import Lsp::Server::Session;
 import Lsp::Server::DiagRenderCache;
 import Lsp::Handlers::Diagnostics;
+import Lsp::Protocol::JsonRpc;
+import Lsp::Protocol::Framing;
 
 
 public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
@@ -48,6 +50,7 @@ public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
                 session_ptr.recompile(uri.as_str(), text.as_str());
                 Diagnostics::publish_for(writer, uri.as_str(),
                                           session_ptr.context(), cache);
+                send_semantic_tokens_refresh(writer);
             }
 
             mut u: String = uri;     u.drop();
@@ -96,6 +99,7 @@ public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
                 session_ptr.recompile(uri.as_str(), new_text.as_str());
                 Diagnostics::publish_for(writer, uri.as_str(),
                                           session_ptr.context(), cache);
+                send_semantic_tokens_refresh(writer);
             }
 
             mut u: String = uri;       u.drop();
@@ -173,4 +177,37 @@ function last_change_text(changes: &JsonValue) -> String {
         }
         _ => { return String::new(); }
     }
+}
+
+
+// ============================================================================
+// Server→client: nudge the editor to re-fetch semantic tokens
+// ============================================================================
+
+/// Monotonically-increasing id for outbound `workspace/semanticTokens/refresh`
+/// requests.  Per JSON-RPC each request needs a unique id so the client's
+/// (ignored) response can be routed; we never read it but the spec
+/// requires the field.
+mut g_refresh_request_id: i64 = 1 as i64;
+
+/// Send `workspace/semanticTokens/refresh` to invalidate the editor's
+/// cached semantic tokens.  Called after every recompile so the client
+/// re-requests tokens against the freshly-built AST.  Without this, the
+/// editor keeps painting STALE tokens from a previous parse onto the
+/// current text: as the user types, the cached spans drift away from
+/// the identifiers they were meant to colour, and VS Code renders the
+/// stale span colours on top of TextMate, producing the "broken-up,
+/// overlapping" highlighting the user reports.
+function send_semantic_tokens_refresh(writer: mut &Stdout) -> void {
+    const id: i64 = g_refresh_request_id;
+    g_refresh_request_id = id + 1 as i64;
+    mut body: String = JsonRpc::encode_request(
+        id,
+        Str::from_cstr("workspace/semanticTokens/refresh"),
+        JsonValue::Null);
+    match (Framing::write_message(writer, body.as_str())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    body.drop();
 }

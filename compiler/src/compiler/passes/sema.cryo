@@ -5002,6 +5002,60 @@ public:
                         } else {
                             format("missing fields %s", names_str)
                         });
+
+                    // Build a help line + diff-style suggestion: insert
+                    // each missing field as `<name>: <type>` on its own
+                    // line, anchored just after the last existing field
+                    // initializer.  The renderer auto-indents inserted
+                    // lines to match the anchor line's leading whitespace,
+                    // so the replacement carries no indent itself —
+                    // `,\n<name>: <type>` is enough.  The literal-empty
+                    // case is skipped (we don't have the open-brace
+                    // column at hand); the headline + help still guide
+                    // the user.
+                    mut repl: string = "";
+                    mut hint_names: string = "";
+                    for (mut i: i64 = 0; i < missing_names.length; i++) {
+                        if (i > 0) { hint_names = format("%s, ", hint_names); }
+                        const fname: string = this.intern.resolve(missing_names[i]);
+                        mut ftype: string = "_";
+                        for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+                            if (fields_ptr[k].name.id == missing_names[i].id) {
+                                ftype = this.arena.resolve_display_name(
+                                    fields_ptr[k].field_type.id);
+                                break;
+                            }
+                        }
+                        if (lit.field_inits.length > 0 || i > 0) {
+                            // Trailing comma on the prior line (the anchor
+                            // line for i==0, the previous inserted field
+                            // otherwise) before the new field's own line.
+                            repl = format("%s,", repl);
+                        }
+                        repl = format("%s\n%s: <%s>", repl, fname, ftype);
+                        hint_names = format("%s`%s`", hint_names, fname);
+                    }
+
+                    diag = diag.help(
+                        if (missing_names.length == 1) {
+                            format("specify a value for field %s", hint_names)
+                        } else {
+                            format("specify values for fields %s", hint_names)
+                        });
+
+                    if (lit.field_inits.length > 0) {
+                        const anchor: FieldInit =
+                            lit.field_inits[lit.field_inits.length - 1];
+                        const insert_span: SourceSpan = SourceSpan::new(
+                            anchor.span.file,
+                            anchor.span.end_line, anchor.span.end_col,
+                            anchor.span.end_line, anchor.span.end_col);
+                        const sug_msg: string =
+                            format("add %s", hint_names);
+                        diag = diag.suggest(Suggestion::single(insert_span,
+                            repl, sug_msg, Applicability::HasPlaceholders));
+                    }
+
                     this.ctx.emit_diagnostic(diag);
                 }
             }

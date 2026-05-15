@@ -222,6 +222,42 @@ function splice_replacement(line: string, start_col: u32, end_col: u32,
 }
 
 
+/// Extract bytes `[start..end)` of `s` into a freshly-allocated, NUL-
+/// terminated string the caller owns.  Returns `""` for empty / inverted
+/// ranges or on allocation failure.  Used by the multi-line suggestion
+/// renderer to split a replacement string on `\n` and to pull leading
+/// whitespace off the anchor line for auto-indenting inserted lines.
+function substring_bytes(s: string, start: i64, end: i64) -> string {
+    if (s == null as string || s == "") { return ""; }
+    if (end <= start) { return ""; }
+    const len: i64 = end - start;
+    const buf: i8* = intrinsics::malloc(len + 1) as i8*;
+    if (buf == null) { return ""; }
+    intrinsics::memcpy(buf as void*,
+        intrinsics::ptr_add(s as void*, start) as void*, len as u64);
+    *(intrinsics::ptr_add(buf as void*, len) as i8*) = 0 as i8;
+    return buf as string;
+}
+
+
+/// Count of leading space / tab bytes on `line`.  The renderer auto-
+/// indents every inserted line of a multi-line suggestion by this many
+/// bytes off the anchor line, so a fix-it like `,\nbuz: <bool>` lands
+/// at the same column as the existing fields without the emission site
+/// having to compute indent itself.
+function leading_whitespace_count(line: string) -> i64 {
+    if (line == null as string || line == "") { return 0; }
+    const len: i64 = intrinsics::strlen(line) as i64;
+    mut i: i64 = 0;
+    while (i < len) {
+        const c: u8 = line[i] as u8;
+        if (c != 0x20 && c != 0x09) { break; }
+        i = i + 1;
+    }
+    return i;
+}
+
+
 /// Visual cells occupied by the substring `line[start_byte..end_byte]`
 /// (1-indexed, half-open).  Used to compute caret-span widths so a
 /// `^^^^` underline matches the visual extent of a tab- or multi-byte
@@ -694,6 +730,22 @@ type struct DiagRenderer {
             }
             this.load_source(label.span.file);
             this.render_secondary_span(label);
+        }
+
+        // Section divider between the diagnostic report (header +
+        // snippet + cross-file labels) and the compiler-suggestion
+        // block (children + suggestions).  Grey rather than severity-
+        // tinted so it reads as a within-diagnostic separator instead
+        // of the start of a new diagnostic.
+        const has_followup: boolean =
+            diag.children.length > 0 || diag.suggestions.length > 0;
+        if (has_followup) {
+            const div_bold:  string = this.color_bold();
+            const div_grey:  string = this.color_grey();
+            const div_reset: string = this.color_reset();
+            intrinsics::fprintf(out,
+                "%s%s================================================================================%s\n",
+                div_bold, div_grey, div_reset);
         }
 
         // 4. Children (notes, helps)
@@ -1402,6 +1454,34 @@ type struct DiagRenderer {
             return;
         }
 
+        // Multi-line replacement: if the replacement contains a literal
+        // `\n`, render each segment on its own row.  The first segment
+        // is spliced into the anchor line (which gets a `~` indicator
+        // since its content has changed); each subsequent segment is
+        // shown as an inserted line — auto-indented to the anchor line's
+        // leading whitespace and gutter-marked with `+`.  A single
+        // trailing context line is pulled from the source so the user
+        // sees what closes the construct (typically the `};` after a
+        // struct literal).  Single-line replacements fall through to
+        // the legacy splice-into-one-line path below.
+        const repl_byte_count: i64 = if (part.replacement == null as string) {
+            0
+        } else {
+            intrinsics::strlen(part.replacement) as i64
+        };
+        mut first_nl: i64 = -1;
+        for (mut nl_i: i64 = 0; nl_i < repl_byte_count; nl_i++) {
+            if ((part.replacement[nl_i] as u8) == (10 as u8)) {
+                first_nl = nl_i;
+                break;
+            }
+        }
+        if (first_nl >= 0) {
+            this.render_multiline_suggestion(part, orig_line, first_nl,
+                repl_byte_count);
+            return;
+        }
+
         const span_len: u32 = if (part.span.end_col > part.span.start_col) {
             part.span.end_col - part.span.start_col
         } else {
@@ -1469,6 +1549,165 @@ type struct DiagRenderer {
         if (patched != orig_line) {
             intrinsics::free(patched as void*);
         }
+    }
+
+    /// Render a multi-line suggestion.  Called from `render_suggestion_part`
+    /// when the replacement contains at least one `\n`.  Layout matches
+    /// rustc's "diff" presentation:
+    ///
+    ///   |
+    /// 53 ~     baz: "not a boolean",
+    ///    +     buz: <boolean>
+    /// 54 |     };
+    ///   |
+    ///
+    /// `~` marks the existing anchor line whose content was modified
+    /// (e.g. a trailing comma was appended); `+` rows are new lines the
+    /// edit inserts; the line after with a `|` gutter is unmodified source
+    /// shown as trailing context.  Inserted lines are auto-indented to
+    /// the anchor line's leading whitespace so emission sites don't have
+    /// to compute the indent themselves.
+    render_multiline_suggestion(mut &this, part: SuggestionPart,
+                                 orig_line: string, first_nl: i64,
+                                 repl_byte_count: i64) -> void {
+        const blue:  string = this.color_blue();
+        const green: string = this.color_green();
+        const grey:  string = this.color_grey();
+        const reset: string = this.color_reset();
+        const bold:  string = this.color_bold();
+        const out: void* = this.out_stream();
+
+        // Splice the first segment (everything before the first `\n` in
+        // the replacement) into the anchor line.  This is the line that
+        // visually "changes": it now carries the appended punctuation
+        // (`,`) or whatever leads off the multi-line edit.
+        const first_seg: string = substring_bytes(part.replacement, 0, first_nl);
+        const patched_first: string = splice_replacement(orig_line,
+            part.span.start_col, part.span.end_col, first_seg);
+
+        // Indent for inserted lines = anchor line's leading whitespace.
+        const indent_n: i64 = leading_whitespace_count(orig_line);
+        const indent_str: string = substring_bytes(orig_line, 0, indent_n);
+
+        // Reserve enough digits for the largest line number we'll
+        // render — up to two lines of trailing source context past the
+        // anchor's end.  No artificial minimum; matches the primary
+        // snippet's natural-width column.
+        const line_width: u32 = this.line_number_width(part.span.end_line + 2);
+
+        this.render_margin(line_width);
+
+        // One line of leading context before the anchor (the line that
+        // opens the construct, e.g. `Foo {`).  Skipped on file-start.
+        if (part.span.start_line > 1) {
+            const prev_ln: u32 = part.span.start_line - 1;
+            const prev_text: string = this.get_line(part.span.file, prev_ln);
+            if (prev_text != "") {
+                intrinsics::fprintf(out, "%s%s%*u%s %s|%s ",
+                    this.lead(), grey, line_width, prev_ln, reset,
+                    blue, reset);
+                this.print_source_line(out, prev_text);
+                intrinsics::fprintf(out, "\n");
+            }
+        }
+
+        // Anchor line: line number kept, but gutter switched to `~` so
+        // a casual reader sees the change marker even without colour.
+        intrinsics::fprintf(out, "%s%s%s%*u%s %s~%s ",
+            this.lead(), bold, green, line_width, part.span.start_line, reset,
+            green, reset);
+        this.print_source_line(out, patched_first);
+        intrinsics::fprintf(out, "\n");
+
+        // Underline the inserted slice on the anchor line.
+        const first_seg_bytes: u32 = first_nl as u32;
+        if (first_seg_bytes > 0) {
+            const visual_start: u32 = byte_col_to_visual(patched_first,
+                part.span.start_col);
+            mut ul_start: u32 = 0;
+            if (visual_start > 0) { ul_start = visual_start - 1; }
+            const ul_len: u32 = byte_range_visual_width(patched_first,
+                part.span.start_col, part.span.start_col + first_seg_bytes);
+            intrinsics::fprintf(out, "%s%*s %s|%s ",
+                this.lead(), line_width, "", blue, reset);
+            for (mut s: u32 = 0; s < ul_start; s++) {
+                intrinsics::fprintf(out, " ");
+            }
+            intrinsics::fprintf(out, "%s%s", bold, green);
+            for (mut t: u32 = 0; t < ul_len; t++) {
+                intrinsics::fprintf(out, "~");
+            }
+            intrinsics::fprintf(out, "%s\n", reset);
+        }
+
+        // Each subsequent segment is a new inserted line: blank line-
+        // number column, `+` gutter, anchor-indented content, then a
+        // `+` underline spanning the inserted bytes.
+        mut seg_start: i64 = first_nl + 1;
+        while (seg_start <= repl_byte_count) {
+            mut seg_end: i64 = seg_start;
+            while (seg_end < repl_byte_count
+                    && (part.replacement[seg_end] as u8) != (10 as u8)) {
+                seg_end = seg_end + 1;
+            }
+            const seg: string = substring_bytes(part.replacement,
+                seg_start, seg_end);
+            const new_line: string = indent_str + seg;
+
+            // Inserted-line row.
+            intrinsics::fprintf(out, "%s%*s %s%s+%s ",
+                this.lead(), line_width, "", bold, green, reset);
+            this.print_source_line(out, new_line);
+            intrinsics::fprintf(out, "\n");
+
+            // Underline the new line with `+` glyphs — positioned
+            // under the *content* only, not the leading indent.  The
+            // gutter prints `indent_visual` spaces to skip past the
+            // indent, then prints `seg_visual` `+` chars across the
+            // visual extent of the inserted text.
+            const new_line_bytes: i64 = intrinsics::strlen(new_line) as i64;
+            const indent_byte_end: u32 = (indent_n + 1) as u32;
+            const indent_visual: u32 = if (indent_n > 0) {
+                byte_range_visual_width(new_line, 1, indent_byte_end)
+            } else {
+                0
+            };
+            const seg_visual: u32 = if ((new_line_bytes as i64) > indent_n) {
+                byte_range_visual_width(new_line,
+                    indent_byte_end, (new_line_bytes + 1) as u32)
+            } else {
+                0
+            };
+            intrinsics::fprintf(out, "%s%*s %s|%s ",
+                this.lead(), line_width, "", blue, reset);
+            for (mut sp: u32 = 0; sp < indent_visual; sp++) {
+                intrinsics::fprintf(out, " ");
+            }
+            intrinsics::fprintf(out, "%s%s", bold, green);
+            for (mut t: u32 = 0; t < seg_visual; t++) {
+                intrinsics::fprintf(out, "+");
+            }
+            intrinsics::fprintf(out, "%s\n", reset);
+
+            seg_start = seg_end + 1;
+        }
+
+        // Two trailing lines of unmodified source.  Lets the reader
+        // see what closes the construct (typically the `};` after a
+        // struct literal, plus whatever follows it).  Stops at the
+        // first empty line past the anchor.
+        for (mut ctx_i: u32 = 1; ctx_i <= 2; ctx_i++) {
+            const next_ln: u32 = part.span.end_line + ctx_i;
+            const next_text: string = this.get_line(part.span.file, next_ln);
+            if (next_text == "") { break; }
+            intrinsics::fprintf(out, "%s%s%*u%s %s|%s ",
+                this.lead(), grey, line_width, next_ln, reset,
+                blue, reset);
+            this.print_source_line(out, next_text);
+            intrinsics::fprintf(out, "\n");
+        }
+
+        this.render_margin(line_width);
     }
 
     /// Print a summary line:  "aborting due to N errors; M warnings emitted"
