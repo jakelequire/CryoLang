@@ -46,6 +46,7 @@ import Compiler::Resolver::InternTable;
 
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
+import Lsp::Server::LineIndex;
 import Lsp::Protocol::SemanticTokens;
 
 
@@ -69,6 +70,21 @@ mut g_sym_this:        SymbolStr = SymbolStr::empty();
 mut g_sym_amp_this:    SymbolStr = SymbolStr::empty();
 mut g_sym_mut_this:    SymbolStr = SymbolStr::empty();
 mut g_sym_amp_mut_this:SymbolStr = SymbolStr::empty();
+
+// Intern table for the current request, repopulated each call.  The
+// walker needs it to resolve SymbolStr -> string for sub-span work
+// (e.g., field-name sub-span inside a struct literal's `name: value`
+// span, which the AST stores as a single span).
+mut g_intern: InternTable* = null;
+
+// LineIndex of the current editor buffer.  The compiler may have last
+// parsed a STALE version of the source (recompile lags fast keystrokes,
+// or the parser failed and the AST holds spans pointing past the
+// current buffer's end).  We validate every span against this index in
+// emit_span and drop tokens whose target line/column don't exist in the
+// editor's current view of the file — better to emit no token for a
+// region than to paint at the wrong position.
+mut g_line_index: LineIndex* = null;
 
 
 // ============================================================================
@@ -126,6 +142,20 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
         g_sym_mut_this     = ctx.intern_table.intern("mut &this");
         g_sym_amp_mut_this = ctx.intern_table.intern("&mut this");
     }
+    g_intern = ctx.intern_table;
+
+    // Pick up the editor buffer's line index so emit_span can validate
+    // every span against the live source.  When the compiler holds a
+    // stale AST (parse failed mid-edit, recompile is behind), spans may
+    // point past the current end of file or past a now-shorter line —
+    // emit_span drops them.
+    g_line_index = null;
+    match (docs.get(uri)) {
+        Option::Some(doc) => {
+            if (doc != null) { g_line_index = &doc.line_index; }
+        }
+        Option::None => { }
+    }
 
     // -- Walk the AST, collecting tokens ------------------------------
     mut tokens: Array<SemanticToken> = Array<SemanticToken>::new();
@@ -138,6 +168,21 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     // returns, generic params — emit a name span that sits BEFORE the
     // body's emissions.  A stable sort keeps the result deterministic.
     sort_tokens(&tokens);
+
+    // -- Drop duplicate + overlapping tokens --------------------------
+    // The LSP semantic-tokens spec requires the wire array to be
+    // strictly non-overlapping.  Walks can produce overlaps when two
+    // walkers both classify the same span (e.g. a member access whose
+    // object identifier overlaps with a parent classification, or
+    // legacy emissions that pre-date a narrower replacement).  The
+    // VS Code renderer treats overlap as undefined behaviour and
+    // produces the "multi-coloured token" artefact the user sees.
+    // Drop any token whose range starts before the previously-kept
+    // token ends, and drop exact duplicates.  At equal (line, start)
+    // the sort secondary already prefers the WIDER token, so an
+    // identical-position pair degrades to one wide token rather than
+    // two stacked.
+    dedup_overlapping(&tokens);
 
     // -- Encode as wire `data: number[]` and wrap as response ---------
     const data: JsonValue = Lsp::Protocol::SemanticTokens::encode_tokens(&tokens);
@@ -689,14 +734,28 @@ function walk_struct_literal(s: StructLiteralNode*, tokens: mut &Array<SemanticT
     }
     for (mut i: i64 = 0; i < s.field_inits.length; i++) {
         const fi: FieldInit = s.field_inits[i];
-        // FieldInit carries only the `span` of `name: value` (no separate
-        // name-only span).  Emit a `property` token spanning the whole
-        // field-init — the value walker descends into `fi.value`, which
-        // will overlay its own classifications on the value subrange.
-        if (fi.span.has_location()) {
-            emit_span(fi.span,
-                      Lsp::Protocol::SemanticTokens::TYPE_PROPERTY,
-                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        // FieldInit's span covers the whole `name: value` source range.
+        // Emitting `property` over that range overlaps the value tokens
+        // (numbers, strings, etc.), and the LSP semantic-tokens client
+        // resolves overlaps by the first-claim winning — which paints
+        // literals with the property colour.  Trim to the field-name
+        // sub-span using the interned name length so the value keeps
+        // its own classification (or its TextMate colour if the walker
+        // doesn't classify literals).
+        if (fi.span.has_location() && g_intern != null) {
+            const name_str: string = g_intern.resolve(fi.field_name);
+            const name_len: u32 = strlen(name_str) as u32;
+            if (name_len > 0 as u32) {
+                const name_span: SourceSpan = SourceSpan::new(
+                    fi.span.file,
+                    fi.span.start_line,
+                    fi.span.start_col,
+                    fi.span.start_line,
+                    fi.span.start_col + name_len);
+                emit_span(name_span,
+                          Lsp::Protocol::SemanticTokens::TYPE_PROPERTY,
+                          Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+            }
         }
         walk_expr(fi.value, tokens);
     }
@@ -724,16 +783,56 @@ function walk_scope_resolution(s: ScopeResolutionNode*, is_callee: boolean,
                                 tokens: mut &Array<SemanticToken>) -> void {
     if (s == null) { return; }
     // ScopeResolutionNode doesn't store separate spans for `scope_name`
-    // and `member_name` (only the combined `span`).  The TextMate
-    // `scope-resolution` rule already handles `Type::name` reasonably;
-    // we contribute the member-name classification.  The combined span
-    // covers `Scope::Member` — emit a single token spanning the whole
-    // expression with type=function (or method, if it's a callee).
-    //
-    // This loses sub-span fidelity (scope vs. member), but produces
-    // the right colour for the trailing identifier in 90% of cases.
-    // A future revision adds dedicated `scope_span` / `member_span`
-    // fields to ScopeResolutionNode for accurate sub-span colouring.
+    // and `member_name`; only the combined `span` over `Scope::Member`.
+    // We synthesize sub-spans from the interned string lengths:
+    //   • scope: starts at span.start_col, length = strlen(scope_name)
+    //   • member: ends at span.end_col, length = strlen(member_name)
+    // The `::` separator and any generic-arg list (`<T,U>`) between
+    // them are left to the TextMate grammar.  This is enough to give
+    // `Vec` and `new` the right colors in `Vec<T>::new(...)`.
+    if (s.span.has_location() && g_intern != null) {
+        const scope_str: string = g_intern.resolve(s.scope_name);
+        const scope_len: u32 = strlen(scope_str) as u32;
+        if (scope_len > 0 as u32 && !s.scope_name.is_empty()) {
+            const scope_span: SourceSpan = SourceSpan::new(
+                s.span.file,
+                s.span.start_line,
+                s.span.start_col,
+                s.span.start_line,
+                s.span.start_col + scope_len);
+            emit_span(scope_span,
+                      Lsp::Protocol::SemanticTokens::TYPE_TYPE,
+                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        }
+
+        // Member emit: only when there are no generic-arg lists that
+        // would push the member name away from the span's end.  With
+        // `Foo<T>::bar` or `Foo::bar<U>`, the parser's reported
+        // span.end_col may sit past `bar` (covering `<U>` too), and we
+        // can't reliably back up `member_len` bytes to find `bar`.
+        const has_generics: boolean = s.scope_generic_args.length > 0
+                                    || s.generic_args.length > 0;
+        const member_str: string = g_intern.resolve(s.member_name);
+        const member_len: u32 = strlen(member_str) as u32;
+        if (!has_generics && member_len > 0 as u32 && !s.member_name.is_empty()
+                && s.span.end_line == s.span.start_line
+                && s.span.end_col > member_len) {
+            const member_type: u32 = if (is_callee) {
+                Lsp::Protocol::SemanticTokens::TYPE_FUNCTION
+            } else {
+                Lsp::Protocol::SemanticTokens::TYPE_ENUM_MEMBER
+            };
+            const member_span: SourceSpan = SourceSpan::new(
+                s.span.file,
+                s.span.end_line,
+                s.span.end_col - member_len,
+                s.span.end_line,
+                s.span.end_col);
+            emit_span(member_span, member_type,
+                      Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
+        }
+    }
+
     for (mut i: i64 = 0; i < s.scope_generic_args.length; i++) {
         walk_type_annotation(s.scope_generic_args[i], tokens);
     }
@@ -812,6 +911,14 @@ function walk_type_annotation(ann: TypeAnnotation*, tokens: mut &Array<SemanticT
 /// Converts compiler 1-based line/col to LSP 0-based, and clamps the
 /// length so a multi-line span (rare for identifiers) reports just the
 /// portion on the start line.
+///
+/// Validates the span against the editor buffer's line index when one
+/// is available: a token whose target line doesn't exist in the live
+/// source — or whose start column sits past the line's end — is
+/// silently dropped.  This is the safety net for stale spans coming
+/// out of a parse failure or a lagged recompile, which would otherwise
+/// paint at the wrong place after the user inserts a newline or shrinks
+/// a line.
 function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
                    tokens: mut &Array<SemanticToken>) -> void {
     if (!span.has_location()) { return; }
@@ -830,6 +937,32 @@ function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
     if (span.end_line == span.start_line) {
         if (span.end_col > span.start_col) {
             length = span.end_col - span.start_col;
+        }
+    }
+
+    // Validate against the live buffer.  Reject tokens whose target
+    // line is past the current EOF, or whose horizontal extent runs
+    // past the end of the line.  Clamp the length when only the tail
+    // overflows so the highlighted prefix still renders correctly.
+    if (g_line_index != null) {
+        if (line as u64 >= g_line_index.line_count()) { return; }
+        const line_start: u64 = g_line_index.line_start(line);
+        const line_end:   u64 = g_line_index.line_end(line);
+        // line_end is the start of the next line; subtract 1 for the
+        // trailing newline byte except on the final (newline-less) line.
+        mut line_bytes: u64 = if (line_end > line_start) {
+            line_end - line_start
+        } else {
+            0 as u64
+        };
+        if (line_bytes > 0 && line as u64 + 1 < g_line_index.line_count()) {
+            line_bytes = line_bytes - 1;            // strip trailing \n
+        }
+        if (start as u64 >= line_bytes && line_bytes > 0) { return; }
+        if (start as u64 + length as u64 > line_bytes) {
+            const clamped: u64 = line_bytes - start as u64;
+            length = clamped as u32;
+            if (length == 0 as u32) { return; }
         }
     }
 
@@ -865,7 +998,63 @@ function sort_tokens(tokens: mut &Array<SemanticToken>) -> void {
 function token_lt(a: SemanticToken, b: SemanticToken) -> boolean {
     if (a.line < b.line) { return true; }
     if (a.line > b.line) { return false; }
-    return a.start_char < b.start_char;
+    if (a.start_char != b.start_char) { return a.start_char < b.start_char; }
+    // Same (line, start_char): wider tokens first.  Combined with the
+    // subsequent dedup pass — which drops anything overlapping with the
+    // previously-kept token — this collapses two identical-start tokens
+    // to whichever covers more bytes.  That matches VS Code's TextMate
+    // fallback for the non-covered tail: if our narrow emit also got an
+    // equally-narrow duplicate, the wider one wins and we lose nothing.
+    return a.length > b.length;
+}
+
+/// Walk the sorted token list and drop:
+///   • exact duplicates (same line, start_char, length, type, modifiers)
+///   • later tokens whose range starts inside the previously-kept
+///     token's range
+///
+/// In-place: rewrites the array's prefix and truncates.  Preserves sort
+/// order; the array stays valid for the delta-encoder.
+function dedup_overlapping(tokens: mut &Array<SemanticToken>) -> void {
+    const n: u64 = tokens.length();
+    if (n < 2 as u64) { return; }
+    const data: SemanticToken* = tokens.as_ptr();
+
+    mut write: u64 = 1 as u64;
+    mut last:  SemanticToken = data[0];
+    mut last_end_char: u32 = last.start_char + last.length;
+
+    for (mut read: u64 = 1; read < n; read++) {
+        const cur: SemanticToken = data[read];
+
+        // Exact duplicate of the last kept token → drop.
+        if (cur.line == last.line && cur.start_char == last.start_char
+                && cur.length == last.length
+                && cur.token_type == last.token_type
+                && cur.token_modifiers == last.token_modifiers) {
+            continue;
+        }
+
+        // Overlap on the same line → drop the later (narrower or
+        // duplicate-range) token, keeping the previously-emitted one.
+        if (cur.line == last.line && cur.start_char < last_end_char) {
+            continue;
+        }
+
+        data[write] = cur;
+        write = write + 1;
+        last = cur;
+        last_end_char = last.start_char + last.length;
+    }
+
+    // Array has no truncate(); pop the trailing items we've already
+    // copied forward.  SemanticToken is Copy so the pop's returned
+    // Option<T> doesn't need explicit dropping.
+    mut to_drop: u64 = n - write;
+    while (to_drop > 0 as u64) {
+        tokens.pop();
+        to_drop = to_drop - 1;
+    }
 }
 
 

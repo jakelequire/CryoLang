@@ -29,6 +29,7 @@ import Compiler::AST::Statement;
 import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
 import Compiler::AST::Visitor;
+import Compiler::AST::NodeLocator;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Lex;
@@ -84,6 +85,7 @@ public:
     undo_prev:   TypeRef[];                // scope undo log: previous values
     undo_muts:   boolean[];                // scope undo log: previous mut flags
     return_type: TypeRef;                  // current function return type
+    return_type_ann: TypeAnnotation*;      // current function return-type annotation (for secondary spans)
     this_type:   TypeRef;                  // current method receiver type
     this_sym:    SymbolStr;                // interned "this"
     this_is_mut: boolean;                  // method has `mut &this`
@@ -109,6 +111,7 @@ public:
         this.undo_prev      = [];
         this.undo_muts      = [];
         this.return_type    = TypeRef::invalid();
+        this.return_type_ann = null;
         this.this_type      = TypeRef::invalid();
         this.this_sym       = intern.intern("this");
         this.this_is_mut    = false;
@@ -332,6 +335,59 @@ public:
         if (t == null) { return "?"; }
         const sym: SymbolStr = this.intern.intern(this.arena.format_display(t));
         return this.intern.resolve(sym);
+    }
+
+    /// Walk a type's structure looking for any unsubstituted generic
+    /// parameter (GenericParam or BoundedParam).  Used to gate
+    /// type-mismatch diagnostics that would otherwise fire spuriously
+    /// when a nested generic-function call returns its template-form
+    /// signature type (e.g., `mem::offset<T>` returning `T*`) inside a
+    /// monomorphized caller whose field type has already been
+    /// substituted to a concrete type.  The substitution pipeline does
+    /// not deep-propagate through foreign generic-function return
+    /// types, so we silently skip checks involving any such leftover.
+    contains_generic_param(&this, tref: TypeRef) -> boolean {
+        if (!tref.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(tref.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::BoundedParam) {
+            return true;
+        }
+        if (t.kind == TypeKind::Pointer) {
+            const p: PointerType* = t as PointerType*;
+            return this.contains_generic_param(p.pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            const r: ReferenceType* = t as ReferenceType*;
+            return this.contains_generic_param(r.referent);
+        }
+        if (t.kind == TypeKind::Array) {
+            const a: ArrayType* = t as ArrayType*;
+            return this.contains_generic_param(a.element);
+        }
+        if (t.kind == TypeKind::Optional) {
+            const o: OptionalType* = t as OptionalType*;
+            return this.contains_generic_param(o.wrapped);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.contains_generic_param(tup.elements[i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.contains_generic_param(inst.type_args[i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
     }
 
     /// Build the rich "mismatched types" diagnostic with the rustc-style
@@ -736,8 +792,9 @@ public:
         this.undo_keys  = [];
         this.undo_prev  = [];
         this.undo_muts  = [];
-        this.return_type = func.resolved_return_type;
-        this.this_type   = fn_this_type;
+        this.return_type     = func.resolved_return_type;
+        this.return_type_ann = func.return_type_annotation;
+        this.this_type       = fn_this_type;
         this.this_is_mut = false;
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
@@ -1274,14 +1331,25 @@ public:
                 // Declared type exists; check that the initializer is compatible
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
                     const var_name: string = this.intern.resolve(var_node.name);
+                    // Primary span: the offending initializer expression.
+                    // Secondary span: the type annotation it doesn't match
+                    // (renders as the "expected because of this" caret
+                    // when both spans live on the same source line).
+                    const value_span: SourceSpan =
+                        if (var_node.initializer != null) {
+                            var_node.initializer.span
+                        } else {
+                            var_node.span
+                        };
+                    const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
                     this.emit_type_mismatch(
                         ErrorCode::E0200_TYPE_MISMATCH,
-                        var_node.span,
+                        value_span,
                         var_node.resolved_type,
                         init_type,
                         format("`%s` was declared with this type; the initializer must match",
                                var_name),
-                        SourceSpan::none());
+                        ann_span);
                 }
             }
         }
@@ -1336,13 +1404,20 @@ public:
             this.expected_type = saved_expected;
             if (node.has_resolved_type() && init_type.is_valid()) {
                 if (!this.checker.can_assign(init_type, node.resolved_type)) {
+                    const value_span: SourceSpan =
+                        if (node.initializer != null) {
+                            node.initializer.span
+                        } else {
+                            node.span
+                        };
+                    const ann_span: SourceSpan = annotation_span(node.type_annotation);
                     this.emit_type_mismatch(
                         ErrorCode::E0200_TYPE_MISMATCH,
-                        node.span,
+                        value_span,
                         node.resolved_type,
                         init_type,
                         "destructure pattern's declared type must match the initializer",
-                        SourceSpan::none());
+                        ann_span);
                 }
             }
         }
@@ -1504,13 +1579,20 @@ public:
             this.expected_type = saved_expected;
             if (expr_type.is_valid() && this.return_type.is_valid()) {
                 if (!this.checker.can_assign(expr_type, this.return_type)) {
+                    const value_span: SourceSpan =
+                        if (node.expression != null) {
+                            node.expression.span
+                        } else {
+                            node.span
+                        };
+                    const ann_span: SourceSpan = annotation_span(this.return_type_ann);
                     this.emit_type_mismatch(
                         ErrorCode::E0200_TYPE_MISMATCH,
-                        node.span,
+                        value_span,
                         this.return_type,
                         expr_type,
                         "the function's declared return type doesn't match the value returned here",
-                        SourceSpan::none());
+                        ann_span);
                 }
             }
         }
@@ -4645,7 +4727,28 @@ public:
             } else {
                 this.expected_type = TypeRef::invalid();
             }
-            this.resolve_expr(value_expr);
+            const value_type: TypeRef = this.resolve_expr(value_expr);
+            if (field_type.is_valid() && value_type.is_valid() && value_expr != null) {
+                // Skip the check when either side still has an
+                // unsubstituted generic parameter.  The substituter
+                // doesn't deep-propagate through nested generic-call
+                // return types, so `mem::offset(this.ptr, ...)`
+                // returning `T*` inside a monomorphized `Slice<u8>`
+                // body would otherwise fire a spurious mismatch
+                // against the substituted field type `u8*`.
+                const skip: boolean = this.contains_generic_param(value_type)
+                                    || this.contains_generic_param(field_type);
+                if (!skip && !this.checker.can_assign(value_type, field_type)) {
+                    const field_name_str: string = this.intern.resolve(field_init.field_name);
+                    this.emit_type_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH,
+                        value_expr.span,
+                        field_type,
+                        value_type,
+                        format("field `%s` expects this type", field_name_str),
+                        SourceSpan::none());
+                }
+            }
         }
         this.expected_type = saved_expected;
         return struct_ref;

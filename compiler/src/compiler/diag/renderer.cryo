@@ -46,6 +46,196 @@ const ANSI_GREY:    string = "\x1b[90m";
 
 
 // ============================================================================
+// Column-width helpers (tab expansion + UTF-8 awareness)
+//
+// The renderer treats source columns as 1-indexed BYTE offsets — that's
+// what the parser stamps onto every SourceSpan.  But terminals render
+// in cells, not bytes, and a column-counted-in-bytes will mis-align the
+// caret under any line containing a tab (one byte, many cells) or
+// multi-byte UTF-8 (many bytes, one cell).  These helpers translate
+// from "byte column on the original line" to "cell column on the
+// rendered line", which keeps `^^^^` exactly below the highlighted
+// span no matter what's in the source.
+//
+// Tab stops are 4 cells (rustc convention).  Wide characters (CJK
+// fullwidth, emoji) are still counted as 1 cell — a proper east-asian-
+// wide width table is a follow-up.
+// ============================================================================
+
+const TAB_WIDTH: u32 = 4;
+
+/// Advance one cell past `cell`'s tab stop.  `cell` is 0-indexed; the
+/// returned value is the cell that would print *after* a tab written
+/// at `cell`.
+function advance_past_tab(cell: u32) -> u32 {
+    return ((cell / TAB_WIDTH) + 1) * TAB_WIDTH;
+}
+
+/// Build a copy of `line` with every `\t` replaced by enough spaces
+/// to reach the next tab stop.  Pass through ASCII and UTF-8 bytes
+/// verbatim — they print 1 cell per codepoint either way; the math
+/// in `byte_col_to_visual` cancels the multi-byte cost.  Returns a
+/// freshly allocated string the caller owns; the source-cache copy
+/// is left untouched.
+function expand_tabs(line: string) -> string {
+    if (line == "") { return ""; }
+    const len: i64 = intrinsics::strlen(line) as i64;
+
+    // First pass: compute the output length so we can malloc once.
+    mut out_len: i64 = 0;
+    mut col: u32 = 0;
+    for (mut i: i64 = 0; i < len; i++) {
+        const ch: u8 = line[i] as u8;
+        if (ch == 9) {  // '\t'
+            const next_col: u32 = advance_past_tab(col);
+            const gap: u32 = next_col - col;
+            out_len = out_len + gap as i64;
+            col = next_col;
+        } else if (ch < 0x80) {
+            out_len = out_len + 1;
+            col = col + 1;
+        } else if ((ch & 0xC0) == 0x80) {
+            // UTF-8 continuation byte: copies through, no new cell.
+            out_len = out_len + 1;
+        } else {
+            // UTF-8 lead byte: one cell, byte copies through.
+            out_len = out_len + 1;
+            col = col + 1;
+        }
+    }
+
+    const buf: i8* = intrinsics::malloc(out_len + 1) as i8*;
+    if (buf == null) { return line; }
+
+    mut out_i: i64 = 0;
+    col = 0;
+    for (mut i: i64 = 0; i < len; i++) {
+        const ch: u8 = line[i] as u8;
+        if (ch == 9) {
+            const next_col: u32 = advance_past_tab(col);
+            const gap: u32 = next_col - col;
+            for (mut k: u32 = 0; k < gap; k++) {
+                const slot: i8* = intrinsics::ptr_add(buf as void*, out_i) as i8*;
+                *slot = 32 as i8;  // ' '
+                out_i = out_i + 1;
+            }
+            col = next_col;
+        } else {
+            const slot: i8* = intrinsics::ptr_add(buf as void*, out_i) as i8*;
+            *slot = ch as i8;
+            out_i = out_i + 1;
+            if (ch < 0x80) {
+                col = col + 1;
+            } else if ((ch & 0xC0) != 0x80) {
+                col = col + 1;
+            }
+        }
+    }
+    const term: i8* = intrinsics::ptr_add(buf as void*, out_i) as i8*;
+    *term = 0 as i8;
+    return buf as string;
+}
+
+/// Convert a 1-indexed byte column on `line` into a 1-indexed cell
+/// column on its rendered (tab-expanded) form.  Result for a column
+/// of 0 is 0; column past EOL clamps to the line's final cell+1.
+function byte_col_to_visual(line: string, byte_col: u32) -> u32 {
+    if (byte_col == 0)      { return 0; }
+    if (line == "")         { return byte_col; }
+    const len: i64 = intrinsics::strlen(line) as i64;
+    const target: i64 = (byte_col - 1) as i64;
+
+    mut col: u32 = 0;
+    mut i: i64 = 0;
+    while (i < len && i < target) {
+        const ch: u8 = line[i] as u8;
+        if (ch == 9) {
+            col = advance_past_tab(col);
+        } else if (ch < 0x80) {
+            col = col + 1;
+        } else if ((ch & 0xC0) != 0x80) {
+            // UTF-8 lead byte: one cell.
+            col = col + 1;
+        }
+        // Continuation byte: i advances, col doesn't.
+        i = i + 1;
+    }
+    // 1-indexed cell column.
+    return col + 1;
+}
+
+/// Splice `replacement` into `line` over byte range `[start_col..end_col)`
+/// (both 1-indexed).  Used by the suggestion renderer to build a
+/// patched-source-line view from a single edit.
+///
+/// Out-of-bounds columns clamp to the line bounds.  Returns a freshly
+/// allocated string the caller owns; if no change would be made the
+/// original line is returned unchanged (caller should test pointer
+/// identity before freeing).
+function splice_replacement(line: string, start_col: u32, end_col: u32,
+                            replacement: string) -> string {
+    if (line == "")              { return line; }
+    if (start_col == 0)          { return line; }
+
+    const line_len: i64 = intrinsics::strlen(line) as i64;
+    mut start: i64 = (start_col - 1) as i64;
+    if (start < 0)        { start = 0; }
+    if (start > line_len) { start = line_len; }
+
+    mut end: i64 = if (end_col > 0) { (end_col - 1) as i64 } else { start };
+    if (end < start)      { end = start; }
+    if (end > line_len)   { end = line_len; }
+
+    const repl_len: i64 = if (replacement == null as string) {
+        0
+    } else {
+        intrinsics::strlen(replacement) as i64
+    };
+
+    // No-op edit: an empty replacement over a zero-width span.  Don't
+    // bother allocating.
+    if (start == end && repl_len == 0) { return line; }
+
+    const tail_len: i64 = line_len - end;
+    const out_len: i64 = start + repl_len + tail_len;
+    const buf: i8* = intrinsics::malloc(out_len + 1) as i8*;
+    if (buf == null) { return line; }
+
+    // Prefix.
+    if (start > 0) {
+        intrinsics::memcpy(buf as void*, line as void*, start as u64);
+    }
+    // Replacement.
+    if (repl_len > 0) {
+        const dst_repl: i8* = intrinsics::ptr_add(buf as void*, start) as i8*;
+        intrinsics::memcpy(dst_repl as void*, replacement as void*, repl_len as u64);
+    }
+    // Tail.
+    if (tail_len > 0) {
+        const src_tail: i8* = intrinsics::ptr_add(line as void*, end) as i8*;
+        const dst_tail: i8* = intrinsics::ptr_add(buf as void*, start + repl_len) as i8*;
+        intrinsics::memcpy(dst_tail as void*, src_tail as void*, tail_len as u64);
+    }
+    const term: i8* = intrinsics::ptr_add(buf as void*, out_len) as i8*;
+    *term = 0 as i8;
+    return buf as string;
+}
+
+
+/// Visual cells occupied by the substring `line[start_byte..end_byte]`
+/// (1-indexed, half-open).  Used to compute caret-span widths so a
+/// `^^^^` underline matches the visual extent of a tab- or multi-byte
+/// span.
+function byte_range_visual_width(line: string, start_byte: u32, end_byte: u32) -> u32 {
+    if (end_byte <= start_byte) { return 1; }
+    const v_start: u32 = byte_col_to_visual(line, start_byte);
+    const v_end:   u32 = byte_col_to_visual(line, end_byte);
+    if (v_end <= v_start) { return 1; }
+    return v_end - v_start;
+}
+
+
+// ============================================================================
 // RenderConfig
 // ============================================================================
 
@@ -302,6 +492,72 @@ type struct DiagRenderer {
         return if (this.config.colors) { ANSI_GREY } else { "" };
     }
 
+    /// Print `message` to `out`, bolding any text wrapped in matching
+    /// backticks so identifier and type-name references stand out from
+    /// the prose around them.  When colors are off (NO_COLOR / piped
+    /// output), the backticks are still stripped so the message reads
+    /// naturally — e.g. ``cannot find value `lenght` in this scope``
+    /// becomes "cannot find value lenght in this scope" rather than a
+    /// raw backticked echo.
+    ///
+    /// `base_color` is the ANSI sequence to restore after each bolded
+    /// span (so the surrounding label keeps its color); pass `""` to
+    /// fall back to the default text style.
+    print_message(&this, out: void*, message: string, base_color: string) -> void {
+        if (message == null as string) { return; }
+        const len: i64 = intrinsics::strlen(message) as i64;
+        if (len == 0) { return; }
+
+        const bold:  string = this.color_bold();
+        const reset: string = this.color_reset();
+        const colors_on: boolean = this.config.colors;
+
+        mut i: i64 = 0;
+        mut in_code: boolean = false;
+        while (i < len) {
+            const ch: i8 = message[i];
+            if (ch == 96) {  // '`'
+                if (!in_code) {
+                    // Open: switch to bold; skip the literal backtick.
+                    if (colors_on) {
+                        intrinsics::fprintf(out, "%s", bold);
+                    }
+                    in_code = true;
+                } else {
+                    // Close: restore base color; skip the literal backtick.
+                    if (colors_on) {
+                        intrinsics::fprintf(out, "%s%s", reset, base_color);
+                    }
+                    in_code = false;
+                }
+                i = i + 1;
+                continue;
+            }
+            // Emit one byte verbatim — `%c` handles multi-byte UTF-8 by
+            // letting each lead/continuation byte flow through unchanged.
+            intrinsics::fprintf(out, "%c", ch as i32);
+            i = i + 1;
+        }
+        if (in_code && colors_on) {
+            // Unclosed backtick: best-effort reset so we don't leak
+            // bold formatting into following lines.
+            intrinsics::fprintf(out, "%s%s", reset, base_color);
+        }
+    }
+
+    /// Print one source line through the syntax highlighter, with
+    /// tabs expanded to spaces on the way out so caret math (which
+    /// counts cells, not bytes) lines up with what the terminal
+    /// actually renders.  The expanded copy is heap-allocated and
+    /// freed after the print; the original cached line is untouched.
+    print_source_line(&this, out: void*, line_text: string) -> void {
+        const expanded: string = expand_tabs(line_text);
+        SyntaxHighlighter::print_line(out, expanded, this.config.colors);
+        if (expanded != line_text) {
+            intrinsics::free(expanded as void*);
+        }
+    }
+
     /// Return the ANSI color code for a given severity level.
     severity_color(&this, sev: Severity) -> string {
         return match (sev) {
@@ -478,16 +734,19 @@ type struct DiagRenderer {
         const white: string = this.color_white();
         const out: void* = this.out_stream();
 
-        intrinsics::fprintf(out, "%s%s%s%s[%s]%s: %s%s%s\n",
+        // Severity + code chip, then the headline.  The message body
+        // goes through `print_message` so backticked code like `i32`
+        // can be re-bolded after we drop out of the headline's white
+        // base color.
+        intrinsics::fprintf(out, "%s%s%s%s[%s]%s: %s%s",
             bold, sev_color,
             diag.severity.label(),
             reset,
             diag.code.format(),
             reset,
-            bold, white,
-            diag.message);
-        // Final reset after message
-        intrinsics::fprintf(out, "%s", reset);
+            bold, white);
+        this.print_message(out, diag.message, white);
+        intrinsics::fprintf(out, "%s\n", reset);
     }
 
     /// Render a source snippet with caret underline for the primary span.
@@ -530,7 +789,7 @@ type struct DiagRenderer {
             intrinsics::fprintf(out, " %s%*u%s %s|%s ",
                 grey, line_width, ln, reset,
                 blue, reset);
-            SyntaxHighlighter::print_line(out, line_text, this.config.colors);
+            this.print_source_line(out, line_text);
             intrinsics::fprintf(out, "\n");
         }
 
@@ -539,7 +798,7 @@ type struct DiagRenderer {
         intrinsics::fprintf(out, " %s%s%*u%s %s|%s ",
             bold, blue, line_width, span.start_line, reset,
             blue, reset);
-        SyntaxHighlighter::print_line(out, error_line, this.config.colors);
+        this.print_source_line(out, error_line);
         intrinsics::fprintf(out, "\n");
 
         // Render the caret underline
@@ -555,7 +814,7 @@ type struct DiagRenderer {
             intrinsics::fprintf(out, " %s%*u%s %s|%s ",
                 grey, line_width, ln, reset,
                 blue, reset);
-            SyntaxHighlighter::print_line(out, line_text, this.config.colors);
+            this.print_source_line(out, line_text);
             intrinsics::fprintf(out, "\n");
         }
 
@@ -733,16 +992,140 @@ type struct DiagRenderer {
                     grey, line_width, ln, reset,
                     blue, reset);
             }
-            SyntaxHighlighter::print_line(out, line_text, this.config.colors);
+            this.print_source_line(out, line_text);
             intrinsics::fprintf(out, "\n");
 
             if (has_label) {
-                for (mut k: int = 0; k < labels.length; k++) {
-                    if (labels[k].span.start_line == ln) {
-                        this.render_label_underline(labels[k], severity, line_width);
-                    }
+                this.render_labels_for_line(labels, file, ln, severity, line_width);
+            }
+        }
+    }
+
+    /// Render every label whose primary span starts on `line_num`,
+    /// either as one stacked block (two labels = rustc-style side-by-
+    /// side carets with a connector + caption row) or as the legacy
+    /// one-row-per-label rendering when there's only one or when the
+    /// labels are too many to stack cleanly.
+    render_labels_for_line(mut &this, all_labels: SpanLabel[], file: string,
+                            line_num: u32, severity: Severity,
+                            line_width: u32) -> void {
+        mut on_line: SpanLabel[] = [];
+        for (mut k: i64 = 0; k < all_labels.length; k++) {
+            if (all_labels[k].span.start_line == line_num) {
+                on_line.push(all_labels[k]);
+            }
+        }
+        if (on_line.length == 0) { return; }
+        if (on_line.length == 1) {
+            this.render_label_underline(on_line[0], severity, line_width);
+            return;
+        }
+
+        // Insertion sort by start_col ascending so we can pick out
+        // "rightmost" by index.  Stable: ties keep insertion order.
+        for (mut i: i64 = 1; i < on_line.length; i++) {
+            for (mut j: i64 = i; j > 0; j--) {
+                if (on_line[j].span.start_col < on_line[j - 1].span.start_col) {
+                    const tmp: SpanLabel = on_line[j];
+                    on_line[j] = on_line[j - 1];
+                    on_line[j - 1] = tmp;
+                } else {
+                    break;
                 }
             }
+        }
+
+        // 2-label case gets the stacked rendering; 3+ falls back to
+        // one-row-per-label so we don't have to solve the multi-level
+        // connector layout problem here.
+        if (on_line.length == 2) {
+            this.render_stacked_two_labels(on_line[0], on_line[1],
+                file, line_num, severity, line_width);
+            return;
+        }
+
+        for (mut k: i64 = 0; k < on_line.length; k++) {
+            this.render_label_underline(on_line[k], severity, line_width);
+        }
+    }
+
+    /// Render two labels on the same line as one combined underline
+    /// row + connector + caption stack:
+    ///
+    ///       |     ---   ^^^^^^^^ found `string`
+    ///       |     |
+    ///       |     expected because of this annotation
+    ///
+    /// `left` and `right` are pre-sorted by ascending start_col.  Both
+    /// labels' colors come from severity/primary-ness; primary wins
+    /// when caret ranges overlap.
+    render_stacked_two_labels(mut &this, left: SpanLabel, right: SpanLabel,
+                               file: string, line_num: u32,
+                               severity: Severity, line_width: u32) -> void {
+        const blue:  string = this.color_blue();
+        const cyan:  string = this.color_cyan();
+        const reset: string = this.color_reset();
+        const bold:  string = this.color_bold();
+        const sev_color: string = this.severity_color(severity);
+        const out: void* = this.out_stream();
+
+        const line_text: string = this.get_line(file, line_num);
+
+        const left_vs: u32 = byte_col_to_visual(line_text, left.span.start_col);
+        const left_ve: u32 = if (left.span.end_col > left.span.start_col) {
+            byte_col_to_visual(line_text, left.span.end_col)
+        } else { left_vs + 1 };
+        const right_vs: u32 = byte_col_to_visual(line_text, right.span.start_col);
+        const right_ve: u32 = if (right.span.end_col > right.span.start_col) {
+            byte_col_to_visual(line_text, right.span.end_col)
+        } else { right_vs + 1 };
+
+        // Underline row.  Walk cells 1..max(left_ve, right_ve) and pick
+        // the glyph for each cell; primary wins inside an overlap zone.
+        intrinsics::fprintf(out, " %*s %s|%s ", line_width, "", blue, reset);
+        mut max_cell: u32 = if (right_ve > left_ve) { right_ve } else { left_ve };
+        for (mut cell: u32 = 1; cell < max_cell; cell++) {
+            const in_left:  boolean = cell >= left_vs  && cell < left_ve;
+            const in_right: boolean = cell >= right_vs && cell < right_ve;
+            if (!in_left && !in_right) {
+                intrinsics::fprintf(out, " ");
+                continue;
+            }
+            // Glyph + color preference: primary wins.
+            mut is_primary: boolean = false;
+            if (in_left  && left.is_primary)  { is_primary = true; }
+            if (in_right && right.is_primary) { is_primary = true; }
+            const glyph: string = if (is_primary) { "^" } else { "-" };
+            const color: string = if (is_primary) { sev_color } else { cyan };
+            intrinsics::fprintf(out, "%s%s%s%s", bold, color, glyph, reset);
+        }
+
+        // Append the rightmost label's caption inline.
+        if (right.message != "") {
+            const right_color: string = if (right.is_primary) { sev_color } else { cyan };
+            intrinsics::fprintf(out, " %s%s", bold, right_color);
+            this.print_message(out, right.message, right_color);
+            intrinsics::fprintf(out, "%s", reset);
+        }
+        intrinsics::fprintf(out, "\n");
+
+        // Connector row for the left label.
+        intrinsics::fprintf(out, " %*s %s|%s ", line_width, "", blue, reset);
+        const left_color: string = if (left.is_primary) { sev_color } else { cyan };
+        for (mut cell: u32 = 1; cell < left_vs; cell++) {
+            intrinsics::fprintf(out, " ");
+        }
+        intrinsics::fprintf(out, "%s%s|%s\n", bold, left_color, reset);
+
+        // Caption row for the left label.
+        if (left.message != "") {
+            intrinsics::fprintf(out, " %*s %s|%s ", line_width, "", blue, reset);
+            for (mut cell: u32 = 1; cell < left_vs; cell++) {
+                intrinsics::fprintf(out, " ");
+            }
+            intrinsics::fprintf(out, "%s%s", bold, left_color);
+            this.print_message(out, left.message, left_color);
+            intrinsics::fprintf(out, "%s\n", reset);
         }
     }
 
@@ -758,11 +1141,16 @@ type struct DiagRenderer {
         const out: void* = this.out_stream();
 
         const span: SourceSpan = label.span;
+        // Visual cells, not bytes: a tab counts as up to 4 cells, a
+        // multi-byte UTF-8 codepoint counts as 1.  Without this the
+        // carets drift right of their target on tab-indented source.
+        const line_text: string = this.get_line(span.file, span.start_line);
+        const visual_start: u32 = byte_col_to_visual(line_text, span.start_col);
         mut ul_start: u32 = 0;
-        if (span.start_col > 0) { ul_start = span.start_col - 1; }
+        if (visual_start > 0) { ul_start = visual_start - 1; }
         mut ul_len: u32 = 1;
         if (span.end_col > span.start_col) {
-            ul_len = span.end_col - span.start_col;
+            ul_len = byte_range_visual_width(line_text, span.start_col, span.end_col);
         }
 
         intrinsics::fprintf(out, " %*s %s|%s ", line_width, "", blue, reset);
@@ -770,22 +1158,21 @@ type struct DiagRenderer {
             intrinsics::fprintf(out, " ");
         }
 
-        if (label.is_primary) {
-            const sev_color: string = this.severity_color(severity);
-            intrinsics::fprintf(out, "%s%s^", bold, sev_color);
-            for (mut t: u32 = 1; t < ul_len; t++) {
-                intrinsics::fprintf(out, "^");
-            }
+        const caption_color: string = if (label.is_primary) {
+            this.severity_color(severity)
         } else {
-            const cyan: string = this.color_cyan();
-            intrinsics::fprintf(out, "%s%s-", bold, cyan);
-            for (mut t: u32 = 1; t < ul_len; t++) {
-                intrinsics::fprintf(out, "-");
-            }
+            this.color_cyan()
+        };
+        const caret_char: string = if (label.is_primary) { "^" } else { "-" };
+
+        intrinsics::fprintf(out, "%s%s%s", bold, caption_color, caret_char);
+        for (mut t: u32 = 1; t < ul_len; t++) {
+            intrinsics::fprintf(out, "%s", caret_char);
         }
 
         if (label.message != "") {
-            intrinsics::fprintf(out, " %s", label.message);
+            intrinsics::fprintf(out, " ");
+            this.print_message(out, label.message, caption_color);
         }
         intrinsics::fprintf(out, "%s\n", reset);
     }
@@ -799,15 +1186,19 @@ type struct DiagRenderer {
         const sev_color: string = this.severity_color(severity);
         const out: void* = this.out_stream();
 
-        // Calculate underline position (1-indexed → 0-indexed)
+        // Calculate underline position in *visual cells* — see the
+        // header comments at the top of this file for the byte-to-cell
+        // conversion contract.
+        const line_text: string = this.get_line(span.file, span.start_line);
+        const visual_start: u32 = byte_col_to_visual(line_text, span.start_col);
         mut ul_start: u32 = 0;
-        if (span.start_col > 0) {
-            ul_start = span.start_col - 1;
+        if (visual_start > 0) {
+            ul_start = visual_start - 1;
         }
 
         mut ul_len: u32 = 1;
         if (span.end_col > span.start_col) {
-            ul_len = span.end_col - span.start_col;
+            ul_len = byte_range_visual_width(line_text, span.start_col, span.end_col);
         }
 
         // Build the underline string: spaces + ^ + ~~~
@@ -827,7 +1218,8 @@ type struct DiagRenderer {
 
         // Inline label
         if (message != "") {
-            intrinsics::fprintf(out, " %s", message);
+            intrinsics::fprintf(out, " ");
+            this.print_message(out, message, sev_color);
         }
 
         intrinsics::fprintf(out, "%s\n", reset);
@@ -859,17 +1251,19 @@ type struct DiagRenderer {
         intrinsics::fprintf(out, " %s%*u%s %s|%s ",
             grey, line_width, label.span.start_line, reset,
             blue, reset);
-        SyntaxHighlighter::print_line(out, line_text, this.config.colors);
+        this.print_source_line(out, line_text);
         intrinsics::fprintf(out, "\n");
 
-        // Cyan underline
+        // Cyan underline — visual cells, not bytes.
+        const visual_start: u32 = byte_col_to_visual(line_text, label.span.start_col);
         mut ul_start: u32 = 0;
-        if (label.span.start_col > 0) {
-            ul_start = label.span.start_col - 1;
+        if (visual_start > 0) {
+            ul_start = visual_start - 1;
         }
         mut ul_len: u32 = 1;
         if (label.span.end_col > label.span.start_col) {
-            ul_len = label.span.end_col - label.span.start_col;
+            ul_len = byte_range_visual_width(line_text,
+                label.span.start_col, label.span.end_col);
         }
 
         intrinsics::fprintf(out, " %*s %s|%s ", line_width, "", blue, reset);
@@ -881,7 +1275,8 @@ type struct DiagRenderer {
             intrinsics::fprintf(out, "~");
         }
         if (label.message != "") {
-            intrinsics::fprintf(out, " %s", label.message);
+            intrinsics::fprintf(out, " ");
+            this.print_message(out, label.message, cyan);
         }
         intrinsics::fprintf(out, "%s\n", reset);
 
@@ -895,33 +1290,39 @@ type struct DiagRenderer {
         const sev_color: string = this.severity_color(child.severity);
         const out: void* = this.out_stream();
 
-        if (child.span.has_location()) {
-            // Child with source location: show a mini snippet
-            intrinsics::fprintf(out, " %s%s%s%s: %s\n",
-                bold, sev_color, child.severity.label(), reset,
-                child.message);
+        // Severity prefix; the message body goes through `print_message`
+        // so backticked identifiers/types are bolded inline.
+        intrinsics::fprintf(out, " %s%s%s%s: ",
+            bold, sev_color, child.severity.label(), reset);
+        this.print_message(out, child.message, "");
+        intrinsics::fprintf(out, "\n");
 
+        if (child.span.has_location()) {
             this.load_source(child.span.file);
             this.render_snippet(child.span, child.severity, child.message);
-        } else {
-            // Child without location: just the message
-            intrinsics::fprintf(out, " %s%s%s%s: %s\n",
-                bold, sev_color, child.severity.label(), reset,
-                child.message);
         }
     }
 
-    /// Render a suggestion in green.  Multi-part suggestions show each
-    /// (file:line:col → replacement) pair on its own row; single-part
-    /// suggestions keep the compact one-row layout that the older
-    /// renderer produced so terminal output for existing emission sites
-    /// is unchanged.  A short `[machine-applicable]` / `[maybe]` tag is
-    /// printed after the headline when the suggestion's applicability
-    /// is known so users can tell which fixes the IDE will auto-apply.
-    render_suggestion(&this, sug: Suggestion) -> void {
+    /// Render a suggestion in green, with the replacement spliced into
+    /// the original source line so the user sees the fix in context —
+    /// rather than a free-floating "| length" row.  Each part gets:
+    ///
+    ///    help: a local with a similar name exists
+    ///      |
+    ///    3 |     const x: i32 = length;
+    ///      |                    ~~~~~~  (replace)   /  ++++++ (insert) / ------ (delete)
+    ///
+    /// The diff glyph depends on the part's shape:
+    ///   span_len > 0 && replacement != ""  →  replace (~)
+    ///   span_len > 0 && replacement == ""  →  delete  (-)
+    ///   span_len == 0 && replacement != "" →  insert  (+)
+    ///
+    /// Multi-part suggestions render each part this way in order.  When
+    /// the source line can't be loaded (foreign file the renderer
+    /// hasn't cached) we fall back to the bare replacement row.
+    render_suggestion(mut &this, sug: Suggestion) -> void {
         const bold: string  = this.color_bold();
         const green: string = this.color_green();
-        const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
         const grey: string  = this.color_grey();
         const out: void* = this.out_stream();
@@ -933,28 +1334,115 @@ type struct DiagRenderer {
                 Applicability::MaybeIncorrect    => { " [maybe]"              }
                 Applicability::Unspecified       => { ""                       }
             };
-        intrinsics::fprintf(out, " %s%ssuggestion%s%s%s: %s\n",
-            bold, green, reset, grey, applicability_tag, sug.message);
-        intrinsics::fprintf(out, "%s", reset);
+        intrinsics::fprintf(out, " %s%ssuggestion%s%s%s%s: ",
+            bold, green, reset, grey, applicability_tag, reset);
+        this.print_message(out, sug.message, "");
+        intrinsics::fprintf(out, "\n");
 
-        // Multi-part: render each part separately so the user can see
-        // every edit the fix would apply.  Single-part keeps the legacy
-        // compact form.
-        if (sug.parts.length > 1) {
-            for (mut i: i64 = 0; i < sug.parts.length; i++) {
-                const p: SuggestionPart = sug.parts[i];
-                intrinsics::fprintf(out, "    %s|%s %s%u:%u%s -> %s%s%s%s\n",
-                    blue, reset,
-                    grey, p.span.start_line, p.span.start_col, reset,
-                    bold, green, p.replacement, reset);
+        for (mut i: i64 = 0; i < sug.parts.length; i++) {
+            this.render_suggestion_part(sug.parts[i]);
+        }
+    }
+
+    /// Render one (span, replacement) edit as a patched source-line
+    /// snippet with a diff-glyph underline.  See `render_suggestion`
+    /// for the glyph rules.
+    render_suggestion_part(mut &this, part: SuggestionPart) -> void {
+        const blue:  string = this.color_blue();
+        const green: string = this.color_green();
+        const grey:  string = this.color_grey();
+        const reset: string = this.color_reset();
+        const bold:  string = this.color_bold();
+        const out: void* = this.out_stream();
+
+        // If the part has no real location, fall back to a bare row.
+        if (!part.span.has_location()) {
+            if (part.replacement != "") {
+                intrinsics::fprintf(out, "    %s|%s %s%s%s%s\n",
+                    blue, reset, bold, green, part.replacement, reset);
             }
             return;
         }
 
-        if (sug.replacement != "") {
-            intrinsics::fprintf(out, "    %s|%s %s%s%s%s\n",
-                blue, reset,
-                bold, green, sug.replacement, reset);
+        this.load_source(part.span.file);
+        const orig_line: string = this.get_line(part.span.file, part.span.start_line);
+        if (orig_line == "") {
+            // Source not available; degrade to the bare replacement row.
+            if (part.replacement != "") {
+                intrinsics::fprintf(out, "    %s|%s %s%s%s%s\n",
+                    blue, reset, bold, green, part.replacement, reset);
+            }
+            return;
+        }
+
+        const span_len: u32 = if (part.span.end_col > part.span.start_col) {
+            part.span.end_col - part.span.start_col
+        } else {
+            0
+        };
+        const has_repl: boolean = part.replacement != "" && part.replacement != null as string;
+
+        // Diff-glyph dispatch.
+        mut glyph: string = "~";
+        if (span_len > 0 && !has_repl)      { glyph = "-"; }
+        else if (span_len == 0 && has_repl) { glyph = "+"; }
+
+        // Build the patched line by splicing replacement into the raw
+        // source bytes.  The renderer's tab-expansion + visual-column
+        // math then handles alignment for tab-indented files exactly
+        // like it does for the primary snippet.
+        const patched: string = splice_replacement(orig_line,
+            part.span.start_col, part.span.end_col, part.replacement);
+
+        // Line-number column width matches the primary snippet (min 3).
+        mut line_width: u32 = 3;
+        if (part.span.start_line > 999)   { line_width = 4; }
+        if (part.span.start_line > 9999)  { line_width = 5; }
+        if (part.span.start_line > 99999) { line_width = 6; }
+
+        this.render_margin(line_width);
+
+        // Patched source line, syntax-highlighted (replacement re-tokenises
+        // cleanly inside the surrounding code).
+        intrinsics::fprintf(out, " %s%s%*u%s %s|%s ",
+            bold, blue, line_width, part.span.start_line, reset,
+            blue, reset);
+        this.print_source_line(out, patched);
+        intrinsics::fprintf(out, "\n");
+
+        // Underline row: green diff glyph under the affected portion of
+        // the patched line.
+        // start byte in the patched line: same as the original span.start_col
+        // length:
+        //   - replace / insert: strlen(replacement) bytes
+        //   - delete:           1 cell at start_col
+        const repl_byte_len: u32 = if (has_repl) {
+            intrinsics::strlen(part.replacement) as u32
+        } else {
+            0
+        };
+        const visual_start: u32 = byte_col_to_visual(patched, part.span.start_col);
+        mut ul_start: u32 = 0;
+        if (visual_start > 0) { ul_start = visual_start - 1; }
+
+        mut ul_len: u32 = 1;
+        if (has_repl) {
+            ul_len = byte_range_visual_width(patched,
+                part.span.start_col, part.span.start_col + repl_byte_len);
+        }
+
+        intrinsics::fprintf(out, " %*s %s|%s ", line_width, "", blue, reset);
+        for (mut s: u32 = 0; s < ul_start; s++) {
+            intrinsics::fprintf(out, " ");
+        }
+        intrinsics::fprintf(out, "%s%s%s", bold, green, glyph);
+        for (mut t: u32 = 1; t < ul_len; t++) {
+            intrinsics::fprintf(out, "%s", glyph);
+        }
+        intrinsics::fprintf(out, "%s\n", reset);
+
+        if (patched != orig_line) {
+            intrinsics::free(patched as void*);
         }
     }
 
