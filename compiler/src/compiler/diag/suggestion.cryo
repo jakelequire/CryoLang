@@ -1,34 +1,142 @@
 /// Suggestion
 ///
-/// A machine-applicable suggestion attached to a diagnostic.  Provides a
-/// replacement string for a source span, enabling IDE quick-fix support.
+/// A machine-readable fix attached to a diagnostic.  Supports both
+/// single-edit and multi-edit (atomic) suggestions, plus an Applicability
+/// hint that tells callers whether the edit can be applied
+/// automatically by an IDE without showing it to the user first.
 
 namespace Compiler::Diag::Suggestion;
 
 import Compiler::Diag::SourceSpan;
 
 
-/// A suggested code change attached to a diagnostic.
-type struct Suggestion {
-    message:     string;
+/// How confident the compiler is that a Suggestion will produce
+/// correct, compilable code if applied verbatim.  Mirrors rustc's
+/// `Applicability` enum so the same flow ("auto-fix only when sure,
+/// otherwise prompt") works for editors that already know about it.
+type enum Applicability {
+    /// The compiler is sure this fix is correct.  IDEs may apply it
+    /// automatically (e.g. as the default "Fix all on save" target).
+    MachineApplicable;
+    /// The fix is likely correct but might miss a corner case.  IDEs
+    /// should offer it as a lightbulb but not auto-apply.
+    MaybeIncorrect;
+    /// The replacement text contains placeholders (e.g. `_` or `<...>`)
+    /// the user must fill in before the code compiles.
+    HasPlaceholders;
+    /// No applicability information available.  Default for legacy
+    /// emission sites that haven't been audited.
+    Unspecified;
+}
+
+implement enum Applicability {
+    /// Stable lowercase label used in the LSP wire payload's
+    /// `applicability` field so an editor can mark machine-applicable
+    /// fixes as `isPreferred` in its code-action menu.
+    wire_label(&this) -> string {
+        return match (this) {
+            Applicability::MachineApplicable => { "machine-applicable" }
+            Applicability::MaybeIncorrect    => { "maybe-incorrect"    }
+            Applicability::HasPlaceholders   => { "has-placeholders"   }
+            Applicability::Unspecified       => { "unspecified"        }
+        };
+    }
+
+    is_machine_applicable(&this) -> boolean {
+        return match (this) {
+            Applicability::MachineApplicable => { true  }
+            _                                => { false }
+        };
+    }
+}
+
+
+/// One (span, replacement) edit inside a possibly-multipart suggestion.
+/// Multi-part suggestions hold several of these and the IDE applies all
+/// of them atomically — useful for fixes like "add `mut` HERE and change
+/// `&` to `&mut` THERE" that don't compile if applied piecewise.
+type struct SuggestionPart {
     span:        SourceSpan;
     replacement: string;
 
-    /// Suggest replacing the span contents with `replacement`.
-    static replace(span: SourceSpan, replacement: string, message: string) -> Suggestion {
-        return Suggestion {
-            message:     message,
+    static new(span: SourceSpan, replacement: string) -> SuggestionPart {
+        return SuggestionPart {
             span:        span,
             replacement: replacement,
         };
     }
+}
 
-    /// Suggest removing the span contents entirely.
+
+/// A suggested code change attached to a diagnostic.
+///
+/// Keeps the legacy `span` / `replacement` pair on the surface so the
+/// existing single-edit call sites and the terminal renderer continue
+/// to work without churn; `parts` carries the same data for multi-part
+/// fixes and is what new code should populate via `multipart()` or
+/// `machine_applicable_multipart()`.
+type struct Suggestion {
+    message:       string;
+    span:          SourceSpan;
+    replacement:   string;
+    parts:         SuggestionPart[];
+    applicability: Applicability;
+
+    /// Single-edit suggestion, applicability unspecified.  Kept for
+    /// backwards compatibility with the many existing emission sites
+    /// that built one of these before `Applicability` existed.
+    static replace(span: SourceSpan, replacement: string, message: string) -> Suggestion {
+        return Suggestion::single(span, replacement, message,
+                                  Applicability::Unspecified);
+    }
+
+    /// Single-edit removal (replace span with empty text).
     static remove(span: SourceSpan, message: string) -> Suggestion {
+        return Suggestion::single(span, "", message,
+                                  Applicability::Unspecified);
+    }
+
+    /// Single-edit suggestion that the IDE may auto-apply.  Use only
+    /// when the compiler is sure: the fix lands valid, compilable code
+    /// verbatim, with no required user input.
+    static machine_applicable(span: SourceSpan, replacement: string,
+                               message: string) -> Suggestion {
+        return Suggestion::single(span, replacement, message,
+                                  Applicability::MachineApplicable);
+    }
+
+    /// Single-edit constructor with an explicit applicability level.
+    static single(span: SourceSpan, replacement: string, message: string,
+                  applicability: Applicability) -> Suggestion {
+        mut parts: SuggestionPart[] = [];
+        parts.push(SuggestionPart::new(span, replacement));
         return Suggestion {
-            message:     message,
-            span:        span,
-            replacement: "",
+            message:       message,
+            span:          span,
+            replacement:   replacement,
+            parts:         parts,
+            applicability: applicability,
+        };
+    }
+
+    /// Multi-edit suggestion: the IDE applies every part atomically.
+    /// `parts` must be non-empty; the surface `span` / `replacement`
+    /// echo the first part so terminal rendering and old code that
+    /// reads them directly still work.
+    static multipart(parts: SuggestionPart[], message: string,
+                     applicability: Applicability) -> Suggestion {
+        mut first_span: SourceSpan = SourceSpan::none();
+        mut first_repl: string = "";
+        if (parts.length > 0) {
+            first_span = parts[0].span;
+            first_repl = parts[0].replacement;
+        }
+        return Suggestion {
+            message:       message,
+            span:          first_span,
+            replacement:   first_repl,
+            parts:         parts,
+            applicability: applicability,
         };
     }
 }

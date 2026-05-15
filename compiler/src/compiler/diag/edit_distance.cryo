@@ -1,0 +1,128 @@
+/// EditDistance
+///
+/// Damerau-Levenshtein edit distance and a "did you mean?" candidate
+/// finder.  Used to attach typo-correction suggestions to undefined-X
+/// diagnostics (E0201, E0202, E0203, E0204, E0350, E0351).
+///
+/// The classic DL algorithm allows four edit operations (insertion,
+/// deletion, substitution, transposition) at unit cost, which catches
+/// the common "swap two adjacent letters" typo (`lenght` → `length`)
+/// that plain Levenshtein misses.
+
+namespace Compiler::Diag::EditDistance;
+
+
+/// Damerau-Levenshtein distance between two C strings.
+///
+/// Returns -1 on allocation failure or if either argument is null.
+/// Implementation: full O(m*n) matrix with adjacent-transposition rule.
+/// Strings beyond MAX_LEN are rejected — typo correction across a
+/// 1KB identifier doesn't help anybody.
+const MAX_LEN: i64 = 64;
+
+public function damerau_levenshtein(a: string, b: string) -> i64 {
+    if (a == null as string || b == null as string) { return -1; }
+
+    const ai: i8* = a as i8*;
+    const bi: i8* = b as i8*;
+    const m: i64 = intrinsics::strlen(a) as i64;
+    const n: i64 = intrinsics::strlen(b) as i64;
+
+    if (m == 0) { return n; }
+    if (n == 0) { return m; }
+    if (m > MAX_LEN || n > MAX_LEN) { return -1; }
+
+    // (m+1) * (n+1) matrix laid out row-major in a single malloc.
+    const cols: i64 = n + 1;
+    const cells: i64 = (m + 1) * cols;
+    const bytes: u64 = (cells as u64) * 4;
+    const buf: i32* = intrinsics::malloc(bytes) as i32*;
+    if (buf == null) { return -1; }
+
+    // Row 0 and column 0: distance to the empty prefix.
+    for (mut j: i64 = 0; j <= n; j++) {
+        buf[j] = j as i32;
+    }
+    for (mut i: i64 = 1; i <= m; i++) {
+        buf[i * cols] = i as i32;
+    }
+
+    for (mut i: i64 = 1; i <= m; i++) {
+        const a_ch: i8 = ai[i - 1];
+        for (mut j: i64 = 1; j <= n; j++) {
+            const b_ch: i8 = bi[j - 1];
+            const sub_cost: i32 = if (a_ch == b_ch) { 0 } else { 1 };
+            const del:  i32 = buf[(i - 1) * cols + j] + 1;
+            const ins:  i32 = buf[i * cols + (j - 1)] + 1;
+            const subv: i32 = buf[(i - 1) * cols + (j - 1)] + sub_cost;
+
+            mut best: i32 = del;
+            if (ins  < best) { best = ins;  }
+            if (subv < best) { best = subv; }
+
+            // Damerau adjacent transposition.
+            if (i > 1 && j > 1
+                && a_ch == bi[j - 2]
+                && ai[i - 2] == b_ch) {
+                const trans: i32 = buf[(i - 2) * cols + (j - 2)] + 1;
+                if (trans < best) { best = trans; }
+            }
+
+            buf[i * cols + j] = best;
+        }
+    }
+
+    const result: i32 = buf[m * cols + n];
+    intrinsics::free(buf as void*);
+    return result as i64;
+}
+
+
+/// Pick the closest candidate to `needle` whose distance is small
+/// enough to be plausibly a typo.  Returns "" when no candidate
+/// clears the threshold, when the input is degenerate, or when
+/// the best match is equal to the needle (shouldn't happen in
+/// practice but cheap to guard).
+///
+/// Threshold mirrors rustc's `(max_len + 2) / 3`: shorter names
+/// tolerate fewer edits than longer ones.  A 4-char needle accepts
+/// distance 2 (one transposition is fine, two unrelated edits is
+/// not); a 16-char needle accepts distance 6.
+public function find_best_candidate(needle: string, candidates: string[]) -> string {
+    if (needle == null as string) { return ""; }
+    const needle_len: i64 = intrinsics::strlen(needle) as i64;
+    if (needle_len == 0) { return ""; }
+
+    mut best: string = "";
+    mut best_dist: i64 = -1;
+
+    for (mut i: i64 = 0; i < candidates.length; i++) {
+        const c: string = candidates[i];
+        if (c == "" || c == null as string)         { continue; }
+        if (intrinsics::strcmp(c, needle) == 0)     { continue; }
+
+        const c_len: i64 = intrinsics::strlen(c) as i64;
+        // Quick reject: difference in length alone exceeds the
+        // threshold we'd accept.  Saves the full DP for the common
+        // case of a typo in a scope of 200+ symbols.
+        const max_len: i64 = if (needle_len > c_len) { needle_len } else { c_len };
+        const threshold: i64 = (max_len + 2) / 3;
+        const len_diff: i64 = if (needle_len > c_len) {
+            needle_len - c_len
+        } else {
+            c_len - needle_len
+        };
+        if (len_diff > threshold) { continue; }
+
+        const d: i64 = damerau_levenshtein(needle, c);
+        if (d < 0)         { continue; }
+        if (d > threshold) { continue; }
+
+        if (best_dist < 0 || d < best_dist) {
+            best_dist = d;
+            best = c;
+        }
+    }
+
+    return best;
+}

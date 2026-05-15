@@ -387,7 +387,13 @@ type struct DiagRenderer {
             if (this.has_same_file_secondary(diag)) {
                 this.render_combined_snippet(diag);
             } else {
-                this.render_snippet(diag.span, diag.severity, diag.message);
+                // Prefer the primary label's caption for the inline caret
+                // when the emission site set one (e.g. `at_with_label` used
+                // to surface `expected X, found Y` separately from the
+                // headline).  Falls back to the headline for legacy
+                // emission sites that only call `at(span)`.
+                const caption: string = this.primary_label_caption(diag);
+                this.render_snippet(diag.span, diag.severity, caption);
             }
         }
 
@@ -429,6 +435,24 @@ type struct DiagRenderer {
         const reset: string = this.color_reset();
         intrinsics::fprintf(this.out_stream(), "%s%s================================================================================%s\n",
             bold, sev_color, reset);
+    }
+
+    /// The inline caption to print under the caret for a single-snippet
+    /// render.  Returns the primary label's message when an emission
+    /// site set one via `at_with_label`; otherwise falls back to the
+    /// diagnostic's headline so legacy `at(span)` callers keep their
+    /// "Header line repeats under the caret" output unchanged.
+    primary_label_caption(&this, diag: Diagnostic) -> string {
+        for (mut i: int = 0; i < diag.labels.length; i++) {
+            const lbl: SpanLabel = diag.labels[i];
+            if (!lbl.is_primary)             { continue; }
+            if (!lbl.span.has_location())    { continue; }
+            if (lbl.span.start_line != diag.span.start_line) { continue; }
+            if (lbl.span.start_col  != diag.span.start_col)  { continue; }
+            if (lbl.message == "")           { continue; }
+            return lbl.message;
+        }
+        return diag.message;
     }
 
     /// True iff the diagnostic has at least one secondary label that
@@ -887,22 +911,50 @@ type struct DiagRenderer {
         }
     }
 
-    /// Render a suggestion with the replacement code in green.
+    /// Render a suggestion in green.  Multi-part suggestions show each
+    /// (file:line:col → replacement) pair on its own row; single-part
+    /// suggestions keep the compact one-row layout that the older
+    /// renderer produced so terminal output for existing emission sites
+    /// is unchanged.  A short `[machine-applicable]` / `[maybe]` tag is
+    /// printed after the headline when the suggestion's applicability
+    /// is known so users can tell which fixes the IDE will auto-apply.
     render_suggestion(&this, sug: Suggestion) -> void {
         const bold: string  = this.color_bold();
         const green: string = this.color_green();
         const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
+        const grey: string  = this.color_grey();
         const out: void* = this.out_stream();
 
-        intrinsics::fprintf(out, " %s%ssuggestion%s: %s\n",
-            bold, green, reset, sug.message);
+        const applicability_tag: string =
+            match (sug.applicability) {
+                Applicability::MachineApplicable => { " [machine-applicable]" }
+                Applicability::HasPlaceholders   => { " [has-placeholders]"   }
+                Applicability::MaybeIncorrect    => { " [maybe]"              }
+                Applicability::Unspecified       => { ""                       }
+            };
+        intrinsics::fprintf(out, " %s%ssuggestion%s%s%s: %s\n",
+            bold, green, reset, grey, applicability_tag, sug.message);
+        intrinsics::fprintf(out, "%s", reset);
+
+        // Multi-part: render each part separately so the user can see
+        // every edit the fix would apply.  Single-part keeps the legacy
+        // compact form.
+        if (sug.parts.length > 1) {
+            for (mut i: i64 = 0; i < sug.parts.length; i++) {
+                const p: SuggestionPart = sug.parts[i];
+                intrinsics::fprintf(out, "    %s|%s %s%u:%u%s -> %s%s%s%s\n",
+                    blue, reset,
+                    grey, p.span.start_line, p.span.start_col, reset,
+                    bold, green, p.replacement, reset);
+            }
+            return;
+        }
 
         if (sug.replacement != "") {
-            intrinsics::fprintf(out, "    %s|%s %s%s%s\n",
+            intrinsics::fprintf(out, "    %s|%s %s%s%s%s\n",
                 blue, reset,
-                bold, green, sug.replacement);
-            intrinsics::fprintf(out, "%s", reset);
+                bold, green, sug.replacement, reset);
         }
     }
 

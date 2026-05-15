@@ -15,6 +15,10 @@
 namespace Compiler::Passes::TypeResolution;
 
 import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::EditDistance;
 import Compiler::Diag::Snapshot;
 import Compiler::DeclIndex;
 import Compiler::AST;
@@ -151,6 +155,128 @@ type struct TypeResolutionRunner {
 
 
     // ========================================================================
+    // Did-you-mean helpers for E0203
+    //
+    // The TypeResolver returns `TypeRef::invalid()` when a Named annotation
+    // can't be resolved but doesn't itself emit the diagnostic; the caller
+    // does, with only the surrounding declaration's name in hand.  These
+    // helpers (a) extract the most-likely-typo'd Named leaf out of a
+    // possibly-wrapped TypeAnnotation tree, (b) enumerate bare type names
+    // for the candidate pool, and (c) attach a `did you mean ...?` help +
+    // suggestion to the diagnostic when a near-match exists.
+    // ========================================================================
+
+    /// Walk a type annotation looking for the first NamedAnnotation node
+    /// — the leaf the user most likely typo'd.  Returns null when the
+    /// annotation has no Named subtree (e.g. a pure tuple of primitives).
+    /// Pre-resolved Named leaves are skipped: the resolver already mapped
+    /// them to a concrete TypeRef during substitution, so they aren't the
+    /// failure point.
+    /// Peel through one wrapper layer to find the inner annotation a
+    /// Named name lives on.  Returns the same pointer when `ann` is
+    /// already a Named or a kind we don't peel through (Tuple,
+    /// Function, ThisType).
+    peel_annotation(&this, ann: TypeAnnotation*) -> TypeAnnotation* {
+        if (ann == null) { return null; }
+        match (ann) {
+            TypeAnnotation::Pointer(p)   => { return p.inner; }
+            TypeAnnotation::Reference(r) => { return r.inner; }
+            TypeAnnotation::Array(a)     => { return a.element; }
+            TypeAnnotation::Optional(o)  => { return o.inner; }
+            TypeAnnotation::Generic(g)   => { return g.base; }
+            _                            => { return ann; }
+        }
+    }
+
+    /// Walk `ann` through wrapper layers (`*T`, `&T`, `T[]`, `T?`,
+    /// `T<...>`) until we reach a Named leaf — the identifier the user
+    /// most likely typo'd.  Pre-resolved Named leaves (those the AST
+    /// substituter already mapped to a concrete TypeRef) are ignored
+    /// because they can't be the failure point.  Walks at most a few
+    /// levels to avoid pathological annotations.
+    extract_unresolved_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
+        mut cur: TypeAnnotation* = ann;
+        mut depth: i32 = 0;
+        while (cur != null && depth < 8) {
+            match (cur) {
+                TypeAnnotation::Named(n) => {
+                    if (n.pre_resolved.is_valid()) { return null; }
+                    return n;
+                }
+                _ => {}
+            }
+            const next: TypeAnnotation* = this.peel_annotation(cur);
+            if (next == cur) { return null; }
+            cur = next;
+            depth = depth + 1;
+        }
+        return null;
+    }
+
+    /// Every bare type leaf name in the type arena's leaf index.  The
+    /// candidate pool for the did-you-mean suggestion on undefined types.
+    ///
+    /// We walk the arena's `leaf_index` rather than the DeclarationIndex's
+    /// `module_types` because the TypeResolution pass is the one that
+    /// _populates_ the DI (Phase 4), so the DI is still empty when E0203
+    /// fires from Phase 1 alias resolution or Phase 2 field types.  The
+    /// arena, by contrast, is filled in by the earlier resolver-register
+    /// pass and already has every user-declared type by the time
+    /// TypeResolution starts.
+    collect_bare_type_names(&this) -> string[] {
+        mut out: string[] = [];
+        const intern: InternTable* = this.ctx.get_intern_table();
+        mut it: HashMapIter<u32, u32> = this.arena.leaf_index.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    const name: string = intern.resolve(SymbolStr::from_id(pair.first));
+                    if (name != "" && strstr(name, "::") == null) {
+                        out.push(name);
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        return out;
+    }
+
+    /// Build the rich E0203 diagnostic for an unresolved type referenced
+    /// in `ann` from the declaration named `decl_name` (e.g. a function,
+    /// parameter, or field name used only in the headline).  If the
+    /// annotation has a Named leaf we point the caret at it and attach a
+    /// did-you-mean suggestion; otherwise fall back to the bare error
+    /// stamped at the declaration's span.
+    emit_undefined_type(&this, ann: TypeAnnotation*,
+                        kind_label: string, decl_name: string,
+                        fallback_span: SourceSpan) -> void {
+        const named: NamedAnnotation* = this.extract_unresolved_named(ann);
+        if (named == null) {
+            this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                format("cannot resolve %s for `%s`", kind_label, decl_name),
+                fallback_span);
+            return;
+        }
+
+        const intern: InternTable* = this.ctx.get_intern_table();
+        const ty_name: string = intern.resolve(named.name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0203_UNDEFINED_TYPE,
+            format("cannot find type `%s` in this scope", ty_name));
+        diag = diag.at_with_label(named.span, "not found in this scope");
+        const cands: string[] = this.collect_bare_type_names();
+        const best: string = find_best_candidate(ty_name, cands);
+        if (best != "") {
+            diag = diag.help(
+                format("a type with a similar name exists: `%s`", best));
+            diag = diag.suggest(Suggestion::machine_applicable(named.span, best,
+                format("did you mean `%s`?", best)));
+        }
+        this.ctx.emit_diagnostic(diag);
+    }
+
+
+    // ========================================================================
     // Signature and field resolution helpers
     // ========================================================================
 
@@ -166,9 +292,10 @@ type struct TypeResolutionRunner {
 
         // Emit diagnostics for unresolved types
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
-            this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-                format("cannot resolve return type for function '%s'",
-                    this.ctx.resolve_str(func.name)));
+            this.emit_undefined_type(func.return_type_annotation,
+                "return type",
+                this.ctx.resolve_str(func.name),
+                func.span);
         }
 
         // Emit diagnostics for unresolved parameter types.
@@ -178,9 +305,10 @@ type struct TypeResolutionRunner {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
             if (param.type_annotation != null && !param.resolved_type.is_valid()) {
-                this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-                    format("cannot resolve type for parameter '%s'",
-                        this.ctx.resolve_str(param.name)));
+                this.emit_undefined_type(param.type_annotation,
+                    "type",
+                    this.ctx.resolve_str(param.name),
+                    param.span);
             }
         }
     }
@@ -196,9 +324,10 @@ type struct TypeResolutionRunner {
             const field: FieldDeclNode* = fields[i];
             if (field == null) { continue; }
             if (field.type_annotation != null && !field.resolved_type.is_valid()) {
-                this.ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-                    format("cannot resolve type for field '%s'",
-                        this.ctx.resolve_str(field.name)));
+                this.emit_undefined_type(field.type_annotation,
+                    "type",
+                    this.ctx.resolve_str(field.name),
+                    field.span);
             }
         }
     }
@@ -1546,9 +1675,10 @@ type struct TypeResolutionPasses {
                         }
                         alias_count++;
                     } else {
-                        ctx.emit_error(ErrorCode::E0203_UNDEFINED_TYPE,
-                            format("cannot resolve target type for alias '%s'",
-                                ctx.resolve_str(node.alias_name)));
+                        runner.emit_undefined_type(node.target_annotation,
+                            "target type",
+                            ctx.resolve_str(node.alias_name),
+                            node.span);
                     }
                 }
             }
