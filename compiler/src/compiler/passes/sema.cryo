@@ -2229,6 +2229,7 @@ public:
             // declared param types match the call's arg types, and pin
             // its overload-specific mangled name to `resolved_callee` so
             // codegen can look up the right LLVM function directly.
+            this.check_call_arity(call, ident);
             this.try_pin_overload_mangled_callee(call, ident);
             return this.resolve_direct_call(ident);
         }
@@ -2246,6 +2247,63 @@ public:
         }
 
         return this.resolve_expr(callee);
+    }
+
+    /// Conservative arity check for direct free-function calls.
+    ///
+    /// `resolve_call` resolves every argument expression but never
+    /// validated their *count* against the callee's parameter list —
+    /// `f(a, b, c)` for a 2-parameter `f` reached codegen with no
+    /// diagnostic.  This is the first such check.  It is deliberately
+    /// narrow to stay false-positive-free:
+    ///   - Only plain `Identifier` callees (free functions); method and
+    ///     scope calls have their own resolution paths.
+    ///   - Skipped when the name has 0 or >1 overloads — with multiple
+    ///     overloads we can't know which one this call targets without
+    ///     full argument-type matching.
+    ///   - Skipped for variadic functions and explicit-generic calls.
+    ///   - Only *too many* arguments is reported.  *Too few* is legal in
+    ///     the presence of default parameter values, which `FunctionType`
+    ///     does not track; flagging it here would false-positive on every
+    ///     defaulted call.  Passing *more* args than a non-variadic
+    ///     function declares is unambiguously wrong regardless of defaults.
+    ///
+    /// Per-argument type-compatibility checking is still unimplemented;
+    /// `TypeChecker::check_function_call` (types/checker.cryo) has the
+    /// logic but is not yet wired into this path.
+    check_call_arity(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
+        // Explicit generic calls (`f<T>(...)`) route through specialization;
+        // skip rather than risk a template/instance param-count mismatch.
+        if (call.generic_args.length > 0) { return; }
+
+        // Resolve the overload set for the name.  Require exactly one:
+        // 0 means it isn't a declared free function (e.g. a local
+        // function-pointer binding), >1 means we'd need argument-type
+        // matching to know which overload this call targets.
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        mut overloads: TypeRef[] =
+            this.ctx.decl_index.lookup_func_type_overloads(qualified);
+        if (overloads.length == 0) {
+            overloads = this.ctx.decl_index.lookup_func_type_overloads(ident.name);
+        }
+        if (overloads.length != 1) { return; }
+
+        const ft_raw: Type* = this.arena.lookup(overloads[0].id);
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
+        const ft: FunctionType* = ft_raw as FunctionType*;
+
+        // Variadic functions accept any count >= the fixed prefix.
+        if (ft.is_variadic) { return; }
+
+        const expected: i64 = ft.param_types.length;
+        const got: i64 = call.arguments.length;
+        if (got > expected) {
+            const name: string = this.intern.resolve(ident.name);
+            this.ctx.emit_error_at(ErrorCode::E0215_TOO_MANY_ARGS,
+                format("function `%s` takes %lld argument(s) but %lld were supplied",
+                       name, expected, got),
+                call.span);
+        }
     }
 
     /// Free-function overload resolution.  Walks the overloads registered

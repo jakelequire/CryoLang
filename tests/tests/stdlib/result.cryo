@@ -5,6 +5,8 @@ namespace CryoTests::Tests::Stdlib::ResultT;
 
 import std::core::result;
 import std::core::option;
+import std::collections::str;
+import std::collections::string;
 import std::test::error;
 import std::test::assert;
 
@@ -123,5 +125,24 @@ function contains_err_matches() -> Result<(), TestError> {
 function unwrap_err_panics() -> Result<(), TestError> {
     const r: Result<i32, i32> = Result::Err(-1);
     const _value: i32 = r.unwrap();
+    return Result::Ok(());
+}
+
+// `![sink]` regression: `unwrap` copies the `Ok` payload out of a `&this`
+// borrow.  The `![sink]` marker on `Result::unwrap` tells drop insertion
+// the receiver is consumed at the call site; without it, `r` would also be
+// dropped at scope exit — a double-free of the buffer the unwrapped
+// `String` now owns, which SIGABRTs.
+![test]
+function unwrap_on_owning_ok_payload_no_double_free() -> Result<(), TestError> {
+    const r: Result<String, i32> = Result::Ok(String::from_str(Str::new("payload")));
+    mut s: String = r.unwrap();
+    const len: u64 = s.length();
+    s.drop();
+    const want: u64 = 7;
+    match (expect_eq(len, want)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
     return Result::Ok(());
 }

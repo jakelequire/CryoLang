@@ -66,6 +66,8 @@ type struct MatchSubjectInfo {
     enum_llvm:   LType;
     subject_ptr: LValue;    // ptr to the enum (alloca'd if subject was a value)
     tag_val:     LValue;    // i32 discriminant extracted from subject
+    subject_ty:  TypeRef;   // Cryo type of the match subject (pre-unwrap);
+                            // drives integer-pattern width + signedness
 }
 
 
@@ -604,13 +606,13 @@ public:
                 const d: StatementNode* = node.synth_drops[i];
                 if (d != null) { d.accept(this); }
             }
-            codegen_return(this.cg, val, true);
+            codegen_return(this.cg, val, true, node.expression.resolved_type);
         } else {
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
                 const d: StatementNode* = node.synth_drops[i];
                 if (d != null) { d.accept(this); }
             }
-            codegen_return(this.cg, LValue::null(), false);
+            codegen_return(this.cg, LValue::null(), false, TypeRef::invalid());
         }
     }
 
@@ -815,6 +817,7 @@ public:
             enum_llvm:   LType::null(),
             subject_ptr: subject,
             tag_val:     LValue::null(),
+            subject_ty:  subj_ref,
         };
 
         // Unwrap Reference/Pointer/InstantiatedType to find the enum type.
@@ -1035,10 +1038,12 @@ public:
                     codegen_string_compare(this.cg, subject, pat_val,
                         TokenType::EqualEqual, &cmp);
                 } else {
-                    const pat_val: LValue = this.codegen_pattern_value(pat);
+                    const pat_val: LValue =
+                        this.codegen_pattern_value(pat, minfo.subject_ty);
                     if (pat_val.is_valid()) {
                         const pat_val_coerced: LValue =
-                            coerce_icmp_operands(this.cg, subject, pat_val);
+                            coerce_icmp_operands(this.cg, subject, pat_val,
+                                                 minfo.subject_ty);
                         cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
                             subject, pat_val_coerced,
                             format("%s.cmp", name_prefix));
@@ -1087,7 +1092,11 @@ public:
     }
 
     /// Evaluate a pattern to an LLVM value for comparison.
-    codegen_pattern_value(mut &this, pat: PatternNode*) -> LValue {
+    /// `subj_ty` is the Cryo type of the match subject: integer-literal
+    /// patterns are built at the subject's integer width and signedness so
+    /// `match (x: i64) { -1 => ... }` compares against a real i64 `-1`
+    /// instead of a zero-extended-from-i32 `0x00000000FFFFFFFF`.
+    codegen_pattern_value(mut &this, pat: PatternNode*, subj_ty: TypeRef) -> LValue {
         if (pat.pattern_kind == PatternKind::Literal) {
             // `pat.literal_kind` (set by the parser) says how to read the
             // interned `value` text.  It can't be guessed from the text:
@@ -1107,7 +1116,21 @@ public:
                 return LType::const_int(LType::i1(), bval, false);
             }
             if (pat.literal_kind == LiteralKind::Integer) {
-                return LType::const_int(LType::i32(), parse_int_lexeme(text), true);
+                // Build the literal at the subject's integer width so the
+                // icmp operands match without a lossy widen.  Falls back to
+                // i32 when the subject type isn't a resolvable integer.
+                mut lit_ty: LType = LType::i32();
+                mut lit_signed: boolean = true;
+                const subj_t: Type* = this.cg.lookup_type_by_id(subj_ty.id);
+                if (subj_t != null && subj_t.kind == TypeKind::Int) {
+                    const mapped: LType = this.cg.type_mapper.map_type(subj_ty);
+                    if (mapped.is_valid()
+                            && type_kind_of(mapped.raw) == LTypeKind::Integer) {
+                        lit_ty = mapped;
+                    }
+                    lit_signed = this.cg.int_type_is_signed(subj_ty);
+                }
+                return LType::const_int(lit_ty, parse_int_lexeme(text), lit_signed);
             }
             // String / Float literal patterns don't lower to an `icmp`
             // operand here: a string pattern is routed through the caller's
@@ -3485,7 +3508,8 @@ public:
             // keeps the order valid.
             mut coerced_val: LValue = LValue::null();
             if (!arm_terminated && arm_end.is_valid() && arm_val.is_valid()) {
-                coerced_val = coerce_to_phi_type(this.cg, arm_val, result_ty);
+                coerced_val = coerce_to_phi_type(this.cg, arm_val, result_ty,
+                                                 node.resolved_type);
             }
             if (!arm_terminated && arm_end.is_valid()) {
                 this.cg.builder.build_br(merge_bb);
@@ -4104,8 +4128,12 @@ public:
 /// widening/narrowing logic in `coerce_return_value`; returns the original
 /// value when no cheap conversion applies.  LLVM kind codes: 0=void, 8=int,
 /// 10=struct, 12=pointer.
+///
+/// `result_ty` is the Cryo type of the whole match/if expression — every
+/// arm must produce a value compatible with it, so its signedness drives
+/// the sext-vs-zext choice when an arm value is narrower than the phi type.
 function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
-                             expected: LType) -> LValue {
+                             expected: LType, result_ty: TypeRef) -> LValue {
     if (!val.is_valid() || !expected.is_valid()) { return val; }
 
     // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==`; the
@@ -4123,6 +4151,12 @@ function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
         const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
         if (gw == ww) { return val; }
         if (gw < ww) {
+            // Widen with the result type's signedness: a signed match arm
+            // feeding a wider signed phi must sext, or `-1` becomes a huge
+            // positive value.
+            if (cg.int_type_is_signed(result_ty)) {
+                return cg.builder.build_sext(val, expected, "mexpr.widen");
+            }
             return cg.builder.build_zext(val, expected, "mexpr.widen");
         }
         return cg.builder.build_trunc(val, expected, "mexpr.trunc");

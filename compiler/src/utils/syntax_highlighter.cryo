@@ -1,13 +1,15 @@
 /// Syntax highlighter for diagnostic source snippets.
 ///
-/// Streams a single source line to stderr with ANSI color codes wrapped
-/// around lexical tokens (keywords, type names, string/char literals,
-/// numeric literals, comments, attributes).  Designed to be called from
-/// DiagRenderer: it inserts only escape sequences, never visible
-/// characters, so the renderer's caret math (which works on byte
-/// offsets in the original source) is unaffected.
+/// Streams a single source line to a caller-supplied `FILE*` with ANSI
+/// color codes wrapped around lexical tokens (keywords, type names,
+/// string/char literals, numeric literals, comments, attributes).
+/// Designed to be called from DiagRenderer: it inserts only escape
+/// sequences, never visible characters, so the renderer's caret math
+/// (which works on byte offsets in the original source) is unaffected.
 ///
-/// All output goes to `g_stderr` via fprintf, never stdout.
+/// The destination stream is whatever DiagRenderer passes — `g_stderr`
+/// for terminal output, or an `open_memstream` buffer when rendering a
+/// diagnostic to a string.  Never stdout.
 
 namespace Utils::SyntaxHighlighter;
 
@@ -39,17 +41,20 @@ const HL_FUNC:     string = "\x1b[36m";    // cyan: ident immediately before '('
 // Public entry point
 // ============================================================================
 
-/// Write `line` to stderr, optionally wrapping recognized tokens in ANSI
-/// color escapes.  When `colors == false` the line is emitted verbatim.
-function print_line(line: string, colors: boolean) -> void {
+/// Write `line` to the `out` stream, optionally wrapping recognized
+/// tokens in ANSI color escapes.  When `colors == false` the line is
+/// emitted verbatim.  `out` is the destination `FILE*` — `g_stderr` for
+/// terminal diagnostics, or an `open_memstream` buffer when the renderer
+/// is producing a string for the language server.
+function print_line(out: void*, line: string, colors: boolean) -> void {
     if (line == "") {
         return;
     }
     if (!colors) {
-        intrinsics::fprintf(g_stderr, "%s", line);
+        intrinsics::fprintf(out, "%s", line);
         return;
     }
-    highlight_stream(line);
+    highlight_stream(out, line);
 }
 
 
@@ -60,7 +65,7 @@ function print_line(line: string, colors: boolean) -> void {
 /// Walk `line` byte-by-byte, classifying each lexeme run and emitting it
 /// with the matching color.  Keeps no state across lines; block comments
 /// only span the visible line.
-function highlight_stream(line: string) -> void {
+function highlight_stream(out: void*, line: string) -> void {
     const len: i64 = intrinsics::strlen(line) as i64;
     mut pos: i64 = 0;
 
@@ -73,13 +78,13 @@ function highlight_stream(line: string) -> void {
             while (pos < len && is_space(char_at(line, pos))) {
                 pos += 1;
             }
-            emit_plain(line, ws_start, pos - ws_start);
+            emit_plain(out, line, ws_start, pos - ws_start);
             continue;
         }
 
         // Line comment "// ...": colors the rest of the line.
         if (ch == '/' && pos + 1 < len && char_at(line, pos + 1) == '/') {
-            emit_colored(line, pos, len - pos, HL_COMMENT);
+            emit_colored(out, line, pos, len - pos, HL_COMMENT);
             pos = len;
             continue;
         }
@@ -97,7 +102,7 @@ function highlight_stream(line: string) -> void {
                 pos += 1;
             }
             if (pos > len) { pos = len; }
-            emit_colored(line, cm_start, pos - cm_start, HL_COMMENT);
+            emit_colored(out, line, cm_start, pos - cm_start, HL_COMMENT);
             continue;
         }
 
@@ -117,7 +122,7 @@ function highlight_stream(line: string) -> void {
                 }
                 pos += 1;
             }
-            emit_colored(line, s_start, pos - s_start, HL_STRING);
+            emit_colored(out, line, s_start, pos - s_start, HL_STRING);
             continue;
         }
 
@@ -137,7 +142,7 @@ function highlight_stream(line: string) -> void {
                 }
                 pos += 1;
             }
-            emit_colored(line, c_start, pos - c_start, HL_STRING);
+            emit_colored(out, line, c_start, pos - c_start, HL_STRING);
             continue;
         }
 
@@ -148,7 +153,7 @@ function highlight_stream(line: string) -> void {
             while (pos < len && is_ident_cont(char_at(line, pos))) {
                 pos += 1;
             }
-            emit_colored(line, a_start, pos - a_start, HL_ATTR);
+            emit_colored(out, line, a_start, pos - a_start, HL_ATTR);
             continue;
         }
 
@@ -157,7 +162,7 @@ function highlight_stream(line: string) -> void {
         if (is_digit(ch)) {
             const n_start: i64 = pos;
             pos = consume_number(line, pos, len);
-            emit_colored(line, n_start, pos - n_start, HL_NUMBER);
+            emit_colored(out, line, n_start, pos - n_start, HL_NUMBER);
             continue;
         }
 
@@ -169,14 +174,14 @@ function highlight_stream(line: string) -> void {
             }
             const id_len: i64 = pos - id_start;
             const cls: i32 = classify_ident(line, id_start, id_len, pos, len);
-            emit_ident(line, id_start, id_len, cls);
+            emit_ident(out, line, id_start, id_len, cls);
             continue;
         }
 
         // Punctuation / operator / anything else: pass through one byte
         // uncolored.  Coloring punctuation tends to add visual noise that
         // distracts from the caret, so we leave it default.
-        emit_plain(line, pos, 1);
+        emit_plain(out, line, pos, 1);
         pos += 1;
     }
 }
@@ -310,24 +315,24 @@ function classify_ident(line: string, start: i64, len: i64,
 }
 
 /// Emit an identifier with the color matching its class.
-function emit_ident(line: string, start: i64, len: i64, cls: i32) -> void {
+function emit_ident(out: void*, line: string, start: i64, len: i64, cls: i32) -> void {
     if (cls == 1) {
-        emit_colored(line, start, len, HL_KEYWORD);
+        emit_colored(out, line, start, len, HL_KEYWORD);
         return;
     }
     if (cls == 2) {
-        emit_colored(line, start, len, HL_TYPE);
+        emit_colored(out, line, start, len, HL_TYPE);
         return;
     }
     if (cls == 3) {
-        emit_colored(line, start, len, HL_USERTYPE);
+        emit_colored(out, line, start, len, HL_USERTYPE);
         return;
     }
     if (cls == 4) {
-        emit_colored(line, start, len, HL_FUNC);
+        emit_colored(out, line, start, len, HL_FUNC);
         return;
     }
-    emit_plain(line, start, len);
+    emit_plain(out, line, start, len);
 }
 
 
@@ -444,20 +449,20 @@ function is_type_keyword(line: string, start: i64, len: i64) -> boolean {
 // ============================================================================
 
 /// Emit `len` bytes of `line` starting at `offset`, uncolored.
-function emit_plain(line: string, offset: i64, len: i64) -> void {
+function emit_plain(out: void*, line: string, offset: i64, len: i64) -> void {
     if (len <= 0) { return; }
     const start: i8* = intrinsics::ptr_add(line as void*, offset) as i8*;
-    intrinsics::fprintf(g_stderr, "%.*s", len as i32, start);
+    intrinsics::fprintf(out, "%.*s", len as i32, start);
 }
 
 /// Emit `len` bytes of `line` starting at `offset`, wrapped in
 /// `color`...HL_RESET.
-function emit_colored(line: string, offset: i64, len: i64, color: string) -> void {
+function emit_colored(out: void*, line: string, offset: i64, len: i64, color: string) -> void {
     if (len <= 0) { return; }
     const start: i8* = intrinsics::ptr_add(line as void*, offset) as i8*;
-    intrinsics::fprintf(g_stderr, "%s", color);
-    intrinsics::fprintf(g_stderr, "%.*s", len as i32, start);
-    intrinsics::fprintf(g_stderr, "%s", HL_RESET);
+    intrinsics::fprintf(out, "%s", color);
+    intrinsics::fprintf(out, "%.*s", len as i32, start);
+    intrinsics::fprintf(out, "%s", HL_RESET);
 }
 
 
