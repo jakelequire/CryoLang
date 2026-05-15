@@ -1103,24 +1103,76 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        // Phase 4b: DefaultExpansion + FunctionSignature + TemplateRegistration.
-        // DefaultExpansion runs FIRST so that FunctionSignature resolves
-        // the *rewritten* annotations; this is the only point where
-        // those annotations are turned into TypeRefs (resolution is
-        // guarded by `!resolved_type.is_valid()`, so a later re-walk
-        // would skip them).  Cross-module templates are visible because
-        // earlier modules' TemplateRegistration already populated the
-        // shared GenericRegistry by the time this module's iteration
-        // starts; this module's own templates are discovered via local
-        // AST walk inside the pass.
+        // Phase 4b.0: TemplateRegistration across ALL modules first.
+        //
+        // The DefaultExpansion pass in Phase 4b.1 rewrites bare references
+        // to all-default-generic types (e.g. `String` → `String<GlobalAlloc>`)
+        // by consulting the shared GenericRegistry.  For the rewrite of a
+        // bare `T` to fire, the template for `T` must already be in the
+        // registry — i.e. the module that *declares* `T` must have run
+        // TemplateRegistration before *any* module's DefaultExpansion.
+        //
+        // The previous structure ran the trio
+        // `[DefaultExpansion, FunctionSignature, TemplateRegistration]` as
+        // one per-module loop and relied on module `order[]` being
+        // strictly dependents-after-dependencies.  That assumption fails
+        // whenever the import graph perturbs the topological sort: e.g.
+        // `compiler/src/compiler/diag/renderer.cryo` adds
+        // `import std::collections::string;` and the new edge can place
+        // a consumer (`std::collections::str`, which uses `String` in
+        // `Str::to_ascii_lowercase`) before its declarer
+        // (`std::collections::string`) in `order[]`.  In that case
+        // str.cryo's DefaultExpansion ran with an empty registry, its
+        // bare `String` references were never rewritten, monomorphization
+        // never specialised `String<GlobalAlloc>::push_byte` for that
+        // call site, and the link failed with an undefined reference to
+        // the bare-template method.
+        //
+        // Running TemplateRegistration across all modules first makes
+        // the cross-module visibility invariant true by construction:
+        // every template is in the registry before any DefaultExpansion
+        // runs, regardless of where the module sits in `order[]`.
+        pipeline.set_passes([PassID::TemplateRegistration]);
+        {
+            mut initial4b0: ProvisionSet = ProvisionSet::empty();
+            initial4b0.mark(Provision::ASTValidated);
+            initial4b0.mark(Provision::NamesResolved);
+            initial4b0.mark(Provision::TypeDeclarations);
+            pipeline.validate_with_initial(initial4b0);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Phase 4b.1: DefaultExpansion + FunctionSignature.
+        // With TemplateRegistration now globally complete, DefaultExpansion
+        // sees every cross-module template; FunctionSignature then resolves
+        // the rewritten annotations.  FunctionSignature must run after
+        // DefaultExpansion in the same module's iteration: annotation
+        // resolution is guarded by `!resolved_type.is_valid()`, so a later
+        // re-walk would skip them.
         pipeline.set_passes([PassID::DefaultExpansion,
-                             PassID::FunctionSignature,
-                             PassID::TemplateRegistration]);
+                             PassID::FunctionSignature]);
         {
             mut initial4b: ProvisionSet = ProvisionSet::empty();
             initial4b.mark(Provision::ASTValidated);
             initial4b.mark(Provision::NamesResolved);
             initial4b.mark(Provision::TypeDeclarations);
+            initial4b.mark(Provision::TemplatesRegistered);
             pipeline.validate_with_initial(initial4b);
         }
 
@@ -1135,6 +1187,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::ModuleOrder);
             ctx.provisions.mark(Provision::NamesResolved);
             ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
             if (!pipeline.run_all(ctx)) {
                 return this.project_failure(ctx);
             }
