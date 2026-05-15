@@ -89,6 +89,12 @@ public:
     this_type:   TypeRef;                  // current method receiver type
     this_sym:    SymbolStr;                // interned "this"
     this_is_mut: boolean;                  // method has `mut &this`
+    // Type whose method body we're currently inside, regardless of static-ness.
+    // For non-static methods this matches `this_type`; for static methods
+    // `this_type` is invalid but `current_owner_type` still names the owner so
+    // visibility checks can recognize `Foo::static_method` as "inside Foo".
+    // Invalid outside any method body.
+    current_owner_type: TypeRef;
     body_count:  i64;                      // counter for debug output
 
     // -- Expected type hint (set by DeclStmt for initializer resolution) --
@@ -115,6 +121,7 @@ public:
         this.this_type      = TypeRef::invalid();
         this.this_sym       = intern.intern("this");
         this.this_is_mut    = false;
+        this.current_owner_type = TypeRef::invalid();
         this.body_count     = 0;
         this.expected_type  = TypeRef::invalid();
     }
@@ -1223,6 +1230,8 @@ public:
             } else {
                 owner_type
             };
+            const saved_owner: TypeRef = this.current_owner_type;
+            this.current_owner_type = owner_type;
             this.enter_function(method.func, method_this);
             // Resolve base-class constructor args so codegen can read
             // `arg.resolved_type` (`visit_scope_resolution` needs this to
@@ -1242,6 +1251,7 @@ public:
             if (!method.is_constructor && !method.is_destructor) {
                 this.check_function_returns(method.func);
             }
+            this.current_owner_type = saved_owner;
         }
     }
 
@@ -3216,6 +3226,12 @@ public:
         const ret: TypeRef = this.lookup_method_with_inheritance(
             lookup_ref, type_sym, member.member);
         if (ret.is_valid()) {
+            const acc_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            this.enforce_method_visibility(lookup_ref, member.member, acc_span);
             // When the call carries explicit method-level generic args
             // (`obj.method<U>(...)`), the bare lookup has the receiver's
             // type-level params substituted but knows nothing about the
@@ -4231,6 +4247,162 @@ public:
         return found;
     }
 
+    /// Walk a TypeRef past Pointer/Reference/InstantiatedType wrappers to its
+    /// base Type*.  Returns null if the chain bottoms out at an unresolved
+    /// InstantiatedType or a missing arena entry.  Mirrors the unwrap loops
+    /// in check_field_access / resolve_member_access so visibility comparison
+    /// runs on the same canonical form.
+    unwrap_to_base_type(&this, ty: TypeRef) -> Type* {
+        mut t: Type* = this.arena.lookup(ty.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            match (t.kind) {
+                TypeKind::Pointer => {
+                    const pt: PointerType* = t as PointerType*;
+                    t = this.arena.lookup(pt.pointee.id);
+                }
+                TypeKind::Reference => {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    t = this.arena.lookup(rt.referent.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { return null; }
+                    t = this.arena.lookup(it.resolved_type.id);
+                }
+                _ => { return t; }
+            }
+            depth += 1;
+        }
+        return t;
+    }
+
+    /// If `field_name` on `recv_type` resolves to a private field, emit
+    /// E0353_PRIVATE_ACCESS unless we're inside a method body of the type
+    /// that declares it.  No-op when the field is public, the receiver
+    /// is not a struct/class, or the field is not found (the missing-field
+    /// error path already diagnosed it).
+    enforce_field_visibility(mut &this, recv_type: TypeRef,
+                              field_name: SymbolStr, span: SourceSpan) -> void {
+        const base: Type* = this.unwrap_to_base_type(recv_type);
+        if (base == null) { return; }
+
+        mut field: FieldInfo* = null;
+        mut declaring_t: Type* = null;
+        mut declaring_name: string = "";
+
+        if (base.kind == TypeKind::Struct) {
+            mut st: StructType* = base as StructType*;
+            field = st.get_field(field_name);
+            if (field != null) {
+                declaring_t = base;
+                declaring_name = st.display_name();
+            }
+        } else if (base.kind == TypeKind::Class) {
+            mut current: ClassType* = base as ClassType*;
+            while (current != null) {
+                field = current.get_field(field_name);
+                if (field != null) {
+                    declaring_t = current as Type*;
+                    declaring_name = current.display_name();
+                    break;
+                }
+                if (current.has_base && current.base_class.is_valid()) {
+                    const parent_t: Type* = this.arena.lookup(current.base_class.id);
+                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
+                        current = parent_t as ClassType*;
+                    } else {
+                        current = null;
+                    }
+                } else {
+                    current = null;
+                }
+            }
+        }
+
+        if (field == null) { return; }
+        if (field.is_public) { return; }
+
+        // Allow access when we're inside a method of the declaring type.
+        // current_owner_type stays valid for static methods too, where
+        // `this_type` is invalid by design.
+        if (this.current_owner_type.is_valid()) {
+            const owner: Type* = this.unwrap_to_base_type(this.current_owner_type);
+            if (owner != null && declaring_t != null && owner.id == declaring_t.id) {
+                return;
+            }
+        }
+
+        const field_str: string = this.intern.resolve(field_name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0353_PRIVATE_ACCESS,
+            format("field `%s` of `%s` is private", field_str, declaring_name));
+        diag = diag.at_with_label(span,
+            format("private field accessed outside `%s`", declaring_name));
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Method-call counterpart to enforce_field_visibility.  Searches the
+    /// receiver's Struct/Class for the named method (walking the class
+    /// inheritance chain for Class receivers) and emits E0353 if the matched
+    /// MethodInfo is private and we're not inside that declaring type.
+    enforce_method_visibility(mut &this, recv_type: TypeRef,
+                               method_name: SymbolStr, span: SourceSpan) -> void {
+        const base: Type* = this.unwrap_to_base_type(recv_type);
+        if (base == null) { return; }
+
+        mut method: MethodInfo* = null;
+        mut declaring_t: Type* = null;
+        mut declaring_name: string = "";
+
+        if (base.kind == TypeKind::Struct) {
+            mut st: StructType* = base as StructType*;
+            method = st.get_method(method_name);
+            if (method != null) {
+                declaring_t = base;
+                declaring_name = st.display_name();
+            }
+        } else if (base.kind == TypeKind::Class) {
+            mut current: ClassType* = base as ClassType*;
+            while (current != null) {
+                method = current.get_method(method_name);
+                if (method != null) {
+                    declaring_t = current as Type*;
+                    declaring_name = current.display_name();
+                    break;
+                }
+                if (current.has_base && current.base_class.is_valid()) {
+                    const parent_t: Type* = this.arena.lookup(current.base_class.id);
+                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
+                        current = parent_t as ClassType*;
+                    } else {
+                        current = null;
+                    }
+                } else {
+                    current = null;
+                }
+            }
+        }
+
+        if (method == null) { return; }
+        if (method.is_public) { return; }
+
+        if (this.current_owner_type.is_valid()) {
+            const owner: Type* = this.unwrap_to_base_type(this.current_owner_type);
+            if (owner != null && declaring_t != null && owner.id == declaring_t.id) {
+                return;
+            }
+        }
+
+        const method_str: string = this.intern.resolve(method_name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0353_PRIVATE_ACCESS,
+            format("method `%s` of `%s` is private", method_str, declaring_name));
+        diag = diag.at_with_label(span,
+            format("private method called outside `%s`", declaring_name));
+        this.ctx.emit_diagnostic(diag);
+    }
+
     resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid → upstream error already emitted, stay silent
@@ -4293,14 +4465,30 @@ public:
         // Struct/class field access via TypeChecker
         const result: TypeCheckResult = this.checker.check_field_access(
             obj_type, member.member);
-        if (result.success) { return result.result_type; }
+        if (result.success) {
+            const acc_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            this.enforce_field_visibility(obj_type, member.member, acc_span);
+            return result.result_type;
+        }
 
         // Fall back to method lookup with inheritance chain
         const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
         if (type_sym.is_valid()) {
             const method_ret: TypeRef = this.lookup_method_with_inheritance(
                 obj_type, type_sym, member.member);
-            if (method_ret.is_valid()) { return method_ret; }
+            if (method_ret.is_valid()) {
+                const acc_span: SourceSpan = if (member.member_span.has_location()) {
+                    member.member_span
+                } else {
+                    member.span
+                };
+                this.enforce_method_visibility(obj_type, member.member, acc_span);
+                return method_ret;
+            }
 
             // Both field and method lookup failed on a valid object; emit
             const type_name: string = this.intern.resolve(type_sym);
