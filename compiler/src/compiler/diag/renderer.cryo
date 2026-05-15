@@ -251,6 +251,13 @@ type struct RenderConfig {
     /// surrounding shell output; the LSP virtual-doc renderer uses `""`
     /// so its `.cryo-diag` text is column-zero.
     leading_pad:        string;
+    /// When true, `print_message` keeps the literal backticks around
+    /// inline-code spans rather than stripping them.  Terminal output
+    /// gets bold-via-ANSI styling and the bare prose reads naturally, so
+    /// terminal callers leave this off.  The LSP virtual-doc path turns
+    /// it on so the `.cryo-diag` text retains markdown-style backticks
+    /// for the TextMate grammar to highlight as `markup.inline.raw`.
+    preserve_markup:    boolean;
 
     /// Default config: colors auto-detected, 2 context lines, 50 max errors.
     /// Color is enabled when stderr is a terminal AND `NO_COLOR` is unset,
@@ -262,11 +269,14 @@ type struct RenderConfig {
             max_errors:         50,
             warnings_as_errors: false,
             leading_pad:        " ",
+            preserve_markup:    false,
         };
     }
 
     /// Plain config: no colors, for redirected output, tests, or the
-    /// language-server string-render path.
+    /// language-server string-render path.  Keeps backticks intact so
+    /// downstream renderers (LSP TextMate grammar, markdown viewers)
+    /// can style code references inline.
     static plain() -> RenderConfig {
         return RenderConfig {
             colors:             false,
@@ -274,6 +284,7 @@ type struct RenderConfig {
             max_errors:         50,
             warnings_as_errors: false,
             leading_pad:        "",
+            preserve_markup:    true,
         };
     }
 
@@ -286,6 +297,7 @@ type struct RenderConfig {
             max_errors:         50,
             warnings_as_errors: false,
             leading_pad:        " ",
+            preserve_markup:    false,
         };
     }
 }
@@ -523,7 +535,8 @@ type struct DiagRenderer {
 
         const bold:  string = this.color_bold();
         const reset: string = this.color_reset();
-        const colors_on: boolean = this.config.colors;
+        const colors_on:   boolean = this.config.colors;
+        const keep_ticks:  boolean = this.config.preserve_markup;
 
         mut i: i64 = 0;
         mut in_code: boolean = false;
@@ -531,13 +544,17 @@ type struct DiagRenderer {
             const ch: i8 = message[i];
             if (ch == 96) {  // '`'
                 if (!in_code) {
-                    // Open: switch to bold; skip the literal backtick.
                     if (colors_on) {
                         intrinsics::fprintf(out, "%s", bold);
                     }
+                    if (keep_ticks) {
+                        intrinsics::fprintf(out, "%c", ch as i32);
+                    }
                     in_code = true;
                 } else {
-                    // Close: restore base color; skip the literal backtick.
+                    if (keep_ticks) {
+                        intrinsics::fprintf(out, "%c", ch as i32);
+                    }
                     if (colors_on) {
                         intrinsics::fprintf(out, "%s%s", reset, base_color);
                     }
