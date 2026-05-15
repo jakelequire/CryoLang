@@ -37,7 +37,7 @@ under semver from this point forward.
 - Module system with `_module.cryo` aggregators, prelude auto-import,
   `import` paths, and visibility (`public` / module-private / internal).
 - Directives: `![inline]`, `![packed]`, `![test]`, `![ignore]`,
-  `![should_panic]`, `![consumes_self]`, `![config(testing)]`.
+  `![should_panic]`, `![sink]`, `![config(testing)]`.
 
 ### Standard library
 

@@ -146,12 +146,12 @@ function is_known_builtin(name: string) -> boolean {
         | "should_panic" | "config" | "deprecated" | "align"
         | "repr" | "link" | "target" | "allow" | "warn" | "deny"
         | "derive"
-        // `![consumes_self]`: marks a method as consuming its receiver.
+        // `![sink]`: marks a method as consuming its receiver.
         // Tells move-check / drop-insertion to treat the call as moving
         // the receiver, even when the receiver is syntactically `&this`
         // or `mut &this`.  Used for methods that semantically take
         // ownership but want the borrow-style call ergonomics.
-        | "consumes_self"
+        | "sink"
         // Bare-atom forms of the cfg/config gate.  These are sugar for
         // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
         | "windows" | "linux" | "macos" | "unix"
@@ -260,11 +260,11 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
             }
         }
 
-        // `![consumes_self]`: zero args; method-target only.  Static-method
+        // `![sink]`: zero args; method-target only.  Static-method
         // and missing-receiver checks need the MethodNode and its
         // FunctionDeclNode, so they live in the per-decl loop in
         // run_directive_processing where we already have the decl pointer.
-        "consumes_self" => {
+        "sink" => {
             if (argc != 0) {
                 emit_arity_error(ctx, dir, name, 0, argc);
             }
@@ -514,7 +514,7 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
 /// Currently:
 ///   ![inline]         → sets FunctionDeclNode.is_inline = true
 ///   ![noinline]       → sets FunctionDeclNode.is_inline = false
-///   ![consumes_self]  → sets MethodNode.is_consumes_self = true
+///   ![sink]  → sets MethodNode.is_sink = true
 function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                        decl: DeclarationNode*) -> void {
     if (decl == null) { return; }
@@ -534,13 +534,13 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
 
     if (decl.kind == NodeKind::MethodDeclaration) {
         const m: MethodNode* = decl as MethodNode*;
-        if (strcmp(name, "consumes_self") == 0) {
+        if (strcmp(name, "sink") == 0) {
             // Reject placement on a static method: static methods have
             // no receiver, so "consumes the receiver" is meaningless.
             if (m.is_static) {
                 const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
                 const msg: string =
-                    "directive `![consumes_self]` cannot be applied to a static method (no receiver)";
+                    "directive `![sink]` cannot be applied to a static method (no receiver)";
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
                 ctx.emit_diagnostic(diag);
@@ -553,13 +553,13 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
             if (m.func == null || m.func.parameters.length == 0) {
                 const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
                 const msg: string =
-                    "directive `![consumes_self]` requires a method with a `this` receiver";
+                    "directive `![sink]` requires a method with a `this` receiver";
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
                 ctx.emit_diagnostic(diag);
                 return;
             }
-            m.is_consumes_self = true;
+            m.is_sink = true;
             return;
         }
     }
@@ -679,7 +679,7 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
         // Note: do NOT `continue` when ad_count == 0; the method
         // descent below still needs to run for struct/class/impl decls
         // whose own attached_directives are empty but whose method
-        // members carry their own (e.g. `![consumes_self]`).
+        // members carry their own (e.g. `![sink]`).
 
         for (mut j: i64 = 0; j < ad_count; j++) {
             const d: DirectiveNode* = decl.attached_directives[j];
@@ -736,7 +736,7 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
 
         // Descend into method lists on structs/classes/impls.  The
         // top-level loop above only sees the container; per-method
-        // directives like `![consumes_self]` live on each MethodNode
+        // directives like `![sink]` live on each MethodNode
         // and must be validated + applied here.  Methods on traits
         // are FunctionDeclNode*[] (no MethodNode wrapper) and don't
         // currently carry directives; if that changes, fold them in.
