@@ -1,0 +1,109 @@
+///! `textDocument/codeAction`: contribute a "Show full Cryo
+///! diagnostic" action for every diagnostic the editor sends us.
+///!
+///! The action does not edit the workspace; it asks the editor to run
+///! the `cryo.openRenderedDiagnostic` client-side command (registered
+///! by the CryoAnalyzer VS Code extension) with the diagnostic's id.
+///! That command opens a virtual `cryo-diagnostic:` URI; the editor
+///! then fetches the URI's content via the `cryo/renderedDiagnostic`
+///! custom request and shows it in a side tab — the rust-analyzer
+///! "rendered diagnostic" UX.
+///!
+///! Diagnostics we did not publish (no `data.diagId`) are ignored:
+///! we can only render what we cached, and stamping a code action
+///! onto a third-party diagnostic would be a broken promise.
+
+namespace Lsp::Handlers::CodeAction;
+
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::json::value;
+
+
+/// Handle a `textDocument/codeAction` request.  Walks the
+/// `context.diagnostics` array and emits one action per diagnostic
+/// that carries a `data.diagId` field.
+public function handle(params: &JsonValue) -> JsonValue {
+    mut actions: Array<JsonValue> = Array<JsonValue>::new();
+
+    match (params.get(Str::from_cstr("context"))) {
+        Option::Some(ctx) => {
+            match (ctx.get(Str::from_cstr("diagnostics"))) {
+                Option::Some(diags_ptr) => {
+                    const total: u64 = diags_ptr.length();
+                    for (mut i: u64 = 0; i < total; i++) {
+                        match (diags_ptr.at(i)) {
+                            Option::Some(d) => {
+                                match (extract_diag_id(d)) {
+                                    Option::Some(id) => {
+                                        actions.push(build_action(id));
+                                    }
+                                    Option::None => { }
+                                }
+                            }
+                            Option::None => { }
+                        }
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        Option::None => { }
+    }
+
+    return JsonValue::Array(actions);
+}
+
+
+/// Pull `data.diagId` out of a wire diagnostic.  Returns `None` for
+/// diagnostics not published by this server (no `data` field, no
+/// `diagId`, or wrong type).
+function extract_diag_id(diag: &JsonValue) -> Option<Str> {
+    match (diag.get(Str::from_cstr("data"))) {
+        Option::Some(data) => {
+            match (data.get(Str::from_cstr("diagId"))) {
+                Option::Some(id_v) => { return id_v.as_str(); }
+                Option::None       => { return Option::None; }
+            }
+        }
+        Option::None => { return Option::None; }
+    }
+}
+
+
+/// Build one CodeAction JSON object:
+///
+///   { "title":   "Show full Cryo diagnostic",
+///     "kind":    "quickfix",
+///     "command": { "title":     "Show full Cryo diagnostic",
+///                  "command":   "cryo.openRenderedDiagnostic",
+///                  "arguments": ["<diagId>"] } }
+///
+/// The action does not edit; the client-side command opens the
+/// virtual `cryo-diagnostic:` URI built from the id.
+function build_action(id: Str) -> JsonValue {
+    const title:   string = "Show full Cryo diagnostic";
+    const cmd_id:  string = "cryo.openRenderedDiagnostic";
+
+    mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
+    args.push(JsonValue::String(String::from_str(id)));
+
+    mut cmd: JsonObject = JsonObject::new();
+    cmd.insert(String::from_str(Str::from_cstr("title")),
+               JsonValue::String(String::from_str(Str::from_cstr(title))));
+    cmd.insert(String::from_str(Str::from_cstr("command")),
+               JsonValue::String(String::from_str(Str::from_cstr(cmd_id))));
+    cmd.insert(String::from_str(Str::from_cstr("arguments")),
+               JsonValue::Array(args));
+
+    mut action: JsonObject = JsonObject::new();
+    action.insert(String::from_str(Str::from_cstr("title")),
+                  JsonValue::String(String::from_str(Str::from_cstr(title))));
+    action.insert(String::from_str(Str::from_cstr("kind")),
+                  JsonValue::String(String::from_str(Str::from_cstr("quickfix"))));
+    action.insert(String::from_str(Str::from_cstr("command")),
+                  JsonValue::Object(cmd));
+    return JsonValue::Object(action);
+}

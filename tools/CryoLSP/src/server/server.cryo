@@ -32,28 +32,34 @@ import Lsp::Protocol::JsonRpc;
 import Lsp::Server::State;
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
+import Lsp::Server::DiagRenderCache;
 import Lsp::Handlers::Lifecycle;
 import Lsp::Handlers::TextSync;
 import Lsp::Handlers::Hover;
 import Lsp::Handlers::Definition;
 import Lsp::Handlers::Completion;
 import Lsp::Handlers::SemanticTokens;
+import Lsp::Handlers::CodeAction;
+import Lsp::Handlers::CodeLens;
+import Lsp::Handlers::RenderedDiagnostic;
 
 
 type struct Server {
-    state:    ServerState;
-    docs:     Docs;
-    sessions: SessionMap;
-    reader:   Stdin;
-    writer:   Stdout;
+    state:      ServerState;
+    docs:       Docs;
+    sessions:   SessionMap;
+    diag_cache: DiagRenderCache;
+    reader:     Stdin;
+    writer:     Stdout;
 
     static new() -> Server {
         return Server {
-            state:    ServerState::new(),
-            docs:     Docs::new(),
-            sessions: SessionMap::new(),
-            reader:   stdin(),
-            writer:   stdout(),
+            state:      ServerState::new(),
+            docs:       Docs::new(),
+            sessions:   SessionMap::new(),
+            diag_cache: DiagRenderCache::new(),
+            reader:     stdin(),
+            writer:     stdout(),
         };
     }
 
@@ -61,6 +67,7 @@ type struct Server {
         this.state.drop();
         this.docs.drop();
         this.sessions.drop();
+        this.diag_cache.drop();
     }
 
     /// Run until either `exit` or stdin closes.  Returns the process
@@ -179,6 +186,26 @@ type struct Server {
                     this.reply_ok(&req.id, result);
                     return;
                 }
+                if (method.equals(&Str::from_cstr("textDocument/codeAction"))) {
+                    const result: JsonValue = CodeAction::handle(&req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                if (method.equals(&Str::from_cstr("textDocument/codeLens"))) {
+                    const result: JsonValue =
+                        CodeLens::handle_code_lens(&this.sessions, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
+                // Custom request: the editor extension's
+                // TextDocumentContentProvider asks for the rendered
+                // text behind a `cryo-diagnostic:` virtual URI.
+                if (method.equals(&Str::from_cstr("cryo/renderedDiagnostic"))) {
+                    const result: JsonValue =
+                        RenderedDiagnostic::handle(&this.diag_cache, &req.params);
+                    this.reply_ok(&req.id, result);
+                    return;
+                }
 
                 this.reply_error(&req.id,
                     JsonRpc::METHOD_NOT_FOUND,
@@ -210,12 +237,14 @@ type struct Server {
 
                 if (method.equals(&Str::from_cstr("textDocument/didOpen"))) {
                     TextSync::did_open(&this.docs, &this.sessions,
-                                        &this.writer, &notif.params);
+                                        &this.writer, &this.diag_cache,
+                                        &notif.params);
                     return;
                 }
                 if (method.equals(&Str::from_cstr("textDocument/didChange"))) {
                     TextSync::did_change(&this.docs, &this.sessions,
-                                          &this.writer, &notif.params);
+                                          &this.writer, &this.diag_cache,
+                                          &notif.params);
                     return;
                 }
                 if (method.equals(&Str::from_cstr("textDocument/didClose"))) {

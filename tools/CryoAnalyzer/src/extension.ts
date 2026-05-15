@@ -13,6 +13,7 @@ import {
 import { getConfig, resolveServerPath } from './config';
 import { createStatusBar, updateStatus, disposeStatusBar } from './statusBar';
 import { registerCommands } from './commands';
+import { registerDiagnosticView } from './diagnosticView';
 
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
@@ -46,6 +47,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             updateStatus('stopped');
         }
     );
+
+    // Diagnostic view: register the `cryo-diagnostic:` content
+    // provider and the `cryo.openRenderedDiagnostic` command once.
+    // Both grab the LanguageClient lazily so they survive server
+    // restarts without a re-registration step.
+    registerDiagnosticView(context, () => client, outputChannel);
 
     // Start the language server
     await startClient(context);
