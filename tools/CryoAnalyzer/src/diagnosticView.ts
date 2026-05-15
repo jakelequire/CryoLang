@@ -25,6 +25,12 @@ import { LanguageClient } from 'vscode-languageclient/node';
  */
 export const CRYO_DIAG_SCHEME = 'cryo-diagnostic';
 
+/** Language ID contributed by `package.json` for `.cryo-diag` virtual
+ *  documents.  Set explicitly after opening so the syntax-highlight
+ *  grammar attaches even when VS Code's extension-based resolver loses
+ *  against the custom URI scheme. */
+const CRYO_DIAG_LANGUAGE = 'cryo-diag';
+
 interface RenderedDiagnosticResult {
     content: string;
 }
@@ -94,6 +100,12 @@ export function registerDiagnosticView(
                     `${CRYO_DIAG_SCHEME}:/${diagId}.cryo-diag`
                 );
                 const doc = await vscode.workspace.openTextDocument(uri);
+                if (doc.languageId !== CRYO_DIAG_LANGUAGE) {
+                    await vscode.languages.setTextDocumentLanguage(
+                        doc,
+                        CRYO_DIAG_LANGUAGE
+                    );
+                }
                 await vscode.window.showTextDocument(doc, {
                     preview: false,
                     viewColumn: vscode.ViewColumn.Beside,

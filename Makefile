@@ -58,6 +58,12 @@ cryo: stdlib
 	@cd compiler && "$(PIN)" build
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
 
+# File-target rule so downstream targets (test, lsp) can depend on the
+# binary itself instead of the phony `cryo` target. If the binary is
+# present, Make treats it as up-to-date and skips the rebuild.
+$(STAGE2):
+	@$(MAKE) --no-print-directory cryo
+
 # ---- pin refresh ------------------------------------------------------
 # After running 'make cryo', commit the new bin/cryo + bin/cryo.pin.txt
 # so a fresh clone can reproduce this state.
@@ -66,9 +72,9 @@ pin-cryo:
 
 # ---- Cryo-language LSP server -----------------------------------------
 # Builds tools/CryoLSP/ (entirely Cryo source) into bin/cryolsp.
-# Depends on `cryo` because the LSP imports the self-hosted compiler
-# library + stdlib via include_paths.
-lsp: cryo
+# Depends on the stage-2 binary as a file so an existing compiler build
+# is reused. Run `make cryo` first if you want to pick up compiler changes.
+lsp: $(STAGE2)
 	@echo "==> Building CryoLSP via bin/cryo"
 	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN)"
@@ -83,15 +89,16 @@ selfhost-check: $(PIN)
 	@python3 scripts/selfhost-check.py
 
 # ---- test suite -------------------------------------------------------
-# Builds the stage-2 compiler if needed, then drives `cryo test` against
-# the tests/ project.  See tests/cryoconfig and docs/testing.md for the
+# Builds the stage-2 compiler only if $(STAGE2) is missing, then drives
+# `cryo test` against the tests/ project.  Run `make cryo` first to pick
+# up compiler changes.  See tests/cryoconfig and docs/testing.md for the
 # project layout and the framework surface (`![test]`, `![ignore]`,
 # `![should_panic]`).  Pass arguments through with `make test ARGS=...`
 # (e.g. `make test ARGS="--ignored some_filter"`).
-test: cryo
+test: $(STAGE2)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
-test-list: cryo
+test-list: $(STAGE2)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 
 # ---- system install via symlink ---------------------------------------
