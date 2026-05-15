@@ -16,6 +16,9 @@ namespace Compiler::Passes::Sema;
 
 import Compiler::Diag;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::EditDistance;
 import std::core::option;
 import Compiler::Diag::Snapshot;
 import Compiler::DeclIndex;
@@ -190,6 +193,196 @@ public:
 
     lookup_global_var(&this, name: SymbolStr) -> TypeRef {
         return this.ctx.decl_index.lookup_global(name);
+    }
+
+
+    // ================================================================
+    // Did-you-mean candidate collectors
+    //
+    // Each collector walks one symbol table and returns a string[] of
+    // names to feed `EditDistance::find_best_candidate` from a typo
+    // diagnostic.  Qualified names (those containing `::`) are skipped:
+    // the user wrote a bare identifier, so the candidate set is the set
+    // of bare identifiers they could have typed.
+    // ================================================================
+
+    /// Local variables in the current function's scope.  Used for E0201
+    /// (undefined variable) did-you-mean.
+    collect_local_names(&this) -> string[] {
+        mut out: string[] = [];
+        mut it: HashMapIter<u32, TypeRef> = this.locals.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    const s: string = this.intern.resolve(SymbolStr::from_id(pair.first));
+                    if (s != "" && strstr(s, "::") == null) {
+                        out.push(s);
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        return out;
+    }
+
+    /// Every bare function name registered in the DeclarationIndex.
+    /// Used for E0202 (cannot find function) did-you-mean.
+    collect_bare_callable_names(&this) -> string[] {
+        mut out: string[] = [];
+        const idx: DeclarationIndex* = this.ctx.decl_index;
+        for (mut i: i64 = 0; i < idx.module_funcs.length; i++) {
+            const sym_id: u32 = idx.module_funcs[i].first;
+            const name: string = this.intern.resolve(SymbolStr::from_id(sym_id));
+            if (name == "")                       { continue; }
+            if (strstr(name, "::") != null)       { continue; }
+            // De-dup: linear scan is fine since the bare-function pool
+            // is small (overloads collapse to one bare entry per name).
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < out.length; j++) {
+                if (strcmp(out[j], name) == 0) { seen = true; break; }
+            }
+            if (!seen) { out.push(name); }
+        }
+        return out;
+    }
+
+    /// Every bare type name registered in the DeclarationIndex.  Used
+    /// for E0203 (undefined type) did-you-mean.
+    collect_bare_type_names(&this) -> string[] {
+        mut out: string[] = [];
+        const idx: DeclarationIndex* = this.ctx.decl_index;
+        for (mut i: i64 = 0; i < idx.module_types.length; i++) {
+            const sym_id: u32 = idx.module_types[i].first;
+            const name: string = this.intern.resolve(SymbolStr::from_id(sym_id));
+            if (name == "")                       { continue; }
+            if (strstr(name, "::") != null)       { continue; }
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < out.length; j++) {
+                if (strcmp(out[j], name) == 0) { seen = true; break; }
+            }
+            if (!seen) { out.push(name); }
+        }
+        return out;
+    }
+
+    /// Field + method names on the given struct/class.  Walks past
+    /// pointer/reference/instantiation wrappers the same way the
+    /// member-access resolver does, so `(&dog).barke` suggests `bark`
+    /// against the underlying class's members.  Used for E0204 (no
+    /// field or method on type) did-you-mean.
+    collect_struct_or_class_member_names(&this, obj_type: TypeRef) -> string[] {
+        mut out: string[] = [];
+        mut walk_ty: TypeRef = obj_type;
+        mut walk_t:  Type*    = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            match (walk_t.kind) {
+                TypeKind::Pointer => {
+                    const pt: PointerType* = walk_t as PointerType*;
+                    walk_ty = pt.pointee;
+                    walk_t  = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::Reference => {
+                    const rt: ReferenceType* = walk_t as ReferenceType*;
+                    walk_ty = rt.referent;
+                    walk_t  = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { break; }
+                    walk_ty = it.resolved_type;
+                    walk_t  = this.arena.lookup(walk_ty.id);
+                }
+                _ => { break; }
+            }
+            depth += 1;
+        }
+        if (walk_t == null) { return out; }
+
+        match (walk_t.kind) {
+            TypeKind::Struct => {
+                const st: StructType* = walk_t as StructType*;
+                for (mut i: i64 = 0; i < st.fields.length; i++) {
+                    out.push(this.intern.resolve(st.fields[i].name));
+                }
+                for (mut i: i64 = 0; i < st.methods.length; i++) {
+                    out.push(this.intern.resolve(st.methods[i].name));
+                }
+            }
+            TypeKind::Class => {
+                const cl: ClassType* = walk_t as ClassType*;
+                for (mut i: i64 = 0; i < cl.fields.length; i++) {
+                    out.push(this.intern.resolve(cl.fields[i].name));
+                }
+                for (mut i: i64 = 0; i < cl.methods.length; i++) {
+                    out.push(this.intern.resolve(cl.methods[i].name));
+                }
+            }
+            _ => {}
+        }
+        return out;
+    }
+
+    /// Display name for a TypeRef.  Resolves through the arena's display
+    /// formatter and re-interns the resulting string so it doesn't outlive
+    /// the formatter's static buffer.  Returns "?" for invalid refs.
+    type_display_name(&this, ty: TypeRef) -> string {
+        if (!ty.is_valid()) { return "?"; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return "?"; }
+        const sym: SymbolStr = this.intern.intern(this.arena.format_display(t));
+        return this.intern.resolve(sym);
+    }
+
+    /// Build the rich "mismatched types" diagnostic with the rustc-style
+    /// `expected `<E>`, found `<F>`` inline label.  Callers pass the
+    /// context phrase ("cannot initialize variable `x`", "argument to
+    /// `foo`", "return value of `bar`") which becomes the explanatory
+    /// note attached underneath, so the headline stays short and
+    /// uniform across codes.
+    ///
+    /// `context_span`, when set, attaches a secondary "expected due to
+    /// this" label — useful when the expected type came from an
+    /// explicit annotation elsewhere (parameter declaration, return
+    /// type annotation) so the user sees both ends of the mismatch.
+    emit_type_mismatch(mut &this, code: ErrorCode, span: SourceSpan,
+                       expected: TypeRef, found: TypeRef,
+                       context_msg: string, context_span: SourceSpan) -> void {
+        const expected_name: string = this.type_display_name(expected);
+        const found_name:    string = this.type_display_name(found);
+
+        mut diag: Diagnostic = Diagnostic::error(code, "mismatched types");
+        diag = diag.at_with_label(span,
+            format("expected `%s`, found `%s`", expected_name, found_name));
+        if (context_span.has_location()) {
+            diag = diag.also_at(context_span, "expected due to this");
+        }
+        if (context_msg != "") {
+            diag = diag.with_note(context_msg);
+        }
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Build a `did you mean `<best>`?` help line and a machine-applicable
+    /// suggestion attached to `span`.  Returns the diagnostic unchanged
+    /// when no candidate clears the edit-distance threshold, so callers
+    /// can chain unconditionally:
+    ///
+    ///   diag = this.attach_did_you_mean(diag, name, candidates,
+    ///                                   "variable", ident.span);
+    ///
+    /// `kind` is the noun used in the help text ("variable", "function",
+    /// "type", "field or method").
+    attach_did_you_mean(&this, diag: Diagnostic, name: string,
+                        candidates: string[], kind: string,
+                        span: SourceSpan) -> Diagnostic {
+        const best: string = find_best_candidate(name, candidates);
+        if (best == "") { return diag; }
+        mut out: Diagnostic = diag.help(
+            format("a %s with a similar name exists: `%s`", kind, best));
+        out = out.suggest(Suggestion::machine_applicable(span, best,
+            format("did you mean `%s`?", best)));
+        return out;
     }
 
     /// Resolve a module-qualified function call (e.g., intrinsics::frexp).
@@ -1080,22 +1273,15 @@ public:
             if (var_node.has_resolved_type() && init_type.is_valid()) {
                 // Declared type exists; check that the initializer is compatible
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
-                    const decl_ty: Type* = this.arena.lookup(var_node.resolved_type.id);
-                    const init_ty: Type* = this.arena.lookup(init_type.id);
                     const var_name: string = this.intern.resolve(var_node.name);
-                    // Intern display names to copy them to the heap: format_display
-                    // returns a stack-allocated sprintf buffer that becomes dangling
-                    // after the callee returns.
-                    const decl_sym: SymbolStr = this.intern.intern(
-                        if (decl_ty != null) { this.arena.format_display(decl_ty) } else { "?" });
-                    const init_sym: SymbolStr = this.intern.intern(
-                        if (init_ty != null) { this.arena.format_display(init_ty) } else { "?" });
-                    const decl_name: string = this.intern.resolve(decl_sym);
-                    const init_name: string = this.intern.resolve(init_sym);
-                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
-                        format("cannot initialize '%s' of type '%s' with value of type '%s'",
-                            var_name, decl_name, init_name),
-                        var_node.span);
+                    this.emit_type_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH,
+                        var_node.span,
+                        var_node.resolved_type,
+                        init_type,
+                        format("`%s` was declared with this type; the initializer must match",
+                               var_name),
+                        SourceSpan::none());
                 }
             }
         }
@@ -1150,18 +1336,13 @@ public:
             this.expected_type = saved_expected;
             if (node.has_resolved_type() && init_type.is_valid()) {
                 if (!this.checker.can_assign(init_type, node.resolved_type)) {
-                    const decl_ty: Type* = this.arena.lookup(node.resolved_type.id);
-                    const init_ty: Type* = this.arena.lookup(init_type.id);
-                    const decl_sym: SymbolStr = this.intern.intern(
-                        if (decl_ty != null) { this.arena.format_display(decl_ty) } else { "?" });
-                    const init_sym: SymbolStr = this.intern.intern(
-                        if (init_ty != null) { this.arena.format_display(init_ty) } else { "?" });
-                    const decl_name: string = this.intern.resolve(decl_sym);
-                    const init_name: string = this.intern.resolve(init_sym);
-                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
-                        format("cannot destructure value of type '%s' as '%s'",
-                            init_name, decl_name),
-                        node.span);
+                    this.emit_type_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH,
+                        node.span,
+                        node.resolved_type,
+                        init_type,
+                        "destructure pattern's declared type must match the initializer",
+                        SourceSpan::none());
                 }
             }
         }
@@ -1243,9 +1424,18 @@ public:
                 const field_name: string = this.intern.resolve(b.source_field);
                 const ty_sym: SymbolStr = this.intern.intern(this.arena.format_display(ty));
                 const ty_name: string = this.intern.resolve(ty_sym);
-                this.ctx.emit_error_at(ErrorCode::E0350_STRUCT_FIELD_NOT_FOUND,
-                    format("field '%s' not found on type '%s'", field_name, ty_name),
-                    b.span);
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0350_STRUCT_FIELD_NOT_FOUND,
+                    format("no field `%s` on type `%s`", field_name, ty_name));
+                diag = diag.at_with_label(b.span, "unknown field");
+                // Candidate pool: the struct's actual field names.
+                mut cands: string[] = [];
+                for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+                    cands.push(this.intern.resolve(fields_ptr[k].name));
+                }
+                diag = this.attach_did_you_mean(diag, field_name, cands,
+                                                "field", b.span);
+                this.ctx.emit_diagnostic(diag);
                 this.register_local_with_mut(b.local_name, this.arena.get_void(),
                     b.is_mutable);
                 continue;
@@ -1314,18 +1504,13 @@ public:
             this.expected_type = saved_expected;
             if (expr_type.is_valid() && this.return_type.is_valid()) {
                 if (!this.checker.can_assign(expr_type, this.return_type)) {
-                    const ret_ty: Type* = this.arena.lookup(this.return_type.id);
-                    const expr_ty: Type* = this.arena.lookup(expr_type.id);
-                    const ret_sym: SymbolStr = this.intern.intern(
-                        if (ret_ty != null) { this.arena.format_display(ret_ty) } else { "?" });
-                    const expr_sym: SymbolStr = this.intern.intern(
-                        if (expr_ty != null) { this.arena.format_display(expr_ty) } else { "?" });
-                    const ret_name: string = this.intern.resolve(ret_sym);
-                    const expr_name: string = this.intern.resolve(expr_sym);
-                    this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
-                        format("cannot return value of type '%s' from function returning '%s'",
-                            expr_name, ret_name),
-                        node.span);
+                    this.emit_type_mismatch(
+                        ErrorCode::E0200_TYPE_MISMATCH,
+                        node.span,
+                        this.return_type,
+                        expr_type,
+                        "the function's declared return type doesn't match the value returned here",
+                        SourceSpan::none());
                 }
             }
         }
@@ -1643,9 +1828,14 @@ public:
         const func_ty: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
         if (func_ty.is_valid()) { return func_ty; }
 
-        this.ctx.emit_error_at(ErrorCode::E0201_UNDEFINED_VARIABLE,
-            format("use of undefined variable '%s'", name_str),
-            ident.span);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0201_UNDEFINED_VARIABLE,
+            format("cannot find value `%s` in this scope", name_str));
+        diag = diag.at_with_label(ident.span, "not found in this scope");
+        const cands: string[] = this.collect_local_names();
+        diag = this.attach_did_you_mean(diag, name_str, cands,
+                                        "local", ident.span);
+        this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
 
@@ -1753,10 +1943,11 @@ public:
                         if (!is_mut) {
                             const name_str: string = this.intern.resolve(id.name);
                             mut diag: Diagnostic = Diagnostic::error(
-                                ErrorCode::E0200_TYPE_MISMATCH,
-                                format("cannot assign to immutable variable '%s'",
+                                ErrorCode::E0218_IMMUTABLE_ASSIGNMENT,
+                                format("cannot assign to immutable variable `%s`",
                                     name_str));
-                            diag = diag.at(lhs.span);
+                            diag = diag.at_with_label(lhs.span,
+                                "this binding is immutable");
                             diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
                             this.ctx.diagnostics.emit(diag);
                         }
@@ -2453,9 +2644,14 @@ public:
         }
 
         const name: string = this.intern.resolve(ident.name);
-        this.ctx.emit_error_at(ErrorCode::E0202_UNDEFINED_FUNCTION,
-            format("cannot find function `%s` in this scope", name),
-            ident.span);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0202_UNDEFINED_FUNCTION,
+            format("cannot find function `%s` in this scope", name));
+        diag = diag.at_with_label(ident.span, "not found in this scope");
+        const cands: string[] = this.collect_bare_callable_names();
+        diag = this.attach_did_you_mean(diag, name, cands,
+                                        "function", ident.span);
+        this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
 
@@ -3230,11 +3426,13 @@ public:
         if (!type_sym.is_valid() || !method_name.is_valid()) {
             return SymbolStr::empty();
         }
-        if (this.ctx.decl_index == null) { return SymbolStr::empty(); }
-        // No exhaustive method-name iterator on DeclarationIndex today;
-        // skip suggestions until that exists.  Returning empty here is
-        // safe; the caller falls back to a generic hint.
-        return SymbolStr::empty();
+        const ty_ref: TypeRef = this.lookup_type_by_sym(type_sym);
+        if (!ty_ref.is_valid()) { return SymbolStr::empty(); }
+        const needle: string = this.intern.resolve(method_name);
+        const cands: string[] = this.collect_struct_or_class_member_names(ty_ref);
+        const best: string = find_best_candidate(needle, cands);
+        if (best == "") { return SymbolStr::empty(); }
+        return this.intern.intern(best);
     }
 
     /// Look up a method by walking the class inheritance chain.
@@ -4030,9 +4228,15 @@ public:
             } else {
                 member.span
             };
-            this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
-                format("no field or method `%s` on type `%s`", member_name, type_name),
-                m_span);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0204_UNDEFINED_FIELD,
+                format("no field or method `%s` on type `%s`",
+                    member_name, type_name));
+            diag = diag.at_with_label(m_span, "unknown field or method");
+            const cands: string[] = this.collect_struct_or_class_member_names(obj_type);
+            diag = this.attach_did_you_mean(diag, member_name, cands,
+                                            "field or method", m_span);
+            this.ctx.emit_diagnostic(diag);
         }
 
         return TypeRef::invalid();

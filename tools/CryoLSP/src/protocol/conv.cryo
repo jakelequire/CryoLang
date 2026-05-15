@@ -22,6 +22,7 @@ import Compiler::Diag::Severity;
 import Compiler::Diag::SourceSpan;
 import Compiler::Diag::SpanLabel;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
 import Compiler::Diag::Renderer;
 
 import Lsp::Server::DiagRenderCache;
@@ -265,6 +266,71 @@ public function build_diag_id(diag: &Diagnostic) -> string {
 }
 
 
+/// One JSON object per Suggestion, with shape:
+///
+///   { "message":       "did you mean `length`?",
+///     "applicability": "machine-applicable",
+///     "parts":         [ { "range": {...}, "newText": "length" }, ... ] }
+///
+/// Ranges are LSP-flavoured (0-indexed lines + characters) and
+/// independently point at each (span, replacement) pair the
+/// suggestion would apply, so a CodeAction handler can hand them
+/// straight to `WorkspaceEdit.changes[uri]` and the IDE will apply
+/// every part atomically.
+function suggestion_to_json(sug: &Suggestion) -> JsonValue {
+    mut o: JsonObject = JsonObject::new();
+
+    mut msg: String = String::new();
+    msg.push_cstr(sug.message);
+    o.insert(String::from_str(Str::from_cstr("message")),
+             JsonValue::String(msg));
+
+    mut app: String = String::new();
+    app.push_cstr(sug.applicability.wire_label());
+    o.insert(String::from_str(Str::from_cstr("applicability")),
+             JsonValue::String(app));
+
+    mut parts_arr: Array<JsonValue> =
+        Array<JsonValue>::with_capacity(sug.parts.length as u64);
+    for (mut i: i64 = 0; i < sug.parts.length; i++) {
+        const p: SuggestionPart = sug.parts[i];
+        mut po: JsonObject = JsonObject::new();
+        po.insert(String::from_str(Str::from_cstr("range")),
+                  range_json_from_span(p.span));
+        // Reconstruct a `file://` URI so the editor knows which document
+        // the edit applies to.  Multi-file suggestions are rare today
+        // but the field is essentially free and makes them work.
+        po.insert(String::from_str(Str::from_cstr("uri")),
+                  JsonValue::String(uri_string_from_fs_path(p.span.file)));
+        mut nt: String = String::new();
+        nt.push_cstr(p.replacement);
+        po.insert(String::from_str(Str::from_cstr("newText")),
+                  JsonValue::String(nt));
+        parts_arr.push(JsonValue::Object(po));
+    }
+    o.insert(String::from_str(Str::from_cstr("parts")),
+             JsonValue::Array(parts_arr));
+
+    return JsonValue::Object(o);
+}
+
+/// Build the JSON array of suggestions to embed under
+/// `diagnostic.data.suggestions`.  Spanless suggestions and parts
+/// without a file are skipped — the editor has no way to attach an
+/// edit to nothing.
+function suggestions_array(diag: &Diagnostic) -> Array<JsonValue> {
+    mut arr: Array<JsonValue> = Array<JsonValue>::new();
+    for (mut i: i64 = 0; i < diag.suggestions.length; i++) {
+        const sug: &Suggestion = &diag.suggestions[i];
+        if (sug.parts.length == 0) { continue; }
+        // Drop suggestions whose first part has no real location.
+        if (!sug.parts[0].span.has_location()) { continue; }
+        arr.push(suggestion_to_json(sug));
+    }
+    return arr;
+}
+
+
 /// Render one compiler diagnostic as a fully-populated LSP `Diagnostic`
 /// JSON object.  `renderer` produces the `message` body; `cache`
 /// receives a side copy of that rendered text keyed by a stable
@@ -293,15 +359,23 @@ public function diag_to_json(diag: &Diagnostic,
     o.insert(String::from_str(Str::from_cstr("source")),
              JsonValue::String(String::from_str(Str::from_cstr("cryoc"))));
 
-    // Render once; ship a copy to the editor (inline in `message`) and
-    // a second copy to the cache (fetched on demand by the
-    // `cryo/renderedDiagnostic` request when the user opens a virtual
-    // diagnostic tab).
-    mut rendered: String = renderer.render_to_string(*diag);
-    mut rendered_for_msg: String = String::from_str(rendered.as_str());
-
+    // `message`: the short headline only.  VS Code's problems panel
+    // renders messages as a single line and its own UI already shows
+    // the file/line chip, so stuffing the full multi-line rendered
+    // report here turns into garbage.  The full report (snippet,
+    // carets, secondary labels, notes, suggestions) lives in the
+    // virtual `cryo-diagnostic:` document — opened from the
+    // "Show full Cryo diagnostic" code action — and reaches the
+    // client via `cryo/renderedDiagnostic` keyed off the diagId.
+    mut headline: String = String::new();
+    headline.push_cstr(diag.message);
     o.insert(String::from_str(Str::from_cstr("message")),
-             JsonValue::String(rendered_for_msg));
+             JsonValue::String(headline));
+
+    // Render once for the cache so the virtual-doc view can fetch the
+    // full report on demand.  Kept separate from the inline message
+    // above by design.
+    mut rendered: String = renderer.render_to_string(*diag);
 
     // diagId: stable across publishes; the cache key + the value
     // the editor extension passes to `cryo/renderedDiagnostic`.
@@ -310,13 +384,18 @@ public function diag_to_json(diag: &Diagnostic,
     id_for_cache.push_cstr(id_cstr);
     cache.insert(id_for_cache, rendered);
 
-    // data: { "diagId": "<id>" } — picked up by the code-action
-    // handler to build a "Show full Cryo diagnostic" lightbulb item.
+    // data: { "diagId": "<id>", "suggestions": [...] }.  diagId
+    // backs the "Show full Cryo diagnostic" code action; suggestions
+    // are serialized so the `textDocument/codeAction` handler can
+    // build per-suggestion CodeAction entries with WorkspaceEdit
+    // payloads (machine-applicable fixes auto-apply on click).
     mut id_for_data: String = String::new();
     id_for_data.push_cstr(id_cstr);
     mut data_obj: JsonObject = JsonObject::new();
     data_obj.insert(String::from_str(Str::from_cstr("diagId")),
                     JsonValue::String(id_for_data));
+    data_obj.insert(String::from_str(Str::from_cstr("suggestions")),
+                    JsonValue::Array(suggestions_array(diag)));
     o.insert(String::from_str(Str::from_cstr("data")),
              JsonValue::Object(data_obj));
 
