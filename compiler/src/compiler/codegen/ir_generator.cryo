@@ -11,9 +11,7 @@ import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::Codegen::Context;
-import Compiler::Codegen::DeclCodegen;
-import Compiler::Codegen::ExprCodegen;
-import Compiler::Codegen::StmtCodegen;
+import Compiler::Codegen::Util;
 import Compiler::Codegen::IntrinsicsCodegen;
 import Compiler::CompilationContext;
 import Compiler::DeclIndex;
@@ -48,16 +46,6 @@ import std::collections::pair;
 
 
 // ============================================================================
-// Lambda counter: monotonically incrementing index used to generate unique
-// anonymous-function names like `__lambda_0`, `__lambda_1`, ...
-// Module-level (process-wide) so that lambdas in different Cryo source
-// modules never collide at the LLVM global-context level.
-// ============================================================================
-
-mut g_lambda_counter: u64 = 0;
-
-
-// ============================================================================
 // MatchSubjectInfo: precomputed state for match/if-let pattern codegen.
 // ============================================================================
 
@@ -87,11 +75,18 @@ public:
     /// Current impl block target type (set during impl block traversal).
     current_impl_target: SymbolStr;
 
+    /// Monotonic counter for anonymous-function names (`__lambda_0`,
+    /// `__lambda_1`, ...).  Per-visitor (so per-module), kept unique
+    /// across modules by qualifying the emitted symbol with the current
+    /// namespace; see `visit(LambdaExprNode*)`.
+    lambda_counter: u64;
+
     IRGeneratorVisitor(cg: CodegenContext*) : BaseASTVisitor() {
         this.cg              = cg;
         this.last_value      = LValue::null();
         this.last_is_lvalue  = false;
         this.current_impl_target = SymbolStr::empty();
+        this.lambda_counter  = 0;
     }
 
 
@@ -203,11 +198,11 @@ public:
         }
 
         cdebug("[IRGen] Phase 1: declare_types...\n"); fflush(null);
-        declare_types(this.cg, program);
+        this.cg.declare_types(program);
         cdebug("[IRGen] Phase 1: done\n"); fflush(null);
 
         cdebug("[IRGen] Phase 2: declare_functions...\n"); fflush(null);
-        declare_functions(this.cg, program);
+        this.cg.declare_functions(program);
         cdebug("[IRGen] Phase 2: done\n"); fflush(null);
 
         cdebug("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); fflush(null);
@@ -329,7 +324,7 @@ public:
 
     /// Generate a function body: prologue, block walk, epilogue, validate.
     generate_function_body(mut &this, node: FunctionDeclNode*) -> void {
-        const fn_val: LValue = codegen_function_prologue(this.cg, node);
+        const fn_val: LValue = this.cg.codegen_function_prologue(node);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]     func prologue failed\n"); fflush(null);
             return;
@@ -337,7 +332,7 @@ public:
         cdebug("[IRGen]     func prologue ok, generating block...\n"); fflush(null);
         this.generate_block(node.body);
         cdebug("[IRGen]     func block done, epilogue...\n"); fflush(null);
-        codegen_function_epilogue(this.cg, node);
+        this.cg.codegen_function_epilogue(node);
 
         // Validate: if any block lacks a terminator, body generation
         // failed. Strip back to a clean declare rather than emitting
@@ -417,8 +412,7 @@ public:
         if (func.generic_params.length > 0) { return; }
 
         cdebug("[IRGen]       method prologue...\n"); fflush(null);
-        const fn_val: LValue = codegen_method_prologue(
-            this.cg, node, this.current_impl_target);
+        const fn_val: LValue = this.cg.codegen_method_prologue(node, this.current_impl_target);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]       method prologue FAILED\n"); fflush(null);
             return;
@@ -437,7 +431,7 @@ public:
         cdebug("[IRGen]       method body block...\n"); fflush(null);
         this.generate_block(func.body);
         cdebug("[IRGen]       method body done, epilogue...\n"); fflush(null);
-        codegen_function_epilogue(this.cg, func);
+        this.cg.codegen_function_epilogue(func);
 
         if (!this.cg.is_function_body_valid(fn_val)) {
             const target_str: string = this.cg.resolve(this.current_impl_target);
@@ -632,13 +626,13 @@ public:
                 const d: StatementNode* = node.synth_drops[i];
                 if (d != null) { d.accept(this); }
             }
-            codegen_return(this.cg, val, true, node.expression.resolved_type);
+            this.cg.codegen_return(val, true, node.expression.resolved_type);
         } else {
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
                 const d: StatementNode* = node.synth_drops[i];
                 if (d != null) { d.accept(this); }
             }
-            codegen_return(this.cg, LValue::null(), false, TypeRef::invalid());
+            this.cg.codegen_return(LValue::null(), false, TypeRef::invalid());
         }
     }
 
@@ -815,7 +809,7 @@ public:
         // LLVM elides the whole thing; either way the IR stays well-formed.
         if (!no_match_bb.has_terminator()) {
             this.cg.builder.position_at_end(no_match_bb);
-            const abort_fn: LValue = get_or_decl_abort(this.cg);
+            const abort_fn: LValue = this.cg.get_or_decl_abort();
             const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
             mut a_args: Pair<LValue, TypeRef>[] = [];
             mut a_res: LValue = LValue::null();
@@ -2415,10 +2409,13 @@ public:
                     intr_args.push(this.codegen_rvalue(node.arguments[ai]));
                 }
                 intr_args_evaluated = true;
-                if (try_emit_intrinsic_call(this.cg, intr_name_str, intr_args, &intr_result)) {
-                    this.last_value = intr_result;
-                    this.last_is_lvalue = false;
-                    return;
+                match (this.cg.try_emit_intrinsic_call(intr_name_str, intr_args)) {
+                    Option::Some(v) => {
+                        this.last_value = v;
+                        this.last_is_lvalue = false;
+                        return;
+                    }
+                    Option::None => { }
                 }
             }
 
@@ -2639,11 +2636,13 @@ public:
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.codegen_rvalue(node.arguments[sai]));
                 }
-                mut sr_intr_result: LValue = LValue::null();
-                if (try_emit_intrinsic_call(this.cg, sr_leaf_str, sr_args, &sr_intr_result)) {
-                    this.last_value = sr_intr_result;
-                    this.last_is_lvalue = false;
-                    return;
+                match (this.cg.try_emit_intrinsic_call(sr_leaf_str, sr_args)) {
+                    Option::Some(v) => {
+                        this.last_value = v;
+                        this.last_is_lvalue = false;
+                        return;
+                    }
+                    Option::None => { }
                 }
             }
 
@@ -3026,8 +3025,7 @@ public:
                             if (pp.name.equals(this_val)) { continue; }
                             rm_params.push(pp.resolved_type);
                         }
-                        const slot_idx: i32 = vtable_slot_index(
-                            this.cg, cls_for_vtbl, fn_node.name, rm_params);
+                        const slot_idx: i32 = this.cg.vtable_slot_index(cls_for_vtbl, fn_node.name, rm_params);
                         if (slot_idx >= 0) {
                             vtable_dispatch = true;
                             vtable_slot_idx = slot_idx;
@@ -3746,9 +3744,17 @@ public:
         const intern:  InternTable*        = this.cg.get_intern();
 
         // ── Generate a unique function name ───────────────────────────────────
-        const lam_idx: u64 = g_lambda_counter;
-        g_lambda_counter += 1;
-        const lam_name: string = format("__lambda_%lld", lam_idx as i64);
+        // Per-module counter; the namespace prefix keeps cross-module
+        // lambda symbols unique at link time (lambdas have external
+        // linkage), so each visitor instance can start fresh at 0.
+        const lam_idx: u64 = this.lambda_counter;
+        this.lambda_counter += 1;
+        const ns_str: string = if (ctx_ptr.has_namespace()) {
+            ctx_ptr.namespace_display()
+        } else {
+            ctx_ptr.source_file
+        };
+        const lam_name: string = format("%s::__lambda_%lld", ns_str, lam_idx as i64);
 
         // ── Resolve return type ───────────────────────────────────────────────
         mut ret_ty: LType = LType::void_type();
@@ -4123,7 +4129,7 @@ public:
         // LLVM elides it.
         if (!default_bb.has_terminator()) {
             this.cg.builder.position_at_end(default_bb);
-            const abort_fn_e: LValue = get_or_decl_abort(this.cg);
+            const abort_fn_e: LValue = this.cg.get_or_decl_abort();
             const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
             mut a_args_e: Pair<LValue, TypeRef>[] = [];
             mut a_res_e: LValue = LValue::null();
