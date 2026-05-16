@@ -1,0 +1,168 @@
+/// Diagnostic Sink
+///
+/// Routes codegen diagnostics through the shared `DiagnosticSink` on
+/// `CompilationContext`, and owns the set of "stripped" functions —
+/// those whose body codegen failed and had to be reverted to a declare.
+/// The post-codegen cascade-strip pass reads `stripped_names()` to find
+/// callers that need stripping too, so the LLVM module doesn't ship a
+/// half-built define that fails verification.
+///
+/// Owns `stripped_func_names`.  Borrows `ctx: CompilationContext*` for
+/// diagnostic routing (one back-pointer).
+
+namespace Compiler::Codegen::DiagSink;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::CompilationContext;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Sink;
+
+
+// ============================================================================
+// DiagSink
+// ============================================================================
+
+type struct DiagSink {
+    ctx: CompilationContext*;
+
+    /// Mangled LLVM names of functions whose body was attempted-but-stripped
+    /// in this module.  Used by the post-codegen cascade-strip pass to
+    /// identify same-module declare-only callees and strip their callers
+    /// too, so an `Array<T>::quicksort` body that calls a stripped
+    /// `partition` doesn't emit a dangling extern at link time.
+    /// Cross-module externs are NOT in this set, so they're unaffected.
+    stripped_func_names: string[];
+
+    static new(ctx: CompilationContext*) -> DiagSink {
+        return DiagSink {
+            ctx:                 ctx,
+            stripped_func_names: [],
+        };
+    }
+
+    /// Read-only view of the stripped-function set for the cascade pass.
+    stripped_names(&this) -> string[] {
+        return this.stripped_func_names;
+    }
+
+    /// Check whether a function's mangled LLVM name has been stripped in
+    /// this module.
+    is_stripped(&this, name: string) -> boolean {
+        for (mut i: i64 = 0; i < this.stripped_func_names.length; i++) {
+            if (this.stripped_func_names[i] == name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    // ========================================================================
+    // Diagnostic emission
+    // ========================================================================
+
+    /// Emit an error with a source span.
+    emit_error_at_span(&this, code: ErrorCode, message: string, span: SourceSpan) -> void {
+        this.ctx.emit_error_at(code, message, span);
+    }
+
+    /// Emit a warning with a source span.
+    emit_warning_at_span(&this, code: ErrorCode, message: string, span: SourceSpan) -> void {
+        mut diag: Diagnostic = Diagnostic::warning(code, message);
+        diag = diag.at(span);
+        this.emit(diag);
+    }
+
+    /// Emit a pre-built Diagnostic.  Use this when you need the builder
+    /// API (secondary labels, notes, suggestions) that the `_at_span`
+    /// helpers don't expose.  Breaks the chained access through
+    /// `this.ctx.diagnostics` into intermediate locals; the chained form
+    /// trips a type-resolver limitation when written inline.
+    emit(&this, diag: Diagnostic) -> void {
+        const c: CompilationContext* = this.ctx;
+        const sink: DiagnosticSink* = c.diagnostics;
+        sink.emit(diag);
+    }
+
+
+    // ========================================================================
+    // Function-body validation & stripping
+    // ========================================================================
+
+    /// Strip all basic blocks from a function, reverting it to a declare.
+    /// Used when body generation fails: better a clean declare than a
+    /// half-built define that fails LLVM verification.  Also records the
+    /// function's mangled LLVM name so the post-codegen cascade pass can
+    /// strip callers in the same module.
+    strip_function_body(mut &this, fn_val: LValue) -> void {
+        if (!fn_val.is_valid()) { return; }
+        const fn_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
+        if (fn_name != null) {
+            this.stripped_func_names.push(fn_name);
+        }
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+        while (bb != null) {
+            const next: void* = llvm::LLVMGetNextBasicBlock(bb);
+            llvm::LLVMDeleteBasicBlock(bb);
+            bb = next;
+        }
+    }
+
+    /// Check whether a function's IR is valid (all blocks terminated).
+    /// Returns false if any basic block lacks a terminator.
+    is_function_body_valid(&this, fn_val: LValue) -> boolean {
+        if (!fn_val.is_valid()) { return false; }
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+        while (bb != null) {
+            const term: void* = llvm::LLVMGetBasicBlockTerminator(bb);
+            if (term == null) { return false; }
+            bb = llvm::LLVMGetNextBasicBlock(bb);
+        }
+        return true;
+    }
+
+    /// Count basic blocks in a function partitioned by whether they have a
+    /// terminator.  Both counts are written through the out-parameters.
+    count_unterminated_blocks(&this, fn_val: LValue,
+                              out_total: i32*, out_bad: i32*) -> void {
+        *out_total = 0;
+        *out_bad   = 0;
+        if (!fn_val.is_valid()) { return; }
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+        while (bb != null) {
+            *out_total = *out_total + 1;
+            const term: void* = llvm::LLVMGetBasicBlockTerminator(bb);
+            if (term == null) {
+                *out_bad = *out_bad + 1;
+            }
+            bb = llvm::LLVMGetNextBasicBlock(bb);
+        }
+    }
+
+    /// Report that body codegen left a function in an invalid state, then
+    /// strip its blocks.  Use this instead of `strip_function_body`
+    /// directly so the failure surfaces as a `file:line` diagnostic.
+    ///
+    /// `pretty_name` should be a human-readable identifier (e.g. the
+    /// source-level qualified name like `Foo::bar` for a method, or the
+    /// bare function name for a free function).  `span` should point at
+    /// the offending declaration.
+    report_invalid_function_body(mut &this, fn_val: LValue,
+                                 pretty_name: string,
+                                 span: SourceSpan) -> void {
+        if (!fn_val.is_valid()) { return; }
+        mut total: i32 = 0;
+        mut bad:   i32 = 0;
+        this.count_unterminated_blocks(fn_val, &total, &bad);
+        const llvm_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
+        const llvm_name_safe: string = if (llvm_name == null) { "<unnamed>" } else { llvm_name };
+        const msg: string = format(
+            "codegen: function '%s' (LLVM '%s') left %d of %d basic block(s) unterminated; body discarded (this is a codegen bug, please report it)",
+            pretty_name, llvm_name_safe, bad, total);
+        this.emit_error_at_span(ErrorCode::E0633_FUNCTION_BODY_ERROR, msg, span);
+        this.strip_function_body(fn_val);
+    }
+}
