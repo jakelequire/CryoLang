@@ -4,6 +4,7 @@ import Compiler::Lex;
 import Compiler::Diag;
 import Compiler::Diag::SourceSpan;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
 import Compiler::Diag::Sink;
 import Utils::Logger;
 import Utils::File;
@@ -353,7 +354,10 @@ private:
         // --- Unterminated check ---
         if (this.at_end()) {
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated string literal at line %d", this.current_location.line);
-            return this.emit_error(ErrorCode::E0002_UNTERMINATED_STRING, "Unterminated string literal");
+            return this.emit_error_close_literal(
+                ErrorCode::E0002_UNTERMINATED_STRING,
+                "Unterminated string literal",
+                "\"");
         }
 
         this.advance(); // consume closing quote
@@ -439,7 +443,10 @@ private:
         // --- Expect closing quote ---
         if (this.at_end() || this.peek() != '\'') {
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated character literal at line %d", this.current_location.line);
-            return this.emit_error(ErrorCode::E0003_UNTERMINATED_CHAR, "Unterminated character literal");
+            return this.emit_error_close_literal(
+                ErrorCode::E0003_UNTERMINATED_CHAR,
+                "Unterminated character literal",
+                "'");
         }
         this.advance(); // consume closing '\''
 
@@ -745,6 +752,47 @@ private:
             );
             mut diag: Diagnostic = Diagnostic::error(code, message);
             diag = diag.at(span);
+            this.sink.emit(diag);
+        }
+        return Token::new(
+            TokenType::Unknown,
+            message,
+            this.current_location.line,
+            this.current_location.column
+        );
+    }
+
+    /// Like `emit_error`, but attaches a machine-applicable suggestion
+    /// that inserts `insertion` at the literal's start-of-body position.
+    /// Used by the unterminated-string / unterminated-char paths so the
+    /// user's editor can close the literal in one click.  `body_line` /
+    /// `body_col` point at the byte AFTER the opening quote (where the
+    /// missing closer logically belongs); the suggestion uses a
+    /// zero-width span at the current end-of-stream position so the
+    /// insertion lands at the cursor, exactly where the user dropped
+    /// the closing quote.
+    emit_error_close_literal(&this, code: ErrorCode, message: string,
+                              insertion: string) -> Token {
+        if (this.sink != null) {
+            const span: SourceSpan = SourceSpan::new(
+                this.file.path(),
+                this.current_location.line as u32,
+                this.current_location.column as u32,
+                this.current_location.line as u32,
+                this.current_location.column as u32 + 1
+            );
+            mut diag: Diagnostic = Diagnostic::error(code, message);
+            diag = diag.at(span);
+            const ins_span: SourceSpan = SourceSpan::new(
+                this.file.path(),
+                this.current_location.line as u32,
+                this.current_location.column as u32,
+                this.current_location.line as u32,
+                this.current_location.column as u32
+            );
+            diag = diag.suggest(Suggestion::machine_applicable(
+                ins_span, insertion,
+                format("close the literal with `%s`", insertion)));
             this.sink.emit(diag);
         }
         return Token::new(
