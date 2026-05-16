@@ -81,9 +81,16 @@ public:
     // -- Per-function state (reset via enter_function for each body) --
     locals:      HashMap<u32, TypeRef>;    // local variable scope (fast path)
     local_muts:  HashMap<u32, boolean>;    // mutability flag for each local
+    // Span of the declaring `const`/`mut` keyword (for top-level locals)
+    // or a zero-width insertion anchor (for params declared without
+    // `mut`).  E0218 reads this to emit a precise "replace `const` with
+    // `mut`" or "insert `mut`" quickfix.  Missing entry = no precise
+    // anchor available; E0218 falls back to the explanatory note only.
+    local_kw_spans: HashMap<u32, SourceSpan>;
     undo_keys:   u32[];                    // scope undo log: keys modified
     undo_prev:   TypeRef[];                // scope undo log: previous values
     undo_muts:   boolean[];                // scope undo log: previous mut flags
+    undo_kw_spans: SourceSpan[];           // scope undo log: previous kw_spans
     return_type: TypeRef;                  // current function return type
     return_type_ann: TypeAnnotation*;      // current function return-type annotation (for secondary spans)
     this_type:   TypeRef;                  // current method receiver type
@@ -113,9 +120,11 @@ public:
         this.ctx            = ctx;
         this.locals         = HashMap<u32, TypeRef>::new();
         this.local_muts     = HashMap<u32, boolean>::new();
+        this.local_kw_spans = HashMap<u32, SourceSpan>::new();
         this.undo_keys      = [];
         this.undo_prev      = [];
         this.undo_muts      = [];
+        this.undo_kw_spans  = [];
         this.return_type    = TypeRef::invalid();
         this.return_type_ann = null;
         this.this_type      = TypeRef::invalid();
@@ -411,6 +420,23 @@ public:
     emit_type_mismatch(mut &this, code: ErrorCode, span: SourceSpan,
                        expected: TypeRef, found: TypeRef,
                        context_msg: string, context_span: SourceSpan) -> void {
+        this.emit_type_mismatch_with_value(code, span, expected, found,
+            context_msg, context_span, null);
+    }
+
+    /// Same as `emit_type_mismatch`, but accepts the offending value
+    /// expression so the diagnostic can attach a literal-aware
+    /// suggestion (boolean coercion, numeric→string conversion).  All
+    /// the fixes here are conservative: they only fire when both ends
+    /// of the mismatch are primitives we know how to bridge cleanly,
+    /// and the suggestion's applicability reflects how confident the
+    /// edit is (`MachineApplicable` for unambiguous cases like
+    /// `"true"` → `true`; `MaybeIncorrect` for casts the user may
+    /// reasonably not want).
+    emit_type_mismatch_with_value(mut &this, code: ErrorCode, span: SourceSpan,
+                                   expected: TypeRef, found: TypeRef,
+                                   context_msg: string, context_span: SourceSpan,
+                                   value_expr: ExpressionNode*) -> void {
         const expected_name: string = this.type_display_name(expected);
         const found_name:    string = this.type_display_name(found);
 
@@ -423,7 +449,109 @@ public:
         if (context_msg != "") {
             diag = diag.with_note(context_msg);
         }
+        diag = this.attach_type_coercion_suggestion(diag, span,
+            expected_name, found_name, value_expr);
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Attach a literal-aware quickfix to a type-mismatch diagnostic
+    /// when the (expected, found, value) triple has an obvious bridge:
+    ///
+    ///   * `bool`/`boolean` ← string `"true"` / `"false"`   → drop quotes
+    ///   * `bool`/`boolean` ← integer literal `0`/`1`       → `false` / `true`
+    ///   * `string`         ← integer / float literal       → wrap in quotes
+    ///   * primitive numeric ← string literal that parses   → drop quotes
+    ///
+    /// All suggestions are MachineApplicable (the produced edit is
+    /// guaranteed to compile if applied verbatim).  Returns the
+    /// diagnostic unchanged when none of the patterns fit so callers
+    /// can chain unconditionally.  A more general "wrap with `as T`"
+    /// cast suggestion is intentionally left out — it requires reading
+    /// the original source text, and the semantics (truncation,
+    /// sign-extension) are rarely what the user expected at this point.
+    attach_type_coercion_suggestion(&this, diag: Diagnostic, span: SourceSpan,
+                                     expected_name: string, found_name: string,
+                                     value_expr: ExpressionNode*) -> Diagnostic {
+        if (value_expr == null || !span.has_location()) { return diag; }
+        const node: ASTNode* = value_expr as ASTNode*;
+        if (node.kind != NodeKind::Literal) { return diag; }
+
+        const lit: LiteralNode* = value_expr as LiteralNode*;
+        const want_bool: boolean = strcmp(expected_name, "boolean") == 0
+                                || strcmp(expected_name, "bool") == 0;
+        const want_string: boolean = strcmp(expected_name, "string") == 0;
+        const found_string: boolean = strcmp(found_name, "string") == 0;
+
+        if (want_bool && lit.literal_kind == LiteralKind::String) {
+            if (strcmp(lit.value, "true") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "true", "drop the quotes to write a `boolean`"));
+            }
+            if (strcmp(lit.value, "false") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "false", "drop the quotes to write a `boolean`"));
+            }
+        }
+        if (want_bool && lit.literal_kind == LiteralKind::Integer) {
+            if (strcmp(lit.value, "0") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "false", "use the boolean literal"));
+            }
+            if (strcmp(lit.value, "1") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "true", "use the boolean literal"));
+            }
+        }
+        if (want_string &&
+            (lit.literal_kind == LiteralKind::Integer
+             || lit.literal_kind == LiteralKind::Float)) {
+            return diag.suggest(Suggestion::machine_applicable(
+                span, format("\"%s\"", lit.value),
+                "wrap the literal in quotes to make it a string"));
+        }
+        if (found_string && !want_bool && !want_string
+            && this.is_numeric_type_name(expected_name)
+            && this.lexeme_looks_like_number(lit.value)) {
+            return diag.suggest(Suggestion::machine_applicable(
+                span, lit.value,
+                format("drop the quotes to write a `%s`", expected_name)));
+        }
+
+        return diag;
+    }
+
+    /// True when `name` matches one of the built-in primitive numeric
+    /// type display names.  Used to gate the "drop the quotes" fix so
+    /// it doesn't fire on user-defined types where the suggestion would
+    /// be wrong.
+    is_numeric_type_name(&this, name: string) -> boolean {
+        return strcmp(name, "i8")  == 0 || strcmp(name, "i16") == 0
+            || strcmp(name, "i32") == 0 || strcmp(name, "i64") == 0
+            || strcmp(name, "u8")  == 0 || strcmp(name, "u16") == 0
+            || strcmp(name, "u32") == 0 || strcmp(name, "u64") == 0
+            || strcmp(name, "f32") == 0 || strcmp(name, "f64") == 0
+            || strcmp(name, "int") == 0;
+    }
+
+    /// True when `s` is the body of a numeric literal: an optional sign
+    /// followed by digits (decimal only — hex/octal/binary use a `0x`/
+    /// `0o`/`0b` prefix and won't appear inside a string literal that's
+    /// meant to be a number).
+    lexeme_looks_like_number(&this, s: string) -> boolean {
+        if (s == null) { return false; }
+        const n: i64 = strlen(s) as i64;
+        if (n == 0) { return false; }
+        mut i: i64 = 0;
+        if (s[0] == '-' || s[0] == '+') { i = 1; }
+        if (i >= n) { return false; }
+        mut saw_dot: boolean = false;
+        while (i < n) {
+            const c: char = s[i];
+            if (c >= '0' && c <= '9') { i += 1; continue; }
+            if (c == '.' && !saw_dot)  { saw_dot = true; i += 1; continue; }
+            return false;
+        }
+        return true;
     }
 
     /// Build a `did you mean `<best>`?` help line and a machine-applicable
@@ -567,9 +695,29 @@ public:
             Option::Some(prev) => { this.undo_muts.push(prev); }
             Option::None       => { this.undo_muts.push(false); }
         }
+        match (this.local_kw_spans.get(&key)) {
+            Option::Some(prev) => { this.undo_kw_spans.push(prev); }
+            Option::None       => { this.undo_kw_spans.push(SourceSpan::none()); }
+        }
 
         this.locals.insert(key, ty);
         this.local_muts.insert(key, is_mut);
+        // Default: drop any prior keyword anchor so a stale outer-scope
+        // binding's span doesn't leak into the inner shadowing one.  The
+        // caller pairs the registration with `record_local_kw_span` when
+        // it has a parser-derived span to attach.
+        this.local_kw_spans.remove(&key);
+    }
+
+    /// Attach a keyword-span anchor to a previously-registered local.
+    /// `kw_span` is the SourceSpan the parser stamped on the
+    /// VarDeclNode's `kw_span` field — the `const`/`mut` keyword's
+    /// location for top-level locals, or a zero-width insertion point
+    /// just before the parameter name for params declared without
+    /// `mut`.  No-op when `kw_span` lacks a location.
+    record_local_kw_span(mut &this, name: SymbolStr, kw_span: SourceSpan) -> void {
+        if (!kw_span.has_location()) { return; }
+        this.local_kw_spans.insert(name.id, kw_span);
     }
 
     /// Look up a local binding's mutability.  Returns true for unknown
@@ -595,12 +743,19 @@ public:
             const key: u32 = this.undo_keys[i];
             const prev: TypeRef = this.undo_prev[i];
             const prev_mut: boolean = this.undo_muts[i];
+            const prev_kw: SourceSpan = this.undo_kw_spans[i];
             if (prev.is_valid()) {
                 this.locals.insert(key, prev);
                 this.local_muts.insert(key, prev_mut);
+                if (prev_kw.has_location()) {
+                    this.local_kw_spans.insert(key, prev_kw);
+                } else {
+                    this.local_kw_spans.remove(&key);
+                }
             } else {
                 this.locals.remove(&key);
                 this.local_muts.remove(&key);
+                this.local_kw_spans.remove(&key);
             }
         }
 
@@ -609,14 +764,17 @@ public:
             mut new_keys: u32[] = [];
             mut new_prev: TypeRef[] = [];
             mut new_muts: boolean[] = [];
+            mut new_kw_spans: SourceSpan[] = [];
             for (mut i: i64 = 0; i < save_point; i++) {
                 new_keys.push(this.undo_keys[i]);
                 new_prev.push(this.undo_prev[i]);
                 new_muts.push(this.undo_muts[i]);
+                new_kw_spans.push(this.undo_kw_spans[i]);
             }
             this.undo_keys = new_keys;
             this.undo_prev = new_prev;
             this.undo_muts = new_muts;
+            this.undo_kw_spans = new_kw_spans;
         }
     }
 
@@ -794,11 +952,13 @@ public:
 
     /// Reset per-function state and register parameters + "this".
     enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
-        this.locals     = HashMap<u32, TypeRef>::new();
-        this.local_muts = HashMap<u32, boolean>::new();
-        this.undo_keys  = [];
-        this.undo_prev  = [];
-        this.undo_muts  = [];
+        this.locals         = HashMap<u32, TypeRef>::new();
+        this.local_muts     = HashMap<u32, boolean>::new();
+        this.local_kw_spans = HashMap<u32, SourceSpan>::new();
+        this.undo_keys      = [];
+        this.undo_prev      = [];
+        this.undo_muts      = [];
+        this.undo_kw_spans  = [];
         this.return_type     = func.resolved_return_type;
         this.return_type_ann = func.return_type_annotation;
         this.this_type       = fn_this_type;
@@ -823,6 +983,7 @@ public:
                 this.this_is_mut = param.is_mutable;
             } else {
                 this.register_local_with_mut(param.name, ty, param.is_mutable);
+                this.record_local_kw_span(param.name, param.kw_span);
             }
         }
 
@@ -918,7 +1079,65 @@ public:
         diag = diag.at(func.span);
         diag = diag.with_note("every control-flow path through the body must end in `return <expr>`, a divergent call (e.g. `panic(...)`), or an infinite `loop { ... }` with no `break`");
         diag = diag.with_note("if a missing path is unreachable, end it with `return <default>` or `panic(\"unreachable\")`");
+
+        // Has-placeholders quickfix: append `return <default>;` on a new
+        // line at the end of the body so the user only has to fill in
+        // the value.  The default expression is picked to type-check
+        // against the declared return type for primitive cases, and is
+        // a `<TypeName>` placeholder otherwise.  Skipped when the body
+        // is empty (no anchor) or the last stmt has no usable span.
+        if (func.body.statements.length > 0) {
+            const last: StatementNode* =
+                func.body.statements[func.body.statements.length - 1];
+            if (last != null && last.span.has_location()) {
+                const anchor: SourceSpan = SourceSpan::new(
+                    last.span.file,
+                    last.span.end_line, last.span.end_col,
+                    last.span.end_line, last.span.end_col);
+                const placeholder: string =
+                    this.default_return_expr_for(func.resolved_return_type);
+                const repl: string =
+                    format("\nreturn %s;", placeholder);
+                diag = diag.suggest(Suggestion::single(anchor, repl,
+                    "add a `return` at the end of the body",
+                    Applicability::HasPlaceholders));
+            }
+        }
+
         this.ctx.diagnostics.emit(diag);
+    }
+
+    /// Build a placeholder expression suitable for an E0403 quickfix:
+    /// a literal whose type matches `ret_ty` when one obviously exists
+    /// (integers → `0`, floats → `0.0`, `bool`/`boolean` → `false`,
+    /// `string` → `""`, pointers → `null`), otherwise a `<TypeName>`
+    /// placeholder so the user knows what shape to fill in.  Kept
+    /// deliberately conservative — the goal is "compiles when the
+    /// user clicks `Apply`" for the common primitive case.
+    default_return_expr_for(&this, ret_ty: TypeRef) -> string {
+        if (!ret_ty.is_valid()) { return "<value>"; }
+        const t: Type* = this.arena.lookup(ret_ty.id);
+        if (t == null) { return "<value>"; }
+        match (t.kind) {
+            TypeKind::Pointer  => { return "null"; }
+            TypeKind::Optional => { return "Option::None"; }
+            _                  => { /* fall through */ }
+        }
+        const name: string = this.type_display_name(ret_ty);
+        if (strcmp(name, "boolean") == 0 || strcmp(name, "bool") == 0) {
+            return "false";
+        }
+        if (strcmp(name, "string") == 0) { return "\"\""; }
+        if (strcmp(name, "f32") == 0 || strcmp(name, "f64") == 0) {
+            return "0.0";
+        }
+        if (strcmp(name, "i8") == 0  || strcmp(name, "i16") == 0
+         || strcmp(name, "i32") == 0 || strcmp(name, "i64") == 0
+         || strcmp(name, "u8") == 0  || strcmp(name, "u16") == 0
+         || strcmp(name, "u32") == 0 || strcmp(name, "u64") == 0) {
+            return "0";
+        }
+        return format("<%s>", name);
     }
 
     /// Returns true if `ret` is a return type that demands an explicit
@@ -1352,14 +1571,15 @@ public:
                             var_node.span
                         };
                     const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
-                    this.emit_type_mismatch(
+                    this.emit_type_mismatch_with_value(
                         ErrorCode::E0200_TYPE_MISMATCH,
                         value_span,
                         var_node.resolved_type,
                         init_type,
                         format("`%s` was declared with this type; the initializer must match",
                                var_name),
-                        ann_span);
+                        ann_span,
+                        var_node.initializer);
                 }
             }
         }
@@ -1384,6 +1604,9 @@ public:
             // to keep the variable visible in scope.
             this.register_local(var_node.name, this.arena.get_void());
         }
+        // Stash the parser-stamped keyword span so a later E0218 on this
+        // binding can suggest "make it `mut`" with the right anchor.
+        this.record_local_kw_span(var_node.name, var_node.kw_span);
     }
 
     /// Type-check a struct destructure declaration: `const { f1, f2: alias }: T = expr;`.
@@ -1421,13 +1644,14 @@ public:
                             node.span
                         };
                     const ann_span: SourceSpan = annotation_span(node.type_annotation);
-                    this.emit_type_mismatch(
+                    this.emit_type_mismatch_with_value(
                         ErrorCode::E0200_TYPE_MISMATCH,
                         value_span,
                         node.resolved_type,
                         init_type,
                         "destructure pattern's declared type must match the initializer",
-                        ann_span);
+                        ann_span,
+                        node.initializer);
                 }
             }
         }
@@ -1487,9 +1711,28 @@ public:
             }
             if (dup) {
                 const dup_name: string = this.intern.resolve(b.source_field);
-                this.ctx.emit_error_at(ErrorCode::E0356_DUPLICATE_FIELD,
-                    format("field '%s' bound more than once in destructure", dup_name),
-                    b.span);
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0356_DUPLICATE_FIELD,
+                    format("field `%s` bound more than once in destructure",
+                        dup_name));
+                diag = diag.at_with_label(b.span,
+                    format("duplicate binding for `%s`", dup_name));
+                // Machine-applicable removal: drop everything from just
+                // after the previous binding (which always exists for
+                // dup==true since j<i) up through the duplicate's end.
+                // That captures the `, dup_name` slice; the comma that
+                // separates the prev binding from this one goes with it.
+                const prev: DestructureBinding = node.bindings[i - 1];
+                if (prev.span.has_location() && b.span.has_location()) {
+                    const removal: SourceSpan = SourceSpan::new(
+                        b.span.file,
+                        prev.span.end_line, prev.span.end_col,
+                        b.span.end_line, b.span.end_col);
+                    diag = diag.suggest(Suggestion::machine_applicable(
+                        removal, "",
+                        format("remove the duplicate binding `%s`", dup_name)));
+                }
+                this.ctx.emit_diagnostic(diag);
                 this.register_local_with_mut(b.local_name, this.arena.get_void(),
                     b.is_mutable);
                 continue;
@@ -1557,10 +1800,51 @@ public:
             }
             const ty_sym: SymbolStr = this.intern.intern(this.arena.format_display(ty));
             const ty_name: string = this.intern.resolve(ty_sym);
-            this.ctx.emit_error_at(ErrorCode::E0362_DESTRUCTURE_INCOMPLETE,
-                format("destructure of '%s' must bind all %lld field(s); missing: %s",
-                    ty_name, fields_ptr.length, missing),
-                node.span);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0362_DESTRUCTURE_INCOMPLETE,
+                format("destructure of `%s` must bind all %lld field(s); missing: %s",
+                    ty_name, fields_ptr.length, missing));
+            diag = diag.at_with_label(node.span,
+                format("missing %lld field%s",
+                    count, if (count == 1) { "" } else { "s" }));
+
+            // Machine-applicable insert: append `, <missing_fields>` just
+            // after the last existing binding.  Skipped when there are
+            // no existing bindings (the empty-pattern path is rejected
+            // earlier) or the last binding span is missing.
+            if (node.bindings.length > 0) {
+                const last: DestructureBinding =
+                    node.bindings[node.bindings.length - 1];
+                if (last.span.has_location()) {
+                    mut repl: string = "";
+                    for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+                        mut bound: boolean = false;
+                        for (mut bi: i64 = 0; bi < node.bindings.length; bi++) {
+                            if (node.bindings[bi].source_field.id
+                                    == fields_ptr[k].name.id) {
+                                bound = true; break;
+                            }
+                        }
+                        if (!bound) {
+                            const fname: string =
+                                this.intern.resolve(fields_ptr[k].name);
+                            repl = format("%s, %s", repl, fname);
+                        }
+                    }
+                    const ins: SourceSpan = SourceSpan::new(
+                        last.span.file,
+                        last.span.end_line, last.span.end_col,
+                        last.span.end_line, last.span.end_col);
+                    diag = diag.suggest(Suggestion::machine_applicable(
+                        ins, repl,
+                        if (count == 1) {
+                            "bind the missing field"
+                        } else {
+                            "bind the missing fields"
+                        }));
+                }
+            }
+            this.ctx.emit_diagnostic(diag);
         }
     }
 
@@ -1596,13 +1880,14 @@ public:
                             node.span
                         };
                     const ann_span: SourceSpan = annotation_span(this.return_type_ann);
-                    this.emit_type_mismatch(
+                    this.emit_type_mismatch_with_value(
                         ErrorCode::E0200_TYPE_MISMATCH,
                         value_span,
                         this.return_type,
                         expr_type,
                         "the function's declared return type doesn't match the value returned here",
-                        ann_span);
+                        ann_span,
+                        node.expression);
                 }
             }
         }
@@ -1765,6 +2050,46 @@ public:
                 format("variants: %s", names_str)
             }));
         diag = diag.with_note("add explicit arms for the missing variants, or use `_ => { ... }` to catch the rest");
+
+        // Has-placeholders quickfix: append `<Enum>::<Variant> => { }`
+        // for each missing variant, anchored after the last existing arm
+        // so the renderer's auto-indent picks up the arm-body indent.
+        // Skipped when there are no arms (nothing to anchor to) or when
+        // the last arm's span is empty (synthesised input).
+        if (arms.length > 0) {
+            mut last_arm: MatchArmNode* = null;
+            for (mut k: i64 = arms.length - 1; k >= 0; k -= 1) {
+                if (arms[k] != null && arms[k].span.has_location()) {
+                    last_arm = arms[k];
+                    break;
+                }
+            }
+            if (last_arm != null) {
+                const anchor: SourceSpan = SourceSpan::new(
+                    last_arm.span.file,
+                    last_arm.span.end_line, last_arm.span.end_col,
+                    last_arm.span.end_line, last_arm.span.end_col);
+                // Prefer the subject's bare display name (e.g. `Color`)
+                // over the fully-qualified name (`Main::Color`) so the
+                // suggestion mirrors the form the user already wrote
+                // in the existing arms.
+                const short_enum: string = this.arena.resolve_display_name_short(subject_type.id);
+                mut repl: string = "";
+                for (mut i: i64 = 0; i < missing_names.length; i++) {
+                    const vn: string = this.intern.resolve(missing_names[i]);
+                    repl = format("%s\n%s::%s => { }", repl, short_enum, vn);
+                }
+                const sug_msg: string =
+                    if (missing_names.length == 1) {
+                        "add an arm for the missing variant"
+                    } else {
+                        "add arms for the missing variants"
+                    };
+                diag = diag.suggest(Suggestion::single(anchor, repl,
+                    sug_msg, Applicability::HasPlaceholders));
+            }
+        }
+
         this.ctx.diagnostics.emit(diag);
     }
 
@@ -2040,7 +2365,40 @@ public:
                                     name_str));
                             diag = diag.at_with_label(lhs.span,
                                 "this binding is immutable");
-                            diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
+                            // Machine-applicable fix: if we recorded a
+                            // keyword anchor at the declaration site,
+                            // either replace `const` with `mut` (for
+                            // top-level locals) or insert `mut ` before
+                            // the parameter name (zero-width anchor).
+                            // The renderer + LSP both consume `.parts`
+                            // directly, so a single edit is enough.
+                            match (this.local_kw_spans.get(&id.name.id)) {
+                                Option::Some(kw) => {
+                                    const kw_len: u32 =
+                                        if (kw.end_col > kw.start_col) {
+                                            kw.end_col - kw.start_col
+                                        } else { 0 };
+                                    if (kw_len == 0) {
+                                        // Param without `mut`: insert "mut "
+                                        // before the name.
+                                        diag = diag.suggest(
+                                            Suggestion::machine_applicable(
+                                                kw, "mut ",
+                                                format("make `%s` mutable", name_str)));
+                                    } else {
+                                        // Local with `const` (or `mut` —
+                                        // skipped already by the !is_mut
+                                        // guard above): replace with `mut`.
+                                        diag = diag.suggest(
+                                            Suggestion::machine_applicable(
+                                                kw, "mut",
+                                                format("make `%s` mutable", name_str)));
+                                    }
+                                }
+                                Option::None => {
+                                    diag = diag.with_note("declare the binding with `mut` instead of `const` to allow reassignment");
+                                }
+                            }
                             this.ctx.diagnostics.emit(diag);
                         }
                     }
@@ -2580,12 +2938,102 @@ public:
 
         const expected: i64 = ft.param_types.length;
         const got: i64 = call.arguments.length;
+        if (got < expected) {
+            const name: string = this.intern.resolve(ident.name);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0216_TOO_FEW_ARGS,
+                format("function `%s` takes %lld argument(s) but %lld were supplied",
+                       name, expected, got));
+            diag = diag.at_with_label(call.span,
+                format("missing %lld argument%s",
+                    expected - got,
+                    if (expected - got == 1) { "" } else { "s" }));
+
+            // Has-placeholders insert: append `<TypeName>` placeholders
+            // for each missing parameter, anchored just before the
+            // closing paren.  Skipped when the call span looks malformed.
+            if (call.span.has_location() && call.span.end_col > 0) {
+                mut repl: string = "";
+                for (mut k: i64 = got; k < expected; k++) {
+                    const pname: string =
+                        this.arena.resolve_display_name_short(ft.param_types[k].id);
+                    const sep: string = if (k == 0) { "" } else { ", " };
+                    repl = format("%s%s<%s>", repl, sep, pname);
+                }
+                const ins: SourceSpan = SourceSpan::new(
+                    call.span.file,
+                    call.span.end_line, call.span.end_col - 1,
+                    call.span.end_line, call.span.end_col - 1);
+                diag = diag.suggest(Suggestion::single(ins, repl,
+                    if (expected - got == 1) {
+                        "provide the missing argument"
+                    } else {
+                        "provide the missing arguments"
+                    },
+                    Applicability::HasPlaceholders));
+            }
+            this.ctx.diagnostics.emit(diag);
+            return;
+        }
         if (got > expected) {
             const name: string = this.intern.resolve(ident.name);
-            this.ctx.emit_error_at(ErrorCode::E0215_TOO_MANY_ARGS,
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0215_TOO_MANY_ARGS,
                 format("function `%s` takes %lld argument(s) but %lld were supplied",
-                       name, expected, got),
-                call.span);
+                       name, expected, got));
+            diag = diag.at_with_label(call.span,
+                format("unexpected argument%s",
+                    if (got - expected == 1) { "" } else { "s" }));
+
+            // Machine-applicable: delete from the end of the last
+            // accepted argument through the byte just before the closing
+            // paren.  This removes both the excess args AND the separating
+            // commas, leaving the call shape (and surrounding code)
+            // intact.  Skipped when the spans we'd need are missing or
+            // out of order — the diagnostic itself still renders.
+            mut anchor_end_line: u32 = 0;
+            mut anchor_end_col:  u32 = 0;
+            mut anchor_ok:       boolean = false;
+            if (expected == 0) {
+                // Remove every argument: anchor right after `(`, derived
+                // from the start of the first argument.  We can't undo
+                // any whitespace between `(` and the first arg, but the
+                // user's IDE will collapse it when the replacement
+                // applies.
+                if (call.arguments.length > 0
+                    && call.arguments[0] != null
+                    && call.arguments[0].span.has_location()) {
+                    anchor_end_line = call.arguments[0].span.start_line;
+                    anchor_end_col  = call.arguments[0].span.start_col;
+                    anchor_ok = true;
+                }
+            } else {
+                const last_keep: ExpressionNode* =
+                    call.arguments[expected - 1];
+                if (last_keep != null && last_keep.span.has_location()) {
+                    anchor_end_line = last_keep.span.end_line;
+                    anchor_end_col  = last_keep.span.end_col;
+                    anchor_ok = true;
+                }
+            }
+            if (anchor_ok && call.span.has_location()
+                && call.span.end_col > 0) {
+                const removal: SourceSpan = SourceSpan::new(
+                    call.span.file,
+                    anchor_end_line, anchor_end_col,
+                    call.span.end_line,
+                    call.span.end_col - 1);
+                diag = diag.suggest(Suggestion::machine_applicable(
+                    removal, "",
+                    if (got - expected == 1) {
+                        "remove the extra argument"
+                    } else {
+                        format("remove the %lld extra arguments",
+                            got - expected)
+                    }));
+            }
+
+            this.ctx.diagnostics.emit(diag);
         }
     }
 
@@ -3361,12 +3809,20 @@ public:
                 "implement `%s` for `%s`, or change the receiver to a type that already does",
                 trait_str, type_display));
         } else {
-            // Suggest a similarly-named method on the same type.
+            // Suggest a similarly-named method on the same type.  We
+            // already have the member name's span, so attach an actual
+            // machine-applicable Suggestion (rather than a help-only
+            // line) so editors can offer it as a quickfix.
             const suggestion: SymbolStr = this.suggest_similar_method(type_sym, member.member);
             if (suggestion.is_valid()) {
                 const sug_str: string = this.intern.resolve(suggestion);
                 diag = diag.help(format(
-                    "did you mean `%s`?", sug_str));
+                    "a method with a similar name exists: `%s`", sug_str));
+                if (member.member_span.has_location()) {
+                    diag = diag.suggest(Suggestion::machine_applicable(
+                        member.member_span, sug_str,
+                        format("did you mean `%s`?", sug_str)));
+                }
             }
         }
 
@@ -4827,10 +5283,29 @@ public:
         const fn_shape: i32 = this.enum_try_shape(this.return_type);
         if (fn_shape != operand_shape) {
             const want: string = if (operand_shape == 1) { "Result" } else { "Option" };
-            this.ctx.emit_error_at(ErrorCode::E0235_TRY_OUTSIDE_RESULT_FN,
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0235_TRY_OUTSIDE_RESULT_FN,
                 format("the `?` operator can only be used in a function that returns `%s`",
-                    want),
-                node.span);
+                    want));
+            diag = diag.at_with_label(node.span,
+                format("propagates a `%s`, but the enclosing function doesn't return one",
+                    want));
+
+            // Has-placeholders fix: replace the existing return-type
+            // annotation with the operand's type so the function shape
+            // matches what `?` requires.  The user can later swap in a
+            // different success type, but this version compiles.
+            const ann_span: SourceSpan =
+                annotation_span(this.return_type_ann);
+            if (ann_span.has_location()) {
+                const ret_repl: string =
+                    this.arena.resolve_display_name_short(operand_type.id);
+                diag = diag.suggest(Suggestion::single(ann_span, ret_repl,
+                    format("change the return type to `%s`", ret_repl),
+                    Applicability::HasPlaceholders));
+            }
+
+            this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
 
@@ -4928,13 +5403,14 @@ public:
                                     || this.contains_generic_param(field_type);
                 if (!skip && !this.checker.can_assign(value_type, field_type)) {
                     const field_name_str: string = this.intern.resolve(field_init.field_name);
-                    this.emit_type_mismatch(
+                    this.emit_type_mismatch_with_value(
                         ErrorCode::E0200_TYPE_MISMATCH,
                         value_expr.span,
                         field_type,
                         value_type,
                         format("field `%s` expects this type", field_name_str),
-                        SourceSpan::none());
+                        SourceSpan::none(),
+                        value_expr);
                 }
             }
         }

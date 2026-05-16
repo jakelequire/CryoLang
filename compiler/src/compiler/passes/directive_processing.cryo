@@ -42,6 +42,8 @@ import Compiler::Diag;
 import Compiler::Diag::Snapshot;
 import Compiler::Diag::SourceSpan;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
+import Compiler::Diag::EditDistance;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
@@ -500,6 +502,36 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
                 name);
             mut diag: Diagnostic = Diagnostic::warning(code, msg);
             diag = diag.at(dir.span);
+
+            // Did-you-mean: pick the closest known builtin by edit
+            // distance.  The full directive list is short and stable
+            // enough to embed inline here; updating it tracks
+            // `is_known_builtin` above.
+            mut cands: string[] = [
+                "inline", "noinline", "entry", "test", "ignore",
+                "should_panic", "config", "deprecated", "align",
+                "repr", "link", "target", "allow", "warn", "deny",
+                "derive", "sink",
+                "windows", "linux", "macos", "unix", "not"
+            ];
+            const best: string = find_best_candidate(name, cands);
+            if (best != "") {
+                diag = diag.help(format(
+                    "a directive with a similar name exists: `%s`", best));
+                // The parser stamps `dir.span` over the whole `![name(args)]`
+                // slice with `![` at start_col.  The directive name starts
+                // exactly 2 bytes later and has the length of `name`.  No
+                // whitespace is allowed between `![` and the identifier,
+                // so this byte arithmetic is safe.
+                const name_len: u32 = strlen(name) as u32;
+                const ns: SourceSpan = SourceSpan::new(
+                    dir.span.file,
+                    dir.span.start_line, dir.span.start_col + 2,
+                    dir.span.start_line, dir.span.start_col + 2 + name_len);
+                diag = diag.suggest(Suggestion::machine_applicable(
+                    ns, best,
+                    format("did you mean `%s`?", best)));
+            }
             ctx.emit_diagnostic(diag);
         }
     }
@@ -543,6 +575,9 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                     "directive `![sink]` cannot be applied to a static method (no receiver)";
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
+                diag = diag.suggest(Suggestion::machine_applicable(
+                    dir.span, "",
+                    "remove the `![sink]` directive"));
                 ctx.emit_diagnostic(diag);
                 return;
             }
@@ -556,6 +591,9 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                     "directive `![sink]` requires a method with a `this` receiver";
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
+                diag = diag.suggest(Suggestion::machine_applicable(
+                    dir.span, "",
+                    "remove the `![sink]` directive"));
                 ctx.emit_diagnostic(diag);
                 return;
             }
@@ -601,6 +639,9 @@ function emit_placement_error(ctx: CompilationContext*, dir: DirectiveNode*,
         name, expected_target, target_label(actual));
     mut diag: Diagnostic = Diagnostic::error(code, msg);
     diag = diag.at(dir.span);
+    diag = diag.suggest(Suggestion::machine_applicable(
+        dir.span, "",
+        format("remove the misplaced `![%s]` directive", name)));
     ctx.emit_diagnostic(diag);
 }
 

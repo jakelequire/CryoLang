@@ -14,6 +14,7 @@ namespace Compiler::Passes::ASTValidation;
 import Compiler::Diag;
 import Compiler::Diag::Snapshot;
 import Compiler::Diag::SourceSpan;
+import Compiler::Diag::Diagnostic;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
@@ -228,11 +229,33 @@ type struct ASTValidator {
                 if (seen_tags[k] == tag) { clash_idx = k; break; }
             }
             if (clash_idx >= 0) {
-                this.emit(ErrorCode::E0064_DUPLICATE_ENUM_DISCRIMINANT,
-                    format("variant '%s' shares discriminant %lld with '%s' in enum '%s'",
+                // Suggest the lowest non-negative integer not yet used
+                // by another variant.  Limited to a 1024-value search so
+                // a deeply-clashing enum doesn't spin; in practice the
+                // free slot is always within a handful of the user's
+                // existing tags.
+                mut free_tag: i64 = 0;
+                mut found_free: boolean = false;
+                for (mut cand: i64 = 0; cand < 1024; cand += 1) {
+                    mut taken: boolean = false;
+                    for (mut k: i64 = 0; k < seen_tags.length; k++) {
+                        if (seen_tags[k] == cand) { taken = true; break; }
+                    }
+                    if (!taken) { free_tag = cand; found_free = true; break; }
+                }
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0064_DUPLICATE_ENUM_DISCRIMINANT,
+                    format("variant `%s` shares discriminant %lld with `%s` in enum `%s`",
                         this.ctx.resolve_str(v.name), tag,
-                        this.ctx.resolve_str(seen_names[clash_idx]), name),
-                    v.span);
+                        this.ctx.resolve_str(seen_names[clash_idx]), name));
+                diag = diag.at_with_label(v.span,
+                    format("duplicate discriminant %lld", tag));
+                if (found_free) {
+                    diag = diag.help(format(
+                        "give `%s` a unique tag (e.g. `= %lld`) or remove the conflicting `= %lld` on the earlier variant",
+                        this.ctx.resolve_str(v.name), free_tag, tag));
+                }
+                this.ctx.emit_diagnostic(diag);
             } else {
                 seen_tags.push(tag);
                 seen_names.push(v.name);

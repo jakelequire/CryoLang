@@ -415,6 +415,10 @@ public:
         mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
         node.set_mutable(is_mutable);
         node.set_name_span(this.span_from_token(name_tok));
+        // The leading `const`/`mut` keyword's exact span — recorded
+        // separately from the whole-declaration span so E0218 can emit a
+        // precise replace-keyword quickfix.
+        node.set_kw_span(this.span_from_token(start));
 
         // Required type annotation
         if (this.match_tok(TokenType::Colon)) {
@@ -648,10 +652,15 @@ public:
     parse_parameter() -> VarDeclNode* {
         const start: Token = this.current();
         mut is_mutable: boolean = false;
+        // Span of the leading `mut` keyword if present; otherwise an
+        // anchor for "insert `mut` here" — used by E0218 to suggest
+        // marking a param mutable in place.
+        mut kw_span: SourceSpan = SourceSpan::none();
 
         // Optional 'mut' keyword
         if (this.check(TokenType::KwMut)) {
             is_mutable = true;
+            kw_span = this.span_from_token(start);
             this.advance();
         }
 
@@ -712,6 +721,15 @@ public:
         mut param: VarDeclNode* = new VarDeclNode(pname, this.span_from_token(name_tok));
         param.set_mutable(is_mutable);
         param.set_name_span(this.span_from_token(name_tok));
+        // If no `mut` keyword was consumed, point kw_span at a zero-width
+        // anchor just before the parameter name so a downstream E0218
+        // fix can insert `mut ` at exactly the right place.
+        if (!kw_span.has_location()) {
+            const ns: SourceSpan = this.span_from_token(name_tok);
+            kw_span = SourceSpan::new(ns.file, ns.start_line, ns.start_col,
+                                      ns.start_line, ns.start_col);
+        }
+        param.set_kw_span(kw_span);
 
         // Variadic parameter: name... (e.g., args...)
         // Return the param as-is (no type annotation); the caller
@@ -836,8 +854,17 @@ public:
             }
             if (this.check(TokenType::KwProtected) && this.peek_at(1).kind == TokenType::Colon) {
                 if (is_struct) {
-                    this.report_error(ErrorCode::E0359_PROTECTED_IN_STRUCT,
-                        "'protected:' is not allowed in structs (structs do not support inheritance)");
+                    const kw_span: SourceSpan = this.span_from_token(this.current());
+                    this.panic_mode = true;
+                    this.error_count += 1;
+                    mut diag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0359_PROTECTED_IN_STRUCT,
+                        "`protected:` is not allowed in structs (structs do not support inheritance)");
+                    diag = diag.at(kw_span);
+                    diag = diag.suggest(Suggestion::single(kw_span, "public",
+                        "change to `public:`",
+                        Applicability::MaybeIncorrect));
+                    this.ctx.emit_diagnostic(diag);
                     this.advance(); this.advance();
                     continue;
                 }
@@ -865,8 +892,17 @@ public:
                 this.advance(); // consume 'private'
             } else if (this.check(TokenType::KwProtected) && this.peek_at(1).kind != TokenType::Colon) {
                 if (is_struct) {
-                    this.report_error(ErrorCode::E0359_PROTECTED_IN_STRUCT,
-                        "'protected' is not allowed in structs (structs do not support inheritance)");
+                    const kw_span: SourceSpan = this.span_from_token(this.current());
+                    this.panic_mode = true;
+                    this.error_count += 1;
+                    mut diag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0359_PROTECTED_IN_STRUCT,
+                        "`protected` is not allowed in structs (structs do not support inheritance)");
+                    diag = diag.at(kw_span);
+                    diag = diag.suggest(Suggestion::single(kw_span, "public",
+                        "change to `public`",
+                        Applicability::MaybeIncorrect));
+                    this.ctx.emit_diagnostic(diag);
                     this.advance();
                     continue;
                 }
