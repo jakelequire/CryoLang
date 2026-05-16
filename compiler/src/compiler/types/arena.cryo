@@ -5,7 +5,9 @@
 ///! methods, which return TypeRef handles.
 ///!
 ///! Design note: User-defined type caches are keyed by qualified name only
-///! (not module_id::name), fixing the C++ compiler's cross-module dedup issue.
+///! (not module_id::name) so cross-module references dedup against the
+///! same arena entry; keying on module-prefixed names produces phantom
+///! duplicate types at every import site.
 
 namespace Compiler::Types::Arena;
 
@@ -88,8 +90,10 @@ type struct TypeArena {
     func_template_cache: HashMap<u32, TypeRef>;
 
     // -- Generic parameter dedup cache (key: (name.id << 32) | index → TypeRef) --
-    // Integer key avoids the bootstrap-bug pointer-compare on string keys
-    // that left every (name, index) call producing a fresh TypeRef.
+    // Integer key avoids the trap of using raw `string` keys in a HashMap:
+    // the raw `string` type is `*u8` and equality is pointer-compare, so
+    // distinct `string` instances of the same content would each produce a
+    // fresh TypeRef instead of hitting the cache.
     generic_param_cache:   HashMap<u64, TypeRef>;
     bounded_param_cache:   HashMap<u64, TypeRef>;
 
@@ -498,9 +502,10 @@ type struct TypeArena {
     /// codegen walks `resolved_type` into a real struct/enum/class instead of
     /// bottoming out on an unresolved placeholder.
     ///
-    /// `create_instantiation` does NOT dedupe (the bootstrap HashMap<string,V>
-    /// pointer-compare bug would make a format()-keyed cache useless), so
-    /// sema creates a fresh InstantiatedType at every call site.  Without
+    /// `create_instantiation` does NOT dedupe (a HashMap<string, V> keyed
+    /// on `format()`-produced raw `string` values would compare keys by
+    /// pointer and never hit), so sema creates a fresh InstantiatedType
+    /// at every call site.  Without
     /// propagation, only the single InstantiatedType handed to the
     /// monomorphizer via `request.generic_type` gets its resolved_type set;
     /// every other textual occurrence of `HashMap<string, u32>` stays
