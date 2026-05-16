@@ -219,9 +219,8 @@ type struct CodegenPasses {
         // from this module, avoiding the O(modules × funcs × overloads) bulk
         // pre-declaration loop that used to run here.
 
-        // Emit cryoc's runtime helpers (`format`, `panic`, etc.) into
-        // this module with linkonce_odr linkage.  Replaces the equivalent
-        // definitions that used to come from cryort.c.  Idempotent and
+        // Emit the inline runtime helpers (`format`, `panic`, etc.) into
+        // this module with linkonce_odr linkage.  Idempotent and
         // per-module; the linker collapses the 100+ copies down to one.
         emit_format_runtime(cg);
         emit_panic_runtime(cg);
@@ -643,10 +642,8 @@ type struct CodegenPasses {
             // Library / stdlib target: no executable to produce, but
             // bundle the per-module .o files into a single archive that
             // executable projects can pick up via `<root>/<output>/lib<name>.a`.
-            // The C++ bootstrap stdlib build wrote `stdlib/.bin/libcryo.a`;
-            // cryoc must produce the same artifact (matching name + path)
-            // so the executable-link path's existing stdlib reference still
-            // resolves once cryoc is the one rebuilding stdlib.
+            // The stdlib target writes `stdlib/.bin/libcryo.a` (canonical
+            // path the executable-link path below looks for).
             return CodegenPasses::bundle_archive(ctx);
         }
 
@@ -700,23 +697,22 @@ type struct CodegenPasses {
         for (mut i: i64 = 0; i < cfg.link_libs.length; i++) {
             cmd = format("%s -l%s", cmd, shell_quote(cfg.link_libs[i]));
         }
-        // Stdlib archive: cryoc emits `<stdlib_root>/.bin/libcryo.a`
-        // when it batch-builds the stdlib (see bundle_archive); pull
-        // it in unless the project opted out via `no_std`.  Read the
-        // resolved stdlib_root off the context so installed cryo
-        // (where stdlib lives at <prefix>/share/cryo/stdlib) and
-        // in-repo cryo (where it lives at <repo>/stdlib) both link
+        // Stdlib archive: the stdlib build emits `<stdlib_root>/.bin/libcryo.a`
+        // (see bundle_archive); pull it in unless the project opted out
+        // via `no_std`.  Read the resolved stdlib_root off the context
+        // so installed cryo (where stdlib lives at <prefix>/share/cryo/stdlib)
+        // and in-repo cryo (where it lives at <repo>/stdlib) both link
         // against the right archive.
         if (!cfg.no_std && intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
         }
-        // Cryo runtime support is fully inline-lowered by cryoc itself;
-        // every bare-name intrinsic (i32_to_i64, ptr_add, format, bswap*,
-        // clz*, isfinite, atomic_fence, dirent_*) is emitted directly
-        // into LLVM IR by IntrinsicsCodegen.  No C runtime to link.
-        // System libs every cryoc binary needs: libm for math intrinsics,
+        // Cryo runtime support is fully inline-lowered: every bare-name
+        // intrinsic (i32_to_i64, ptr_add, format, bswap*, clz*, isfinite,
+        // atomic_fence, dirent_*) is emitted directly into LLVM IR by
+        // IntrinsicsCodegen.  No C runtime to link.
+        // System libs every cryo binary needs: libm for math intrinsics,
         // libstdc++ for LLVM's C++ internals (dragged in through -lLLVM-*).
         cmd = format("%s -lm -lstdc++", cmd);
 
@@ -810,9 +806,9 @@ type struct CodegenPasses {
 
     /// Bundle a library/stdlib target's per-module .o files into a single
     /// archive next to them.  The Stdlib target is hardcoded to `libcryo.a`
-    /// (matching the C++ bootstrap stdlib build output and the path the
-    /// executable-link path looks for via `<root>/../stdlib/.bin/libcryo.a`);
-    /// Library targets use `lib<project_name>.a` per the usual convention.
+    /// (the path the executable-link path looks for via
+    /// `<root>/../stdlib/.bin/libcryo.a`); Library targets use
+    /// `lib<project_name>.a` per the usual convention.
     /// `ar rcs` is idempotent; re-runs overwrite the archive cleanly.
     static bundle_archive(ctx: CompilationContext*) -> PassResult {
         if (ctx.project_config == null) {

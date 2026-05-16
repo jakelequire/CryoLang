@@ -1,8 +1,9 @@
 /// IR Generator
 ///
-/// The main AST visitor that produces LLVM IR.  Uses direct dispatch
-/// by NodeKind (no vtable).  Delegates to the expression, statement,
-/// and declaration codegen modules for the actual IR construction.
+/// The main AST visitor that produces LLVM IR.  Extends `BaseASTVisitor`
+/// and uses standard `accept(visitor)` double-dispatch throughout.
+/// Delegates to the expression, statement, and declaration codegen
+/// modules for the actual IR construction.
 
 namespace Compiler::Codegen::IRGenerator;
 
@@ -214,88 +215,15 @@ public:
         for (mut i: i64 = 0; i < stmts.length; i++) {
             const stmt: ASTNode* = stmts[i];
             if (stmt == null) { continue; }
-
-            match (stmt.kind) {
-                NodeKind::FunctionDeclaration => {
-                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    if (func.generic_params.length > 0) { continue; }
-                    if (func.body == null) { continue; }
-                    const fn_name: string = this.cg.resolve(func.name);
-                    // `cryo test` synthesizes its own `main`; suppress the
-                    // user's so the LLVM module has exactly one `main`
-                    // symbol.  Mirrors the `declare_function` guard.
-                    if (this.cg.ctx.mode.skip_user_main()
-                            && intrinsics::strcmp(fn_name, "main") == 0) {
-                        cdebug("[IRGen]   [%lld] func body: main (suppressed by test mode)\n", i);
-                        fflush(null);
-                        continue;
-                    }
-                    cdebug("[IRGen]   [%lld] func body: %s\n", i, fn_name); fflush(null);
-                    this.generate_function_body(func);
-                    cdebug("[IRGen]   [%lld] func done\n", i); fflush(null);
-                }
-                NodeKind::ImplementationBlock => {
-                    const impl_node: ImplBlockNode* = stmt as ImplBlockNode*;
-                    const impl_target: string = this.cg.resolve(impl_node.target_type);
-                    cdebug("[IRGen]   [%lld] impl block: %s (%lld methods)\n",
-                           i, impl_target, impl_node.methods.length); fflush(null);
-                    this.generate_impl_block(impl_node);
-                    cdebug("[IRGen]   [%lld] impl done\n", i); fflush(null);
-                }
-                NodeKind::StructDeclaration => {
-                    const struct_node: StructDeclNode* = stmt as StructDeclNode*;
-                    if (struct_node.generic_params.length > 0) { continue; }
-                    if (struct_node.methods.length > 0) {
-                        const sname: string = this.cg.resolve(struct_node.name);
-                        cdebug("[IRGen]   [%lld] struct methods: %s (%lld methods)\n",
-                               i, sname, struct_node.methods.length); fflush(null);
-                        // Use the arena's canonical qualified name for specialized
-                        // structs so method keys match the DI registration.
-                        const s_di: DeclarationIndex* = this.cg.get_decl_index();
-                        const s_local: SymbolStr = this.cg.qualify(struct_node.name);
-                        mut s_ref: TypeRef = s_di.lookup_type(s_local);
-                        if (!s_ref.is_valid()) {
-                            s_ref = s_di.lookup_type(struct_node.name);
-                        }
-                        if (s_ref.is_valid()) {
-                            const s_arena: TypeArena* = this.cg.get_arena();
-                            const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
-                            if (s_qname.is_valid()) {
-                                this.current_impl_target = s_qname;
-                            } else {
-                                this.current_impl_target = s_local;
-                            }
-                        } else {
-                            this.current_impl_target = s_local;
-                        }
-                        for (mut j: i64 = 0; j < struct_node.methods.length; j++) {
-                            this.generate_method_body(struct_node.methods[j]);
-                        }
-                        this.current_impl_target = SymbolStr::empty();
-                        cdebug("[IRGen]   [%lld] struct methods done\n", i); fflush(null);
-                    }
-                }
-                NodeKind::ClassDeclaration => {
-                    const class_node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (class_node.generic_params.length > 0) { continue; }
-                    if (class_node.methods.length > 0) {
-                        const cname: string = this.cg.resolve(class_node.name);
-                        cdebug("[IRGen]   [%lld] class methods: %s (%lld methods)\n",
-                               i, cname, class_node.methods.length); fflush(null);
-                        this.current_impl_target = this.cg.qualify(class_node.name);
-                        for (mut j: i64 = 0; j < class_node.methods.length; j++) {
-                            this.generate_method_body(class_node.methods[j]);
-                        }
-                        this.current_impl_target = SymbolStr::empty();
-                        cdebug("[IRGen]   [%lld] class methods done\n", i); fflush(null);
-                    }
-                }
-                NodeKind::VariableDeclaration => {
-                    // Globals are emitted in Phase 2 (declare_functions) so they
-                    // are visible to function bodies regardless of source order.
-                }
-                _ => {}
-            }
+            // Top-level dispatch via accept(); the visit() overrides for
+            // FunctionDeclNode / ImplBlockNode / StructDeclNode /
+            // ClassDeclNode handle their own emission.  Any node kind
+            // without an override (TypeAlias, Enum, Trait, Namespace,
+            // Import, etc.) falls through to BaseASTVisitor's no-op.
+            // Top-level VarDeclNode is guarded by `is_global` inside its
+            // visit() override so globals (emitted in Phase 2) are
+            // re-skipped here.
+            stmt.accept(this);
         }
 
         cdebug("[IRGen] Phase 3: all bodies done\n"); fflush(null);
@@ -304,10 +232,102 @@ public:
 
 
     // ========================================================================
-    // Direct codegen methods (bypass vtable dispatch)
+    // Top-level declaration visit() overrides
+    //
+    // Each override carries the orchestration (skip-generic / skip-test-main
+    // / debug logging / current_impl_target plumbing) that previously sat in
+    // generate_program's top-level match.  The body generators below
+    // (`generate_function_body`, `generate_impl_block`, `generate_method_body`)
+    // are still called directly from these — they're shared helpers.
     // ========================================================================
 
-    /// Generate a function body directly, without virtual dispatch.
+    override visit(mut &this, node: FunctionDeclNode*) -> void {
+        if (node == null) { return; }
+        if (node.generic_params.length > 0) { return; }
+        if (node.body == null) { return; }
+        const fn_name: string = this.cg.resolve(node.name);
+        // `cryo test` synthesizes its own `main`; suppress the user's so
+        // the LLVM module has exactly one `main` symbol.  Mirrors the
+        // `declare_function` guard.
+        if (this.cg.ctx.mode.skip_user_main()
+                && intrinsics::strcmp(fn_name, "main") == 0) {
+            cdebug("[IRGen]   func body: main (suppressed by test mode)\n");
+            fflush(null);
+            return;
+        }
+        cdebug("[IRGen]   func body: %s\n", fn_name); fflush(null);
+        this.generate_function_body(node);
+        cdebug("[IRGen]   func done\n"); fflush(null);
+    }
+
+    override visit(mut &this, node: ImplBlockNode*) -> void {
+        if (node == null) { return; }
+        const impl_target: string = this.cg.resolve(node.target_type);
+        cdebug("[IRGen]   impl block: %s (%lld methods)\n",
+               impl_target, node.methods.length); fflush(null);
+        this.generate_impl_block(node);
+        cdebug("[IRGen]   impl done\n"); fflush(null);
+    }
+
+    override visit(mut &this, node: StructDeclNode*) -> void {
+        if (node == null) { return; }
+        if (node.generic_params.length > 0) { return; }
+        if (node.methods.length == 0) { return; }
+        const sname: string = this.cg.resolve(node.name);
+        cdebug("[IRGen]   struct methods: %s (%lld methods)\n",
+               sname, node.methods.length); fflush(null);
+        // Use the arena's canonical qualified name for specialized
+        // structs so method keys match the DI registration.
+        const s_di: DeclarationIndex* = this.cg.get_decl_index();
+        const s_local: SymbolStr = this.cg.qualify(node.name);
+        mut s_ref: TypeRef = s_di.lookup_type(s_local);
+        if (!s_ref.is_valid()) {
+            s_ref = s_di.lookup_type(node.name);
+        }
+        if (s_ref.is_valid()) {
+            const s_arena: TypeArena* = this.cg.get_arena();
+            const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
+            if (s_qname.is_valid()) {
+                this.current_impl_target = s_qname;
+            } else {
+                this.current_impl_target = s_local;
+            }
+        } else {
+            this.current_impl_target = s_local;
+        }
+        for (mut j: i64 = 0; j < node.methods.length; j++) {
+            this.generate_method_body(node.methods[j]);
+        }
+        this.current_impl_target = SymbolStr::empty();
+        cdebug("[IRGen]   struct methods done\n"); fflush(null);
+    }
+
+    override visit(mut &this, node: ClassDeclNode*) -> void {
+        if (node == null) { return; }
+        if (node.generic_params.length > 0) { return; }
+        if (node.methods.length == 0) { return; }
+        const cname: string = this.cg.resolve(node.name);
+        cdebug("[IRGen]   class methods: %s (%lld methods)\n",
+               cname, node.methods.length); fflush(null);
+        this.current_impl_target = this.cg.qualify(node.name);
+        for (mut j: i64 = 0; j < node.methods.length; j++) {
+            this.generate_method_body(node.methods[j]);
+        }
+        this.current_impl_target = SymbolStr::empty();
+        cdebug("[IRGen]   class methods done\n"); fflush(null);
+    }
+
+
+    // ========================================================================
+    // Shared body-emission helpers
+    //
+    // Called from the top-level visit() overrides above.  Kept as named
+    // methods (not visit() overrides) because they're also called from
+    // `visit(StructDeclNode*)` / `visit(ClassDeclNode*)` to emit each
+    // method body without re-entering the visit dispatch for the wrapper.
+    // ========================================================================
+
+    /// Generate a function body: prologue, block walk, epilogue, validate.
     generate_function_body(mut &this, node: FunctionDeclNode*) -> void {
         const fn_val: LValue = codegen_function_prologue(this.cg, node);
         if (!fn_val.is_valid()) {
@@ -330,7 +350,7 @@ public:
         }
     }
 
-    /// Generate an impl block directly.
+    /// Generate every method body for an impl block.
     generate_impl_block(mut &this, node: ImplBlockNode*) -> void {
         if (node.generic_params.length > 0) {
             cdebug("[IRGen]     impl skipped (generic)\n"); fflush(null);
@@ -389,7 +409,8 @@ public:
         this.current_impl_target = SymbolStr::empty();
     }
 
-    /// Generate a method body directly.
+    /// Generate a method body: prologue, optional base-ctor call, block walk,
+    /// epilogue, validate.
     generate_method_body(mut &this, node: MethodNode*) -> void {
         const func: FunctionDeclNode* = node.func;
         if (func == null || func.body == null) { return; }
@@ -533,7 +554,10 @@ public:
         codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
     }
 
-    /// Generate a block of statements directly (no virtual dispatch).
+    /// Generate a block of statements: push a scope, dispatch each child
+    /// statement through `generate_statement` (which calls accept()),
+    /// pop the scope.  Stops early once the current basic block has a
+    /// terminator so we don't emit unreachable IR after an early return.
     generate_block(mut &this, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
         this.cg.push_scope();
@@ -555,7 +579,7 @@ public:
 
 
     // ========================================================================
-    // Statement dispatch (by NodeKind)
+    // Statement dispatch
     // ========================================================================
 
     /// Dispatch a statement via double-dispatch (`stmt.accept(this)` →
@@ -911,8 +935,8 @@ public:
     /// Registers each binding as a pointer to its payload slot.  `codegen_identifier`
     /// treats named values as lvalues, so `codegen_rvalue` loads through the ptr.
     /// This avoids creating entry-block allocas after the entry block has been
-    /// terminated (cryoc's `create_entry_alloca` uses position_at_end and would
-    /// emit allocas after the terminator).
+    /// terminated (`create_entry_alloca` uses position_at_end and would emit
+    /// allocas after the terminator).
     bind_arm_enum_payloads(mut &this, arm: MatchArmNode*, minfo: MatchSubjectInfo) -> void {
         if (minfo.enum_type == null || !minfo.subject_ptr.is_valid()) { return; }
         if (!minfo.enum_llvm.is_valid()) { return; }
@@ -1488,7 +1512,6 @@ public:
     // Expression visitors
     // ========================================================================
 
-    /// Binary expression: direct dispatch.
     override visit(mut &this, node: BinaryExprNode*) -> void {
         const op: TokenType = node.op.kind;
 
@@ -1644,7 +1667,6 @@ public:
         this.last_is_lvalue = false;
     }
 
-    /// Unary expression: direct dispatch.
     override visit(mut &this, node: UnaryExprNode*) -> void {
         const op: TokenType = node.op.kind;
         if (op == TokenType::Star) {
@@ -1782,7 +1804,6 @@ public:
         this.last_is_lvalue = false;
     }
 
-    /// Call expression: direct dispatch.
     override visit(mut &this, node: CallExprNode*) -> void {
         mut callee_val: LValue = LValue::null();
 
@@ -2654,8 +2675,7 @@ public:
         //   2. The callee resolves to a known divergent function from
         //      the stdlib (`panic` intrinsic; `core::panic::panic` and the
         //      legacy `prelude::panic` wrapper).  These are declared
-        //      `-> void` in source for bootstrap compatibility but
-        //      semantically diverge.
+        //      `-> void` in source even though they semantically diverge.
         // Without this, calls in a non-void-returning context (e.g. the
         // `None` arm of `Option<T>::unwrap`) leave the block without a
         // terminator and the body-validator strips the entire function.
@@ -2747,8 +2767,8 @@ public:
         return true;
     }
 
-    /// Tuple literal: direct dispatch. Sema tags `resolved_type` with the
-    /// arena's TupleType (deduped by element types), so the layout follows
+    /// Tuple literal: Sema tags `resolved_type` with the arena's
+    /// TupleType (deduped by element types), so the layout follows
     /// `map_tuple` (anonymous LLVM struct of element types in order).
     override visit(mut &this, node: TupleLiteralNode*) -> void {
         const type_ref: TypeRef = node.resolved_type;
@@ -2761,7 +2781,6 @@ public:
                               node.span);
     }
 
-    /// Struct literal: direct dispatch.
     override visit(mut &this, node: StructLiteralNode*) -> void {
         // Use the sema-tagged `resolved_type`; it's the authoritative
         // TypeRef produced by `lookup_type_by_sym`, which does the full
@@ -2783,7 +2802,6 @@ public:
                                node.span);
     }
 
-    /// Array literal: direct dispatch.
     override visit(mut &this, node: ArrayLiteralNode*) -> void {
         // Fill form `[value; N]`: single element repeated N times.  Needs
         // its own codegen path: allocate the backing storage, run a fill
@@ -3315,7 +3333,6 @@ public:
         this.last_is_lvalue = false;
     }
 
-    /// Scope resolution: direct dispatch.
     override visit(mut &this, node: ScopeResolutionNode*) -> void {
         const intern: InternTable* = this.cg.get_intern();
         const di: DeclarationIndex* = this.cg.get_decl_index();
@@ -3566,7 +3583,6 @@ public:
         intrinsics::free(phi_blks);
     }
 
-    /// Ternary/if expression: direct dispatch.
     override visit(mut &this, node: TernaryExprNode*) -> void {
         const cond: LValue = this.codegen_rvalue(node.condition);
         const current_fn: LValue = this.get_current_function();
@@ -3619,7 +3635,7 @@ public:
         this.last_is_lvalue = false;
     }
 
-    /// New expression (heap allocation): direct dispatch.
+    /// New expression (heap allocation).
     override visit(mut &this, node: NewExprNode*) -> void {
         // Resolve the type name: try current module's qualified form first,
         // then fall back to the DI's bare→qualified mapping, then the raw
@@ -3693,8 +3709,8 @@ public:
 
         const mapped: LType = this.cg.type_mapper.map_type(type_ref);
         // Virtual dispatch through `t.size_bytes()` resolves to the base
-        // `Type::size_bytes` (which returns 0) when cryoc's codegen hasn't
-        // wired vtable dispatch yet.  Pull `computed_size` directly from the
+        // `Type::size_bytes` (which returns 0) when codegen hasn't wired
+        // vtable dispatch yet.  Pull `computed_size` directly from the
         // concrete type based on kind; type_lowering already accounted for
         // inheritance in that value.
         mut size: u64 = 0;
@@ -3713,11 +3729,11 @@ public:
         if (size == 0) { size = 1; }  // safe fallback; malloc(0) is UB on some platforms
 
         const size_val: LValue = LType::const_int(LType::i64(), size, false);
-        // Avoid the single-element array literal form (`[size_val]`); the C++
-        // Cryo compiler miscompiles it: emits `alloca [1 x T]` but then loads
-        // as `Array<T>` (3-field struct), reading 16 bytes of stack garbage
-        // into the length/capacity fields.  Downstream code that reads
-        // `args.length` (e.g., `codegen_call`) then feeds the garbage into
+        // Avoid the single-element array literal form (`[size_val]`); it
+        // miscompiles to `alloca [1 x T]` and then loads as `Array<T>`
+        // (3-field struct), reading 16 bytes of stack garbage into the
+        // length/capacity fields.  Downstream code that reads `args.length`
+        // (e.g., `codegen_call`) then feeds the garbage into
         // `LLVMBuildCall2` as NumArgs → `bad_alloc`.  `push` on an empty
         // array initializes the struct correctly.
         mut malloc_args: Pair<LValue, TypeRef>[] = [];
@@ -3849,7 +3865,7 @@ public:
         this.last_is_lvalue = false;
     }
 
-    /// Delete expression (heap free): direct dispatch.
+    /// Delete expression (heap free).
     override visit(mut &this, node: DeleteExprNode*) -> void {
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
         //   1. Run the pointee's drop method, if it has one.
@@ -4138,10 +4154,10 @@ function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
                              expected: LType, result_ty: TypeRef) -> LValue {
     if (!val.is_valid() || !expected.is_valid()) { return val; }
 
-    // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==`; the
-    // C++ Cryo bootstrap compiler lowers that to strcmp, which returns
-    // "equal" for structurally-different types and short-circuits the
-    // coercion path.  Dispatch on kind + width instead.
+    // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==`; that
+    // currently lowers to strcmp, which returns "equal" for structurally-
+    // different types and short-circuits the coercion path.  Dispatch on
+    // kind + width instead.
     const got_ty: void* = llvm::LLVMTypeOf(val.raw);
     const want_ty: void* = expected.raw;
     const gk: LTypeKind = type_kind_of(got_ty);

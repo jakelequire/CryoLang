@@ -207,8 +207,8 @@ function register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> voi
 }
 
 /// Tag an AST node's source_module field with the template's module name.
-/// Uses concrete-type casts to avoid C++ codegen vtable offset bugs
-/// when writing fields through base class (DeclarationNode*) pointers.
+/// Uses concrete-type casts to avoid the vtable-offset miscompile when
+/// writing fields through base class (DeclarationNode*) pointers.
 function tag_decl_source_module(node: ASTNode*, module: string) -> void {
     if (node == null) { return; }
     match (node.kind) {
@@ -240,8 +240,8 @@ function tag_decl_source_module(node: ASTNode*, module: string) -> void {
 /// qualified name for method keys.  Uses the SpecializationEntry's
 /// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
 /// cross-module specs with the same bare name from overwriting each other.
-/// This is a static method (not a free function) to avoid C++ codegen
-/// issues with parameter visibility in free functions.
+/// This is wrapped as a static method (not a free function) to dodge a
+/// codegen issue with parameter visibility inside free functions.
 type struct SpecInjector {
     /// Register a specialized type using the arena type's ACTUAL qualified
     /// name for method keys.  This prevents cross-module specs with the
@@ -621,7 +621,7 @@ type struct SpecializationPasses {
 
             // Inject main AST and register its template module origin
             // in the CompilationContext's side table (not on the AST node
-            // itself, to avoid C++ codegen vtable field-write bugs).
+            // itself, to avoid vtable field-write miscompiles).
             if (entry.ast_node != null) {
                 if (entry.template_module.is_valid()) {
                     ctx.register_injected_origin(
@@ -734,7 +734,7 @@ type struct SpecializationPasses {
 
     /// Walks all types in the arena and asserts that every InstantiatedType
     /// has a valid resolved_type.  Delegates to free functions to avoid
-    /// vtable offset issues with class-method field access in the C++ codegen.
+    /// vtable-offset issues with class-method field access.
     static run_generic_validation(ctx: CompilationContext*) -> PassResult {
         return run_generic_validation_impl(ctx);
     }
@@ -745,9 +745,9 @@ type struct SpecializationPasses {
 // Generic Validation: free function implementation
 //
 // Uses a free function (not class method) and avoids ALL virtual method
-// calls on Type* pointers.  The C++ codegen has a known vtable offset bug
-// that causes SIGSEGV when dispatching virtual methods on Type subclass
-// pointers in certain compilation units.
+// calls on Type* pointers.  Dispatching virtual methods on Type subclass
+// pointers in certain compilation units has triggered a vtable-offset
+// SIGSEGV; the workaround is to access only plain fields here.
 //
 // Only non-virtual access is used:
 //   - ty.kind        (plain field, TypeKind enum, no vtable)
