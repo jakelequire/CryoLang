@@ -482,9 +482,9 @@ public:
 
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
-        mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
+        mut ctor_fn: LValue = this.cg.resolve_function_with_arity(ctor_sym, ctor_arity);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = resolve_function(this.cg, ctor_sym);
+            ctor_fn = this.cg.resolve_function(ctor_sym);
         }
         if (!ctor_fn.is_valid()) {
             cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
@@ -551,7 +551,7 @@ public:
         if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
 
         mut ctor_result: LValue = LValue::null();
-        codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
+        ctor_result = this.cg.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
     }
 
     /// Generate a block of statements: push a scope, dispatch each child
@@ -599,11 +599,11 @@ public:
     }
 
     override visit(mut &this, node: BreakStmtNode*) -> void {
-        codegen_break(this.cg);
+        this.cg.codegen_break();
     }
 
     override visit(mut &this, node: ContinueStmtNode*) -> void {
-        codegen_continue(this.cg);
+        this.cg.codegen_continue();
     }
 
     override visit(mut &this, node: ExprStmtNode*) -> void {
@@ -645,24 +645,24 @@ public:
     override visit(mut &this, node: IfStmtNode*) -> void {
         const cond: LValue = this.codegen_rvalue(node.condition);
         const current_fn: LValue = this.get_current_function();
-        const blocks: IfBlocks = codegen_if(this.cg, cond, current_fn,
+        const blocks: IfBlocks = this.cg.codegen_if(cond, current_fn,
                                              node.else_stmt != null);
         this.cg.builder.position_at_end(blocks.then_bb);
         if (node.then_stmt != null) {
             this.generate_statement(node.then_stmt);
         }
-        branch_if_not_terminated(this.cg, blocks.merge_bb);
+        this.cg.branch_if_not_terminated(blocks.merge_bb);
         if (node.else_stmt != null) {
             this.cg.builder.position_at_end(blocks.else_bb);
             this.generate_statement(node.else_stmt);
-            branch_if_not_terminated(this.cg, blocks.merge_bb);
+            this.cg.branch_if_not_terminated(blocks.merge_bb);
         }
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
     override visit(mut &this, node: WhileStmtNode*) -> void {
         const current_fn: LValue = this.get_current_function();
-        const blocks: LoopBlocks = codegen_while_header(this.cg, current_fn);
+        const blocks: LoopBlocks = this.cg.codegen_while_header(current_fn);
         this.cg.builder.position_at_end(blocks.cond_bb);
         const cond: LValue = this.codegen_rvalue(node.condition);
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
@@ -670,7 +670,7 @@ public:
         if (node.body != null) {
             this.generate_statement(node.body);
         }
-        branch_if_not_terminated(this.cg, blocks.cond_bb);
+        this.cg.branch_if_not_terminated(blocks.cond_bb);
         this.cg.pop_loop();
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
@@ -681,7 +681,7 @@ public:
         if (node.init != null) {
             this.generate_statement(node.init as StatementNode*);
         }
-        const blocks: ForBlocks = codegen_for_header(this.cg, current_fn);
+        const blocks: ForBlocks = this.cg.codegen_for_header(current_fn);
         this.cg.builder.build_br(blocks.cond_bb);
         this.cg.builder.position_at_end(blocks.cond_bb);
         if (node.condition != null) {
@@ -694,12 +694,12 @@ public:
         if (node.body != null) {
             this.generate_statement(node.body);
         }
-        branch_if_not_terminated(this.cg, blocks.update_bb);
+        this.cg.branch_if_not_terminated(blocks.update_bb);
         this.cg.builder.position_at_end(blocks.update_bb);
         if (node.update != null) {
             this.codegen_rvalue(node.update);
         }
-        branch_if_not_terminated(this.cg, blocks.cond_bb);
+        this.cg.branch_if_not_terminated(blocks.cond_bb);
         this.cg.pop_loop();
         this.cg.pop_scope();
         this.cg.builder.position_at_end(blocks.merge_bb);
@@ -707,12 +707,12 @@ public:
 
     override visit(mut &this, node: LoopStmtNode*) -> void {
         const current_fn: LValue = this.get_current_function();
-        const blocks: LoopBlocks = codegen_loop_header(this.cg, current_fn);
+        const blocks: LoopBlocks = this.cg.codegen_loop_header(current_fn);
         this.cg.builder.position_at_end(blocks.body_bb);
         if (node.body != null) {
             this.generate_statement(node.body);
         }
-        branch_if_not_terminated(this.cg, blocks.body_bb);
+        this.cg.branch_if_not_terminated(blocks.body_bb);
         this.cg.pop_loop();
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
@@ -800,7 +800,7 @@ public:
             const cur_after: LBasicBlock = this.cg.builder.get_insert_block();
             const arm_falls: boolean = cur_after.is_valid() && !cur_after.has_terminator();
             if (arm_falls) { any_arm_falls_through = true; }
-            branch_if_not_terminated(this.cg, merge_bb);
+            this.cg.branch_if_not_terminated(merge_bb);
             this.cg.pop_scope();
         }
 
@@ -819,7 +819,7 @@ public:
             const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
             mut a_args: Pair<LValue, TypeRef>[] = [];
             mut a_res: LValue = LValue::null();
-            codegen_call(this.cg, abort_fn, abort_ty, a_args, "", &a_res);
+            a_res = this.cg.codegen_call(abort_fn, abort_ty, a_args, "");
             this.cg.builder.build_unreachable();
         }
 
@@ -1061,14 +1061,14 @@ public:
                     const pat_text: string = this.cg.resolve(pat.value);
                     const pat_val: LValue =
                         this.cg.get_or_create_string_literal(pat_text);
-                    codegen_string_compare(this.cg, subject, pat_val,
-                        TokenType::EqualEqual, &cmp);
+                    cmp = this.cg.codegen_string_compare(subject, pat_val,
+                        TokenType::EqualEqual);
                 } else {
                     const pat_val: LValue =
                         this.codegen_pattern_value(pat, minfo.subject_ty);
                     if (pat_val.is_valid()) {
                         const pat_val_coerced: LValue =
-                            coerce_icmp_operands(this.cg, subject, pat_val,
+                            this.cg.coerce_icmp_operands(subject, pat_val,
                                                  minfo.subject_ty);
                         cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
                             subject, pat_val_coerced,
@@ -1199,7 +1199,7 @@ public:
         if (has_init) {
             init_val = this.codegen_rvalue(node.initializer);
         }
-        codegen_local_var(this.cg, node.name, node.resolved_type,
+        this.cg.codegen_local_var(node.name, node.resolved_type,
                           init_val, has_init, node.span);
     }
 
@@ -1269,7 +1269,7 @@ public:
                 field_val = this.cg.builder.build_load(field_lty, field_ptr, "destruct.fieldval");
             }
 
-            codegen_local_var(this.cg, b.local_name, b.resolved_type,
+            this.cg.codegen_local_var(b.local_name, b.resolved_type,
                               field_val, true, b.span);
         }
     }
@@ -1375,14 +1375,588 @@ public:
         expr.accept(this);
     }
 
+    /// Generate a constant value from a literal node.
+    codegen_literal(mut &this, node: LiteralNode*) -> void {
+        mut ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+
+        const kind: LiteralKind = node.literal_kind;
+
+        this.last_is_lvalue = false;
+
+        if (kind == LiteralKind::Integer) {
+            if (!ty.is_valid()) { ty = LType::i32(); }
+            const val: u64 = parse_int_lexeme(node.value);
+            // Default to sign-extension (matches signed integer types and the
+            // historical fallback when resolved_type is missing).  For unsigned
+            // integer types we have to pass false: a u64 literal whose bit
+            // pattern exceeds i64::MAX (e.g. 0x9000000000000000) is otherwise
+            // sign-extended into a negative APInt, and a later inline `>` against
+            // 0 is lowered as a *signed* compare against a negative constant,
+            // i.e. the literal silently flips negative.  Chase InstantiatedType
+            // wrappers the same way codegen_binary does at line 246 so generic
+            // contexts behave identically to concrete ones.
+            mut sign_extend: boolean = true;
+            mut sty: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            mut sbd: i32 = 0;
+            while (sty != null && sty.kind == TypeKind::InstantiatedType && sbd < 5) {
+                const sinst: InstantiatedType* = sty as InstantiatedType*;
+                if (sinst.has_resolved_type()) {
+                    sty = this.cg.lookup_type_by_id(sinst.resolved_type.id);
+                } else { break; }
+                sbd += 1;
+            }
+            if (sty != null && sty.kind == TypeKind::Int) {
+                const sint: IntType* = sty as IntType*;
+                if (sint.int_kind.is_unsigned()) { sign_extend = false; }
+            }
+            this.last_value = LType::const_int(ty, val, sign_extend);
+        } else if (kind == LiteralKind::Float) {
+            if (!ty.is_valid()) { ty = LType::f64(); }
+            mut val: f64 = 0.0;
+            intrinsics::sscanf(node.value, "%lf", &val);
+            this.last_value = LType::const_real(ty, val);
+        } else if (kind == LiteralKind::String) {
+            this.last_value = this.cg.get_or_create_string_literal(node.value);
+        } else if (kind == LiteralKind::Char) {
+            // Char is stored as i32.  The lexer hands us the raw lexeme between
+            // the surrounding quotes; for `'\n'` that's the two-char string
+            // "\\n" (backslash + n), not the resolved 0x0A.  `decode_char_lexeme`
+            // resolves the standard C-style escapes so `'\n' == 10`, `'\0' == 0`,
+            // etc.  Without this, every character-literal escape in cryoc source
+            // is wrong (e.g., `c == '\n'` in skip_whitespace never matches).
+            this.last_value = LType::const_int(LType::i32(),
+                                               decode_char_lexeme(node.value), false);
+        } else if (kind == LiteralKind::Boolean) {
+            const bval: u64 = if (node.value == "true") { 1 } else { 0 };
+            this.last_value = LType::const_int(LType::i1(), bval, false);
+        } else if (kind == LiteralKind::Null) {
+            // Null literal must always be a pointer type.  If resolved_type
+            // mapped to void or an invalid type, fall back to i8* (void*).
+            if (!ty.is_valid() || type_kind_of(ty.raw) != LTypeKind::Pointer) {
+                ty = LType::pointer_to(LType::i8());
+            }
+            this.last_value = LType::const_pointer_null(ty);
+        } else {
+            this.last_value = LValue::null();
+        }
+    }
+
+    /// Look up a named value (local, parameter, or global).
+    codegen_identifier(mut &this, node: IdentifierNode*) -> void {
+        // Built-in pseudo-macros: FILE and LINE expand to the source location
+        // of the identifier reference.
+        const name_str: string = this.cg.resolve(node.name);
+        if (intrinsics::strcmp(name_str, "FILE") == 0) {
+            mut filename: string = node.span.file;
+            if (filename == null || intrinsics::strlen(filename) == 0) {
+                filename = "<unknown>";
+            }
+            this.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
+            this.last_is_lvalue = false;
+            return;
+        }
+        if (intrinsics::strcmp(name_str, "LINE") == 0) {
+            const line: u64 = node.span.start_line as u64;
+            this.last_value = LType::const_int(LType::i32(), line, false);
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Try local/parameter first.
+        const local: LValue = this.cg.get_named_value(node.name);
+        if (local.is_valid()) {
+            this.last_value = local;
+            this.last_is_lvalue = true;
+            return;
+        }
+
+        // Try global.
+        const global: LValue = this.cg.resolve_global(node.name);
+        if (global.is_valid()) {
+            this.last_value = global;
+            this.last_is_lvalue = true;
+            return;
+        }
+
+        // Try function (for function references / first-class functions).
+        const func: LValue = this.cg.resolve_function(node.name);
+        if (func.is_valid()) {
+            this.last_value = func;
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        this.last_value = LValue::null();
+        this.last_is_lvalue = false;
+    }
+
+    /// Generate a GEP to a struct/class field.  `site_span` is the source span
+    /// of the access expression in the caller; used only to attach a source
+    /// snippet to any diagnostic we emit.
+    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, site_span: SourceSpan) -> void {
+        // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
+        // stored in an alloca), load the pointer value so we can GEP into the struct.
+        // This matches C/Rust behavior where `node.field` on a pointer is an implicit
+        // deref.  Applied once per call; GEP'd field pointers stay as struct pointers.
+        mut obj_ptr: LValue = object_ptr;
+        mut obj_type: TypeRef = object_type;
+        mut t: Type* = this.cg.lookup_type_by_id(obj_type.id);
+
+        // Unwrap InstantiatedType to its concrete resolved form before kind-based
+        // dispatch.  Sema does the same in `check_field_access`; without this,
+        // a `Pair<string>` resolves to an `InstantiatedType` whose kind isn't
+        // Struct/Class/Array, and every field/length access silently returns null.
+        mut inst_depth: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { break; }
+            obj_type = inst.resolved_type;
+            t = this.cg.lookup_type_by_id(obj_type.id);
+            inst_depth += 1;
+        }
+
+        if (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
+            if (t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = t as PointerType*;
+                obj_type = pt.pointee;
+            } else {
+                const rt: ReferenceType* = t as ReferenceType*;
+                obj_type = rt.referent;
+            }
+            t = this.cg.lookup_type_by_id(obj_type.id);
+
+            // Load the pointer value through the alloca (only when `object_ptr`
+            // really is an lvalue pointing at a ptr slot). Under opaque pointers
+            // every value has LLVM type `ptr`, so the kind check alone can't
+            // distinguish a slot from a raw rvalue; the previous version
+            // ALWAYS loaded, which over-derefed any pointer rvalue (e.g. the
+            // result of `obj.as_ptr().count` where `as_ptr()` already returned
+            // the pointer value, not a slot containing it). Threading the
+            // semantic lvalue flag through is the only reliable signal.
+            if (object_is_lvalue && obj_ptr.is_valid()) {
+                obj_ptr = this.cg.builder.build_load(LType::pointer_to(LType::i8()),
+                                                obj_ptr, "autoderef");
+            }
+        }
+
+        // The pointee of a Pointer/Reference may itself be an InstantiatedType
+        // (e.g. `HashMapEntry<u32, i64>` sitting in the arena as the pointee of a
+        // `HashMapEntry<u32, i64>*`). Mirror the pre-Pointer unwrap above so the
+        // kind dispatch below sees the concrete Struct/Class/Array; without this,
+        // field_idx stays -1, the access silently emits no IR, and the
+        // half-emitted basic block gets stripped by `is_function_body_valid`.
+        mut inst_depth2: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth2 < 5) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { break; }
+            obj_type = inst.resolved_type;
+            t = this.cg.lookup_type_by_id(obj_type.id);
+            inst_depth2 += 1;
+        }
+
+        if (t == null) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const tk: TypeKind = t.kind;
+        mut field_idx: i64 = -1;
+
+        if (tk == TypeKind::Tuple) {
+            // Tuple positional access: parse member SymbolStr as decimal index.
+            // Sema already validated bounds; codegen trusts the resolved_type
+            // path and just GEPs slot N.
+            const member_str: string = this.cg.resolve(member);
+            const idx: i64 = parse_tuple_member_index(member_str);
+            if (idx >= 0) {
+                const tup: TupleType* = t as TupleType*;
+                if (idx < tup.elements.length) {
+                    field_idx = idx;
+                }
+            }
+        } else if (tk == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            field_idx = st.field_index(member);
+        } else if (tk == TypeKind::Class) {
+            // Classes are flattened at struct-layout time (see `map_class`):
+            //   [ vtable ptr, if any ancestor has virtual methods ]
+            //   [ root class's fields, then each derived class's fields in order ]
+            //   [ this class's own fields ]
+            // Walk the base chain root-first and sum field counts to get the
+            // absolute slot index.
+            const cls: ClassType* = t as ClassType*;
+            mut chain: ClassType*[] = [];
+            mut any_virtual: boolean = false;
+            mut walk: ClassType* = cls;
+            mut depth: i32 = 0;
+            while (walk != null && depth < 16) {
+                chain.push(walk);
+                if (walk.has_virtual_methods) { any_virtual = true; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
+                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+                walk = base_t as ClassType*;
+                depth += 1;
+            }
+
+            mut cumulative: i64 = if (any_virtual) { 1 } else { 0 };
+            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+                const link: ClassType* = chain[ci];
+                const local_idx: i64 = link.field_index(member);
+                if (local_idx >= 0) {
+                    field_idx = cumulative + local_idx;
+                    break;
+                }
+                cumulative += link.fields.length;
+            }
+        } else if (tk == TypeKind::Array) {
+            const arr_t: ArrayType* = t as ArrayType*;
+            const length_sym: SymbolStr = this.cg.intern_str("length");
+            if (member.id == length_sym.id) {
+                if (arr_t.is_fixed()) {
+                    // Fixed array: length is a compile-time constant.
+                    this.last_value = LType::const_int(LType::i64(), arr_t.size as u64, false);
+                    this.last_is_lvalue = false;
+                    return;
+                }
+                // Dynamic array { T*, i64 }: length is field 1.
+                field_idx = 1;
+            }
+        }
+
+        if (field_idx < 0) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const struct_ty: LType = this.cg.type_mapper.map_type(obj_type);
+        if (!struct_ty.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                "codegen: member access: failed to map object type to LLVM type",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        if (!obj_ptr.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                "codegen: member access: object pointer is null",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        // If `obj_ptr` is a struct VALUE (e.g., a direct return from a
+        // function call: `f().field`), it isn't a GEP-able address.  Use
+        // `extractvalue` to pull out the field from the value and return
+        // an rvalue.  Under opaque pointers an actual pointer has kind
+        // Pointer, so checking for Struct here is unambiguous.
+        const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
+        if (obj_llvm_ty != null && type_kind_of(obj_llvm_ty) == LTypeKind::Struct) {
+            this.last_value = this.cg.builder.build_extract_value(
+                obj_ptr, field_idx as u32, "fieldval");
+            this.last_is_lvalue = false;
+            return;
+        }
+        const gep: LValue = this.cg.builder.build_struct_gep(struct_ty, obj_ptr,
+                                                          field_idx as u32, "fieldptr");
+        this.last_value = gep;
+        this.last_is_lvalue = true;
+    }
+
+
+    /// Generate IR for an array indexing operation.
+    codegen_array_access(mut &this, array_val: LValue, array_type: TypeRef, array_is_lvalue: boolean, index_val: LValue, site_span: SourceSpan) -> void {
+        const t: Type* = this.cg.lookup_type_by_id(array_type.id);
+        if (t == null) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Pointer indexing (C-style `ptr[i]` ≡ `*(ptr + i)`).  When
+        // `array_is_lvalue` is true, `array_val` is a slot containing the
+        // pointer (e.g. a local variable of type `T*`) and needs a load
+        // first.  When false, the pointer value is already in hand
+        // (e.g. result of a call returning `T*`) and we GEP directly.
+        if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            const elem_ty: LType = this.cg.type_mapper.map_type(pt.pointee);
+            if (!elem_ty.is_valid() || !array_val.is_valid() || !index_val.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            mut data_ptr: LValue = array_val;
+            if (array_is_lvalue) {
+                const ptr_ty: LType = LType::pointer_to(elem_ty);
+                data_ptr = this.cg.builder.build_load(ptr_ty, array_val, "ptrload");
+            }
+            const buf: void* = intrinsics::malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = index_val.raw;
+            const gep: LValue = this.cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
+            intrinsics::free(buf);
+            this.last_value = gep;
+            this.last_is_lvalue = true;
+            return;
+        }
+
+        // String indexing (`s[i]`): treat the string as `i8*` at the LLVM
+        // level.  Return the byte's address as an lvalue so it can be used
+        // on both sides of an assignment (`c = s[i]` AND `s[i] = c`).  The
+        // `char` (i32) vs byte (i8) size mismatch is resolved by the callers
+        // (`codegen_rvalue` load-and-zext for reads, the assignment path
+        // trunc-and-store for writes; both look for the `TypeKind::String`
+        // source type to detect this case).
+        if (t.kind == TypeKind::String) {
+            if (!array_val.is_valid() || !index_val.is_valid()) {
+                this.last_value = LValue::null();
+                this.last_is_lvalue = false;
+                return;
+            }
+            const i8_ty: LType = LType::i8();
+            mut data_ptr: LValue = array_val;
+            if (array_is_lvalue) {
+                const i8_ptr_ty: LType = LType::pointer_to(i8_ty);
+                data_ptr = this.cg.builder.build_load(i8_ptr_ty, array_val, "strptr");
+            }
+            const buf: void* = intrinsics::malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = index_val.raw;
+            const byte_ptr: LValue = this.cg.builder.build_gep(i8_ty, data_ptr, buf, 1, "charptr");
+            intrinsics::free(buf);
+            this.last_value = byte_ptr;
+            this.last_is_lvalue = true;
+            return;
+        }
+
+        if (t.kind != TypeKind::Array) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const arr: ArrayType* = t as ArrayType*;
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr.element);
+        if (!elem_ty.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                "codegen: array access: failed to map element type",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        if (!array_val.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                "codegen: array access: array value is null",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        if (!index_val.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                "codegen: array access: index value is null",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        if (arr.is_fixed()) {
+            // Fixed array: GEP into [N x T].
+            const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+            // Build indices: [0, index]
+            const zero: LValue = LType::const_int(LType::i64(), 0, false);
+            const buf: void* = intrinsics::malloc(16);
+            const slots: void** = buf as void**;
+            slots[0] = zero.raw;
+            slots[1] = index_val.raw;
+            const gep: LValue = this.cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
+            intrinsics::free(buf);
+            this.last_value = gep;
+            this.last_is_lvalue = true;
+        } else {
+            // Dynamic array: { T*, i64 } fat pointer.  When the value is in
+            // a slot (lvalue, the usual case), load the struct first; when
+            // the value is in hand (rvalue, e.g. `f()[i]` where `f` returns
+            // `T[]`), use it directly.  Either way, extract field 0 to get
+            // the data pointer, then GEP elem_ty by index.
+            const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+            mut struct_val: LValue = array_val;
+            if (array_is_lvalue) {
+                struct_val = this.cg.builder.build_load(arr_ty, array_val, "arrload");
+            }
+            const data_ptr: LValue = this.cg.builder.build_extract_value(struct_val, 0, "data");
+            const buf: void* = intrinsics::malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = index_val.raw;
+            const gep: LValue = this.cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
+            intrinsics::free(buf);
+            this.last_value = gep;
+            this.last_is_lvalue = true;
+        }
+    }
+
+
+    /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
+    /// and store each field.  Writes the alloca's address to `this.last_value`
+    /// with `this.last_is_lvalue=true`; rvalue users load through it.
+    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: SymbolStr[], field_values: LValue[], site_span: SourceSpan) -> void {
+        const ty: LType = this.cg.type_mapper.map_type(struct_type);
+        if (!ty.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        // Get the current function for entry block alloca.
+        const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!current_bb.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+                "codegen: struct literal: builder has no insert block",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = current_bb.get_parent();
+        if (!current_fn.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+                "codegen: struct literal: insert block has no parent function",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "structlit", ty);
+
+        // Store each field value at its GEP index.  If a field expects a
+        // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a
+        // fixed LLVM array (`[N x T]`; happens when the source literal
+        // `[a, b, c]` resolved to a fixed ArrayType but the field is
+        // dynamic), convert by malloc'ing a buffer, memcpy'ing the literal
+        // contents, and packaging into a fat pointer.  Without this, the
+        // store writes only the first few bytes of the field, leaving the
+        // rest uninitialised, and downstream `provisions[k]` reads garbage.
+        const t: Type* = this.cg.lookup_type_by_id(struct_type.id);
+        if (t != null && t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            for (mut i: i64 = 0; i < field_names.length; i++) {
+                const fidx: i64 = st.field_index(field_names[i]);
+                if (fidx >= 0) {
+                    const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, fidx as u32, "field");
+                    mut val: LValue = field_values[i];
+                    if (val.is_valid()) {
+                        val = this.cg.coerce_fixed_array_to_fat_ptr(val, st.fields[fidx].field_type);
+                        // Widen/narrow integer literals to the field's declared
+                        // width before storing.  `HashMap { len: 0, cap: 0, ... }`
+                        // arrives with each `0` as `i32 0` (codegen_literal defaults
+                        // integer literals to i32 when sema doesn't propagate the
+                        // expected type) but `len`/`cap`/`deleted` are u64 fields
+                        // a direct `store i32` writes only the low 4 bytes,
+                        // leaving the high 4 uninitialised.  Mirrors the same fix
+                        // in stmt_codegen.cryo:codegen_local_var so subsequent
+                        // i64 reads through the field don't see stack garbage in
+                        // the upper bits.  LLVMIntegerTypeKind = 8.
+                        const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, fidx as u32);
+                        const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        if (field_llvm_ty != null && val_ty_raw != null
+                                && type_kind_of(field_llvm_ty) == LTypeKind::Integer
+                                && type_kind_of(val_ty_raw) == LTypeKind::Integer) {
+                            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
+                            const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
+                            const field_lty: LType = LType { raw: field_llvm_ty };
+                            if (want_bits > got_bits) {
+                                // Widen with the field's signedness; using zext
+                                // for a signed i64 field stored a negative i32
+                                // literal (`-1`) as `0x00000000FFFFFFFF`, which
+                                // is `4294967295` not `-1`.  This is what made
+                                // `new ArrayAnnotation { size: -1, ... }` lose
+                                // its sign and turn dynamic arrays into giant
+                                // fixed ones (the size sentinel was treated as
+                                // a positive i64).  Mirrors the local-var fix.
+                                mut signed_target: boolean = false;
+                                const field_t: Type* = this.cg.lookup_type_by_id(
+                                    st.fields[fidx].field_type.id);
+                                if (field_t != null && field_t.kind == TypeKind::Int) {
+                                    const ft_int: IntType* = field_t as IntType*;
+                                    signed_target = ft_int.int_kind.is_signed();
+                                }
+                                if (signed_target) {
+                                    val = this.cg.builder.build_sext(val, field_lty, "field.widen");
+                                } else {
+                                    val = this.cg.builder.build_zext(val, field_lty, "field.widen");
+                                }
+                            } else if (want_bits < got_bits) {
+                                val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
+                            }
+                        }
+                    }
+                    this.cg.builder.build_store(val, gep);
+                }
+            }
+        }
+
+        this.last_value = alloca;
+        this.last_is_lvalue = true;
+    }
+
+
+    /// Materialize a tuple literal `(a, b, c)` into a stack alloca and store
+    /// each element.  Same lvalue convention as `codegen_struct_literal`.
+    codegen_tuple_literal(mut &this, tuple_type: TypeRef, element_values: LValue[], site_span: SourceSpan) -> void {
+        const ty: LType = this.cg.type_mapper.map_type(tuple_type);
+        if (!ty.is_valid()) {
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!current_bb.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+                "codegen: tuple literal: builder has no insert block",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = current_bb.get_parent();
+        if (!current_fn.is_valid()) {
+            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+                "codegen: tuple literal: insert block has no parent function",
+                site_span);
+            this.last_value = LValue::null();
+            this.last_is_lvalue = false;
+            return;
+        }
+
+        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "tuplit", ty);
+
+        for (mut i: i64 = 0; i < element_values.length; i++) {
+            const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, i as u32, "elem");
+            const val: LValue = element_values[i];
+            if (val.is_valid()) {
+                this.cg.builder.build_store(val, gep);
+            }
+        }
+
+        this.last_value = alloca;
+        this.last_is_lvalue = true;
+    }
+
+
     override visit(mut &this, node: LiteralNode*) -> void {
-        codegen_literal(this.cg, node,
-                        &this.last_value, &this.last_is_lvalue);
+        this.codegen_literal(node);
     }
 
     override visit(mut &this, node: IdentifierNode*) -> void {
-        codegen_identifier(this.cg, node,
-                           &this.last_value, &this.last_is_lvalue);
+        this.codegen_identifier(node);
     }
 
     override visit(mut &this, node: MemberAccessNode*) -> void {
@@ -1392,10 +1966,9 @@ public:
         // last_is_lvalue=false so the autoderef inside member-access
         // codegen knows not to over-load the call's pointer rvalue.
         const obj_is_lvalue: boolean = this.last_is_lvalue;
-        codegen_member_access(this.cg, obj, node.object.resolved_type,
-                              obj_is_lvalue, node.member,
-                              &this.last_value, &this.last_is_lvalue,
-                              node.span);
+        this.codegen_member_access(obj, node.object.resolved_type,
+                                   obj_is_lvalue, node.member,
+                                   node.span);
     }
 
     override visit(mut &this, node: ArrayAccessNode*) -> void {
@@ -1414,10 +1987,9 @@ public:
         // for a stored pointer.
         const arr_is_lvalue: boolean = this.last_is_lvalue;
         const idx: LValue = this.codegen_rvalue(node.index);
-        codegen_array_access(this.cg, arr, node.array.resolved_type,
-                             arr_is_lvalue, idx,
-                             &this.last_value, &this.last_is_lvalue,
-                             node.span);
+        this.codegen_array_access(arr, node.array.resolved_type,
+                                  arr_is_lvalue, idx,
+                                  node.span);
     }
 
     override visit(mut &this, node: CastExprNode*) -> void {
@@ -1477,8 +2049,8 @@ public:
             this.last_is_lvalue = false;
         } else {
             const val: LValue = this.codegen_rvalue(node.expression);
-            codegen_cast(this.cg, val, node.expression.resolved_type,
-                         node.resolved_target, &this.last_value);
+            this.last_value = this.cg.codegen_cast(val, node.expression.resolved_type,
+                                                   node.resolved_target);
             this.last_is_lvalue = false;
         }
     }
@@ -1488,7 +2060,7 @@ public:
         if (!sz_type_ref.is_valid()) {
             sz_type_ref = this.lookup_type(node.type_name);
         }
-        codegen_sizeof(this.cg, sz_type_ref, &this.last_value);
+        this.last_value = this.cg.codegen_sizeof(sz_type_ref);
         this.last_is_lvalue = false;
     }
 
@@ -1497,7 +2069,7 @@ public:
         if (!al_type_ref.is_valid()) {
             al_type_ref = this.lookup_type(node.type_name);
         }
-        codegen_alignof(this.cg, al_type_ref, &this.last_value);
+        this.last_value = this.cg.codegen_alignof(al_type_ref);
         this.last_is_lvalue = false;
     }
 
@@ -1625,7 +2197,7 @@ public:
                 _                             => { TokenType::Plus }
             };
             mut result: LValue = LValue::null();
-            codegen_binary(this.cg, lhs_loaded, rhs, base_op, node.resolved_type, &result);
+            result = this.cg.codegen_binary(lhs_loaded, rhs, base_op, node.resolved_type);
             // Narrow-store fix: codegen_binary normalizes operand widths to
             // the wider of lhs/rhs, so when the LHS slot is a narrow int
             // (char / i8 / u8) and the RHS is wider, `result` is wider than
@@ -1662,7 +2234,7 @@ public:
         const lhs: LValue = this.codegen_rvalue(node.left);
         const rhs: LValue = this.codegen_rvalue(node.right);
         mut result: LValue = LValue::null();
-        codegen_binary(this.cg, lhs, rhs, op, node.left.resolved_type, &result);
+        result = this.cg.codegen_binary(lhs, rhs, op, node.left.resolved_type);
         this.last_value = result;
         this.last_is_lvalue = false;
     }
@@ -1799,7 +2371,7 @@ public:
         }
         const operand: LValue = this.codegen_rvalue(node.operand);
         mut result: LValue = LValue::null();
-        codegen_unary(this.cg, operand, op, node.operand.resolved_type, &result);
+        result = this.cg.codegen_unary(operand, op, node.operand.resolved_type);
         this.last_value = result;
         this.last_is_lvalue = false;
     }
@@ -1863,7 +2435,7 @@ public:
             // was re-resolving names sema had already resolved.  See
             // memory/feedback_codegen_architecture_rules.md.
             if (node.resolved_callee.is_valid()) {
-                callee_val = resolve_function_by_mangled(this.cg, node.resolved_callee);
+                callee_val = this.cg.resolve_function_by_mangled(node.resolved_callee);
             }
 
             // 3b. Class / struct constructor call: `ClassName(args)` resolves
@@ -1902,9 +2474,9 @@ public:
                     const ctor_sym: SymbolStr = intern.intern(combined);
                     // Constructor LLVM arity = user args + 1 for `this`.
                     const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-                    mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
+                    mut ctor_fn: LValue = this.cg.resolve_function_with_arity(ctor_sym, ctor_arity);
                     if (!ctor_fn.is_valid()) {
-                        ctor_fn = resolve_function(this.cg, ctor_sym);
+                        ctor_fn = this.cg.resolve_function(ctor_sym);
                     }
                     if (ctor_fn.is_valid()) {
                         const mapped: LType = this.cg.type_mapper.map_type(type_ref);
@@ -1954,7 +2526,7 @@ public:
                                     ctor_args.push(Pair<LValue, TypeRef>::new(carg, node.arguments[ci].resolved_type));
                                 }
                                 mut ctor_res: LValue = LValue::null();
-                                codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_res);
+                                ctor_res = this.cg.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
                             }
                             // Load the constructed value as the expression result.
                             const loaded: LValue = this.cg.builder.build_load(
@@ -2035,7 +2607,7 @@ public:
                         const void_ty: LType = LType::void_type();
                         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
                         mut call_result: LValue = LValue::null();
-                        codegen_call(this.cg, fn_ptr, fn_type, call_args, call_name, &call_result);
+                        call_result = this.cg.codegen_call(fn_ptr, fn_type, call_args, call_name);
                         this.last_value = call_result;
                         this.last_is_lvalue = false;
                         return;
@@ -2084,8 +2656,7 @@ public:
             // call shapes sema doesn't yet pin (the spec-first lookup
             // based on `node.resolved_type`, enum-variant constructors).
             if (node.resolved_callee.is_valid()) {
-                callee_val = resolve_function_by_mangled(
-                    this.cg, node.resolved_callee);
+                callee_val = this.cg.resolve_function_by_mangled(node.resolved_callee);
             }
 
             // Resolve the scope name (e.g., "LValue") to its qualified form
@@ -2155,9 +2726,9 @@ public:
                     const member_str0: string = intern.resolve(sr.member_name);
                     const conc_combined0: string = format("%s::%s", conc_name0, member_str0);
                     const conc_sym0: SymbolStr = intern.intern(conc_combined0);
-                    callee_val = resolve_function_with_arity(this.cg, conc_sym0, sr_arity);
+                    callee_val = this.cg.resolve_function_with_arity(conc_sym0, sr_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = resolve_function(this.cg, conc_sym0);
+                        callee_val = this.cg.resolve_function(conc_sym0);
                     }
                 }
             }
@@ -2179,9 +2750,9 @@ public:
             if (!callee_val.is_valid()) {
                 const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
                 const sym: SymbolStr = intern.intern(combined);
-                callee_val = resolve_function_with_arity(this.cg, sym, sr_arity);
+                callee_val = this.cg.resolve_function_with_arity(sym, sr_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, sym);
+                    callee_val = this.cg.resolve_function(sym);
                 }
             }
 
@@ -2196,9 +2767,9 @@ public:
                 const matches: SymbolStr[] = collect_namespace_suffix_matches(
                     this.cg, intern, scope_str, sr.member_name, sr_arity);
                 if (matches.length == 1) {
-                    callee_val = resolve_function_with_arity(this.cg, matches[0], sr_arity);
+                    callee_val = this.cg.resolve_function_with_arity(matches[0], sr_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = resolve_function(this.cg, matches[0]);
+                        callee_val = this.cg.resolve_function(matches[0]);
                     }
                 } else if (matches.length > 1) {
                     mut detail: string = "";
@@ -2227,10 +2798,9 @@ public:
             // `std::fs::file::read(path: string)`, both reachable under bare
             // "read" via type_resolution's bare-alias registration).
             if (!callee_val.is_valid()) {
-                callee_val = resolve_function_with_arity(
-                    this.cg, sr.member_name, sr_arity);
+                callee_val = this.cg.resolve_function_with_arity(sr.member_name, sr_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, sr.member_name);
+                    callee_val = this.cg.resolve_function(sr.member_name);
                 }
             }
 
@@ -2371,7 +2941,7 @@ public:
                 const void_ty: LType = LType::void_type();
                 const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
                 mut call_result: LValue = LValue::null();
-                codegen_call(this.cg, fn_ptr, llvm_fn_type, fnp_args, call_name, &call_result);
+                call_result = this.cg.codegen_call(fn_ptr, llvm_fn_type, fnp_args, call_name);
                 this.last_value = call_result;
                 this.last_is_lvalue = false;
                 return;
@@ -2481,8 +3051,7 @@ public:
             // `Eq for i16`).  Routes through `resolve_function_by_mangled`,
             // identical to the Identifier branch.
             if (node.resolved_callee.is_valid()) {
-                callee_val = resolve_function_by_mangled(
-                    this.cg, node.resolved_callee);
+                callee_val = this.cg.resolve_function_by_mangled(node.resolved_callee);
             }
 
             // Post-specialization fallback: when the receiver is a
@@ -2502,9 +3071,9 @@ public:
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
                 const sym: SymbolStr = intern.intern(combined);
-                callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
+                callee_val = this.cg.resolve_function_with_arity(sym, ma_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = resolve_function(this.cg, sym);
+                    callee_val = this.cg.resolve_function(sym);
                 }
             }
             if (!callee_val.is_valid() && t != null) {
@@ -2531,9 +3100,9 @@ public:
                 if (intrinsics::strlen(type_str) > 0) {
                     const combined: string = format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
-                    callee_val = resolve_function_with_arity(this.cg, sym, ma_arity);
+                    callee_val = this.cg.resolve_function_with_arity(sym, ma_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = resolve_function(this.cg, sym);
+                        callee_val = this.cg.resolve_function(sym);
                     }
                 }
             }
@@ -2667,7 +3236,7 @@ public:
                                   type_kind_of(ret_ty.raw) == LTypeKind::Void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
-        codegen_call(this.cg, callee_val, fn_ty, args, call_name, &result);
+        result = this.cg.codegen_call(callee_val, fn_ty, args, call_name);
 
         // Emit `unreachable` after calls to divergent functions.  Two
         // cases handled here:
@@ -2776,9 +3345,7 @@ public:
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             element_values.push(this.codegen_rvalue(node.elements[i]));
         }
-        codegen_tuple_literal(this.cg, type_ref, element_values,
-                              &this.last_value, &this.last_is_lvalue,
-                              node.span);
+        this.codegen_tuple_literal(type_ref, element_values, node.span);
     }
 
     override visit(mut &this, node: StructLiteralNode*) -> void {
@@ -2797,9 +3364,7 @@ public:
             field_names.push(init.field_name);
             field_values.push(this.codegen_rvalue(init.value));
         }
-        codegen_struct_literal(this.cg, type_ref, field_names, field_values,
-                               &this.last_value, &this.last_is_lvalue,
-                               node.span);
+        this.codegen_struct_literal(type_ref, field_names, field_values, node.span);
     }
 
     override visit(mut &this, node: ArrayLiteralNode*) -> void {
@@ -2906,12 +3471,11 @@ public:
             // into heap corruption at the next allocation. `codegen_sizeof`
             // tries `size_bytes()` first and falls back to `LLVMSizeOf`,
             // which is always data-layout-correct.
-            mut elem_size_val: LValue = LValue::null();
-            codegen_sizeof(this.cg, arr_type.element, &elem_size_val);
+            const elem_size_val: LValue = this.cg.codegen_sizeof(arr_type.element);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
+            const malloc_fn: LValue = this.cg.resolve_function(this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -2920,7 +3484,7 @@ public:
             const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
             mut malloc_args: Pair<LValue, TypeRef>[] = [];
             malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-            codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "arrdata", &data_ptr);
+            data_ptr = this.cg.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrdata");
             if (!data_ptr.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3047,12 +3611,11 @@ public:
 
             // Stride from LLVM's data layout; see visit_dynamic_array_literal
             // for why size_bytes() can be 0 here.
-            mut elem_size_val: LValue = LValue::null();
-            codegen_sizeof(this.cg, arr_type.element, &elem_size_val);
+            const elem_size_val: LValue = this.cg.codegen_sizeof(arr_type.element);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
+            const malloc_fn: LValue = this.cg.resolve_function(this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3062,7 +3625,7 @@ public:
             mut malloc_args: Pair<LValue, TypeRef>[] = [];
             malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
             mut data_ptr: LValue = LValue::null();
-            codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "filldata", &data_ptr);
+            data_ptr = this.cg.codegen_call(malloc_fn, malloc_ty, malloc_args, "filldata");
             if (!data_ptr.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3343,7 +3906,7 @@ public:
         const combined_bare: string  = format("%s::%s", scope_str_bare, member_str);
         const sym_bare: SymbolStr    = this.cg.intern_str(combined_bare);
 
-        mut fn_val: LValue = resolve_function(this.cg, sym_bare);
+        mut fn_val: LValue = this.cg.resolve_function(sym_bare);
         if (fn_val.is_valid()) {
             this.last_value    = fn_val;
             this.last_is_lvalue = false;
@@ -3362,7 +3925,7 @@ public:
         if (!sym_qual.equals(sym_bare)) {
             fn_val = this.cg.get_function(sym_qual);
             if (!fn_val.is_valid()) {
-                fn_val = resolve_function(this.cg, sym_qual);
+                fn_val = this.cg.resolve_function(sym_qual);
             }
             if (fn_val.is_valid()) {
                 this.last_value    = fn_val;
@@ -3372,7 +3935,7 @@ public:
         }
 
         // ── 3. Global variable lookups ────────────────────────────────────────
-        const global: LValue = resolve_global(this.cg, sym_bare);
+        const global: LValue = this.cg.resolve_global(sym_bare);
         if (global.is_valid()) {
             this.last_value    = global;
             this.last_is_lvalue = true;
@@ -3384,7 +3947,7 @@ public:
         // name lookup misses, so also try the bare member name. Globals
         // are unique LLVM symbols at link time, so the bare name resolves
         // to the same definition regardless of which module references it.
-        const bare_global: LValue = resolve_global(this.cg, node.member_name);
+        const bare_global: LValue = this.cg.resolve_global(node.member_name);
         if (bare_global.is_valid()) {
             this.last_value    = bare_global;
             this.last_is_lvalue = true;
@@ -3564,7 +4127,7 @@ public:
             const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
             mut a_args_e: Pair<LValue, TypeRef>[] = [];
             mut a_res_e: LValue = LValue::null();
-            codegen_call(this.cg, abort_fn_e, abort_ty_e, a_args_e, "", &a_res_e);
+            a_res_e = this.cg.codegen_call(abort_fn_e, abort_ty_e, a_args_e, "");
             this.cg.builder.build_unreachable();
         }
 
@@ -3594,12 +4157,12 @@ public:
         this.cg.builder.position_at_end(then_bb);
         const then_val: LValue = this.codegen_rvalue(node.true_expr);
         const then_end: LBasicBlock = this.cg.builder.get_insert_block();
-        branch_if_not_terminated(this.cg, merge_bb);
+        this.cg.branch_if_not_terminated(merge_bb);
 
         this.cg.builder.position_at_end(else_bb);
         const else_val: LValue = this.codegen_rvalue(node.false_expr);
         const else_end: LBasicBlock = this.cg.builder.get_insert_block();
-        branch_if_not_terminated(this.cg, merge_bb);
+        this.cg.branch_if_not_terminated(merge_bb);
 
         this.cg.builder.position_at_end(merge_bb);
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
@@ -3683,12 +4246,12 @@ public:
                 vargs.push(this.codegen_rvalue(node.arguments[i]));
             }
             const variant_val: LValue = this.build_enum_variant(et, variant, type_ref, vargs);
-            this.last_value = heap_box_enum_variant(this.cg, et, type_ref, variant_val, node.span);
+            this.last_value = this.cg.heap_box_enum_variant(et, type_ref, variant_val, node.span);
             this.last_is_lvalue = false;
             return;
         }
 
-        const malloc_fn: LValue = resolve_function(this.cg, this.cg.intern_str("malloc"));
+        const malloc_fn: LValue = this.cg.resolve_function(this.cg.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
             this.cg.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: 'new' expression: 'malloc' not declared",
@@ -3739,7 +4302,7 @@ public:
         mut malloc_args: Pair<LValue, TypeRef>[] = [];
         malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
         mut raw_ptr: LValue = LValue::null();
-        codegen_call(this.cg, malloc_fn, malloc_ty, malloc_args, "newtmp", &raw_ptr);
+        raw_ptr = this.cg.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
 
         // Bitcast to the target struct pointer type.
         mut obj_ptr: LValue = raw_ptr;
@@ -3842,9 +4405,9 @@ public:
         const ctor_sym: SymbolStr = intern.intern(ctor_combined);
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-        mut ctor_fn: LValue = resolve_function_with_arity(this.cg, ctor_sym, ctor_arity);
+        mut ctor_fn: LValue = this.cg.resolve_function_with_arity(ctor_sym, ctor_arity);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = resolve_function(this.cg, ctor_sym);
+            ctor_fn = this.cg.resolve_function(ctor_sym);
         }
         if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
@@ -3857,7 +4420,7 @@ public:
                     ctor_args.push(Pair<LValue, TypeRef>::new(arg_val, node.arguments[i].resolved_type));
                 }
                 mut ctor_result: LValue = LValue::null();
-                codegen_call(this.cg, ctor_fn, ctor_ty, ctor_args, "", &ctor_result);
+                ctor_result = this.cg.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
             }
         }
 
@@ -3914,7 +4477,7 @@ public:
         }
 
         const ptr: LValue = this.codegen_rvalue(node.operand);
-        const free_fn: LValue = resolve_function(this.cg, this.cg.intern_str("free"));
+        const free_fn: LValue = this.cg.resolve_function(this.cg.intern_str("free"));
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(
                 ptr, LType::pointer_to(LType::i8()), "delcast");
@@ -3923,7 +4486,7 @@ public:
                 mut free_args: Pair<LValue, TypeRef>[] = [];
                 free_args.push(Pair<LValue, TypeRef>::new(void_ptr, TypeRef::invalid()));
                 mut result: LValue = LValue::null();
-                codegen_call(this.cg, free_fn, free_ty, free_args, "", &result);
+                result = this.cg.codegen_call(free_fn, free_ty, free_args, "");
             } else {
                 this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                     "codegen: 'delete' expression: failed to retrieve free function type",
@@ -3957,7 +4520,7 @@ public:
         this.cg.builder.position_at_end(rhs_bb);
         const rhs: LValue = this.codegen_rvalue(node.right);
         const rhs_end_bb: LBasicBlock = this.cg.builder.get_insert_block();
-        branch_if_not_terminated(this.cg, merge_bb);
+        this.cg.branch_if_not_terminated(merge_bb);
 
         // If either operand failed to lower (e.g. `entry.key == key` where K
         // is a struct that doesn't support `==`, or any expression that
@@ -4239,7 +4802,7 @@ function collect_namespace_suffix_matches(cg: CodegenContext*, intern: InternTab
         // Build "<ns>::<member>" and probe the function table.
         const qualified: string = format("%s::%s", ns_str, member_str);
         const q_sym: SymbolStr = intern.intern(qualified);
-        const probe: LValue = resolve_function_with_arity(cg, q_sym, arity);
+        const probe: LValue = cg.resolve_function_with_arity(q_sym, arity);
         if (!probe.is_valid()) { continue; }
 
         // Dedup: same qualified name shouldn't appear twice (e.g. when
