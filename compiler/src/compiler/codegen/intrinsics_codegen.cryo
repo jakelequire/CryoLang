@@ -1,10 +1,10 @@
 /// Intrinsic Codegen
 ///
 /// Inline-lowering for the bare-name intrinsics declared in
-/// `stdlib/core/intrinsics.cryo` that the C++ bootstrap inline-lowers but
-/// the self-hosted cryoc previously emitted as plain function calls.  By
-/// emitting the equivalent LLVM IR directly here, we eliminate the
-/// undefined-symbol references that used to require `runtime/cryort.c`.
+/// `stdlib/core/intrinsics.cryo`.  Each call is emitted directly as the
+/// equivalent LLVM IR rather than routed through a runtime helper, so the
+/// produced binary has no separate C runtime dependency for these
+/// primitives.
 ///
 /// Layout:
 ///   - `IntrinsicKind`:          one variant per recognized intrinsic.
@@ -83,8 +83,8 @@ type enum IntrinsicKind {
     Clz32; Clz64; Ctz32; Ctz64;
     Rotl32; Rotl64; Rotr32; Rotr64;
 
-    // Memory ordering: `fence seq_cst`.  cryort.c's atomic_fence took
-    // an order arg but always used SeqCst; we keep the same semantics.
+    // Memory ordering: `fence seq_cst`.  The order argument is accepted
+    // for ABI compatibility but always lowered as SequentiallyConsistent.
     AtomicFence;
 
     // Float predicate: `(x - x) == 0` is true iff x is finite (NaN and
@@ -227,8 +227,7 @@ function is_intrinsic_name(name: string) -> boolean {
 //
 // Stdlib code (primitives.cryo) routinely calls these intrinsics with
 // `&this` rather than `this`, passing a primitive by reference instead
-// of by value.  The C++ bootstrap auto-deref'd that pattern; we need to
-// match it.  When an intrinsic expects an integer/float value but the
+// of by value.  When an intrinsic expects an integer/float value but the
 // caller passed a pointer, load through the pointer first.
 
 function auto_deref_to(cg: CodegenContext*, val: LValue, expected: LType) -> LValue {
@@ -430,8 +429,7 @@ function emit_clz_or_ctz(cg: CodegenContext*, iname: string, ty: LType, x: LValu
     param_slots[1] = LType::i1().raw;
     const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
     intrinsics::free(param_buf);
-    // is_zero_undef = false: zero input returns the bit width.  Matches
-    // the cryort.c semantics callers were depending on.
+    // is_zero_undef = false: zero input returns the bit width.
     const flag: LValue = LType::const_int(LType::i1(), 0, false);
     const raw: LValue = call2(cg, fn, fn_ty, x, flag, "clztmp");
     if (llvm::LLVMGetIntTypeWidth(ty.raw) != 32) {
@@ -452,9 +450,9 @@ function emit_rotate(cg: CodegenContext*, iname: string, ty: LType, x: LValue, n
     intrinsics::free(param_buf);
     // Rotate signature is `(value, n: u32)`; funnel-shift wants the
     // shift amount in the same width as the value.  For 64-bit rotates,
-    // widen the i32 shift count to i64.  Note: cryoc's `void*` equality
-    // is documented as broken (always true), so we compare integer
-    // widths via LLVMGetIntTypeWidth instead of `ty.raw == ...raw`.
+    // widen the i32 shift count to i64.  Note: `void*` equality is
+    // currently broken (always true), so we compare integer widths via
+    // LLVMGetIntTypeWidth instead of `ty.raw == ...raw`.
     mut shift: LValue = n;
     const target_width: u32 = llvm::LLVMGetIntTypeWidth(ty.raw);
     if (target_width == 64) {
@@ -496,11 +494,9 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
     if (args.length != expected) { return false; }
 
     // Auto-deref pointer args for value-arg intrinsics: handles the
-    // pervasive `intrinsic(&this)` pattern in stdlib's primitives.cryo
-    // that the C++ bootstrap silently coerced via `codegen_call`'s
-    // pointer-vs-value mismatch path.  No-op for the pointer-arg
-    // intrinsics (PtrAdd/PtrSub/PtrDiff) since intrinsic_src_type
-    // returns null for those.
+    // pervasive `intrinsic(&this)` pattern in stdlib's primitives.cryo.
+    // No-op for the pointer-arg intrinsics (PtrAdd/PtrSub/PtrDiff) since
+    // intrinsic_src_type returns null for those.
     const src_ty: LType = intrinsic_src_type(kind);
     mut a0: LValue = args[0];
     if (src_ty.is_valid()) {
@@ -609,10 +605,10 @@ function try_emit_intrinsic_call(cg: CodegenContext*, name: string, args: LValue
         IntrinsicKind::Rotr32 => { emit_rotate(cg, "llvm.fshr.i32", LType::i32(), a0, a1) }
         IntrinsicKind::Rotr64 => { emit_rotate(cg, "llvm.fshr.i64", LType::i64(), a0, a1) }
 
-        // -- atomic_fence(order): emit `fence seq_cst`.  cryort.c
-        //    ignored the order arg and always used SeqCst, matching that
-        //    here.  Returns void; we synthesize a void value.  The
-        //    Ordering enum value 7 = SequentiallyConsistent. --
+        // -- atomic_fence(order): emit `fence seq_cst`.  The order arg
+        //    is ignored; we always emit SequentiallyConsistent.  Returns
+        //    void; we synthesize a void value.  The Ordering enum value
+        //    7 = SequentiallyConsistent. --
         IntrinsicKind::AtomicFence => {
             llvm::LLVMBuildFence(cg.builder.raw, 7, 0, "");
             LValue::null()
@@ -682,8 +678,8 @@ function emit_panic_call(cg: CodegenContext*, msg: LValue, file: LValue, line: L
 //     char           d_name[256]; // offset 19, size up to 256
 // };
 //
-// We hardcode the offsets matching cryort.c's behavior.  Both helpers
-// guard against a null entry pointer (cryort.c returned "" / 0).
+// We hardcode the offsets above.  Both helpers guard against a null
+// entry pointer (returning "" / 0 in that case).
 
 function emit_dirent_name(cg: CodegenContext*, entry: LValue) -> LValue {
     const i8_ty: LType = LType::i8();
@@ -719,12 +715,11 @@ function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
     // Map POSIX DT_* values to FileType enum ordinals.  The intrinsic
     // contract (see stdlib/fs/dir.cryo and stdlib/core/intrinsics.cryo:
     // "returns i32 mapped to FileType ordinals") expects ordinals, not
-    // raw d_type bytes.  The C++ bootstrap performs this mapping in
-    // src/Codegen/Intrinsics.cpp:generate_dirent_type; cryoc previously
-    // returned the raw byte, so callers like module_loader.cryo's
+    // raw d_type bytes.  Callers like module_loader.cryo's
     // `if (dtype == 1)` (directory) and `else if (dtype == 0)` (file)
-    // never matched anything (Linux returns DT_DIR=4 / DT_REG=8) and
-    // every .cryo entry was silently skipped during pre-scan.
+    // depend on this remapping; without it, Linux's DT_DIR=4 / DT_REG=8
+    // would never match and every .cryo entry would be skipped during
+    // pre-scan.
     //
     //   DT_REG(8)   → FileType::File(0)
     //   DT_DIR(4)   → FileType::Directory(1)
@@ -781,9 +776,9 @@ function emit_dirent_type(cg: CodegenContext*, entry: LValue) -> LValue {
 // `format` runtime helper
 // ============================================================================
 //
-// `format(fmt, args...) -> string` was previously defined in cryort.c; this
-// emits an equivalent definition into every module that's compiled.  With
-// linkonce_odr linkage the linker keeps one copy across all 100+ modules.
+// `format(fmt, args...) -> string` is emitted as a `linkonce_odr` definition
+// into every module that's compiled.  The linker keeps one copy across all
+// 100+ modules.
 //
 // Body (vasprintf-based: single call, no va_copy gymnastics):
 //
