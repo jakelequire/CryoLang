@@ -9,6 +9,12 @@ namespace Compiler::Codegen::Context;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::LoopStack;
+import Compiler::Codegen::ValueTable;
+import Compiler::Codegen::FunctionRegistry;
+import Compiler::Codegen::GlobalRegistry;
+import Compiler::Codegen::StringCache;
+import Compiler::Codegen::DiagSink;
 import Compiler::CompilationContext;
 import Compiler::DeclIndex;
 import Compiler::Diag;
@@ -38,35 +44,22 @@ type struct CodegenContext {
     builder:     LBuilder;
     type_mapper: TypeMapper;
 
-    // -- Named values: SymbolStr.id -> LLVMValueRef raw pointer --
-    // Local variables and parameters in the current scope.
-    named: Pair<u32, void*>[];
+    // -- Local-scope bindings (named values + push/pop_scope undo log) --
+    values: ValueTable;
 
-    // -- Scope undo log (same pattern as sema's TypeCheckVisitor) --
-    // On push_scope(), record the undo log length.  On pop_scope(), roll
-    // back all bindings added since the push.
-    undo:         Pair<u32, void*>[];  // (SymbolStr.id, previous LLVMValueRef or null)
-    scope_marks:  i64[];              // undo log length at each scope push
+    // -- Function declarations (by-name and overload-aware) --
+    functions: FunctionRegistry;
 
-    // -- Function map: SymbolStr.id -> LLVMValueRef --
-    funcs: Pair<u32, void*>[];
+    // -- Module-global variables --
+    globals: GlobalRegistry;
 
-    // -- Overload-aware function map: (SymbolStr.id, arity) -> LLVMValueRef.
-    //    Parallel arrays so callers can disambiguate `Array::new()` from
-    //    `Array::new(u64)` without collapsing to a single last-wins entry.
-    func_overload_keys:    u32[];
-    func_overload_arities: u32[];
-    func_overload_values:  void*[];
+    // -- Deduplicated string literal globals --
+    str_cache: StringCache;
 
-    // -- Global map: SymbolStr.id -> LLVMValueRef --
-    globals: Pair<u32, void*>[];
-
-    // -- String literal dedup --
-    str_lits: Pair<string, void*>[];
-
-    // -- Break/Continue target stack (for loops) --
-    break_targets:    void*[];     // LLVMBasicBlockRef stack
-    continue_targets: void*[];     // LLVMBasicBlockRef stack
+    // -- Loop target stack --
+    // Push (break_bb, continue_bb) on loop entry; pop on loop exit.
+    // `break`/`continue` jump to the top of the stack.
+    loops: LoopStack;
 
     // -- Shared references --
     ctx:    CompilationContext*;
@@ -79,15 +72,8 @@ type struct CodegenContext {
     // means the current function is not variadic.
     current_variadic_arg_id: u32;
 
-    // -- Stripped-functions set --
-    // Mangled LLVM names of functions whose body was attempted-but-stripped
-    // in this module (`is_function_body_valid` returned false →
-    // `strip_function_body` deleted all blocks).  Used by the post-codegen
-    // cascade-strip pass to identify same-module declare-only callees and
-    // strip their callers too, so an `Array<T>::quicksort` body that calls
-    // a stripped `partition` doesn't emit a dangling extern at link time.
-    // Cross-module externs are NOT in this set, so they're unaffected.
-    stripped_func_names: string[];
+    // -- Diagnostic routing + stripped-functions set --
+    diag: DiagSink;
 
     /// Create a new codegen context for a module.
     static new(ctx: CompilationContext*, module_name: string) -> CodegenContext {
@@ -99,29 +85,19 @@ type struct CodegenContext {
             builder:     builder,
             type_mapper: TypeMapper::new(ctx.type_arena, ctx.intern_table),
 
-            named:        [],
-            undo:         [],
-            scope_marks:  [],
+            values:    ValueTable::new(),
+            functions: FunctionRegistry::new(),
+            globals:   GlobalRegistry::new(),
+            str_cache: StringCache::new(),
 
-            funcs:        [],
-
-            func_overload_keys:    [],
-            func_overload_arities: [],
-            func_overload_values:  [],
-
-            globals:   [],
-
-            str_lits:   [],
-
-            break_targets:    [],
-            continue_targets: [],
+            loops: LoopStack::new(),
 
             ctx:    ctx,
             arena:  ctx.type_arena,
             intern: ctx.intern_table,
 
             current_variadic_arg_id: 0,
-            stripped_func_names: [],
+            diag:                    DiagSink::new(ctx),
         };
     }
 
@@ -201,146 +177,52 @@ type struct CodegenContext {
     // Diagnostic helpers (codegen-local shorthand)
     // ========================================================================
 
-    /// Emit an error with a source span. Shorthand for
-    /// `this.ctx.emit_error_at(code, msg, span)`; prefer this over
-    /// `ctx.emit_error` whenever the triggering AST node is in scope; the
-    /// span gives the renderer a file:line arrow and source snippet.
+    // Diagnostic trampolines.  TODO(decomposition): callers migrate to
+    // `this.diag.emit_error_at_span(...)` etc.
     emit_error_at_span(&this, code: ErrorCode, message: string, span: SourceSpan) -> void {
-        this.ctx.emit_error_at(code, message, span);
+        this.diag.emit_error_at_span(code, message, span);
     }
 
-    /// Emit a warning with a source span.
     emit_warning_at_span(&this, code: ErrorCode, message: string, span: SourceSpan) -> void {
-        mut diag: Diagnostic = Diagnostic::warning(code, message);
-        diag = diag.at(span);
-        this.emit_diagnostic(diag);
+        this.diag.emit_warning_at_span(code, message, span);
     }
 
-    /// Emit a pre-built Diagnostic.  Use this when you need the builder
-    /// API (secondary labels, notes, suggestions) that the `_at_span`
-    /// helpers don't expose.  Breaks the chained access through
-    /// `this.ctx.diagnostics` into intermediate locals; the chained form
-    /// trips a type-resolver limitation when written inline.
     emit_diagnostic(&this, diag: Diagnostic) -> void {
-        const c: CompilationContext* = this.ctx;
-        const sink: DiagnosticSink* = c.diagnostics;
-        sink.emit(diag);
+        this.diag.emit(diag);
     }
 
-    /// Strip all basic blocks from a function, reverting it to a declare.
-    /// Used when body generation fails: better a clean declare than
-    /// a half-built define that fails LLVM verification.  Also records the
-    /// function's mangled LLVM name in `stripped_func_names` so the
-    /// post-codegen cascade pass can strip callers in the same module.
     strip_function_body(mut &this, fn_val: LValue) -> void {
-        if (!fn_val.is_valid()) { return; }
-        const fn_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
-        if (fn_name != null) {
-            this.stripped_func_names.push(fn_name);
-        }
-        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
-        while (bb != null) {
-            const next: void* = llvm::LLVMGetNextBasicBlock(bb);
-            llvm::LLVMDeleteBasicBlock(bb);
-            bb = next;
-        }
+        this.diag.strip_function_body(fn_val);
     }
 
-    /// Check whether a function's IR is valid (all blocks terminated).
-    /// Returns false if any basic block lacks a terminator.
     is_function_body_valid(&this, fn_val: LValue) -> boolean {
-        if (!fn_val.is_valid()) { return false; }
-        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
-        while (bb != null) {
-            const term: void* = llvm::LLVMGetBasicBlockTerminator(bb);
-            if (term == null) { return false; }
-            bb = llvm::LLVMGetNextBasicBlock(bb);
-        }
-        return true;
+        return this.diag.is_function_body_valid(fn_val);
     }
 
-    /// Count basic blocks in a function partitioned by whether they have a
-    /// terminator.  Both counts are written through the out-parameters.
-    /// Used by `report_invalid_function_body` to phrase the diagnostic.
     count_unterminated_blocks(&this, fn_val: LValue,
                               out_total: i32*, out_bad: i32*) -> void {
-        *out_total = 0;
-        *out_bad   = 0;
-        if (!fn_val.is_valid()) { return; }
-        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
-        while (bb != null) {
-            *out_total = *out_total + 1;
-            const term: void* = llvm::LLVMGetBasicBlockTerminator(bb);
-            if (term == null) {
-                *out_bad = *out_bad + 1;
-            }
-            bb = llvm::LLVMGetNextBasicBlock(bb);
-        }
+        this.diag.count_unterminated_blocks(fn_val, out_total, out_bad);
     }
 
-    /// Report that body codegen left a function in an invalid state, then
-    /// strip its blocks.  Use this instead of calling `strip_function_body`
-    /// directly so the failure surfaces as a `file:line` diagnostic
-    /// rather than a silent dropped body that only reveals itself as an
-    /// `undefined reference` at link time.
-    ///
-    /// `pretty_name` should be a human-readable identifier (e.g. the
-    /// source-level qualified name like `Foo::bar` for a method, or the
-    /// bare function name for a free function).  `span` should point at
-    /// the offending declaration.  Both are best-effort; even with
-    /// `SourceSpan::empty()` we still report the LLVM mangled name.
     report_invalid_function_body(mut &this, fn_val: LValue,
                                  pretty_name: string,
                                  span: SourceSpan) -> void {
-        if (!fn_val.is_valid()) { return; }
-        mut total: i32 = 0;
-        mut bad:   i32 = 0;
-        this.count_unterminated_blocks(fn_val, &total, &bad);
-        const llvm_name: string = llvm::LLVMGetValueName(fn_val.raw) as string;
-        const llvm_name_safe: string = if (llvm_name == null) { "<unnamed>" } else { llvm_name };
-        const msg: string = format(
-            "codegen: function '%s' (LLVM '%s') left %d of %d basic block(s) unterminated; body discarded (this is a codegen bug, please report it)",
-            pretty_name, llvm_name_safe, bad, total);
-        this.emit_error_at_span(ErrorCode::E0633_FUNCTION_BODY_ERROR, msg, span);
-        this.strip_function_body(fn_val);
+        this.diag.report_invalid_function_body(fn_val, pretty_name, span);
     }
 
     // ========================================================================
     // Scope management
     // ========================================================================
 
-    /// Push a new scope level.  Records the current undo log length so
-    /// pop_scope() knows how far to roll back.
+    // Scope + named-value trampolines.  TODO(decomposition): callers will
+    // migrate to `this.values.push_scope()` / `this.values.set(...)` etc.;
+    // these wrappers will be removed.
     push_scope(mut &this) -> void {
-        this.scope_marks.push(this.undo.length);
+        this.values.push_scope();
     }
 
-    /// Pop the current scope.  Restores all named value bindings to their
-    /// state at the matching push_scope().
     pop_scope(mut &this) -> void {
-        if (this.scope_marks.length == 0) {
-            return;
-        }
-
-        const mark: i64 = this.scope_marks[this.scope_marks.length - 1];
-        this.scope_marks.pop();
-
-        // Roll back undo log entries from mark to end.
-        for (mut i: i64 = this.undo.length - 1; i >= mark; i--) {
-            const key: u32 = this.undo[i].first;
-            const prev: void* = this.undo[i].second;
-
-            if (prev == null) {
-                // This was a new binding; remove it.
-                this.remove_named_value(key);
-            } else {
-                // Restore previous value.
-                this.set_named_value_raw(key, prev);
-            }
-        }
-
-        // Truncate undo log.
-        while (this.undo.length > mark) { this.undo.pop(); }
+        this.values.pop_scope();
     }
 
 
@@ -348,23 +230,12 @@ type struct CodegenContext {
     // Named value access (locals / parameters)
     // ========================================================================
 
-    /// Set a named value in the current scope.  Records the previous
-    /// binding (if any) in the undo log for rollback on pop_scope().
     set_named_value(mut &this, name: SymbolStr, val: LValue) -> void {
-        const key: u32 = name.id;
-
-        // Record undo entry: find existing binding.
-        const existing: void* = this.get_named_value_raw(key);
-        this.undo.push(Pair::new(key, existing));
-
-        // Set or update the binding.
-        this.set_named_value_raw(key, val.raw);
+        this.values.set(name, val);
     }
 
-    /// Look up a named value.  Returns null LValue if not found.
     get_named_value(&this, name: SymbolStr) -> LValue {
-        const raw: void* = this.get_named_value_raw(name.id);
-        return LValue { raw: raw };
+        return this.values.get(name);
     }
 
 
@@ -372,58 +243,22 @@ type struct CodegenContext {
     // Function map
     // ========================================================================
 
-    /// Register a function by name.
+    // Function-registry trampolines.  TODO(decomposition): callers migrate
+    // to `this.functions.register(...)` / `this.functions.get(...)` etc.
     register_function(mut &this, name: SymbolStr, val: LValue) -> void {
-        const key: u32 = name.id;
-        // Update existing or append.
-        for (mut i: i64 = 0; i < this.funcs.length; i++) {
-            if (this.funcs[i].first == key) {
-                this.funcs[i].second = val.raw;
-                return;
-            }
-        }
-        this.funcs.push(Pair::new(key, val.raw));
+        this.functions.register(name, val);
     }
 
-    /// Register a function against a (name, user-arg-count) composite key so
-    /// overloaded methods (e.g., `Array::new()` vs `Array::new(u64)`) stay
-    /// distinct.  The regular `register_function` still records the last-
-    /// seen overload for callers that don't disambiguate by arity.
     register_function_with_arity(mut &this, name: SymbolStr, arity: u32, val: LValue) -> void {
-        const key: u32 = name.id;
-        for (mut i: i64 = 0; i < this.func_overload_keys.length; i++) {
-            if (this.func_overload_keys[i] == key && this.func_overload_arities[i] == arity) {
-                this.func_overload_values[i] = val.raw;
-                return;
-            }
-        }
-        this.func_overload_keys.push(key);
-        this.func_overload_arities.push(arity);
-        this.func_overload_values.push(val.raw);
+        this.functions.register_with_arity(name, arity, val);
     }
 
-    /// Look up a function by name.
     get_function(&this, name: SymbolStr) -> LValue {
-        const key: u32 = name.id;
-        for (mut i: i64 = 0; i < this.funcs.length; i++) {
-            if (this.funcs[i].first == key) {
-                return LValue { raw: this.funcs[i].second };
-            }
-        }
-        return LValue::null();
+        return this.functions.get(name);
     }
 
-    /// Look up an overloaded function by (name, user-arg-count).  Returns
-    /// null if no matching overload is registered; callers should fall back
-    /// to `get_function` for code paths that weren't arity-annotated.
     get_function_with_arity(&this, name: SymbolStr, arity: u32) -> LValue {
-        const key: u32 = name.id;
-        for (mut i: i64 = 0; i < this.func_overload_keys.length; i++) {
-            if (this.func_overload_keys[i] == key && this.func_overload_arities[i] == arity) {
-                return LValue { raw: this.func_overload_values[i] };
-            }
-        }
-        return LValue::null();
+        return this.functions.get_with_arity(name, arity);
     }
 
 
@@ -432,24 +267,11 @@ type struct CodegenContext {
     // ========================================================================
 
     register_global(mut &this, name: SymbolStr, val: LValue) -> void {
-        const key: u32 = name.id;
-        for (mut i: i64 = 0; i < this.globals.length; i++) {
-            if (this.globals[i].first == key) {
-                this.globals[i].second = val.raw;
-                return;
-            }
-        }
-        this.globals.push(Pair::new(key, val.raw));
+        this.globals.register(name, val);
     }
 
     get_global(&this, name: SymbolStr) -> LValue {
-        const key: u32 = name.id;
-        for (mut i: i64 = 0; i < this.globals.length; i++) {
-            if (this.globals[i].first == key) {
-                return LValue { raw: this.globals[i].second };
-            }
-        }
-        return LValue::null();
+        return this.globals.get(name);
     }
 
 
@@ -457,22 +279,10 @@ type struct CodegenContext {
     // String literal dedup
     // ========================================================================
 
-    /// Get or create a global string constant.  Deduplicates identical strings.
+    /// Get or create a global string constant.  Trampoline; callers will
+    /// migrate to `this.str_cache.get_or_create(text, this.builder)`.
     get_or_create_string_literal(mut &this, text: string) -> LValue {
-        // Check dedup cache.
-        for (mut i: i64 = 0; i < this.str_lits.length; i++) {
-            if (this.str_lits[i].first == text) {
-                return LValue { raw: this.str_lits[i].second };
-            }
-        }
-
-        // Create a new global string.
-        const name: string = format(".str.%d", this.str_lits.length);
-        const val: LValue = this.builder.build_global_string_ptr(text, name);
-
-        this.str_lits.push(Pair::new(text, val.raw));
-
-        return val;
+        return this.str_cache.get_or_create(text, this.builder);
     }
 
 
@@ -480,30 +290,24 @@ type struct CodegenContext {
     // Loop target stack
     // ========================================================================
 
+    // Loop-stack trampolines.  TODO(decomposition): callers will migrate to
+    // `this.loops.push(...)` / `this.loops.pop()` / `this.loops.current_break()`
+    // / `this.loops.current_continue()` directly, and these wrappers will be
+    // removed.
     push_loop(mut &this, break_bb: LBasicBlock, continue_bb: LBasicBlock) -> void {
-        this.break_targets.push(break_bb.raw);
-        this.continue_targets.push(continue_bb.raw);
+        this.loops.push(break_bb, continue_bb);
     }
 
     pop_loop(mut &this) -> void {
-        if (this.break_targets.length > 0) {
-            this.break_targets.pop();
-            this.continue_targets.pop();
-        }
+        this.loops.pop();
     }
 
     current_break_target(&this) -> LBasicBlock {
-        if (this.break_targets.length == 0) {
-            return LBasicBlock::null();
-        }
-        return LBasicBlock { raw: this.break_targets[this.break_targets.length - 1] };
+        return this.loops.current_break();
     }
 
     current_continue_target(&this) -> LBasicBlock {
-        if (this.continue_targets.length == 0) {
-            return LBasicBlock::null();
-        }
-        return LBasicBlock { raw: this.continue_targets[this.continue_targets.length - 1] };
+        return this.loops.current_continue();
     }
 
 
@@ -576,37 +380,18 @@ type struct CodegenContext {
     // Internal helpers
     // ========================================================================
 
+    // Raw value-table trampolines.  TODO(decomposition): callers (currently
+    // only internal codegen paths) migrate to `this.values.get_raw(...)` etc.
     get_named_value_raw(&this, key: u32) -> void* {
-        for (mut i: i64 = 0; i < this.named.length; i++) {
-            if (this.named[i].first == key) {
-                return this.named[i].second;
-            }
-        }
-        return null;
+        return this.values.get_raw(key);
     }
 
     set_named_value_raw(mut &this, key: u32, val: void*) -> void {
-        for (mut i: i64 = 0; i < this.named.length; i++) {
-            if (this.named[i].first == key) {
-                this.named[i].second = val;
-                return;
-            }
-        }
-        this.named.push(Pair::new(key, val));
+        this.values.set_raw(key, val);
     }
 
     remove_named_value(mut &this, key: u32) -> void {
-        for (mut i: i64 = 0; i < this.named.length; i++) {
-            if (this.named[i].first == key) {
-                // Swap with last and pop.
-                const last: i64 = this.named.length - 1;
-                if (i < last) {
-                    this.named[i] = this.named[last];
-                }
-                this.named.pop();
-                return;
-            }
-        }
+        this.values.remove_raw(key);
     }
 
     // ========================================================================

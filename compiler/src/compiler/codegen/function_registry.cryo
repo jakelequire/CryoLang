@@ -1,0 +1,84 @@
+/// Function Registry
+///
+/// Module-local map of function declarations: `SymbolStr.id` ->
+/// `LLVMValueRef`.  Two parallel storage backends:
+///
+/// * `by_name` — single binding per name.  Last-wins; this matches what
+///    most call sites need (resolve by mangled name, which is unique).
+/// * `by_overload` — `(SymbolStr.id, arity)` parallel arrays so
+///    overloaded methods such as `Array::new()` vs `Array::new(u64)`
+///    can be disambiguated by argument count without collapsing.
+///
+/// Leaf component: owns its arrays, holds no back-pointers.
+
+namespace Compiler::Codegen::FunctionRegistry;
+
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Resolver::SymbolStr;
+import std::collections::pair;
+
+
+// ============================================================================
+// FunctionRegistry
+// ============================================================================
+
+type struct FunctionRegistry {
+    by_name: Pair<u32, void*>[];   // (SymbolStr.id, LLVMValueRef)
+
+    overload_keys:    u32[];
+    overload_arities: u32[];
+    overload_values:  void*[];
+
+    static new() -> FunctionRegistry {
+        return FunctionRegistry {
+            by_name:          [],
+            overload_keys:    [],
+            overload_arities: [],
+            overload_values:  [],
+        };
+    }
+
+    register(mut &this, name: SymbolStr, val: LValue) -> void {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.by_name.length; i++) {
+            if (this.by_name[i].first == key) {
+                this.by_name[i].second = val.raw;
+                return;
+            }
+        }
+        this.by_name.push(Pair::new(key, val.raw));
+    }
+
+    register_with_arity(mut &this, name: SymbolStr, arity: u32, val: LValue) -> void {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.overload_keys.length; i++) {
+            if (this.overload_keys[i] == key && this.overload_arities[i] == arity) {
+                this.overload_values[i] = val.raw;
+                return;
+            }
+        }
+        this.overload_keys.push(key);
+        this.overload_arities.push(arity);
+        this.overload_values.push(val.raw);
+    }
+
+    get(&this, name: SymbolStr) -> LValue {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.by_name.length; i++) {
+            if (this.by_name[i].first == key) {
+                return LValue { raw: this.by_name[i].second };
+            }
+        }
+        return LValue::null();
+    }
+
+    get_with_arity(&this, name: SymbolStr, arity: u32) -> LValue {
+        const key: u32 = name.id;
+        for (mut i: i64 = 0; i < this.overload_keys.length; i++) {
+            if (this.overload_keys[i] == key && this.overload_arities[i] == arity) {
+                return LValue { raw: this.overload_values[i] };
+            }
+        }
+        return LValue::null();
+    }
+}
