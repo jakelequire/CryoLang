@@ -127,8 +127,9 @@ type struct CodegenContext {
 
 
     // ========================================================================
-    // Safe accessors: route through CompilationContext to avoid
-    // CodegenContext struct offset issues in the C++ compiler.
+    // Safe accessors: route through CompilationContext to dodge subtle
+    // struct-offset issues on the large CodegenContext layout that have
+    // historically miscalculated `this.<field>` offsets.
     // ========================================================================
 
     /// Get the InternTable reliably via ctx→intern_table.
@@ -172,8 +173,9 @@ type struct CodegenContext {
     }
 
     /// Look up a type in the arena by ID.
-    /// Avoids the chained `cg.get_arena().lookup(id)` pattern which
-    /// the C++ compiler can't resolve.
+    /// Splits the chained `cg.get_arena().lookup(id)` pattern into two
+    /// local-typed deref steps; chained method-call resolution across
+    /// pointer hops has historically been brittle here.
     lookup_type_by_id(&this, id: u64) -> Type* {
         const c: CompilationContext* = this.ctx;
         const a: TypeArena* = c.type_arena;
@@ -521,8 +523,9 @@ type struct CodegenContext {
         }
 
         // Void is unsized; LLVMBuildAlloca crashes in DataLayout::getPrefTypeAlign.
-        // Use LLVMGetTypeKind to detect it instead of pointer comparison,
-        // because the C++ compiler's == on void* uses strcmp.
+        // Use LLVMGetTypeKind to detect it instead of `lhs_ty_raw == rhs_ty_raw`:
+        // `==` on `void*` has historically lowered to strcmp, which would read
+        // from the LLVM type objects as if they were C strings.
         if (type_kind_of(ty.raw) == LTypeKind::Void) {
             return LValue::null();
         }
