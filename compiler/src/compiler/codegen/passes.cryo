@@ -144,9 +144,9 @@ function cascade_strip_dependents(cg: CodegenContext*) -> void {
                             ErrorCode::E0633_FUNCTION_BODY_ERROR,
                             format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
                                 fn_name_safe));
-                        cg.emit_diagnostic(wdiag);
+                        cg.diag.emit(wdiag);
                         const wrap: LValue = LValue { raw: fn_val };
-                        cg.strip_function_body(wrap);
+                        cg.diag.strip_function_body(wrap);
                         newly_stripped += 1;
                     }
                 }
@@ -189,6 +189,10 @@ type struct CodegenPasses {
         cdebug("[Codegen] Step 4: Creating CodegenContext...\n");
         const _box_cg: Box<CodegenContext> = Box<CodegenContext>::new(CodegenContext::new(ctx, module_name));
         const cg: CodegenContext* = _box_cg.leak();
+        // Two-phase init step 2: wire back-pointers on sub-components now
+        // that `cg` is at its stable heap address.  Wiring before the move
+        // into the Box would leave back-pointers dangling at the source.
+        cg.wire();
         cdebug("[Codegen] Step 5: CodegenContext created\n");
 
         // Set target triple and data layout.  Honor a project-level
@@ -217,8 +221,8 @@ type struct CodegenPasses {
         // Emit the inline runtime helpers (`format`, `panic`, etc.) into
         // this module with linkonce_odr linkage.  Idempotent and
         // per-module; the linker collapses the 100+ copies down to one.
-        cg.emit_format_runtime();
-        cg.emit_panic_runtime();
+        cg.intrinsics.emit_format_runtime();
+        cg.intrinsics.emit_panic_runtime();
 
         // Create the visitor and generate IR.
         cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");

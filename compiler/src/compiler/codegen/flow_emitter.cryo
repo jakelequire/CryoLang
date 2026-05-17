@@ -1,0 +1,229 @@
+/// IR Flow Emitter
+///
+/// Control-flow IR primitives: `if`/`while`/`for`/`loop` block layouts,
+/// `break`/`continue` jumps to the current loop's targets, terminator
+/// guards, and entry-block `alloca` hoisting (for LLVM's `mem2reg`).
+///
+/// Borrows the LLVM builder and the per-context loop stack via back-
+/// pointers set by `CodegenContext::wire()`.  Holds no owned state.
+
+namespace Compiler::Codegen::IRFlowEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::LoopStack;
+
+
+// ============================================================================
+// Block-result structs returned by the control-flow primitives.
+// Kept top-level (a method can't return a type defined inside its struct)
+// so that visit() overrides can name the type when destructuring.
+// ============================================================================
+
+type struct IfBlocks {
+    then_bb:  LBasicBlock;
+    else_bb:  LBasicBlock;
+    merge_bb: LBasicBlock;
+}
+
+type struct LoopBlocks {
+    cond_bb:  LBasicBlock;
+    body_bb:  LBasicBlock;
+    merge_bb: LBasicBlock;
+}
+
+type struct ForBlocks {
+    cond_bb:   LBasicBlock;
+    body_bb:   LBasicBlock;
+    update_bb: LBasicBlock;
+    merge_bb:  LBasicBlock;
+}
+
+
+// ============================================================================
+// IRFlowEmitter
+// ============================================================================
+
+type struct IRFlowEmitter {
+    // Back-pointers set by wire().  Null until wire() runs.
+    builder: LBuilder*;
+    loops:   LoopStack*;
+
+    /// Stage 1 of two-phase init.  Produces an IRFlowEmitter with null
+    /// back-pointers; the parent calls `wire()` once it is at its stable
+    /// (heap) address.
+    static null() -> IRFlowEmitter {
+        return IRFlowEmitter {
+            builder: null,
+            loops:   null,
+        };
+    }
+
+    /// Stage 2 of two-phase init.  Stores the back-pointers.  Must be
+    /// called from `CodegenContext::wire()` after the context is at its
+    /// stable address (e.g. after `Box::leak()`).
+    wire(mut &this, builder: LBuilder*, loops: LoopStack*) -> void {
+        this.builder = builder;
+        this.loops   = loops;
+    }
+
+
+    // ========================================================================
+    // Loop control
+    // ========================================================================
+
+    codegen_break(mut &this) -> void {
+        const target: LBasicBlock = this.loops.current_break();
+        if (target.is_valid()) {
+            this.builder.build_br(target);
+        }
+    }
+
+    codegen_continue(mut &this) -> void {
+        const target: LBasicBlock = this.loops.current_continue();
+        if (target.is_valid()) {
+            this.builder.build_br(target);
+        }
+    }
+
+    /// Branch to a target block if the current block has no terminator.
+    branch_if_not_terminated(mut &this, target: LBasicBlock) -> void {
+        const current: LBasicBlock = this.builder.get_insert_block();
+        if (current.is_valid() && !current.has_terminator()) {
+            this.builder.build_br(target);
+        }
+    }
+
+
+    // ========================================================================
+    // Control-flow shapes
+    // ========================================================================
+
+    /// Generate IR for an if/else statement.  Creates then_bb, else_bb (if
+    /// needed), and merge_bb.
+    codegen_if(mut &this, cond: LValue,
+               current_fn: LValue,
+               has_else: boolean) -> IfBlocks {
+        const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "then");
+        const else_bb: LBasicBlock = if (has_else) {
+            LBasicBlock::append(current_fn, "else")
+        } else {
+            LBasicBlock::null()
+        };
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "ifcont");
+
+        if (has_else) {
+            this.builder.build_cond_br(cond, then_bb, else_bb);
+        } else {
+            this.builder.build_cond_br(cond, then_bb, merge_bb);
+        }
+
+        return IfBlocks {
+            then_bb:  then_bb,
+            else_bb:  else_bb,
+            merge_bb: merge_bb,
+        };
+    }
+
+    /// Create the basic blocks for a while loop.
+    codegen_while_header(mut &this, current_fn: LValue) -> LoopBlocks {
+        const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "while.cond");
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "while.body");
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "while.end");
+
+        this.builder.build_br(cond_bb);
+        this.loops.push(merge_bb, cond_bb);
+
+        return LoopBlocks {
+            cond_bb:  cond_bb,
+            body_bb:  body_bb,
+            merge_bb: merge_bb,
+        };
+    }
+
+    /// Create basic blocks for a for loop: init -> cond -> body -> update -> cond.
+    codegen_for_header(mut &this, current_fn: LValue) -> ForBlocks {
+        const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.cond");
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.body");
+        const update_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.update");
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "for.end");
+
+        this.loops.push(merge_bb, update_bb);
+
+        return ForBlocks {
+            cond_bb:   cond_bb,
+            body_bb:   body_bb,
+            update_bb: update_bb,
+            merge_bb:  merge_bb,
+        };
+    }
+
+    /// Create basic blocks for a `loop { ... }` infinite loop.
+    codegen_loop_header(mut &this, current_fn: LValue) -> LoopBlocks {
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "loop.body");
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "loop.end");
+
+        this.builder.build_br(body_bb);
+        this.loops.push(merge_bb, body_bb);
+
+        return LoopBlocks {
+            cond_bb:  LBasicBlock::null(),
+            body_bb:  body_bb,
+            merge_bb: merge_bb,
+        };
+    }
+
+
+    // ========================================================================
+    // Entry-block alloca hoisting
+    // ========================================================================
+
+    /// Create an alloca in the entry block of the given function.  This
+    /// ensures allocas are hoisted to the entry block for `mem2reg`
+    /// promotion by LLVM's optimization passes.
+    create_entry_alloca(mut &this, func: LValue, name: string, ty: LType) -> LValue {
+        if (!func.is_valid()) {
+            return LValue::null();
+        }
+        if (!ty.is_valid()) {
+            return LValue::null();
+        }
+
+        // Void is unsized; LLVMBuildAlloca crashes in DataLayout::getPrefTypeAlign.
+        // Use LLVMGetTypeKind to detect it instead of `lhs_ty_raw == rhs_ty_raw`:
+        // `==` on `void*` has historically lowered to strcmp, which would read
+        // from the LLVM type objects as if they were C strings.
+        if (type_kind_of(ty.raw) == LTypeKind::Void) {
+            return LValue::null();
+        }
+
+        // Save current insert point.
+        const saved_block: LBasicBlock = this.builder.get_insert_block();
+
+        // Position at the start of the entry block.
+        const entry: LBasicBlock = LBasicBlock { raw: llvm::LLVMGetEntryBasicBlock(func.raw) };
+        if (!entry.is_valid()) {
+            return LValue::null();
+        }
+        // If the entry block already has a terminator (e.g., the function
+        // body has emitted a `br`/`ret`), `position_at_end(entry)` would
+        // insert AFTER that terminator, breaking the block.  Position
+        // BEFORE the terminator in that case so every alloca lands in a
+        // well-formed entry block regardless of when the helper is called.
+        const term: void* = llvm::LLVMGetBasicBlockTerminator(entry.raw);
+        if (term != null) {
+            llvm::LLVMPositionBuilderBefore(this.builder.raw, term);
+        } else {
+            this.builder.position_at_end(entry);
+        }
+
+        const alloca: LValue = this.builder.build_alloca(ty, name);
+
+        // Restore insert point.
+        if (saved_block.is_valid()) {
+            this.builder.position_at_end(saved_block);
+        }
+
+        return alloca;
+    }
+}

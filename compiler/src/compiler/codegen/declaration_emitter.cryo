@@ -1,0 +1,1528 @@
+/// Declaration Emitter
+///
+/// Phase-1 (forward-declare types) and Phase-2 (declare functions,
+/// methods, externs, globals, vtables) of the codegen pipeline; called
+/// by the Codegen pass before body emission begins.  Also owns the
+/// function-prologue / function-epilogue / method-prologue lowering
+/// that materializes parameter allocas, binds `this` / args slots, and
+/// emits the leading va_start / trailing va_end for variadic bodies.
+///
+/// Holds back-pointers to every codegen subsystem: LLVM handles, the
+/// type mapper, value/function/global registries, the IR-flow emitter,
+/// name resolver, expression-ops, intrinsic emitter, diag sink, and
+/// `CompilationContext`.  Does NOT import the parent Context module to
+/// avoid a module-graph cycle.
+
+namespace Compiler::Codegen::DeclarationEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Util;
+import Compiler::Codegen::ValueTable;
+import Compiler::Codegen::FunctionRegistry;
+import Compiler::Codegen::GlobalRegistry;
+import Compiler::Codegen::StringCache;
+import Compiler::Codegen::IRFlowEmitter;
+import Compiler::Codegen::SymbolResolver;
+import Compiler::Codegen::IntrinsicEmitter;
+import Compiler::Codegen::ExprOps;
+import Compiler::Codegen::DiagSink;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Types::Ownership;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+import Compiler::Resolver::QualifiedName;
+import std::collections::pair;
+
+
+// ============================================================================
+// DeclarationEmitter
+// ============================================================================
+
+type struct DeclarationEmitter {
+    llvm_module: LModule*;
+    builder:     LBuilder*;
+    type_mapper: TypeMapper*;
+    values:      ValueTable*;
+    functions:   FunctionRegistry*;
+    globals:     GlobalRegistry*;
+    str_cache:   StringCache*;
+    flow:        IRFlowEmitter*;
+    resolver:    SymbolResolver*;
+    expr_ops:    ExprOps*;
+    intrinsics:  IntrinsicEmitter*;
+    diag:        DiagSink*;
+    ctx:         CompilationContext*;
+
+    static null() -> DeclarationEmitter {
+        return DeclarationEmitter {
+            llvm_module: null,
+            builder:     null,
+            type_mapper: null,
+            values:      null,
+            functions:   null,
+            globals:     null,
+            str_cache:   null,
+            flow:        null,
+            resolver:    null,
+            expr_ops:    null,
+            intrinsics:  null,
+            diag:        null,
+            ctx:         null,
+        };
+    }
+
+    wire(mut &this,
+         llvm_module: LModule*, builder: LBuilder*,
+         type_mapper: TypeMapper*, values: ValueTable*,
+         functions: FunctionRegistry*, globals: GlobalRegistry*,
+         str_cache: StringCache*,
+         flow: IRFlowEmitter*, resolver: SymbolResolver*,
+         expr_ops: ExprOps*, intrinsics: IntrinsicEmitter*,
+         diag: DiagSink*, ctx: CompilationContext*) -> void {
+        this.llvm_module = llvm_module;
+        this.builder     = builder;
+        this.type_mapper = type_mapper;
+        this.values      = values;
+        this.functions   = functions;
+        this.globals     = globals;
+        this.str_cache   = str_cache;
+        this.flow        = flow;
+        this.resolver    = resolver;
+        this.expr_ops    = expr_ops;
+        this.intrinsics  = intrinsics;
+        this.diag        = diag;
+        this.ctx         = ctx;
+    }
+
+
+    // ========================================================================
+    // Small ctx-routed accessors (inlined so DeclarationEmitter doesn't
+    // have to import the parent Context module).
+    // ========================================================================
+
+    get_intern(&this) -> InternTable* {
+        const c: CompilationContext* = this.ctx;
+        return c.intern_table;
+    }
+
+    get_arena(&this) -> TypeArena* {
+        const c: CompilationContext* = this.ctx;
+        return c.type_arena;
+    }
+
+    get_decl_index(&this) -> DeclarationIndex* {
+        const c: CompilationContext* = this.ctx;
+        return c.decl_index;
+    }
+
+    qualify(&this, sym: SymbolStr) -> SymbolStr {
+        const c: CompilationContext* = this.ctx;
+        return c.qualify_symbol_sym(sym);
+    }
+
+    resolve(&this, sym: SymbolStr) -> string {
+        const i: InternTable* = this.get_intern();
+        return i.resolve(sym);
+    }
+
+    intern_str(&this, text: string) -> SymbolStr {
+        const i: InternTable* = this.get_intern();
+        return i.intern(text);
+    }
+
+    lookup_type_by_id(&this, id: u64) -> Type* {
+        const a: TypeArena* = this.get_arena();
+        return a.lookup(id);
+    }
+
+    int_type_is_signed(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.lookup_type_by_id(ty.id);
+        if (t == null) { return false; }
+        if (t.kind != TypeKind::Int) { return false; }
+        const it: IntType* = t as IntType*;
+        return it.int_kind.is_signed();
+    }
+
+
+
+    // ========================================================================
+    // Declaration emission.  Phase-1 (forward-declare types) and Phase-2
+    // (declare functions, methods, externs, globals, vtables) of the codegen
+    // pipeline; called by the Codegen pass before body emission begins.
+    // ========================================================================
+
+    /// Walk the program and forward-declare all struct/class/enum types as
+    /// named LLVM struct types.  This must run before function declarations
+    /// so that parameter and return types can reference these types.
+    declare_types(mut &this, program: ProgramNode*) -> void {
+        const stmts: ASTNode*[] = program.statements;
+        for (mut i: i64 = 0; i < stmts.length; i++) {
+            const stmt: ASTNode* = stmts[i];
+            if (stmt == null) { continue; }
+
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    this.declare_struct_type(stmt as StructDeclNode*);
+                }
+                NodeKind::ClassDeclaration => {
+                    this.declare_class_type(stmt as ClassDeclNode*);
+                }
+                NodeKind::EnumDeclaration => {
+                    this.declare_enum_type(stmt as EnumDeclNode*);
+                }
+                // Impl blocks may contain methods we need, but types are
+                // already declared via StructDecl/ClassDecl.
+                _ => {}
+            }
+        }
+    }
+
+    /// Declare the `@llvm.va_start.p0` intrinsic in the current LLVM module.
+    /// Signature: `void (ptr)`: the argument is a pointer to the va_list
+    /// storage to initialize from the caller's argument area.
+
+    /// Forward-declare a struct as a named LLVM type and fill its body.
+    declare_struct_type(mut &this, node: StructDeclNode*) -> void {
+        // Skip generic templates; only monomorphized versions get IR.
+        if (node.generic_params.length > 0) {
+            return;
+        }
+
+        const name: string = this.resolve(node.name);
+        const qname: QualifiedName = QualifiedName::single(this.get_intern(), name);
+        const mangled: string = MangledName::for_struct_type(this.get_intern(), qname).resolve(this.get_intern());
+
+        // Look up the Cryo StructType to get field info.
+        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        if (type_ref.is_invalid()) {
+            return;
+        }
+
+        // Let the type mapper handle forward declaration + body fill.
+        this.type_mapper.map_type(type_ref);
+    }
+
+    /// Forward-declare a class type.
+    declare_class_type(mut &this, node: ClassDeclNode*) -> void {
+        if (node.generic_params.length > 0) {
+            return;
+        }
+
+        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        if (type_ref.is_invalid()) {
+            return;
+        }
+
+        this.type_mapper.map_type(type_ref);
+    }
+
+    /// Declare an enum type.
+    declare_enum_type(mut &this, node: EnumDeclNode*) -> void {
+        if (node.generic_params.length > 0) {
+            return;
+        }
+
+        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        if (type_ref.is_invalid()) {
+            return;
+        }
+
+        this.type_mapper.map_type(type_ref);
+    }
+
+    /// Walk the program and create LLVM function declarations for all
+    /// functions, methods, and extern blocks.  Also emits module-level global
+    /// variable declarations so any function body that references a global
+    /// (regardless of source order, e.g. `clock_gettime(CLOCK_REALTIME, ...)`
+    /// where the const is declared later in the file) can resolve it.
+    declare_functions(mut &this, program: ProgramNode*) -> void {
+        const stmts: ASTNode*[] = program.statements;
+        for (mut i: i64 = 0; i < stmts.length; i++) {
+            const stmt: ASTNode* = stmts[i];
+            if (stmt == null) { continue; }
+
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    this.declare_function(stmt as FunctionDeclNode*);
+                }
+                NodeKind::IntrinsicDeclaration => {
+                    this.declare_intrinsic(stmt as IntrinsicDeclNode*);
+                }
+                NodeKind::ExternBlock => {
+                    this.declare_extern_block(stmt as ExternBlockNode*);
+                }
+                NodeKind::ImplementationBlock => {
+                    this.declare_impl_block(stmt as ImplBlockNode*);
+                }
+                NodeKind::StructDeclaration => {
+                    this.declare_struct_methods(stmt as StructDeclNode*);
+                }
+                NodeKind::ClassDeclaration => {
+                    this.declare_class_methods(stmt as ClassDeclNode*);
+                }
+                NodeKind::VariableDeclaration => {
+                    const var_decl: VarDeclNode* = stmt as VarDeclNode*;
+                    if (var_decl.is_global) {
+                        this.codegen_global_var(var_decl);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Declare a single function signature (no body generation).
+    declare_function(mut &this, node: FunctionDeclNode*) -> void {
+        // Skip generic templates.
+        if (node.generic_params.length > 0) {
+            return;
+        }
+
+        // Compute this overload's func_type_ref so we can look up the
+        // overload-specific mangled name.  The bare-keyed `lookup_mangled_name`
+        // is last-write-wins: for two `visit(A*)` / `visit(B*)` overloads,
+        // both share the qualified name `Mod::visit` and the second one
+        // overwrites the first's mangled-name entry.  The overload-keyed
+        // table (registered alongside in type_resolution) disambiguates by
+        // (name, func_type_ref).
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const intern: InternTable* = ctx_ptr.intern_table;
+        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        const arena: TypeArena* = this.get_arena();
+
+        mut params: TypeRef[] = [];
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            const param: VarDeclNode* = node.parameters[pi];
+            if (param != null && param.resolved_type.is_valid()) {
+                params.push(param.resolved_type);
+            }
+        }
+        const func_type_ref: TypeRef = arena.get_function(
+            node.resolved_return_type, params, node.is_variadic);
+
+        mut mangled_sym: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
+        if (!mangled_sym.is_valid()) {
+            mangled_sym = di.lookup_mangled_name(qualified);
+        }
+        if (!mangled_sym.is_valid()) {
+            // Compute and register on first use using the v0.2 mangler.
+            const qname: QualifiedName = QualifiedName::from_symbol(qualified);
+            const computed: MangledName = MangledName::for_free_function(
+                intern, arena, qname, params,
+                node.resolved_return_type, node.is_variadic);
+            mangled_sym = computed.value;
+            di.register_mangled_name(qualified, mangled_sym);
+            di.register_overload_mangled(qualified, func_type_ref, mangled_sym);
+        }
+        // The C ABI entry point must be named `main` verbatim; the C
+        // runtime's _start references the unmangled symbol.  Override the
+        // mangled name for any free function whose source-level name is
+        // `main` so the linker can find it.
+        const main_sym: SymbolStr = intern.intern("main");
+        mut fn_name: string = intern.resolve(mangled_sym);
+        const is_program_main: boolean = node.name.equals(main_sym);
+        if (is_program_main) {
+            fn_name = "main";
+            // `cryo test` synthesizes its own `main` that drives every
+            // discovered `![test]` function; if we also emitted the user's
+            // `main` the linker would see two `main` symbols.  Skip
+            // declaration (and therefore body emission) in test mode.
+            if (this.ctx.mode.skip_user_main()) {
+                return;
+            }
+        }
+
+        // Build the LLVM function type.
+        const ret_ty: LType = this.map_return_type(node);
+        if (!ret_ty.is_valid()) { return; }
+
+        const param_count: u32 = fixed_param_count(node);
+
+        mut fn_type: LType = LType::null();
+        if (is_program_main && param_count == 0) {
+            // The C ABI entry point is `int main(int argc, char** argv)`
+            // _start always passes argc/argv, and the stdlib's
+            // `std::env::args()` reads them through `set_args` (called
+            // from the synthesized prologue in `codegen_function_prologue`
+            // below).  User source still writes `function main() -> int`;
+            // we silently widen the LLVM signature to take argc/argv.
+            const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
+            const buf: void* = intrinsics::malloc(2 * 8);
+            const slots: void** = buf as void**;
+            slots[0] = LType::i32().raw;
+            slots[1] = argv_ty.raw;
+            fn_type = LType::function_type(ret_ty, buf, 2, false);
+            intrinsics::free(buf);
+        } else if (param_count == 0) {
+            fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
+        } else {
+            const buf: void* = intrinsics::malloc(param_count as u64 * 8);
+            const slots: void** = buf as void**;
+            mut all_valid: boolean = true;
+            for (mut i: u32 = 0; i < param_count; i++) {
+                const param: VarDeclNode* = node.parameters[i];
+                const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
+                if (!param_ty.is_valid()) {
+                    all_valid = false;
+                    break;
+                }
+                slots[i] = param_ty.raw;
+            }
+            if (!all_valid) {
+                intrinsics::free(buf);
+                return;
+            }
+            fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
+            intrinsics::free(buf);
+        }
+
+        // Add the function to the LLVM module.
+        const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
+
+        // Register under qualified name (module scope).
+        this.functions.register(qualified, fn_val);
+    }
+
+    /// Declare all methods in an impl block.
+    declare_impl_block(mut &this, node: ImplBlockNode*) -> void {
+        // Skip generic impl blocks.
+        if (node.generic_params.length > 0) {
+            return;
+        }
+
+        // Use TypeResolution's canonical-qualified target when available; it
+        // resolves cross-module impl targets (e.g. `implement trait FmtWrite
+        // for struct Stdout` in fmt::write where Stdout lives in io::stdio)
+        // by walking the bare→qualified table, so the impl's methods land
+        // under the same key the type's defining module uses.  Without the
+        // canonical resolution, we'd qualify with the CURRENT module and
+        // produce `fmt::write::Stdout::write_str`, which `declare_method`
+        // can't look up; bodies would be silently dropped and the linker
+        // would surface them as undefined references.
+        const ctx_ptr: CompilationContext* = this.ctx;
+        mut qualified_target: SymbolStr = SymbolStr::empty();
+        if (node.qualified_target_name.is_valid()) {
+            qualified_target = node.qualified_target_name;
+        } else {
+            const target_str: string = ctx_ptr.intern_table.resolve(node.target_type);
+            if (intrinsics::strstr(target_str, "::") != null) {
+                qualified_target = node.target_type;
+            } else if (ctx_ptr.decl_index.lookup_type(node.target_type).is_valid()) {
+                qualified_target = node.target_type;
+            } else {
+                const resolved: SymbolStr = ctx_ptr.decl_index.resolve_qualified(node.target_type);
+                if (!resolved.equals(node.target_type)) {
+                    qualified_target = resolved;
+                } else {
+                    qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
+                }
+            }
+        }
+        // Skip impls whose target is a generic template; only the
+        // monomorphized spec'd clones should produce LLVM symbols.  Mirrors
+        // the `generic_params.length > 0` skip above for `implement<T> Foo<T>`;
+        // catches the additional case where the impl has no impl-level params
+        // but the target type does (e.g. `implement trait Eq for struct String`
+        // on `String<A = GlobalAlloc>`).  Without this, the template impl's
+        // bodies are codegen'd against the bare-template `this` type, but
+        // method registrations live under the spec'd target; so call sites
+        // like `this.as_str()` inside the template body fail to resolve.
+        if (ctx_ptr.generic_registry != null) {
+            const greg: GenericRegistry* = ctx_ptr.generic_registry;
+            if (greg.get_template(qualified_target) != null) {
+                return;
+            }
+        }
+
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.declare_method(node.methods[i], qualified_target);
+        }
+    }
+
+    /// Declare methods defined inline within a struct declaration.
+    declare_struct_methods(mut &this, node: StructDeclNode*) -> void {
+        if (node.generic_params.length > 0) {
+            return;
+        }
+        if (node.methods.length == 0) {
+            return;
+        }
+        // Use the arena's canonical qualified name for the struct type.
+        // For specialized structs (e.g., Array_Token), the arena name is
+        // the correct DI key (e.g., std::collections::array::Array_Token).
+        // qualify_symbol_sym would produce the consuming module's namespace
+        // prefix, which doesn't match the DI registration.
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        mut qualified: SymbolStr = SymbolStr::empty();
+        // Try both local-qualified and bare name in the DI, then get the
+        // arena's canonical qualified name from the TypeRef.
+        const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        mut di_ref: TypeRef = di.lookup_type(local_sym);
+        if (!di_ref.is_valid()) {
+            di_ref = di.lookup_type(node.name);
+        }
+        if (di_ref.is_valid()) {
+            const arena: TypeArena* = this.get_arena();
+            qualified = arena.get_qualified_name(di_ref);
+        }
+        if (!qualified.is_valid()) {
+            qualified = local_sym;
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.declare_method(node.methods[i], qualified);
+        }
+    }
+
+    /// Declare methods defined inline within a class declaration.
+    declare_class_methods(mut &this, node: ClassDeclNode*) -> void {
+        if (node.generic_params.length > 0) {
+            return;
+        }
+        // Qualify the class name; node.name is the bare AST name.
+        // Split `this.ctx.qualify_symbol_sym(...)` via a local: double-deref
+        // chains have historically been a source of subtle codegen bugs.
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.declare_method(node.methods[i], qualified);
+        }
+
+        // Emit the vtable for classes with virtual methods.  Drive this from
+        // ClassType.methods + its base chain (populated by the type-resolution
+        // pass) so the vtable is inheritance-complete: a subclass's vtable has
+        // one slot per virtual method introduced anywhere in the ancestry,
+        // in the order of first introduction (root → leaf).  The slot's
+        // implementation is the most-derived override present in the chain,
+        // falling back to the inherited base implementation when the subclass
+        // doesn't override that slot.  Layout discipline is what makes call-site
+        // dispatch work: a `Base*` callsite looks up slot N in `Base`'s layout,
+        // and any subclass's vtable guarantees slot N at the same index.
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        const type_ref: TypeRef = di.lookup_type(qualified);
+        if (type_ref.is_valid()) {
+            const arena: TypeArena* = this.get_arena();
+            const t: Type* = arena.lookup(type_ref.id);
+            if (t != null && t.kind == TypeKind::Class) {
+                const cls: ClassType* = t as ClassType*;
+                if (cls.has_virtual_methods) {
+                    this.codegen_vtable_for_class(cls);
+                }
+            }
+        }
+    }
+
+    /// Walk the class's base chain (leaf → root) and collect the ordered
+    /// list of virtual-method slots.  New `is_virtual` methods append a
+    /// new slot; `is_override` methods do NOT; they install into an
+    /// existing slot at vtable-emission time.  The returned list is in
+    /// root → leaf declaration order, so every subclass's vtable extends
+    /// the base's layout with its own additions.
+    collect_vtable_slots(mut &this, cls: ClassType*) -> VTableSlot[] {
+        const arena: TypeArena* = this.get_arena();
+
+        // Build chain = [cls, ..., root].
+        mut chain: ClassType*[] = [];
+        mut walk: ClassType* = cls;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = arena.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth += 1;
+        }
+
+        mut slots: VTableSlot[] = [];
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            for (mut mi: i64 = 0; mi < link.methods.length; mi++) {
+                const m: MethodInfo = link.methods[mi];
+                if (!m.is_virtual) { continue; }
+                mut already: boolean = false;
+                for (mut ki: i64 = 0; ki < slots.length; ki++) {
+                    if (slots[ki].name.equals(m.name) &&
+                        param_types_equal(slots[ki].param_types, m.param_types)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    slots.push(VTableSlot { name: m.name, param_types: m.param_types });
+                }
+            }
+        }
+        return slots;
+    }
+
+    /// For a given vtable slot (name + param_types), walk leaf → root and
+    /// return the first matching method's LLVM function: the most-derived
+    /// override, falling back to the inherited base implementation when
+    /// the subclass doesn't override that specific overload.  Resolution
+    /// goes through the overload-specific mangled name so the correct LLVM
+    /// function is installed in the slot, not the last-registered one
+    /// under `Type::method`.
+    find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: TypeRef[]) -> LValue {
+        const arena: TypeArena* = this.get_arena();
+        const intern: InternTable* = this.get_intern();
+        mut walk: ClassType* = cls;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
+                const m: MethodInfo = walk.methods[mi];
+                if (!m.name.equals(slot_name)) { continue; }
+                // Use structural (display-name) equality on params instead of
+                // raw-ID matching: an override method's params can resolve to
+                // different TypeRef IDs than the virtual base's params even
+                // though they're semantically the same type (e.g. `ASTVisitor*`
+                // registered before vs. after the visitor module finished
+                // resolving).  Strict ID matching here misses every override
+                // and the whole vtable bails (every `new <DerivedClass>` then
+                // skips the vtable store; runtime virtual dispatch crashes
+                // reading a null vtable pointer).
+                if (!param_types_equal_structural(arena, intern, m.param_types, slot_params)) { continue; }
+                if (!m.is_virtual && !m.is_override) { continue; }
+                // Skip pure virtual declarations (virtual without body).
+                // Their LLVM function is a bare `declare` that links as an
+                // undefined reference.  Keep walking up; a concrete override
+                // must come from further up the chain, or the caller's
+                // `!impl.is_valid()` bail drops the whole vtable.
+                if (m.ast_node != null) {
+                    const mnode_ck: MethodNode* = m.ast_node as MethodNode*;
+                    if (mnode_ck != null && mnode_ck.func != null && !mnode_ck.func.has_body()) {
+                        continue;
+                    }
+                }
+                const type_qname: QualifiedName = QualifiedName::from_symbol(walk.qualified_name);
+                const method_str: string = intern.resolve(slot_name);
+                // Resolve method's full signature for the v0.2 mangler.
+                mut method_ret: TypeRef = TypeRef::invalid();
+                mut method_variadic: boolean = false;
+                const fn_t: Type* = arena.lookup(m.function_type.id);
+                if (fn_t != null && fn_t.kind == TypeKind::Function) {
+                    const fn_ty: FunctionType* = fn_t as FunctionType*;
+                    method_ret = fn_ty.return_type;
+                    method_variadic = fn_ty.is_variadic;
+                }
+                // MethodInfo.param_types already excludes the receiver.  Default
+                // to ImmutRef receiver for virtual methods; if the method has
+                // a `mut &this` receiver we recover it from the AST node.
+                mut recv_kind: ReceiverKind = ReceiverKind::ImmutRef;
+                if (m.ast_node != null) {
+                    const mn: MethodNode* = m.ast_node as MethodNode*;
+                    if (mn != null && mn.func != null) {
+                        recv_kind = method_receiver_kind(mn.func, mn.is_static, intern);
+                    }
+                }
+                const computed: MangledName = MangledName::for_method(
+                    intern, arena, type_qname, slot_name, recv_kind,
+                    m.param_types, method_ret, method_variadic);
+                // Look up the LLVM function by its mangled name directly
+                // in the module.  resolve_function/this.get_function cache by
+                // bare or qualified name, which is last-write-wins for
+                // overloaded virtuals; the cache would hand out whichever
+                // overload was declared most recently regardless of which
+                // slot we're filling, populating every inherited slot with
+                // the same (wrong) function.
+                const mangled_str: string = intern.resolve(computed.value);
+                mut fn_val: LValue = this.llvm_module.get_named_function(mangled_str);
+                if (!fn_val.is_valid()) {
+                    fn_val = this.resolver.resolve_function(computed.value);
+                }
+                if (!fn_val.is_valid()) {
+                    const type_str: string = intern.resolve(walk.qualified_name);
+                    const combined: string = format("%s::%s", type_str, method_str);
+                    fn_val = this.resolver.resolve_function(intern.intern(combined));
+                }
+                return fn_val;
+            }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = arena.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth += 1;
+        }
+        return LValue::null();
+    }
+
+    /// Return the vtable slot index of (method_name, param_types) in this
+    /// class's layout, or -1 if no matching virtual slot exists.  Called
+    /// from codegen dispatch after sema has identified the exact overload
+    /// via `CallExprNode.resolved_method`; this function just maps that
+    /// declaration to its slot position.
+    ///
+    /// Uses *structural* param-type equality (display-name match) rather than
+    /// strict arena-ID match: an override method's parameter `Foo*` may be
+    /// registered under a different arena ID than the base method's `Foo*` if
+    /// the two declarations were resolved before/after `Foo`'s body was sealed,
+    /// even though they denote the same nominal pointer type.  Without this,
+    /// `node.accept(this)` on a base-class pointer falls back to a static call
+    /// to the base accept (which targets vtable slot 0, the no-op base
+    /// `visit(BaseNode*)`; silently dropping every visitor traversal).
+    vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: TypeRef[]) -> i32 {
+        const slots: VTableSlot[] = this.collect_vtable_slots(cls);
+        const arena: TypeArena* = this.get_arena();
+        const intern: InternTable* = this.get_intern();
+        for (mut i: i32 = 0; i < slots.length as i32; i++) {
+            if (slots[i].name.equals(method_name) &&
+                param_types_equal_structural(arena, intern,
+                    slots[i].param_types, param_types)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /// Emit the vtable global for `cls`.  Slot layout comes from
+    /// `collect_vtable_slots` (inheritance-complete, overload-aware); each
+    /// slot's contents come from `find_vtable_slot_impl` (most-derived
+    /// override wins, inherited base implementation otherwise).
+    codegen_vtable_for_class(mut &this, cls: ClassType*) -> void {
+        const intern: InternTable* = this.get_intern();
+
+        const slots: VTableSlot[] = this.collect_vtable_slots(cls);
+        if (slots.length == 0) { return; }
+
+        mut impls: LValue[] = [];
+        for (mut i: i64 = 0; i < slots.length; i++) {
+            const impl: LValue = this.find_vtable_slot_impl(cls, slots[i].name, slots[i].param_types);
+            if (!impl.is_valid()) {
+                // If the slot's implementation isn't declared in this module,
+                // skip vtable emission entirely; a half-populated vtable would
+                // misdispatch.  Cross-module vtables are handled when the owning
+                // module's codegen runs.
+                return;
+            }
+            impls.push(impl);
+        }
+
+        const n: u32 = impls.length as u32;
+        const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
+        const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
+
+        const buf: void* = intrinsics::malloc(n as u64 * 8);
+        const slot_ptrs: void** = buf as void**;
+        for (mut i: u32 = 0; i < n; i++) {
+            slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
+        }
+        const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
+        intrinsics::free(buf);
+
+        const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name);
+        const mangled: string = MangledName::for_vtable(intern, qname).resolve(intern);
+        const global: LValue = this.llvm_module.add_global(vtable_ty, mangled);
+        global.set_initializer(init);
+        global.set_global_constant(true);
+        // External linkage so cross-module `new` sites can resolve the vtable
+        // symbol at link time.  Internal linkage hides the global from the
+        // owning module's .o exports, leaving cross-module references unresolved.
+        global.set_linkage(LLinkage::External);
+    }
+
+    /// Declare a method.  Methods get a `this` pointer as the first parameter.
+    declare_method(mut &this, node: MethodNode*, target_type: SymbolStr) -> void {
+        const func: FunctionDeclNode* = node.func;
+        if (func == null) { return; }
+
+        // Skip generic methods.
+        if (func.generic_params.length > 0) {
+            return;
+        }
+
+        const intern: InternTable* = this.get_intern();
+        const type_str: string = intern.resolve(target_type);
+        const method_str: string = intern.resolve(func.name);
+
+        // Build the combined DI key.  Always compute the mangled name fresh
+        // from THIS overload's parameter types; the DI cache `lookup_mangled_name`
+        // only stores ONE entry per combined key, so for overloaded methods
+        // (e.g., every `visit(SomeNode*)` in BaseASTVisitor) using the cached
+        // name would map every overload to the first one's mangled name,
+        // collide at LLVM level, and leave all but the first-declared overload
+        // as unnamed declares without bodies.
+        const combined: string = format("%s::%s", type_str, method_str);
+        const combined_sym: SymbolStr = intern.intern(combined);
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        const arena: TypeArena* = this.get_arena();
+        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
+        const recv_kind: ReceiverKind = method_receiver_kind(func, node.is_static, intern);
+        const method_param_refs: TypeRef[] = method_non_receiver_params(func, intern);
+        const computed: MangledName = MangledName::for_method(
+            intern, arena, type_qname, func.name, recv_kind,
+            method_param_refs, func.resolved_return_type, func.is_variadic);
+        const mangled_sym: SymbolStr = computed.value;
+        // Cache into DI only if this is the first overload; preserves the
+        // existing single-slot behavior for call sites that don't disambiguate.
+        if (!di.lookup_mangled_name(combined_sym).is_valid()) {
+            di.register_mangled_name(combined_sym, mangled_sym);
+        }
+        const fn_name: string = intern.resolve(mangled_sym);
+
+        // Build LLVM function type.  Non-static methods prepend a `this` pointer.
+        const ret_ty: LType = this.map_return_type(func);
+        if (!ret_ty.is_valid()) { return; }
+
+        const is_instance: boolean = !node.is_static;
+
+        // Detect whether the method already declares an explicit self parameter.
+        // Cryo allows three forms: `&this` / `mut &this` (reference, default),
+        // and `this` (by-value).  `&this` is stored in `parameters` with the
+        // literal name "&this"; `this` by-value is stored with the literal name
+        // "this".  In EITHER case we must NOT prepend an extra implicit `this`
+        // slot; the explicit param already accounts for the self argument.
+        // Only when the method has no self-param at all (e.g., some elaborated
+        // methods) should we synthesize the `&this` pointer prefix.
+        mut explicit_self_name: string = "";  // "", "&this", "this", or "typed-this"
+        for (mut pc0: u32 = 0; pc0 < func.parameters.length as u32; pc0++) {
+            const pp0: VarDeclNode* = func.parameters[pc0];
+            if (pp0 == null) { continue; }
+            const pn: string = intern.resolve(pp0.name);
+            if (intrinsics::strcmp(pn, "&this") == 0) {
+                explicit_self_name = "&this";
+                break;
+            }
+            if (intrinsics::strcmp(pn, "this") == 0) {
+                // Distinguish parser-synthesized by-value `this` (no annotation)
+                // from user-written `this: Lexer*` (explicit annotation).  Both
+                // count as "self" so we skip the implicit-prefix synthesis, but
+                // the LLVM param type comes from different sources: bare `this`
+                // uses the struct by value; typed `this` uses the annotation.
+                if (pp0.type_annotation == null) {
+                    explicit_self_name = "this";
+                } else {
+                    explicit_self_name = "typed-this";
+                }
+                break;
+            }
+        }
+
+        // Look up the target type.  `&this` forms want `T*`; by-value `this`
+        // wants the struct `T` directly.  If there's no explicit self we'll
+        // synthesize `T*` as the implicit prefix.
+        mut target_mapped: LType = LType::null();
+        mut this_ty: LType = LType::null();
+        if (is_instance) {
+            mut target_ref: TypeRef = di.lookup_type(target_type);
+            if (!target_ref.is_valid()) {
+                // The unit type `()` isn't in the DeclarationIndex (it's a
+                // primitive owned by the arena, never registered through the
+                // decl-collection pass).  Fall back to the arena's canonical
+                // unit TypeRef so `implement trait Drop for ()` and similar
+                // get a real LLVM declaration.  Detected by the literal `()`
+                // suffix on the qualified target name.
+                const target_str: string = intern.resolve(target_type);
+                const tlen: u64 = intrinsics::strlen(target_str);
+                if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
+                              && target_str[tlen - 1] == 0x29 /* ')' */) {
+                    target_ref = arena.get_unit();
+                }
+            }
+            if (target_ref.is_valid()) {
+                target_mapped = this.type_mapper.map_type(target_ref);
+                if (target_mapped.is_valid()) {
+                    this_ty = LType::pointer_to(target_mapped);
+                }
+            }
+            if (!this_ty.is_valid()) {
+                return;
+            }
+        }
+
+        const prepend_implicit_this: boolean = is_instance && intrinsics::strlen(explicit_self_name) == 0;
+
+        // Count user parameters.  `&this` contributes a ptr slot via the
+        // existing param; by-value `this` contributes a struct slot via the
+        // existing param; implicit missing self is handled by prepend_implicit_this.
+        // For variadic methods (`args...`), skip the trailing name-only param;
+        // LLVM's `...` marker covers it.
+        const fixed_user_count: u32 = fixed_param_count(func);
+        mut user_param_count: u32 = 0;
+        for (mut pc: u32 = 0; pc < fixed_user_count; pc++) {
+            const pp: VarDeclNode* = func.parameters[pc];
+            if (pp != null) { user_param_count += 1; }
+        }
+        const total_params: u32 = user_param_count + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
+
+        const buf: void* = intrinsics::malloc(total_params as u64 * 8);
+        const slots: void** = buf as void**;
+
+        mut idx: u32 = 0;
+        if (prepend_implicit_this) {
+            slots[0] = this_ty.raw;
+            idx = 1;
+        }
+
+        mut params_valid: boolean = true;
+        for (mut i: u32 = 0; i < fixed_user_count; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            const param_name: string = intern.resolve(param.name);
+
+            // For `&this` and `mut &this`, force the LLVM type to `T*`;
+            // parser-synthesized reference annotations may not round-trip
+            // through the arena correctly for every method.
+            // For by-value `this` with NO type annotation (parser-synthesized
+            // self form), use the struct type directly.  But `this: Lexer*`
+            // a user-written explicit annotation on a param named `this`
+            // is just a regular typed parameter; map via resolved_type.
+            mut mapped_param: LType = LType::null();
+            if (intrinsics::strcmp(param_name, "&this") == 0 && this_ty.is_valid()) {
+                mapped_param = this_ty;
+            } else if (intrinsics::strcmp(param_name, "this") == 0 && target_mapped.is_valid()
+                       && param.type_annotation == null) {
+                mapped_param = target_mapped;
+            } else {
+                mapped_param = this.type_mapper.map_type(param.resolved_type);
+            }
+            if (!mapped_param.is_valid()) {
+                params_valid = false;
+                break;
+            }
+            slots[idx] = mapped_param.raw;
+            idx += 1;
+        }
+
+        if (!params_valid) {
+            intrinsics::free(buf);
+            return;
+        }
+
+        const fn_type: LType = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
+        intrinsics::free(buf);
+
+        const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
+
+        // Register under the combined key built above.  Also register against the
+        // (name, total-LLVM-arity) composite so that callers can pick the correct
+        // overload at call sites (e.g., `Array::new()` vs `Array::new(u64)`).
+        // `total_params` matches the arity cross-module externs register with
+        // (the FunctionType's param count), keeping the two registration paths
+        // interoperable.  Finally register under the unique mangled_sym; that's
+        // the key `codegen_method_prologue` uses to look up the right LLVM
+        // function for each overload (combined_sym alone is ambiguous because
+        // overloads share the same `Type::method` form).
+        this.functions.register(combined_sym, fn_val);
+        this.functions.register_with_arity(combined_sym, total_params, fn_val);
+        this.functions.register(mangled_sym, fn_val);
+    }
+
+    /// Declare an intrinsic function (e.g., malloc, printf, strlen).
+    /// Intrinsics use C linkage: bare name, no namespace qualification.
+    declare_intrinsic(mut &this, node: IntrinsicDeclNode*) -> void {
+        const intern: InternTable* = this.get_intern();
+        const name_str: string = intern.resolve(node.name);
+
+        // Map return type.
+        mut ret_ty: LType = LType::void_type();
+        if (node.has_resolved_return_type()) {
+            ret_ty = this.type_mapper.map_type(node.resolved_return_type);
+            if (!ret_ty.is_valid()) { return; }
+        }
+
+        const param_count: u32 = fixed_param_count_intrinsic(node);
+        mut fn_type: LType = LType::null();
+
+        if (param_count == 0) {
+            fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
+        } else {
+            const buf: void* = intrinsics::malloc(param_count as u64 * 8);
+            const slots: void** = buf as void**;
+            mut all_valid: boolean = true;
+            for (mut i: u32 = 0; i < param_count; i++) {
+                const param: VarDeclNode* = node.parameters[i];
+                const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
+                if (!param_ty.is_valid()) {
+                    all_valid = false;
+                    break;
+                }
+                slots[i] = param_ty.raw;
+            }
+            if (!all_valid) {
+                intrinsics::free(buf);
+                return;
+            }
+            fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
+            intrinsics::free(buf);
+        }
+
+        // C linkage: use bare name.
+        const fn_val: LValue = this.llvm_module.add_function(name_str, fn_type);
+
+        // Register under bare name (for identifier lookups like `malloc(...)`)
+        this.functions.register(node.name, fn_val);
+
+        // Also register under qualified name (for cross-module resolution).
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        if (!qualified.equals(node.name)) {
+            this.functions.register(qualified, fn_val);
+        }
+    }
+
+    /// Declare extern block functions.
+    declare_extern_block(mut &this, node: ExternBlockNode*) -> void {
+        // Get intern table from CompilationContext to avoid CodegenContext offset issues.
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const intern: InternTable* = ctx_ptr.intern_table;
+
+        for (mut i: i64 = 0; i < node.functions.length; i++) {
+            const func: FunctionDeclNode* = node.functions[i];
+            if (func == null) { continue; }
+
+            const name_str: string = intern.resolve(func.name);
+
+            // Extern functions use their bare name (C linkage).
+            const ret_ty: LType = this.map_return_type(func);
+            if (!ret_ty.is_valid()) {
+                this.diag.emit_warning_at_span(ErrorCode::E0643_RETURN_TYPE_ERROR,
+                    format("codegen: extern function '%s': failed to map return type", name_str),
+                    func.span);
+                continue;
+            }
+            const param_count: u32 = fixed_param_count(func);
+
+            mut fn_type: LType = LType::null();
+            if (param_count == 0) {
+                fn_type = LType::function_type(ret_ty, null, 0, func.is_variadic);
+            } else {
+                const buf: void* = intrinsics::malloc(param_count as u64 * 8);
+                const slots: void** = buf as void**;
+                mut params_ok: boolean = true;
+                for (mut j: u32 = 0; j < param_count; j++) {
+                    const param: VarDeclNode* = func.parameters[j];
+                    const mapped_ep: LType = this.type_mapper.map_type(param.resolved_type);
+                    if (!mapped_ep.is_valid()) {
+                        this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
+                            format("codegen: extern function '%s': failed to map parameter %d type", name_str, j as i32),
+                            param.span);
+                        params_ok = false;
+                        break;
+                    }
+                    slots[j] = mapped_ep.raw;
+                }
+                if (!params_ok) {
+                    intrinsics::free(buf);
+                    continue;
+                }
+                fn_type = LType::function_type(ret_ty, buf, param_count, func.is_variadic);
+                intrinsics::free(buf);
+            }
+
+            // Use bare name for C linkage.
+            const fn_val: LValue = this.llvm_module.add_function(name_str, fn_type);
+            this.functions.register(func.name, fn_val);
+        }
+    }
+
+    /// Generate IR for all function bodies in the program.
+    /// `visit_fn` is a callback that generates the body using the visitor.
+    generate_bodies(mut &this, program: ProgramNode*, visit_fn: void*) -> void {
+        const stmts: ASTNode*[] = program.statements;
+        for (mut i: i64 = 0; i < stmts.length; i++) {
+            const stmt: ASTNode* = stmts[i];
+            if (stmt == null) { continue; }
+
+            const kind: NodeKind = stmt.kind;
+
+            if (kind == NodeKind::FunctionDeclaration) {
+                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                if (func.generic_params.length > 0) { continue; }
+                if (func.body == null) { continue; }
+                // Body generation happens through the visitor.
+            } else if (kind == NodeKind::VariableDeclaration) {
+                const var_decl: VarDeclNode* = stmt as VarDeclNode*;
+                if (var_decl.is_global) {
+                    this.codegen_global_var(var_decl);
+                }
+            }
+        }
+    }
+
+    /// Generate a global variable declaration with optional initializer.
+    codegen_global_var(mut &this, node: VarDeclNode*) -> void {
+        // Mangle definitions under the current module's namespace
+        // (`C$<namespace>.<name>`) so two modules with the same private
+        // `const NAME = ...` don't collide at link time.  Cross-module readers
+        // pull the same namespace out of `DeclarationIndex::get_global_namespace`.
+        const mangled: string = MangledName::for_global(
+            this.get_intern(), this.ctx.namespace_str, node.name).resolve(this.get_intern());
+
+        const ty: LType = this.type_mapper.map_type(node.resolved_type);
+        if (!ty.is_valid()) {
+            return;
+        }
+
+        const global: LValue = this.llvm_module.add_global(ty, mangled);
+
+        // Initializer: if the source declaration has a literal initializer
+        // (e.g., `const BUCKET_OCCUPIED: u8 = 1`), emit it as the constant
+        // initializer typed against the global's own type so consumers see
+        // the right value.  LLVM globals require a constant initializer, so
+        // anything more complex than a literal falls back to zeroinitializer
+        // (more involved cases would need a runtime ctor, out of scope here).
+        mut init: LValue = LValue::null();
+        // Peel one layer of cast so initializers like
+        // `const HEX_LOWER: u8* = "0123456789abcdef"` route to the
+        // string-literal branch below.  Without this, the cast wraps the
+        // literal and the global lands on the `null` fallback at the bottom
+        // of this function, leaving HEX_LOWER null at runtime, which
+        // segfaults the moment a downstream consumer indexes it.
+        mut init_expr: ExpressionNode* = node.initializer;
+        if (init_expr != null && init_expr.kind == NodeKind::CastExpression) {
+            const ce: CastExprNode* = init_expr as CastExprNode*;
+            if (ce.expression != null && ce.expression.kind == NodeKind::Literal) {
+                init_expr = ce.expression;
+            }
+        }
+        if (init_expr != null && init_expr.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = init_expr as LiteralNode*;
+            const tk: LTypeKind = type_kind_of(ty.raw);
+            if (lit.literal_kind == LiteralKind::Integer && tk == LTypeKind::Integer) {
+                const ival: u64 = parse_int_lexeme(lit.value);
+                init = LType::const_int(ty, ival, true);
+            } else if (lit.literal_kind == LiteralKind::Boolean && tk == LTypeKind::Integer) {
+                const bval: u64 = if (lit.value == "true") { 1 } else { 0 };
+                init = LType::const_int(ty, bval, false);
+            } else if (lit.literal_kind == LiteralKind::Float
+                       && (tk == LTypeKind::Float || tk == LTypeKind::Double)) {
+                mut fval: f64 = 0.0;
+                intrinsics::sscanf(lit.value, "%lf", &fval);
+                init = LType::const_real(ty, fval);
+            } else if (lit.literal_kind == LiteralKind::Null && tk == LTypeKind::Pointer) {
+                init = LType::const_pointer_null(ty);
+            } else if (lit.literal_kind == LiteralKind::String && tk == LTypeKind::Pointer) {
+                // String literal global: store the address of the interned
+                // string global as the initializer.  Without this, every
+                // `const SOME_TEXT: string = "..."` emits as `null`, which
+                // surfaces as literal "(null)" in any printf/format output
+                // that consumes the constant.
+                init = this.str_cache.get_or_create(lit.value, this.builder);
+            }
+        }
+        if (!init.is_valid()) {
+            init = LType::const_null(ty);
+        }
+        global.set_initializer(init);
+
+        if (!node.is_mutable) {
+            global.set_global_constant(true);
+        }
+
+        this.globals.register(node.name, global);
+    }
+
+    /// Generate the body of a function.  Called from the IRGeneratorVisitor.
+    ///
+    /// 1. Look up the LLVM function
+    /// 2. Create entry basic block
+    /// 3. Create allocas for parameters and store incoming values
+    /// 4. Push scope, bind parameter names
+    /// 5. The visitor will visit the body (BlockStmtNode)
+    /// 6. Handle implicit return for void functions
+    codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const intern: InternTable* = ctx_ptr.intern_table;
+        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        const arena: TypeArena* = this.get_arena();
+
+        // Body emission must attach to the LLVM function for THIS exact
+        // overload, not whichever one was registered last under the bare
+        // qualified-name cache.  Build the same func_type_ref declare_function
+        // used to derive the mangled name, then fetch by name from the LLVM
+        // module directly.  Falls back to the bare cache for non-overloaded
+        // functions (no overload-keyed entry registered).
+        mut params: TypeRef[] = [];
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            const param: VarDeclNode* = node.parameters[pi];
+            if (param != null && param.resolved_type.is_valid()) {
+                params.push(param.resolved_type);
+            }
+        }
+        const func_type_ref: TypeRef = arena.get_function(
+            node.resolved_return_type, params, node.is_variadic);
+        const overload_mangled: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
+
+        mut fn_val: LValue = LValue::null();
+        if (overload_mangled.is_valid()) {
+            // `main` is special-cased to keep its unmangled C ABI symbol;
+            // mirror declare_function's override so we look up "main" not
+            // the mangled form.
+            const main_sym: SymbolStr = intern.intern("main");
+            mut ir_name: string = intern.resolve(overload_mangled);
+            if (node.name.equals(main_sym)) {
+                ir_name = "main";
+            }
+            fn_val = this.llvm_module.get_named_function(ir_name);
+        }
+        if (!fn_val.is_valid()) {
+            fn_val = this.resolver.resolve_function(qualified);
+        }
+        if (!fn_val.is_valid()) {
+            // The prior FunctionDeclaration pass should have produced a
+            // declare for this function. When it didn't, the body simply
+            // can't land; emit a warning rather than an error because
+            // the upstream gap is the real bug to fix, and a warning lets
+            // the build continue so downstream code can be exercised.
+            const fname: string = this.resolve(node.name);
+            this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
+                format("codegen: function '%s' has no LLVM declaration in this module; body skipped (the prior FunctionDeclaration pass should have produced one). Calls to this function will fail at link time.", fname),
+                node.span);
+            return LValue::null();
+        }
+
+        // Create entry basic block.
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        this.builder.position_at_end(entry_bb);
+
+        // Create allocas for each parameter and store the incoming value.
+        this.values.push_scope();
+
+        const fixed_count: u32 = fixed_param_count(node);
+        for (mut i: u32 = 0; i < fixed_count; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            const param_name: string = this.resolve(param.name);
+            const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
+
+            if (!param_ty.is_valid()) {
+                const fname: string = this.resolve(node.name);
+                this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
+                    format("codegen: function '%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this function will fail at link time.",
+                        fname, param_name),
+                    if (param != null) { param.span } else { node.span });
+                this.values.pop_scope();
+                return LValue::null();
+            }
+
+            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
+            const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, i) };
+            this.builder.build_store(arg, alloca);
+            this.values.set(param.name, alloca);
+        }
+
+        // For variadic functions with an `args...` bucket, set up a va_list
+        // so the body can forward varargs to other variadic intrinsics via
+        // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
+        // identifier has no LLVM value and every forwarding call codegens
+        // with a null operand.
+        this.expr_ops.emit_va_start_for_variadic(fn_val, variadic_param_name(node));
+
+        // Program-main prologue: publish argc/argv to the standard library
+        // before the user's body runs, so `std::env::args()` returns the
+        // real argv instead of an empty slice.  `declare_function` widened
+        // main's LLVM signature to `i32 (i32, ptr)`; the user's source has
+        // no parameters, so we read the synthetic params via LLVMGetParam
+        // and forward them through the regular function-resolution path.
+        const intern: InternTable* = this.get_intern();
+        const main_sym: SymbolStr = intern.intern("main");
+        if (node.name.equals(main_sym) && fixed_param_count(node) == 0) {
+            this.emit_set_args_call(fn_val);
+        }
+
+        return fn_val;
+    }
+
+    /// Emit `std::env::set_args(argc, argv)` at the entry of the program's
+    /// main function.  Looks the function up by qualified name so the
+    /// mangled symbol is whatever `MangledName::for_free_function` decides
+    /// No hardcoded mangle.  Silent no-op if the stdlib (or `set_args`
+    /// specifically) isn't available, which keeps `--no-std` builds and
+    /// freestanding mains compiling.
+    emit_set_args_call(mut &this, main_fn: LValue) -> void {
+        const intern: InternTable* = this.get_intern();
+        const set_args_sym: SymbolStr = intern.intern("std::env::set_args");
+        const set_args_fn: LValue = this.resolver.resolve_function(set_args_sym);
+        if (!set_args_fn.is_valid()) { return; }
+
+        const set_args_ty: LType = LType {
+            raw: llvm::LLVMGlobalGetValueType(set_args_fn.raw),
+        };
+        if (!set_args_ty.is_valid()) { return; }
+
+        const argc: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 0) };
+        const argv: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 1) };
+
+        mut args: Pair<LValue, TypeRef>[] = [];
+        args.push(Pair<LValue, TypeRef>::new(argc, TypeRef::invalid()));
+        args.push(Pair<LValue, TypeRef>::new(argv, TypeRef::invalid()));
+        mut result: LValue = LValue::null();
+        result = this.expr_ops.codegen_call(set_args_fn, set_args_ty, args, "");
+    }
+
+    /// Emit implicit void return ONLY for void/unit functions.
+    /// Non-void functions must have explicit returns from the source code.
+    /// If a non-void function's block has no terminator, body generation
+    /// failed; the caller will strip it back to a declare.
+    codegen_function_epilogue(mut &this, node: FunctionDeclNode*) -> void {
+        const current_bb: LBasicBlock = this.builder.get_insert_block();
+        if (current_bb.is_valid() && !current_bb.has_terminator()) {
+            const ret_ty: TypeRef = node.resolved_return_type;
+            mut is_void: boolean = ret_ty.is_invalid();
+            if (!is_void) {
+                const t: Type* = this.lookup_type_by_id(ret_ty.id);
+                is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
+            }
+            if (is_void) {
+                this.expr_ops.emit_va_end_if_variadic(variadic_param_name(node));
+                this.builder.build_ret_void();
+            }
+            // Non-void: intentionally leave unterminated. The caller
+            // detects this and strips the function body.
+        }
+
+        // Sweep orphaned blocks that body codegen left empty + unterminated.
+        // The classic source is the merge block of an infinite `loop { ... }`
+        // (no `break`, so nothing branches into `loop.end`); the same shape
+        // appears for any control-flow scaffolding that creates a join block
+        // that ends up unused.  Without this fixup the function-body
+        // validator strips the WHOLE body to a declare, producing silent
+        // link-time `undefined reference` errors.  An empty block has no
+        // semantic meaning; terminating it with `unreachable` is a no-op
+        // for any reachable path and keeps LLVM happy.
+        const fn_val: LValue = this.builder.get_insert_block().get_parent();
+        if (fn_val.is_valid()) {
+            mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
+            while (bb != null) {
+                const lbb: LBasicBlock = LBasicBlock { raw: bb };
+                if (!lbb.has_terminator()
+                        && llvm::LLVMGetFirstInstruction(bb) == null) {
+                    this.builder.position_at_end(lbb);
+                    this.builder.build_unreachable();
+                }
+                bb = llvm::LLVMGetNextBasicBlock(bb);
+            }
+        }
+
+        this.values.pop_scope();
+    }
+
+    /// Generate function prologue for a method.  Prepends `this` parameter binding.
+    codegen_method_prologue(mut &this, node: MethodNode*, target_type: SymbolStr) -> LValue {
+        const func: FunctionDeclNode* = node.func;
+        if (func == null) { return LValue::null(); }
+
+        const intern: InternTable* = this.get_intern();
+        const type_str: string = intern.resolve(target_type);
+        const method_str: string = intern.resolve(func.name);
+        const combined: string = format("%s::%s", type_str, method_str);
+        const combined_sym: SymbolStr = intern.intern(combined);
+
+        // Recompute the mangled name from THIS overload's parameter types so
+        // overloaded methods (e.g., BaseASTVisitor's 62 `visit(...)` overrides)
+        // resolve to their own LLVM function rather than all mapping to the
+        // first-declared overload via the ambiguous combined key.  Must mirror
+        // the computation in `declare_method` exactly.
+        const arena: TypeArena* = this.get_arena();
+        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
+        const recv_kind: ReceiverKind = method_receiver_kind(func, node.is_static, intern);
+        const method_param_refs: TypeRef[] = method_non_receiver_params(func, intern);
+        const computed: MangledName = MangledName::for_method(
+            intern, arena, type_qname, func.name, recv_kind,
+            method_param_refs, func.resolved_return_type, func.is_variadic);
+        const mangled_sym: SymbolStr = computed.value;
+
+        // Prefer mangled_sym for overload-correct lookup; fall back to the
+        // combined key for paths that only registered the non-overloaded form.
+        mut fn_val: LValue = this.resolver.resolve_function(mangled_sym);
+        if (!fn_val.is_valid()) {
+            fn_val = this.resolver.resolve_function(combined_sym);
+        }
+        if (!fn_val.is_valid()) {
+            // declare_method should have produced an LLVM declare for this
+            // method.  When it didn't (e.g. cross-module trait impls whose
+            // target lookup misses, or primitive impls whose target qualify
+            // resolves to a name DI doesn't know), the body simply can't
+            // land.  Emit a warning rather than an error so the build
+            // continues; calls to this method will surface as undefined
+            // references at link time, which is the correct visibility
+            // outcome until the upstream declare path is fixed.
+            this.diag.emit_warning_at_span(ErrorCode::E0619_METHOD_GENERATION_ERROR,
+                format("codegen: method '%s::%s' has no LLVM declaration in this module; body skipped (declare_method should have produced one). Calls to this method will fail at link time.",
+                    type_str, method_str),
+                func.span);
+            return LValue::null();
+        }
+
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        this.builder.position_at_end(entry_bb);
+
+        this.values.push_scope();
+
+        // Detect which of the three self forms (if any) this method uses.
+        //   `&this` / `mut &this`: param named "&this", semantically a T*
+        //   `this`               : param named "this", semantically a by-value T
+        //   (none)               : implicit `&this`; `declare_method` synthesized
+        //                           a leading T* in the LLVM function signature
+        // The LLVM parameter layout depends on which case we're in; matches the
+        // logic in declare_method so named_values and LLVM params line up.
+        mut explicit_ref_idx: i64 = -1;    // parameters[i] is "&this"
+        mut explicit_val_idx: i64 = -1;    // parameters[i] is bare "this" (by-value self)
+        mut explicit_typed_idx: i64 = -1;  // parameters[i] is "this: T*" (user-typed self)
+        for (mut pc: i64 = 0; pc < func.parameters.length; pc++) {
+            const pp: VarDeclNode* = func.parameters[pc];
+            if (pp == null) { continue; }
+            const pn: string = this.resolve(pp.name);
+            if (intrinsics::strcmp(pn, "&this") == 0) { explicit_ref_idx = pc; break; }
+            if (intrinsics::strcmp(pn, "this") == 0) {
+                if (pp.type_annotation == null) {
+                    explicit_val_idx = pc;
+                } else {
+                    // `this: T*`: user wrote the type out, method takes
+                    // `this` as a regular typed parameter (e.g. Lexer's
+                    // helper methods that use this convention).
+                    explicit_typed_idx = pc;
+                }
+                break;
+            }
+        }
+
+        mut param_idx: u32 = 0;
+
+        // Bind `this` for instance methods.  All three forms produce a `this`
+        // named-value that's a pointer to the struct; for by-value `this` we
+        // alloca+store the struct so member-access GEPs work the same way.
+        if (!node.is_static) {
+            const qualified_target: SymbolStr = this.ctx.qualify_symbol_sym(target_type);
+            mut target_ref: TypeRef = this.ctx.decl_index.lookup_type(qualified_target);
+            if (target_ref.is_invalid()) {
+                target_ref = this.ctx.decl_index.lookup_type(target_type);
+            }
+            if (target_ref.is_invalid()) {
+                // Unit-target impls (`implement trait Drop for ()`):
+                // unit type lives in the arena, not the DeclarationIndex.
+                // Detected by the literal `()` suffix on the qualified target
+                // name; mirrors the fallback in declare_method.
+                const target_str: string = this.resolve(target_type);
+                const tlen: u64 = intrinsics::strlen(target_str);
+                if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
+                              && target_str[tlen - 1] == 0x29 /* ')' */) {
+                    target_ref = this.get_arena().get_unit();
+                }
+            }
+            if (target_ref.is_invalid()) {
+                const ts: string = this.resolve(target_type);
+                const ms: string = this.resolve(func.name);
+                this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("codegen: method '%s::%s': target type '%s' not found in declaration index", ts, ms, ts),
+                    func.span);
+                this.values.pop_scope();
+                return LValue::null();
+            }
+
+            const this_sym: SymbolStr = this.intern_str("this");
+            const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+
+            if (explicit_val_idx >= 0) {
+                // By-value `this`: LLVM param 0 is a struct value.  Alloca it so
+                // downstream code (member access, method calls) can treat `this`
+                // as a pointer uniformly.
+                const target_mapped: LType = this.type_mapper.map_type(target_ref);
+                if (!target_mapped.is_valid()) {
+                    this.diag.emit_warning_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                        format("codegen: method '%s::%s': could not lower the by-value `this` type to LLVM; body skipped. Calls to this method will fail at link time.",
+                            type_str, method_str),
+                        func.span);
+                    this.values.pop_scope();
+                    return LValue::null();
+                }
+                const slot: LValue = this.flow.create_entry_alloca(fn_val, "this", target_mapped);
+                this.builder.build_store(arg0, slot);
+                this.values.set(this_sym, slot);
+            } else if (explicit_typed_idx >= 0) {
+                // User-typed `this: T*`: LLVM param 0 is whatever the
+                // annotation resolves to (typically a ptr).  Bind `this`
+                // directly to that value, same as the `&this` path.
+                this.values.set(this_sym, arg0);
+            } else {
+                // `&this` (explicit or implicit): LLVM param 0 is already a ptr.
+                // Store the raw pointer directly in named_values (no alloca).
+                this.values.set(this_sym, arg0);
+            }
+
+            param_idx = 1;
+        }
+
+        // Bind the remaining user parameters.  Skip whichever self form this
+        // method uses (we already handled it above).  Cap iteration at the
+        // fixed-param count so a trailing `args...` bucket doesn't try to pull
+        // an LLVM param that doesn't exist.
+        const fixed_count: u32 = fixed_param_count(func);
+        for (mut i: u32 = 0; i < fixed_count; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) { continue; }
+            if (i as i64 == explicit_ref_idx) { continue; }
+            if (i as i64 == explicit_val_idx) { continue; }
+            if (i as i64 == explicit_typed_idx) { continue; }
+
+            const param_name: string = this.resolve(param.name);
+            const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
+            if (!param_ty.is_valid()) {
+                this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
+                    format("codegen: method '%s::%s', parameter '%s': could not lower its type to LLVM; body skipped. Calls to this method will fail at link time.",
+                        type_str, method_str, param_name),
+                    if (param != null) { param.span } else { func.span });
+                this.values.pop_scope();
+                return LValue::null();
+            }
+
+            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
+            const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
+            this.builder.build_store(arg, alloca);
+            this.values.set(param.name, alloca);
+            param_idx += 1;
+        }
+
+        return fn_val;
+    }
+
+    /// Map a function's return type to an LLVMType.
+    map_return_type(mut &this, node: FunctionDeclNode*) -> LType {
+        if (node.resolved_return_type.is_invalid()) {
+            return LType::void_type();
+        }
+
+        const t: Type* = this.lookup_type_by_id(node.resolved_return_type.id);
+        if (t == null || t.kind == TypeKind::Void || t.kind == TypeKind::Unit) {
+            return LType::void_type();
+        }
+
+        return this.type_mapper.map_type(node.resolved_return_type);
+    }
+
+    // ========================================================================
+    // Intrinsics codegen.  Inline-lowers calls to compiler-recognized
+    // intrinsics (ptr arithmetic, sext/zext, rotates, abort, panic, ...
+    // dispatched by name through `try_emit_intrinsic_call`).
+    // ========================================================================
+
+    auto_deref_to(mut &this, val: LValue, expected: LType) -> LValue {
+        if (!val.is_valid() || !expected.is_valid()) { return val; }
+        const actual_ty: void* = llvm::LLVMTypeOf(val.raw);
+        if (actual_ty == null) { return val; }
+        if (type_kind_of(actual_ty) == LTypeKind::Pointer) {
+            return this.builder.build_load(expected, val, "deref");
+        }
+        return val;
+    }
+
+}
