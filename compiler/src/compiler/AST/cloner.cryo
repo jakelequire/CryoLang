@@ -22,53 +22,6 @@ import Compiler::AST::Visitor;
 
 
 // ============================================================================
-// Module-level specialization state
-// ============================================================================
-//
-// Specialization parameters are stored in module-level globals rather than
-// on `this`.  The ASTCloner is a class (extends BaseASTVisitor), and reading
-// its own fields from within visit() methods through the vtable-prefixed
-// layout has been a source of subtle codegen bugs: field offsets get
-// miscomputed for class hierarchies with vtables.  Module-level globals
-// sidestep the vtable dispatch entirely.
-//
-// The specializer sets these before cloning, and the cloner's visit methods
-// read and clear them.  Not re-entrant, but cloning is always single-threaded.
-
-mut g_spec_name:     SymbolStr = SymbolStr::empty();
-mut g_skip_generics: boolean   = false;
-
-/// Set the module-level specialization name + skip_generics flag.
-/// Called by the specializer before each clone operation.
-function set_clone_specialization(name: SymbolStr) -> void {
-    g_spec_name     = name;
-    g_skip_generics = true;
-}
-
-/// Consume the one-shot specialization name.  Returns the spec_name
-/// if valid, otherwise falls back to `original`.  Clears both globals
-/// so child declarations are not affected.
-function consume_clone_spec_name(original: SymbolStr) -> SymbolStr {
-    if (g_spec_name.is_valid()) {
-        const name: SymbolStr = g_spec_name;
-        g_spec_name = SymbolStr::empty();
-        // NOTE: do NOT clear g_skip_generics here; consume_clone_skip_generics
-        // must read it after this function returns.
-        return name;
-    }
-    return original;
-}
-
-/// Read and clear the skip_generics flag.  Called right after
-/// consume_clone_spec_name() in each visit() method.
-function consume_clone_skip_generics() -> boolean {
-    const skip: boolean = g_skip_generics;
-    g_skip_generics = false;
-    return skip;
-}
-
-
-// ============================================================================
 // ASTCloner: Deep-copy visitor
 // ============================================================================
 
@@ -78,30 +31,47 @@ public:
     /// node.accept(this), retrieve the clone from this field.
     result: ASTNode*;
 
+    /// One-shot specialization name applied at the first decl-level visit
+    /// (StructDeclNode / ClassDeclNode / EnumDeclNode / FunctionDeclNode).
+    /// `consume_spec_name()` reads and clears it so child decls keep their
+    /// own names.
+    spec_name: SymbolStr;
+
+    /// When true, the next decl-level visit drops `generic_params`, producing
+    /// a concrete specialization. Read-and-clear via `consume_skip_generics()`.
+    skip_generics: boolean;
+
     ASTCloner() : BaseASTVisitor() {
-        this.result = null;
+        this.result        = null;
+        this.spec_name     = SymbolStr::empty();
+        this.skip_generics = false;
     }
 
-    /// Create a cloner configured for specialization.
-    /// Sets module-level globals (not class fields) to avoid the
-    /// vtable-offset miscompile when reading from `this` inside
-    /// visit() methods.
+    /// Create a cloner configured for specialization. The first matching
+    /// decl-level visit will apply `name` and drop generic_params.
     static for_specialization(name: SymbolStr) -> ASTCloner {
-        set_clone_specialization(name);
-        return ASTCloner();
+        mut c: ASTCloner   = ASTCloner();
+        c.spec_name        = name;
+        c.skip_generics    = true;
+        return c;
     }
 
-    /// Create a plain ASTCloner with no specialization flags set. Use
-    /// this for one-off clones that need to preserve the source node's
-    /// generic_params (e.g., default-trait-method synthesis cloning a
-    /// `hash<H>(...)` body; the H param must survive the clone).
-    /// Functionally equivalent to `ASTCloner()`, but routed through a
-    /// static method because value-style construction of class types at
-    /// function scope can miscompile (segfaults later in resolution).
-    static new_plain() -> ASTCloner {
-        g_spec_name     = SymbolStr::empty();
-        g_skip_generics = false;
-        return ASTCloner();
+    /// Read and clear the one-shot specialization name, falling back to
+    /// `original` when not specializing.
+    consume_spec_name(original: SymbolStr) -> SymbolStr {
+        if (this.spec_name.is_valid()) {
+            const name: SymbolStr = this.spec_name;
+            this.spec_name = SymbolStr::empty();
+            return name;
+        }
+        return original;
+    }
+
+    /// Read and clear the skip_generics flag.
+    consume_skip_generics() -> boolean {
+        const skip: boolean = this.skip_generics;
+        this.skip_generics = false;
+        return skip;
     }
 
 
@@ -628,8 +598,8 @@ public:
     }
 
     override visit(node: FunctionDeclNode*) -> void {
-        const name: SymbolStr = consume_clone_spec_name(node.name);
-        const skip_gp: boolean = consume_clone_skip_generics();
+        const name: SymbolStr = this.consume_spec_name(node.name);
+        const skip_gp: boolean = this.consume_skip_generics();
         mut c: FunctionDeclNode* = new FunctionDeclNode(name, node.span);
         this.copy_decl_base(node, c);
         c.is_public   = node.is_public;
@@ -714,8 +684,8 @@ public:
     }
 
     override visit(node: StructDeclNode*) -> void {
-        const name: SymbolStr = consume_clone_spec_name(node.name);
-        const skip_gp: boolean = consume_clone_skip_generics();
+        const name: SymbolStr = this.consume_spec_name(node.name);
+        const skip_gp: boolean = this.consume_skip_generics();
         mut c: StructDeclNode* = new StructDeclNode(name, node.span);
         this.copy_decl_base(node, c);
         if (!skip_gp) {
@@ -734,8 +704,8 @@ public:
     }
 
     override visit(node: ClassDeclNode*) -> void {
-        const name: SymbolStr = consume_clone_spec_name(node.name);
-        const skip_gp: boolean = consume_clone_skip_generics();
+        const name: SymbolStr = this.consume_spec_name(node.name);
+        const skip_gp: boolean = this.consume_skip_generics();
         mut c: ClassDeclNode* = new ClassDeclNode(name, node.span);
         this.copy_decl_base(node, c);
         c.base_class = node.base_class;
@@ -781,8 +751,8 @@ public:
     }
 
     override visit(node: EnumDeclNode*) -> void {
-        const name: SymbolStr = consume_clone_spec_name(node.name);
-        const skip_gp: boolean = consume_clone_skip_generics();
+        const name: SymbolStr = this.consume_spec_name(node.name);
+        const skip_gp: boolean = this.consume_skip_generics();
         mut c: EnumDeclNode* = new EnumDeclNode(name, node.span);
         this.copy_decl_base(node, c);
         if (!skip_gp) {
@@ -874,22 +844,18 @@ public:
 
     override visit(node: EnumPatternNode*) -> void {
         mut c: EnumPatternNode* = new EnumPatternNode(node.span);
-        c.value             = node.value;
-        c.binding_name      = node.binding_name;
-        c.literal_kind      = node.literal_kind;
-        c.enum_name         = node.enum_name;
-        c.variant_name      = node.variant_name;
-        c.elements          = node.elements;  // PatternElement[] - value types, shallow copy is fine
-        c.binding_names     = node.binding_names;
-        c.binding_spans     = node.binding_spans;
-        c.binding_positions = node.binding_positions;
-        c.has_error         = node.has_error;
+        c.value        = node.value;
+        c.binding_name = node.binding_name;
+        c.literal_kind = node.literal_kind;
+        c.enum_name    = node.enum_name;
+        c.variant_name = node.variant_name;
+        c.elements     = node.elements;  // PatternElement[] - value types, shallow copy is fine
+        c.has_error    = node.has_error;
         this.result = c;
     }
 
     override visit(node: DirectiveNode*) -> void {
         mut c: DirectiveNode* = new DirectiveNode(node.directive_kind, node.span);
-        c.arguments = node.arguments;
         // Deep-clone typed args; nested DirectiveNode* references must be
         // cloned recursively so two callers don't alias the same nested call.
         for (mut i: i64 = 0; i < node.args.length; i++) {

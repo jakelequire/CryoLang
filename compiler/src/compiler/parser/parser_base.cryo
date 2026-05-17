@@ -46,6 +46,17 @@ public:
     // variadic flag onto the node. Reset on entry to parse_parameter_list.
     pending_bare_variadic: boolean;
 
+    // Set by parse_parameter when a named `args...` form is seen. Callers
+    // forward the variadic flag onto the function node the same way as
+    // pending_bare_variadic. Reset on entry to parse_parameter_list.
+    pending_named_variadic: boolean;
+
+    // Set by consume_right_angle when it encounters `>>` while expecting a
+    // single `>`: advances past the `>>` and leaves this flag so the *next*
+    // consume_right_angle (closing the outer generic) consumes the virtual
+    // remaining `>` without re-reading the token stream.
+    pending_right_angle: boolean;
+
     // Doc comment accumulation
     pending_doc_comments: string[];
 
@@ -78,7 +89,9 @@ public:
         this.paren_depth  = 0;
         this.bracket_depth = 0;
 
-        this.pending_bare_variadic = false;
+        this.pending_bare_variadic  = false;
+        this.pending_named_variadic = false;
+        this.pending_right_angle    = false;
 
         this.pending_doc_comments = [];
         this.last_doc_end_line    = -1;
@@ -417,6 +430,19 @@ public:
         return val;
     }
 
+    /// True iff `s` looks like a float literal (contains `.`, `e`, or `E`).
+    /// Used by pattern parsing to pick between LiteralInt and LiteralFloat
+    /// when the token kind alone (NumericConstant) doesn't distinguish them.
+    static is_float_lexeme(s: string) -> boolean {
+        if (s == null) { return false; }
+        const llen: u32 = s.length();
+        for (mut i: u32 = 0; i < llen; i++) {
+            const c: char = s[i];
+            if (c == '.' || c == 'e' || c == 'E') { return true; }
+        }
+        return false;
+    }
+
     /// Merge two spans into one covering both.
     static merge_spans(a: SourceSpan, b: SourceSpan) -> SourceSpan {
         mut start_line: u32 = a.start_line;
@@ -690,24 +716,22 @@ public:
     }
 
     /// Handle `>>` splitting for nested generics.
-    /// When expecting `>` but finding `>>`, logically split it:
-    /// consume the first `>` and leave a synthetic `>` for the next read.
+    /// When expecting `>` but finding `>>`, advance past the whole `>>` and
+    /// raise `pending_right_angle` so the *next* `consume_right_angle()`
+    /// (closing the outer generic) finds the virtual second `>` without
+    /// re-reading the token stream.
     consume_right_angle() -> void {
+        if (this.pending_right_angle) {
+            this.pending_right_angle = false;
+            return;
+        }
         if (this.check(TokenType::RAngle)) {
             this.advance();
             return;
         }
         if (this.check(TokenType::GreaterGreater)) {
-            // Logically consume one `>` by replacing `>>` with `>`
-            // We modify the token in-place: shorten lexeme and advance column
-            const tok: Token = this.tokens[this.pos];
-            this.tokens[this.pos] = Token::new(
-                TokenType::RAngle,
-                ">",
-                tok.line,
-                tok.column + 1
-            );
-            // Don't advance; the remaining `>` is now the current token
+            this.advance();
+            this.pending_right_angle = true;
             return;
         }
         this.error_expected("'>'");

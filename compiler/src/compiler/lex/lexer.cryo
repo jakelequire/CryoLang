@@ -119,7 +119,7 @@ private:
 
         // --- Number ---
         if (Lexer::is_digit(c)) {
-            return this.lex_number(c);
+            return this.lex_number();
         }
 
         // --- String literal ---
@@ -165,16 +165,14 @@ private:
         return this.make_token(kind, text);
     }
 
-    lex_number(&this, first_char: char) -> Token {
+    lex_number(&this) -> Token {
         // Back up one character: lex_token() already consumed the first digit via advance()
         const start: string = intrinsics::ptr_add(this.current as void*, -1) as string;
 
         mut is_special_base: boolean = false;
 
         // --- Special base prefixes (0x, 0b, 0o) ---
-        // Use `first_char` (passed from lex_token) instead of dereferencing
-        // `*start`, as pointer dereference may not codegen correctly.
-        if (first_char == '0' && !this.at_end()) {
+        if (*start == '0' && !this.at_end()) {
             const prefix: char = this.peek();
 
             if (prefix == 'x' || prefix == 'X') {
@@ -271,13 +269,7 @@ private:
             const suffix_len: u64 = (this.current as i64 - suffix_start as i64) as u64;
             const suffix: string = substr(suffix_start, 0, suffix_len);
 
-            const valid: boolean = 
-                suffix == "u8"    || suffix == "u16"   || suffix == "u32" || suffix == "u64"  ||
-                suffix == "i8"    || suffix == "i16"   || suffix == "i32" || suffix == "i64"  ||
-                suffix == "f32"   || suffix == "f64"   ||
-                suffix == "usize" || suffix == "isize";
-
-            if (!valid) {
+            if (!Lexer::is_valid_numeric_suffix(suffix)) {
                 // Not a valid suffix, backtrack
                 this.current = suffix_start;
             }
@@ -439,7 +431,7 @@ private:
         } else if (opener == '*') {
             this.advance(); // consume '*'
 
-            while (!this.at_end() && this.peek_ahead(1) != '\0') {
+            while (!this.at_end()) {
                 if (this.peek() == '*' && this.peek_ahead(1) == '/') {
                     this.advance(); // consume '*'
                     this.advance(); // consume '/'
@@ -494,7 +486,7 @@ private:
                 this.advance();
             }
 
-            while (!this.at_end() && this.peek_ahead(1) != '\0') {
+            while (!this.at_end()) {
                 if (this.peek() == '*' && this.peek_ahead(1) == '/') {
                     this.advance(); // consume '*'
                     this.advance(); // consume '/'
@@ -518,7 +510,7 @@ private:
         return this.make_token(doc_kind, lexeme);
     }
 
-    lex_punctuator(this: Lexer*, c: i8) -> TokenType {
+    lex_punctuator(&this, c: char) -> TokenType {
         match (c) {
             '('  => { return TokenType::LParen;     }
             ')'  => { return TokenType::RParen;     }
@@ -787,6 +779,22 @@ private:
 
     static is_whitespace(c: char) -> boolean {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    /// True iff `s` is one of the accepted numeric-literal type suffixes
+    /// (e.g. `42u32`, `1.5f64`, `0xffi8`). Kept as a single source of truth
+    /// so adding a new primitive width touches one list instead of several.
+    static is_valid_numeric_suffix(s: string) -> boolean {
+        const table: string[] = [
+            "i8", "i16", "i32", "i64",
+            "u8", "u16", "u32", "u64",
+            "f32", "f64",
+            "isize", "usize"
+        ];
+        for (mut i: i64 = 0; i < table.length; i++) {
+            if (s == table[i]) { return true; }
+        }
+        return false;
     }
 
     /// Processes escape sequences in a string literal, converting backslash

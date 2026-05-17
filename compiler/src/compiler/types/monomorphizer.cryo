@@ -1823,8 +1823,10 @@ type struct Monomorphizer {
                 depth += 1;
             }
             if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
-                for (mut j: i64 = 0; j < enum_pat.binding_names.length; j++) {
-                    this.scope_names.push(enum_pat.binding_names[j]);
+                for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
+                    const pb: PatternBinding* = enum_pat.binding_at(j);
+                    if (pb == null) { continue; }
+                    this.scope_names.push(pb.name);
                     this.scope_types.push(subject_type);
                     added += 1;
                 }
@@ -1852,16 +1854,17 @@ type struct Monomorphizer {
                     payload_types = substituted;
                 }
             }
-            for (mut j: i64 = 0; j < enum_pat.binding_names.length; j++) {
-                const pos: i64 = enum_pat.binding_positions[j];
+            for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
+                const pb: PatternBinding* = enum_pat.binding_at(j);
+                if (pb == null) { continue; }
                 mut bind_t: TypeRef = TypeRef::invalid();
-                if (pos < payload_types.length && payload_types[pos].is_valid()) {
-                    bind_t = payload_types[pos];
+                if (j < payload_types.length && payload_types[j].is_valid()) {
+                    bind_t = payload_types[j];
                 } else {
                     bind_t = subject_type;
                 }
                 if (!bind_t.is_valid()) { continue; }
-                this.scope_names.push(enum_pat.binding_names[j]);
+                this.scope_names.push(pb.name);
                 this.scope_types.push(bind_t);
                 added += 1;
             }
@@ -3383,24 +3386,13 @@ type struct Monomorphizer {
         const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
         *subst_ptr = subst_val;
 
-        // Clone the method.  The cloner's `for_specialization` is for
-        // type templates (renames the type itself); methods don't get
-        // a renamed leaf, so use the plain cloner.  Bypass MethodNode's
-        // accept() (the vtable-offset miscompile can dispatch it to the
-        // wrong override and lose the body); call clone_func_decl
-        // directly and rebuild the MethodNode locally.
-        mut cloner: ASTCloner = ASTCloner::new_plain();
-        const cloned_func: FunctionDeclNode* = cloner.clone_func_decl(original.func);
-        if (cloned_func == null) { return null; }
-        mut spec_method: MethodNode* = new MethodNode(cloned_func, original.span);
-        spec_method.visibility            = original.visibility;
-        spec_method.is_constructor        = original.is_constructor;
-        spec_method.is_destructor         = original.is_destructor;
-        spec_method.is_static             = original.is_static;
-        spec_method.is_default_destructor = original.is_default_destructor;
-        spec_method.is_virtual            = original.is_virtual;
-        spec_method.is_override           = original.is_override;
-        spec_method.base_ctor_name        = original.base_ctor_name;
+        // Clone the method via the normal visitor path. `for_specialization`
+        // is for type templates (renames the type itself); methods don't get
+        // a renamed leaf, so a plain cloner is correct here.
+        mut cloner: ASTCloner = ASTCloner();
+        (original as ASTNode*).accept(cloner);
+        mut spec_method: MethodNode* = cloner.result as MethodNode*;
+        if (spec_method == null || spec_method.func == null) { return null; }
         const cloned_node: ASTNode* = spec_method as ASTNode*;
         // The cloner copies `generic_params` by ref; reset to empty so
         // sema/declare_method don't classify the spec as still generic.
