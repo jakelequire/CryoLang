@@ -36,6 +36,11 @@ import Compiler::Resolver::Symbol;
 import Compiler::Resolver::SymbolID;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
+import Compiler::Types;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
 import Compiler::ModuleGraph;
 import Utils::File;
 
@@ -210,21 +215,54 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
         }
     }
 
-    // 3. `obj.method` — receiver's resolved type → method on that type.
-    //    `find_innermost_node_at` returns MemberAccess only when the
-    //    cursor is past the receiver (on the dot or member token), so
-    //    cursor-on-receiver naturally falls through to (4).
+    // 3. `obj.member` — receiver's resolved type → method or field on
+    //    that type.  `find_innermost_node_at` returns MemberAccess only
+    //    when the cursor is past the receiver (on the dot or member
+    //    token), so cursor-on-receiver naturally falls through to (4).
+    //
+    //    Mirrors hover's resolution:
+    //      • `unwrap_to_carrier` peels Reference / Pointer /
+    //        InstantiatedType wrappers so `&Foo<T>` → `Foo`, since
+    //        methods and fields register against the carrier TypeRef.
+    //      • `is_member_access_callee` decides field-first vs
+    //        method-first: `obj.member(args)` commits to a method,
+    //        bare `obj.member` prefers a field of the same name.
+    //      • Each path falls through to the other on miss — function-
+    //        pointer fields and bare method references both exist.
     if (!target_span.has_location() && node.kind == NodeKind::MemberAccess) {
         const ma: MemberAccessNode* = node as MemberAccessNode*;
         if (ma.object != null && ctx.decl_index != null) {
-            const recv_ty: TypeRef = ma.object.resolved_type;
+            const recv_ty: TypeRef = unwrap_to_carrier(
+                ma.object.resolved_type, ctx.type_arena);
             if (recv_ty.is_valid()) {
                 const type_sym: SymbolStr = ctx.decl_index.lookup_type_name(recv_ty);
                 if (type_sym.is_valid()) {
-                    const m: MethodNode* = NodeLocator::find_method_in_modules(
-                        ctx.module_graph, ctx.intern_table, type_sym, ma.member);
-                    if (m != null && m.func != null) {
-                        target_span = m.func.name_span;
+                    const is_call: boolean = NodeLocator::is_member_access_callee(
+                        ctx.module_graph, ma);
+                    if (is_call) {
+                        const m: MethodNode* = NodeLocator::find_method_in_modules(
+                            ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                        if (m != null && m.func != null) {
+                            target_span = m.func.name_span;
+                        } else {
+                            const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                                ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                            if (fld != null) {
+                                target_span = NodeLocator::name_span_of(fld as ASTNode*);
+                            }
+                        }
+                    } else {
+                        const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                            ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                        if (fld != null) {
+                            target_span = NodeLocator::name_span_of(fld as ASTNode*);
+                        } else {
+                            const m: MethodNode* = NodeLocator::find_method_in_modules(
+                                ctx.module_graph, ctx.intern_table, type_sym, ma.member);
+                            if (m != null && m.func != null) {
+                                target_span = m.func.name_span;
+                            }
+                        }
                     }
                 }
             }
@@ -237,21 +275,48 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //    Builtins (`i32`, `bool`, …) come back with an empty
     //    declaring span and are filtered at the bottom.
     //
+    //    `this` is special: it parses as an IdentifierNode but the
+    //    resolver has no symbol entry for it (it's the synthesised
+    //    receiver, not a user-bound name).  Recover the carrier type
+    //    by finding the enclosing method's owner and jumping to that
+    //    struct/class/enum's name span — same trick hover uses.
+    //
     //    `Symbol::declaring_span` is stamped at registration time and
     //    typically covers the whole decl statement.  Walk the target
     //    file's AST to find the decl node at that span and use its
     //    narrower `name_span` so the editor highlights just the name
     //    on jump.
-    if (!target_span.has_location()
-        && node.kind == NodeKind::Identifier
-        && ctx.resolver != null) {
+    if (!target_span.has_location() && node.kind == NodeKind::Identifier) {
         const id_node: IdentifierNode* = node as IdentifierNode*;
-        const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
-        if (sym_id.is_valid()) {
-            const sym: Symbol = ctx.resolver.get_symbol(sym_id);
-            if (sym.declaring_span.has_location()) {
-                target_span = narrow_to_name_span(
-                    ctx.module_graph, sym.declaring_span);
+
+        // `this` → enclosing method's owner type.
+        if (id_node.name.is_valid()
+                && ctx.intern_table != null
+                && id_node.span.has_location()) {
+            const this_sym: SymbolStr = ctx.intern_table.intern("this");
+            if (id_node.name.equals(this_sym)) {
+                const owner: SymbolStr = NodeLocator::find_enclosing_method_owner(
+                    ctx.module_graph, id_node.span.file,
+                    id_node.span.start_line, id_node.span.start_col);
+                if (owner.is_valid()) {
+                    const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                        ctx.module_graph, ctx.intern_table, owner);
+                    if (decl != null) {
+                        target_span = NodeLocator::name_span_of(decl);
+                    }
+                }
+            }
+        }
+
+        // Regular identifier path: resolver span → symbol → decl.
+        if (!target_span.has_location() && ctx.resolver != null) {
+            const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
+            if (sym_id.is_valid()) {
+                const sym: Symbol = ctx.resolver.get_symbol(sym_id);
+                if (sym.declaring_span.has_location()) {
+                    target_span = narrow_to_name_span(
+                        ctx.module_graph, sym.declaring_span);
+                }
             }
         }
     }
@@ -610,6 +675,41 @@ function json_u32_field(obj: &JsonValue, key: string) -> u32 {
         Option::None => { return 0 as u32; }
     }
     return 0 as u32;
+}
+
+/// Strip Reference, Pointer, and InstantiatedType wrappers from `ty`
+/// until a "carrier" type — the actual struct / class / enum the
+/// receiver names — is reached.  Method and field declarations
+/// register against the carrier's TypeRef, never against the borrow
+/// form or the spec instantiation wrapper, so any DI lookup that
+/// expects to find `Foo::bar` from a `&Foo<T>` receiver must unwrap
+/// first.  Caps the chain at 6 hops as a safety net against
+/// malformed type arenas — a self-referential pointer would otherwise
+/// loop forever.  Duplicated from hover.cryo for now; consolidates
+/// into a shared helper module once a third handler needs it.
+function unwrap_to_carrier(ty: TypeRef, arena: TypeArena*) -> TypeRef {
+    if (arena == null) { return ty; }
+    mut cur: TypeRef = ty;
+    mut hops: i64 = 0;
+    while (hops < 6) {
+        if (!cur.is_valid()) { return cur; }
+        const t: Type* = arena.lookup(cur.id);
+        if (t == null) { return cur; }
+        if (t.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = t as ReferenceType*;
+            cur = rt.referent;
+        } else if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            cur = pt.pointee;
+        } else if (t.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = t as InstantiatedType*;
+            cur = it.generic_base;
+        } else {
+            return cur;
+        }
+        hops = hops + 1;
+    }
+    return cur;
 }
 
 /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
