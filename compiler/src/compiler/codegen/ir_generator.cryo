@@ -11,6 +11,7 @@ import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::Codegen::Context;
+import Compiler::Codegen::IRFlowEmitter;
 import Compiler::Codegen::Util;
 import Compiler::Codegen::IntrinsicsCodegen;
 import Compiler::CompilationContext;
@@ -198,11 +199,11 @@ public:
         }
 
         cdebug("[IRGen] Phase 1: declare_types...\n"); fflush(null);
-        this.cg.declare_types(program);
+        this.cg.decl.declare_types(program);
         cdebug("[IRGen] Phase 1: done\n"); fflush(null);
 
         cdebug("[IRGen] Phase 2: declare_functions...\n"); fflush(null);
-        this.cg.declare_functions(program);
+        this.cg.decl.declare_functions(program);
         cdebug("[IRGen] Phase 2: done\n"); fflush(null);
 
         cdebug("[IRGen] Phase 3: generate bodies (%lld stmts)...\n", program.statements.length); fflush(null);
@@ -324,7 +325,7 @@ public:
 
     /// Generate a function body: prologue, block walk, epilogue, validate.
     generate_function_body(mut &this, node: FunctionDeclNode*) -> void {
-        const fn_val: LValue = this.cg.codegen_function_prologue(node);
+        const fn_val: LValue = this.cg.decl.codegen_function_prologue(node);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]     func prologue failed\n"); fflush(null);
             return;
@@ -332,16 +333,16 @@ public:
         cdebug("[IRGen]     func prologue ok, generating block...\n"); fflush(null);
         this.generate_block(node.body);
         cdebug("[IRGen]     func block done, epilogue...\n"); fflush(null);
-        this.cg.codegen_function_epilogue(node);
+        this.cg.decl.codegen_function_epilogue(node);
 
         // Validate: if any block lacks a terminator, body generation
         // failed. Strip back to a clean declare rather than emitting
         // broken IR that fails LLVM verification; ALWAYS surface a
         // diagnostic so the user sees a real error instead of a silent
         // `undefined reference` from the linker.
-        if (!this.cg.is_function_body_valid(fn_val)) {
+        if (!this.cg.diag.is_function_body_valid(fn_val)) {
             const fname: string = this.cg.resolve(node.name);
-            this.cg.report_invalid_function_body(fn_val, fname, node.span);
+            this.cg.diag.report_invalid_function_body(fn_val, fname, node.span);
         }
     }
 
@@ -412,7 +413,7 @@ public:
         if (func.generic_params.length > 0) { return; }
 
         cdebug("[IRGen]       method prologue...\n"); fflush(null);
-        const fn_val: LValue = this.cg.codegen_method_prologue(node, this.current_impl_target);
+        const fn_val: LValue = this.cg.decl.codegen_method_prologue(node, this.current_impl_target);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]       method prologue FAILED\n"); fflush(null);
             return;
@@ -431,9 +432,9 @@ public:
         cdebug("[IRGen]       method body block...\n"); fflush(null);
         this.generate_block(func.body);
         cdebug("[IRGen]       method body done, epilogue...\n"); fflush(null);
-        this.cg.codegen_function_epilogue(func);
+        this.cg.decl.codegen_function_epilogue(func);
 
-        if (!this.cg.is_function_body_valid(fn_val)) {
+        if (!this.cg.diag.is_function_body_valid(fn_val)) {
             const target_str: string = this.cg.resolve(this.current_impl_target);
             const method_str: string = this.cg.resolve(func.name);
             const pretty: string = if (intrinsics::strlen(target_str) > 0) {
@@ -441,7 +442,7 @@ public:
             } else {
                 method_str
             };
-            this.cg.report_invalid_function_body(fn_val, pretty, func.span);
+            this.cg.diag.report_invalid_function_body(fn_val, pretty, func.span);
         }
     }
 
@@ -476,9 +477,9 @@ public:
 
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
-        mut ctor_fn: LValue = this.cg.resolve_function_with_arity(ctor_sym, ctor_arity);
+        mut ctor_fn: LValue = this.cg.resolver.resolve_function_with_arity(ctor_sym, ctor_arity);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = this.cg.resolve_function(ctor_sym);
+            ctor_fn = this.cg.resolver.resolve_function(ctor_sym);
         }
         if (!ctor_fn.is_valid()) {
             cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
@@ -545,7 +546,7 @@ public:
         if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
 
         mut ctor_result: LValue = LValue::null();
-        ctor_result = this.cg.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
+        ctor_result = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
     }
 
     /// Generate a block of statements: push a scope, dispatch each child
@@ -554,7 +555,7 @@ public:
     /// terminator so we don't emit unreachable IR after an early return.
     generate_block(mut &this, block: BlockStmtNode*) -> void {
         if (block == null) { return; }
-        this.cg.push_scope();
+        this.cg.values.push_scope();
         cdebug("[IRGen]         block (%lld stmts) at %s:%d:%d\n",
                block.statements.length, block.span.file,
                block.span.start_line as i32, block.span.start_col as i32); fflush(null);
@@ -568,7 +569,7 @@ public:
                 this.generate_statement(stmt);
             }
         }
-        this.cg.pop_scope();
+        this.cg.values.pop_scope();
     }
 
 
@@ -593,11 +594,11 @@ public:
     }
 
     override visit(mut &this, node: BreakStmtNode*) -> void {
-        this.cg.codegen_break();
+        this.cg.flow.codegen_break();
     }
 
     override visit(mut &this, node: ContinueStmtNode*) -> void {
-        this.cg.codegen_continue();
+        this.cg.flow.codegen_continue();
     }
 
     override visit(mut &this, node: ExprStmtNode*) -> void {
@@ -626,37 +627,37 @@ public:
                 const d: StatementNode* = node.synth_drops[i];
                 if (d != null) { d.accept(this); }
             }
-            this.cg.codegen_return(val, true, node.expression.resolved_type);
+            this.cg.expr_ops.codegen_return(val, true, node.expression.resolved_type);
         } else {
             for (mut i: i64 = 0; i < node.synth_drops.length; i++) {
                 const d: StatementNode* = node.synth_drops[i];
                 if (d != null) { d.accept(this); }
             }
-            this.cg.codegen_return(LValue::null(), false, TypeRef::invalid());
+            this.cg.expr_ops.codegen_return(LValue::null(), false, TypeRef::invalid());
         }
     }
 
     override visit(mut &this, node: IfStmtNode*) -> void {
         const cond: LValue = this.codegen_rvalue(node.condition);
         const current_fn: LValue = this.get_current_function();
-        const blocks: IfBlocks = this.cg.codegen_if(cond, current_fn,
+        const blocks: IfBlocks = this.cg.flow.codegen_if(cond, current_fn,
                                              node.else_stmt != null);
         this.cg.builder.position_at_end(blocks.then_bb);
         if (node.then_stmt != null) {
             this.generate_statement(node.then_stmt);
         }
-        this.cg.branch_if_not_terminated(blocks.merge_bb);
+        this.cg.flow.branch_if_not_terminated(blocks.merge_bb);
         if (node.else_stmt != null) {
             this.cg.builder.position_at_end(blocks.else_bb);
             this.generate_statement(node.else_stmt);
-            this.cg.branch_if_not_terminated(blocks.merge_bb);
+            this.cg.flow.branch_if_not_terminated(blocks.merge_bb);
         }
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
     override visit(mut &this, node: WhileStmtNode*) -> void {
         const current_fn: LValue = this.get_current_function();
-        const blocks: LoopBlocks = this.cg.codegen_while_header(current_fn);
+        const blocks: LoopBlocks = this.cg.flow.codegen_while_header(current_fn);
         this.cg.builder.position_at_end(blocks.cond_bb);
         const cond: LValue = this.codegen_rvalue(node.condition);
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
@@ -664,18 +665,18 @@ public:
         if (node.body != null) {
             this.generate_statement(node.body);
         }
-        this.cg.branch_if_not_terminated(blocks.cond_bb);
-        this.cg.pop_loop();
+        this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
+        this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
     override visit(mut &this, node: ForStmtNode*) -> void {
         const current_fn: LValue = this.get_current_function();
-        this.cg.push_scope();
+        this.cg.values.push_scope();
         if (node.init != null) {
             this.generate_statement(node.init as StatementNode*);
         }
-        const blocks: ForBlocks = this.cg.codegen_for_header(current_fn);
+        const blocks: ForBlocks = this.cg.flow.codegen_for_header(current_fn);
         this.cg.builder.build_br(blocks.cond_bb);
         this.cg.builder.position_at_end(blocks.cond_bb);
         if (node.condition != null) {
@@ -688,26 +689,26 @@ public:
         if (node.body != null) {
             this.generate_statement(node.body);
         }
-        this.cg.branch_if_not_terminated(blocks.update_bb);
+        this.cg.flow.branch_if_not_terminated(blocks.update_bb);
         this.cg.builder.position_at_end(blocks.update_bb);
         if (node.update != null) {
             this.codegen_rvalue(node.update);
         }
-        this.cg.branch_if_not_terminated(blocks.cond_bb);
-        this.cg.pop_loop();
-        this.cg.pop_scope();
+        this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
+        this.cg.loops.pop();
+        this.cg.values.pop_scope();
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
     override visit(mut &this, node: LoopStmtNode*) -> void {
         const current_fn: LValue = this.get_current_function();
-        const blocks: LoopBlocks = this.cg.codegen_loop_header(current_fn);
+        const blocks: LoopBlocks = this.cg.flow.codegen_loop_header(current_fn);
         this.cg.builder.position_at_end(blocks.body_bb);
         if (node.body != null) {
             this.generate_statement(node.body);
         }
-        this.cg.branch_if_not_terminated(blocks.body_bb);
-        this.cg.pop_loop();
+        this.cg.flow.branch_if_not_terminated(blocks.body_bb);
+        this.cg.loops.pop();
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
@@ -785,7 +786,7 @@ public:
             this.cg.builder.position_at_end(arm_bbs[i]);
 
             // Bind enum pattern payloads (scoped to arm body).
-            this.cg.push_scope();
+            this.cg.values.push_scope();
             this.bind_arm_enum_payloads(arm, minfo);
 
             if (arm.body != null) {
@@ -794,8 +795,8 @@ public:
             const cur_after: LBasicBlock = this.cg.builder.get_insert_block();
             const arm_falls: boolean = cur_after.is_valid() && !cur_after.has_terminator();
             if (arm_falls) { any_arm_falls_through = true; }
-            this.cg.branch_if_not_terminated(merge_bb);
-            this.cg.pop_scope();
+            this.cg.flow.branch_if_not_terminated(merge_bb);
+            this.cg.values.pop_scope();
         }
 
         // no_match_bb is reached when the discriminant matched no arm.
@@ -809,11 +810,11 @@ public:
         // LLVM elides the whole thing; either way the IR stays well-formed.
         if (!no_match_bb.has_terminator()) {
             this.cg.builder.position_at_end(no_match_bb);
-            const abort_fn: LValue = this.cg.get_or_decl_abort();
+            const abort_fn: LValue = this.cg.intrinsics.get_or_decl_abort();
             const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
             mut a_args: Pair<LValue, TypeRef>[] = [];
             mut a_res: LValue = LValue::null();
-            a_res = this.cg.codegen_call(abort_fn, abort_ty, a_args, "");
+            a_res = this.cg.expr_ops.codegen_call(abort_fn, abort_ty, a_args, "");
             this.cg.builder.build_unreachable();
         }
 
@@ -993,7 +994,7 @@ public:
                 // the binding will load via `codegen_rvalue` using the
                 // identifier's resolved_type.
                 if (field_ptr.is_valid()) {
-                    this.cg.set_named_value(epat.binding_names[bi], field_ptr);
+                    this.cg.values.set(epat.binding_names[bi], field_ptr);
                 }
             }
 
@@ -1054,15 +1055,15 @@ public:
                 if (is_string_subj) {
                     const pat_text: string = this.cg.resolve(pat.value);
                     const pat_val: LValue =
-                        this.cg.get_or_create_string_literal(pat_text);
-                    cmp = this.cg.codegen_string_compare(subject, pat_val,
+                        this.cg.str_cache.get_or_create(pat_text, this.cg.builder);
+                    cmp = this.cg.expr_ops.codegen_string_compare(subject, pat_val,
                         TokenType::EqualEqual);
                 } else {
                     const pat_val: LValue =
                         this.codegen_pattern_value(pat, minfo.subject_ty);
                     if (pat_val.is_valid()) {
                         const pat_val_coerced: LValue =
-                            this.cg.coerce_icmp_operands(subject, pat_val,
+                            this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
                                                  minfo.subject_ty);
                         cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
                             subject, pat_val_coerced,
@@ -1160,7 +1161,7 @@ public:
         } else if (pat.pattern_kind == PatternKind::Identifier) {
             // Identifier pattern: could be an enum variant name.
             // Look it up as a named value or try to resolve as an enum discriminant.
-            const val: LValue = this.cg.get_named_value(pat.value);
+            const val: LValue = this.cg.values.get(pat.value);
             if (val.is_valid()) {
                 // Load the named value.
                 const ty: LType = LType::i32();
@@ -1193,7 +1194,7 @@ public:
         if (has_init) {
             init_val = this.codegen_rvalue(node.initializer);
         }
-        this.cg.codegen_local_var(node.name, node.resolved_type,
+        this.cg.expr_ops.codegen_local_var(node.name, node.resolved_type,
                           init_val, has_init, node.span);
     }
 
@@ -1263,7 +1264,7 @@ public:
                 field_val = this.cg.builder.build_load(field_lty, field_ptr, "destruct.fieldval");
             }
 
-            this.cg.codegen_local_var(b.local_name, b.resolved_type,
+            this.cg.expr_ops.codegen_local_var(b.local_name, b.resolved_type,
                               field_val, true, b.span);
         }
     }
@@ -1330,8 +1331,8 @@ public:
             // for va_list forwarding, which always takes a pointer.
             if (expr.kind == NodeKind::Identifier) {
                 const ident: IdentifierNode* = expr as IdentifierNode*;
-                if (this.cg.current_variadic_arg_id != 0 &&
-                    ident.name.id == this.cg.current_variadic_arg_id) {
+                if (this.cg.expr_ops.current_variadic_arg_id != 0 &&
+                    ident.name.id == this.cg.expr_ops.current_variadic_arg_id) {
                     this.last_is_lvalue = false;
                     return this.last_value;
                 }
@@ -1410,7 +1411,7 @@ public:
             intrinsics::sscanf(node.value, "%lf", &val);
             this.last_value = LType::const_real(ty, val);
         } else if (kind == LiteralKind::String) {
-            this.last_value = this.cg.get_or_create_string_literal(node.value);
+            this.last_value = this.cg.str_cache.get_or_create(node.value, this.cg.builder);
         } else if (kind == LiteralKind::Char) {
             // Char is stored as i32.  The lexer hands us the raw lexeme between
             // the surrounding quotes; for `'\n'` that's the two-char string
@@ -1457,7 +1458,7 @@ public:
         }
 
         // Try local/parameter first.
-        const local: LValue = this.cg.get_named_value(node.name);
+        const local: LValue = this.cg.values.get(node.name);
         if (local.is_valid()) {
             this.last_value = local;
             this.last_is_lvalue = true;
@@ -1465,7 +1466,7 @@ public:
         }
 
         // Try global.
-        const global: LValue = this.cg.resolve_global(node.name);
+        const global: LValue = this.cg.resolver.resolve_global(node.name);
         if (global.is_valid()) {
             this.last_value = global;
             this.last_is_lvalue = true;
@@ -1473,7 +1474,7 @@ public:
         }
 
         // Try function (for function references / first-class functions).
-        const func: LValue = this.cg.resolve_function(node.name);
+        const func: LValue = this.cg.resolver.resolve_function(node.name);
         if (func.is_valid()) {
             this.last_value = func;
             this.last_is_lvalue = false;
@@ -1627,7 +1628,7 @@ public:
 
         const struct_ty: LType = this.cg.type_mapper.map_type(obj_type);
         if (!struct_ty.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                 "codegen: member access: failed to map object type to LLVM type",
                 site_span);
             this.last_value = LValue::null();
@@ -1635,7 +1636,7 @@ public:
             return;
         }
         if (!obj_ptr.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
                 "codegen: member access: object pointer is null",
                 site_span);
             this.last_value = LValue::null();
@@ -1736,7 +1737,7 @@ public:
         const arr: ArrayType* = t as ArrayType*;
         const elem_ty: LType = this.cg.type_mapper.map_type(arr.element);
         if (!elem_ty.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                 "codegen: array access: failed to map element type",
                 site_span);
             this.last_value = LValue::null();
@@ -1744,7 +1745,7 @@ public:
             return;
         }
         if (!array_val.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                 "codegen: array access: array value is null",
                 site_span);
             this.last_value = LValue::null();
@@ -1752,7 +1753,7 @@ public:
             return;
         }
         if (!index_val.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
                 "codegen: array access: index value is null",
                 site_span);
             this.last_value = LValue::null();
@@ -1810,7 +1811,7 @@ public:
         // Get the current function for entry block alloca.
         const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
         if (!current_bb.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: struct literal: builder has no insert block",
                 site_span);
             this.last_value = LValue::null();
@@ -1819,7 +1820,7 @@ public:
         }
         const current_fn: LValue = current_bb.get_parent();
         if (!current_fn.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: struct literal: insert block has no parent function",
                 site_span);
             this.last_value = LValue::null();
@@ -1827,7 +1828,7 @@ public:
             return;
         }
 
-        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "structlit", ty);
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "structlit", ty);
 
         // Store each field value at its GEP index.  If a field expects a
         // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a
@@ -1846,7 +1847,7 @@ public:
                     const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, fidx as u32, "field");
                     mut val: LValue = field_values[i];
                     if (val.is_valid()) {
-                        val = this.cg.coerce_fixed_array_to_fat_ptr(val, st.fields[fidx].field_type);
+                        val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, st.fields[fidx].field_type);
                         // Widen/narrow integer literals to the field's declared
                         // width before storing.  `HashMap { len: 0, cap: 0, ... }`
                         // arrives with each `0` as `i32 0` (codegen_literal defaults
@@ -1913,7 +1914,7 @@ public:
 
         const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
         if (!current_bb.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: tuple literal: builder has no insert block",
                 site_span);
             this.last_value = LValue::null();
@@ -1922,7 +1923,7 @@ public:
         }
         const current_fn: LValue = current_bb.get_parent();
         if (!current_fn.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
                 "codegen: tuple literal: insert block has no parent function",
                 site_span);
             this.last_value = LValue::null();
@@ -1930,7 +1931,7 @@ public:
             return;
         }
 
-        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "tuplit", ty);
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "tuplit", ty);
 
         for (mut i: i64 = 0; i < element_values.length; i++) {
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, i as u32, "elem");
@@ -2043,7 +2044,7 @@ public:
             this.last_is_lvalue = false;
         } else {
             const val: LValue = this.codegen_rvalue(node.expression);
-            this.last_value = this.cg.codegen_cast(val, node.expression.resolved_type,
+            this.last_value = this.cg.expr_ops.codegen_cast(val, node.expression.resolved_type,
                                                    node.resolved_target);
             this.last_is_lvalue = false;
         }
@@ -2054,7 +2055,7 @@ public:
         if (!sz_type_ref.is_valid()) {
             sz_type_ref = this.lookup_type(node.type_name);
         }
-        this.last_value = this.cg.codegen_sizeof(sz_type_ref);
+        this.last_value = this.cg.expr_ops.codegen_sizeof(sz_type_ref);
         this.last_is_lvalue = false;
     }
 
@@ -2063,7 +2064,7 @@ public:
         if (!al_type_ref.is_valid()) {
             al_type_ref = this.lookup_type(node.type_name);
         }
-        this.last_value = this.cg.codegen_alignof(al_type_ref);
+        this.last_value = this.cg.expr_ops.codegen_alignof(al_type_ref);
         this.last_is_lvalue = false;
     }
 
@@ -2096,7 +2097,7 @@ public:
                 if (!val.is_valid()) {
                     diag = diag.also_at(node.right.span, "right-hand side did not produce a valid rvalue");
                 }
-                this.cg.emit_diagnostic(diag);
+                this.cg.diag.emit(diag);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
@@ -2161,14 +2162,14 @@ public:
                     "codegen: compound assignment target produced null lvalue");
                 diag = diag.at(node.span);
                 diag = diag.also_at(node.left.span, "this expression must be assignable");
-                this.cg.emit_diagnostic(diag);
+                this.cg.diag.emit(diag);
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
                 return;
             }
             const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
             if (!lhs_ty.is_valid()) {
-                this.cg.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                this.cg.diag.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
                     "codegen: compound assignment: failed to map left-hand side type",
                     node.left.span);
                 this.last_value = LValue::null();
@@ -2191,7 +2192,7 @@ public:
                 _                             => { TokenType::Plus }
             };
             mut result: LValue = LValue::null();
-            result = this.cg.codegen_binary(lhs_loaded, rhs, base_op, node.resolved_type);
+            result = this.cg.expr_ops.codegen_binary(lhs_loaded, rhs, base_op, node.resolved_type);
             // Narrow-store fix: codegen_binary normalizes operand widths to
             // the wider of lhs/rhs, so when the LHS slot is a narrow int
             // (char / i8 / u8) and the RHS is wider, `result` is wider than
@@ -2228,7 +2229,7 @@ public:
         const lhs: LValue = this.codegen_rvalue(node.left);
         const rhs: LValue = this.codegen_rvalue(node.right);
         mut result: LValue = LValue::null();
-        result = this.cg.codegen_binary(lhs, rhs, op, node.left.resolved_type);
+        result = this.cg.expr_ops.codegen_binary(lhs, rhs, op, node.left.resolved_type);
         this.last_value = result;
         this.last_is_lvalue = false;
     }
@@ -2365,7 +2366,7 @@ public:
         }
         const operand: LValue = this.codegen_rvalue(node.operand);
         mut result: LValue = LValue::null();
-        result = this.cg.codegen_unary(operand, op, node.operand.resolved_type);
+        result = this.cg.expr_ops.codegen_unary(operand, op, node.operand.resolved_type);
         this.last_value = result;
         this.last_is_lvalue = false;
     }
@@ -2409,7 +2410,7 @@ public:
                     intr_args.push(this.codegen_rvalue(node.arguments[ai]));
                 }
                 intr_args_evaluated = true;
-                match (this.cg.try_emit_intrinsic_call(intr_name_str, intr_args)) {
+                match (this.cg.intrinsics.try_emit(intr_name_str, intr_args)) {
                     Option::Some(v) => {
                         this.last_value = v;
                         this.last_is_lvalue = false;
@@ -2432,7 +2433,7 @@ public:
             // was re-resolving names sema had already resolved.  See
             // memory/feedback_codegen_architecture_rules.md.
             if (node.resolved_callee.is_valid()) {
-                callee_val = this.cg.resolve_function_by_mangled(node.resolved_callee);
+                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
             }
 
             // 3b. Class / struct constructor call: `ClassName(args)` resolves
@@ -2471,15 +2472,15 @@ public:
                     const ctor_sym: SymbolStr = intern.intern(combined);
                     // Constructor LLVM arity = user args + 1 for `this`.
                     const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-                    mut ctor_fn: LValue = this.cg.resolve_function_with_arity(ctor_sym, ctor_arity);
+                    mut ctor_fn: LValue = this.cg.resolver.resolve_function_with_arity(ctor_sym, ctor_arity);
                     if (!ctor_fn.is_valid()) {
-                        ctor_fn = this.cg.resolve_function(ctor_sym);
+                        ctor_fn = this.cg.resolver.resolve_function(ctor_sym);
                     }
                     if (ctor_fn.is_valid()) {
                         const mapped: LType = this.cg.type_mapper.map_type(type_ref);
                         const current_fn: LValue = this.get_current_function();
                         if (mapped.is_valid() && current_fn.is_valid()) {
-                            const obj_alloca: LValue = this.cg.create_entry_alloca(
+                            const obj_alloca: LValue = this.cg.flow.create_entry_alloca(
                                 current_fn, "ctor.tmp", mapped);
                             // Vtable slot for classes with virtual methods.
                             const t_for_vtbl: Type* = this.cg.lookup_type_by_id(type_ref.id);
@@ -2523,7 +2524,7 @@ public:
                                     ctor_args.push(Pair<LValue, TypeRef>::new(carg, node.arguments[ci].resolved_type));
                                 }
                                 mut ctor_res: LValue = LValue::null();
-                                ctor_res = this.cg.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
+                                ctor_res = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
                             }
                             // Load the constructed value as the expression result.
                             const loaded: LValue = this.cg.builder.build_load(
@@ -2544,7 +2545,7 @@ public:
             //    instruction, not a GlobalValue; LLVMGlobalGetValueType
             //    would segfault on it.
             if (!callee_val.is_valid()) {
-                const local: LValue = this.cg.get_named_value(id.name);
+                const local: LValue = this.cg.values.get(id.name);
                 if (local.is_valid()) {
                     // Build the LLVM function type from the Cryo FunctionType.
                     // Unwrap Pointer/Reference if the param type is &fn(...).
@@ -2604,7 +2605,7 @@ public:
                         const void_ty: LType = LType::void_type();
                         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
                         mut call_result: LValue = LValue::null();
-                        call_result = this.cg.codegen_call(fn_ptr, fn_type, call_args, call_name);
+                        call_result = this.cg.expr_ops.codegen_call(fn_ptr, fn_type, call_args, call_name);
                         this.last_value = call_result;
                         this.last_is_lvalue = false;
                         return;
@@ -2636,7 +2637,7 @@ public:
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.codegen_rvalue(node.arguments[sai]));
                 }
-                match (this.cg.try_emit_intrinsic_call(sr_leaf_str, sr_args)) {
+                match (this.cg.intrinsics.try_emit(sr_leaf_str, sr_args)) {
                     Option::Some(v) => {
                         this.last_value = v;
                         this.last_is_lvalue = false;
@@ -2655,7 +2656,7 @@ public:
             // call shapes sema doesn't yet pin (the spec-first lookup
             // based on `node.resolved_type`, enum-variant constructors).
             if (node.resolved_callee.is_valid()) {
-                callee_val = this.cg.resolve_function_by_mangled(node.resolved_callee);
+                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
             }
 
             // Resolve the scope name (e.g., "LValue") to its qualified form
@@ -2703,12 +2704,12 @@ public:
                     // mangled name from `(generic_base, type_args)` and
                     // try to find the registered spec method directly.
                     const ci_unres: InstantiatedType* = conc_t0 as InstantiatedType*;
-                    const base_qname: SymbolStr = this.cg.arena.get_qualified_name(
+                    const base_qname: SymbolStr = this.cg.get_arena().get_qualified_name(
                         ci_unres.generic_base);
                     if (base_qname.is_valid()) {
                         const base_qn: QualifiedName = QualifiedName::from_symbol(base_qname);
                         const spec_sym: SymbolStr = MangledName::specialized_identifier(
-                            this.cg.get_intern(), this.cg.arena, base_qn,
+                            this.cg.get_intern(), this.cg.get_arena(), base_qn,
                             ci_unres.type_args);
                         if (spec_sym.is_valid()) {
                             conc_name0 = intern.resolve(spec_sym);
@@ -2725,9 +2726,9 @@ public:
                     const member_str0: string = intern.resolve(sr.member_name);
                     const conc_combined0: string = format("%s::%s", conc_name0, member_str0);
                     const conc_sym0: SymbolStr = intern.intern(conc_combined0);
-                    callee_val = this.cg.resolve_function_with_arity(conc_sym0, sr_arity);
+                    callee_val = this.cg.resolver.resolve_function_with_arity(conc_sym0, sr_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = this.cg.resolve_function(conc_sym0);
+                        callee_val = this.cg.resolver.resolve_function(conc_sym0);
                     }
                 }
             }
@@ -2749,9 +2750,9 @@ public:
             if (!callee_val.is_valid()) {
                 const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
                 const sym: SymbolStr = intern.intern(combined);
-                callee_val = this.cg.resolve_function_with_arity(sym, sr_arity);
+                callee_val = this.cg.resolver.resolve_function_with_arity(sym, sr_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = this.cg.resolve_function(sym);
+                    callee_val = this.cg.resolver.resolve_function(sym);
                 }
             }
 
@@ -2766,9 +2767,9 @@ public:
                 const matches: SymbolStr[] = collect_namespace_suffix_matches(
                     this.cg, intern, scope_str, sr.member_name, sr_arity);
                 if (matches.length == 1) {
-                    callee_val = this.cg.resolve_function_with_arity(matches[0], sr_arity);
+                    callee_val = this.cg.resolver.resolve_function_with_arity(matches[0], sr_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = this.cg.resolve_function(matches[0]);
+                        callee_val = this.cg.resolver.resolve_function(matches[0]);
                     }
                 } else if (matches.length > 1) {
                     mut detail: string = "";
@@ -2781,7 +2782,7 @@ public:
                         "ambiguous call `%s::%s`: %lld modules match the namespace suffix `%s` and define `%s`\n%s",
                         scope_str, intern.resolve(sr.member_name),
                         matches.length, scope_str, intern.resolve(sr.member_name), detail);
-                    this.cg.emit_error_at_span(
+                    this.cg.diag.emit_error_at_span(
                         ErrorCode::E0154_AMBIGUOUS_CALL, msg, node.span);
                     this.last_value = LValue::null();
                     this.last_is_lvalue = false;
@@ -2797,9 +2798,9 @@ public:
             // `std::fs::file::read(path: string)`, both reachable under bare
             // "read" via type_resolution's bare-alias registration).
             if (!callee_val.is_valid()) {
-                callee_val = this.cg.resolve_function_with_arity(sr.member_name, sr_arity);
+                callee_val = this.cg.resolver.resolve_function_with_arity(sr.member_name, sr_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = this.cg.resolve_function(sr.member_name);
+                    callee_val = this.cg.resolver.resolve_function(sr.member_name);
                 }
             }
 
@@ -2940,7 +2941,7 @@ public:
                 const void_ty: LType = LType::void_type();
                 const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
                 mut call_result: LValue = LValue::null();
-                call_result = this.cg.codegen_call(fn_ptr, llvm_fn_type, fnp_args, call_name);
+                call_result = this.cg.expr_ops.codegen_call(fn_ptr, llvm_fn_type, fnp_args, call_name);
                 this.last_value = call_result;
                 this.last_is_lvalue = false;
                 return;
@@ -3025,7 +3026,7 @@ public:
                             if (pp.name.equals(this_val)) { continue; }
                             rm_params.push(pp.resolved_type);
                         }
-                        const slot_idx: i32 = this.cg.vtable_slot_index(cls_for_vtbl, fn_node.name, rm_params);
+                        const slot_idx: i32 = this.cg.decl.vtable_slot_index(cls_for_vtbl, fn_node.name, rm_params);
                         if (slot_idx >= 0) {
                             vtable_dispatch = true;
                             vtable_slot_idx = slot_idx;
@@ -3049,7 +3050,7 @@ public:
             // `Eq for i16`).  Routes through `resolve_function_by_mangled`,
             // identical to the Identifier branch.
             if (node.resolved_callee.is_valid()) {
-                callee_val = this.cg.resolve_function_by_mangled(node.resolved_callee);
+                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
             }
 
             // Post-specialization fallback: when the receiver is a
@@ -3069,9 +3070,9 @@ public:
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = format("%s::%s", type_str, method_str);
                 const sym: SymbolStr = intern.intern(combined);
-                callee_val = this.cg.resolve_function_with_arity(sym, ma_arity);
+                callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
                 if (!callee_val.is_valid()) {
-                    callee_val = this.cg.resolve_function(sym);
+                    callee_val = this.cg.resolver.resolve_function(sym);
                 }
             }
             if (!callee_val.is_valid() && t != null) {
@@ -3098,9 +3099,9 @@ public:
                 if (intrinsics::strlen(type_str) > 0) {
                     const combined: string = format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
-                    callee_val = this.cg.resolve_function_with_arity(sym, ma_arity);
+                    callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
                     if (!callee_val.is_valid()) {
-                        callee_val = this.cg.resolve_function(sym);
+                        callee_val = this.cg.resolver.resolve_function(sym);
                     }
                 }
             }
@@ -3147,7 +3148,7 @@ public:
                 diag = diag.with_note("method lookup walks the class inheritance chain; neither the concrete type nor any base defines this method");
             }
 
-            this.cg.emit_diagnostic(diag);
+            this.cg.diag.emit(diag);
             this.last_value = LValue::null();
             this.last_is_lvalue = false;
             return;
@@ -3182,7 +3183,7 @@ public:
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
         if (!fn_ty.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                 "codegen: call expression: failed to retrieve function type from callee",
                 node.span);
             this.last_value = LValue::null();
@@ -3234,7 +3235,7 @@ public:
                                   type_kind_of(ret_ty.raw) == LTypeKind::Void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
-        result = this.cg.codegen_call(callee_val, fn_ty, args, call_name);
+        result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
 
         // Emit `unreachable` after calls to divergent functions.  Two
         // cases handled here:
@@ -3396,7 +3397,7 @@ public:
 
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
                 "codegen: array literal: failed to map array type",
                 node.span);
             this.last_value = LValue::null();
@@ -3409,7 +3410,7 @@ public:
             this.last_is_lvalue = false;
             return;
         }
-        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", ty);
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", ty);
 
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const elem: LValue = this.codegen_rvalue(node.elements[i]);
@@ -3454,7 +3455,7 @@ public:
             this.last_is_lvalue = false;
             return;
         }
-        const fat: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", fat_ty);
+        const fat: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", fat_ty);
 
         const count: i64 = node.elements.length;
         const count_val: LValue = LType::const_int(LType::i64(), count as u64, false);
@@ -3469,11 +3470,11 @@ public:
             // into heap corruption at the next allocation. `codegen_sizeof`
             // tries `size_bytes()` first and falls back to `LLVMSizeOf`,
             // which is always data-layout-correct.
-            const elem_size_val: LValue = this.cg.codegen_sizeof(arr_type.element);
+            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(arr_type.element);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = this.cg.resolve_function(this.cg.intern_str("malloc"));
+            const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3482,7 +3483,7 @@ public:
             const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
             mut malloc_args: Pair<LValue, TypeRef>[] = [];
             malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-            data_ptr = this.cg.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrdata");
+            data_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrdata");
             if (!data_ptr.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3595,7 +3596,7 @@ public:
             // Alloca `[N x T]` and fill loop.  `gep_element_type` is T;
             // GEP needs `[N x T]` + indices `[0, i]` to land on slot i.
             const arr_lty: LType = LType::array_of(elem_ty, arr_type.size as u32);
-            const alloca: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", arr_lty);
+            const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", arr_lty);
             this.emit_fill_loop_indexed(current_fn, arr_lty, alloca,
                                          elem_ty, fill_val, count_val);
             this.last_value = alloca;
@@ -3605,15 +3606,15 @@ public:
             // a buffer of `count * sizeof(T)` bytes, fill it, then store
             // the (data_ptr, count) into the fat pointer.
             const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-            const fat: LValue = this.cg.create_entry_alloca(current_fn, "arrlit", fat_ty);
+            const fat: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", fat_ty);
 
             // Stride from LLVM's data layout; see visit_dynamic_array_literal
             // for why size_bytes() can be 0 here.
-            const elem_size_val: LValue = this.cg.codegen_sizeof(arr_type.element);
+            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(arr_type.element);
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            const malloc_fn: LValue = this.cg.resolve_function(this.cg.intern_str("malloc"));
+            const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
             if (!malloc_fn.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3623,7 +3624,7 @@ public:
             mut malloc_args: Pair<LValue, TypeRef>[] = [];
             malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
             mut data_ptr: LValue = LValue::null();
-            data_ptr = this.cg.codegen_call(malloc_fn, malloc_ty, malloc_args, "filldata");
+            data_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "filldata");
             if (!data_ptr.is_valid()) {
                 this.last_value = LValue::null();
                 this.last_is_lvalue = false;
@@ -3798,7 +3799,7 @@ public:
             }
 
             if (!param_ty.is_valid()) {
-                this.cg.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                this.cg.diag.emit_warning_at_span(ErrorCode::E0600_CODEGEN_FAILED,
                     format("lambda: cannot resolve type for parameter '%s'; lambda skipped",
                         intern.resolve(param.name)),
                     param.span);
@@ -3827,7 +3828,7 @@ public:
 
         // Register so that cross-module references can find it.
         const lam_sym: SymbolStr = intern.intern(lam_name);
-        this.cg.register_function(lam_sym, fn_val);
+        this.cg.functions.register(lam_sym, fn_val);
 
         // ── Save builder insertion point (we're mid-function) ─────────────────
         const saved_bb: LBasicBlock = this.cg.builder.get_insert_block();
@@ -3835,7 +3836,7 @@ public:
         // ── Build function entry block + body ─────────────────────────────────
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.cg.builder.position_at_end(entry_bb);
-        this.cg.push_scope();
+        this.cg.values.push_scope();
 
         // Bind each parameter to an alloca so the body can refer to them.
         for (mut pi: u32 = 0; pi < param_count; pi++) {
@@ -3851,10 +3852,10 @@ public:
             }
             if (!p_ty.is_valid()) { continue; }
 
-            const alloca: LValue = this.cg.create_entry_alloca(fn_val, param_name, p_ty);
+            const alloca: LValue = this.cg.flow.create_entry_alloca(fn_val, param_name, p_ty);
             const arg:    LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, pi) };
             this.cg.builder.build_store(arg, alloca);
-            this.cg.set_named_value(param.name, alloca);
+            this.cg.values.set(param.name, alloca);
         }
 
         // Generate the body.
@@ -3890,7 +3891,7 @@ public:
             sweep_bb = llvm::LLVMGetNextBasicBlock(sweep_bb);
         }
 
-        this.cg.pop_scope();
+        this.cg.values.pop_scope();
 
         // ── Restore the outer function's insert point ─────────────────────────
         if (saved_bb.is_valid()) {
@@ -3912,7 +3913,7 @@ public:
         const combined_bare: string  = format("%s::%s", scope_str_bare, member_str);
         const sym_bare: SymbolStr    = this.cg.intern_str(combined_bare);
 
-        mut fn_val: LValue = this.cg.resolve_function(sym_bare);
+        mut fn_val: LValue = this.cg.resolver.resolve_function(sym_bare);
         if (fn_val.is_valid()) {
             this.last_value    = fn_val;
             this.last_is_lvalue = false;
@@ -3929,9 +3930,9 @@ public:
         const sym_qual: SymbolStr       = intern.intern(combined_qual);
 
         if (!sym_qual.equals(sym_bare)) {
-            fn_val = this.cg.get_function(sym_qual);
+            fn_val = this.cg.functions.get(sym_qual);
             if (!fn_val.is_valid()) {
-                fn_val = this.cg.resolve_function(sym_qual);
+                fn_val = this.cg.resolver.resolve_function(sym_qual);
             }
             if (fn_val.is_valid()) {
                 this.last_value    = fn_val;
@@ -3941,7 +3942,7 @@ public:
         }
 
         // ── 3. Global variable lookups ────────────────────────────────────────
-        const global: LValue = this.cg.resolve_global(sym_bare);
+        const global: LValue = this.cg.resolver.resolve_global(sym_bare);
         if (global.is_valid()) {
             this.last_value    = global;
             this.last_is_lvalue = true;
@@ -3953,7 +3954,7 @@ public:
         // name lookup misses, so also try the bare member name. Globals
         // are unique LLVM symbols at link time, so the bare name resolves
         // to the same definition regardless of which module references it.
-        const bare_global: LValue = this.cg.resolve_global(node.member_name);
+        const bare_global: LValue = this.cg.resolver.resolve_global(node.member_name);
         if (bare_global.is_valid()) {
             this.last_value    = bare_global;
             this.last_is_lvalue = true;
@@ -4071,7 +4072,7 @@ public:
 
             this.cg.builder.position_at_end(arm_bbs[i]);
 
-            this.cg.push_scope();
+            this.cg.values.push_scope();
             this.bind_arm_enum_payloads(arm, minfo);
 
             // Match expression arms produce values.
@@ -4112,13 +4113,13 @@ public:
                     // Arm produced no value; use undef as placeholder.
                     phi_vals_arr[phi_count] = llvm::LLVMGetUndef(result_ty.raw);
                 } else {
-                    this.cg.pop_scope();
+                    this.cg.values.pop_scope();
                     continue;
                 }
                 phi_blks_arr[phi_count] = arm_end.raw;
                 phi_count += 1;
             }
-            this.cg.pop_scope();
+            this.cg.values.pop_scope();
         }
 
         // No arm matched; trap with `call @abort(); unreachable`.  Bare
@@ -4129,11 +4130,11 @@ public:
         // LLVM elides it.
         if (!default_bb.has_terminator()) {
             this.cg.builder.position_at_end(default_bb);
-            const abort_fn_e: LValue = this.cg.get_or_decl_abort();
+            const abort_fn_e: LValue = this.cg.intrinsics.get_or_decl_abort();
             const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
             mut a_args_e: Pair<LValue, TypeRef>[] = [];
             mut a_res_e: LValue = LValue::null();
-            a_res_e = this.cg.codegen_call(abort_fn_e, abort_ty_e, a_args_e, "");
+            a_res_e = this.cg.expr_ops.codegen_call(abort_fn_e, abort_ty_e, a_args_e, "");
             this.cg.builder.build_unreachable();
         }
 
@@ -4163,12 +4164,12 @@ public:
         this.cg.builder.position_at_end(then_bb);
         const then_val: LValue = this.codegen_rvalue(node.true_expr);
         const then_end: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.branch_if_not_terminated(merge_bb);
+        this.cg.flow.branch_if_not_terminated(merge_bb);
 
         this.cg.builder.position_at_end(else_bb);
         const else_val: LValue = this.codegen_rvalue(node.false_expr);
         const else_end: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.branch_if_not_terminated(merge_bb);
+        this.cg.flow.branch_if_not_terminated(merge_bb);
 
         this.cg.builder.position_at_end(merge_bb);
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
@@ -4197,7 +4198,7 @@ public:
             node.desugared.accept(this);
             return;
         }
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: `?` operator was not lowered by semantic analysis",
             node.span);
         this.last_value     = LValue::null();
@@ -4226,7 +4227,7 @@ public:
 
         const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {
-            this.cg.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                 format("codegen: 'new': target type '%s' not found",
                     intern.resolve(node.type_name)),
                 node.span);
@@ -4240,7 +4241,7 @@ public:
             const et: EnumType* = t as EnumType*;
             const variant: EnumVariantInfo* = et.get_variant(node.variant_name);
             if (variant == null) {
-                this.cg.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
+                this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
                     "codegen: enum variant not found in `new T::V(...)`",
                     node.span);
                 this.last_value = LValue::null();
@@ -4252,14 +4253,14 @@ public:
                 vargs.push(this.codegen_rvalue(node.arguments[i]));
             }
             const variant_val: LValue = this.build_enum_variant(et, variant, type_ref, vargs);
-            this.last_value = this.cg.heap_box_enum_variant(et, type_ref, variant_val, node.span);
+            this.last_value = this.cg.expr_ops.heap_box_enum_variant(et, type_ref, variant_val, node.span);
             this.last_is_lvalue = false;
             return;
         }
 
-        const malloc_fn: LValue = this.cg.resolve_function(this.cg.intern_str("malloc"));
+        const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 "codegen: 'new' expression: 'malloc' not declared",
                 node.span);
             this.last_value = LValue::null();
@@ -4268,7 +4269,7 @@ public:
         }
         const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
         if (!malloc_ty.is_valid()) {
-            this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+            this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                 "codegen: 'new' expression: failed to retrieve malloc function type",
                 node.span);
             this.last_value = LValue::null();
@@ -4308,7 +4309,7 @@ public:
         mut malloc_args: Pair<LValue, TypeRef>[] = [];
         malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
         mut raw_ptr: LValue = LValue::null();
-        raw_ptr = this.cg.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
+        raw_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
 
         // Bitcast to the target struct pointer type.
         mut obj_ptr: LValue = raw_ptr;
@@ -4411,9 +4412,9 @@ public:
         const ctor_sym: SymbolStr = intern.intern(ctor_combined);
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.arguments.length + 1) as u32;
-        mut ctor_fn: LValue = this.cg.resolve_function_with_arity(ctor_sym, ctor_arity);
+        mut ctor_fn: LValue = this.cg.resolver.resolve_function_with_arity(ctor_sym, ctor_arity);
         if (!ctor_fn.is_valid()) {
-            ctor_fn = this.cg.resolve_function(ctor_sym);
+            ctor_fn = this.cg.resolver.resolve_function(ctor_sym);
         }
         if (ctor_fn.is_valid() && obj_ptr.is_valid()) {
             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
@@ -4426,7 +4427,7 @@ public:
                     ctor_args.push(Pair<LValue, TypeRef>::new(arg_val, node.arguments[i].resolved_type));
                 }
                 mut ctor_result: LValue = LValue::null();
-                ctor_result = this.cg.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
+                ctor_result = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
             }
         }
 
@@ -4483,7 +4484,7 @@ public:
         }
 
         const ptr: LValue = this.codegen_rvalue(node.operand);
-        const free_fn: LValue = this.cg.resolve_function(this.cg.intern_str("free"));
+        const free_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("free"));
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(
                 ptr, LType::pointer_to(LType::i8()), "delcast");
@@ -4492,9 +4493,9 @@ public:
                 mut free_args: Pair<LValue, TypeRef>[] = [];
                 free_args.push(Pair<LValue, TypeRef>::new(void_ptr, TypeRef::invalid()));
                 mut result: LValue = LValue::null();
-                result = this.cg.codegen_call(free_fn, free_ty, free_args, "");
+                result = this.cg.expr_ops.codegen_call(free_fn, free_ty, free_args, "");
             } else {
-                this.cg.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                     "codegen: 'delete' expression: failed to retrieve free function type",
                     node.span);
             }
@@ -4526,7 +4527,7 @@ public:
         this.cg.builder.position_at_end(rhs_bb);
         const rhs: LValue = this.codegen_rvalue(node.right);
         const rhs_end_bb: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.branch_if_not_terminated(merge_bb);
+        this.cg.flow.branch_if_not_terminated(merge_bb);
 
         // If either operand failed to lower (e.g. `entry.key == key` where K
         // is a struct that doesn't support `==`, or any expression that
@@ -4601,7 +4602,7 @@ public:
 
         // Payload variant: alloca, store tag, store payload fields.
         const current_fn: LValue = this.get_current_function();
-        const alloca: LValue = this.cg.create_entry_alloca(current_fn, "enum.tmp", enum_llvm);
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "enum.tmp", enum_llvm);
 
         // Store tag at field 0 using struct GEP.
         const tag_ptr: LValue = this.cg.builder.build_struct_gep(enum_llvm, alloca, 0, "enum.tag.ptr");
@@ -4660,7 +4661,7 @@ public:
     // `last_value` so downstream code fails loudly rather than wrongly.
 
     override visit(mut &this, node: AwaitExprNode*) -> void {
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'await' expressions are not implemented",
             node.span);
         this.last_value     = LValue::null();
@@ -4668,7 +4669,7 @@ public:
     }
 
     override visit(mut &this, node: YieldExprNode*) -> void {
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'yield' expressions are not implemented",
             node.span);
         this.last_value     = LValue::null();
@@ -4676,7 +4677,7 @@ public:
     }
 
     override visit(mut &this, node: TypeofExprNode*) -> void {
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'typeof' expressions are not implemented",
             node.span);
         this.last_value     = LValue::null();
@@ -4684,19 +4685,19 @@ public:
     }
 
     override visit(mut &this, node: DoWhileStmtNode*) -> void {
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'do { ... } while (...)' statements are not implemented; use 'while' or 'loop' instead",
             node.span);
     }
 
     override visit(mut &this, node: SwitchStmtNode*) -> void {
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'switch' statements are not implemented; use 'match' instead",
             node.span);
     }
 
     override visit(mut &this, node: CaseStmtNode*) -> void {
-        this.cg.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
             "codegen: 'case' statements are not implemented; use 'match' arms instead",
             node.span);
     }
@@ -4808,7 +4809,7 @@ function collect_namespace_suffix_matches(cg: CodegenContext*, intern: InternTab
         // Build "<ns>::<member>" and probe the function table.
         const qualified: string = format("%s::%s", ns_str, member_str);
         const q_sym: SymbolStr = intern.intern(qualified);
-        const probe: LValue = cg.resolve_function_with_arity(q_sym, arity);
+        const probe: LValue = cg.resolver.resolve_function_with_arity(q_sym, arity);
         if (!probe.is_valid()) { continue; }
 
         // Dedup: same qualified name shouldn't appear twice (e.g. when

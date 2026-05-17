@@ -1,0 +1,415 @@
+/// Symbol Resolver
+///
+/// On-demand cross-module extern declaration for functions and globals.
+/// Replaces the old `declare_cross_module_externs` pre-pass that walked
+/// every function and global in every module — that was
+/// `O(modules × functions × overloads)` per compiled module, crippling
+/// for stdlib-heavy programs with many generic specializations.
+///
+/// Instead, codegen calls `resolve_function` / `resolve_function_with_arity`
+/// / `resolve_global` at each cross-module reference.  The helpers:
+///   1. Fast-path: check the context's own function/global registry.
+///   2. Slow-path: look up the signature in `DeclarationIndex`, emit an
+///      `external` declaration in the current LLVM module, register it,
+///      and return the handle.
+///
+/// This mirrors what LLVM itself does via `Module::getOrInsertFunction`.
+///
+/// Borrows the LLVM module, the type mapper, the function/global
+/// registries, and the compilation context via back-pointers set by
+/// `CodegenContext::wire()`.
+
+namespace Compiler::Codegen::SymbolResolver;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::FunctionRegistry;
+import Compiler::Codegen::GlobalRegistry;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::MangledName;
+import Compiler::Resolver::QualifiedName;
+
+
+// ============================================================================
+// SymbolResolver
+// ============================================================================
+
+type struct SymbolResolver {
+    // Back-pointers (set by wire()).
+    llvm_module: LModule*;
+    type_mapper: TypeMapper*;
+    functions:   FunctionRegistry*;
+    globals:     GlobalRegistry*;
+    ctx:         CompilationContext*;
+
+    static null() -> SymbolResolver {
+        return SymbolResolver {
+            llvm_module: null,
+            type_mapper: null,
+            functions:   null,
+            globals:     null,
+            ctx:         null,
+        };
+    }
+
+    wire(mut &this, llvm_module: LModule*, type_mapper: TypeMapper*,
+         functions: FunctionRegistry*, globals: GlobalRegistry*,
+         ctx: CompilationContext*) -> void {
+        this.llvm_module = llvm_module;
+        this.type_mapper = type_mapper;
+        this.functions   = functions;
+        this.globals     = globals;
+        this.ctx         = ctx;
+    }
+
+
+    // ========================================================================
+    // Function-type construction
+    // ========================================================================
+
+    /// Build an LLVM function type from a Cryo `FunctionType*`.  Returns
+    /// `LType::null()` if any parameter or the return type fails to map.
+    build_function_ltype(mut &this, ft: FunctionType*) -> LType {
+        const ret_ty: LType = this.type_mapper.map_type(ft.return_type);
+        if (!ret_ty.is_valid()) { return LType::null(); }
+
+        const param_count: u32 = ft.param_types.length as u32;
+        if (param_count == 0) {
+            return LType::function_type(ret_ty, null, 0, ft.is_variadic);
+        }
+
+        const buf: void* = malloc(param_count as u64 * 8);
+        const slots: void** = buf as void**;
+        mut valid: boolean = true;
+        for (mut j: u32 = 0; j < param_count; j++) {
+            const mapped: LType = this.type_mapper.map_type(ft.param_types[j]);
+            if (!mapped.is_valid()) { valid = false; break; }
+            slots[j] = mapped.raw;
+        }
+        mut result: LType = LType::null();
+        if (valid) {
+            result = LType::function_type(ret_ty, buf, param_count, ft.is_variadic);
+        }
+        free(buf);
+        return result;
+    }
+
+
+    // ========================================================================
+    // Cross-module extern declaration
+    // ========================================================================
+
+    /// Declare an extern function for a single (name, func_type_ref) pair,
+    /// and register it under both the bare name and the (name, arity)
+    /// composite key.  If an LLVM symbol with the same mangled name
+    /// already exists in this module, reuse it.  Returns the LValue on
+    /// success, null otherwise.
+    declare_extern_function_overload(mut &this, fn_name: SymbolStr,
+                                     func_type_ref: TypeRef) -> LValue {
+        const arena: TypeArena* = this.ctx.type_arena;
+        const ft_ptr: Type* = arena.lookup(func_type_ref.id);
+        if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { return LValue::null(); }
+        const ft: FunctionType* = ft_ptr as FunctionType*;
+
+        const fn_type: LType = this.build_function_ltype(ft);
+        if (!fn_type.is_valid()) { return LValue::null(); }
+
+        const intern: InternTable* = this.ctx.intern_table;
+        const di: DeclarationIndex* = this.ctx.decl_index;
+
+        // Prefer the overload-specific mangled name registered for this
+        // exact (fn_name, func_type_ref) pair.  Fall back to the
+        // single-slot alias only when no overload entry exists.
+        mut mangled_sym: SymbolStr = di.lookup_overload_mangled(fn_name, func_type_ref);
+        if (!mangled_sym.is_valid()) {
+            mangled_sym = di.lookup_mangled_name(fn_name);
+        }
+        if (!mangled_sym.is_valid()) {
+            const ext_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+            mangled_sym = MangledName::for_free_function(
+                intern, arena, ext_qname, ft.param_types,
+                ft.return_type, ft.is_variadic).value;
+        }
+        const ir_name: string = intern.resolve(mangled_sym);
+
+        mut fn_val: LValue = this.llvm_module.get_named_function(ir_name);
+        if (!fn_val.is_valid()) {
+            fn_val = this.llvm_module.add_function(ir_name, fn_type);
+        }
+        this.functions.register(fn_name, fn_val);
+        this.functions.register_with_arity(fn_name, ft.param_types.length as u32, fn_val);
+        return fn_val;
+    }
+
+    /// Return-type-only fallback: declare a no-arg function for names
+    /// that have no full signature in DeclarationIndex but do have a
+    /// return type.
+    declare_extern_function_return_only(mut &this, fn_name: SymbolStr) -> LValue {
+        const intern: InternTable* = this.ctx.intern_table;
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const arena: TypeArena* = this.ctx.type_arena;
+        const ret_ref: TypeRef = di.lookup_func_return(fn_name);
+        if (ret_ref.is_invalid()) { return LValue::null(); }
+
+        const ret_ty: LType = this.type_mapper.map_type(ret_ref);
+        if (!ret_ty.is_valid()) { return LValue::null(); }
+
+        const fn_type: LType = LType::function_type(ret_ty, null, 0, false);
+        mut fb_mangled: SymbolStr = di.lookup_mangled_name(fn_name);
+        if (!fb_mangled.is_valid()) {
+            const fb_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
+            const empty_params: TypeRef[] = [];
+            fb_mangled = MangledName::for_free_function(
+                intern, arena, fb_qname, empty_params, ret_ref, false).value;
+        }
+        const ir_name: string = intern.resolve(fb_mangled);
+        mut fn_val: LValue = this.llvm_module.get_named_function(ir_name);
+        if (!fn_val.is_valid()) {
+            fn_val = this.llvm_module.add_function(ir_name, fn_type);
+        }
+        this.functions.register(fn_name, fn_val);
+        return fn_val;
+    }
+
+    /// Returns true iff `name` is defined in the module currently being
+    /// compiled.  Used by the resolve_* helpers to avoid turning a stale
+    /// local lookup into a stub extern declaration.
+    owned_by_current_module(&this, mod_sym: SymbolStr) -> boolean {
+        if (!mod_sym.is_valid()) { return false; }
+        const current: SymbolStr = this.ctx.intern_table.intern(this.ctx.source_file);
+        return mod_sym.equals(current);
+    }
+
+
+    // ========================================================================
+    // Function / global resolution (cached lookup + lazy extern)
+    // ========================================================================
+
+    /// Look up a function by name, declaring a cross-module extern on
+    /// demand when this module hasn't seen it yet.  Returns null when the
+    /// name is unknown to the DeclarationIndex OR when the symbol is
+    /// owned by the current module (the caller should be using the value
+    /// that declare_* put in the map, not a freshly declared extern that
+    /// would clobber the body).
+    resolve_function(mut &this, name: SymbolStr) -> LValue {
+        const cached: LValue = this.functions.get(name);
+        if (cached.is_valid()) { return cached; }
+
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        if (this.owned_by_current_module(di.get_function_module(name))) {
+            return LValue::null();
+        }
+
+        const arena: TypeArena* = this.ctx.type_arena;
+        const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
+        // Two-pass declaration: prefer concrete overloads (no
+        // GenericParam anywhere in the signature) over template entries
+        // left in DI by sema-time registration of generic methods.
+        // Without this, the template's `Reference(GenericParam)`-typed
+        // signature is the first overload to succeed
+        // (build_function_ltype lowers `Reference(_)` to opaque `ptr`
+        // regardless), so the cross-module extern gets declared under
+        // the template's `1H`-placeholder mangled name and the call site
+        // never links to the spec.  Pass 1: concrete overloads.  Pass 2:
+        // any remaining (template) overloads, only as a fallback when no
+        // concrete overload was registered for the name.
+        mut first: LValue = LValue::null();
+        for (mut i: i64 = 0; i < overloads.length; i++) {
+            const ft_ptr: Type* = arena.lookup(overloads[i].id);
+            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = ft_ptr as FunctionType*;
+            if (function_type_has_generic_params(arena, ft)) { continue; }
+            const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
+            if (!first.is_valid() && v.is_valid()) { first = v; }
+        }
+        if (!first.is_valid()) {
+            for (mut i: i64 = 0; i < overloads.length; i++) {
+                const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
+                if (!first.is_valid() && v.is_valid()) { first = v; }
+            }
+        }
+        if (first.is_valid()) { return first; }
+
+        return this.declare_extern_function_return_only(name);
+    }
+
+    /// Resolve a function from a sema-pinned symbol.
+    resolve_function_by_mangled(mut &this, pinned: SymbolStr) -> LValue {
+        if (!pinned.is_valid()) { return LValue::null(); }
+
+        const intern: InternTable* = this.ctx.intern_table;
+        const pinned_str: string = intern.resolve(pinned);
+        mut v: LValue = this.llvm_module.get_named_function(pinned_str);
+        if (v.is_valid()) { return v; }
+
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        for (mut i: i64 = 0; i < di.overload_func_keys.length; i++) {
+            if (di.overload_func_mangled[i] != pinned.id) { continue; }
+            const qual: SymbolStr = SymbolStr::from_id(di.overload_func_keys[i]);
+            if (this.owned_by_current_module(di.get_function_module(qual))) {
+                return LValue::null();
+            }
+            v = this.declare_extern_function_overload(qual, di.overload_func_types[i]);
+            if (v.is_valid()) { return v; }
+        }
+
+        return this.resolve_function(pinned);
+    }
+
+    /// Look up an overloaded function by (name, user-arg-count),
+    /// declaring a cross-module extern on demand.
+    resolve_function_with_arity(mut &this, name: SymbolStr,
+                                arity: u32) -> LValue {
+        const cached: LValue = this.functions.get_with_arity(name, arity);
+        if (cached.is_valid()) { return cached; }
+
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        if (this.owned_by_current_module(di.get_function_module(name))) {
+            return LValue::null();
+        }
+
+        const arena: TypeArena* = this.ctx.type_arena;
+        const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
+        // Two-pass: concrete overloads first, then templates as
+        // fallback.  See `resolve_function` for the rationale.
+        for (mut i: i64 = 0; i < overloads.length; i++) {
+            const ft_ptr: Type* = arena.lookup(overloads[i].id);
+            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = ft_ptr as FunctionType*;
+            if (ft.param_types.length as u32 != arity) { continue; }
+            if (function_type_has_generic_params(arena, ft)) { continue; }
+            const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
+            if (v.is_valid()) { return v; }
+        }
+        for (mut i: i64 = 0; i < overloads.length; i++) {
+            const ft_ptr: Type* = arena.lookup(overloads[i].id);
+            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = ft_ptr as FunctionType*;
+            if (ft.param_types.length as u32 != arity) { continue; }
+            const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
+            if (v.is_valid()) { return v; }
+        }
+        return LValue::null();
+    }
+
+    /// Look up a global by name, declaring a cross-module extern on demand.
+    resolve_global(mut &this, name: SymbolStr) -> LValue {
+        const cached: LValue = this.globals.get(name);
+        if (cached.is_valid()) { return cached; }
+
+        const intern: InternTable* = this.ctx.intern_table;
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        if (this.owned_by_current_module(di.get_global_module(name))) {
+            return LValue::null();
+        }
+
+        const g_type_ref: TypeRef = di.lookup_global(name);
+        if (g_type_ref.is_invalid()) { return LValue::null(); }
+
+        const g_llvm_ty: LType = this.type_mapper.map_type(g_type_ref);
+        if (!g_llvm_ty.is_valid()) { return LValue::null(); }
+
+        // Mirror codegen_global_var's mangle: pull the defining namespace
+        // out of DI so the extern decl in this module refers to the same
+        // LLVM symbol the defining module emits.  Empty namespace → bare
+        // `C$<name>` (root-namespace globals).
+        const def_ns: SymbolStr = di.get_global_namespace(name);
+        const mangled: string = MangledName::for_global(intern, def_ns, name).resolve(intern);
+
+        // Reuse an existing LLVM global if something (e.g. a prior pass)
+        // already created one with the same mangled name; identical-name
+        // externs share the same symbol at link time.
+        mut g_val: LValue = this.llvm_module.get_named_global(mangled);
+        if (!g_val.is_valid()) {
+            g_val = this.llvm_module.add_global(g_llvm_ty, mangled);
+        }
+        this.globals.register(name, g_val);
+        return g_val;
+    }
+}
+
+
+// ============================================================================
+// Free helpers used by resolver passes
+// ============================================================================
+
+/// Returns true if the FunctionType reaches a GenericParam / BoundedParam
+/// anywhere in its return type or parameter types (walking through
+/// References, Pointers, Arrays, Optionals, Tuples, and InstantiatedTypes
+/// with no resolved_type).  Used by extern-overload declaration to filter
+/// out sema-time registrations of still-generic templates whose param
+/// signatures would otherwise lower to opaque `ptr` and produce a wrong
+/// mangled name.
+function type_ref_has_generic_params(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    return type_has_generic_params_walker(arena, ty, 0);
+}
+
+function type_has_generic_params_walker(arena: TypeArena*, ty: TypeRef, depth: i32) -> boolean {
+    if (depth > 8) { return false; }
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null) { return false; }
+    const k: TypeKind = t.kind;
+    if (k == TypeKind::GenericParam || k == TypeKind::BoundedParam) {
+        return true;
+    }
+    if (k == TypeKind::Reference) {
+        const r: ReferenceType* = t as ReferenceType*;
+        return type_has_generic_params_walker(arena, r.referent, depth + 1);
+    }
+    if (k == TypeKind::Pointer) {
+        const p: PointerType* = t as PointerType*;
+        return type_has_generic_params_walker(arena, p.pointee, depth + 1);
+    }
+    if (k == TypeKind::Array) {
+        const a: ArrayType* = t as ArrayType*;
+        return type_has_generic_params_walker(arena, a.element, depth + 1);
+    }
+    if (k == TypeKind::Optional) {
+        const o: OptionalType* = t as OptionalType*;
+        return type_has_generic_params_walker(arena, o.wrapped, depth + 1);
+    }
+    if (k == TypeKind::Tuple) {
+        const tu: TupleType* = t as TupleType*;
+        for (mut i: i64 = 0; i < tu.elements.length; i++) {
+            if (type_has_generic_params_walker(arena, tu.elements[i], depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (k == TypeKind::InstantiatedType) {
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (inst.has_resolved_type()) {
+            return type_has_generic_params_walker(arena, inst.resolved_type, depth + 1);
+        }
+        // Un-resolved InstantiatedType: walk its type_args for generic
+        // params (e.g. `Foo<T>` where T is still a template param).
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (type_has_generic_params_walker(arena, inst.type_args[i], depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+function function_type_has_generic_params(arena: TypeArena*, ft: FunctionType*) -> boolean {
+    if (type_ref_has_generic_params(arena, ft.return_type)) { return true; }
+    for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+        if (type_ref_has_generic_params(arena, ft.param_types[i])) { return true; }
+    }
+    return false;
+}
