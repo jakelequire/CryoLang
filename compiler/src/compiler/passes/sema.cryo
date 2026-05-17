@@ -3827,6 +3827,26 @@ public:
             }
         }
 
+        // Import-shadow detection: if a different user-defined type with
+        // the same simple-name owns this method, the user likely imported
+        // (or had auto-imported) the wrong one.  Common when two crates
+        // both define `Diagnostic`/`Result`/`Error` etc.  The note +
+        // quickfix tells the user which qualified type to add to imports.
+        const resolved_qname: SymbolStr = this.arena.get_qualified_name(lookup_ref);
+        if (resolved_qname.is_valid()) {
+            const resolved_qname_str: string = this.intern.resolve(resolved_qname);
+            const simple: string = extract_leaf_segment(resolved_qname_str);
+            if (simple != "") {
+                const simple_sym: SymbolStr = this.intern.intern(simple);
+                const shadows: SymbolStr[] = this.find_shadowed_type_candidates(
+                    simple_sym, member.member, lookup_ref);
+                if (shadows.length > 0) {
+                    diag = this.attach_shadow_import_suggestions(
+                        diag, simple, shadows);
+                }
+            }
+        }
+
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
@@ -3988,6 +4008,164 @@ public:
         const best: string = find_best_candidate(needle, cands);
         if (best == "") { return SymbolStr::empty(); }
         return this.intern.intern(best);
+    }
+
+    /// Walk the type arena for other user-defined types whose simple-name
+    /// (last `::` segment of the qualified name) matches `simple_name` and
+    /// that own a method named `member_name`.  `resolved_type` is the type
+    /// the failed lookup actually landed on; it is excluded from results
+    /// so we don't suggest "import the type we already resolved to".
+    ///
+    /// Used to detect import-shadow cases: e.g. the source imports
+    /// `Compiler::Diag` but calls `Diagnostic::error(...)`, and the
+    /// resolver picked `Lsp::Protocol::Lsp::Diagnostic` because the LSP
+    /// project was in scope.  The arena holds both `Diagnostic` types;
+    /// walking it finds the one that has `error` and lets us emit a
+    /// machine-applicable "import the right one" quickfix.
+    ///
+    /// Pass `SymbolStr::empty()` as `member_name` to skip the method
+    /// filter (used when the failure is "no static at all" and we only
+    /// need same-simple-name candidates).  Result capped at 4 candidates;
+    /// past that the suggestion is too noisy to help.
+    find_shadowed_type_candidates(&this, simple_name: SymbolStr,
+                                  member_name: SymbolStr,
+                                  resolved_type: TypeRef) -> SymbolStr[] {
+        mut results: SymbolStr[] = [];
+        if (!simple_name.is_valid()) { return results; }
+        const needle: string = this.intern.resolve(simple_name);
+        const filter_member: boolean = member_name.is_valid();
+
+        const n: i64 = this.arena.type_count();
+        for (mut i: i64 = 0; i < n; i++) {
+            const t: Type* = this.arena.types[i];
+            if (t == null) { continue; }
+            if (resolved_type.is_valid() && t.id == resolved_type.id) { continue; }
+
+            mut qname: SymbolStr = SymbolStr::empty();
+            mut has_member: boolean = !filter_member;
+
+            if (t.kind == TypeKind::Struct) {
+                const st: StructType* = t as StructType*;
+                qname = st.qualified_name;
+                if (filter_member) {
+                    has_member = st.get_method(member_name) != null;
+                }
+            } else if (t.kind == TypeKind::Class) {
+                const ct: ClassType* = t as ClassType*;
+                qname = ct.qualified_name;
+                if (filter_member) {
+                    has_member = ct.get_method(member_name) != null;
+                }
+            } else if (t.kind == TypeKind::Enum) {
+                const et: EnumType* = t as EnumType*;
+                qname = et.qualified_name;
+                if (filter_member) {
+                    has_member = et.get_method(member_name) != null
+                              || et.get_variant(member_name) != null;
+                }
+            } else {
+                continue;
+            }
+
+            if (!qname.is_valid() || !has_member) { continue; }
+            const qstr: string = this.intern.resolve(qname);
+            const leaf: string = extract_leaf_segment(qstr);
+            if (leaf != needle) { continue; }
+
+            // Dedupe in case the arena holds multiple TypeRefs that point
+            // at the same qualified name (e.g. template + instantiation).
+            mut dup: boolean = false;
+            for (mut j: i64 = 0; j < results.length; j++) {
+                if (results[j].equals(qname)) { dup = true; break; }
+            }
+            if (dup) { continue; }
+
+            results.push(qname);
+            if (results.length >= 4) { break; }
+        }
+        return results;
+    }
+
+    /// Build a zero-width SourceSpan suitable for inserting a new
+    /// `import ...;` line into the current module.  Walks the top-level
+    /// statements for the last `ImportDeclNode` and returns a point span
+    /// at its end coordinate (so inserting `"\nimport X;"` lands the new
+    /// line directly under the existing import block).  Falls back to a
+    /// point at the end of the first non-namespace statement when no
+    /// imports exist, and to `SourceSpan::none()` when there is nothing
+    /// usable — which signals "skip the machine-applicable suggestion".
+    find_import_insertion_span(&this) -> SourceSpan {
+        if (this.ctx == null) { return SourceSpan::none(); }
+        const root: ProgramNode* = this.ctx.artifacts.ast.root;
+        if (root == null) { return SourceSpan::none(); }
+
+        mut last_import_span: SourceSpan = SourceSpan::none();
+        mut fallback_span: SourceSpan = SourceSpan::none();
+
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            if (stmt.kind == NodeKind::ImportDeclaration) {
+                last_import_span = stmt.span;
+            } else if (!fallback_span.has_location()) {
+                // First non-import top-level node (likely a namespace
+                // declaration or doc-comment block).  We only use this
+                // when there are NO imports at all.
+                fallback_span = stmt.span;
+            }
+        }
+
+        const anchor: SourceSpan = if (last_import_span.has_location()) {
+            last_import_span
+        } else {
+            fallback_span
+        };
+        if (!anchor.has_location()) { return SourceSpan::none(); }
+        return SourceSpan::new(anchor.file,
+                               anchor.end_line, anchor.end_col,
+                               anchor.end_line, anchor.end_col);
+    }
+
+    /// Attach an "import the right type" note + machine-applicable
+    /// quickfix to `diag` for every shadowed candidate.  No-op when
+    /// `candidates` is empty.  Applicability is MachineApplicable when
+    /// there is exactly one candidate; with multiple candidates each
+    /// suggestion is MaybeIncorrect so editors don't auto-apply a
+    /// guess.  Returns the (possibly extended) diagnostic.
+    attach_shadow_import_suggestions(&this, diag: Diagnostic,
+                                     simple_name_str: string,
+                                     candidates: SymbolStr[]) -> Diagnostic {
+        if (candidates.length == 0) { return diag; }
+        mut out: Diagnostic = diag;
+        const insert_span: SourceSpan = this.find_import_insertion_span();
+        const apply: Applicability = if (candidates.length == 1) {
+            Applicability::MachineApplicable
+        } else {
+            Applicability::MaybeIncorrect
+        };
+
+        for (mut i: i64 = 0; i < candidates.length; i++) {
+            const cand_str: string = this.intern.resolve(candidates[i]);
+            out = out.with_note(format(
+                "another `%s` exists: `%s`", simple_name_str, cand_str));
+            // The import targets the *module* that owns the type
+            // (`Compiler::Diag::Diagnostic`), not the type's own
+            // fully-qualified path (`Compiler::Diag::Diagnostic::Diagnostic`).
+            // Bringing the module into scope is the idiomatic form and
+            // makes the simple name `Diagnostic` resolve unambiguously.
+            const import_path: string = extract_parent_path(cand_str);
+            if (import_path == "") { continue; }
+            if (insert_span.has_location()) {
+                const insertion: string = format("\nimport %s;", import_path);
+                const msg: string = format("import `%s`", import_path);
+                out = out.suggest(Suggestion::single(
+                    insert_span, insertion, msg, apply));
+            }
+        }
+        out = out.help(format(
+            "the unqualified name `%s` resolved to a different type than the one you meant; import the intended module to disambiguate",
+            simple_name_str));
+        return out;
     }
 
     /// Look up a method by walking the class inheritance chain.
@@ -4193,10 +4371,25 @@ public:
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
-        this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0233_UNDEFINED_SYMBOL,
             format("cannot find `%s::%s`: no matching static method, variant, or type",
-                scope_str, member_str),
-            scope.span);
+                scope_str, member_str));
+        diag = diag.at(scope.span);
+
+        // Import-shadow detection: if another user-defined type with the
+        // same simple-name as `scope.scope_name` has a static / variant
+        // matching `scope.member_name`, suggest importing it.  Same idea
+        // as the E0358 path above, but here the "wrong type" lookup
+        // failed on the static side (Foo::bar) rather than on a method
+        // call against an already-typed receiver.
+        const shadows: SymbolStr[] = this.find_shadowed_type_candidates(
+            scope.scope_name, scope.member_name, TypeRef::invalid());
+        if (shadows.length > 0) {
+            diag = this.attach_shadow_import_suggestions(diag, scope_str, shadows);
+        }
+
+        this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }
 
