@@ -1,0 +1,127 @@
+/// Enum Variant Emitter
+///
+/// Build an enum variant value (the literal-form of "construct an enum"):
+///   - simple enums          → return the i32 discriminant constant
+///   - ADT no-payload variant → return `{ tag, zeroinit }`
+///   - ADT payload variant   → alloca, store tag, store payload, load value
+///
+/// Shared by `visit(CallExprNode*)` (when the call resolves to a variant
+/// ctor), `visit(NewExprNode*)` (for `new EnumType::Variant(args)`), and
+/// `visit(ScopeResolutionNode*)` (for `EnumType::Variant` zero-args form).
+///
+/// Holds only `cg: CodegenContext*`; does not touch the visitor's state.
+
+namespace Compiler::Codegen::Visit::EnumVariantEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::Diag;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::UserDefined;
+
+
+// ============================================================================
+// EnumVariantEmitter
+// ============================================================================
+
+type struct EnumVariantEmitter {
+    cg: CodegenContext*;
+
+    static null() -> EnumVariantEmitter {
+        return EnumVariantEmitter { cg: null };
+    }
+
+    wire(mut &this, cg: CodegenContext*) -> void {
+        this.cg = cg;
+    }
+
+
+    /// Current LLVM function for entry-block alloca placement.
+    get_current_function(&this) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!bb.is_valid()) {
+            this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
+                "codegen: builder has no insert block; cannot determine current function");
+            return LValue::null();
+        }
+        return bb.get_parent();
+    }
+
+
+    /// Build an enum variant value.
+    /// For simple enums: returns i32 tag constant.
+    /// For ADT enums: returns `{ i32 tag, [N x i8] }` with payload stored.
+    build(mut &this, et: EnumType*, variant: EnumVariantInfo*,
+                     enum_ref: TypeRef, args: LValue[]) -> LValue {
+        const tag_val: LValue = LType::const_int(LType::i32(), variant.tag_value, false);
+
+        // Simple enum: just an i32 tag.
+        if (et.is_simple_enum()) {
+            return tag_val;
+        }
+
+        // ADT enum: map the full enum type to { i32, [N x i8] }.
+        const enum_llvm: LType = this.cg.type_mapper.map_type(enum_ref);
+        if (!enum_llvm.is_valid()) {
+            return LValue::null();
+        }
+
+        // No-payload variant on an ADT enum: return { tag, zeroinit }.
+        if (!variant.has_payload()) {
+            const null_val: LValue = LType::const_null(enum_llvm);
+            const result: LValue = this.cg.builder.build_insert_value(
+                null_val, tag_val, 0, "enum.tag");
+            return result;
+        }
+
+        // Payload variant: alloca, store tag, store payload fields.
+        const current_fn: LValue = this.get_current_function();
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "enum.tmp", enum_llvm);
+
+        // Store tag at field 0 using struct GEP.
+        const tag_ptr: LValue = this.cg.builder.build_struct_gep(enum_llvm, alloca, 0, "enum.tag.ptr");
+        this.cg.builder.build_store(tag_val, tag_ptr);
+
+        // Get pointer to payload at field 1.
+        const payload_ptr: LValue = this.cg.builder.build_struct_gep(enum_llvm, alloca, 1, "enum.payload.ptr");
+
+        // For single-payload variants, store the argument directly.
+        // For multi-payload, store each field sequentially.
+        if (args.length == 1 && variant.payload_types.length == 1) {
+            const payload_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[0]);
+            if (payload_ty.is_valid()) {
+                const typed_ptr: LValue = this.cg.builder.build_bitcast(
+                    payload_ptr, LType::pointer_to(payload_ty), "enum.payload.cast");
+                this.cg.builder.build_store(args[0], typed_ptr);
+            }
+        } else {
+            // Multi-field payload: lay out sequentially.
+            mut offset: u64 = 0;
+            for (mut i: i64 = 0; i < args.length && i < variant.payload_types.length as i64; i++) {
+                const field_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[i]);
+                if (!field_ty.is_valid()) { continue; }
+                const byte_offset: LValue = LType::const_int(LType::i64(), offset, false);
+                const obuf: void* = intrinsics::malloc(8);
+                const obuf_arr: void** = obuf as void**;
+                obuf_arr[0] = byte_offset.raw;
+                const field_ptr_raw: LValue = this.cg.builder.build_gep(
+                    LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
+                intrinsics::free(obuf);
+                const field_ptr: LValue = this.cg.builder.build_bitcast(
+                    field_ptr_raw, LType::pointer_to(field_ty), "enum.field.cast");
+                this.cg.builder.build_store(args[i], field_ptr);
+                // Advance offset by the field's size.
+                const ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[i].id);
+                if (ft != null) {
+                    offset += ft.size_bytes();
+                }
+            }
+        }
+
+        // Load and return the complete enum value.
+        return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
+    }
+}

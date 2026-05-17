@@ -1,0 +1,185 @@
+/// Expression Dispatch
+///
+/// Thin wrapper around the visitor's `accept()` mechanism plus the
+/// lvalue→rvalue conversion that codegen needs at most expression sites.
+/// Lives as a separate module so sub-emitters (ArrayLit, Call, Stmt,
+/// Expr, Decl, ...) can recurse into the AST through the parent visitor
+/// — `dispatch.codegen_rvalue(visitor, expr)` — without having to import
+/// the concrete `IRGeneratorVisitor` type (which would form a
+/// module-graph cycle with this module's callers).
+///
+/// `visitor: ASTVisitor*` is the abstract base; double-dispatch via
+/// `expr.accept(visitor)` selects the right `override visit(...)` on
+/// the actual concrete visitor at runtime.
+
+namespace Compiler::Codegen::Visit::ExprDispatch;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::State::VisitorState;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::Lex;
+
+
+// ============================================================================
+// ExprDispatch
+// ============================================================================
+
+type struct ExprDispatch {
+    // Back-pointers set by wire().  Null until wire() runs.
+    cg:    CodegenContext*;
+    state: VisitorState*;
+
+    static null() -> ExprDispatch {
+        return ExprDispatch {
+            cg:    null,
+            state: null,
+        };
+    }
+
+    wire(mut &this, cg: CodegenContext*, state: VisitorState*) -> void {
+        this.cg    = cg;
+        this.state = state;
+    }
+
+
+    // ========================================================================
+    // Statement / block / expression dispatch
+    // ========================================================================
+
+    /// Generate a block of statements: push a scope, dispatch each child
+    /// statement through `generate_statement` (which calls accept()),
+    /// pop the scope.  Stops early once the current basic block has a
+    /// terminator so we don't emit unreachable IR after an early return.
+    generate_block(mut &this, visitor: ASTVisitor*, block: BlockStmtNode*) -> void {
+        if (block == null) { return; }
+        this.cg.values.push_scope();
+        cdebug("[IRGen]         block (%lld stmts) at %s:%d:%d\n",
+               block.statements.length, block.span.file,
+               block.span.start_line as i32, block.span.start_col as i32); fflush(null);
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const current: LBasicBlock = this.cg.builder.get_insert_block();
+            if (current.is_valid() && current.has_terminator()) {
+                break;
+            }
+            const stmt: StatementNode* = block.statements[i];
+            if (stmt != null) {
+                this.generate_statement(visitor, stmt);
+            }
+        }
+        this.cg.values.pop_scope();
+    }
+
+    /// Dispatch a statement via double-dispatch (`stmt.accept(visitor)` →
+    /// runtime type calls the right `override visit(SpecificType*)`).
+    generate_statement(mut &this, visitor: ASTVisitor*, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        cdebug("[IRGen]           stmt kind=%s\n", stmt.kind.to_string()); fflush(null);
+        stmt.accept(visitor);
+    }
+
+    /// Dispatch an expression via double-dispatch (`expr.accept(visitor)`).
+    /// Each expression kind has its own `override visit(SpecificType*)` on
+    /// the visitor.  Unknown kinds fall through to BaseASTVisitor's no-op
+    /// defaults; `state.last_value` stays at its previous value, which the
+    /// caller (codegen_rvalue / codegen_lvalue) treats as "no result".
+    generate_expression(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> void {
+        if (expr == null) { return; }
+        cdebug("[IRGen]             expr kind=%s\n", expr.kind.to_string());
+        expr.accept(visitor);
+    }
+
+
+    // ========================================================================
+    // Value-shape helpers (codegen_expr / codegen_rvalue / codegen_lvalue)
+    // ========================================================================
+
+    /// Codegen an expression and return the resulting value.
+    codegen_expr(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        this.generate_expression(visitor, expr);
+        return this.state.last_value;
+    }
+
+    /// Codegen an expression, ensuring the result is an rvalue (loaded).
+    codegen_rvalue(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        this.generate_expression(visitor, expr);
+
+        if (this.state.last_is_lvalue && this.state.last_value.is_valid()) {
+            // String-index special case: char is i32 but string storage
+            // is i8 per byte.  `codegen_array_access` returns the byte's
+            // i8* as lvalue; here we do the i8-load-and-zext so the
+            // value has the expected char/i32 type.  Generic map_type
+            // load would read 4 bytes from an i8 slot (walking into
+            // neighbouring bytes), which is wrong.
+            if (expr.kind == NodeKind::ArrayAccess) {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                const arr_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
+                if (arr_t != null && arr_t.kind == TypeKind::String) {
+                    const byte: LValue = this.cg.builder.build_load(
+                        LType::i8(), this.state.last_value, "charbyte");
+                    this.state.last_value = this.cg.builder.build_zext(
+                        byte, LType::i32(), "char");
+                    this.state.last_is_lvalue = false;
+                    return this.state.last_value;
+                }
+            }
+            // Same special case for `*string`: lex_token does
+            // `mut c: char = *this.current as char` to read one ASCII byte.
+            // The generic load reads `map_type(char) = i32` (4 bytes), which
+            // is wrong for an i8-sized backing store.  Emit i8-load + zext-to-i32.
+            if (expr.kind == NodeKind::UnaryExpression) {
+                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                if (ue.op.kind == TokenType::Star) {
+                    const op_t: Type* = this.cg.lookup_type_by_id(ue.operand.resolved_type.id);
+                    if (op_t != null && op_t.kind == TypeKind::String) {
+                        const byte: LValue = this.cg.builder.build_load(
+                            LType::i8(), this.state.last_value, "strbyte");
+                        this.state.last_value = this.cg.builder.build_zext(
+                            byte, LType::i32(), "char");
+                        this.state.last_is_lvalue = false;
+                        return this.state.last_value;
+                    }
+                }
+            }
+            // Variadic bucket: `args` in a variadic function body is
+            // bound to a `[24 x i8]` va_list alloca.  When referenced
+            // as an rvalue (e.g., forwarded to `vformat(fmt, args)`),
+            // return the alloca pointer directly rather than loading;
+            // loading the raw [24 x i8] array value isn't meaningful
+            // for va_list forwarding, which always takes a pointer.
+            if (expr.kind == NodeKind::Identifier) {
+                const ident: IdentifierNode* = expr as IdentifierNode*;
+                if (this.cg.expr_ops.current_variadic_arg_id != 0 &&
+                    ident.name.id == this.cg.expr_ops.current_variadic_arg_id) {
+                    this.state.last_is_lvalue = false;
+                    return this.state.last_value;
+                }
+            }
+            const ty: LType = this.cg.type_mapper.map_type(expr.resolved_type);
+            if (ty.is_valid()) {
+                const loaded: LValue = this.cg.builder.build_load(ty, this.state.last_value, "load");
+                this.state.last_value = loaded;
+            }
+            this.state.last_is_lvalue = false;
+        }
+        return this.state.last_value;
+    }
+
+    /// Codegen an expression, ensuring the result is an lvalue (address).
+    codegen_lvalue(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        this.generate_expression(visitor, expr);
+        return this.state.last_value;
+    }
+}

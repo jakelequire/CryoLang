@@ -1,0 +1,465 @@
+/// Array Literal Emitter
+///
+/// Lowering for the three array-literal shapes:
+///   1. element-form fixed `[a, b, c]`          → alloca `[N x T]`, store per slot
+///   2. element-form dynamic `[a, b, c]: T[]`   → malloc + fat pointer `{T*, i64, i64}`
+///   3. fill-form    `[value; N]`               → alloca + fill loop (fixed or dynamic)
+///
+/// The fill-loop emitters (`emit_fill_loop_indexed` / `emit_fill_loop_raw`)
+/// alloca the loop counter in the *current* block, not via
+/// `IRFlowEmitter::create_entry_alloca`, because at the call-site the entry
+/// block may already have a terminator (a preceding `br cond_bb`) and
+/// inserting another alloca past a terminator breaks the block.
+///
+/// Holds `cg`, `state`, and `dispatch` back-pointers; recursion into the
+/// element expressions goes through `dispatch.codegen_rvalue(visitor, ...)`.
+
+namespace Compiler::Codegen::Visit::ArrayLitEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::State::VisitorState;
+import Compiler::Codegen::Visit::ExprDispatch;
+import Compiler::Codegen::Util;
+import Compiler::Diag;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import std::collections::pair;
+
+
+// ============================================================================
+// ArrayLitEmitter
+// ============================================================================
+
+type struct ArrayLitEmitter {
+    // Back-pointers set by wire().  Null until wire() runs.
+    cg:       CodegenContext*;
+    state:    VisitorState*;
+    dispatch: ExprDispatch*;
+
+    static null() -> ArrayLitEmitter {
+        return ArrayLitEmitter {
+            cg:       null,
+            state:    null,
+            dispatch: null,
+        };
+    }
+
+    wire(mut &this, cg: CodegenContext*, state: VisitorState*,
+                    dispatch: ExprDispatch*) -> void {
+        this.cg       = cg;
+        this.state    = state;
+        this.dispatch = dispatch;
+    }
+
+
+    // ========================================================================
+    // Small helpers
+    // ========================================================================
+
+    /// Current LLVM function pointer for entry-block alloca placement.
+    /// Inlines what the visitor's `get_current_function` does so this
+    /// module can do allocas without calling back into the visitor.
+    get_current_function(mut &this) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!bb.is_valid()) {
+            this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
+                "codegen: builder has no insert block; cannot determine current function");
+            return LValue::null();
+        }
+        return bb.get_parent();
+    }
+
+
+    // ========================================================================
+    // Element-form dispatch (`[a, b, c]`)
+    // ========================================================================
+
+    /// Top-level entry: pick fill-form, dynamic element-form, or fixed
+    /// element-form codegen based on the AST node's shape and resolved
+    /// type.  Mirrors the visitor's `override visit(ArrayLiteralNode*)`.
+    emit(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*) -> void {
+        // Fill form `[value; N]`: single element repeated N times.  Needs
+        // its own codegen path: allocate the backing storage, run a fill
+        // loop writing the value at every slot, and (for dynamic arrays)
+        // wire up the fat-pointer struct.  The element-form path below
+        // would write only slot 0 and GEP as if the alloca's outer type
+        // were a flat array, which is wrong for both fixed `[N x T]`
+        // alloca shapes and dynamic `{T*, i64}` fat pointers.
+        const is_fill: boolean = (node.repeat_count > 0 || node.repeat_count_expr != null)
+                                 && node.elements.length == 1;
+        if (is_fill) {
+            this.emit_fill(visitor, node);
+            return;
+        }
+
+        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        mut is_dynamic: boolean = false;
+        mut arr_type_ptr: ArrayType* = null;
+        if (arr_t_raw != null && arr_t_raw.kind == TypeKind::Array) {
+            arr_type_ptr = arr_t_raw as ArrayType*;
+            if (!arr_type_ptr.is_fixed()) {
+                is_dynamic = true;
+            }
+        }
+        if (is_dynamic) {
+            this.emit_dynamic(visitor, node, arr_type_ptr);
+            return;
+        }
+
+        const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (!ty.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                "codegen: array literal: failed to map array type",
+                node.span);
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", ty);
+
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            const elem: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[i]);
+            const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
+            const buf: void* = intrinsics::malloc(16);
+            const buf_arr: void** = buf as void**;
+            const zero_idx: LValue = LType::const_int(LType::i64(), 0, false);
+            buf_arr[0] = zero_idx.raw;
+            buf_arr[1] = idx.raw;
+            const gep: LValue = this.cg.builder.build_gep(ty, alloca, buf, 2, "arrelem");
+            intrinsics::free(buf);
+            this.cg.builder.build_store(elem, gep);
+        }
+
+        this.state.last_value     = alloca;
+        this.state.last_is_lvalue = true;
+    }
+
+
+    // ========================================================================
+    // Element-form dynamic (`[a, b, c]: T[]`)
+    // ========================================================================
+
+    /// Emit element-form `[a, b, c]` where the expected type is a dynamic
+    /// array `T[]` (fat pointer `{T*, i64, i64}`).  Malloc a buffer for N
+    /// elements, store each element into it, then stash (data, len, cap)
+    /// into the fat pointer alloca.  Without this path, we'd alloca
+    /// `[N x T]` and hand back a fixed-size array to a caller expecting
+    /// `{ptr, i64}`, failing LLVM verification.
+    emit_dynamic(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*,
+                  arr_type: ArrayType*) -> void {
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+        if (!elem_ty.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (!fat_ty.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const fat: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", fat_ty);
+
+        const count: i64 = node.elements.length;
+        const count_val: LValue = LType::const_int(LType::i64(), count as u64, false);
+
+        mut data_ptr: LValue = LValue::null();
+        if (count > 0) {
+            // Stride must come from LLVM's data layout, not the cryo arena's
+            // `size_bytes()`. Element layout is computed lazily and may still
+            // be 0 here (e.g. when the literal is inside a struct ctor whose
+            // own layout pass hasn't reached the element's StructType yet;
+            // falling back to `1` would emit `malloc(count * 1)` and cascade
+            // into heap corruption at the next allocation. `codegen_sizeof`
+            // tries `size_bytes()` first and falls back to `LLVMSizeOf`,
+            // which is always data-layout-correct.
+            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(arr_type.element);
+            const byte_count: LValue = this.cg.builder.build_mul(
+                count_val, elem_size_val, "bytecnt");
+
+            const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
+            if (!malloc_fn.is_valid()) {
+                this.state.last_value     = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
+            data_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrdata");
+            if (!data_ptr.is_valid()) {
+                this.state.last_value     = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+
+            for (mut i: i64 = 0; i < count; i++) {
+                const elem: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[i]);
+                if (!elem.is_valid()) { continue; }
+                const idx: LValue = LType::const_int(LType::i64(), i as u64, false);
+                const buf: void* = intrinsics::malloc(8);
+                const buf_arr: void** = buf as void**;
+                buf_arr[0] = idx.raw;
+                const slot: LValue = this.cg.builder.build_gep(
+                    elem_ty, data_ptr, buf, 1, "arrelem");
+                intrinsics::free(buf);
+                this.cg.builder.build_store(elem, slot);
+            }
+        } else {
+            data_ptr = LType::const_null(LType::pointer_to(elem_ty));
+        }
+
+        const ptr_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 0, "fat.ptr");
+        this.cg.builder.build_store(data_ptr, ptr_slot);
+        const len_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 1, "fat.len");
+        this.cg.builder.build_store(count_val, len_slot);
+        const cap_slot: LValue = this.cg.builder.build_struct_gep(
+            fat_ty, fat, 2, "fat.cap");
+        this.cg.builder.build_store(count_val, cap_slot);
+
+        this.state.last_value     = fat;
+        this.state.last_is_lvalue = true;
+    }
+
+
+    // ========================================================================
+    // Fill form (`[value; N]`)
+    // ========================================================================
+
+    /// Emit codegen for `[value; N]` (fill form).  N may be a compile-time
+    /// constant (fixed array) or a runtime expression (dynamic array).
+    emit_fill(mut &this, visitor: ASTVisitor*, node: ArrayLiteralNode*) -> void {
+        const arr_t_raw: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        if (arr_t_raw == null || arr_t_raw.kind != TypeKind::Array) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const arr_type: ArrayType* = arr_t_raw as ArrayType*;
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr_type.element);
+        if (!elem_ty.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Compute count as i64.  Either from the static `repeat_count`
+        // field or by evaluating `repeat_count_expr` and widening.
+        mut count_val: LValue = LValue::null();
+        if (node.repeat_count_expr != null) {
+            const raw: LValue = this.dispatch.codegen_rvalue(visitor, node.repeat_count_expr);
+            if (raw.is_valid()) {
+                const raw_ty: void* = llvm::LLVMTypeOf(raw.raw);
+                if (raw_ty != null && type_kind_of(raw_ty) == LTypeKind::Integer) {
+                    const width: u32 = llvm::LLVMGetIntTypeWidth(raw_ty);
+                    if (width < 64) {
+                        count_val = this.cg.builder.build_zext(raw, LType::i64(), "cnt.widen");
+                    } else if (width > 64) {
+                        count_val = this.cg.builder.build_trunc(raw, LType::i64(), "cnt.trunc");
+                    } else {
+                        count_val = raw;
+                    }
+                } else {
+                    count_val = raw;
+                }
+            }
+        } else {
+            count_val = LType::const_int(LType::i64(), node.repeat_count as u64, false);
+        }
+        if (!count_val.is_valid()) {
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Compute the fill value.  Coerce the RHS integer width to match
+        // the element type; common case: `[0; N]` for `i8[]` where 0 is
+        // an i32 literal and slots want i8.
+        mut fill_val: LValue = this.dispatch.codegen_rvalue(visitor, node.elements[0]);
+        if (fill_val.is_valid()) {
+            const fill_llvm_ty: void* = llvm::LLVMTypeOf(fill_val.raw);
+            if (fill_llvm_ty != null &&
+                type_kind_of(fill_llvm_ty) == LTypeKind::Integer &&
+                type_kind_of(elem_ty.raw) == LTypeKind::Integer) {
+                const fw: u32 = llvm::LLVMGetIntTypeWidth(fill_llvm_ty);
+                const ew: u32 = llvm::LLVMGetIntTypeWidth(elem_ty.raw);
+                if (fw < ew) {
+                    fill_val = this.cg.builder.build_zext(fill_val, elem_ty, "fill.widen");
+                } else if (fw > ew) {
+                    fill_val = this.cg.builder.build_trunc(fill_val, elem_ty, "fill.trunc");
+                }
+            }
+        }
+
+        if (arr_type.is_fixed()) {
+            // Fixed `[value; N]` where N is a compile-time constant.
+            // Alloca `[N x T]` and fill loop.  `gep_element_type` is T;
+            // GEP needs `[N x T]` + indices `[0, i]` to land on slot i.
+            const arr_lty: LType = LType::array_of(elem_ty, arr_type.size as u32);
+            const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", arr_lty);
+            this.emit_fill_loop_indexed(current_fn, arr_lty, alloca,
+                                         elem_ty, fill_val, count_val);
+            this.state.last_value     = alloca;
+            this.state.last_is_lvalue = true;
+        } else {
+            // Dynamic `{T*, i64}` fat pointer.  Alloca the struct, malloc
+            // a buffer of `count * sizeof(T)` bytes, fill it, then store
+            // the (data_ptr, count) into the fat pointer.
+            const fat_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+            const fat: LValue = this.cg.flow.create_entry_alloca(current_fn, "arrlit", fat_ty);
+
+            // Stride from LLVM's data layout; see emit_dynamic above for
+            // why size_bytes() can be 0 here.
+            const elem_size_val: LValue = this.cg.expr_ops.codegen_sizeof(arr_type.element);
+            const byte_count: LValue = this.cg.builder.build_mul(
+                count_val, elem_size_val, "bytecnt");
+
+            const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
+            if (!malloc_fn.is_valid()) {
+                this.state.last_value     = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
+            mut data_ptr: LValue = LValue::null();
+            data_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "filldata");
+            if (!data_ptr.is_valid()) {
+                this.state.last_value     = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+
+            this.emit_fill_loop_raw(current_fn, elem_ty, data_ptr, fill_val, count_val);
+
+            const ptr_slot: LValue = this.cg.builder.build_struct_gep(
+                fat_ty, fat, 0, "fat.ptr");
+            this.cg.builder.build_store(data_ptr, ptr_slot);
+            const len_slot: LValue = this.cg.builder.build_struct_gep(
+                fat_ty, fat, 1, "fat.len");
+            this.cg.builder.build_store(count_val, len_slot);
+            const cap_slot: LValue = this.cg.builder.build_struct_gep(
+                fat_ty, fat, 2, "fat.cap");
+            this.cg.builder.build_store(count_val, cap_slot);
+
+            this.state.last_value     = fat;
+            this.state.last_is_lvalue = true;
+        }
+    }
+
+
+    // ========================================================================
+    // Fill loops
+    // ========================================================================
+
+    /// Fill `[N x T]`-typed storage by looping through indices [0..count)
+    /// and storing `fill_val` at each slot via a two-index GEP.
+    emit_fill_loop_indexed(mut &this, current_fn: LValue, arr_ty: LType,
+                            base: LValue, elem_ty: LType,
+                            fill_val: LValue, count_val: LValue) -> void {
+        const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.cond");
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
+        const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
+
+        // Alloca the counter in the CURRENT block, not via create_entry_alloca.
+        // The entry block may already hold allocas for preceding locals and
+        // is about to get its `br cond_bb` terminator; inserting another
+        // alloca via `position_at_end(entry)` after we've emitted a
+        // terminator there lands the instruction after the terminator and
+        // breaks the block.  Inline alloca keeps the block well-formed and
+        // LLVM still optimizes it correctly.
+        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        this.cg.builder.build_store(
+            LType::const_int(LType::i64(), 0, false), i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(cond_bb);
+        const cur: LValue = this.cg.builder.build_load(LType::i64(), i_slot, "fill.cur");
+        const done: LValue = this.cg.builder.build_icmp(LIntPredicate::UGE, cur, count_val, "fill.done");
+        this.cg.builder.build_cond_br(done, end_bb, body_bb);
+
+        this.cg.builder.position_at_end(body_bb);
+        const buf: void* = intrinsics::malloc(16);
+        const buf_arr: void** = buf as void**;
+        buf_arr[0] = LType::const_int(LType::i64(), 0, false).raw;
+        buf_arr[1] = cur.raw;
+        const slot: LValue = this.cg.builder.build_gep(arr_ty, base, buf, 2, "fill.slot");
+        intrinsics::free(buf);
+        if (fill_val.is_valid() && slot.is_valid()) {
+            this.cg.builder.build_store(fill_val, slot);
+        }
+        const one: LValue = LType::const_int(LType::i64(), 1, false);
+        const nxt: LValue = this.cg.builder.build_add(cur, one, "fill.nxt");
+        this.cg.builder.build_store(nxt, i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(end_bb);
+    }
+
+    /// Fill a raw element-typed pointer (dynamic buffer from malloc) by
+    /// looping through indices [0..count) with a single-index GEP.
+    emit_fill_loop_raw(mut &this, current_fn: LValue, elem_ty: LType,
+                        base: LValue, fill_val: LValue, count_val: LValue) -> void {
+        const cond_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.cond");
+        const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
+        const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
+
+        // See `emit_fill_loop_indexed` above for why this alloca goes in
+        // the current block, not via `create_entry_alloca`.
+        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        this.cg.builder.build_store(
+            LType::const_int(LType::i64(), 0, false), i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(cond_bb);
+        const cur: LValue = this.cg.builder.build_load(LType::i64(), i_slot, "fill.cur");
+        const done: LValue = this.cg.builder.build_icmp(LIntPredicate::UGE, cur, count_val, "fill.done");
+        this.cg.builder.build_cond_br(done, end_bb, body_bb);
+
+        this.cg.builder.position_at_end(body_bb);
+        const buf: void* = intrinsics::malloc(8);
+        const buf_arr: void** = buf as void**;
+        buf_arr[0] = cur.raw;
+        const slot: LValue = this.cg.builder.build_gep(elem_ty, base, buf, 1, "fill.slot");
+        intrinsics::free(buf);
+        if (fill_val.is_valid() && slot.is_valid()) {
+            this.cg.builder.build_store(fill_val, slot);
+        }
+        const one: LValue = LType::const_int(LType::i64(), 1, false);
+        const nxt: LValue = this.cg.builder.build_add(cur, one, "fill.nxt");
+        this.cg.builder.build_store(nxt, i_slot);
+        this.cg.builder.build_br(cond_bb);
+
+        this.cg.builder.position_at_end(end_bb);
+    }
+}

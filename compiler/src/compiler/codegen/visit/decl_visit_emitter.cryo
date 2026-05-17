@@ -1,0 +1,386 @@
+/// Declaration Visit Emitter
+///
+/// Function / impl-block / struct-decl / class-decl visit dispatch
+/// (the four AST node kinds whose visit() handlers walk *method
+/// bodies* rather than emit expressions).  Shared body-emission
+/// helpers (`generate_function_body`, `generate_impl_block`,
+/// `generate_method_body`, `emit_base_ctor_call`) live here so they
+/// can recurse into method bodies via the visitor while honoring the
+/// `state.current_impl_target` traversal context.
+///
+/// Holds `cg`, `state`, `dispatch` back-pointers.  The visitor is
+/// passed at each call site as `ASTVisitor*` so body statements
+/// recurse through `dispatch.generate_block(visitor, ...)`.
+
+namespace Compiler::Codegen::Visit::DeclVisitEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::State::VisitorState;
+import Compiler::Codegen::Visit::ExprDispatch;
+import Compiler::Codegen::Util;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
+import Compiler::Types::GenericRegistry;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import std::collections::pair;
+
+
+// ============================================================================
+// DeclVisitEmitter
+// ============================================================================
+
+type struct DeclVisitEmitter {
+    cg:       CodegenContext*;
+    state:    VisitorState*;
+    dispatch: ExprDispatch*;
+
+    static null() -> DeclVisitEmitter {
+        return DeclVisitEmitter {
+            cg:       null,
+            state:    null,
+            dispatch: null,
+        };
+    }
+
+    wire(mut &this, cg: CodegenContext*, state: VisitorState*,
+                    dispatch: ExprDispatch*) -> void {
+        this.cg       = cg;
+        this.state    = state;
+        this.dispatch = dispatch;
+    }
+
+
+    // ========================================================================
+    // visit() entry points (called by ir_generator.cryo's overrides)
+    // ========================================================================
+
+    emit_function_decl(mut &this, visitor: ASTVisitor*, node: FunctionDeclNode*) -> void {
+        if (node == null) { return; }
+        if (node.generic_params.length > 0) { return; }
+        if (node.body == null) { return; }
+        const fn_name: string = this.cg.resolve(node.name);
+        // `cryo test` synthesizes its own `main`; suppress the user's so
+        // the LLVM module has exactly one `main` symbol.  Mirrors the
+        // `declare_function` guard.
+        if (this.cg.ctx.mode.skip_user_main()
+                && intrinsics::strcmp(fn_name, "main") == 0) {
+            cdebug("[IRGen]   func body: main (suppressed by test mode)\n");
+            fflush(null);
+            return;
+        }
+        cdebug("[IRGen]   func body: %s\n", fn_name); fflush(null);
+        this.generate_function_body(visitor, node);
+        cdebug("[IRGen]   func done\n"); fflush(null);
+    }
+
+    emit_impl_block_visit(mut &this, visitor: ASTVisitor*, node: ImplBlockNode*) -> void {
+        if (node == null) { return; }
+        const impl_target: string = this.cg.resolve(node.target_type);
+        cdebug("[IRGen]   impl block: %s (%lld methods)\n",
+               impl_target, node.methods.length); fflush(null);
+        this.generate_impl_block(visitor, node);
+        cdebug("[IRGen]   impl done\n"); fflush(null);
+    }
+
+    emit_struct_decl(mut &this, visitor: ASTVisitor*, node: StructDeclNode*) -> void {
+        if (node == null) { return; }
+        if (node.generic_params.length > 0) { return; }
+        if (node.methods.length == 0) { return; }
+        const sname: string = this.cg.resolve(node.name);
+        cdebug("[IRGen]   struct methods: %s (%lld methods)\n",
+               sname, node.methods.length); fflush(null);
+        // Use the arena's canonical qualified name for specialized
+        // structs so method keys match the DI registration.
+        const s_di: DeclarationIndex* = this.cg.get_decl_index();
+        const s_local: SymbolStr = this.cg.qualify(node.name);
+        mut s_ref: TypeRef = s_di.lookup_type(s_local);
+        if (!s_ref.is_valid()) {
+            s_ref = s_di.lookup_type(node.name);
+        }
+        if (s_ref.is_valid()) {
+            const s_arena: TypeArena* = this.cg.get_arena();
+            const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
+            if (s_qname.is_valid()) {
+                this.state.current_impl_target = s_qname;
+            } else {
+                this.state.current_impl_target = s_local;
+            }
+        } else {
+            this.state.current_impl_target = s_local;
+        }
+        for (mut j: i64 = 0; j < node.methods.length; j++) {
+            this.generate_method_body(visitor, node.methods[j]);
+        }
+        this.state.current_impl_target = SymbolStr::empty();
+        cdebug("[IRGen]   struct methods done\n"); fflush(null);
+    }
+
+    emit_class_decl(mut &this, visitor: ASTVisitor*, node: ClassDeclNode*) -> void {
+        if (node == null) { return; }
+        if (node.generic_params.length > 0) { return; }
+        if (node.methods.length == 0) { return; }
+        const cname: string = this.cg.resolve(node.name);
+        cdebug("[IRGen]   class methods: %s (%lld methods)\n",
+               cname, node.methods.length); fflush(null);
+        this.state.current_impl_target = this.cg.qualify(node.name);
+        for (mut j: i64 = 0; j < node.methods.length; j++) {
+            this.generate_method_body(visitor, node.methods[j]);
+        }
+        this.state.current_impl_target = SymbolStr::empty();
+        cdebug("[IRGen]   class methods done\n"); fflush(null);
+    }
+
+
+    // ========================================================================
+    // Shared body-emission helpers
+    //
+    // Called from the top-level visit() overrides above.  Kept as named
+    // methods (not visit() overrides) because they're also called from
+    // `visit(StructDeclNode*)` / `visit(ClassDeclNode*)` to emit each
+    // method body without re-entering the visit dispatch for the wrapper.
+    // ========================================================================
+
+    /// Generate a function body: prologue, block walk, epilogue, validate.
+    generate_function_body(mut &this, visitor: ASTVisitor*, node: FunctionDeclNode*) -> void {
+        const fn_val: LValue = this.cg.decl.codegen_function_prologue(node);
+        if (!fn_val.is_valid()) {
+            cdebug("[IRGen]     func prologue failed\n"); fflush(null);
+            return;
+        }
+        cdebug("[IRGen]     func prologue ok, generating block...\n"); fflush(null);
+        this.dispatch.generate_block(visitor,node.body);
+        cdebug("[IRGen]     func block done, epilogue...\n"); fflush(null);
+        this.cg.decl.codegen_function_epilogue(node);
+
+        // Validate: if any block lacks a terminator, body generation
+        // failed. Strip back to a clean declare rather than emitting
+        // broken IR that fails LLVM verification; ALWAYS surface a
+        // diagnostic so the user sees a real error instead of a silent
+        // `undefined reference` from the linker.
+        if (!this.cg.diag.is_function_body_valid(fn_val)) {
+            const fname: string = this.cg.resolve(node.name);
+            this.cg.diag.report_invalid_function_body(fn_val, fname, node.span);
+        }
+    }
+
+    /// Generate every method body for an impl block.
+    generate_impl_block(mut &this, visitor: ASTVisitor*, node: ImplBlockNode*) -> void {
+        if (node.generic_params.length > 0) {
+            cdebug("[IRGen]     impl skipped (generic)\n"); fflush(null);
+            return;
+        }
+
+        // Prefer TypeResolution's canonical-qualified target so cross-
+        // module trait impls (`implement trait FmtWrite for struct
+        // Stdout` in fmt::write where Stdout lives in io::stdio) emit
+        // method bodies under the same key declare_method registered
+        // them under.  Mirrors the resolution logic in declare_impl_block.
+        const di_ptr: DeclarationIndex* = this.cg.get_decl_index();
+        mut qualified_impl_target: SymbolStr = SymbolStr::empty();
+        if (node.qualified_target_name.is_valid()) {
+            qualified_impl_target = node.qualified_target_name;
+        } else {
+            const impl_target_str: string = this.cg.resolve(node.target_type);
+            if (intrinsics::strstr(impl_target_str, "::") != null) {
+                qualified_impl_target = node.target_type;
+            } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
+                qualified_impl_target = node.target_type;
+            } else {
+                const resolved: SymbolStr = di_ptr.resolve_qualified(node.target_type);
+                if (!resolved.equals(node.target_type)) {
+                    qualified_impl_target = resolved;
+                } else {
+                    qualified_impl_target = this.cg.qualify(node.target_type);
+                }
+            }
+        }
+        // Mirror declare_impl_block: skip when the target type is a generic
+        // template; only spec'd clones should be codegen'd.
+        const cg_ctx: CompilationContext* = this.cg.ctx;
+        if (cg_ctx.generic_registry != null) {
+            const greg: GenericRegistry* = cg_ctx.generic_registry;
+            if (greg.get_template(qualified_impl_target) != null) {
+                cdebug("[IRGen]     impl skipped (template target)\n"); fflush(null);
+                return;
+            }
+        }
+        this.state.current_impl_target = qualified_impl_target;
+
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            const m: MethodNode* = node.methods[i];
+            const mfunc: FunctionDeclNode* = m.func;
+            if (mfunc != null) {
+                const mname: string = this.cg.resolve(mfunc.name);
+                cdebug("[IRGen]     method[%lld]: %s (static=%d, generic=%lld, body=%p)\n",
+                       i, mname, m.is_static as i32,
+                       mfunc.generic_params.length, mfunc.body as void*); fflush(null);
+            }
+            this.generate_method_body(visitor, m);
+            cdebug("[IRGen]     method[%lld] done\n", i); fflush(null);
+        }
+
+        this.state.current_impl_target = SymbolStr::empty();
+    }
+
+    /// Generate a method body: prologue, optional base-ctor call, block walk,
+    /// epilogue, validate.
+    generate_method_body(mut &this, visitor: ASTVisitor*, node: MethodNode*) -> void {
+        const func: FunctionDeclNode* = node.func;
+        if (func == null || func.body == null) { return; }
+        if (func.generic_params.length > 0) { return; }
+
+        cdebug("[IRGen]       method prologue...\n"); fflush(null);
+        const fn_val: LValue = this.cg.decl.codegen_method_prologue(node, this.state.current_impl_target);
+        if (!fn_val.is_valid()) {
+            cdebug("[IRGen]       method prologue FAILED\n"); fflush(null);
+            return;
+        }
+
+        // Constructor with base-class delegation (`Parser(...) : ExprParser(...)`):
+        // emit the base-class constructor call before the body so the inherited
+        // fields (e.g. ParserBase's `tokens`/`pos`) are properly initialised.
+        // Without this, every derived-class constructor returns immediately
+        // after storing its params into locals, and downstream uses of inherited
+        // fields read garbage.
+        if (node.is_constructor && node.has_base_ctor()) {
+            this.emit_base_ctor_call(visitor, node, fn_val);
+        }
+
+        cdebug("[IRGen]       method body block...\n"); fflush(null);
+        this.dispatch.generate_block(visitor,func.body);
+        cdebug("[IRGen]       method body done, epilogue...\n"); fflush(null);
+        this.cg.decl.codegen_function_epilogue(func);
+
+        if (!this.cg.diag.is_function_body_valid(fn_val)) {
+            const target_str: string = this.cg.resolve(this.state.current_impl_target);
+            const method_str: string = this.cg.resolve(func.name);
+            const pretty: string = if (intrinsics::strlen(target_str) > 0) {
+                format("%s::%s", target_str, method_str)
+            } else {
+                method_str
+            };
+            this.cg.diag.report_invalid_function_body(fn_val, pretty, func.span);
+        }
+    }
+
+    /// Emit the immediate base-class constructor call for a derived-class
+    /// constructor with `: BaseClass(args)` initialisation.  `this` (the LLVM
+    /// param 0 of the enclosing constructor) is passed as the receiver, and
+    /// `node.base_ctor_args` are codegen'd as rvalues for the remaining args.
+    emit_base_ctor_call(mut &this, visitor: ASTVisitor*, node: MethodNode*, fn_val: LValue) -> void {
+        const intern: InternTable* = this.cg.get_intern();
+        const di: DeclarationIndex* = this.cg.get_decl_index();
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+
+        // Resolve the base class name (e.g. bare "ExprParser") to its
+        // qualified form so we can build the constructor's mangled lookup
+        // key (`QualifiedBase::BareBase`).
+        mut base_qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.base_ctor_name);
+        mut base_type: TypeRef = di.lookup_type(base_qualified);
+        if (base_type.is_invalid()) {
+            base_qualified = di.resolve_qualified(node.base_ctor_name);
+            base_type = di.lookup_type(base_qualified);
+        }
+        if (base_type.is_invalid()) {
+            base_qualified = node.base_ctor_name;
+            base_type = di.lookup_type(base_qualified);
+        }
+        if (base_type.is_invalid()) { cdebug("[BCTOR-BAIL] type invalid\n"); return; }
+
+        const base_qualified_str: string = intern.resolve(base_qualified);
+        const base_bare_str: string = intern.resolve(node.base_ctor_name);
+        const ctor_combined: string = format("%s::%s", base_qualified_str, base_bare_str);
+        const ctor_sym: SymbolStr = intern.intern(ctor_combined);
+
+        // Constructor LLVM arity = user args + 1 for the implicit `this`.
+        const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
+        mut ctor_fn: LValue = this.cg.resolver.resolve_function_with_arity(ctor_sym, ctor_arity);
+        if (!ctor_fn.is_valid()) {
+            ctor_fn = this.cg.resolver.resolve_function(ctor_sym);
+        }
+        if (!ctor_fn.is_valid()) {
+            cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
+            return;
+        }
+
+        const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
+        if (!ctor_ty.is_valid()) { cdebug("[BCTOR-BAIL] ctor_ty invalid\n"); return; }
+
+        // `this` is LLVM param 0 of the enclosing constructor.
+        const this_arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+
+        mut ctor_args: Pair<LValue, TypeRef>[] = [];
+        ctor_args.push(Pair<LValue, TypeRef>::new(this_arg, base_type));
+        mut any_arg_invalid: boolean = false;
+        for (mut i: i64 = 0; i < node.base_ctor_args.length; i++) {
+            const arg_node: ExpressionNode* = node.base_ctor_args[i];
+            mut arg: LValue = this.dispatch.codegen_rvalue(visitor,arg_node);
+            if (!arg.is_valid()) {
+                any_arg_invalid = true;
+                break;
+            }
+            // codegen_rvalue's load step short-circuits when the arg's
+            // `resolved_type` doesn't map to a valid LType: base ctor
+            // args from `Parser(...) : ExprParser(tokens, source_file, ctx)`
+            // are AST identifiers wired up by the parser before sema fully
+            // resolves them, so we sometimes get the alloca address back
+            // instead of the loaded value.  With opaque pointers the
+            // mismatch is invisible to LLVM (`ptr` either way), and the
+            // chain Parser → ExprParser → ParserBase ends up storing the
+            // OUTER constructor's local-`%ctx` alloca address into
+            // `this.ctx`, leaving the parser's `ctx` field pointing at
+            // dead stack frame data the moment from_context returns.
+            //
+            // codegen_rvalue's load step short-circuits when the arg's
+            // `resolved_type` doesn't map to a valid LType: base ctor
+            // args from `Parser(...) : ExprParser(tokens, source_file, ctx)`
+            // are AST identifiers wired up by the parser before sema fully
+            // resolves them, so we sometimes get the alloca address back
+            // instead of the loaded value.  codegen_rvalue clears
+            // last_is_lvalue unconditionally before returning, so we
+            // can't use that flag; check the value's opcode directly.
+            // If `arg.raw` is still an alloca instruction (opcode 26),
+            // codegen_rvalue skipped its load and we need to deref here
+            // before passing to the base ctor.  Restrict to pointer /
+            // integer / float allocas; aggregate (struct) allocas get
+            // the load via codegen_call's ek=10/ak=12 coercion, so
+            // pre-loading would double-deref.
+            const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg.raw);
+            if (opcode == 26) {
+                const alloc_ty: void* = llvm::LLVMGetAllocatedType(arg.raw);
+                if (alloc_ty != null) {
+                    const alloc_kind: LTypeKind = type_kind_of(alloc_ty);
+                    if (alloc_kind == LTypeKind::Pointer || alloc_kind == LTypeKind::Integer
+                            || alloc_kind == LTypeKind::Float || alloc_kind == LTypeKind::Double) {
+                        const alloc_lty: LType = LType { raw: alloc_ty };
+                        arg = this.cg.builder.build_load(
+                            alloc_lty, arg, "base.arg.load");
+                    }
+                }
+            }
+            ctor_args.push(Pair<LValue, TypeRef>::new(arg, arg_node.resolved_type));
+        }
+        if (any_arg_invalid) { cdebug("[BCTOR-BAIL] any_arg_invalid\n"); return; }
+
+        mut ctor_result: LValue = LValue::null();
+        ctor_result = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
+    }
+}

@@ -9,8 +9,8 @@ import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
 import Compiler::Codegen::Context;
-import Compiler::Codegen::IntrinsicsCodegen;
-import Compiler::Codegen::IRGenerator;
+import Compiler::Codegen::Ops::IntrinsicsCodegen;
+import Compiler::Codegen::Visit::IRGenerator;
 import Compiler::CompilationContext;
 import Compiler::ProjectConfig;
 import Compiler::Artifacts;
@@ -224,9 +224,17 @@ type struct CodegenPasses {
         cg.intrinsics.emit_format_runtime();
         cg.intrinsics.emit_panic_runtime();
 
-        // Create the visitor and generate IR.
+        // Create the visitor and generate IR.  Heap-allocate via Box::leak
+        // so sub-emitters can hold stable `state: VisitorState*` back-pointers
+        // into `gen.state`; same two-phase pattern as `CodegenContext` above.
         cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
-        mut gen: IRGeneratorVisitor = IRGeneratorVisitor(cg);
+        const _box_gen: Box<IRGeneratorVisitor> = Box<IRGeneratorVisitor>::new(IRGeneratorVisitor(cg));
+        const gen: IRGeneratorVisitor* = _box_gen.leak();
+        // Two-phase init step 2: wire back-pointers on sub-emitters now
+        // that `gen` is at its stable heap address.  No-op while the
+        // visitor's sub-emitter set is empty; the call site is in place
+        // for incremental extraction.
+        gen.wire();
         cdebug("[Codegen] Step 13: Getting program AST...\n");
         const program: ProgramNode* = ctx.artifacts.ast.program();
         cdebug("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
