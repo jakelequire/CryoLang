@@ -1,0 +1,1058 @@
+/// Call Emitter
+///
+/// Lowering for `node.callee(args)` in all its shapes:
+///   - bare-identifier call (`foo(x)`)             → direct call after sema's mangled-callee
+///   - method-on-object (`obj.method(x)`)          → vtable dispatch when virtual
+///   - scope-resolution call (`Mod::fn(x)`)        → qualified resolver lookup
+///   - class/struct construction (`Cls(args)`)     → alloca + ctor invocation + load
+///   - enum variant construction                   → delegated to EnumVariantEmitter
+///   - intrinsic call (`@-prefixed or builtins`)   → inline IR via IntrinsicEmitter::try_emit
+///   - divergent callee (`panic`)                   → call followed by `unreachable`
+///
+/// Holds the full bundle of back-pointers needed to evaluate argument
+/// expressions (`dispatch`), look up symbols (`cg.resolver`), and
+/// construct enum variant values (`enum_variant`).  The visitor passes
+/// itself as `ASTVisitor*` so element-expression evaluation can recurse
+/// via `accept(visitor)` through `dispatch.codegen_rvalue`.
+
+namespace Compiler::Codegen::Visit::CallEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::State::VisitorState;
+import Compiler::Codegen::Visit::ExprDispatch;
+import Compiler::Codegen::Visit::EnumVariantEmitter;
+import Compiler::Codegen::Ops::IntrinsicsCodegen;
+import Compiler::Codegen::Util;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::ModuleGraph;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
+import Compiler::Types::Resolver;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::Lex;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
+import std::collections::pair;
+
+
+// ============================================================================
+// CallEmitter
+// ============================================================================
+
+type struct CallEmitter {
+    cg:           CodegenContext*;
+    state:        VisitorState*;
+    dispatch:     ExprDispatch*;
+    enum_variant: EnumVariantEmitter*;
+
+    static null() -> CallEmitter {
+        return CallEmitter {
+            cg:           null,
+            state:        null,
+            dispatch:     null,
+            enum_variant: null,
+        };
+    }
+
+    wire(mut &this, cg: CodegenContext*, state: VisitorState*,
+                    dispatch: ExprDispatch*, enum_variant: EnumVariantEmitter*) -> void {
+        this.cg           = cg;
+        this.state        = state;
+        this.dispatch     = dispatch;
+        this.enum_variant = enum_variant;
+    }
+
+
+    // ========================================================================
+    // Small helpers (inlined from IRGeneratorVisitor)
+    // ========================================================================
+
+    /// Current LLVM function pointer for entry-block alloca placement.
+    get_current_function(&this) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!bb.is_valid()) {
+            this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
+                "codegen: builder has no insert block; cannot determine current function");
+            return LValue::null();
+        }
+        return bb.get_parent();
+    }
+
+    /// Determine whether an AST call callee resolves to a known
+    /// divergent (non-returning) function.  Drives the post-call
+    /// `unreachable` emission without relying on string-comparing the
+    /// emitted LLVM symbol name to a hard-coded mangle.
+    ///
+    /// Recognized:
+    ///   - bare `panic` (the intrinsic / legacy stdlib path)
+    ///   - any function `panic` whose containing namespace ends in
+    ///     `::core::panic` or `::prelude` (matches the new stdlib's
+    ///     `std::core::panic::panic` and the legacy `std::prelude::panic`)
+    ///
+    /// When the language gains `-> never` return-type syntax this is
+    /// the path that should subsume the special cases.
+    is_divergent_callee(&this, callee: ExpressionNode*) -> boolean {
+        if (callee == null) { return false; }
+        const intern: InternTable* = this.cg.get_intern();
+
+        if (callee.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = callee as IdentifierNode*;
+            const name_str: string = intern.resolve(id.name);
+            if (intrinsics::strcmp(name_str, "panic") == 0) { return true; }
+            return false;
+        }
+
+        if (callee.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
+            const member_str: string = intern.resolve(sr.member_name);
+            if (intrinsics::strcmp(member_str, "panic") != 0) { return false; }
+
+            const scope_str: string = intern.resolve(sr.scope_name);
+            const slen: i64 = intrinsics::strlen(scope_str) as i64;
+            // Match `<...>::core::panic`.
+            if (slen >= 11) {
+                const tail11: string = (scope_str + (slen - 11)) as string;
+                if (intrinsics::strcmp(tail11, "core::panic") == 0) { return true; }
+            }
+            // Match `<...>::prelude` and the bare `prelude` form.
+            if (slen >= 7) {
+                const tail7: string = (scope_str + (slen - 7)) as string;
+                if (intrinsics::strcmp(tail7, "prelude") == 0) { return true; }
+            }
+            // Match `intrinsics` / `core::intrinsics` (the stdlib's
+            // panic emerges through this layer too).
+            if (slen >= 10) {
+                const tail10: string = (scope_str + (slen - 10)) as string;
+                if (intrinsics::strcmp(tail10, "intrinsics") == 0) { return true; }
+            }
+            if (intrinsics::strcmp(scope_str, "intrinsics") == 0) { return true; }
+            return false;
+        }
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // Main emit
+    // ========================================================================
+
+    /// Lower `node.callee(args)` into LLVM IR.  Mirrors the visitor's
+    /// `override visit(CallExprNode*)`; the visitor passes itself as
+    /// `visitor: ASTVisitor*` so argument expressions can recurse via
+    /// `accept(visitor)` through `dispatch.codegen_rvalue`.
+    emit(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> void {
+        mut callee_val: LValue = LValue::null();
+
+        // Break pointer chains into locals (see the codegen helper note).
+        const ctx_ptr: CompilationContext* = this.cg.ctx;
+        const intern: InternTable* = this.cg.get_intern();
+
+        // Virtual-dispatch state: populated in the MemberAccess branch when
+        // the static receiver type declares virtual methods and the called
+        // method has a vtable slot.  If set, after we emit arg evaluation
+        // and fn_ty lookup, we replace `callee_val` with a vtable-indexed
+        // function-pointer load instead of a direct call to the statically
+        // resolved function.
+        mut vtable_dispatch: boolean = false;
+        mut vtable_slot_idx: i32 = -1;
+        mut vtable_obj_ref: TypeRef = TypeRef::invalid();
+
+        if (node.callee.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = node.callee as IdentifierNode*;
+            const id_arity: u32 = node.arguments.length as u32;
+
+            // Intrinsics first: `i32_to_i64`, `ptr_add`, `bswap32`, etc.
+            // are emitted as inline LLVM IR, not as real function calls,
+            // so they have no LLVM definition.  If sema pinned
+            // `resolved_callee` to an intrinsic's mangled name, the
+            // module DOES contain an extern declaration (from
+            // declare_function), but no module DEFINES the function;
+            // calling it would emit a real call and the link step would
+            // fail with `undefined reference`.  Run the inline dispatcher
+            // up front to avoid that path.
+            const intr_name_str: string = intern.resolve(id.name);
+            mut intr_args: LValue[] = [];
+            mut intr_args_evaluated: boolean = false;
+            mut intr_result: LValue = LValue::null();
+            if (is_intrinsic_name(intr_name_str)) {
+                for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                    intr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
+                }
+                intr_args_evaluated = true;
+                match (this.cg.intrinsics.try_emit(intr_name_str, intr_args)) {
+                    Option::Some(v) => {
+                        this.state.last_value = v;
+                        this.state.last_is_lvalue = false;
+                        return;
+                    }
+                    Option::None => { }
+                }
+            }
+
+            // Trust sema: `resolved_callee` is the mangled LLVM symbol
+            // chosen by overload resolution (or, for unique-name
+            // functions, the canonical mangling registered by
+            // declare_function).  Sema runs
+            // `try_pin_overload_mangled_callee` on every Identifier
+            // call, so any function known to the DeclarationIndex
+            // (qualified, bare-aliased, overloaded, or unique) gets
+            // pinned to its registered mangled symbol.  Codegen calls
+            // `resolve_function_by_mangled` once on that symbol; the
+            // qualified/bare/DI-mapping cascade that used to live here
+            // was re-resolving names sema had already resolved.  See
+            // memory/feedback_codegen_architecture_rules.md.
+            if (node.resolved_callee.is_valid()) {
+                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            }
+
+            // 3b. Class / struct constructor call: `ClassName(args)` resolves
+            //     to the method named `ClassName` on the class itself,
+            //     registered as `{qualified_class}::ClassName`.  Sema sets
+            //     the call's resolved_type to the class type for this form.
+            //     Unlike the `new` form (which heap-allocates), this emits
+            //     a stack-local construction: alloca the object, call the
+            //     constructor with the alloca pointer as `this`, then load
+            //     the populated value so the caller sees an rvalue of the
+            //     class type.
+            if (!callee_val.is_valid()) {
+                const di: DeclarationIndex* = this.cg.get_decl_index();
+                mut type_ref: TypeRef = di.lookup_type(id.name);
+                mut ctor_qn: SymbolStr = SymbolStr::empty();
+                if (type_ref.is_valid()) {
+                    const arena: TypeArena* = this.cg.get_arena();
+                    ctor_qn = arena.get_qualified_name(type_ref);
+                }
+                if (!ctor_qn.is_valid()) {
+                    const resolved: SymbolStr = di.resolve_qualified(id.name);
+                    if (resolved.is_valid() && !resolved.equals(id.name)) {
+                        ctor_qn = resolved;
+                        // Refetch the type through the qualified alias
+                        // (cross-module types only reachable via DI's
+                        // bare→qualified map).
+                        if (!type_ref.is_valid()) {
+                            type_ref = di.lookup_type(ctor_qn);
+                        }
+                    }
+                }
+                if (ctor_qn.is_valid() && type_ref.is_valid()) {
+                    const qn_str: string = intern.resolve(ctor_qn);
+                    const bare_str: string = intern.resolve(id.name);
+                    const combined: string = format("%s::%s", qn_str, bare_str);
+                    const ctor_sym: SymbolStr = intern.intern(combined);
+                    // Constructor LLVM arity = user args + 1 for `this`.
+                    const ctor_arity: u32 = (node.arguments.length + 1) as u32;
+                    mut ctor_fn: LValue = this.cg.resolver.resolve_function_with_arity(ctor_sym, ctor_arity);
+                    if (!ctor_fn.is_valid()) {
+                        ctor_fn = this.cg.resolver.resolve_function(ctor_sym);
+                    }
+                    if (ctor_fn.is_valid()) {
+                        const mapped: LType = this.cg.type_mapper.map_type(type_ref);
+                        const current_fn: LValue = this.get_current_function();
+                        if (mapped.is_valid() && current_fn.is_valid()) {
+                            const obj_alloca: LValue = this.cg.flow.create_entry_alloca(
+                                current_fn, "ctor.tmp", mapped);
+                            // Vtable slot for classes with virtual methods.
+                            const t_for_vtbl: Type* = this.cg.lookup_type_by_id(type_ref.id);
+                            if (t_for_vtbl != null && t_for_vtbl.kind == TypeKind::Class) {
+                                const cls_vtbl: ClassType* = t_for_vtbl as ClassType*;
+                                if (cls_vtbl.has_virtual_methods) {
+                                    const qname: QualifiedName = QualifiedName::from_symbol(ctor_qn);
+                                    const vtbl_name: string = MangledName::for_vtable(
+                                        intern, qname).resolve(intern);
+                                    mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
+                                    if (!vtbl_global.is_valid()) {
+                                        // Cross-module reference: declare the
+                                        // vtable as extern.  Mirrors the new-
+                                        // expression path: the placeholder type
+                                        // doesn't need to match the definition
+                                        // exactly (opaque pointers), the linker
+                                        // resolves by symbol name.  Without
+                                        // this, constructor calls into a class
+                                        // defined in another module skip the
+                                        // vptr init entirely and any virtual
+                                        // dispatch on the result reads garbage.
+                                        const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
+                                        const placeholder_ty: LType = LType::array_of(fn_ptr_ty, 1);
+                                        vtbl_global = this.cg.llvm_module.add_global(placeholder_ty, vtbl_name);
+                                    }
+                                    if (vtbl_global.is_valid()) {
+                                        const vptr_slot: LValue = this.cg.builder.build_struct_gep(
+                                            mapped, obj_alloca, 0, "vptr.slot");
+                                        if (vptr_slot.is_valid()) {
+                                            this.cg.builder.build_store(vtbl_global, vptr_slot);
+                                        }
+                                    }
+                                }
+                            }
+                            const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
+                            if (ctor_ty.is_valid() && type_kind_of(ctor_ty.raw) == LTypeKind::Function) {
+                                mut ctor_args: Pair<LValue, TypeRef>[] = [];
+                                ctor_args.push(Pair<LValue, TypeRef>::new(obj_alloca, node.resolved_type));
+                                for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
+                                    const carg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ci]);
+                                    ctor_args.push(Pair<LValue, TypeRef>::new(carg, node.arguments[ci].resolved_type));
+                                }
+                                mut ctor_res: LValue = LValue::null();
+                                ctor_res = this.cg.expr_ops.codegen_call(ctor_fn, ctor_ty, ctor_args, "");
+                            }
+                            // Load the constructed value as the expression result.
+                            const loaded: LValue = this.cg.builder.build_load(
+                                mapped, obj_alloca, "ctor.val");
+                            this.state.last_value = loaded;
+                            this.state.last_is_lvalue = false;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // 4. Function-typed parameter: look in named_values (local scope).
+            //    If the identifier refers to a parameter of function type,
+            //    it will be stored as an alloca in named_values.  Load the
+            //    function pointer and call through it.
+            //    We must handle the call here because the loaded value is an
+            //    instruction, not a GlobalValue; LLVMGlobalGetValueType
+            //    would segfault on it.
+            if (!callee_val.is_valid()) {
+                const local: LValue = this.cg.values.get(id.name);
+                if (local.is_valid()) {
+                    // Build the LLVM function type from the Cryo FunctionType.
+                    // Unwrap Pointer/Reference if the param type is &fn(...).
+                    mut callee_type_ref: TypeRef = id.resolved_type;
+                    mut callee_t: Type* = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    if (callee_t != null && callee_t.kind == TypeKind::Pointer) {
+                        const pt: PointerType* = callee_t as PointerType*;
+                        callee_type_ref = pt.pointee;
+                        callee_t = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    } else if (callee_t != null && callee_t.kind == TypeKind::Reference) {
+                        const rt: ReferenceType* = callee_t as ReferenceType*;
+                        callee_type_ref = rt.referent;
+                        callee_t = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    }
+                    if (callee_t != null && callee_t.kind == TypeKind::Function) {
+                        const ft: FunctionType* = callee_t as FunctionType*;
+                        // Map return type.
+                        const ret_ty: LType = this.cg.type_mapper.map_type(ft.return_type);
+                        if (!ret_ty.is_valid()) {
+                            this.state.last_value = LValue::null();
+                            this.state.last_is_lvalue = false;
+                            return;
+                        }
+                        // Map parameter types.
+                        const param_count: u32 = ft.param_types.length as u32;
+                        mut fn_type: LType = LType::null();
+                        if (param_count == 0) {
+                            fn_type = LType::function_type(ret_ty, null, 0, false);
+                        } else {
+                            const pbuf: void* = intrinsics::malloc(param_count as u64 * 8);
+                            const pslots: void** = pbuf as void**;
+                            mut valid: boolean = true;
+                            for (mut pi: u32 = 0; pi < param_count; pi++) {
+                                const pt: LType = this.cg.type_mapper.map_type(ft.param_types[pi]);
+                                if (!pt.is_valid()) { valid = false; break; }
+                                pslots[pi] = pt.raw;
+                            }
+                            if (!valid) {
+                                intrinsics::free(pbuf);
+                                this.state.last_value = LValue::null();
+                                this.state.last_is_lvalue = false;
+                                return;
+                            }
+                            fn_type = LType::function_type(ret_ty, pbuf, param_count, false);
+                            intrinsics::free(pbuf);
+                        }
+                        // Load the function pointer from the alloca.
+                        const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
+                        const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, "fn.ptr.load");
+                        // Codegen arguments.
+                        mut call_args: Pair<LValue, TypeRef>[] = [];
+                        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                            const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
+                            call_args.push(Pair<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
+                        }
+                        // Build the call.
+                        const void_ty: LType = LType::void_type();
+                        const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
+                        mut call_result: LValue = LValue::null();
+                        call_result = this.cg.expr_ops.codegen_call(fn_ptr, fn_type, call_args, call_name);
+                        this.state.last_value = call_result;
+                        this.state.last_is_lvalue = false;
+                        return;
+                    }
+                }
+            }
+        } else if (node.callee.kind == NodeKind::ScopeResolution) {
+            // Scope resolution: e.g., LValue::null(), TypeRef::invalid().
+            // The scope name may be bare (LValue) while the function was
+            // registered under the qualified type name.
+            // Resolve the scope name through the DI type map to get the
+            // qualified type name, then build the combined key.
+            const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
+            const di: DeclarationIndex* = this.cg.get_decl_index();
+
+            // Inline-lower intrinsics referenced via a namespace prefix
+            // (e.g., `intrinsics::isfinite`, `intrinsics::ptr_add`).  The
+            // leaf name uniquely identifies the intrinsic; the prefix is
+            // ignored because intrinsics live in the global LLVM namespace,
+            // not in the source-level module they were declared in.  Run
+            // BEFORE the resolved_callee lookup: sema pins
+            // `intrinsics::ptr_add` as a qualified callee symbol, and the
+            // declaration table would happily declare it as an extern,
+            // causing the linker to look for a real `ptr_add` symbol that
+            // doesn't exist (intrinsics are lowered inline, never linked).
+            const sr_leaf_str: string = intern.resolve(sr.member_name);
+            if (is_intrinsic_name(sr_leaf_str)) {
+                mut sr_args: LValue[] = [];
+                for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
+                    sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));
+                }
+                match (this.cg.intrinsics.try_emit(sr_leaf_str, sr_args)) {
+                    Option::Some(v) => {
+                        this.state.last_value = v;
+                        this.state.last_is_lvalue = false;
+                        return;
+                    }
+                    Option::None => { }
+                }
+            }
+
+            // Sema-pinned callee: set by the monomorphizer's body walk
+            // for generic free-function calls (`mem::offset(p, n)`,
+            // `Layout::array<T>(n)`) AND by sema's `try_resolve_*` static-
+            // method / module-function / cimport-function paths.  Routes
+            // through `resolve_function_by_mangled`, identical to the
+            // Identifier branch.  The fallback chain below still runs for
+            // call shapes sema doesn't yet pin (the spec-first lookup
+            // based on `node.resolved_type`, enum-variant constructors).
+            if (node.resolved_callee.is_valid()) {
+                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            }
+
+            // Resolve the scope name (e.g., "LValue") to its qualified form
+            // (e.g., "Compiler::Codegen::LLVMTypes::LValue") via the DI mapping.
+            const resolved_scope: SymbolStr = di.resolve_qualified(sr.scope_name);
+            const scope_str: string = intern.resolve(resolved_scope);
+            const sr_arity: u32 = node.arguments.length as u32;
+
+            // Spec-first: when `node.resolved_type` is a generic instantiation,
+            // the call resolves to the spec'd method (e.g.
+            // `Map<string, Argument>::new`), not the bare template (`Map::new`).
+            // The bare template is also registered in the DI when the source
+            // contains `type struct Map<K,V> { static new() ... }`; the inner
+            // `Map` return type resolves to the bare struct, and a bare-mangled
+            // declaration ends up in the function table.  Without trying the
+            // spec name first, the bare-name lookup at the next step finds
+            // that template and emits a call to a symbol nobody defines.
+            mut conc_ref0: TypeRef = node.resolved_type;
+            mut conc_t0: Type* = this.cg.lookup_type_by_id(conc_ref0.id);
+            mut fc0: i32 = 0;
+            while (conc_t0 != null && conc_t0.kind == TypeKind::InstantiatedType && fc0 < 5) {
+                const ci0: InstantiatedType* = conc_t0 as InstantiatedType*;
+                if (ci0.has_resolved_type()) {
+                    conc_ref0 = ci0.resolved_type;
+                    conc_t0 = this.cg.lookup_type_by_id(conc_ref0.id);
+                } else { break; }
+                fc0 += 1;
+            }
+            if (conc_t0 != null) {
+                mut conc_name0: string = "";
+                if (conc_t0.kind == TypeKind::Struct) {
+                    const cst0: StructType* = conc_t0 as StructType*;
+                    conc_name0 = intern.resolve(cst0.qualified_name);
+                } else if (conc_t0.kind == TypeKind::Class) {
+                    const cct0: ClassType* = conc_t0 as ClassType*;
+                    conc_name0 = intern.resolve(cct0.qualified_name);
+                } else if (conc_t0.kind == TypeKind::Enum) {
+                    const cet0: EnumType* = conc_t0 as EnumType*;
+                    conc_name0 = intern.resolve(cet0.qualified_name);
+                } else if (conc_t0.kind == TypeKind::InstantiatedType) {
+                    // Unresolved InstantiatedType: sema's expected_type
+                    // fallback returned a generic instantiation that the
+                    // monomorphizer hadn't yet pinned to its spec struct
+                    // when codegen ran. Compute the deterministic spec
+                    // mangled name from `(generic_base, type_args)` and
+                    // try to find the registered spec method directly.
+                    const ci_unres: InstantiatedType* = conc_t0 as InstantiatedType*;
+                    const base_qname: SymbolStr = this.cg.get_arena().get_qualified_name(
+                        ci_unres.generic_base);
+                    if (base_qname.is_valid()) {
+                        const base_qn: QualifiedName = QualifiedName::from_symbol(base_qname);
+                        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+                            this.cg.get_intern(), this.cg.get_arena(), base_qn,
+                            ci_unres.type_args);
+                        if (spec_sym.is_valid()) {
+                            conc_name0 = intern.resolve(spec_sym);
+                        }
+                    }
+                }
+                // Don't overwrite a callee_val that the resolved_callee path
+                // already produced; the monomorphizer's pin is authoritative
+                // for spec'd generic free-function callees, and rebuilding the
+                // lookup key from `node.resolved_type` (the call's return type)
+                // collapses spec'd static methods like `Layout::array<Point>`
+                // to the bare-template `Layout::array` symbol.
+                if (!callee_val.is_valid() && intrinsics::strlen(conc_name0) > 0) {
+                    const member_str0: string = intern.resolve(sr.member_name);
+                    const conc_combined0: string = format("%s::%s", conc_name0, member_str0);
+                    const conc_sym0: SymbolStr = intern.intern(conc_combined0);
+                    callee_val = this.cg.resolver.resolve_function_with_arity(conc_sym0, sr_arity);
+                    if (!callee_val.is_valid()) {
+                        callee_val = this.cg.resolver.resolve_function(conc_sym0);
+                    }
+                }
+            }
+
+            // Post-substitution combined-key lookup: in spec'd function
+            // bodies, AST substituter rewrites `sr.scope_name` from
+            // `String` to the bare-leaf spec form (`6String$L...$G`).
+            // Sema's pin was on the pre-substitution template form
+            // (`String::method`) and the substituter doesn't update
+            // `resolved_callee`, so when codegen lands on this branch the
+            // pinned symbol is for a function that only exists at
+            // template time.  `di.resolve_qualified(sr.scope_name)` maps
+            // the bare-leaf spec back to its fully-qualified arena name
+            // (registered by specialization.cryo), and the combined
+            // `<qualified>::<method>` lookup finds the spec's LLVM
+            // symbol.  Sema upstreams the non-spec case via pinned
+            // `resolved_callee`; this branch covers the spec-context
+            // lookups until AST cloning clears stale callee pins.
+            if (!callee_val.is_valid()) {
+                const combined: string = format("%s::%s", scope_str, intern.resolve(sr.member_name));
+                const sym: SymbolStr = intern.intern(combined);
+                callee_val = this.cg.resolver.resolve_function_with_arity(sym, sr_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = this.cg.resolver.resolve_function(sym);
+                }
+            }
+
+            // Module-graph walk: when source writes a shorthand path like
+            // `libc::read` or `CHeaderImport::run`, find every module
+            // whose namespace ends with `::scope_str` (or equals it).
+            // Sema's `resolve_module_qualified_function` mirrors this and
+            // pins resolved_callee for non-spec cases; this branch covers
+            // call sites whose scope name was substituted (where sema's
+            // pin is for the template form) or otherwise didn't pin.
+            if (!callee_val.is_valid()) {
+                const matches: SymbolStr[] = collect_namespace_suffix_matches(
+                    this.cg, intern, scope_str, sr.member_name, sr_arity);
+                if (matches.length == 1) {
+                    callee_val = this.cg.resolver.resolve_function_with_arity(matches[0], sr_arity);
+                    if (!callee_val.is_valid()) {
+                        callee_val = this.cg.resolver.resolve_function(matches[0]);
+                    }
+                } else if (matches.length > 1) {
+                    mut detail: string = "";
+                    for (mut k: i64 = 0; k < matches.length; k++) {
+                        const alt_str: string = intern.resolve(matches[k]);
+                        if (k == 0) { detail = format("  - `%s`", alt_str); }
+                        else        { detail = format("%s\n  - `%s`", detail, alt_str); }
+                    }
+                    const msg: string = format(
+                        "ambiguous call `%s::%s`: %lld modules match the namespace suffix `%s` and define `%s`\n%s",
+                        scope_str, intern.resolve(sr.member_name),
+                        matches.length, scope_str, intern.resolve(sr.member_name), detail);
+                    this.cg.diag.emit_error_at_span(
+                        ErrorCode::E0154_AMBIGUOUS_CALL, msg, node.span);
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+            }
+
+            // Fallback 1: try the bare member name.  Extern "C" functions
+            // (e.g., llvm::LLVMGetTypeKind) are registered under their
+            // unqualified C name, not the scope-qualified form.
+            // Use arity-aware lookup first to discriminate between overloads
+            // that share a bare name (e.g., the `read` intrinsic vs the free
+            // `std::fs::file::read(path: string)`, both reachable under bare
+            // "read" via type_resolution's bare-alias registration).
+            if (!callee_val.is_valid()) {
+                callee_val = this.cg.resolver.resolve_function_with_arity(sr.member_name, sr_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = this.cg.resolver.resolve_function(sr.member_name);
+                }
+            }
+
+            // If the function wasn't found, check if this is an enum variant
+            // constructor (e.g., Option::Some, Result::Ok).  Enum constructors
+            // are not registered as functions; synthesize the value inline.
+            // Use node.resolved_type (the sema-resolved result type of the call)
+            // to find the concrete monomorphized enum, not the scope name
+            // (which may still be the generic "Option" template name).
+            if (!callee_val.is_valid()) {
+                mut real_ref: TypeRef = node.resolved_type;
+                mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
+                // Follow InstantiatedType chain (may be multiple levels deep).
+                mut follow_count: i32 = 0;
+                while (real_t != null && real_t.kind == TypeKind::InstantiatedType && follow_count < 5) {
+                    const inst: InstantiatedType* = real_t as InstantiatedType*;
+                    if (inst.has_resolved_type()) {
+                        real_ref = inst.resolved_type;
+                        real_t = this.cg.lookup_type_by_id(real_ref.id);
+                    } else {
+                        break;
+                    }
+                    follow_count += 1;
+                }
+                // Also try: the scope name might resolve to a type directly
+                // (for cases where resolved_type isn't set on the call node).
+                if (real_t == null || (real_t.kind != TypeKind::Enum && real_t.kind != TypeKind::Struct)) {
+                    const scope_ref: TypeRef = di.lookup_type(resolved_scope);
+                    if (scope_ref.is_valid()) {
+                        real_ref = scope_ref;
+                        real_t = this.cg.lookup_type_by_id(real_ref.id);
+                        mut sc: i32 = 0;
+                        while (real_t != null && real_t.kind == TypeKind::InstantiatedType && sc < 5) {
+                            const sinst: InstantiatedType* = real_t as InstantiatedType*;
+                            if (sinst.has_resolved_type()) {
+                                real_ref = sinst.resolved_type;
+                                real_t = this.cg.lookup_type_by_id(real_ref.id);
+                            } else { break; }
+                            sc += 1;
+                        }
+                    }
+                }
+                if (real_t != null && real_t.kind == TypeKind::Enum) {
+                    const et: EnumType* = real_t as EnumType*;
+                    const variant: EnumVariantInfo* = et.get_variant(sr.member_name);
+                    if (variant != null) {
+                        // Codegen the arguments first.
+                        mut vargs: LValue[] = [];
+                        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                            vargs.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
+                        }
+                        const result: LValue = this.enum_variant.build(et, variant, real_ref, vargs);
+                        this.state.last_value = result;
+                        this.state.last_is_lvalue = false;
+                        return;
+                    }
+                }
+            }
+        } else if (node.callee.kind == NodeKind::MemberAccess) {
+            // Member access: sema's `resolve_method_overload` pins the
+            // mangled LLVM callee on `resolved_callee` for inherent
+            // class/struct/enum methods AND for trait-impl methods on
+            // non-generic receivers.  Codegen detects the function-
+            // pointer-field shortcut, picks up virtual-dispatch state for
+            // class receivers, then routes the pinned symbol through
+            // `resolve_function_by_mangled`.  The post-specialization
+            // fallback at the bottom covers methods on spec'd receivers
+            // (InstantiatedType, where sema runs before monomorphization
+            // and the receiver's concrete spec name doesn't exist yet).
+            const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            const di: DeclarationIndex* = this.cg.get_decl_index();
+            const method_str: string = intern.resolve(ma.member);
+
+            // Function-pointer field call: `receiver.field(args)` where
+            // `field` has a Function type.  Sema sets
+            // `ma.resolved_type` to that Function; we load the field then
+            // call indirectly through the loaded pointer.  Without this,
+            // codegen would chase method lookups and bottom out on
+            // "no method found" for every callback-style stdlib field.
+            mut ma_callee_t: Type* = this.cg.lookup_type_by_id(ma.resolved_type.id);
+            // Unwrap pointer/reference to match how function-typed fields
+            // land; `fn(...) -> T` stores as a raw function-pointer so the
+            // member may resolve to a Function type directly.
+            mut ma_fn_type: FunctionType* = null;
+            if (ma_callee_t != null && ma_callee_t.kind == TypeKind::Function) {
+                ma_fn_type = ma_callee_t as FunctionType*;
+            } else if (ma_callee_t != null && ma_callee_t.kind == TypeKind::Pointer) {
+                const ppt: PointerType* = ma_callee_t as PointerType*;
+                const pin: Type* = this.cg.lookup_type_by_id(ppt.pointee.id);
+                if (pin != null && pin.kind == TypeKind::Function) {
+                    ma_fn_type = pin as FunctionType*;
+                }
+            }
+            if (ma_fn_type != null) {
+                const ft: FunctionType* = ma_fn_type;
+                const ret_ty: LType = this.cg.type_mapper.map_type(ft.return_type);
+                if (!ret_ty.is_valid()) {
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                const param_count: u32 = ft.param_types.length as u32;
+                mut llvm_fn_type: LType = LType::null();
+                if (param_count == 0) {
+                    llvm_fn_type = LType::function_type(ret_ty, null, 0, false);
+                } else {
+                    const pbuf: void* = intrinsics::malloc(param_count as u64 * 8);
+                    const pslots: void** = pbuf as void**;
+                    mut all_valid: boolean = true;
+                    for (mut pi: u32 = 0; pi < param_count; pi++) {
+                        const pty: LType = this.cg.type_mapper.map_type(ft.param_types[pi]);
+                        if (!pty.is_valid()) { all_valid = false; break; }
+                        pslots[pi] = pty.raw;
+                    }
+                    if (!all_valid) {
+                        intrinsics::free(pbuf);
+                        this.state.last_value = LValue::null();
+                        this.state.last_is_lvalue = false;
+                        return;
+                    }
+                    llvm_fn_type = LType::function_type(ret_ty, pbuf, param_count, false);
+                    intrinsics::free(pbuf);
+                }
+                // Load the fn-pointer value from the field (rvalue).
+                const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,ma);
+                if (!fn_ptr.is_valid()) {
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                // Codegen user args (no implicit `this`; the fn-pointer field
+                // is a plain function, not a bound method).
+                mut fnp_args: Pair<LValue, TypeRef>[] = [];
+                for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+                    const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
+                    fnp_args.push(Pair<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
+                }
+                const void_ty: LType = LType::void_type();
+                const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
+                mut call_result: LValue = LValue::null();
+                call_result = this.cg.expr_ops.codegen_call(fn_ptr, llvm_fn_type, fnp_args, call_name);
+                this.state.last_value = call_result;
+                this.state.last_is_lvalue = false;
+                return;
+            }
+
+            // Get the object's type, unwrapping pointer/reference.
+            mut obj_ref: TypeRef = ma.object.resolved_type;
+            mut t: Type* = this.cg.lookup_type_by_id(obj_ref.id);
+            if (t != null && t.kind == TypeKind::Pointer) {
+                const ptr_t: PointerType* = t as PointerType*;
+                obj_ref = ptr_t.pointee;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
+            } else if (t != null && t.kind == TypeKind::Reference) {
+                const ref_t: ReferenceType* = t as ReferenceType*;
+                obj_ref = ref_t.referent;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
+            }
+
+            // Follow InstantiatedType chain to get the concrete type's TypeRef.
+            mut inst_depth: i32 = 0;
+            while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (inst.has_resolved_type()) {
+                    obj_ref = inst.resolved_type;
+                    t = this.cg.lookup_type_by_id(obj_ref.id);
+                } else { break; }
+                inst_depth += 1;
+            }
+
+            // Also unwrap pointer/reference AFTER InstantiatedType unwrap
+            // (some monomorphized types resolve to Pointer<ConcreteStruct>).
+            if (t != null && t.kind == TypeKind::Pointer) {
+                const ptr_t2: PointerType* = t as PointerType*;
+                obj_ref = ptr_t2.pointee;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
+            } else if (t != null && t.kind == TypeKind::Reference) {
+                const ref_t2: ReferenceType* = t as ReferenceType*;
+                obj_ref = ref_t2.referent;
+                t = this.cg.lookup_type_by_id(obj_ref.id);
+            }
+
+            // Use DI type_reverse to get the type's registered name,
+            // then look up "QualifiedType::method" in the function map.
+            // For ArrayType, use the element-type → Array_<T> mapping
+            // since ArrayType TypeRefs are not canonical.  Only used by
+            // the post-specialization fallback below (when sema's pin
+            // was empty or its symbol isn't in the LLVM module).
+            mut type_sym: SymbolStr = di.lookup_type_name(obj_ref);
+            if (!type_sym.is_valid() && t != null && t.kind == TypeKind::Array) {
+                const arr_t: ArrayType* = t as ArrayType*;
+                type_sym = di.lookup_array_type_name(arr_t.element);
+            }
+
+            // Check for virtual dispatch: if the STATIC receiver type is a
+            // class with virtual methods and sema has resolved this call
+            // to a specific method declaration, dispatch indirectly through
+            // the object's vtable pointer.  We use the static type (rather
+            // than walking to the most-derived type) because the vtable
+            // layout is defined by the static type's declaration order;
+            // subclass vtables are inheritance-complete, so `slot[idx]`
+            // resolves correctly at runtime to whatever override the
+            // dynamic type installed.  The slot key is (name, param_types)
+            // read directly from sema's resolved method; no string
+            // matching, no guessing at arg-type display names, no chance
+            // of collapsing overloads.
+            if (t != null && t.kind == TypeKind::Class &&
+                node.resolved_method != null) {
+                const cls_for_vtbl: ClassType* = t as ClassType*;
+                if (cls_for_vtbl.has_virtual_methods) {
+                    const rm: MethodNode* = node.resolved_method as MethodNode*;
+                    if (rm != null && rm.func != null) {
+                        const fn_node: FunctionDeclNode* = rm.func;
+                        // Extract the resolved method's declared param
+                        // types (skipping self) in exact declaration order.
+                        mut rm_params: TypeRef[] = [];
+                        const this_amp: SymbolStr = intern.intern("&this");
+                        const this_val: SymbolStr = intern.intern("this");
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp)) { continue; }
+                            if (pp.name.equals(this_val)) { continue; }
+                            rm_params.push(pp.resolved_type);
+                        }
+                        const slot_idx: i32 = this.cg.decl.vtable_slot_index(cls_for_vtbl, fn_node.name, rm_params);
+                        if (slot_idx >= 0) {
+                            vtable_dispatch = true;
+                            vtable_slot_idx = slot_idx;
+                            vtable_obj_ref = obj_ref;
+                        }
+                    }
+                }
+            }
+
+            // Instance-method calls prepend `&this` at the call site, so the
+            // LLVM arity is user-args + 1.  This matches declare_method's
+            // `total_params` registration key.
+            const ma_arity: u32 = (node.arguments.length + 1) as u32;
+
+            // Trust sema: `resolved_callee` is the mangled LLVM symbol
+            // chosen by `resolve_method_overload` for inherent methods on
+            // classes / structs / enums (including the base-class walk
+            // for inheritance) AND for trait-impl methods on non-generic
+            // receivers (e.g. `String::write_bytes` from `implement trait
+            // FmtWrite for String`, or primitive trait impls like
+            // `Eq for i16`).  Routes through `resolve_function_by_mangled`,
+            // identical to the Identifier branch.
+            if (node.resolved_callee.is_valid()) {
+                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            }
+
+            // Post-specialization fallback: when the receiver is a
+            // monomorphized InstantiatedType (e.g. `Array<u8, GlobalAlloc>`
+            // inside a spec'd `String<GlobalAlloc>::with_capacity`), sema's
+            // pin uses the TEMPLATE's mangled symbol, which doesn't exist
+            // in the LLVM module (only specs are emitted).  Re-resolve via
+            // the post-substitution receiver type name registered in the
+            // DI: `lookup_type_name(obj_ref)` returns the spec's qname
+            // (e.g. `Array_u8_GlobalAlloc`) and the combined
+            // `<spec_qname>::<method>` lookup finds the spec'd LLVM symbol.
+            //
+            // Long-term: move this into a post-monomorphization re-pin
+            // pass that updates `resolved_callee` after AST substitution.
+            // Until then this branch handles the spec'd-receiver case.
+            if (!callee_val.is_valid() && type_sym.is_valid()) {
+                const type_str: string = intern.resolve(type_sym);
+                const combined: string = format("%s::%s", type_str, method_str);
+                const sym: SymbolStr = intern.intern(combined);
+                callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
+                if (!callee_val.is_valid()) {
+                    callee_val = this.cg.resolver.resolve_function(sym);
+                }
+            }
+            if (!callee_val.is_valid() && t != null) {
+                mut type_str: string = "";
+                if (t.kind == TypeKind::Struct) {
+                    const st: StructType* = t as StructType*;
+                    type_str = intern.resolve(st.qualified_name);
+                } else if (t.kind == TypeKind::Class) {
+                    const ct: ClassType* = t as ClassType*;
+                    type_str = intern.resolve(ct.qualified_name);
+                } else if (t.kind == TypeKind::Enum) {
+                    const et: EnumType* = t as EnumType*;
+                    type_str = intern.resolve(et.qualified_name);
+                } else if (t.kind == TypeKind::Int
+                        || t.kind == TypeKind::Float
+                        || t.kind == TypeKind::Bool
+                        || t.kind == TypeKind::Char
+                        || t.kind == TypeKind::String
+                        || t.kind == TypeKind::Unit) {
+                    // Primitives have no `qualified_name`; the trait-
+                    // impl registry keys on the bare display name.
+                    type_str = t.display_name();
+                }
+                if (intrinsics::strlen(type_str) > 0) {
+                    const combined: string = format("%s::%s", type_str, method_str);
+                    const sym: SymbolStr = intern.intern(combined);
+                    callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
+                    if (!callee_val.is_valid()) {
+                        callee_val = this.cg.resolver.resolve_function(sym);
+                    }
+                }
+            }
+
+        } else {
+            callee_val = this.dispatch.codegen_rvalue(visitor,node.callee);
+        }
+
+        if (!callee_val.is_valid()) {
+            // Build a rich diagnostic that names the callee (when available)
+            // and labels the receiver for member/scope calls.
+            mut msg: string = "codegen: call expression: callee function not found";
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, msg);
+            diag = diag.at(node.span);
+
+            if (node.callee.kind == NodeKind::Identifier) {
+                const id: IdentifierNode* = node.callee as IdentifierNode*;
+                const id_str: string = this.cg.resolve(id.name);
+                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: cannot resolve function '%s'", id_str));
+                diag = diag.at(node.span);
+                diag = diag.also_at(node.callee.span, "no function with this name is in scope");
+            } else if (node.callee.kind == NodeKind::ScopeResolution) {
+                const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
+                const scope_str: string = intern.resolve(sr.scope_name);
+                const member_str: string = intern.resolve(sr.member_name);
+                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: cannot resolve '%s::%s'", scope_str, member_str));
+                diag = diag.at(node.span);
+                diag = diag.also_at(node.callee.span, "no such associated function");
+            } else if (node.callee.kind == NodeKind::MemberAccess) {
+                const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+                mut type_str: string = "<unknown>";
+                const dbg_t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
+                if (dbg_t != null) {
+                    type_str = dbg_t.display_name();
+                }
+                const member_str: string = intern.resolve(ma.member);
+                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: no method '%s' found on type '%s'", member_str, type_str));
+                diag = diag.at(node.span);
+                diag = diag.also_at(ma.object.span, format("receiver has type '%s'", type_str));
+                diag = diag.with_note("method lookup walks the class inheritance chain; neither the concrete type nor any base defines this method");
+            }
+
+            this.cg.diag.emit(diag);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // `Pair<LValue, TypeRef>` per arg; the type drives sext-vs-zext
+        // when codegen_call needs to widen a narrow integer to the formal
+        // param's LLVM width.  Receivers are pointer/reference-typed and
+        // never hit the integer-widening path, but we record the receiver
+        // type anyway to keep the array meaningful end-to-end.
+        mut args: Pair<LValue, TypeRef>[] = [];
+        if (node.callee.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            // For pointer/reference receivers (e.g. `runner: Runner*`),
+            // the receiver value is itself the `this` pointer; load it
+            // out of the local slot.  For value receivers (`runner: Runner`),
+            // take the lvalue address as `this`.
+            const recv_t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
+            mut obj: LValue = LValue::null();
+            if (recv_t != null && (recv_t.kind == TypeKind::Pointer
+                                || recv_t.kind == TypeKind::Reference)) {
+                obj = this.dispatch.codegen_rvalue(visitor,ma.object);
+            } else {
+                obj = this.dispatch.codegen_lvalue(visitor,ma.object);
+            }
+            args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
+        }
+        for (mut i: i64 = 0; i < node.arguments.length; i++) {
+            const arg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
+            args.push(Pair<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
+        }
+
+        const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
+        if (!fn_ty.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: call expression: failed to retrieve function type from callee",
+                node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Virtual dispatch: replace the direct callee with a vtable-loaded
+        // function pointer.  We keep `fn_ty` from the statically resolved
+        // function; it describes the correct signature for `LLVMBuildCall2`
+        // and matches whatever override got installed in the slot at
+        // runtime (since all overrides share the base's signature).
+        if (vtable_dispatch && args.length > 0 && args[0].first.is_valid() && vtable_obj_ref.is_valid()) {
+            const class_lty: LType = this.cg.type_mapper.map_type(vtable_obj_ref);
+            if (class_lty.is_valid()) {
+                const vptr_slot: LValue = this.cg.builder.build_struct_gep(
+                    class_lty, args[0].first, 0, "vptr.slot");
+                if (vptr_slot.is_valid()) {
+                    const i8_ptr_ty: LType = LType::pointer_to(LType::i8());
+                    const i8_ptr_ptr_ty: LType = LType::pointer_to(i8_ptr_ty);
+                    const vtbl: LValue = this.cg.builder.build_load(
+                        i8_ptr_ptr_ty, vptr_slot, "vtbl");
+                    if (vtbl.is_valid()) {
+                        const idx_val: LValue = LType::const_int(
+                            LType::i32(), vtable_slot_idx as u64, false);
+                        const idx_buf: void* = intrinsics::malloc(8);
+                        const idx_slots: void** = idx_buf as void**;
+                        idx_slots[0] = idx_val.raw;
+                        const fn_slot: LValue = this.cg.builder.build_gep(
+                            i8_ptr_ty, vtbl, idx_buf, 1, "vtbl.slot");
+                        intrinsics::free(idx_buf);
+                        if (fn_slot.is_valid()) {
+                            const fn_ptr: LValue = this.cg.builder.build_load(
+                                i8_ptr_ty, fn_slot, "vtbl.fn");
+                            if (fn_ptr.is_valid()) {
+                                callee_val = fn_ptr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const void_ty: LType = LType::void_type();
+        // Void calls and unresolved return types must use empty name;
+        // LLVM doesn't allow naming void-typed instructions.
+        const is_void: boolean = !ret_ty.is_valid() || ret_ty.raw == void_ty.raw ||
+                                  type_kind_of(ret_ty.raw) == LTypeKind::Void;
+        const call_name: string = if (is_void) { "" } else { "calltmp" };
+        mut result: LValue = LValue::null();
+        result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+
+        // Emit `unreachable` after calls to divergent functions.  Two
+        // cases handled here:
+        //   1. The callee's resolved return type is `never`.
+        //   2. The callee resolves to a known divergent function from
+        //      the stdlib (`panic` intrinsic; `core::panic::panic` and the
+        //      legacy `prelude::panic` wrapper).  These are declared
+        //      `-> void` in source even though they semantically diverge.
+        // Without this, calls in a non-void-returning context (e.g. the
+        // `None` arm of `Option<T>::unwrap`) leave the block without a
+        // terminator and the body-validator strips the entire function.
+        mut should_unreachable: boolean = false;
+        if (node.resolved_type.is_valid()) {
+            const _ret_t: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            if (_ret_t != null && _ret_t.kind == TypeKind::Never) {
+                should_unreachable = true;
+            }
+        }
+        if (!should_unreachable && this.is_divergent_callee(node.callee)) {
+            should_unreachable = true;
+        }
+        if (should_unreachable) {
+            this.cg.builder.build_unreachable();
+        }
+
+        this.state.last_value = result;
+        this.state.last_is_lvalue = false;
+    }
+}

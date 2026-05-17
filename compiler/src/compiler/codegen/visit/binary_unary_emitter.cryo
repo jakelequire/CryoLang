@@ -1,0 +1,443 @@
+/// Binary / Unary Expression Emitter
+///
+/// Lowering for arithmetic, comparison, logical, and pointer-arithmetic
+/// binary operators, plus all unary operators (negate, not, bitnot,
+/// address-of, dereference, pre/post inc/dec).  Short-circuit `&&` / `||`
+/// get their own path (`short_circuit`) so the RHS is only evaluated
+/// when needed and `last_value` lands as the phi result.
+///
+/// Operand expressions are evaluated through `dispatch.codegen_rvalue`
+/// (or `codegen_lvalue` for the address-of / mutation cases); the
+/// arithmetic/logic lowering itself lives on `cg.expr_ops`.
+
+namespace Compiler::Codegen::Visit::BinaryUnaryEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::State::VisitorState;
+import Compiler::Codegen::Visit::ExprDispatch;
+import Compiler::Codegen::Util;
+import Compiler::Diag;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::Lex;
+
+
+// ============================================================================
+// BinaryUnaryEmitter
+// ============================================================================
+
+type struct BinaryUnaryEmitter {
+    cg:       CodegenContext*;
+    state:    VisitorState*;
+    dispatch: ExprDispatch*;
+
+    static null() -> BinaryUnaryEmitter {
+        return BinaryUnaryEmitter {
+            cg:       null,
+            state:    null,
+            dispatch: null,
+        };
+    }
+
+    wire(mut &this, cg: CodegenContext*, state: VisitorState*,
+                    dispatch: ExprDispatch*) -> void {
+        this.cg       = cg;
+        this.state    = state;
+        this.dispatch = dispatch;
+    }
+
+
+    /// Current LLVM function pointer for entry-block alloca placement.
+    get_current_function(&this) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!bb.is_valid()) {
+            this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
+                "codegen: builder has no insert block; cannot determine current function");
+            return LValue::null();
+        }
+        return bb.get_parent();
+    }
+
+
+    // ========================================================================
+    // Binary expressions
+    // ========================================================================
+
+    emit_binary(mut &this, visitor: ASTVisitor*, node: BinaryExprNode*) -> void {
+        const op: TokenType = node.op.kind;
+
+        // Assignment
+        if (op == TokenType::Equal) {
+            const addr: LValue = this.dispatch.codegen_lvalue(visitor,node.left);
+            const val: LValue = this.dispatch.codegen_rvalue(visitor,node.right);
+            if (!addr.is_valid() || !val.is_valid()) {
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0614_ASSIGNMENT_ERROR,
+                    "codegen: assignment: target or value produced null");
+                diag = diag.at(node.span);
+                if (!addr.is_valid()) {
+                    diag = diag.also_at(node.left.span, "left-hand side did not produce a valid lvalue");
+                }
+                if (!val.is_valid()) {
+                    diag = diag.also_at(node.right.span, "right-hand side did not produce a valid rvalue");
+                }
+                this.cg.diag.emit(diag);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            // Narrow-store fix: the LHS may be an i8 slot (string char,
+            // pointer-to-i8 element, array-of-i8 element) while the RHS
+            // is an i32 char or other wider int.  LLVM's `store` writes
+            // the value's full width; without truncation we'd emit a
+            // 4-byte i32 store over a 1-byte slot, clobbering the next
+            // 3 bytes.  This is what produced the `name_buf[k] = '_'`
+            // miscompile in passes.cryo (only the first colon was
+            // replaced; the next 3 bytes became zeros).
+            //
+            // Decide based on the destination element's *resolved type*
+            // (i.e. the type of `node.left` itself) so this covers
+            // String, Pointer-to-i8, and Array-of-i8 in a single check.
+            mut store_val: LValue = val;
+            const dest_t: Type* = this.cg.lookup_type_by_id(node.left.resolved_type.id);
+            mut needs_chartrunc: boolean = false;
+            if (dest_t != null) {
+                if (dest_t.kind == TypeKind::Char) {
+                    // `s[i] = c` where the indexable is a Cryo `string`:
+                    // the destination type maps to char (i32 at semantic
+                    // level) but the underlying byte slot is i8.
+                    needs_chartrunc = true;
+                } else if (dest_t.kind == TypeKind::Int) {
+                    const it: IntType* = dest_t as IntType*;
+                    if (it.int_kind == IntegerKind::I8 ||
+                        it.int_kind == IntegerKind::U8) {
+                        needs_chartrunc = true;
+                    }
+                }
+            }
+            if (needs_chartrunc) {
+                store_val = this.cg.builder.build_trunc(val, LType::i8(), "chartrunc");
+            }
+            this.cg.builder.build_store(store_val, addr);
+            this.state.last_value = val;
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Compound assignment.  Each compound op (`+=`, `-=`, `*=`, `/=`,
+        // `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) loads the LHS, computes the
+        // arithmetic / bitwise / shift result using its base operator, then
+        // stores the narrowed result back.  Bitwise (`&=`/`|=`/`^=`) and
+        // shift (`<<=`/`>>=`) were silently miscompiled before; the
+        // BinaryExprNode fell through to the "regular binary" path below,
+        // which calls codegen_rvalue(left) (a load) and codegen_binary
+        // with the compound op kind, producing an expression result but
+        // never storing it back.
+        if (op == TokenType::PlusEqual    || op == TokenType::MinusEqual ||
+            op == TokenType::StarEqual    || op == TokenType::SlashEqual ||
+            op == TokenType::PercentEqual ||
+            op == TokenType::AmpEqual     || op == TokenType::PipeEqual  ||
+            op == TokenType::CaretEqual   ||
+            op == TokenType::LessLessEqual || op == TokenType::GreaterGreaterEqual) {
+            const addr: LValue = this.dispatch.codegen_lvalue(visitor,node.left);
+            if (!addr.is_valid()) {
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0614_ASSIGNMENT_ERROR,
+                    "codegen: compound assignment target produced null lvalue");
+                diag = diag.at(node.span);
+                diag = diag.also_at(node.left.span, "this expression must be assignable");
+                this.cg.diag.emit(diag);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const lhs_ty: LType = this.cg.type_mapper.map_type(node.left.resolved_type);
+            if (!lhs_ty.is_valid()) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
+                    "codegen: compound assignment: failed to map left-hand side type",
+                    node.left.span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const lhs_loaded: LValue = this.cg.builder.build_load(lhs_ty, addr, "compoundlhs");
+            const rhs: LValue = this.dispatch.codegen_rvalue(visitor,node.right);
+            const base_op: TokenType = match (op) {
+                TokenType::PlusEqual          => { TokenType::Plus    }
+                TokenType::MinusEqual         => { TokenType::Minus   }
+                TokenType::StarEqual          => { TokenType::Star    }
+                TokenType::SlashEqual         => { TokenType::Slash   }
+                TokenType::PercentEqual       => { TokenType::Percent }
+                TokenType::AmpEqual           => { TokenType::Amp     }
+                TokenType::PipeEqual          => { TokenType::Pipe    }
+                TokenType::CaretEqual         => { TokenType::Caret   }
+                TokenType::LessLessEqual      => { TokenType::LessLess }
+                TokenType::GreaterGreaterEqual => { TokenType::GreaterGreater }
+                _                             => { TokenType::Plus }
+            };
+            mut result: LValue = LValue::null();
+            result = this.cg.expr_ops.codegen_binary(lhs_loaded, rhs, base_op, node.resolved_type);
+            // Narrow-store fix: codegen_binary normalizes operand widths to
+            // the wider of lhs/rhs, so when the LHS slot is a narrow int
+            // (char / i8 / u8) and the RHS is wider, `result` is wider than
+            // the destination.  `store` writes the full result width; left
+            // unfixed, `buf[k] += '_'` over an i8 slot clobbers the next
+            // 3 bytes, the same class of bug that produced the chartrunc
+            // path on the plain `=` branch above.  Truncate when the
+            // stored type's LLVM width exceeds the destination slot's.
+            mut store_val: LValue = result;
+            if (result.is_valid()) {
+                const res_ty: void* = llvm::LLVMTypeOf(result.raw);
+                if (type_kind_of(res_ty) == LTypeKind::Integer &&
+                    type_kind_of(lhs_ty.raw) == LTypeKind::Integer) {
+                    const res_w: u32 = llvm::LLVMGetIntTypeWidth(res_ty);
+                    const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty.raw);
+                    if (res_w > lhs_w) {
+                        store_val = this.cg.builder.build_trunc(result, lhs_ty, "compound.trunc");
+                    }
+                }
+            }
+            this.cg.builder.build_store(store_val, addr);
+            this.state.last_value = store_val;
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Logical short-circuit
+        if (op == TokenType::AmpAmp || op == TokenType::PipePipe) {
+            this.short_circuit(visitor, node);
+            return;
+        }
+
+        // Regular binary
+        const lhs: LValue = this.dispatch.codegen_rvalue(visitor,node.left);
+        const rhs: LValue = this.dispatch.codegen_rvalue(visitor,node.right);
+        mut result: LValue = LValue::null();
+        result = this.cg.expr_ops.codegen_binary(lhs, rhs, op, node.left.resolved_type);
+        this.state.last_value = result;
+        this.state.last_is_lvalue = false;
+    }
+
+    // ========================================================================
+    // Unary expressions
+    // ========================================================================
+
+    emit_unary(mut &this, visitor: ASTVisitor*, node: UnaryExprNode*) -> void {
+        const op: TokenType = node.op.kind;
+        if (op == TokenType::Star) {
+            const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
+            mut is_ptr_like: boolean = false;
+            if (op_t != null) {
+                is_ptr_like = op_t.kind == TypeKind::Pointer ||
+                              op_t.kind == TypeKind::Reference ||
+                              op_t.kind == TypeKind::String;
+            }
+            mut deref_addr: LValue = LValue::null();
+            if (is_ptr_like) {
+                // Pointer/reference operand: codegen_rvalue loads the
+                // operand's value (the pointer itself), giving us the
+                // address to dereference.
+                deref_addr = this.dispatch.codegen_rvalue(visitor,node.operand);
+            } else {
+                // Value-typed operand reached `*`; this is the
+                // method-receiver case where sema types `this` as the
+                // bare owner (`Option<T>`, etc.) but the ABI passes a
+                // pointer.  codegen_lvalue yields the address of the
+                // operand's storage; loading it produces the value.
+                deref_addr = this.dispatch.codegen_lvalue(visitor,node.operand);
+            }
+            if (!deref_addr.is_valid()) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            // The dereferenced expression is always an lvalue: it
+            // names a memory location that callers can either read
+            // (via codegen_rvalue → emit a load) or write (via the
+            // assignment path → use as a store destination).  The
+            // previous code set `last_is_lvalue = is_ptr_like`, which
+            // dropped the load step for value-typed operands and
+            // stored the *address bits* in place of the dereferenced
+            // value, observable as `const x: Option<T> = *this`
+            // emitting `store ptr %this, ptr %x` instead of the
+            // 32-byte value copy, garbaging the enum discriminant.
+            this.state.last_value = deref_addr;
+            this.state.last_is_lvalue = true;
+            return;
+        }
+        if (op == TokenType::Amp) {
+            // codegen_lvalue runs generate_expression and returns last_value;
+            // it doesn't enforce lvalue-ness.  When the operand is an rvalue
+            // (literal, call result, arithmetic), `last_value` IS the value
+            // itself, not an address.  Returning it here makes `&literal`
+            // lower to `inttoptr (i32 N to ptr)` once arg coercion converts
+            // the i32 to ptr; every callee that dereferences then crashes.
+            // Materialize an rvalue into a stack temp and pass that addr.
+            const v: LValue = this.dispatch.codegen_lvalue(visitor,node.operand);
+            if (!v.is_valid()) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            mut addr: LValue = v;
+            if (!this.state.last_is_lvalue) {
+                const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
+                if (ty.is_valid()) {
+                    addr = this.cg.builder.build_alloca(ty, "addrof.tmp");
+                    this.cg.builder.build_store(v, addr);
+                }
+            }
+            this.state.last_value = addr;
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        if (op == TokenType::PlusPlus || op == TokenType::MinusMinus) {
+            const addr: LValue = this.dispatch.codegen_lvalue(visitor,node.operand);
+            const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
+            if (!addr.is_valid() || !ty.is_valid()) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const old: LValue = this.cg.builder.build_load(ty, addr, "incdec.old");
+            // Pointer ++/-- must lower to a GEP over the pointee, not an
+            // integer add; LLVM rejects `add ptr, i64`.  `++p` advances
+            // one pointee-sized slot; `--p` retreats one.  Mirrors the
+            // `ptr + int` path in codegen_binary (expr_codegen.cryo).
+            const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
+            mut is_ptr: boolean = false;
+            mut elem_ty_ref: TypeRef = TypeRef::invalid();
+            if (op_t != null) {
+                if (op_t.kind == TypeKind::Pointer) {
+                    is_ptr = true;
+                    const ptr_t: PointerType* = op_t as PointerType*;
+                    elem_ty_ref = ptr_t.pointee;
+                } else if (op_t.kind == TypeKind::Reference) {
+                    is_ptr = true;
+                    const ref_t: ReferenceType* = op_t as ReferenceType*;
+                    elem_ty_ref = ref_t.referent;
+                }
+            }
+            mut updated: LValue = LValue::null();
+            if (is_ptr) {
+                const pointee_lty: LType = this.cg.type_mapper.map_type(elem_ty_ref);
+                if (!pointee_lty.is_valid()) {
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                const step: i64 = if (op == TokenType::PlusPlus) { 1 } else { -1 };
+                const idx_val: LValue = LType::const_int(LType::i64(), step as u64, true);
+                const buf: void* = intrinsics::malloc(8);
+                const slots: void** = buf as void**;
+                slots[0] = idx_val.raw;
+                updated = this.cg.builder.build_gep(
+                    pointee_lty, old, buf, 1, "incdec.gep");
+                intrinsics::free(buf);
+            } else {
+                const one: LValue = LType::const_int(ty, 1, false);
+                updated = if (op == TokenType::PlusPlus) {
+                    this.cg.builder.build_add(old, one, "inctmp")
+                } else {
+                    this.cg.builder.build_sub(old, one, "dectmp")
+                };
+            }
+            this.cg.builder.build_store(updated, addr);
+            // Postfix `a++` / `a--` returns the pre-update value; prefix
+            // `++a` / `--a` returns the updated value.  Without this
+            // branch (and the matching is_postfix discriminator on
+            // UnaryExprNode), every form returned the old value, so
+            // `const x: int = ++b;` bound x to b's pre-increment value.
+            this.state.last_value = if (node.is_postfix) { old } else { updated };
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const operand: LValue = this.dispatch.codegen_rvalue(visitor,node.operand);
+        mut result: LValue = LValue::null();
+        result = this.cg.expr_ops.codegen_unary(operand, op, node.operand.resolved_type);
+        this.state.last_value = result;
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Call expression: delegate to CallEmitter.  Handles all call shapes
+    /// — identifier / method / scope-resolution / ctor / intrinsic /
+    /// vtable-dispatched — plus the post-call `unreachable` emission for
+
+    // ========================================================================
+    // Short-circuit && / ||
+    // ========================================================================
+
+    /// Short-circuit evaluation for && and ||.
+    short_circuit(mut &this, visitor: ASTVisitor*, node: BinaryExprNode*) -> void {
+        const is_and: boolean = node.op.kind == TokenType::AmpAmp;
+
+        const lhs: LValue = this.dispatch.codegen_rvalue(visitor,node.left);
+        const current_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        const current_fn: LValue = this.get_current_function();
+
+        const rhs_bb: LBasicBlock = LBasicBlock::append(current_fn, "sc.rhs");
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "sc.merge");
+
+        if (is_and) {
+            // &&: if lhs is false, short-circuit to merge with false.
+            this.cg.builder.build_cond_br(lhs, rhs_bb, merge_bb);
+        } else {
+            // ||: if lhs is true, short-circuit to merge with true.
+            this.cg.builder.build_cond_br(lhs, merge_bb, rhs_bb);
+        }
+
+        // Evaluate RHS.
+        this.cg.builder.position_at_end(rhs_bb);
+        const rhs: LValue = this.dispatch.codegen_rvalue(visitor,node.right);
+        const rhs_end_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        this.cg.flow.branch_if_not_terminated(merge_bb);
+
+        // If either operand failed to lower (e.g. `entry.key == key` where K
+        // is a struct that doesn't support `==`, or any expression that
+        // codegen_rvalue couldn't reduce to a value), don't synthesize a
+        // phi with a null incoming; that produces invalid IR that LLVM
+        // verification rejects. Leave merge_bb unterminated and signal
+        // failure so the caller's downstream codegen also bails, which
+        // ultimately leaves the function body unterminated and triggers
+        // `is_function_body_valid` to strip the whole body. That's the
+        // pre-existing "give up cleanly on lowering errors" path; before
+        // this guard the SC branch was the one place that emitted broken
+        // IR instead of bailing.
+        if (!lhs.is_valid() || !rhs.is_valid()) {
+            this.cg.builder.position_at_end(merge_bb);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Merge with phi.
+        this.cg.builder.position_at_end(merge_bb);
+        const phi: LValue = this.cg.builder.build_phi(LType::i1(), "sc.result");
+
+        // Add incoming values.
+        const vals_buf: void* = intrinsics::malloc(16);
+        const vals: void** = vals_buf as void**;
+        const blocks_buf: void* = intrinsics::malloc(16);
+        const blocks: void** = blocks_buf as void**;
+
+        vals[0] = lhs.raw;
+        blocks[0] = current_bb.raw;
+        vals[1] = rhs.raw;
+        blocks[1] = rhs_end_bb.raw;
+        phi_add_incoming(phi, vals_buf, blocks_buf, 2);
+
+        intrinsics::free(vals_buf);
+        intrinsics::free(blocks_buf);
+
+        this.state.last_value = phi;
+        this.state.last_is_lvalue = false;
+    }
+}

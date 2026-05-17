@@ -22,15 +22,20 @@ LSP_BUILD_DIR := $(ROOT)/tools/CryoLSP/build
 LSP_BIN       := $(LSP_BUILD_DIR)/bin/cryolsp
 LSP_PIN       := $(ROOT)/bin/cryolsp
 
+EXT_DIR       := $(ROOT)/tools/CryoAnalyzer
+EXT_ID        := cryolang.cryo-analyzer
+EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
+
 .DEFAULT_GOAL := help
 .PHONY: help stdlib cryo selfhost-check test test-list pin-cryo install uninstall \
-        clean lsp
+        clean lsp install-lsp
 
 help:
 	@echo "Cryo build targets:"
 	@echo "  make stdlib            Build the standard library via bin/cryo"
 	@echo "  make cryo              Build the self-hosted compiler via bin/cryo"
 	@echo "  make lsp               Build the Cryo-language LSP server (bin/cryolsp)"
+	@echo "  make install-lsp       Package + install the CryoAnalyzer VS Code extension"
 	@echo "  make selfhost-check    3-round chain (6 stages) + byte-identity gate"
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
@@ -79,6 +84,24 @@ lsp: $(STAGE2)
 	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN)"
 	@echo "==> bin/cryolsp ready"
+
+# ---- CryoAnalyzer VS Code extension -----------------------------------
+# Packages tools/CryoAnalyzer/ into a .vsix and installs it into VS Code,
+# evicting any previously installed copy and any stale .vsix artifacts so
+# the install always reflects the current source.
+install-lsp:
+	@command -v code >/dev/null 2>&1 || { echo "ERROR: 'code' CLI not found on PATH"; exit 1; }
+	@echo "==> Ensuring CryoAnalyzer node_modules are present"
+	@cd "$(EXT_DIR)" && [ -d node_modules ] || npm install
+	@echo "==> Uninstalling previously installed $(EXT_ID) (if any)"
+	@code --uninstall-extension $(EXT_ID) >/dev/null 2>&1 || true
+	@echo "==> Removing cached .vsix artifacts"
+	@rm -f "$(EXT_DIR)"/*.vsix
+	@echo "==> Packaging CryoAnalyzer"
+	@cd "$(EXT_DIR)" && ./node_modules/.bin/vsce package --out "$(EXT_VSIX)"
+	@echo "==> Installing $(EXT_VSIX)"
+	@code --install-extension "$(EXT_VSIX)" --force
+	@echo "==> CryoAnalyzer extension installed"
 
 # ---- selfhost byte-identity check -------------------------------------
 # Implementation lives in scripts/selfhost-check.py — that gives us

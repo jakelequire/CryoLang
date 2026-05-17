@@ -1,0 +1,459 @@
+/// Place Emitter
+///
+/// Lvalue / place lowering for member access (`obj.field`), array
+/// access (`arr[i]`), and tuple index (`t.0`).  Each path GEPs into the
+/// container and lands on `state.last_value` with `last_is_lvalue=true`
+/// so the caller can assign through or load from it depending on
+/// context (rvalue users go through `dispatch.codegen_rvalue` which
+/// loads).
+///
+/// The visit() handlers in `ir_generator.cryo` evaluate the receiver
+/// (and index, for array access) via `dispatch.codegen_lvalue` /
+/// `dispatch.codegen_rvalue`, then call the corresponding `emit_*`
+/// method here to perform the GEP and field-typing.
+///
+/// Holds `cg`, `state`, `dispatch` back-pointers.  Does not call
+/// back into the visitor — `try_codegen_tuple_index` and the two
+/// `codegen_*` paths receive everything they need by parameter.
+
+namespace Compiler::Codegen::Visit::PlaceEmitter;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Context;
+import Compiler::Codegen::State::VisitorState;
+import Compiler::Codegen::Visit::ExprDispatch;
+import Compiler::Codegen::Util;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+
+
+// ============================================================================
+// PlaceEmitter
+// ============================================================================
+
+type struct PlaceEmitter {
+    cg:       CodegenContext*;
+    state:    VisitorState*;
+    dispatch: ExprDispatch*;
+
+    static null() -> PlaceEmitter {
+        return PlaceEmitter {
+            cg:       null,
+            state:    null,
+            dispatch: null,
+        };
+    }
+
+    wire(mut &this, cg: CodegenContext*, state: VisitorState*,
+                    dispatch: ExprDispatch*) -> void {
+        this.cg       = cg;
+        this.state    = state;
+        this.dispatch = dispatch;
+    }
+
+
+    // ========================================================================
+    // Member access (obj.field)
+    // ========================================================================
+
+    /// Generate a GEP to a struct/class field.  `site_span` is the source span
+    /// of the access expression in the caller; used only to attach a source
+    /// snippet to any diagnostic we emit.
+    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, site_span: SourceSpan) -> void {
+        // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
+        // stored in an alloca), load the pointer value so we can GEP into the struct.
+        // This matches C/Rust behavior where `node.field` on a pointer is an implicit
+        // deref.  Applied once per call; GEP'd field pointers stay as struct pointers.
+        mut obj_ptr: LValue = object_ptr;
+        mut obj_type: TypeRef = object_type;
+        mut t: Type* = this.cg.lookup_type_by_id(obj_type.id);
+
+        // Unwrap InstantiatedType to its concrete resolved form before kind-based
+        // dispatch.  Sema does the same in `check_field_access`; without this,
+        // a `Pair<string>` resolves to an `InstantiatedType` whose kind isn't
+        // Struct/Class/Array, and every field/length access silently returns null.
+        mut inst_depth: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth < 5) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { break; }
+            obj_type = inst.resolved_type;
+            t = this.cg.lookup_type_by_id(obj_type.id);
+            inst_depth += 1;
+        }
+
+        if (t != null && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
+            if (t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = t as PointerType*;
+                obj_type = pt.pointee;
+            } else {
+                const rt: ReferenceType* = t as ReferenceType*;
+                obj_type = rt.referent;
+            }
+            t = this.cg.lookup_type_by_id(obj_type.id);
+
+            // Load the pointer value through the alloca (only when `object_ptr`
+            // really is an lvalue pointing at a ptr slot). Under opaque pointers
+            // every value has LLVM type `ptr`, so the kind check alone can't
+            // distinguish a slot from a raw rvalue; the previous version
+            // ALWAYS loaded, which over-derefed any pointer rvalue (e.g. the
+            // result of `obj.as_ptr().count` where `as_ptr()` already returned
+            // the pointer value, not a slot containing it). Threading the
+            // semantic lvalue flag through is the only reliable signal.
+            if (object_is_lvalue && obj_ptr.is_valid()) {
+                obj_ptr = this.cg.builder.build_load(LType::pointer_to(LType::i8()),
+                                                obj_ptr, "autoderef");
+            }
+        }
+
+        // The pointee of a Pointer/Reference may itself be an InstantiatedType
+        // (e.g. `HashMapEntry<u32, i64>` sitting in the arena as the pointee of a
+        // `HashMapEntry<u32, i64>*`). Mirror the pre-Pointer unwrap above so the
+        // kind dispatch below sees the concrete Struct/Class/Array; without this,
+        // field_idx stays -1, the access silently emits no IR, and the
+        // half-emitted basic block gets stripped by `is_function_body_valid`.
+        mut inst_depth2: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && inst_depth2 < 5) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { break; }
+            obj_type = inst.resolved_type;
+            t = this.cg.lookup_type_by_id(obj_type.id);
+            inst_depth2 += 1;
+        }
+
+        if (t == null) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const tk: TypeKind = t.kind;
+        mut field_idx: i64 = -1;
+
+        if (tk == TypeKind::Tuple) {
+            // Tuple positional access: parse member SymbolStr as decimal index.
+            // Sema already validated bounds; codegen trusts the resolved_type
+            // path and just GEPs slot N.
+            const member_str: string = this.cg.resolve(member);
+            const idx: i64 = parse_tuple_member_index(member_str);
+            if (idx >= 0) {
+                const tup: TupleType* = t as TupleType*;
+                if (idx < tup.elements.length) {
+                    field_idx = idx;
+                }
+            }
+        } else if (tk == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            field_idx = st.field_index(member);
+        } else if (tk == TypeKind::Class) {
+            // Classes are flattened at struct-layout time (see `map_class`):
+            //   [ vtable ptr, if any ancestor has virtual methods ]
+            //   [ root class's fields, then each derived class's fields in order ]
+            //   [ this class's own fields ]
+            // Walk the base chain root-first and sum field counts to get the
+            // absolute slot index.
+            const cls: ClassType* = t as ClassType*;
+            mut chain: ClassType*[] = [];
+            mut any_virtual: boolean = false;
+            mut walk: ClassType* = cls;
+            mut depth: i32 = 0;
+            while (walk != null && depth < 16) {
+                chain.push(walk);
+                if (walk.has_virtual_methods) { any_virtual = true; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
+                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+                walk = base_t as ClassType*;
+                depth += 1;
+            }
+
+            mut cumulative: i64 = if (any_virtual) { 1 } else { 0 };
+            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+                const link: ClassType* = chain[ci];
+                const local_idx: i64 = link.field_index(member);
+                if (local_idx >= 0) {
+                    field_idx = cumulative + local_idx;
+                    break;
+                }
+                cumulative += link.fields.length;
+            }
+        } else if (tk == TypeKind::Array) {
+            const arr_t: ArrayType* = t as ArrayType*;
+            const length_sym: SymbolStr = this.cg.intern_str("length");
+            if (member.id == length_sym.id) {
+                if (arr_t.is_fixed()) {
+                    // Fixed array: length is a compile-time constant.
+                    this.state.last_value = LType::const_int(LType::i64(), arr_t.size as u64, false);
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                // Dynamic array { T*, i64 }: length is field 1.
+                field_idx = 1;
+            }
+        }
+
+        if (field_idx < 0) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const struct_ty: LType = this.cg.type_mapper.map_type(obj_type);
+        if (!struct_ty.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                "codegen: member access: failed to map object type to LLVM type",
+                site_span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        if (!obj_ptr.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                "codegen: member access: object pointer is null",
+                site_span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        // If `obj_ptr` is a struct VALUE (e.g., a direct return from a
+        // function call: `f().field`), it isn't a GEP-able address.  Use
+        // `extractvalue` to pull out the field from the value and return
+        // an rvalue.  Under opaque pointers an actual pointer has kind
+        // Pointer, so checking for Struct here is unambiguous.
+        const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
+        if (obj_llvm_ty != null && type_kind_of(obj_llvm_ty) == LTypeKind::Struct) {
+            this.state.last_value = this.cg.builder.build_extract_value(
+                obj_ptr, field_idx as u32, "fieldval");
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const gep: LValue = this.cg.builder.build_struct_gep(struct_ty, obj_ptr,
+                                                          field_idx as u32, "fieldptr");
+        this.state.last_value = gep;
+        this.state.last_is_lvalue = true;
+    }
+
+    // ========================================================================
+    // Array access (arr[i])
+    // ========================================================================
+
+
+    /// Generate IR for an array indexing operation.
+    codegen_array_access(mut &this, array_val: LValue, array_type: TypeRef, array_is_lvalue: boolean, index_val: LValue, site_span: SourceSpan) -> void {
+        const t: Type* = this.cg.lookup_type_by_id(array_type.id);
+        if (t == null) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Pointer indexing (C-style `ptr[i]` ≡ `*(ptr + i)`).  When
+        // `array_is_lvalue` is true, `array_val` is a slot containing the
+        // pointer (e.g. a local variable of type `T*`) and needs a load
+        // first.  When false, the pointer value is already in hand
+        // (e.g. result of a call returning `T*`) and we GEP directly.
+        if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            const elem_ty: LType = this.cg.type_mapper.map_type(pt.pointee);
+            if (!elem_ty.is_valid() || !array_val.is_valid() || !index_val.is_valid()) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            mut data_ptr: LValue = array_val;
+            if (array_is_lvalue) {
+                const ptr_ty: LType = LType::pointer_to(elem_ty);
+                data_ptr = this.cg.builder.build_load(ptr_ty, array_val, "ptrload");
+            }
+            const buf: void* = intrinsics::malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = index_val.raw;
+            const gep: LValue = this.cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
+            intrinsics::free(buf);
+            this.state.last_value = gep;
+            this.state.last_is_lvalue = true;
+            return;
+        }
+
+        // String indexing (`s[i]`): treat the string as `i8*` at the LLVM
+        // level.  Return the byte's address as an lvalue so it can be used
+        // on both sides of an assignment (`c = s[i]` AND `s[i] = c`).  The
+        // `char` (i32) vs byte (i8) size mismatch is resolved by the callers
+        // (`codegen_rvalue` load-and-zext for reads, the assignment path
+        // trunc-and-store for writes; both look for the `TypeKind::String`
+        // source type to detect this case).
+        if (t.kind == TypeKind::String) {
+            if (!array_val.is_valid() || !index_val.is_valid()) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const i8_ty: LType = LType::i8();
+            mut data_ptr: LValue = array_val;
+            if (array_is_lvalue) {
+                const i8_ptr_ty: LType = LType::pointer_to(i8_ty);
+                data_ptr = this.cg.builder.build_load(i8_ptr_ty, array_val, "strptr");
+            }
+            const buf: void* = intrinsics::malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = index_val.raw;
+            const byte_ptr: LValue = this.cg.builder.build_gep(i8_ty, data_ptr, buf, 1, "charptr");
+            intrinsics::free(buf);
+            this.state.last_value = byte_ptr;
+            this.state.last_is_lvalue = true;
+            return;
+        }
+
+        if (t.kind != TypeKind::Array) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const arr: ArrayType* = t as ArrayType*;
+        const elem_ty: LType = this.cg.type_mapper.map_type(arr.element);
+        if (!elem_ty.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                "codegen: array access: failed to map element type",
+                site_span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        if (!array_val.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                "codegen: array access: array value is null",
+                site_span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        if (!index_val.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0621_ARRAY_OPERATION_ERROR,
+                "codegen: array access: index value is null",
+                site_span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        if (arr.is_fixed()) {
+            // Fixed array: GEP into [N x T].
+            const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+            // Build indices: [0, index]
+            const zero: LValue = LType::const_int(LType::i64(), 0, false);
+            const buf: void* = intrinsics::malloc(16);
+            const slots: void** = buf as void**;
+            slots[0] = zero.raw;
+            slots[1] = index_val.raw;
+            const gep: LValue = this.cg.builder.build_gep(arr_ty, array_val, buf, 2, "elemptr");
+            intrinsics::free(buf);
+            this.state.last_value = gep;
+            this.state.last_is_lvalue = true;
+        } else {
+            // Dynamic array: { T*, i64 } fat pointer.  When the value is in
+            // a slot (lvalue, the usual case), load the struct first; when
+            // the value is in hand (rvalue, e.g. `f()[i]` where `f` returns
+            // `T[]`), use it directly.  Either way, extract field 0 to get
+            // the data pointer, then GEP elem_ty by index.
+            const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+            mut struct_val: LValue = array_val;
+            if (array_is_lvalue) {
+                struct_val = this.cg.builder.build_load(arr_ty, array_val, "arrload");
+            }
+            const data_ptr: LValue = this.cg.builder.build_extract_value(struct_val, 0, "data");
+            const buf: void* = intrinsics::malloc(8);
+            const slots: void** = buf as void**;
+            slots[0] = index_val.raw;
+            const gep: LValue = this.cg.builder.build_gep(elem_ty, data_ptr, buf, 1, "elemptr");
+            intrinsics::free(buf);
+            this.state.last_value = gep;
+            this.state.last_is_lvalue = true;
+        }
+    }
+
+    // ========================================================================
+    // Tuple index (t.N as t[N])
+    // ========================================================================
+
+    try_codegen_tuple_index(mut &this, visitor: ASTVisitor*, aa: ArrayAccessNode*) -> boolean {
+        // Walk past pointer/reference/instantiation wrappers to find the
+        // underlying tuple kind. Mirrors the unwrap chain in
+        // codegen_member_access so `(&t)[0]` works the same as `t[0]`.
+        mut walk_ty: TypeRef = aa.array.resolved_type;
+        mut walk_t: Type* = this.cg.lookup_type_by_id(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            if (walk_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = walk_t as PointerType*;
+                walk_ty = pt.pointee;
+                walk_t = this.cg.lookup_type_by_id(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = walk_t as ReferenceType*;
+                walk_ty = rt.referent;
+                walk_t = this.cg.lookup_type_by_id(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                if (!it.has_resolved_type()) { break; }
+                walk_ty = it.resolved_type;
+                walk_t = this.cg.lookup_type_by_id(walk_ty.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (walk_t == null || walk_t.kind != TypeKind::Tuple) {
+            return false;
+        }
+
+        // Sema already validated this; the index is an integer literal
+        // in bounds. Read the literal value directly off the AST so we
+        // can pass it to build_struct_gep.
+        const idx_node: ASTNode* = aa.index as ASTNode*;
+        if (idx_node.kind != NodeKind::Literal) { return false; }
+        const lit: LiteralNode* = aa.index as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        const idx: u64 = parse_int_lexeme(lit.value);
+
+        const recv: LValue = this.dispatch.codegen_lvalue(visitor,aa.array);
+        const recv_is_lvalue: boolean = this.state.last_is_lvalue;
+        // Auto-deref reference receivers so `&t[0]` GEPs the underlying
+        // tuple, not the reference slot.
+        mut obj_ptr: LValue = recv;
+        const obj_t: Type* = this.cg.lookup_type_by_id(aa.array.resolved_type.id);
+        if (obj_t != null && (obj_t.kind == TypeKind::Pointer
+                            || obj_t.kind == TypeKind::Reference)
+                && recv_is_lvalue) {
+            obj_ptr = this.cg.builder.build_load(
+                LType::pointer_to(LType::i8()), recv, "autoderef");
+        }
+
+        const tup_ty: LType = this.cg.type_mapper.map_type(walk_ty);
+        if (!tup_ty.is_valid() || !obj_ptr.is_valid()) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return true;
+        }
+        const gep: LValue = this.cg.builder.build_struct_gep(
+            tup_ty, obj_ptr, idx as u32, "tupelem");
+        this.state.last_value = gep;
+        this.state.last_is_lvalue = true;
+        return true;
+    }
+}
