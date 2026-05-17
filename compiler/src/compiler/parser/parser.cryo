@@ -45,6 +45,7 @@ public:
         mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
 
         while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const before_pos: int = this.pos;
             if (this.panic_mode) {
                 if (this.check(TokenType::RBrace)) {
                     this.panic_mode = false;
@@ -75,6 +76,10 @@ public:
                 }
                 this.match_tok(TokenType::Semicolon);
             }
+
+            // Progress guard: avoid infinite loops when an error-recovery path
+            // returns without consuming any tokens.
+            if (this.pos == before_pos) { this.advance(); }
         }
 
         this.consume(TokenType::RBrace, "'}'");
@@ -561,33 +566,7 @@ public:
             }
         }
 
-        // Parameter list
-        this.consume(TokenType::LParen, "'('");
-        if (!this.check(TokenType::RParen)) {
-            const params: VarDeclNode*[] = this.parse_parameter_list();
-            for (mut i: int = 0; i < params.length; i++) {
-                const p: VarDeclNode* = params[i];
-                // A trailing `args...` parameter has no type annotation;
-                // that's parse_parameter's signal for variadic.  Set the
-                // flag (so the LLVM decl is emitted with `...`) but still
-                // add the parameter so `args` is in scope inside the body.
-                // Bare `this` (value-receiver) ALSO arrives here with no
-                // annotation; the `&this` form already synthesizes one to
-                // dodge this heuristic, but `this` does not; exclude it
-                // by name so a method like `leak(mut this) -> T*` isn't
-                // miscategorized as variadic.
-                if (p.type_annotation == null && i == params.length - 1
-                        && !p.name.equals(this.ctx.intern("this"))) {
-                    func.set_variadic(true);
-                }
-                func.add_parameter(p);
-            }
-        }
-        if (this.pending_bare_variadic) {
-            func.set_variadic(true);
-            this.pending_bare_variadic = false;
-        }
-        this.consume(TokenType::RParen, "')'");
+        this.parse_function_param_list_into(func);
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
@@ -615,16 +594,56 @@ public:
         return func;
     }
 
+    /// Emit E0359 for `protected` (block or inline form) used inside a struct.
+    /// `is_block` controls the suggestion text (`public:` vs `public`).
+    emit_protected_in_struct_error(kw_tok: Token, is_block: boolean) -> void {
+        const kw_span: SourceSpan = this.span_from_token(kw_tok);
+        this.panic_mode = true;
+        this.error_count += 1;
+        const msg: string = if (is_block) {
+            "`protected:` is not allowed in structs (structs do not support inheritance)"
+        } else {
+            "`protected` is not allowed in structs (structs do not support inheritance)"
+        };
+        const sugg_text: string = if (is_block) { "public" } else { "public" };
+        const sugg_label: string = if (is_block) { "change to `public:`" } else { "change to `public`" };
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0359_PROTECTED_IN_STRUCT, msg);
+        diag = diag.at(kw_span);
+        diag = diag.suggest(Suggestion::single(kw_span, sugg_text, sugg_label,
+            Applicability::MaybeIncorrect));
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Parse `'(' params ')'` directly into `func`, also forwarding bare
+    /// (`...`) and named (`name...`) variadic markers. Shared by free-fn,
+    /// method, and constructor parsing so the variadic-detection rules don't
+    /// drift across the three sites.
+    parse_function_param_list_into(func: FunctionDeclNode*) -> void {
+        this.consume(TokenType::LParen, "'('");
+        if (!this.check(TokenType::RParen)) {
+            const params: VarDeclNode*[] = this.parse_parameter_list();
+            for (mut i: int = 0; i < params.length; i++) {
+                func.add_parameter(params[i]);
+            }
+        }
+        if (this.pending_bare_variadic || this.pending_named_variadic) {
+            func.set_variadic(true);
+            this.pending_bare_variadic  = false;
+            this.pending_named_variadic = false;
+        }
+        this.consume(TokenType::RParen, "')'");
+    }
+
     /// Parse a parameter list (inside parentheses).
     ///
     /// A bare `...` (no accompanying name) sets `this.pending_bare_variadic`
-    /// instead of producing a parameter; callers forward that flag onto
-    /// the function node they're building. The named form `args...` flows
-    /// through parse_parameter and is detected separately by the caller's
-    /// no-type-annotation-on-last-param heuristic.
+    /// instead of producing a parameter; the named form `args...` sets
+    /// `this.pending_named_variadic` after pushing the parameter. Callers
+    /// forward either flag onto the function node they're building.
     parse_parameter_list() -> VarDeclNode*[] {
         mut params: VarDeclNode*[] = [];
-        this.pending_bare_variadic = false;
+        this.pending_bare_variadic  = false;
+        this.pending_named_variadic = false;
 
         while (true) {
             // Bare variadic: `...` with no preceding name. Common in extern
@@ -664,25 +683,20 @@ public:
             this.advance();
         }
 
-        // Check for &this parameter (method self reference)
+        // Check for &this parameter (method self reference). Synthesize the
+        // reference-to-receiver type annotation so FunctionSignature can
+        // resolve the self parameter: inside a struct/class/impl the receiver
+        // is `&CurrentType`; inside a trait declaration it is `&This`, a
+        // placeholder that downstream impl-method resolution rewrites to
+        // each concrete impl target.
         if (this.check(TokenType::Amp) && this.peek_at(1).kind == TokenType::KwThis) {
-            // &this or mut &this
             this.advance(); // consume '&'
-            const this_tok: Token = this.advance(); // consume 'this'
+            this.advance(); // consume 'this'
             const pname: SymbolStr = this.ctx.intern("&this");
             const span: SourceSpan = this.span_from(start);
             mut param: VarDeclNode* = new VarDeclNode(pname, span);
             param.set_mutable(is_mutable);
 
-            // Synthesize type annotation so FunctionSignature pass can resolve
-            // the self parameter type. Inside a struct/class/impl the receiver
-            // is `&CurrentType`; inside a trait declaration it is `&This`;
-            // a placeholder that downstream impl-method resolution rewrites
-            // to each concrete impl target. Without an annotation here, the
-            // last-param-null-annotation heuristic in parse_function_declaration
-            // mistakes the receiver for a variadic `args...` bucket and sets
-            // `is_variadic=true`, which later wipes the receiver alloca in
-            // codegen (fixed_param_count) and yields a null-receiver call.
             mut inner: TypeAnnotation* = null;
             if (this.current_type_name != "") {
                 const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
@@ -693,9 +707,7 @@ public:
                 };
                 inner = new TypeAnnotation::Named(named_ann);
             } else {
-                const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation {
-                    span: span,
-                };
+                const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation { span: span };
                 inner = new TypeAnnotation::ThisType(tt_ann);
             }
             const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
@@ -731,12 +743,14 @@ public:
         }
         param.set_kw_span(kw_span);
 
-        // Variadic parameter: name... (e.g., args...)
-        // Return the param as-is (no type annotation); the caller
-        // will see the Ellipsis and mark the function as variadic.
+        // Variadic parameter: name... (e.g., args...). Signal the caller
+        // by setting pending_named_variadic; the param itself has no type
+        // annotation but remains in the parameter list so the body can
+        // reference it by name.
         if (this.check(TokenType::Ellipsis)) {
             this.advance(); // consume '...'
             param.set_mutable(false);
+            this.pending_named_variadic = true;
             return param;
         }
 
@@ -840,38 +854,26 @@ public:
             const doc: string = this.take_documentation();
 
             // Visibility labels: public: / private: / protected:
-            if (this.check(TokenType::KwPublic) && this.peek_at(1).kind == TokenType::Colon) {
-                current_visibility = Visibility::Public;
-                has_visibility_block = true;
-                this.advance(); this.advance(); // consume 'public' ':'
-                continue;
-            }
-            if (this.check(TokenType::KwPrivate) && this.peek_at(1).kind == TokenType::Colon) {
-                current_visibility = Visibility::Private;
-                has_visibility_block = true;
-                this.advance(); this.advance();
-                continue;
-            }
-            if (this.check(TokenType::KwProtected) && this.peek_at(1).kind == TokenType::Colon) {
-                if (is_struct) {
-                    const kw_span: SourceSpan = this.span_from_token(this.current());
-                    this.panic_mode = true;
-                    this.error_count += 1;
-                    mut diag: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0359_PROTECTED_IN_STRUCT,
-                        "`protected:` is not allowed in structs (structs do not support inheritance)");
-                    diag = diag.at(kw_span);
-                    diag = diag.suggest(Suggestion::single(kw_span, "public",
-                        "change to `public:`",
-                        Applicability::MaybeIncorrect));
-                    this.ctx.emit_diagnostic(diag);
-                    this.advance(); this.advance();
+            if (this.peek_at(1).kind == TokenType::Colon) {
+                mut matched: boolean = true;
+                match (this.current().kind) {
+                    TokenType::KwPublic    => { current_visibility = Visibility::Public; }
+                    TokenType::KwPrivate   => { current_visibility = Visibility::Private; }
+                    TokenType::KwProtected => {
+                        if (is_struct) {
+                            this.emit_protected_in_struct_error(this.current(), true);
+                            current_visibility = Visibility::Public;
+                        } else {
+                            current_visibility = Visibility::Protected;
+                        }
+                    }
+                    _ => { matched = false; }
+                }
+                if (matched) {
+                    has_visibility_block = true;
+                    this.advance(); this.advance(); // consume keyword + ':'
                     continue;
                 }
-                current_visibility = Visibility::Protected;
-                has_visibility_block = true;
-                this.advance(); this.advance();
-                continue;
             }
 
             // Inline visibility for the next member: `private foo()`,
@@ -882,33 +884,25 @@ public:
             // inline opt-out doesn't shift the rest of the section.
             mut member_visibility: Visibility = current_visibility;
             mut had_inline_visibility: boolean = false;
-            if (this.check(TokenType::KwPublic) && this.peek_at(1).kind != TokenType::Colon) {
-                member_visibility = Visibility::Public;
-                had_inline_visibility = true;
-                this.advance(); // consume 'public'
-            } else if (this.check(TokenType::KwPrivate) && this.peek_at(1).kind != TokenType::Colon) {
-                member_visibility = Visibility::Private;
-                had_inline_visibility = true;
-                this.advance(); // consume 'private'
-            } else if (this.check(TokenType::KwProtected) && this.peek_at(1).kind != TokenType::Colon) {
-                if (is_struct) {
-                    const kw_span: SourceSpan = this.span_from_token(this.current());
-                    this.panic_mode = true;
-                    this.error_count += 1;
-                    mut diag: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0359_PROTECTED_IN_STRUCT,
-                        "`protected` is not allowed in structs (structs do not support inheritance)");
-                    diag = diag.at(kw_span);
-                    diag = diag.suggest(Suggestion::single(kw_span, "public",
-                        "change to `public`",
-                        Applicability::MaybeIncorrect));
-                    this.ctx.emit_diagnostic(diag);
-                    this.advance();
-                    continue;
+            if (this.peek_at(1).kind != TokenType::Colon) {
+                mut matched: boolean = true;
+                match (this.current().kind) {
+                    TokenType::KwPublic    => { member_visibility = Visibility::Public; }
+                    TokenType::KwPrivate   => { member_visibility = Visibility::Private; }
+                    TokenType::KwProtected => {
+                        if (is_struct) {
+                            this.emit_protected_in_struct_error(this.current(), false);
+                            this.advance();
+                            continue;
+                        }
+                        member_visibility = Visibility::Protected;
+                    }
+                    _ => { matched = false; }
                 }
-                member_visibility = Visibility::Protected;
-                had_inline_visibility = true;
-                this.advance(); // consume 'protected'
+                if (matched) {
+                    had_inline_visibility = true;
+                    this.advance(); // consume keyword
+                }
             }
 
             // For classes, every member must declare visibility; either
@@ -1056,23 +1050,7 @@ public:
         // Parse as function declaration
         mut func: FunctionDeclNode* = new FunctionDeclNode(name, this.span_from_token(start));
 
-        this.consume(TokenType::LParen, "'('");
-        if (!this.check(TokenType::RParen)) {
-            const params: VarDeclNode*[] = this.parse_parameter_list();
-            for (mut i: int = 0; i < params.length; i++) {
-                const p: VarDeclNode* = params[i];
-                if (p.type_annotation == null && i == params.length - 1
-                        && !p.name.equals(this.ctx.intern("this"))) {
-                    func.set_variadic(true);
-                }
-                func.add_parameter(p);
-            }
-        }
-        if (this.pending_bare_variadic) {
-            func.set_variadic(true);
-            this.pending_bare_variadic = false;
-        }
-        this.consume(TokenType::RParen, "')'");
+        this.parse_function_param_list_into(func);
 
         mut method: MethodNode* = new MethodNode(func, this.span_from_token(start));
         method.set_constructor(true);
@@ -1175,24 +1153,7 @@ public:
             }
         }
 
-        // Parameter list
-        this.consume(TokenType::LParen, "'('");
-        if (!this.check(TokenType::RParen)) {
-            const params: VarDeclNode*[] = this.parse_parameter_list();
-            for (mut i: int = 0; i < params.length; i++) {
-                const p: VarDeclNode* = params[i];
-                if (p.type_annotation == null && i == params.length - 1
-                        && !p.name.equals(this.ctx.intern("this"))) {
-                    func.set_variadic(true);
-                }
-                func.add_parameter(p);
-            }
-        }
-        if (this.pending_bare_variadic) {
-            func.set_variadic(true);
-            this.pending_bare_variadic = false;
-        }
-        this.consume(TokenType::RParen, "')'");
+        this.parse_function_param_list_into(func);
 
         // Optional return type
         if (this.match_tok(TokenType::Arrow)) {
@@ -1663,13 +1624,13 @@ public:
             if (this.peek_at(off + 1).kind != TokenType::Identifier) { break; }
             off += 2;
         }
-        // Optional `< ... >` generic args; cap the walk so a bogus stream
-        // can't loop indefinitely.
+        // Optional `< ... >` generic args. The walk terminates on `depth == 0`
+        // (balanced) or EOF (giving up); no artificial step cap needed since
+        // `off` strictly increases each iteration.
         if (this.peek_at(off).kind == TokenType::LAngle) {
             mut depth: int = 1;
-            mut steps: int = 0;
             off += 1;
-            while (depth > 0 && steps < 64) {
+            while (depth > 0) {
                 const k: TokenType = this.peek_at(off).kind;
                 if (k == TokenType::EOF) { return 0; }
                 if (k == TokenType::LAngle) { depth += 1; }
@@ -1679,9 +1640,7 @@ public:
                     if (depth < 0) { depth = 0; }
                 }
                 off += 1;
-                steps += 1;
             }
-            if (depth != 0) { return 0; }
         }
         if (this.peek_at(off).kind != TokenType::KwFor) { return 0; }
         return if (had_kind_tag) { 2 } else { 1 };
@@ -2211,7 +2170,7 @@ public:
         }
 
         // String literal: "foo"
-        if (start.kind == TokenType::StringLiteral || start.kind == TokenType::RawStringLiteral) {
+        if (start.kind == TokenType::StringLiteral) {
             const tok: Token = this.advance();
             const content: string = ParserBase::unquote_string_lexeme(tok.lexeme);
             return DirectiveArg::string_lit(content, this.span_from_token(tok));
@@ -2292,7 +2251,7 @@ public:
                 kv.value_kind = DirectiveArgKind::BoolLit;
                 kv.bool_value = false;
             }
-            TokenType::StringLiteral | TokenType::RawStringLiteral => {
+            TokenType::StringLiteral => {
                 this.advance();
                 kv.value_kind = DirectiveArgKind::StringLit;
                 kv.str_value  = ParserBase::unquote_string_lexeme(v_tok.lexeme);
@@ -2618,55 +2577,10 @@ public:
         const start: Token = this.current();
         mut arm: MatchArmNode* = this.parse_match_arm_patterns();
 
-        // Body: block statement (parsed specially; ';' is optional before '}')
         if (this.check(TokenType::LBrace)) {
-            const bstart: Token = this.advance(); // consume '{'
-            mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
-
-            while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-                const before_pos: int = this.pos;
-                if (this.panic_mode) {
-                    // If we're at '}', the error was likely a missing ';'; recover gracefully
-                    if (this.check(TokenType::RBrace)) {
-                        this.panic_mode = false;
-                        break;
-                    }
-                    this.synchronize();
-                    if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
-                }
-
-                if (this.is_declaration_start()) {
-                    const decl: ASTNode* = this.parse_declaration(false, "");
-                    if (decl != null) {
-                        const decl_stmt: DeclStmtNode* = new DeclStmtNode(decl as DeclarationNode*, decl.span);
-                        block.add_statement(decl_stmt);
-                    }
-                } else if (this.is_statement_keyword()) {
-                    // Statement keywords (if/while/return/etc.): parse as normal statement
-                    const stmt: StatementNode* = this.parse_statement();
-                    if (stmt != null) {
-                        block.add_statement(stmt);
-                    }
-                } else {
-                    // Expression: ';' is optional before '}'
-                    const expr: ExpressionNode* = this.parse_expression();
-                    if (expr != null) {
-                        const stmt: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
-                        block.add_statement(stmt);
-                    }
-                    // Consume ';' if present, but don't require it
-                    this.match_tok(TokenType::Semicolon);
-                }
-
-                // Progress guard: matches the rationale in parse_match_statement.
-                if (this.pos == before_pos) {
-                    this.advance();
-                }
-            }
-
-            this.consume(TokenType::RBrace, "'}'");
-            block.span = this.span_from(bstart);
-            arm.set_body(block);
+            // Block body — semicolons optional before `}`, same shape as
+            // parse_inner_block (used for function bodies / loop bodies).
+            arm.set_body(this.parse_inner_block());
         } else {
             // Single statement/expression
             const stmt: StatementNode* = this.parse_statement();

@@ -64,19 +64,10 @@ public:
     variant_name: SymbolStr;
     elements:     PatternElement[];
 
-    // Precomputed binding info: avoids needing to match on PatternElement
-    // (which currently has codegen limitations around enum variant extraction).
-    binding_names:     SymbolStr[];
-    binding_spans:     SourceSpan[];
-    binding_positions: i64[];       // element index for payload type mapping
-
     EnumPatternNode(span: SourceSpan) : PatternNode(PatternKind::Enum, span) {
-        this.enum_name          = SymbolStr::empty();
-        this.variant_name       = SymbolStr::empty();
-        this.elements           = [];
-        this.binding_names      = [];
-        this.binding_spans      = [];
-        this.binding_positions  = [];
+        this.enum_name    = SymbolStr::empty();
+        this.variant_name = SymbolStr::empty();
+        this.elements     = [];
     }
 
     set_enum_name(n: SymbolStr) -> void    { this.enum_name = n; }
@@ -86,10 +77,27 @@ public:
         this.elements.push(elem);
     }
 
-    add_binding(name: SymbolStr, span: SourceSpan, position: i64) -> void {
-        this.binding_names.push(name);
-        this.binding_spans.push(span);
-        this.binding_positions.push(position);
+    /// Returns the binding at element-position `i`, or null if that element
+    /// is not a binding. Sema, codegen, and the monomorphizer iterate
+    /// `elements` and call this to grab the name+span for binding registration.
+    binding_at(i: i64) -> PatternBinding* {
+        if (i < 0 || i >= this.elements.length) { return null; }
+        return match (this.elements[i]) {
+            PatternElement::Binding(pb) => { pb }
+            _                           => { null }
+        };
+    }
+
+    /// True if this pattern has any binding elements (skips arms with only
+    /// wildcards/literals).
+    has_bindings() -> boolean {
+        for (mut i: i64 = 0; i < this.elements.length; i++) {
+            match (this.elements[i]) {
+                PatternElement::Binding(_) => { return true; }
+                _                          => {}
+            }
+        }
+        return false;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -264,28 +272,16 @@ type struct DirectiveArg {
 type class DirectiveNode : ASTNode {
 public:
     directive_kind: string;
-    arguments:      string[];     // legacy human-readable text per arg
-    args:           DirectiveArg[]; // typed argument list (rich form)
+    args:           DirectiveArg[];
 
     DirectiveNode(directive_kind: string, span: SourceSpan)
         : ASTNode(NodeKind::Directive, span) {
         this.directive_kind = directive_kind;
-        this.arguments      = [];
         this.args           = [];
     }
 
-    /// Append an argument.  Pushes to BOTH the legacy `arguments` (text)
-    /// and the typed `args` list so older readers stay compatible.
     add_arg(a: DirectiveArg) -> void {
-        this.arguments.push(a.to_text());
         this.args.push(a);
-    }
-
-    /// Legacy text-only arg add.  Used by code that hasn't migrated to
-    /// the typed argument API yet.
-    add_argument(arg: string) -> void {
-        this.arguments.push(arg);
-        this.args.push(DirectiveArg::ident(arg, this.span));
     }
 
     /// True if any argument matches the given identifier name.
