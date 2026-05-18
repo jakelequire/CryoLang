@@ -1,35 +1,407 @@
 ///! Completion handler.
 ///!
-///! v1: returns a small static list of Cryo keywords so the trigger
-///! characters (`.` and `::`) at least produce *something* in the
-///! editor.  Real symbol-aware completion needs:
-///!   • the position-→-AST-node walker (shared with hover/definition)
-///!   • member enumeration via `node.resolved_type` → arena lookup
-///!   • scope walking via the resolver
+///! Provides type-aware auto-complete triggered by `.` (dot access)
+///! and `::` (scope resolution).
 ///!
-///! Returning a CompletionList (rather than just an array) lets us
-///! signal `isIncomplete: true` when we want the editor to keep
-///! re-querying as the user types.
+///! Dot completion:
+///!   - Finds the AST node under the cursor (position of the receiver
+///!     expression before the dot).
+///!   - Reads the node's `resolved_type`, unwraps Reference/Pointer/
+///!     InstantiatedType wrappers, and maps the carrier TypeRef to a
+///!     SymbolStr via `decl_index.lookup_type_name`.
+///!   - Walks all modules to enumerate fields and non-static methods
+///!     declared on matching struct/class/impl blocks.
+///!
+///! Scope-resolution completion:
+///!   - Reads the identifier text immediately before `::`.
+///!   - Interns it to get a SymbolStr, then walks all modules to
+///!     enumerate static methods (struct/class/impl) and enum variants.
+///!
+///! Falls back to a static keyword list when type info is unavailable.
 
 namespace Lsp::Handlers::Completion;
 
 import std::core::option;
+import std::core::primitives;
 import std::collections::str;
 import std::collections::string;
 import std::collections::array;
 import std::json::value;
 
+import Compiler::CompilationContext;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Declaration;
+import Compiler::AST::NodeLocator;
+import Compiler::Diag::SourceSpan;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Arena;
+import Compiler::Types;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
+import Compiler::ModuleGraph;
+
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
+import Lsp::Protocol::Lsp;
 
+
+// ============================================================================
+// LSP CompletionItemKind constants
+// ============================================================================
+
+const CK_METHOD:      i64 = 2;
+const CK_FUNCTION:    i64 = 3;
+const CK_FIELD:       i64 = 5;
+const CK_KEYWORD:     i64 = 14;
+const CK_ENUM_MEMBER: i64 = 20;
+
+
+// ============================================================================
+// Public entry point
+// ============================================================================
 
 public function handle_completion(docs: &Docs, sessions: mut &SessionMap,
                                    params: &JsonValue) -> JsonValue {
-    match (params.get(Str::from_cstr("textDocument"))) {
-        Option::Some(_) => { }
-        Option::None    => { }
+    // 1. Extract textDocument.uri
+    const td_opt: Option<JsonValue*> = params.get(Str::from_cstr("textDocument"));
+    if (!td_opt.is_some()) { return make_keyword_list(); }
+    const td: JsonValue* = td_opt.unwrap_or(null);
+    if (td == null) { return make_keyword_list(); }
+
+    const uri_opt: Option<JsonValue*> = td.get(Str::from_cstr("uri"));
+    if (!uri_opt.is_some()) { return make_keyword_list(); }
+    const uri_val: JsonValue* = uri_opt.unwrap_or(null);
+    if (uri_val == null) { return make_keyword_list(); }
+
+    const uri_str_opt: Option<Str> = uri_val.as_str();
+    if (!uri_str_opt.is_some()) { return make_keyword_list(); }
+    const uri: Str = uri_str_opt.unwrap_or(Str::from_cstr(""));
+
+    // 2. Extract position
+    const pos_opt: Option<JsonValue*> = params.get(Str::from_cstr("position"));
+    if (!pos_opt.is_some()) { return make_keyword_list(); }
+    const pos: JsonValue* = pos_opt.unwrap_or(null);
+    if (pos == null) { return make_keyword_list(); }
+    const line:      u32 = json_u32_field(pos, "line");
+    const character: u32 = json_u32_field(pos, "character");
+
+    // 3. Get document text
+    const doc_opt: Option<Document*> = docs.get(uri);
+    if (!doc_opt.is_some()) { return make_keyword_list(); }
+    const doc: Document* = doc_opt.unwrap_or(null);
+    if (doc == null) { return make_keyword_list(); }
+
+    const text: Str = doc.text.as_str();
+    const len: u64 = text.length();
+    if (len == 0) { return make_keyword_list(); }
+    const ptr: u8* = text.as_ptr();
+
+    const byte_off: u64 = doc.line_index.byte_offset(line, character);
+    if (byte_off == 0 || byte_off > len) { return make_keyword_list(); }
+
+    // 4. Detect trigger character
+    const DOT:   u8 = 46 as u8;
+    const COLON: u8 = 58 as u8;
+
+    mut is_dot:   boolean = false;
+    mut is_scope: boolean = false;
+
+    if (byte_off >= 1 && ptr[byte_off - 1] == DOT) {
+        is_dot = true;
+    } else if (byte_off >= 2 && ptr[byte_off - 1] == COLON && ptr[byte_off - 2] == COLON) {
+        is_scope = true;
+    } else {
+        return make_keyword_list();
     }
 
+    // 5. Extract identifier immediately before the trigger
+    //    For dot  : identifier ends at byte_off-2 (inclusive); dot at byte_off-1
+    //    For ::   : identifier ends at byte_off-3 (inclusive); :: at byte_off-2..byte_off-1
+    mut ident_end_excl: u64 = 0;
+    if (is_dot) {
+        if (byte_off < 2) { return make_keyword_list(); }
+        ident_end_excl = byte_off - 1;
+    } else {
+        if (byte_off < 3) { return make_keyword_list(); }
+        ident_end_excl = byte_off - 2;
+    }
+
+    mut ident_start: u64 = ident_end_excl;
+    while (ident_start > 0 && is_ident_byte(ptr[ident_start - 1])) {
+        ident_start = ident_start - 1;
+    }
+    if (ident_start == ident_end_excl) { return make_keyword_list(); }
+
+    // Build NUL-terminated C-string from the identifier bytes
+    const ident_len: u64 = ident_end_excl - ident_start;
+    mut ident_buf: String = String::with_capacity(ident_len + 1);
+    ident_buf.push_str(text.sub_bytes(ident_start, ident_end_excl));
+    ident_buf.push_byte(0 as u8);
+    ident_buf.truncate(ident_len);
+    const ident_cstr: string = ident_buf.as_ptr() as string;
+
+    // 6. Get compiler session and context
+    const session_opt: Option<CompilerSession*> = sessions.get(uri);
+    if (!session_opt.is_some()) {
+        ident_buf.drop();
+        return make_keyword_list();
+    }
+    const session: CompilerSession* = session_opt.unwrap_or(null);
+    if (session == null) {
+        ident_buf.drop();
+        return make_keyword_list();
+    }
+    const ctx: CompilationContext* = session.context();
+    if (ctx == null || ctx.type_arena == null || ctx.intern_table == null) {
+        ident_buf.drop();
+        return make_keyword_list();
+    }
+
+    // 7. Resolve the file URI to a module AST
+    const fs_path: Str = uri_to_fs_path(uri);
+    mut path_buf: String = String::with_capacity(fs_path.length() + 1);
+    path_buf.push_str(fs_path);
+    path_buf.push_byte(0 as u8);
+    const path_buf_len: u64 = path_buf.length() - 1;
+    path_buf.truncate(path_buf_len);
+    const path_cstr: string = path_buf.as_ptr() as string;
+
+    const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
+    path_buf.drop();
+    if (mod_idx < 0) {
+        ident_buf.drop();
+        return make_keyword_list();
+    }
+    const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
+    if (ast == null) {
+        ident_buf.drop();
+        return make_keyword_list();
+    }
+
+    // 8. Build completion items
+    mut items: Array<JsonValue> = Array<JsonValue>::with_capacity(64);
+
+    if (is_dot) {
+        // Dot completion: enumerate instance members of the receiver type.
+        // Convert the last byte of the identifier from LSP 0-based coords to
+        // compiler 1-based coords so node_locator can find the right node.
+        const cursor_line: u32 = line + 1 as u32;
+        const line_start_off: u64 = doc.line_index.byte_offset(line, 0 as u32);
+        const ident_last_0based: u64 = ident_end_excl - 1 - line_start_off;
+        const lookup_char: u32 = (ident_last_0based + 1) as u32;
+
+        const node: ASTNode* = NodeLocator::find_innermost_node_at(
+            ast, cursor_line, lookup_char);
+        if (node != null) {
+            const ty: TypeRef = NodeLocator::resolved_type_of(node);
+            if (ty.is_valid() && ctx.decl_index != null) {
+                const recv_ty: TypeRef = unwrap_to_carrier(ty, ctx.type_arena);
+                if (recv_ty.is_valid()) {
+                    const type_sym: SymbolStr =
+                        ctx.decl_index.lookup_type_name(recv_ty);
+                    if (type_sym.is_valid()) {
+                        collect_instance_members(
+                            ctx.module_graph, ctx.intern_table,
+                            ctx.type_arena, type_sym, &items);
+                    }
+                }
+            }
+        }
+    } else {
+        // Scope-resolution completion: enumerate static methods + enum variants.
+        const name_sym: SymbolStr = ctx.intern_table.intern(ident_cstr);
+        if (name_sym.is_valid()) {
+            collect_scope_members(
+                ctx.module_graph, ctx.intern_table,
+                ctx.type_arena, name_sym, &items);
+        }
+    }
+
+    ident_buf.drop();
+
+    if (items.length == 0) {
+        items.drop();
+        return make_keyword_list();
+    }
+    return make_completion_list(items);
+}
+
+
+// ============================================================================
+// Member collection
+// ============================================================================
+
+/// Walk all modules and add fields + non-static methods that belong to
+/// `type_sym` into `items`.
+function collect_instance_members(graph: ModuleGraph*,
+                                    intern: InternTable*,
+                                    arena: TypeArena*,
+                                    type_sym: SymbolStr,
+                                    items: mut &Array<JsonValue>) -> void {
+    if (graph == null) { return; }
+    const type_leaf: string = if (intern != null) {
+        leaf_after_separator(intern.resolve(type_sym))
+    } else { "" };
+
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const mod_ast: ProgramNode* = graph.get_module_ast(mi);
+        if (mod_ast == null) { continue; }
+        for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_top_decl(mod_ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind == NodeKind::StructDeclaration) {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                if (!names_match(intern, d.name, type_sym, type_leaf)) { continue; }
+                add_fields(d.fields, arena, items);
+                add_instance_methods(d.methods, arena, intern, items);
+            } else if (stmt.kind == NodeKind::ClassDeclaration) {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (!names_match(intern, d.name, type_sym, type_leaf)) { continue; }
+                add_fields(d.fields, arena, items);
+                add_instance_methods(d.methods, arena, intern, items);
+            } else if (stmt.kind == NodeKind::ImplementationBlock) {
+                const d: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (!names_match(intern, d.target_type, type_sym, type_leaf)) { continue; }
+                add_instance_methods(d.methods, arena, intern, items);
+            }
+        }
+    }
+}
+
+/// Walk all modules and add static methods + enum variants that belong to
+/// `name_sym` into `items`.
+function collect_scope_members(graph: ModuleGraph*,
+                                 intern: InternTable*,
+                                 arena: TypeArena*,
+                                 name_sym: SymbolStr,
+                                 items: mut &Array<JsonValue>) -> void {
+    if (graph == null) { return; }
+    const name_leaf: string = if (intern != null) {
+        leaf_after_separator(intern.resolve(name_sym))
+    } else { "" };
+
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const mod_ast: ProgramNode* = graph.get_module_ast(mi);
+        if (mod_ast == null) { continue; }
+        for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
+            const stmt: ASTNode* = unwrap_top_decl(mod_ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind == NodeKind::EnumDeclaration) {
+                const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                if (!names_match(intern, d.name, name_sym, name_leaf)) { continue; }
+                add_enum_variants(d.variants, intern, items);
+            } else if (stmt.kind == NodeKind::StructDeclaration) {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                if (!names_match(intern, d.name, name_sym, name_leaf)) { continue; }
+                add_static_methods(d.methods, arena, intern, items);
+            } else if (stmt.kind == NodeKind::ClassDeclaration) {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (!names_match(intern, d.name, name_sym, name_leaf)) { continue; }
+                add_static_methods(d.methods, arena, intern, items);
+            } else if (stmt.kind == NodeKind::ImplementationBlock) {
+                const d: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (!names_match(intern, d.target_type, name_sym, name_leaf)) { continue; }
+                add_static_methods(d.methods, arena, intern, items);
+            }
+        }
+    }
+}
+
+function add_fields(fields: FieldDeclNode*[], arena: TypeArena*,
+                     items: mut &Array<JsonValue>) -> void {
+    if (arena == null) { return; }
+    for (mut i: i64 = 0; i < fields.length; i++) {
+        const f: FieldDeclNode* = fields[i];
+        if (f == null) { continue; }
+        const label: string = arena.intern_table.resolve(f.name);
+        const detail: string = arena.resolve_display_name_short(f.resolved_type.id);
+        push_item(items, label, detail, CK_FIELD);
+    }
+}
+
+function add_instance_methods(methods: MethodNode*[], arena: TypeArena*,
+                                intern: InternTable*,
+                                items: mut &Array<JsonValue>) -> void {
+    if (arena == null || intern == null) { return; }
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null || m.func == null) { continue; }
+        if (m.is_static || m.is_constructor) { continue; }
+        const label: string = intern.resolve(m.func.name);
+        const detail: string = "(...) -> "
+            + arena.resolve_display_name_short(m.func.resolved_return_type.id);
+        push_item(items, label, detail, CK_METHOD);
+    }
+}
+
+function add_static_methods(methods: MethodNode*[], arena: TypeArena*,
+                              intern: InternTable*,
+                              items: mut &Array<JsonValue>) -> void {
+    if (arena == null || intern == null) { return; }
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null || m.func == null) { continue; }
+        if (!m.is_static && !m.is_constructor) { continue; }
+        const label: string = intern.resolve(m.func.name);
+        const detail: string = "(...) -> "
+            + arena.resolve_display_name_short(m.func.resolved_return_type.id);
+        push_item(items, label, detail, CK_FUNCTION);
+    }
+}
+
+function add_enum_variants(variants: EnumVariantNode*[], intern: InternTable*,
+                             items: mut &Array<JsonValue>) -> void {
+    if (intern == null) { return; }
+    for (mut i: i64 = 0; i < variants.length; i++) {
+        const v: EnumVariantNode* = variants[i];
+        if (v == null) { continue; }
+        const label: string = intern.resolve(v.name);
+        push_item(items, label, "", CK_ENUM_MEMBER);
+    }
+}
+
+
+// ============================================================================
+// Item builders
+// ============================================================================
+
+/// Append a single CompletionItem with the given label, optional detail,
+/// and LSP kind.
+function push_item(items: mut &Array<JsonValue>, label: string,
+                    detail: string, kind: i64) -> void {
+    mut o: JsonObject = JsonObject::new();
+
+    mut label_s: String = String::new();
+    label_s.push_cstr(label);
+    o.insert(String::from_str(Str::from_cstr("label")),
+             JsonValue::String(label_s));
+
+    o.insert(String::from_str(Str::from_cstr("kind")),
+             JsonValue::Number(JsonNumber::Int(kind)));
+
+    if (strlen(detail) > 0) {
+        mut detail_s: String = String::new();
+        detail_s.push_cstr(detail);
+        o.insert(String::from_str(Str::from_cstr("detail")),
+                 JsonValue::String(detail_s));
+    }
+
+    items.push(JsonValue::Object(o));
+}
+
+/// Append one CompletionItem of kind=Keyword (LSP kind 14).
+function push_keyword(items: mut &Array<JsonValue>, label: string) -> void {
+    push_item(items, label, "", CK_KEYWORD);
+}
+
+/// Build the static keyword completion list (fallback).
+function make_keyword_list() -> JsonValue {
     mut items: Array<JsonValue> = Array<JsonValue>::with_capacity(20);
     push_keyword(&items, "function");
     push_keyword(&items, "return");
@@ -49,7 +421,11 @@ public function handle_completion(docs: &Docs, sessions: mut &SessionMap,
     push_keyword(&items, "import");
     push_keyword(&items, "namespace");
     push_keyword(&items, "const");
+    return make_completion_list(items);
+}
 
+/// Wrap an items array into a LSP `CompletionList` object.
+function make_completion_list(items: Array<JsonValue>) -> JsonValue {
     mut out: JsonObject = JsonObject::new();
     out.insert(
         String::from_str(Str::from_cstr("isIncomplete")),
@@ -61,14 +437,124 @@ public function handle_completion(docs: &Docs, sessions: mut &SessionMap,
 }
 
 
-/// Append one CompletionItem of kind=Keyword (LSP enum 14).
-function push_keyword(items: mut &Array<JsonValue>, label: string) -> void {
-    mut o: JsonObject = JsonObject::new();
-    mut label_buf: String = String::new();
-    label_buf.push_cstr(label);
-    o.insert(String::from_str(Str::from_cstr("label")),
-             JsonValue::String(label_buf));
-    o.insert(String::from_str(Str::from_cstr("kind")),
-             JsonValue::Number(JsonNumber::Int(14 as i64)));
-    items.push(JsonValue::Object(o));
+// ============================================================================
+// AST helpers
+// ============================================================================
+
+/// `ProgramNode.statements` may wrap top-level decls in a
+/// `DeclStmtNode`; unwrap so callers can branch on the inner kind.
+/// Mirrors `unwrap_decl_stmt` in `Compiler::AST::NodeLocator`
+/// (kept private there).
+function unwrap_top_decl(node: ASTNode*) -> ASTNode* {
+    if (node == null) { return null; }
+    if (node.kind != NodeKind::DeclarationStatement) { return node; }
+    const d: DeclStmtNode* = node as DeclStmtNode*;
+    return d.declaration as ASTNode*;
+}
+
+
+// ============================================================================
+// Utilities (duplicated from hover.cryo / keyword_docs.cryo to avoid
+// accessing private symbols across namespace boundaries)
+// ============================================================================
+
+const COMPLETION_FILE_SCHEME:     string = "file://";
+const COMPLETION_FILE_SCHEME_LEN: u64    = 7;
+
+function uri_to_fs_path(uri: Str) -> Str {
+    if (uri.length() >= COMPLETION_FILE_SCHEME_LEN) {
+        const prefix: Str = uri.sub_bytes(0, COMPLETION_FILE_SCHEME_LEN);
+        if (prefix.equals(&Str::from_cstr(COMPLETION_FILE_SCHEME))) {
+            return uri.sub_bytes(COMPLETION_FILE_SCHEME_LEN, uri.length());
+        }
+    }
+    return uri;
+}
+
+function json_u32_field(obj: &JsonValue, key: string) -> u32 {
+    match (obj.get(Str::from_cstr(key))) {
+        Option::Some(v) => {
+            match (v) {
+                JsonValue::Number(n) => {
+                    match (n) {
+                        JsonNumber::Int(i)   => {
+                            if (i < 0) { return 0 as u32; }
+                            return i as u32;
+                        }
+                        JsonNumber::UInt(u)  => { return u as u32; }
+                        JsonNumber::Float(f) => {
+                            if (f < 0.0) { return 0 as u32; }
+                            return f as u32;
+                        }
+                    }
+                }
+                _ => { return 0 as u32; }
+            }
+        }
+        Option::None => { return 0 as u32; }
+    }
+    return 0 as u32;
+}
+
+/// Return everything after the final `::` in `s`, or `s` itself when
+/// there is no `::`.  Mirrors `leaf_after_separator` in
+/// `Lsp::Handlers::Hover` (kept private there).
+function leaf_after_separator(s: string) -> string {
+    const len: i64 = strlen(s) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i + 1 < len; i++) {
+        if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
+    }
+    if (last_sep < 0) { return s; }
+    const start: i64 = last_sep + 2;
+    if (start >= len) { return ""; }
+    return ptr_add(s as void*, start) as string;
+}
+
+/// Strip `Reference`, `Pointer`, and `InstantiatedType` wrappers from
+/// `ty` until the carrier struct/class/enum TypeRef is reached.
+/// Mirrors `unwrap_to_carrier` in `Lsp::Handlers::Hover`.
+function unwrap_to_carrier(ty: TypeRef, arena: TypeArena*) -> TypeRef {
+    if (arena == null) { return ty; }
+    mut cur: TypeRef = ty;
+    mut hops: i64 = 0;
+    while (hops < 6) {
+        if (!cur.is_valid()) { return cur; }
+        const t: Type* = arena.lookup(cur.id);
+        if (t == null) { return cur; }
+        if (t.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = t as ReferenceType*;
+            cur = rt.referent;
+        } else if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            cur = pt.pointee;
+        } else if (t.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = t as InstantiatedType*;
+            cur = it.generic_base;
+        } else {
+            return cur;
+        }
+        hops = hops + 1;
+    }
+    return cur;
+}
+
+/// True when `decl_name` matches `type_sym` either by SymbolStr id
+/// or by string content versus the pre-extracted leaf segment.
+function names_match(intern: InternTable*, decl_name: SymbolStr,
+                      type_sym: SymbolStr, type_leaf: string) -> boolean {
+    if (decl_name.equals(type_sym)) { return true; }
+    if (intern == null || strlen(type_leaf) == 0) { return false; }
+    const dn: string = intern.resolve(decl_name);
+    return strcmp(dn, type_leaf) == 0;
+}
+
+/// True when `b` is a valid identifier byte (a-z, A-Z, 0-9, _).
+/// Mirrors `is_ident_byte` in `Lsp::Handlers::KeywordDocs`.
+function is_ident_byte(b: u8) -> boolean {
+    if (b >= 97 as u8 && b <= 122 as u8) { return true; }
+    if (b >= 65 as u8 && b <= 90 as u8)  { return true; }
+    if (b >= 48 as u8 && b <= 57 as u8)  { return true; }
+    if (b == 95 as u8) { return true; }
+    return false;
 }
