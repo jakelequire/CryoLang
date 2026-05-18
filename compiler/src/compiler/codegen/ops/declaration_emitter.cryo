@@ -497,11 +497,30 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        // Qualify the class name; node.name is the bare AST name.
-        // Split `this.ctx.qualify_symbol_sym(...)` via a local: double-deref
-        // chains have historically been a source of subtle codegen bugs.
+        // Use the arena's canonical qualified name for specialized
+        // classes so method keys match the DI registration.  Mirrors
+        // the struct path in `declare_struct_methods` — without the
+        // canonical lookup, a spec'd `Bucket<u32, i32>` injected into
+        // the consuming module would get keyed under that module's
+        // namespace (e.g. `std::core::intrinsics::Bucket<u32, i32>`)
+        // while the call site (in the defining module) emits the
+        // canonical `Main::Bucket<u32, i32>` reference, producing an
+        // `undefined reference` at link time.
         const ctx_ptr: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        mut qualified: SymbolStr = SymbolStr::empty();
+        mut di_ref: TypeRef = di.lookup_type(local_sym);
+        if (!di_ref.is_valid()) {
+            di_ref = di.lookup_type(node.name);
+        }
+        if (di_ref.is_valid()) {
+            const arena: TypeArena* = this.get_arena();
+            qualified = arena.get_qualified_name(di_ref);
+        }
+        if (!qualified.is_valid()) {
+            qualified = local_sym;
+        }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -516,11 +535,9 @@ type struct DeclarationEmitter {
         // doesn't override that slot.  Layout discipline is what makes call-site
         // dispatch work: a `Base*` callsite looks up slot N in `Base`'s layout,
         // and any subclass's vtable guarantees slot N at the same index.
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        const type_ref: TypeRef = di.lookup_type(qualified);
-        if (type_ref.is_valid()) {
+        if (di_ref.is_valid()) {
             const arena: TypeArena* = this.get_arena();
-            const t: Type* = arena.lookup(type_ref.id);
+            const t: Type* = arena.lookup(di_ref.id);
             if (t != null && t.kind == TypeKind::Class) {
                 const cls: ClassType* = t as ClassType*;
                 if (cls.has_virtual_methods) {
