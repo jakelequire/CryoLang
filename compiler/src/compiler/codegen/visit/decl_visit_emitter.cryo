@@ -140,7 +140,31 @@ type struct DeclVisitEmitter {
         const cname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   class methods: %s (%lld methods)\n",
                cname, node.methods.length); fflush(null);
-        this.state.current_impl_target = this.cg.qualify(node.name);
+        // Use the arena's canonical qualified name for specialized
+        // classes so method keys match the DI registration.  Mirrors
+        // the struct path in `emit_struct_decl` — without the canonical
+        // lookup a spec'd `Bucket<u32, i32>` injected into the consuming
+        // module emits its body under that module's namespace, while
+        // call sites in the defining module reference the canonical
+        // qualified name; the mismatch surfaces as an undefined-reference
+        // link error.
+        const c_di: DeclarationIndex* = this.cg.get_decl_index();
+        const c_local: SymbolStr = this.cg.qualify(node.name);
+        mut c_ref: TypeRef = c_di.lookup_type(c_local);
+        if (!c_ref.is_valid()) {
+            c_ref = c_di.lookup_type(node.name);
+        }
+        if (c_ref.is_valid()) {
+            const c_arena: TypeArena* = this.cg.get_arena();
+            const c_qname: SymbolStr = c_arena.get_qualified_name(c_ref);
+            if (c_qname.is_valid()) {
+                this.state.current_impl_target = c_qname;
+            } else {
+                this.state.current_impl_target = c_local;
+            }
+        } else {
+            this.state.current_impl_target = c_local;
+        }
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j]);
         }

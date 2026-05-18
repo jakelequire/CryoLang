@@ -787,62 +787,93 @@ public:
         // store writes only the first few bytes of the field, leaving the
         // rest uninitialised, and downstream `provisions[k]` reads garbage.
         const t: Type* = this.cg.lookup_type_by_id(struct_type.id);
+        // Collect the field info and the GEP base offset.  Structs are
+        // 1:1 with their LLVM-struct slots; classes are flattened with
+        // an optional vtable header + every ancestor's fields preceding
+        // this class's own fields (see `map_class`).  Initializer-list
+        // syntax only writes THIS class's own fields, so the slot index
+        // for `field_names[i]` is `base_offset + local_idx`.
+        mut fields: FieldInfo[] = [];
+        mut base_offset: i64 = 0;
         if (t != null && t.kind == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
-            for (mut i: i64 = 0; i < field_names.length; i++) {
-                const fidx: i64 = st.field_index(field_names[i]);
-                if (fidx >= 0) {
-                    const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, fidx as u32, "field");
-                    mut val: LValue = field_values[i];
-                    if (val.is_valid()) {
-                        val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, st.fields[fidx].field_type);
-                        // Widen/narrow integer literals to the field's declared
-                        // width before storing.  `HashMap { len: 0, cap: 0, ... }`
-                        // arrives with each `0` as `i32 0` (codegen_literal defaults
-                        // integer literals to i32 when sema doesn't propagate the
-                        // expected type) but `len`/`cap`/`deleted` are u64 fields
-                        // a direct `store i32` writes only the low 4 bytes,
-                        // leaving the high 4 uninitialised.  Mirrors the same fix
-                        // in stmt_codegen.cryo:codegen_local_var so subsequent
-                        // i64 reads through the field don't see stack garbage in
-                        // the upper bits.  LLVMIntegerTypeKind = 8.
-                        const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, fidx as u32);
-                        const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
-                        if (field_llvm_ty != null && val_ty_raw != null
-                                && type_kind_of(field_llvm_ty) == LTypeKind::Integer
-                                && type_kind_of(val_ty_raw) == LTypeKind::Integer) {
-                            const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
-                            const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
-                            const field_lty: LType = LType { raw: field_llvm_ty };
-                            if (want_bits > got_bits) {
-                                // Widen with the field's signedness; using zext
-                                // for a signed i64 field stored a negative i32
-                                // literal (`-1`) as `0x00000000FFFFFFFF`, which
-                                // is `4294967295` not `-1`.  This is what made
-                                // `new ArrayAnnotation { size: -1, ... }` lose
-                                // its sign and turn dynamic arrays into giant
-                                // fixed ones (the size sentinel was treated as
-                                // a positive i64).  Mirrors the local-var fix.
-                                mut signed_target: boolean = false;
-                                const field_t: Type* = this.cg.lookup_type_by_id(
-                                    st.fields[fidx].field_type.id);
-                                if (field_t != null && field_t.kind == TypeKind::Int) {
-                                    const ft_int: IntType* = field_t as IntType*;
-                                    signed_target = ft_int.int_kind.is_signed();
-                                }
-                                if (signed_target) {
-                                    val = this.cg.builder.build_sext(val, field_lty, "field.widen");
-                                } else {
-                                    val = this.cg.builder.build_zext(val, field_lty, "field.widen");
-                                }
-                            } else if (want_bits < got_bits) {
-                                val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
-                            }
-                        }
-                    }
-                    this.cg.builder.build_store(val, gep);
+            fields = st.fields;
+        } else if (t != null && t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            fields = cls.fields;
+            mut any_virtual: boolean = false;
+            mut walk: ClassType* = cls;
+            mut depth: i32 = 0;
+            while (walk != null && depth < 16) {
+                if (walk.has_virtual_methods) { any_virtual = true; }
+                if (depth > 0) { base_offset += walk.fields.length; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
+                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+                walk = base_t as ClassType*;
+                depth += 1;
+            }
+            if (any_virtual) { base_offset += 1; }
+        }
+        for (mut i: i64 = 0; i < field_names.length; i++) {
+            mut fidx: i64 = -1;
+            for (mut fi: i64 = 0; fi < fields.length; fi++) {
+                if (fields[fi].name.equals(field_names[i])) {
+                    fidx = fi;
+                    break;
                 }
             }
+            if (fidx < 0) { continue; }
+            const slot: u32 = (base_offset + fidx) as u32;
+            const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
+            mut val: LValue = field_values[i];
+            if (val.is_valid()) {
+                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, fields[fidx].field_type);
+                // Widen/narrow integer literals to the field's declared
+                // width before storing.  `HashMap { len: 0, cap: 0, ... }`
+                // arrives with each `0` as `i32 0` (codegen_literal defaults
+                // integer literals to i32 when sema doesn't propagate the
+                // expected type) but `len`/`cap`/`deleted` are u64 fields
+                // a direct `store i32` writes only the low 4 bytes,
+                // leaving the high 4 uninitialised.  Mirrors the same fix
+                // in stmt_codegen.cryo:codegen_local_var so subsequent
+                // i64 reads through the field don't see stack garbage in
+                // the upper bits.  LLVMIntegerTypeKind = 8.
+                const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, slot);
+                const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                if (field_llvm_ty != null && val_ty_raw != null
+                        && type_kind_of(field_llvm_ty) == LTypeKind::Integer
+                        && type_kind_of(val_ty_raw) == LTypeKind::Integer) {
+                    const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
+                    const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
+                    const field_lty: LType = LType { raw: field_llvm_ty };
+                    if (want_bits > got_bits) {
+                        // Widen with the field's signedness; using zext
+                        // for a signed i64 field stored a negative i32
+                        // literal (`-1`) as `0x00000000FFFFFFFF`, which
+                        // is `4294967295` not `-1`.  This is what made
+                        // `new ArrayAnnotation { size: -1, ... }` lose
+                        // its sign and turn dynamic arrays into giant
+                        // fixed ones (the size sentinel was treated as
+                        // a positive i64).  Mirrors the local-var fix.
+                        mut signed_target: boolean = false;
+                        const field_t: Type* = this.cg.lookup_type_by_id(
+                            fields[fidx].field_type.id);
+                        if (field_t != null && field_t.kind == TypeKind::Int) {
+                            const ft_int: IntType* = field_t as IntType*;
+                            signed_target = ft_int.int_kind.is_signed();
+                        }
+                        if (signed_target) {
+                            val = this.cg.builder.build_sext(val, field_lty, "field.widen");
+                        } else {
+                            val = this.cg.builder.build_zext(val, field_lty, "field.widen");
+                        }
+                    } else if (want_bits < got_bits) {
+                        val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
+                    }
+                }
+            }
+            this.cg.builder.build_store(val, gep);
         }
 
         this.state.last_value = alloca;
