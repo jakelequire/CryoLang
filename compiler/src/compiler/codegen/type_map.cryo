@@ -358,6 +358,15 @@ type struct TypeMapper {
 
     /// StructType → named LLVM struct with fields.
     /// If already forward-declared (in cache), just returns it.
+    ///
+    /// Honours layout directives recorded on the StructType:
+    ///   * `repr_packed` → emit the LLVM struct as `packed`, so LLVM
+    ///     skips per-field padding.  Matches `compute_struct_layout`'s
+    ///     own packed branch so `sizeof(T)` and the LLVM-level type
+    ///     agree.
+    ///   * `repr_transparent` → no codegen change needed beyond what
+    ///     the field list already produces; layout equivalence to the
+    ///     inner field is enforced by `compute_struct_layout`.
     map_struct(mut &this, t: StructType*) -> LType {
         const mangled: string = MangledName::for_struct_type(this.intern, QualifiedName::from_symbol(t.qualified_name)).resolve(this.intern);
 
@@ -371,6 +380,8 @@ type struct TypeMapper {
         const ctx: LContext = LContext::global();
         mut llvm_ty: LType = LType::named_struct(ctx, mangled);
         this.store_cache(t.id, llvm_ty);
+
+        const packed: boolean = t.repr_packed;
 
         // Build field type array.
         const n: u32 = t.fields.length as u32;
@@ -386,10 +397,10 @@ type struct TypeMapper {
                     slots[i] = i8_fb.raw;
                 }
             }
-            llvm_ty.set_struct_body(buf, n, false);
+            llvm_ty.set_struct_body(buf, n, packed);
             intrinsics::free(buf);
         } else {
-            llvm_ty.set_struct_body(null, 0, false);
+            llvm_ty.set_struct_body(null, 0, packed);
         }
 
         return llvm_ty;

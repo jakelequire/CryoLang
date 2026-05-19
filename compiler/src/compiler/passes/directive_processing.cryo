@@ -50,6 +50,12 @@ import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::UserDefined;
+import Compiler::Resolver::SymbolStr;
 import Utils::Logger;
 
 
@@ -388,10 +394,27 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
                 emit_arg_kind_error(ctx, dir, name, 0, "an integer literal");
                 return;
             }
+            // Enforce power-of-two and a sane upper bound.  The bound
+            // (65536) mirrors LLVM's MaximumAlignment for object-file
+            // sections and is comfortably beyond what any real target
+            // demands.  Zero, negative, or non-power-of-two values are
+            // meaningless as alignments.
+            const n: i64 = a.int_value;
+            if (n <= 0 || n > 65536 || ((n & (n - 1)) != 0)) {
+                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                const msg: string = format(
+                    "directive `![align]`: alignment must be a power of two between 1 and 65536, got %lld",
+                    n);
+                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                diag = diag.at(dir.span);
+                ctx.emit_diagnostic(diag);
+                return;
+            }
             if (target != DirectiveTarget::Struct
                 && target != DirectiveTarget::Class
+                && target != DirectiveTarget::Enum
                 && target != DirectiveTarget::Variable) {
-                emit_placement_error(ctx, dir, name, "struct/class/variable", target);
+                emit_placement_error(ctx, dir, name, "struct/class/enum/variable", target);
             }
         }
 
@@ -405,10 +428,49 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
                 emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
                 return;
             }
+            // Recognised repr kinds.  Anything else is rejected explicitly
+            // so a typo like `repr(Packed)` doesn't silently no-op.
+            // `repr(<int_type>)` is reserved (see docs/cryo.md § 21); use
+            // `type enum Foo : i32 { ... }` instead.
+            const repr_known: boolean = match (a.name) {
+                "C" | "packed" | "transparent" => { true }
+                _                              => { false }
+            };
+            if (!repr_known) {
+                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                const msg: string = format(
+                    "directive `![repr]`: unknown layout `%s` (expected `C`, `packed`, or `transparent`)",
+                    a.name);
+                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                diag = diag.at(dir.span);
+                ctx.emit_diagnostic(diag);
+                return;
+            }
             if (target != DirectiveTarget::Struct
                 && target != DirectiveTarget::Class
                 && target != DirectiveTarget::Enum) {
                 emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+                return;
+            }
+            // Per-flavor placement.  `repr(packed)` and `repr(transparent)`
+            // only make sense on plain structs:
+            //   - Classes have vtables / inheritance / fixed-offset
+            //     conventions that don't compose with packing or
+            //     newtype-style flattening.
+            //   - Enums have a tag-plus-payload layout; `packed` and
+            //     `transparent` don't have a meaningful semantics there.
+            // `repr(C)` is accepted on all three kinds.
+            const is_packed:      boolean = a.name == "packed";
+            const is_transparent: boolean = a.name == "transparent";
+            if ((is_packed || is_transparent)
+                    && target != DirectiveTarget::Struct) {
+                const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+                const msg: string = format(
+                    "directive `![repr(%s)]` only applies to structs",
+                    a.name);
+                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                diag = diag.at(dir.span);
+                ctx.emit_diagnostic(diag);
             }
         }
 
@@ -539,6 +601,148 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
 
 
 // ============================================================================
+// Side-effect application: layout directives
+// ============================================================================
+//
+// `apply_layout_effects_{struct,class,enum}` mirror `![repr(...)]` /
+// `![align(N)]` onto the decl node and emit a diagnostic when two
+// directives on the same decl conflict.  Conflicts:
+//   * `repr(packed)` + `align(N)` (mutually exclusive)
+//   * Two different `repr(...)` flavours on the same decl
+//   * Two `![align]` directives on the same decl
+//
+// The diagnostic span is the *second* directive (the one being applied
+// when the conflict is observed); the message names both directives so
+// the user can tell which one to remove.
+
+function emit_layout_conflict(ctx: CompilationContext*, dir: DirectiveNode*,
+                              this_name: string, other_name: string) -> void {
+    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+    const msg: string = format(
+        "directive `![%s]` conflicts with `![%s]` on the same declaration",
+        this_name, other_name);
+    mut diag: Diagnostic = Diagnostic::error(code, msg);
+    diag = diag.at(dir.span);
+    diag = diag.suggest(Suggestion::machine_applicable(
+        dir.span, "",
+        format("remove `![%s]` or `![%s]`", this_name, other_name)));
+    ctx.emit_diagnostic(diag);
+}
+
+function apply_layout_effects_struct(ctx: CompilationContext*,
+                                     dir: DirectiveNode*,
+                                     sd: StructDeclNode*,
+                                     name: string) -> void {
+    match (name) {
+        "repr" => {
+            if (dir.args.length != 1) { return; }
+            // Reject a second `![repr]` on the same decl.
+            if (sd.repr_c || sd.repr_packed || sd.repr_transparent) {
+                emit_layout_conflict(ctx, dir, "repr", "repr");
+                return;
+            }
+            match (dir.args[0].name) {
+                "C"           => { sd.repr_c = true; }
+                "packed"      => {
+                    if (sd.min_alignment != 0) {
+                        emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                        return;
+                    }
+                    sd.repr_packed = true;
+                }
+                "transparent" => { sd.repr_transparent = true; }
+                _             => { }
+            }
+        }
+        "align" => {
+            if (dir.args.length != 1) { return; }
+            if (sd.repr_packed) {
+                emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                return;
+            }
+            if (sd.min_alignment != 0) {
+                emit_layout_conflict(ctx, dir, "align", "align");
+                return;
+            }
+            sd.min_alignment = dir.args[0].int_value as u64;
+        }
+        _ => { }
+    }
+}
+
+function apply_layout_effects_class(ctx: CompilationContext*,
+                                    dir: DirectiveNode*,
+                                    cd: ClassDeclNode*,
+                                    name: string) -> void {
+    match (name) {
+        "repr" => {
+            if (dir.args.length != 1) { return; }
+            if (cd.repr_c || cd.repr_packed || cd.repr_transparent) {
+                emit_layout_conflict(ctx, dir, "repr", "repr");
+                return;
+            }
+            match (dir.args[0].name) {
+                "C"           => { cd.repr_c = true; }
+                "packed"      => {
+                    if (cd.min_alignment != 0) {
+                        emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                        return;
+                    }
+                    cd.repr_packed = true;
+                }
+                "transparent" => { cd.repr_transparent = true; }
+                _             => { }
+            }
+        }
+        "align" => {
+            if (dir.args.length != 1) { return; }
+            if (cd.repr_packed) {
+                emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                return;
+            }
+            if (cd.min_alignment != 0) {
+                emit_layout_conflict(ctx, dir, "align", "align");
+                return;
+            }
+            cd.min_alignment = dir.args[0].int_value as u64;
+        }
+        _ => { }
+    }
+}
+
+function apply_layout_effects_enum(ctx: CompilationContext*,
+                                   dir: DirectiveNode*,
+                                   ed: EnumDeclNode*,
+                                   name: string) -> void {
+    // Enums accept only `repr(C)` and `![align(N)]` today; the validator
+    // has already rejected `repr(packed)` / `repr(transparent)` on
+    // enums, and a non-`C` `repr` argument would have been rejected
+    // before reaching this function.
+    match (name) {
+        "repr" => {
+            if (dir.args.length != 1) { return; }
+            if (ed.repr_c) {
+                emit_layout_conflict(ctx, dir, "repr", "repr");
+                return;
+            }
+            if (dir.args[0].name == "C") {
+                ed.repr_c = true;
+            }
+        }
+        "align" => {
+            if (dir.args.length != 1) { return; }
+            if (ed.min_alignment != 0) {
+                emit_layout_conflict(ctx, dir, "align", "align");
+                return;
+            }
+            ed.min_alignment = dir.args[0].int_value as u64;
+        }
+        _ => { }
+    }
+}
+
+
+// ============================================================================
 // Side-effect application: known directives that mutate the AST
 // ============================================================================
 
@@ -546,7 +750,9 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
 /// Currently:
 ///   ![inline]         → sets FunctionDeclNode.is_inline = true
 ///   ![noinline]       → sets FunctionDeclNode.is_inline = false
-///   ![sink]  → sets MethodNode.is_sink = true
+///   ![sink]           → sets MethodNode.is_sink = true
+///   ![repr(C|packed|transparent)] → sets repr_* flags on struct/class/enum decl
+///   ![align(N)]       → sets min_alignment on struct/class/enum decl
 function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                        decl: DeclarationNode*) -> void {
     if (decl == null) { return; }
@@ -562,6 +768,28 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
             fn.is_inline = false;
             return;
         }
+    }
+
+    // Layout effects on user-defined types.  The validator above has
+    // already rejected malformed args; here we just mirror the directive
+    // onto the decl node so TypeResolution / TypeLowering / codegen can
+    // observe it.  Conflict detection (e.g. `repr(packed)` + `align`,
+    // duplicate `repr`) lives in the same place so a stable diagnostic
+    // is produced regardless of source order.
+    if (decl.kind == NodeKind::StructDeclaration) {
+        const sd: StructDeclNode* = decl as StructDeclNode*;
+        apply_layout_effects_struct(ctx, dir, sd, name);
+        return;
+    }
+    if (decl.kind == NodeKind::ClassDeclaration) {
+        const cd: ClassDeclNode* = decl as ClassDeclNode*;
+        apply_layout_effects_class(ctx, dir, cd, name);
+        return;
+    }
+    if (decl.kind == NodeKind::EnumDeclaration) {
+        const ed: EnumDeclNode* = decl as EnumDeclNode*;
+        apply_layout_effects_enum(ctx, dir, ed, name);
+        return;
     }
 
     if (decl.kind == NodeKind::MethodDeclaration) {
@@ -830,12 +1058,103 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
         has_config_testing, has_test_directive,
         first_test_dir_span, first_test_dir_name);
 
+    // Propagate `![repr(...)]` / `![align(N)]` from AST decls onto the
+    // corresponding Type* objects in the arena.  This must happen after
+    // the per-decl walk above (which sets the AST flags) and before
+    // TypeLowering reads the Type-side flags.  StructFieldTypeSync
+    // populated `fields` already at this point; here we just stamp the
+    // layout intent on top.
+    propagate_layout_attrs_to_types(ctx);
+
     if (ctx.debug_mode) {
         cdebug("[DirectiveProcessing] Processed %lld directives in this module (%lld cumulative)\n",
             count, registry.count());
     }
 
     return PassResult::from_snapshot(ctx.diagnostics, snap);
+}
+
+// ============================================================================
+// Layout-attr propagation: AST → Type
+// ============================================================================
+
+/// After the per-decl walk has set `repr_*` and `min_alignment` on each
+/// `{Struct,Class,Enum}DeclNode`, walk the AST again and mirror those
+/// flags onto the corresponding `{Struct,Class,Enum}Type*` in the arena
+/// so TypeLowering and codegen see the chosen layout.
+///
+/// Lookup path: qualify the decl's bare name with the current module's
+/// namespace via `ctx.qualify_symbol_sym`, then ask the decl index for
+/// the type's TypeRef.  This matches what StructFieldTypeSync does to
+/// find the same Type, so a name that resolves there resolves here.
+function propagate_layout_attrs_to_types(ctx: CompilationContext*) -> void {
+    const root: ProgramNode* = ctx.artifacts.ast.root;
+    if (root == null) { return; }
+
+    const arena: TypeArena* = ctx.type_arena;
+    if (arena == null) { return; }
+
+    for (mut i: i64 = 0; i < root.statements.length; i++) {
+        const stmt: ASTNode* = root.statements[i];
+        if (stmt == null) { continue; }
+
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const node: StructDeclNode* = stmt as StructDeclNode*;
+                if (node.is_generic()) {
+                    // Generic struct definitions don't have a Type until
+                    // monomorphization produces concrete instantiations;
+                    // each specialization will pick up its own layout
+                    // attrs when the monomorphizer copies them from the
+                    // template (post-1.0 work — for now, layout on
+                    // generic structs is best-effort).
+                    continue;
+                }
+                if (!node.repr_c && !node.repr_packed
+                        && !node.repr_transparent && node.min_alignment == 0) {
+                    continue;
+                }
+                const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                if (!tref.is_valid()) { continue; }
+                const ty: Type* = arena.lookup(tref.id);
+                if (ty == null || ty.kind != TypeKind::Struct) { continue; }
+                mut st: StructType* = ty as StructType*;
+                st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                st.set_min_alignment(node.min_alignment);
+            }
+            NodeKind::ClassDeclaration => {
+                const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (node.is_generic()) { continue; }
+                if (!node.repr_c && !node.repr_packed
+                        && !node.repr_transparent && node.min_alignment == 0) {
+                    continue;
+                }
+                const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                if (!tref.is_valid()) { continue; }
+                const ty: Type* = arena.lookup(tref.id);
+                if (ty == null || ty.kind != TypeKind::Class) { continue; }
+                mut ct: ClassType* = ty as ClassType*;
+                ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                ct.set_min_alignment(node.min_alignment);
+            }
+            NodeKind::EnumDeclaration => {
+                const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                if (node.is_generic()) { continue; }
+                if (!node.repr_c && node.min_alignment == 0) { continue; }
+                const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                if (!tref.is_valid()) { continue; }
+                const ty: Type* = arena.lookup(tref.id);
+                if (ty == null || ty.kind != TypeKind::Enum) { continue; }
+                mut et: EnumType* = ty as EnumType*;
+                et.set_repr_c(node.repr_c);
+                et.set_min_alignment(node.min_alignment);
+            }
+            _ => { }
+        }
+    }
 }
 
 // ============================================================================

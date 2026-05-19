@@ -1,0 +1,166 @@
+///! Memory-layout tests — exercises `![repr(...)]` and `![align(N)]`
+///! directives against `sizeof` / `alignof`.  See docs/cryo.md § 17.3.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::MemoryLayout;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// Default layout (no directives): C-ABI padding.
+// On a 64-bit target, { u8, u32 } has 3 bytes of padding so the u32 lands
+// on its natural alignment; total size is 8, alignment is 4.
+// ---------------------------------------------------------------------------
+
+type struct DefaultMixed {
+    a: u8;
+    b: u32;
+}
+
+![test]
+function default_layout_has_padding() -> Result<(), TestError> {
+    match (expect_eq(sizeof(DefaultMixed) as u64, 8 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(alignof(DefaultMixed) as u64, 4 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// `![repr(C)]` — at present, identical to the default for primitive fields.
+// The directive nails down the contract so future optimisations cannot
+// reorder these fields.
+// ---------------------------------------------------------------------------
+
+![repr(C)]
+type struct CMixed {
+    a: u8;
+    b: u32;
+}
+
+![test]
+function repr_c_matches_default() -> Result<(), TestError> {
+    match (expect_eq(sizeof(CMixed) as u64,  sizeof(DefaultMixed) as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(alignof(CMixed) as u64, alignof(DefaultMixed) as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// `![repr(packed)]` — no padding, alignment 1.
+// { u8, u32 } sums to 5 bytes; without padding the struct is 5/1.
+// ---------------------------------------------------------------------------
+
+![repr(packed)]
+type struct PackedMixed {
+    a: u8;
+    b: u32;
+}
+
+![test]
+function repr_packed_drops_padding() -> Result<(), TestError> {
+    match (expect_eq(sizeof(PackedMixed) as u64, 5 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(alignof(PackedMixed) as u64, 1 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// A realistic FFI / wire-protocol header: 1 + 1 + 4 + 4 = 10 bytes.
+![repr(packed)]
+type struct PacketHeader {
+    version: u8;
+    flags:   u8;
+    length:  u32;
+    crc:     u32;
+}
+
+![test]
+function packed_packet_header_is_ten_bytes() -> Result<(), TestError> {
+    match (expect_eq(sizeof(PacketHeader) as u64, 10 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// `![align(N)]` — raises minimum alignment; rounds size up to alignment.
+// CacheLine is a single 64-byte payload aligned to a cache line.
+// ---------------------------------------------------------------------------
+
+![align(64)]
+type struct CacheLine {
+    payload: u8[64];
+}
+
+![test]
+function align_directive_raises_alignment() -> Result<(), TestError> {
+    match (expect_eq(alignof(CacheLine) as u64, 64 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sizeof(CacheLine) as u64, 64 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// `![align(N)]` on a struct whose natural alignment is smaller pads the
+// final size up to N.  { u8 } would be size 1, align 1; with align(8) it
+// becomes size 8, align 8.
+![align(8)]
+type struct OverAlignedByte {
+    b: u8;
+}
+
+![test]
+function align_pads_size_up() -> Result<(), TestError> {
+    match (expect_eq(alignof(OverAlignedByte) as u64, 8 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sizeof(OverAlignedByte) as u64, 8 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// `![repr(transparent)]` — wrapper has same layout as its single field.
+// ---------------------------------------------------------------------------
+
+![repr(transparent)]
+type struct Pid {
+    inner: i32;
+}
+
+![test]
+function repr_transparent_matches_inner() -> Result<(), TestError> {
+    match (expect_eq(sizeof(Pid)  as u64, sizeof(i32)  as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(alignof(Pid) as u64, alignof(i32) as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
