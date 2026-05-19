@@ -199,12 +199,10 @@ type struct AbiClassifier {
 
     /// Variant of `classify_signature` for `extern "C"` declarations.
     /// Uses `classify_return_extern_c` (Phase 3 coercion for small
-    /// aggregate returns) instead of `classify_return`; params still
-    /// flow through the regular `classify_param` (Phase 2's >16-byte
-    /// byval rule matches what clang emits for extern signatures).
-    /// See the comment on `classify_return_extern_c` for why the
-    /// small-aggregate rule is gated behind extern declarations rather
-    /// than applied uniformly.
+    /// aggregate returns) and `classify_param_extern_c` (Phase 3
+    /// coercion for ≤ 8 byte aggregate params) instead of the Cryo-
+    /// internal variants.  See the comments on the `_extern_c` helpers
+    /// for the gating rationale.
     classify_signature_extern_c(mut &this,
                                 params: TypeRef[],
                                 return_type: TypeRef,
@@ -213,7 +211,7 @@ type struct AbiClassifier {
 
         mut param_plans: ParamPlan[] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
-            param_plans.push(this.classify_param(params[i]));
+            param_plans.push(this.classify_param_extern_c(params[i]));
         }
 
         const sret: boolean = return_plan.cls == ArgClass::Indirect;
@@ -386,6 +384,222 @@ type struct AbiClassifier {
         };
     }
 
+    /// Phase 3 — `extern "C"` parameter classification.  Mirrors
+    /// `classify_param`'s >16-byte byval rule and adds the small-
+    /// aggregate INTEGER-eightbyte coercion (≤ 8 bytes → single
+    /// register-sized integer slot).  The 9–16 byte aggregate param
+    /// case (DirectPair) is *not* promoted here yet — that requires
+    /// call-site slot expansion that hasn't landed; tracking under
+    /// HANDOFF §3.2.  Real C code that takes a 9–16 byte struct by
+    /// value will ABI-mismatch until that gap is closed; today no
+    /// such function is exercised by the test suite.
+    classify_param_extern_c(mut &this, t: TypeRef) -> ParamPlan {
+        const tm: TypeMapper* = this.type_mapper;
+        if (!t.is_valid()) {
+            return ParamPlan {
+                cryo_type:  t,
+                cls:      ArgClass::Direct,
+                llvm_slots: [],
+                attr:       AbiAttr::None,
+                pointee_ty: LType::null(),
+            };
+        }
+
+        const arena: TypeArena* = tm.arena;
+        const ty: Type* = arena.lookup(t.id);
+        if (ty == null) {
+            mut slots_fb: LType[] = [];
+            const lty_fb: LType = tm.map_type(t);
+            if (lty_fb.is_valid()) { slots_fb.push(lty_fb); }
+            return ParamPlan {
+                cryo_type:  t,
+                cls:      ArgClass::Direct,
+                llvm_slots: slots_fb,
+                attr:       AbiAttr::None,
+                pointee_ty: LType::null(),
+            };
+        }
+
+        mut concrete: Type* = ty;
+        if (concrete.kind == TypeKind::TypeAlias) {
+            const alias: TypeAliasType* = concrete as TypeAliasType*;
+            if (alias.has_target()) {
+                const tgt: Type* = arena.lookup(alias.target.id);
+                if (tgt != null) { concrete = tgt; }
+            }
+        }
+        if (concrete.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = concrete as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                const res: Type* = arena.lookup(inst.resolved_type.id);
+                if (res != null) { concrete = res; }
+            }
+        }
+
+        const is_aggregate: boolean = match (concrete.kind) {
+            TypeKind::Struct => { true }
+            TypeKind::Class  => { true }
+            TypeKind::Enum   => { true }
+            _ => { false }
+        };
+
+        if (is_aggregate) {
+            const sz: u64 = concrete.size_bytes();
+            if (sz > 16) {
+                // Phase 2: large aggregate → byval.
+                const pointee: LType = tm.map_type(t);
+                mut slots_iv: LType[] = [];
+                slots_iv.push(LType::pointer_to(LType::i8()));
+                return ParamPlan {
+                    cryo_type:  t,
+                    cls:      ArgClass::Indirect,
+                    llvm_slots: slots_iv,
+                    attr:       AbiAttr::ByVal,
+                    pointee_ty: pointee,
+                };
+            }
+            if (sz > 0 && sz <= 8) {
+                // Phase 3: ≤ 8-byte aggregate → single eightbyte.
+                // SSE (§3.3) chooses `double`/`float` when the bucket
+                // is one float-class field that fully occupies it;
+                // otherwise INTEGER.  Call site spills the struct
+                // value to a temp and loads it back as the scalar;
+                // callee does the inverse on its side.
+                const orig: LType = tm.map_type(t);
+                const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
+                if (slot.is_valid()) {
+                    mut slots_d: LType[] = [];
+                    slots_d.push(slot);
+                    return ParamPlan {
+                        cryo_type:  t,
+                        cls:      ArgClass::Direct,
+                        llvm_slots: slots_d,
+                        attr:       AbiAttr::None,
+                        pointee_ty: orig,
+                    };
+                }
+            }
+            if (sz > 8 && sz <= 16) {
+                // Phase 3 — DirectPair param: split into two
+                // eightbyte slots, classified independently (§3.3
+                // SSE-or-INTEGER per bucket).  The call site
+                // expands a single source-struct arg into two LLVM
+                // arg slots: spill struct → temp, GEP+load lo, GEP
+                // at +8 → load hi.  Cryo-internal callers continue
+                // to pass these as `Direct(struct)` via
+                // `classify_param`, so this path is reachable only
+                // from extern-C call sites.
+                const orig: LType = tm.map_type(t);
+                const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
+                const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
+                if (lo_slot.is_valid() && hi_slot.is_valid()) {
+                    mut slots_dp: LType[] = [];
+                    slots_dp.push(lo_slot);
+                    slots_dp.push(hi_slot);
+                    return ParamPlan {
+                        cryo_type:  t,
+                        cls:      ArgClass::DirectPair,
+                        llvm_slots: slots_dp,
+                        attr:       AbiAttr::None,
+                        pointee_ty: orig,
+                    };
+                }
+            }
+        }
+
+        mut slots: LType[] = [];
+        const lty: LType = tm.map_type(t);
+        if (lty.is_valid()) { slots.push(lty); }
+        return ParamPlan {
+            cryo_type:  t,
+            cls:      ArgClass::Direct,
+            llvm_slots: slots,
+            attr:       AbiAttr::None,
+            pointee_ty: LType::null(),
+        };
+    }
+
+    /// Phase 3 §3.3 — classify a single eightbyte bucket of an
+    /// aggregate type into its SysV class slot.  Returns the LLVM
+    /// type that should occupy this eightbyte register slot.
+    ///
+    /// The bucket is the half-open byte interval `[bucket_start,
+    /// bucket_end)` of the aggregate (typically `[0..8)` or
+    /// `[8..16)`).  Walks the struct/class fields whose offsets fall
+    /// in the interval and applies SysV's classification rules:
+    ///   - All fields are floats AND the bucket has exactly one field
+    ///     that fully fills the bucket-relevant bytes ⇒ SSE class.
+    ///     Slot type is `double` (for f64) or `float` (for f32).
+    ///   - Mixed / integer / multiple-float bucket ⇒ INTEGER class.
+    ///     Slot type is the smallest power-of-two integer that holds
+    ///     `bucket_size` bytes (`eightbyte_integer_type`).
+    ///
+    /// Multi-float SSE buckets (e.g. two f32s packing into one
+    /// XMM half) are NOT yet promoted to `<2 x float>` — that's the
+    /// follow-up.  Falling back to INTEGER for that case still works
+    /// at the bit level (the data round-trips through the register)
+    /// but uses an integer register instead of an XMM one; the C
+    /// side's signature will then disagree about which register is
+    /// used.  No current test exercises this case.
+    eightbyte_slot_type(mut &this, ty: Type*, bucket_start: u64, bucket_end: u64) -> LType {
+        const tm: TypeMapper* = this.type_mapper;
+        const arena: TypeArena* = tm.arena;
+        const bucket_size: u64 = bucket_end - bucket_start;
+
+        // Field access depends on the kind: StructType, ClassType.
+        // Other kinds (Enum, primitives, etc.) don't expose a uniform
+        // field list — fall back to INTEGER.
+        mut fields: FieldInfo[] = [];
+        match (ty.kind) {
+            TypeKind::Struct => {
+                const st: StructType* = ty as StructType*;
+                fields = st.fields;
+            }
+            TypeKind::Class => {
+                const ct: ClassType* = ty as ClassType*;
+                fields = ct.fields;
+            }
+            _ => {
+                return eightbyte_integer_type(bucket_size);
+            }
+        }
+
+        mut last_in_bucket_idx: i64 = -1;
+        mut field_count_in_bucket: i64 = 0;
+        mut all_floats: boolean = true;
+
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f_off: u64 = fields[i].offset;
+            // Field belongs to this bucket iff its starting offset
+            // falls inside `[bucket_start, bucket_end)`.  Spans that
+            // cross the boundary (offset < bucket_end <= offset+size)
+            // are rare for natural layouts and would force INTEGER
+            // class on both halves under SysV's merging rule.  Treat
+            // them as INTEGER by leaving `all_floats=false` and the
+            // field count > 1.
+            if (f_off >= bucket_start && f_off < bucket_end) {
+                last_in_bucket_idx = i;
+                field_count_in_bucket += 1;
+                const ft: Type* = arena.lookup(fields[i].field_type.id);
+                if (ft == null || ft.kind != TypeKind::Float) {
+                    all_floats = false;
+                }
+            }
+        }
+
+        if (field_count_in_bucket == 1 && all_floats) {
+            const f_idx: i64 = last_in_bucket_idx;
+            const ft: Type* = arena.lookup(fields[f_idx].field_type.id);
+            if (ft != null && ft.kind == TypeKind::Float) {
+                const flt: FloatType* = ft as FloatType*;
+                if (flt.float_kind == FloatKind::F64) { return LType::f64(); }
+                return LType::f32();
+            }
+        }
+
+        return eightbyte_integer_type(bucket_size);
+    }
+
     /// Phase 3 — Direct-with-coercion: small (≤ 8 byte) aggregate
     /// returns are passed in a single integer register (SysV INTEGER
     /// eightbyte).  Used by `classify_return_extern_c` to lower extern
@@ -485,12 +699,51 @@ type struct AbiClassifier {
                 };
             }
             if (sz > 0 && sz <= 8) {
-                // Phase 3: single INTEGER eightbyte, coerced to register.
-                return this.classify_small_aggregate_int(t, sz);
+                // Phase 3: single eightbyte, coerced to a register.
+                // SSE (§3.3) chooses `double`/`float` when the bucket
+                // is one float-class field that fully occupies it;
+                // otherwise INTEGER.
+                const orig: LType = tm.map_type(t);
+                const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
+                if (slot.is_valid()) {
+                    mut slots_d: LType[] = [];
+                    slots_d.push(slot);
+                    return ParamPlan {
+                        cryo_type:  t,
+                        cls:      ArgClass::Direct,
+                        llvm_slots: slots_d,
+                        attr:       AbiAttr::None,
+                        pointee_ty: orig,   // coercion target
+                    };
+                }
             }
-            // 9–16 byte aggregate: TODO Phase 3 DirectPair.  Falling
-            // through to the legacy Direct-struct path keeps current
-            // behaviour for this gap; documented in the C-interop test.
+            if (sz > 8 && sz <= 16) {
+                // Phase 3 — DirectPair: split into two eightbytes.
+                // Each bucket classified independently (§3.3): SSE
+                // when all fields in the bucket are float-class and
+                // the bucket has exactly one such field, INTEGER
+                // otherwise.  Mixed return types like `{double, i64}`
+                // for `struct {double a; long b;}` arise naturally.
+                const orig: LType = tm.map_type(t);
+                const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
+                const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
+                if (!lo_slot.is_valid() || !hi_slot.is_valid()) {
+                    // Defensive: fall through to Direct on an
+                    // unexpected size (shouldn't trigger for the
+                    // 9..16 window, but bail safely if it does).
+                } else {
+                    mut slots_dp: LType[] = [];
+                    slots_dp.push(lo_slot);
+                    slots_dp.push(hi_slot);
+                    return ParamPlan {
+                        cryo_type:  t,
+                        cls:      ArgClass::DirectPair,
+                        llvm_slots: slots_dp,
+                        attr:       AbiAttr::None,
+                        pointee_ty: orig,   // coercion target
+                    };
+                }
+            }
         }
 
         const lty: LType = tm.map_type(t);
@@ -811,10 +1064,21 @@ function build_llvm_fn_type(return_plan:  ParamPlan,
                             is_variadic:  boolean) -> LType {
     // Step 1: pick the LLVM return type.  `Indirect` returns become
     // `void` because the value is written through the hidden sret
-    // pointer; everything else uses the single Direct slot.  Ignore
-    // returns also use `void` (their slots[0] was preset to void).
+    // pointer; everything else uses the single Direct slot.  `DirectPair`
+    // wraps its two slots in an anonymous LLVM struct so the function
+    // signature reads e.g. `{i64, i32} f(...)` — the call site coerces
+    // back to the source struct via store-then-load.  Ignore returns
+    // also use `void` (their slots[0] was preset to void).
     mut ret_ty: LType = LType::void_type();
-    if (return_plan.cls != ArgClass::Indirect
+    if (return_plan.cls == ArgClass::DirectPair
+            && return_plan.llvm_slots.length == 2) {
+        const dp_buf: void* = intrinsics::malloc(2 * 8);
+        const dp_slots: void** = dp_buf as void**;
+        dp_slots[0] = return_plan.llvm_slots[0].raw;
+        dp_slots[1] = return_plan.llvm_slots[1].raw;
+        ret_ty = LType::literal_struct(dp_buf, 2, false);
+        intrinsics::free(dp_buf);
+    } else if (return_plan.cls != ArgClass::Indirect
             && return_plan.llvm_slots.length > 0) {
         ret_ty = return_plan.llvm_slots[0];
     }
