@@ -1527,14 +1527,14 @@ function hot_path(x: int) -> int {
     return x * 2;
 }
 
-![packed]
+![repr(packed)]
 type struct PackedHeader {
     magic:   u32;
     version: u8;
     flags:   u8;
 }
 
-![aligned(16)]
+![align(16)]
 type struct AlignedData {
     data: f64;
 }
@@ -1542,20 +1542,22 @@ type struct AlignedData {
 
 ### 17.1 Recognised Attributes
 
-| Directive | Description |
-| --- | --- |
-| `![deprecated]` | Marks a declaration as deprecated; the compiler warns on use. |
-| `![inline]` | Hints the optimiser to inline the function. |
-| `![noinline]` | Forbids inlining even when the optimiser would otherwise. |
-| `![pure]` | Asserts the function has no side effects (enables aggressive folding). |
-| `![const]` | Marks a function as evaluable at compile time. |
-| `![noreturn]` | The function never returns normally (e.g., `panic`). |
-| `![packed]` | Removes padding between struct fields (binary protocols, FFI). |
-| `![aligned(N)]` | Sets the type's minimum alignment to `N` bytes. |
-| `![section(name)]` | Places the symbol in a specific object-file section. |
-| `![weak]` | Declares weak linkage. |
-| `![constructor]` | Runs the function automatically before `main`. |
-| `![destructor]` | Runs the function automatically after `main` returns. |
+| Directive | Target | Description |
+| --- | --- | --- |
+| `![inline]` | function | Hints the optimiser to inline the function. |
+| `![noinline]` | function | Forbids inlining even when the optimiser would otherwise. |
+| `![deprecated]` / `![deprecated("msg")]` | any decl | Marks a declaration as deprecated; the compiler warns on use. |
+| `![link("name")]` | extern fn / extern block | Override the linker symbol used to resolve the function. |
+| `![allow(name)]` / `![warn(name)]` / `![deny(name)]` | any decl | Adjust the level of a named lint over the decl. |
+| `![derive(Trait, …)]` | struct / class / enum | Auto-derive one or more traits. |
+| `![sink]` | method | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics. |
+| `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]` | any decl | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match. |
+| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum | Memory layout control. See [§ 17.3](#173-memory-layout). |
+| `![align(N)]` | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout). |
+
+The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
+
+Other names that appear with `![…]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [§ 21](#21-reserved-syntax).
 
 ### 17.2 Test Directives
 
@@ -1567,6 +1569,127 @@ The test framework introduces a small set of directives recognised by the compil
 | `![test]` | Marks a function as a discoverable test. |
 | `![ignore]` | Skips the test unless `cryo test --ignored` is passed. |
 | `![should_panic]` | Asserts the test panics; passing the test means observing a panic. |
+
+### 17.3 Memory Layout
+
+Cryo is a systems language and gives programmers explicit control over the in-memory layout of user-defined types. Layout matters for FFI (matching a `struct` declared in a C header), for binary protocols (network packets, on-disk records, hardware register maps), and for memory-conscious data structures.
+
+#### 17.3.1 The Default Layout (`repr(Cryo)`)
+
+Without any explicit directive, a struct or class has the **default Cryo layout**:
+
+- Fields are laid out in source order.
+- Each field is placed at the lowest offset that satisfies its natural alignment.
+- The size of the type is rounded up to the type's alignment (the maximum alignment among its fields, or 1 for empty types).
+- Padding bytes inserted to satisfy alignment have undefined content.
+
+The default layout currently matches the platform's C ABI for primitive-typed fields. The language reserves the right to optimise the default layout in future versions (e.g. reordering fields). **Do not rely on the default layout for FFI or binary serialisation; use `![repr(C)]` for those cases.**
+
+A class with virtual methods carries an 8-byte vtable pointer at offset 0; non-virtual classes have no vtable. Inheritance is flattened in root-to-derived order so an upcast pointer is a no-op.
+
+#### 17.3.2 `![repr(C)]`
+
+```cryo
+![repr(C)]
+type struct timespec {
+    tv_sec:  i64;
+    tv_nsec: i64;
+}
+```
+
+`![repr(C)]` guarantees that the type's layout matches the platform's C ABI:
+
+- Fields are laid out in source order.
+- Padding follows the C rules: each field starts at the lowest offset that is a multiple of its alignment.
+- The size of the type is rounded up to the type's alignment.
+- The compiler will not reorder fields under any circumstances.
+
+`![repr(C)]` is the correct choice for any type that is exchanged with C code, mapped to a C header, or used as a binary record. Combine with `![align(N)]` to over-align such a struct.
+
+#### 17.3.3 `![repr(packed)]`
+
+```cryo
+![repr(packed)]
+type struct PacketHeader {
+    version: u8;
+    flags:   u8;
+    length:  u32;     // no padding before this field
+    crc:     u32;
+}
+```
+
+`![repr(packed)]` removes all inter-field padding:
+
+- Fields are laid out in source order.
+- Each field is placed at the next byte offset, regardless of its natural alignment.
+- The type's alignment is 1.
+- The size of the type equals the sum of its fields' sizes.
+
+A `repr(packed)` type may contain misaligned fields. Taking a Cryo reference (`&` or `mut &`) to a field of a `repr(packed)` type is a compile error: the reference would not be naturally aligned for its referent, which is undefined behaviour. Read or write the field by value instead; the compiler emits the unaligned load/store at the use site.
+
+`![repr(packed)]` and `![align(N)]` are mutually exclusive on the same type.
+
+#### 17.3.4 `![repr(transparent)]`
+
+```cryo
+![repr(transparent)]
+type struct Pid {
+    inner: i32;
+}
+```
+
+`![repr(transparent)]` declares a wrapper type whose layout is identical to a single contained field:
+
+- The type must have exactly one field whose size is non-zero.
+- The wrapper has the same size, alignment, and ABI as that inner field.
+- A `Pid` and an `i32` are interchangeable at the ABI level — passing `Pid` to an `extern "C"` function is identical to passing `i32`.
+
+This is the recommended idiom for type-safe wrappers around primitive FFI types (file descriptors, error codes, opaque handles) where the wrapper exists purely for type discipline at the source level.
+
+#### 17.3.5 `![align(N)]`
+
+```cryo
+![align(64)]
+type struct CacheLine {
+    payload: u8[64];
+}
+```
+
+`![align(N)]` sets the minimum alignment of the type to `N` bytes:
+
+- `N` must be a power of two between 1 and 65536.
+- The actual alignment of the type is `max(natural_alignment, N)`.
+- The size of the type is rounded up to its alignment.
+
+`![align(N)]` is compatible with `![repr(C)]` and `![repr(transparent)]`; it is mutually exclusive with `![repr(packed)]`.
+
+`![align(N)]` on a variable raises that variable's alignment for the lifetime of its storage; this is useful for stack buffers that must satisfy SIMD or hardware-register alignment requirements.
+
+#### 17.3.6 Enums
+
+A unit enum (no variant payloads) has a discriminant whose type defaults to `i32`. The discriminant type can be set explicitly with the type-annotation syntax (not a directive):
+
+```cryo
+type enum Color : u8 {
+    Red    = 0;
+    Green  = 1;
+    Blue   = 2;
+}
+```
+
+An ADT enum (variants with payloads) is laid out as a tag (`i32`) followed by a payload area sized to the largest variant, with padding so the payload area is naturally aligned. `![repr(C)]` on an ADT enum is reserved syntax and currently produces the same layout as the default.
+
+#### 17.3.7 Inspecting Layout: `sizeof(T)` and `alignof(T)`
+
+`sizeof(T)` and `alignof(T)` return compile-time `u64` constants reflecting the type's chosen layout — including any `![repr]` or `![align]` directives applied to it. They are the recommended way to verify FFI struct layout against a C header in a test:
+
+```cryo
+![test]
+function timespec_matches_c() -> void {
+    expect_eq(sizeof(timespec),  16);
+    expect_eq(alignof(timespec), 8);
+}
+```
 
 ---
 
@@ -1735,6 +1858,13 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
+| `![pure]` | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics). |
+| `![const]` | Reserved. Will mark a function as evaluable at compile time. |
+| `![noreturn]` | Reserved. Will declare a function that never returns normally (a stronger form of `-> never`). |
+| `![section("name")]` | Reserved. Will place the symbol in a specific object-file section. |
+| `![weak]` | Reserved. Will declare weak linkage. |
+| `![constructor]` / `![destructor]` | Reserved. Will register functions that run before `main` / after `main` returns. |
+| `![repr(<int_type>)]` on enums | Reserved. Use `type enum Foo : u8 { … }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling. |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 

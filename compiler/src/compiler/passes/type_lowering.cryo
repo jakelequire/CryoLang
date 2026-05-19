@@ -186,13 +186,27 @@ function compute_layout(ty: Type*, arena: TypeArena*) -> boolean {
 function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
     if (st.computed_align > 0) { return false; }
     if (st.fields.length == 0) {
-        // Zero-field struct: size 0, align 1 (like C empty struct)
-        st.set_layout(0, 1);
+        // Zero-field struct: size 0, align 1 (like C empty struct).
+        // An explicit `![align(N)]` still bumps the alignment of an
+        // otherwise empty struct so e.g. `![align(64)]` on a marker can
+        // serve as a cache-line-aligned tag.
+        mut empty_align: u64 = 1;
+        if (st.min_alignment > empty_align) { empty_align = st.min_alignment; }
+        const empty_size: u64 = if (empty_align > 1) { 0 } else { 0 } as u64;
+        st.set_layout(empty_size, empty_align);
         return true;
     }
 
+    // `repr(packed)` skips all alignment-driven padding: every field
+    // sits at the next available byte and the struct's alignment is 1.
+    // `![align(N)]` raises the struct's minimum alignment.  Honoured
+    // simultaneously is rejected by DirectiveProcessing, but if both
+    // ever slip through, `repr(packed)` wins (packed implies align=1).
+    const packed: boolean = st.repr_packed;
+
     mut offset: u64 = 0;
     mut max_align: u64 = 1;
+    if (!packed && st.min_alignment > max_align) { max_align = st.min_alignment; }
 
     for (mut i: i64 = 0; i < st.fields.length; i++) {
         const field_ty: Type* = arena.lookup(st.fields[i].field_type.id);
@@ -208,7 +222,7 @@ function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
             return false;
         }
 
-        if (f_align > 0) {
+        if (!packed && f_align > 0) {
             offset = align_up(offset, f_align);
             if (f_align > max_align) { max_align = f_align; }
         }
@@ -217,7 +231,31 @@ function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
         offset += f_size;
     }
 
-    // Pad total size to struct alignment
+    // For `repr(transparent)`, the wrapper must adopt its single
+    // non-zero-sized field's layout exactly: same size, same alignment.
+    // Without this, an `![repr(transparent)]` Pid { inner: i32 } would
+    // be padded to a multiple of its own alignment (no-op for i32, but
+    // would matter for stranger inner types) and we'd lose the ABI
+    // equivalence that's the whole point of `transparent`.
+    if (st.repr_transparent) {
+        mut inner_size:  u64 = 0;
+        mut inner_align: u64 = 1;
+        for (mut k: i64 = 0; k < st.fields.length; k++) {
+            const ft: Type* = arena.lookup(st.fields[k].field_type.id);
+            if (ft == null) { continue; }
+            const sz: u64 = ft.size_bytes();
+            if (sz == 0) { continue; }
+            inner_size  = sz;
+            inner_align = ft.alignment();
+            break;
+        }
+        if (inner_align < 1) { inner_align = 1; }
+        st.set_layout(inner_size, inner_align);
+        return true;
+    }
+
+    // Pad total size to struct alignment (alignment is 1 for packed
+    // structs, so no padding is added in that case).
     const total: u64 = align_up(offset, max_align);
     st.set_layout(total, max_align);
     return true;
@@ -233,6 +271,9 @@ function compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
 
     mut offset: u64 = 0;
     mut max_align: u64 = 8;  // Classes always at least pointer-aligned
+    // `![align(N)]` raises the minimum alignment further; the 8-byte
+    // floor is preserved because of the vtable-pointer convention.
+    if (cl.min_alignment > max_align) { max_align = cl.min_alignment; }
 
     // If this class has virtual methods, reserve 8 bytes for vtable pointer
     if (cl.has_virtual_methods) {
@@ -300,13 +341,18 @@ function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
     if (en.computed_align > 0) { return false; }
 
     if (en.variants.length == 0) {
-        en.set_layout(ENUM_TAG_SIZE, ENUM_TAG_ALIGN);
+        mut a: u64 = ENUM_TAG_ALIGN;
+        if (en.min_alignment > a) { a = en.min_alignment; }
+        en.set_layout(align_up(ENUM_TAG_SIZE, a), a);
         return true;
     }
 
-    // Simple enum (no payloads): just the tag
+    // Simple enum (no payloads): just the tag, padded to `min_alignment`
+    // if one was requested.
     if (en.is_simple_enum()) {
-        en.set_layout(ENUM_TAG_SIZE, ENUM_TAG_ALIGN);
+        mut a: u64 = ENUM_TAG_ALIGN;
+        if (en.min_alignment > a) { a = en.min_alignment; }
+        en.set_layout(align_up(ENUM_TAG_SIZE, a), a);
         return true;
     }
 
@@ -348,6 +394,8 @@ function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
     // Alignment is max of tag alignment and payload alignment
     mut overall_align: u64 = ENUM_TAG_ALIGN;
     if (max_payload_align > overall_align) { overall_align = max_payload_align; }
+    // `![align(N)]` raises the minimum alignment of the enum as a whole.
+    if (en.min_alignment > overall_align) { overall_align = en.min_alignment; }
 
     // Payload starts after tag, aligned to payload alignment
     const payload_offset: u64 = align_up(ENUM_TAG_SIZE, max_payload_align);
