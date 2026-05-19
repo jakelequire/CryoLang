@@ -1,0 +1,54 @@
+///! C-interop ABI tests — verify Cryo's calling convention matches
+///! the C ABI on the host (SysV x86-64 here).  Uses `div(3)` from
+///! libc as a probe: it returns `div_t` (`{int quot, int rem}` — 8
+///! bytes, single INTEGER eightbyte) by value.  If Cryo's lowering
+///! mismatches the real C ABI, the returned bytes will be garbage.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AbiCInterop;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// Mirror of libc `div_t`: `{int quot, int rem}`.  8 bytes total.
+type struct DivT {
+    quot: i32;
+    rem:  i32;
+}
+
+extern "C" {
+    function div(numerator: i32, denominator: i32) -> DivT;
+}
+
+// 17 / 5 = quot=3 rem=2.  If the ABI for this 8-byte by-value
+// struct return is wrong, one or both fields read back garbage.
+![test]
+function libc_div_struct_return_small() -> Result<(), TestError> {
+    const r: DivT = div(17, 5);
+    match (expect_eq(r.quot, 3 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(r.rem, 2 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function libc_div_negative_dividend() -> Result<(), TestError> {
+    // div(3) is defined to truncate toward zero.  Confirms we read the
+    // correct sign-bit out of each eightbyte half.
+    const r: DivT = div(-7, 2);
+    match (expect_eq(r.quot, -3 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(r.rem, -1 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
