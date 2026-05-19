@@ -60,6 +60,7 @@ type struct DeclarationEmitter {
     llvm_module: LModule*;
     builder:     LBuilder*;
     type_mapper: TypeMapper*;
+    abi:         AbiClassifier*;
     values:      ValueTable*;
     functions:   FunctionRegistry*;
     globals:     GlobalRegistry*;
@@ -76,6 +77,7 @@ type struct DeclarationEmitter {
             llvm_module: null,
             builder:     null,
             type_mapper: null,
+            abi:         null,
             values:      null,
             functions:   null,
             globals:     null,
@@ -91,7 +93,8 @@ type struct DeclarationEmitter {
 
     wire(mut &this,
          llvm_module: LModule*, builder: LBuilder*,
-         type_mapper: TypeMapper*, values: ValueTable*,
+         type_mapper: TypeMapper*, abi: AbiClassifier*,
+         values: ValueTable*,
          functions: FunctionRegistry*, globals: GlobalRegistry*,
          str_cache: StringCache*,
          flow: IRFlowEmitter*, resolver: SymbolResolver*,
@@ -100,6 +103,7 @@ type struct DeclarationEmitter {
         this.llvm_module = llvm_module;
         this.builder     = builder;
         this.type_mapper = type_mapper;
+        this.abi         = abi;
         this.values      = values;
         this.functions   = functions;
         this.globals     = globals;
@@ -393,9 +397,8 @@ type struct DeclarationEmitter {
                     params.push(param.resolved_type);
                 }
             }
-            const plan: SignaturePlan = Abi::classify_signature(
-                this.type_mapper, params,
-                node.resolved_return_type, node.is_variadic);
+            const plan: SignaturePlan = this.abi.classify_signature(
+                params, node.resolved_return_type, node.is_variadic);
             if (!plan.llvm_fn_type.is_valid()) { return; }
             fn_type = plan.llvm_fn_type;
             if (plan.sret_slot) {
@@ -409,12 +412,13 @@ type struct DeclarationEmitter {
 
         // Phase 1: attach `sret(%T)` to LLVM parameter slot 0 when the
         // classifier promoted the return to Indirect.  Call sites detect
-        // this attribute via `Abi::sret_pointee_of` and marshal a hidden
-        // result-slot pointer; the function-body prologue and
-        // `codegen_return` likewise consult it so the LLVM-level
-        // signature stays `void f(ptr sret(%T), ...)` end-to-end.
+        // this attribute via `AbiClassifier::sret_pointee_of` and
+        // marshal a hidden result-slot pointer; the function-body
+        // prologue and `codegen_return` likewise consult it so the
+        // LLVM-level signature stays `void f(ptr sret(%T), ...)`
+        // end-to-end.
         if (sret_pointee.is_valid()) {
-            Abi::apply_sret_attribute(fn_val, sret_pointee);
+            this.abi.apply_sret_attribute(fn_val, sret_pointee);
         }
 
         // Phase 2: attach `byval(%T)` to each LLVM parameter slot whose
@@ -428,7 +432,7 @@ type struct DeclarationEmitter {
                     && pp_fn.attr == AbiAttr::ByVal
                     && pp_fn.pointee_ty.is_valid()) {
                 const llvm_idx: u32 = (pi as u32) + sret_inc_fn;
-                Abi::apply_byval_attribute(fn_val, llvm_idx, pp_fn.pointee_ty);
+                this.abi.apply_byval_attribute(fn_val, llvm_idx, pp_fn.pointee_ty);
             }
         }
 
@@ -843,8 +847,8 @@ type struct DeclarationEmitter {
         // definition wouldn't, and call sites would crash on the
         // mismatch.  So we classify just the return here and let the
         // seam decide on sret.
-        const ret_plan: ParamPlan = Abi::classify_return(
-            this.type_mapper, func.resolved_return_type);
+        const ret_plan: ParamPlan = this.abi.classify_return(
+            func.resolved_return_type);
         mut ret_ty: LType = LType::null();
         mut sret_pointee: LType = LType::null();
         if (ret_plan.cls == ArgClass::Indirect) {
@@ -993,8 +997,8 @@ type struct DeclarationEmitter {
                 // >16-byte aggregate is lowered to a byval `ptr`
                 // slot, matching what `build_function_ltype` will
                 // produce for cross-module externs of this method.
-                const pplan: ParamPlan = Abi::classify_param(
-                    this.type_mapper, param.resolved_type);
+                const pplan: ParamPlan = this.abi.classify_param(
+                    param.resolved_type);
                 if (pplan.cls == ArgClass::Indirect
                         && pplan.attr == AbiAttr::ByVal
                         && pplan.pointee_ty.is_valid()) {
@@ -1030,7 +1034,7 @@ type struct DeclarationEmitter {
         // otherwise the call site marshals one way and the callee
         // expects the other.
         if (sret_pointee.is_valid()) {
-            Abi::apply_sret_attribute(fn_val, sret_pointee);
+            this.abi.apply_sret_attribute(fn_val, sret_pointee);
         }
 
         // Attach `byval(%T)` to any parameter slot the classifier
@@ -1039,7 +1043,7 @@ type struct DeclarationEmitter {
         for (mut bvi: u32 = 0; bvi < total_params; bvi++) {
             const pointee_bv: LType = byval_pointees[bvi as i64];
             if (pointee_bv.is_valid()) {
-                Abi::apply_byval_attribute(fn_val, bvi, pointee_bv);
+                this.abi.apply_byval_attribute(fn_val, bvi, pointee_bv);
             }
         }
 
@@ -1086,8 +1090,8 @@ type struct DeclarationEmitter {
                 params.push(param.resolved_type);
             }
         }
-        const plan: SignaturePlan = Abi::classify_signature(
-            this.type_mapper, params, ret_ref, node.is_variadic);
+        const plan: SignaturePlan = this.abi.classify_signature(
+            params, ret_ref, node.is_variadic);
         if (!plan.llvm_fn_type.is_valid()) { return; }
         const fn_type: LType = plan.llvm_fn_type;
 
@@ -1130,9 +1134,8 @@ type struct DeclarationEmitter {
                     params.push(param_pi.resolved_type);
                 }
             }
-            const plan: SignaturePlan = Abi::classify_signature_extern_c(
-                this.type_mapper, params,
-                func.resolved_return_type, func.is_variadic);
+            const plan: SignaturePlan = this.abi.classify_signature_extern_c(
+                params, func.resolved_return_type, func.is_variadic);
             if (!plan.llvm_fn_type.is_valid()) {
                 this.diag.emit_warning_at_span(ErrorCode::E0643_RETURN_TYPE_ERROR,
                     format("codegen: extern function '%s': failed to classify signature", name_str),
@@ -1149,7 +1152,7 @@ type struct DeclarationEmitter {
             // small-aggregate slot is *not* an attribute — it lowers
             // to a plain integer return that the call site bitcasts.
             if (plan.sret_slot && plan.return_plan.pointee_ty.is_valid()) {
-                Abi::apply_sret_attribute(fn_val, plan.return_plan.pointee_ty);
+                this.abi.apply_sret_attribute(fn_val, plan.return_plan.pointee_ty);
             }
             const sret_off_ex: u32 = if (plan.sret_slot) { 1 } else { 0 } as u32;
             for (mut xi: i64 = 0; xi < plan.param_plans.length; xi++) {
@@ -1157,7 +1160,7 @@ type struct DeclarationEmitter {
                 if (xpp.cls == ArgClass::Indirect
                         && xpp.attr == AbiAttr::ByVal
                         && xpp.pointee_ty.is_valid()) {
-                    Abi::apply_byval_attribute(
+                    this.abi.apply_byval_attribute(
                         fn_val, (xi as u32) + sret_off_ex, xpp.pointee_ty);
                 }
             }
@@ -1334,7 +1337,7 @@ type struct DeclarationEmitter {
         // parameter slot 0 is the hidden result pointer (not a regular
         // source parameter).  Source parameters start at LLVM index 1.
         // Codegen_return reads the same slot via LLVMGetParam(fn, 0).
-        const is_sret_fn: boolean = Abi::sret_pointee_of(fn_val).is_valid();
+        const is_sret_fn: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         const llvm_param_base: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
 
         const fixed_count: u32 = fixed_param_count(node);
@@ -1367,7 +1370,7 @@ type struct DeclarationEmitter {
             // stored into an alloca-of-struct) and lose the byval
             // semantics besides.
             const byval_pointee: LType =
-                Abi::byval_pointee_of_param(fn_val, llvm_idx);
+                this.abi.byval_pointee_of_param(fn_val, llvm_idx);
             if (byval_pointee.is_valid()) {
                 this.values.set(param.name, arg);
                 continue;
@@ -1532,7 +1535,7 @@ type struct DeclarationEmitter {
         // `codegen_return` reads the sret slot via LLVMGetParam(fn, 0)
         // independently; here we only need to offset the receiver/
         // user-param binding loop.
-        const is_sret_method: boolean = Abi::sret_pointee_of(fn_val).is_valid();
+        const is_sret_method: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         const sret_off: u32 = if (is_sret_method) { 1 } else { 0 } as u32;
 
         // Detect which of the three self forms (if any) this method uses.
@@ -1660,7 +1663,7 @@ type struct DeclarationEmitter {
             // the byval `ptr` directly preserves the copy semantics
             // and matches the LLVM signature.
             const byval_pointee_m: LType =
-                Abi::byval_pointee_of_param(fn_val, param_idx);
+                this.abi.byval_pointee_of_param(fn_val, param_idx);
             if (byval_pointee_m.is_valid()) {
                 this.values.set(param.name, arg);
                 param_idx += 1;
