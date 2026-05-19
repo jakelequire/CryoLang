@@ -18,6 +18,7 @@ namespace Compiler::Codegen::Ops::ExprOps;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Abi;
 import Compiler::Codegen::State::ValueTable;
 import Compiler::Codegen::State::FunctionRegistry;
 import Compiler::Codegen::Ops::IRFlowEmitter;
@@ -450,6 +451,57 @@ type struct ExprOps {
     /// type isn't known (low-level callers wiring up malloc/free/abort
     /// with already-matched widths); invalid slots fall back to `zext`.
     codegen_call(mut &this, callee: LValue, callee_type: LType, args: Pair<LValue, TypeRef>[], name: string) -> LValue {
+        // Phase 1 — sret marshalling.  If the callee was declared with
+        // `sret(%T)` on parameter slot 0, the LLVM-level signature is
+        // `void f(ptr sret(%T), …source params…)`.  Allocate a result
+        // slot, prepend its address as the hidden first argument,
+        // apply the sret call-site attribute, and synthesise the
+        // struct value back to upstream callers by loading from the
+        // slot.  This keeps `codegen_call`'s contract intact: callers
+        // still get a struct value back from a struct-returning call.
+        const sret_pointee: LType = Abi::sret_pointee_of(callee);
+        if (sret_pointee.is_valid()) {
+            const cur_bb: LBasicBlock = this.builder.get_insert_block();
+            mut fn_for_alloca: LValue = LValue::null();
+            if (cur_bb.is_valid()) {
+                fn_for_alloca = cur_bb.get_parent();
+            }
+            if (!fn_for_alloca.is_valid()) {
+                // No enclosing function — extremely unusual; fall back
+                // to the legacy path rather than crashing on alloca.
+                return this.codegen_call_direct(callee, callee_type, args, name);
+            }
+            const slot: LValue = this.flow.create_entry_alloca(
+                fn_for_alloca, "sret.tmp", sret_pointee);
+
+            // Build the marshalled arg list: [slot, ...args].
+            mut marshalled: Pair<LValue, TypeRef>[] = [];
+            marshalled.push(Pair<LValue, TypeRef>::new(slot, TypeRef::invalid()));
+            for (mut ai: i64 = 0; ai < args.length; ai++) {
+                marshalled.push(args[ai]);
+            }
+
+            const call_val: LValue = this.codegen_call_direct(
+                callee, callee_type, marshalled, "");
+            if (call_val.is_valid()) {
+                Abi::apply_sret_call_attribute(call_val, sret_pointee);
+            }
+
+            // Synthesise the struct return value upstream callers
+            // expect, by loading the freshly-written slot.
+            const loaded: LValue = this.builder.build_load(
+                sret_pointee, slot, name);
+            return loaded;
+        }
+
+        return this.codegen_call_direct(callee, callee_type, args, name);
+    }
+
+    /// The pre-Phase-1 call lowering: coerce integer widths to match
+    /// the callee's expected param types, then `build_call`.  Split out
+    /// of `codegen_call` so the sret-marshalling wrapper can call
+    /// through to the same coercion logic.
+    codegen_call_direct(mut &this, callee: LValue, callee_type: LType, args: Pair<LValue, TypeRef>[], name: string) -> LValue {
         mut out_value: LValue = LValue::null();
         const n: u32 = args.length as u32;
 
@@ -1192,6 +1244,35 @@ type struct ExprOps {
             if (cur_bb.is_valid()) {
                 const fn: LValue = cur_bb.get_parent();
                 if (fn.is_valid()) {
+                    // Phase 1 — sret: if this function was declared
+                    // with `sret(%T)` on its hidden param 0, the
+                    // LLVM-level signature is `void f(ptr sret(%T), …)`.
+                    // Store the returned value through that pointer
+                    // and emit `ret void`, *before* the void-check
+                    // below routes a unit-style return.  Callers
+                    // observe the result via the slot they passed in.
+                    const sret_pointee: LType = Abi::sret_pointee_of(fn);
+                    if (sret_pointee.is_valid()) {
+                        const sret_ptr: LValue = LValue {
+                            raw: llvm::LLVMGetParam(fn.raw, 0),
+                        };
+                        // `val` is typically the struct loaded from a
+                        // local by `codegen_rvalue`; sometimes it is
+                        // still a pointer (e.g. `return this_lvalue`).
+                        // Normalise to a struct value before storing
+                        // through the sret slot.
+                        mut store_val: LValue = val;
+                        const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        if (type_kind_of(got_ty_raw) == LTypeKind::Pointer) {
+                            store_val = this.builder.build_load(
+                                sret_pointee, val, "sret.load");
+                        }
+                        this.builder.build_store(store_val, sret_ptr);
+                        this.emit_va_end_if_variadic(this.current_variadic_arg());
+                        this.builder.build_ret_void();
+                        return;
+                    }
+
                     const fn_ty_raw: void* = llvm::LLVMGlobalGetValueType(fn.raw);
                     if (type_kind_of(fn_ty_raw) == LTypeKind::Function) {
                         const ret_ty_raw: void* = llvm::LLVMGetReturnType(fn_ty_raw);

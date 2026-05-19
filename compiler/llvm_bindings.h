@@ -34,6 +34,7 @@ typedef void *LLVMTargetDataRef;
 typedef void *LLVMPassManagerRef;
 typedef void *LLVMPassBuilderOptionsRef;
 typedef void *LLVMMemoryBufferRef;
+typedef void *LLVMAttributeRef;
 
 typedef int LLVMBool;
 
@@ -456,6 +457,53 @@ enum {
     LLVMPrivateLinkage             = 9,
     LLVMExternalWeakLinkage        = 12
 };
+
+
+/* ===================================================================
+ * Attributes (used for sret / byval ABI lowering)
+ * ===================================================================
+ *
+ * `LLVMGetEnumAttributeKindForName` returns the numeric kind ID for a
+ * named enum attribute ("sret", "byval", "noundef", ...).  The kind ID
+ * is stable for the lifetime of the process and is the input to
+ * `LLVMCreateEnumAttribute` / `LLVMCreateTypeAttribute`.
+ *
+ * `LLVMCreateTypeAttribute` builds a type-carrying attribute used for
+ * `sret(%T)` / `byval(%T)` in modern LLVM (the typed-attribute form
+ * was made mandatory in LLVM 15+ when opaque pointers landed).
+ *
+ * Attribute index conventions:
+ *   * 0 (LLVMAttributeReturnIndex)   — the function's return value
+ *   * -1 / UINT_MAX (LLVMAttributeFunctionIndex) — the function itself
+ *   * 1..N                          — parameter slot N (1-based)
+ */
+
+unsigned          LLVMGetEnumAttributeKindForName(const char *Name, unsigned long SLen);
+LLVMAttributeRef  LLVMCreateEnumAttribute(LLVMContextRef C, unsigned KindID,
+                                          unsigned long long Val);
+LLVMAttributeRef  LLVMCreateTypeAttribute(LLVMContextRef C, unsigned KindID,
+                                          LLVMTypeRef type_ref);
+void              LLVMAddAttributeAtIndex(LLVMValueRef F, unsigned Idx,
+                                          LLVMAttributeRef A);
+void              LLVMAddCallSiteAttribute(LLVMValueRef C, unsigned Idx,
+                                           LLVMAttributeRef A);
+
+/* Query for the presence of an enum-or-type attribute at a given
+ * index.  Returns NULL when the attribute is not present.  Used by the
+ * call-site marshaller to detect that a callee was declared with
+ * `sret(%T)` so it can allocate a result slot and forward the hidden
+ * pointer.  `LLVMGetTypeAttributeValue` extracts the pointee type
+ * from a type attribute (e.g. the `%T` in `sret(%T)`).
+ *
+ * `LLVMIsAFunction` is the isa-style cast used to make the attribute
+ * query safe: the LLVM-C attribute APIs only accept function-typed
+ * `LLVMValueRef`s, and a callee may be a function pointer loaded from
+ * a struct field rather than a function declaration.  Returns the
+ * value cast as a function, or NULL when the cast fails. */
+LLVMAttributeRef  LLVMGetEnumAttributeAtIndex(LLVMValueRef F, unsigned Idx,
+                                              unsigned KindID);
+LLVMTypeRef       LLVMGetTypeAttributeValue(LLVMAttributeRef A);
+LLVMValueRef      LLVMIsAFunction(LLVMValueRef V);
 
 
 /* ===================================================================

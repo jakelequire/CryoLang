@@ -18,6 +18,7 @@ namespace Compiler::Codegen::Ops::DeclarationEmitter;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Abi;
 import Compiler::Codegen::Util;
 import Compiler::Codegen::State::ValueTable;
 import Compiler::Codegen::State::FunctionRegistry;
@@ -350,20 +351,26 @@ type struct DeclarationEmitter {
             }
         }
 
-        // Build the LLVM function type.
-        const ret_ty: LType = this.map_return_type(node);
-        if (!ret_ty.is_valid()) { return; }
-
+        // Build the LLVM function type via the ABI seam.  Phase 1: the
+        // classifier promotes >16-byte aggregate returns to `Indirect`
+        // (sret), so the produced LLVM signature is `void f(ptr sret(%T),
+        // ...)`.  Phase 1's attribute attachment happens just below.
         const param_count: u32 = fixed_param_count(node);
 
-        mut fn_type: LType = LType::null();
+        mut fn_type:    LType         = LType::null();
+        mut sret_pointee: LType       = LType::null();   // null ⇒ no sret
         if (is_program_main && param_count == 0) {
-            // The C ABI entry point is `int main(int argc, char** argv)`
+            // The C ABI entry point is `int main(int argc, char** argv)`.
             // _start always passes argc/argv, and the stdlib's
             // `std::env::args()` reads them through `set_args` (called
             // from the synthesized prologue in `codegen_function_prologue`
             // below).  User source still writes `function main() -> int`;
             // we silently widen the LLVM signature to take argc/argv.
+            // This widening is not expressible in the ABI seam (it adds
+            // synthetic parameters not in the source signature), so it
+            // stays open-coded here.
+            const ret_ty: LType = this.map_return_type(node);
+            if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
             const buf: void* = intrinsics::malloc(2 * 8);
             const slots: void** = buf as void**;
@@ -371,31 +378,36 @@ type struct DeclarationEmitter {
             slots[1] = argv_ty.raw;
             fn_type = LType::function_type(ret_ty, buf, 2, false);
             intrinsics::free(buf);
-        } else if (param_count == 0) {
-            fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
         } else {
-            const buf: void* = intrinsics::malloc(param_count as u64 * 8);
-            const slots: void** = buf as void**;
-            mut all_valid: boolean = true;
+            mut params: TypeRef[] = [];
             for (mut i: u32 = 0; i < param_count; i++) {
                 const param: VarDeclNode* = node.parameters[i];
-                const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
-                if (!param_ty.is_valid()) {
-                    all_valid = false;
-                    break;
+                if (param != null && param.resolved_type.is_valid()) {
+                    params.push(param.resolved_type);
                 }
-                slots[i] = param_ty.raw;
             }
-            if (!all_valid) {
-                intrinsics::free(buf);
-                return;
+            const plan: SignaturePlan = Abi::classify_signature(
+                this.type_mapper, params,
+                node.resolved_return_type, node.is_variadic);
+            if (!plan.llvm_fn_type.is_valid()) { return; }
+            fn_type = plan.llvm_fn_type;
+            if (plan.sret_slot) {
+                sret_pointee = plan.return_plan.pointee_ty;
             }
-            fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
-            intrinsics::free(buf);
         }
 
         // Add the function to the LLVM module.
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
+
+        // Phase 1: attach `sret(%T)` to LLVM parameter slot 0 when the
+        // classifier promoted the return to Indirect.  Call sites detect
+        // this attribute via `Abi::sret_pointee_of` and marshal a hidden
+        // result-slot pointer; the function-body prologue and
+        // `codegen_return` likewise consult it so the LLVM-level
+        // signature stays `void f(ptr sret(%T), ...)` end-to-end.
+        if (sret_pointee.is_valid()) {
+            Abi::apply_sret_attribute(fn_val, sret_pointee);
+        }
 
         // Register under qualified name (module scope).
         this.functions.register(qualified, fn_val);
@@ -796,7 +808,30 @@ type struct DeclarationEmitter {
         const fn_name: string = intern.resolve(mangled_sym);
 
         // Build LLVM function type.  Non-static methods prepend a `this` pointer.
-        const ret_ty: LType = this.map_return_type(func);
+        //
+        // Method params keep the legacy receiver-override loop below
+        // (the parser-synthesized reference annotations on `&this`
+        // don't always round-trip through the arena, so the seam's
+        // `classify_param(t -> map_type(t))` flow can't safely classify
+        // them).  But the *return type* must agree with what
+        // `build_function_ltype` would produce for a cross-module
+        // extern of this method — if it doesn't, externs declared via
+        // the seam in another module would get sret while this
+        // definition wouldn't, and call sites would crash on the
+        // mismatch.  So we classify just the return here and let the
+        // seam decide on sret.
+        const ret_plan: ParamPlan = Abi::classify_return(
+            this.type_mapper, func.resolved_return_type);
+        mut ret_ty: LType = LType::null();
+        mut sret_pointee: LType = LType::null();
+        if (ret_plan.cls == ArgClass::Indirect) {
+            ret_ty = LType::void_type();
+            sret_pointee = ret_plan.pointee_ty;
+        } else if (ret_plan.llvm_slots.length > 0) {
+            ret_ty = ret_plan.llvm_slots[0];
+        } else {
+            ret_ty = LType::void_type();
+        }
         if (!ret_ty.is_valid()) { return; }
 
         const is_instance: boolean = !node.is_static;
@@ -878,15 +913,27 @@ type struct DeclarationEmitter {
             const pp: VarDeclNode* = func.parameters[pc];
             if (pp != null) { user_param_count += 1; }
         }
-        const total_params: u32 = user_param_count + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
+        // sret-returning methods get a hidden `ptr sret(%T)` parameter
+        // prepended at LLVM slot 0; source parameters (including `this`)
+        // shift to slot 1..N.  The attribute is attached after
+        // `add_function` below, mirroring `declare_function`.
+        const has_sret_slot: boolean = sret_pointee.is_valid();
+        const sret_inc: u32 = if (has_sret_slot) { 1 } else { 0 } as u32;
+        const total_params: u32 = user_param_count
+            + (if (prepend_implicit_this) { 1 } else { 0 } as u32)
+            + sret_inc;
 
         const buf: void* = intrinsics::malloc(total_params as u64 * 8);
         const slots: void** = buf as void**;
 
         mut idx: u32 = 0;
+        if (has_sret_slot) {
+            slots[idx] = LType::pointer_to(LType::i8()).raw;
+            idx += 1;
+        }
         if (prepend_implicit_this) {
-            slots[0] = this_ty.raw;
-            idx = 1;
+            slots[idx] = this_ty.raw;
+            idx += 1;
         }
 
         mut params_valid: boolean = true;
@@ -929,6 +976,15 @@ type struct DeclarationEmitter {
 
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
 
+        // Attach `sret(%T)` to LLVM param 0 when the classifier promoted
+        // the return.  This must match what `build_function_ltype`
+        // produces for a cross-module extern of this same method —
+        // otherwise the call site marshals one way and the callee
+        // expects the other.
+        if (sret_pointee.is_valid()) {
+            Abi::apply_sret_attribute(fn_val, sret_pointee);
+        }
+
         // Register under the combined key built above.  Also register against the
         // (name, total-LLVM-arity) composite so that callers can pick the correct
         // overload at call sites (e.g., `Array::new()` vs `Array::new(u64)`).
@@ -938,8 +994,15 @@ type struct DeclarationEmitter {
         // the key `codegen_method_prologue` uses to look up the right LLVM
         // function for each overload (combined_sym alone is ambiguous because
         // overloads share the same `Type::method` form).
+        // The arity tracked in the function registry is the *source-level*
+        // arity (counting any implicit `&this`, but *not* the hidden
+        // sret slot).  Call-site lookups in `call_emitter.cryo` count
+        // source arguments and need to match what extern registrations
+        // record (which is `ft.param_types.length` — also source-level).
+        // Subtracting `sret_inc` keeps both registration paths aligned.
+        const registry_arity: u32 = total_params - sret_inc;
         this.functions.register(combined_sym, fn_val);
-        this.functions.register_with_arity(combined_sym, total_params, fn_val);
+        this.functions.register_with_arity(combined_sym, registry_arity, fn_val);
         this.functions.register(mangled_sym, fn_val);
     }
 
@@ -949,38 +1012,26 @@ type struct DeclarationEmitter {
         const intern: InternTable* = this.get_intern();
         const name_str: string = intern.resolve(node.name);
 
-        // Map return type.
-        mut ret_ty: LType = LType::void_type();
-        if (node.has_resolved_return_type()) {
-            ret_ty = this.type_mapper.map_type(node.resolved_return_type);
-            if (!ret_ty.is_valid()) { return; }
-        }
-
-        const param_count: u32 = fixed_param_count_intrinsic(node);
-        mut fn_type: LType = LType::null();
-
-        if (param_count == 0) {
-            fn_type = LType::function_type(ret_ty, null, 0, node.is_variadic);
+        // Route the LLVM function-type through the ABI seam.  Intrinsics
+        // are flat C signatures with no receiver, so the seam handles
+        // them directly without any pre-lowering.
+        const ret_ref: TypeRef = if (node.has_resolved_return_type()) {
+            node.resolved_return_type
         } else {
-            const buf: void* = intrinsics::malloc(param_count as u64 * 8);
-            const slots: void** = buf as void**;
-            mut all_valid: boolean = true;
-            for (mut i: u32 = 0; i < param_count; i++) {
-                const param: VarDeclNode* = node.parameters[i];
-                const param_ty: LType = this.type_mapper.map_type(param.resolved_type);
-                if (!param_ty.is_valid()) {
-                    all_valid = false;
-                    break;
-                }
-                slots[i] = param_ty.raw;
+            TypeRef::invalid()
+        };
+        const param_count: u32 = fixed_param_count_intrinsic(node);
+        mut params: TypeRef[] = [];
+        for (mut i: u32 = 0; i < param_count; i++) {
+            const param: VarDeclNode* = node.parameters[i];
+            if (param != null && param.resolved_type.is_valid()) {
+                params.push(param.resolved_type);
             }
-            if (!all_valid) {
-                intrinsics::free(buf);
-                return;
-            }
-            fn_type = LType::function_type(ret_ty, buf, param_count, node.is_variadic);
-            intrinsics::free(buf);
         }
+        const plan: SignaturePlan = Abi::classify_signature(
+            this.type_mapper, params, ret_ref, node.is_variadic);
+        if (!plan.llvm_fn_type.is_valid()) { return; }
+        const fn_type: LType = plan.llvm_fn_type;
 
         // C linkage: use bare name.
         const fn_val: LValue = this.llvm_module.add_function(name_str, fn_type);
@@ -1215,6 +1266,13 @@ type struct DeclarationEmitter {
         // Create allocas for each parameter and store the incoming value.
         this.values.push_scope();
 
+        // Phase 1: if this function was declared with sret, LLVM
+        // parameter slot 0 is the hidden result pointer (not a regular
+        // source parameter).  Source parameters start at LLVM index 1.
+        // Codegen_return reads the same slot via LLVMGetParam(fn, 0).
+        const is_sret_fn: boolean = Abi::sret_pointee_of(fn_val).is_valid();
+        const llvm_param_base: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
+
         const fixed_count: u32 = fixed_param_count(node);
         for (mut i: u32 = 0; i < fixed_count; i++) {
             const param: VarDeclNode* = node.parameters[i];
@@ -1232,7 +1290,9 @@ type struct DeclarationEmitter {
             }
 
             const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
-            const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, i) };
+            const arg: LValue = LValue {
+                raw: llvm::LLVMGetParam(fn_val.raw, llvm_param_base + i),
+            };
             this.builder.build_store(arg, alloca);
             this.values.set(param.name, alloca);
         }
@@ -1385,6 +1445,15 @@ type struct DeclarationEmitter {
 
         this.values.push_scope();
 
+        // Phase 1: if this method was declared with sret, LLVM
+        // parameter slot 0 is the hidden result pointer and the
+        // *real* parameters (including `this`) start at index 1.
+        // `codegen_return` reads the sret slot via LLVMGetParam(fn, 0)
+        // independently; here we only need to offset the receiver/
+        // user-param binding loop.
+        const is_sret_method: boolean = Abi::sret_pointee_of(fn_val).is_valid();
+        const sret_off: u32 = if (is_sret_method) { 1 } else { 0 } as u32;
+
         // Detect which of the three self forms (if any) this method uses.
         //   `&this` / `mut &this`: param named "&this", semantically a T*
         //   `this`               : param named "this", semantically a by-value T
@@ -1413,7 +1482,7 @@ type struct DeclarationEmitter {
             }
         }
 
-        mut param_idx: u32 = 0;
+        mut param_idx: u32 = 0 + sret_off;
 
         // Bind `this` for instance methods.  All three forms produce a `this`
         // named-value that's a pointer to the struct; for by-value `this` we
@@ -1447,7 +1516,8 @@ type struct DeclarationEmitter {
             }
 
             const this_sym: SymbolStr = this.intern_str("this");
-            const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, 0) };
+            // LLVM index for the receiver is `sret_off` (0 normally, 1 when sret).
+            const arg0: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, sret_off) };
 
             if (explicit_val_idx >= 0) {
                 // By-value `this`: LLVM param 0 is a struct value.  Alloca it so
@@ -1476,7 +1546,7 @@ type struct DeclarationEmitter {
                 this.values.set(this_sym, arg0);
             }
 
-            param_idx = 1;
+            param_idx = 1 + sret_off;
         }
 
         // Bind the remaining user parameters.  Skip whichever self form this

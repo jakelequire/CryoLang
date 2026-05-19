@@ -1,0 +1,109 @@
+///! ABI sret tests — exercises `void f(ptr sret(%T), ...)` lowering for
+///! free functions whose return type is an aggregate larger than the
+///! SysV x86-64 16-byte register-pair window.  Same-module calls are
+///! the supported case today; cross-module sret is known broken (see
+///! `build_function_ltype` TODO in `symbol_resolver.cryo`).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AbiSret;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// A struct comfortably above the 16-byte threshold so the classifier
+// promotes the return to Indirect.  Five i64 fields = 40 bytes.
+// ---------------------------------------------------------------------------
+
+type struct Big {
+    a: i64;
+    b: i64;
+    c: i64;
+    d: i64;
+    e: i64;
+}
+
+function make_big(start: i64) -> Big {
+    return Big {
+        a: start + 0,
+        b: start + 1,
+        c: start + 2,
+        d: start + 3,
+        e: start + 4,
+    };
+}
+
+![test]
+function sret_caller_sees_correct_fields() -> Result<(), TestError> {
+    const v: Big = make_big(100);
+    match (expect_eq(v.a, 100 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v.b, 101 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v.c, 102 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v.d, 103 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v.e, 104 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// Caller-side: capturing the return into a different local must observe
+// the same bytes the callee wrote.  This is the case that fails when
+// the sret hidden-pointer marshalling is wrong on the caller side.
+// ---------------------------------------------------------------------------
+
+![test]
+function sret_two_calls_independent() -> Result<(), TestError> {
+    const x: Big = make_big(0);
+    const y: Big = make_big(1000);
+    match (expect_eq(x.a + y.a, 1000 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(x.e + y.e, (4 + 1004) as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// Sret-returning function calling another sret-returning function:
+// inside `chain_make_big`, the inner `make_big` writes through ITS sret
+// slot; `chain_make_big` then returns the same struct through ITS OWN
+// sret slot.  Stresses the prologue's "skip LLVM param 0 in sret
+// functions" branch alongside the call-site marshalling.
+// ---------------------------------------------------------------------------
+
+function chain_make_big(start: i64) -> Big {
+    const inner: Big = make_big(start);
+    return inner;
+}
+
+![test]
+function sret_chained_returns_preserve_payload() -> Result<(), TestError> {
+    const v: Big = chain_make_big(50);
+    match (expect_eq(v.a, 50 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v.e, 54 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

@@ -24,6 +24,7 @@ namespace Compiler::Codegen::Ops::SymbolResolver;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Abi;
 import Compiler::Codegen::State::FunctionRegistry;
 import Compiler::Codegen::State::GlobalRegistry;
 import Compiler::CompilationContext;
@@ -77,31 +78,29 @@ type struct SymbolResolver {
     // Function-type construction
     // ========================================================================
 
-    /// Build an LLVM function type from a Cryo `FunctionType*`.  Returns
-    /// `LType::null()` if any parameter or the return type fails to map.
+    /// Build an LLVM function type from a Cryo `FunctionType*`, routing
+    /// through the ABI seam so cross-module extern declarations agree
+    /// with the defining module's lowering (sret / byval / …).
+    /// Returns `LType::null()` if classification fails (e.g. an
+    /// un-lowered struct or an invalid TypeRef in `ft`).
     build_function_ltype(mut &this, ft: FunctionType*) -> LType {
-        const ret_ty: LType = this.type_mapper.map_type(ft.return_type);
-        if (!ret_ty.is_valid()) { return LType::null(); }
+        const plan: SignaturePlan = Abi::classify_signature(
+            this.type_mapper, ft.param_types,
+            ft.return_type, ft.is_variadic);
+        return plan.llvm_fn_type;
+    }
 
-        const param_count: u32 = ft.param_types.length as u32;
-        if (param_count == 0) {
-            return LType::function_type(ret_ty, null, 0, ft.is_variadic);
-        }
-
-        const buf: void* = malloc(param_count as u64 * 8);
-        const slots: void** = buf as void**;
-        mut valid: boolean = true;
-        for (mut j: u32 = 0; j < param_count; j++) {
-            const mapped: LType = this.type_mapper.map_type(ft.param_types[j]);
-            if (!mapped.is_valid()) { valid = false; break; }
-            slots[j] = mapped.raw;
-        }
-        mut result: LType = LType::null();
-        if (valid) {
-            result = LType::function_type(ret_ty, buf, param_count, ft.is_variadic);
-        }
-        free(buf);
-        return result;
+    /// Companion to `build_function_ltype`: returns the sret pointee
+    /// type if the function would be lowered with sret, or
+    /// `LType::null()` otherwise.  Used by the extern-declare path so
+    /// the cross-module declaration receives the same `sret(%T)`
+    /// attribute the defining module attached.
+    build_function_sret_pointee(mut &this, ft: FunctionType*) -> LType {
+        const plan: SignaturePlan = Abi::classify_signature(
+            this.type_mapper, ft.param_types,
+            ft.return_type, ft.is_variadic);
+        if (!plan.sret_slot) { return LType::null(); }
+        return plan.return_plan.pointee_ty;
     }
 
 
@@ -143,8 +142,19 @@ type struct SymbolResolver {
         const ir_name: string = intern.resolve(mangled_sym);
 
         mut fn_val: LValue = this.llvm_module.get_named_function(ir_name);
-        if (!fn_val.is_valid()) {
+        const created_now: boolean = !fn_val.is_valid();
+        if (created_now) {
             fn_val = this.llvm_module.add_function(ir_name, fn_type);
+            // Phase 1: cross-module extern must carry `sret(%T)` so the
+            // call site path's `Abi::sret_pointee_of` check sees the
+            // attribute and marshals the hidden result slot.  Only
+            // attach on the first declaration — a pre-existing symbol
+            // already carries whatever attributes the defining module
+            // attached.
+            const sret_pointee: LType = this.build_function_sret_pointee(ft);
+            if (sret_pointee.is_valid()) {
+                Abi::apply_sret_attribute(fn_val, sret_pointee);
+            }
         }
         this.functions.register(fn_name, fn_val);
         this.functions.register_with_arity(fn_name, ft.param_types.length as u32, fn_val);
