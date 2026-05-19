@@ -55,3 +55,19 @@ TwoDoubles abi_make_two_doubles(double a, double b) {
 double abi_sum_two_doubles(TwoDoubles s) {
     return s.a + s.b;
 }
+
+// 8-byte struct of two `float`s.  Both fields share a single eightbyte
+// and SysV packs them into one SSE register as `<2 x float>` rather
+// than two scalar SSE slots.  Exercises the multi-float SSE bucket in
+// `eightbyte_slot_type`; the integer fallback would land the bytes on
+// %rax and the test would read garbage out of %xmm0.
+typedef struct TwoFloats { float a, b; } TwoFloats;
+
+TwoFloats abi_make_two_floats(float a, float b) {
+    TwoFloats s = { a, b };
+    return s;
+}
+
+float abi_sum_two_floats(TwoFloats s) {
+    return s.a + s.b;
+}

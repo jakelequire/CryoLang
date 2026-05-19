@@ -534,13 +534,12 @@ type struct AbiClassifier {
     ///     Slot type is the smallest power-of-two integer that holds
     ///     `bucket_size` bytes (`eightbyte_integer_type`).
     ///
-    /// Multi-float SSE buckets (e.g. two f32s packing into one
-    /// XMM half) are NOT yet promoted to `<2 x float>` — that's the
-    /// follow-up.  Falling back to INTEGER for that case still works
-    /// at the bit level (the data round-trips through the register)
-    /// but uses an integer register instead of an XMM one; the C
-    /// side's signature will then disagree about which register is
-    /// used.  No current test exercises this case.
+    /// Multi-float SSE: when the bucket has more than one float-class
+    /// field and every such field is F32, promote to `<2 x float>` so
+    /// the SSE-vector calling convention matches what clang emits for
+    /// `struct { float a, b; }`.  Any other mixed bucket (e.g. a single
+    /// F32 in a half-occupied 8-byte bucket, or F32+F64) falls back to
+    /// INTEGER.
     eightbyte_slot_type(mut &this, ty: Type*, bucket_start: u64, bucket_end: u64) -> LType {
         const tm: TypeMapper* = this.type_mapper;
         const arena: TypeArena* = tm.arena;
@@ -567,6 +566,7 @@ type struct AbiClassifier {
         mut last_in_bucket_idx: i64 = -1;
         mut field_count_in_bucket: i64 = 0;
         mut all_floats: boolean = true;
+        mut all_f32: boolean = true;
 
         for (mut i: i64 = 0; i < fields.length; i++) {
             const f_off: u64 = fields[i].offset;
@@ -583,6 +583,12 @@ type struct AbiClassifier {
                 const ft: Type* = arena.lookup(fields[i].field_type.id);
                 if (ft == null || ft.kind != TypeKind::Float) {
                     all_floats = false;
+                    all_f32 = false;
+                } else {
+                    const flt: FloatType* = ft as FloatType*;
+                    if (flt.float_kind != FloatKind::F32) {
+                        all_f32 = false;
+                    }
                 }
             }
         }
@@ -595,6 +601,16 @@ type struct AbiClassifier {
                 if (flt.float_kind == FloatKind::F64) { return LType::f64(); }
                 return LType::f32();
             }
+        }
+
+        // Multi-float SSE: two F32s packing into one eightbyte slot
+        // lower to `<2 x float>`.  Only fires for a full eightbyte
+        // (bucket_size == 8) holding exactly two F32 fields — that's
+        // the only shape the SysV rules promote to SSEUP-style packing
+        // (any other count/size combo would either fit a single-field
+        // branch or trip the alignment rules into INTEGER).
+        if (field_count_in_bucket == 2 && all_f32 && bucket_size == 8) {
+            return LType::vector_of(LType::f32(), 2);
         }
 
         return eightbyte_integer_type(bucket_size);
@@ -758,17 +774,18 @@ type struct AbiClassifier {
         };
     }
 
-    /// Phase 1: large aggregate returns (>16 bytes, struct / class /
-    /// ADT enum) flow through a hidden sret pointer; everything else is
-    /// Direct.  Void/unit/invalid → Ignore (LLVM void return, no slot
-    /// consumed).
+    /// §3.5 — unified return classification covering Phase 1 (sret for
+    /// > 16 byte aggregates), Phase 3 ≤8 byte Direct-with-coercion, and
+    /// Phase 3 9–16 byte DirectPair.  Same rules as the previous
+    /// `_extern_c` variant; the gating distinction is gone now that
+    /// `codegen_return` knows how to coerce a struct value into the
+    /// declared register-shaped return type.
     ///
-    /// Tuples and Optional<T> are also aggregates at the LLVM level,
-    /// but Cryo-internal code passes them by value today; classifying
-    /// them as `Indirect` here without a matching update at every call
-    /// site would break selfhost-check, so they continue as `Direct`
-    /// for now.  When the call-site marshalling is sret-aware they can
-    /// join.
+    /// §3.4 — Tuples, Optional<T>, and Result<T,E> (an ADT enum) all
+    /// classify as aggregates and follow the SysV rules.  Tuple lives
+    /// at `TypeKind::Tuple`, Optional at `TypeKind::Optional`, Result
+    /// at `TypeKind::Enum`.  All flow through the same size-based
+    /// promotion paths below.
     classify_return(mut &this, t: TypeRef) -> ParamPlan {
         const tm: TypeMapper* = this.type_mapper;
         if (!t.is_valid()) {
@@ -816,33 +833,69 @@ type struct AbiClassifier {
         }
 
         const is_aggregate: boolean = match (concrete.kind) {
-            TypeKind::Struct => { true }
-            TypeKind::Class  => { true }
-            TypeKind::Enum   => {
+            TypeKind::Struct   => { true }
+            TypeKind::Class    => { true }
+            TypeKind::Enum     => {
                 // Simple enums lower to i32 (size 4); ADT enums lower
                 // to a struct that may well exceed 16 bytes.  The
                 // size_bytes() gate below filters either way, so
-                // accept both here.
+                // accept both here.  Result<T,E> lives here.
                 true
             }
+            TypeKind::Tuple    => { true }   // §3.4
+            TypeKind::Optional => { true }   // §3.4
             _ => { false }
         };
 
-        if (is_aggregate && concrete.size_bytes() > 16) {
-            // sret: LLVM function returns void; LLVM param 0 is `ptr`
-            // with `sret(%T)`.  Record the underlying LLVM struct/class
-            // type in `pointee_ty` so `declare_function` can build the
-            // attribute payload.
-            const pointee: LType = tm.map_type(t);
-            mut slots: LType[] = [];
-            slots.push(LType::pointer_to(LType::i8()));
-            return ParamPlan {
-                cryo_type:  t,
-                cls:      ArgClass::Indirect,
-                llvm_slots: slots,
-                attr:       AbiAttr::SRet,
-                pointee_ty: pointee,
-            };
+        if (is_aggregate) {
+            const sz: u64 = concrete.size_bytes();
+            if (sz > 16) {
+                // Phase 1: large aggregate → sret.
+                const pointee: LType = tm.map_type(t);
+                mut slots: LType[] = [];
+                slots.push(LType::pointer_to(LType::i8()));
+                return ParamPlan {
+                    cryo_type:  t,
+                    cls:      ArgClass::Indirect,
+                    llvm_slots: slots,
+                    attr:       AbiAttr::SRet,
+                    pointee_ty: pointee,
+                };
+            }
+            if (sz > 0 && sz <= 8) {
+                // Phase 3: ≤ 8 byte aggregate → single eightbyte slot.
+                const orig: LType = tm.map_type(t);
+                const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
+                if (slot.is_valid()) {
+                    mut slots_d: LType[] = [];
+                    slots_d.push(slot);
+                    return ParamPlan {
+                        cryo_type:  t,
+                        cls:      ArgClass::Direct,
+                        llvm_slots: slots_d,
+                        attr:       AbiAttr::None,
+                        pointee_ty: orig,   // coercion target
+                    };
+                }
+            }
+            if (sz > 8 && sz <= 16) {
+                // Phase 3: 9–16 byte aggregate → DirectPair.
+                const orig: LType = tm.map_type(t);
+                const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
+                const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
+                if (lo_slot.is_valid() && hi_slot.is_valid()) {
+                    mut slots_dp: LType[] = [];
+                    slots_dp.push(lo_slot);
+                    slots_dp.push(hi_slot);
+                    return ParamPlan {
+                        cryo_type:  t,
+                        cls:      ArgClass::DirectPair,
+                        llvm_slots: slots_dp,
+                        attr:       AbiAttr::None,
+                        pointee_ty: orig,   // coercion target
+                    };
+                }
+            }
         }
 
         const lty: LType = tm.map_type(t);

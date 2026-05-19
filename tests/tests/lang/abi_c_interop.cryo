@@ -53,6 +53,16 @@ type struct TwoDoubles {
     b: f64;
 }
 
+// 8-byte struct of two f32s.  Under SysV, both fields share one
+// eightbyte that classifies as SSE and lowers to `<2 x float>` (a
+// single XMM register holding two packed singles), NOT `{float, float}`
+// (two scalar SSE slots) and NOT `i64` (the INTEGER fallback).
+// Exercises the multi-float SSE bucket in `eightbyte_slot_type`.
+type struct TwoFloats {
+    a: f32;
+    b: f32;
+}
+
 extern "C" {
     function div(numerator: i32, denominator: i32) -> DivT;
     function lldiv(numerator: i64, denominator: i64) -> LLDivT;
@@ -60,6 +70,8 @@ extern "C" {
     function abi_sum_two_i32(s: TwoI32) -> i32;
     function abi_sum_three_i32(s: ThreeI32) -> i32;
     function abi_make_two_doubles(a: f64, b: f64) -> TwoDoubles;
+    function abi_make_two_floats(a: f32, b: f32) -> TwoFloats;
+    function abi_sum_two_floats(s: TwoFloats) -> f32;
 }
 
 // 17 / 5 = quot=3 rem=2.  If the ABI for this 8-byte by-value
@@ -203,6 +215,38 @@ function helper_make_three_i32_directpair() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     return Result::Ok(());
+}
+
+// §3.3 multi-float SSE return: a `{float, float}` struct lowers to a
+// single `<2 x float>` register slot under SysV.  Verifies that the
+// vector return type round-trips back to the source struct via the
+// store-then-load coercion (got_kind=Vector, expected_kind=Struct).
+// If the lowering falls back to INTEGER (`i64`), the bytes would land
+// in %rax instead of %xmm0 and both fields would read garbage.
+![test]
+function helper_make_two_floats_sse() -> Result<(), TestError> {
+    const r: TwoFloats = abi_make_two_floats(1.5 as f32, -2.25 as f32);
+    match (expect_close_f64(r.a as f64, 1.5 as f64, 0.0001 as f64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_close_f64(r.b as f64, -2.25 as f64, 0.0001 as f64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// §3.3 multi-float SSE param: passing a `{float, float}` struct by
+// value lowers to a single `<2 x float>` LLVM argument.  Exercises the
+// Struct → Vector coercion path at the call site (spill struct to a
+// vector-typed slot and reload as the vector).  The C side reads the
+// two singles back out of the XMM register and sums them.
+![test]
+function helper_sum_two_floats_sse_param() -> Result<(), TestError> {
+    const s: TwoFloats = TwoFloats { a: 1.5 as f32, b: 2.5 as f32 };
+    const r: f32 = abi_sum_two_floats(s);
+    return expect_close_f64(r as f64, 4.0 as f64, 0.0001 as f64);
 }
 
 ![test]

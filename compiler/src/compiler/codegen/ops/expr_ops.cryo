@@ -604,10 +604,13 @@ type struct ExprOps {
             if (arg_val.is_valid() && param_types_buf != null && i < expected_count) {
                 const expected_ty: void* = param_types[i];
                 const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
-                // Compare by type kind; void* pointer equality is broken
-                // in the Cryo compiler (always returns true), so we
-                // cannot rely on expected_ty != actual_ty to detect
-                // mismatches.
+                // Compare by LLVM type kind first to dispatch to
+                // shape-aware coercion branches (ptr↔struct, ptr↔int,
+                // struct→scalar, etc.).  When kinds match we fall
+                // through to the equal-kinds branches further down
+                // and use direct void* identity (`expected_ty !=
+                // actual_ty`) to catch named-vs-literal struct
+                // mismatches and similar.
                 const ek: LTypeKind = type_kind_of(expected_ty);
                 const ak: LTypeKind = type_kind_of(actual_ty);
                 if (ek != ak) {
@@ -665,25 +668,62 @@ type struct ExprOps {
                         arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(this.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
                     } else if ((ek == LTypeKind::Integer
                                 || ek == LTypeKind::Float
-                                || ek == LTypeKind::Double)
+                                || ek == LTypeKind::Double
+                                || ek == LTypeKind::Vector)
                                && ak == LTypeKind::Struct) {
                         // §3.2 / §3.3 — `extern "C"` small-aggregate
                         // param.  The callee's LLVM signature has a
                         // register-sized scalar slot (integer for
-                        // INTEGER class, float/double for SSE class)
-                        // where the Cryo source type is a ≤ 8-byte
-                        // struct lowered via `classify_param_extern_c`.
-                        // Spill the struct value to a slot typed as
-                        // the scalar and reload it; the scalar's
-                        // storage size (≥ struct size for the ≤ 8-byte
-                        // case) covers the struct's bytes, so the
-                        // round-trip is safe.  This is the inverse of
-                        // the receiver-side load on the C side.
+                        // INTEGER class, float/double for single-field
+                        // SSE class, `<2 x float>` for two-F32 SSE
+                        // class) where the Cryo source type is a ≤ 8-
+                        // byte struct lowered via
+                        // `classify_param_extern_c`.  Spill the struct
+                        // value to a slot typed as the scalar/vector
+                        // and reload it; the slot's storage size
+                        // matches the struct's byte width by
+                        // construction.  This is the inverse of the
+                        // receiver-side coercion on the C side.
                         const slot_lty: LType = LType { raw: expected_ty };
                         const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.coerce");
                         this.builder.build_store(arg_val, slot_p);
                         arg_val = this.builder.build_load(slot_lty, slot_p, "arg.coerced");
+                    } else if (ek == LTypeKind::Struct
+                               && (ak == LTypeKind::Integer
+                                   || ak == LTypeKind::Float
+                                   || ak == LTypeKind::Double
+                                   || ak == LTypeKind::Vector)) {
+                        // §3.5 inverse — the arg is a register-shaped
+                        // scalar/vector coming out of a ≤ 8-byte
+                        // aggregate return (Direct-with-coercion),
+                        // but the receiving param wants the source-
+                        // level named struct.  Alloca with the scalar
+                        // type so the store doesn't overflow, then
+                        // reload at the named struct.
+                        const slot_lty: LType = LType { raw: actual_ty };
+                        const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.reshape");
+                        this.builder.build_store(arg_val, slot_p);
+                        const exp_lty: LType = LType { raw: expected_ty };
+                        arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
                     }
+                } else if (ek == LTypeKind::Struct && ak == LTypeKind::Struct
+                           && expected_ty != actual_ty) {
+                    // §3.5 — both Struct but distinct LLVM types: the
+                    // arg is the anonymous `{lo, hi}` literal struct
+                    // from a DirectPair-classified callee return (or
+                    // another layout-compatible-but-not-identical
+                    // struct, e.g. anonymous `Option<i32>` layout vs.
+                    // the source-level named type).  Spill-then-reload
+                    // at the expected named struct.  Catches cases
+                    // where the post-call coercion couldn't fire
+                    // (e.g. node.resolved_type didn't resolve fully
+                    // through generic instantiation) but the param-
+                    // type disagreement is unambiguous.
+                    const slot_lty: LType = LType { raw: actual_ty };
+                    const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.reshape");
+                    this.builder.build_store(arg_val, slot_p);
+                    const exp_lty: LType = LType { raw: expected_ty };
+                    arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
                 } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
                     // Both integers: coerce widths if needed.  Picking
                     // sext vs zext from the *source* Cryo type's
@@ -780,13 +820,15 @@ type struct ExprOps {
                     && llvm_slot_idx + 1 < expected_count
                     && (ek == LTypeKind::Integer
                         || ek == LTypeKind::Float
-                        || ek == LTypeKind::Double)
+                        || ek == LTypeKind::Double
+                        || ek == LTypeKind::Vector)
                     && arg_ty_ref.is_valid()) {
                 const next_ty: void* = param_types[llvm_slot_idx + 1];
                 const nk: LTypeKind = type_kind_of(next_ty);
                 if (nk == LTypeKind::Integer
                         || nk == LTypeKind::Float
-                        || nk == LTypeKind::Double) {
+                        || nk == LTypeKind::Double
+                        || nk == LTypeKind::Vector) {
                     const src_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
                     if (src_t != null) {
                         const sz: u64 = src_t.size_bytes();
@@ -858,7 +900,8 @@ type struct ExprOps {
                     arg_val = this.builder.build_load(st, arg_val, "arg.deref");
                 } else if ((ek == LTypeKind::Integer
                             || ek == LTypeKind::Float
-                            || ek == LTypeKind::Double)
+                            || ek == LTypeKind::Double
+                            || ek == LTypeKind::Vector)
                            && ak == LTypeKind::Struct) {
                     const slot_lty: LType = LType { raw: expected_ty };
                     const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.coerce");
@@ -1548,6 +1591,42 @@ type struct ExprOps {
                             this.builder.build_ret_void();
                             return;
                         }
+
+                        // §3.5 — Phase 3 defining-side coercion.  When
+                        // the function's LLVM return type is a register-
+                        // shaped scalar/pair (Integer/Float/Double/Vector
+                        // for ≤8 byte aggregates, anonymous `{lo, hi}`
+                        // Struct for 9–16 byte DirectPair returns) but
+                        // the source value is a struct, spill the
+                        // struct to a stack temp and reload it at the
+                        // declared LLVM return type.  Inverse of the
+                        // post-call coercion in `call_emitter.cryo`;
+                        // see that file for the structural-comparison
+                        // rationale (Cryo's void* != doesn't reliably
+                        // distinguish distinct LLVM type handles).
+                        const got_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
+                        if (got_ty_raw != null && got_ty_raw != ret_ty_raw) {
+                            const ret_k: LTypeKind = type_kind_of(ret_ty_raw);
+                            const got_k: LTypeKind = type_kind_of(got_ty_raw);
+                            const ret_is_reg: boolean = (ret_k == LTypeKind::Integer
+                                || ret_k == LTypeKind::Float
+                                || ret_k == LTypeKind::Double
+                                || ret_k == LTypeKind::Vector
+                                || ret_k == LTypeKind::Struct);
+                            const do_coerce: boolean = got_k == LTypeKind::Struct && ret_is_reg;
+                            if (do_coerce) {
+                                const src_lty: LType = LType { raw: got_ty_raw };
+                                const slot: LValue = this.flow.create_entry_alloca(
+                                    fn, "ret.coerce.src", src_lty);
+                                this.builder.build_store(val, slot);
+                                const ret_lty: LType = LType { raw: ret_ty_raw };
+                                const coerced_v: LValue = this.builder.build_load(
+                                    ret_lty, slot, "ret.coerce.val");
+                                this.emit_va_end_if_variadic(this.current_variadic_arg());
+                                this.builder.build_ret(coerced_v);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1578,9 +1657,11 @@ type struct ExprOps {
     /// from an `-> i64` function would `zext` and turn `-1` into
     /// `0xFFFFFFFF`.
     ///
-    /// Comparisons use LLVMGetTypeKind codes (integers) rather than
-    /// void* equality; `==` on `void*` currently lowers to strcmp, so we
-    /// never pull the raw types into a `==` expression.
+    /// Branches use `LLVMGetTypeKind`-based dispatch because the same
+    /// LLVM kind covers many source-level shapes (`Integer` for every
+    /// width, `Pointer` for typed pointers / refs / opaque pointers,
+    /// etc.); raw `void* != void*` would force a separate branch per
+    /// LLVM type handle, which is much noisier.
     coerce_return_value(mut &this, val: LValue, src_ty: TypeRef) -> LValue {
         const cur_bb: LBasicBlock = this.builder.get_insert_block();
         if (!cur_bb.is_valid()) { return val; }
