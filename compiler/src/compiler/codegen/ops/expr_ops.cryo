@@ -49,6 +49,7 @@ type struct ExprOps {
     llvm_module: LModule*;
     builder:     LBuilder*;
     type_mapper: TypeMapper*;
+    abi:         AbiClassifier*;
     values:      ValueTable*;
     functions:   FunctionRegistry*;
     flow:        IRFlowEmitter*;
@@ -68,6 +69,7 @@ type struct ExprOps {
             llvm_module: null,
             builder:     null,
             type_mapper: null,
+            abi:         null,
             values:      null,
             functions:   null,
             flow:        null,
@@ -81,13 +83,15 @@ type struct ExprOps {
 
     wire(mut &this,
          llvm_module: LModule*, builder: LBuilder*,
-         type_mapper: TypeMapper*, values: ValueTable*,
+         type_mapper: TypeMapper*, abi: AbiClassifier*,
+         values: ValueTable*,
          functions: FunctionRegistry*, flow: IRFlowEmitter*,
          resolver: SymbolResolver*, intrinsics: IntrinsicEmitter*,
          diag: DiagSink*, ctx: CompilationContext*) -> void {
         this.llvm_module = llvm_module;
         this.builder     = builder;
         this.type_mapper = type_mapper;
+        this.abi         = abi;
         this.values      = values;
         this.functions   = functions;
         this.flow        = flow;
@@ -459,7 +463,7 @@ type struct ExprOps {
         // struct value back to upstream callers by loading from the
         // slot.  This keeps `codegen_call`'s contract intact: callers
         // still get a struct value back from a struct-returning call.
-        const sret_pointee: LType = Abi::sret_pointee_of(callee);
+        const sret_pointee: LType = this.abi.sret_pointee_of(callee);
         if (sret_pointee.is_valid()) {
             const cur_bb: LBasicBlock = this.builder.get_insert_block();
             mut fn_for_alloca: LValue = LValue::null();
@@ -484,7 +488,7 @@ type struct ExprOps {
             const call_val: LValue = this.codegen_call_direct(
                 callee, callee_type, marshalled, "");
             if (call_val.is_valid()) {
-                Abi::apply_sret_call_attribute(call_val, sret_pointee);
+                this.abi.apply_sret_call_attribute(call_val, sret_pointee);
             }
 
             // Synthesise the struct return value upstream callers
@@ -537,14 +541,14 @@ type struct ExprOps {
 
             const call_val: LValue = this.codegen_call_direct(
                 callee, callee_type, marshalled, "");
-            Abi::apply_call_site_attrs_from_plan(call_val, &plan);
+            this.abi.apply_call_site_attrs_from_plan(call_val, &plan);
 
             return this.builder.build_load(sret_pointee, slot, name);
         }
 
         const call_val: LValue = this.codegen_call_direct(
             callee, callee_type, args, name);
-        Abi::apply_call_site_attrs_from_plan(call_val, &plan);
+        this.abi.apply_call_site_attrs_from_plan(call_val, &plan);
         return call_val;
     }
 
@@ -692,9 +696,9 @@ type struct ExprOps {
         // (tracked under the function-pointer ABI gap).
         if (out_value.is_valid()) {
             for (mut bi: u32 = 0; bi < n; bi++) {
-                const pointee_b: LType = Abi::byval_pointee_of_param(callee, bi);
+                const pointee_b: LType = this.abi.byval_pointee_of_param(callee, bi);
                 if (pointee_b.is_valid()) {
-                    Abi::apply_byval_call_attribute(out_value, bi, pointee_b);
+                    this.abi.apply_byval_call_attribute(out_value, bi, pointee_b);
                 }
             }
         }
@@ -1320,7 +1324,7 @@ type struct ExprOps {
                     // and emit `ret void`, *before* the void-check
                     // below routes a unit-style return.  Callers
                     // observe the result via the slot they passed in.
-                    const sret_pointee: LType = Abi::sret_pointee_of(fn);
+                    const sret_pointee: LType = this.abi.sret_pointee_of(fn);
                     if (sret_pointee.is_valid()) {
                         const sret_ptr: LValue = LValue {
                             raw: llvm::LLVMGetParam(fn.raw, 0),

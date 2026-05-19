@@ -49,6 +49,7 @@ type struct SymbolResolver {
     // Back-pointers (set by wire()).
     llvm_module: LModule*;
     type_mapper: TypeMapper*;
+    abi:         AbiClassifier*;
     functions:   FunctionRegistry*;
     globals:     GlobalRegistry*;
     ctx:         CompilationContext*;
@@ -57,6 +58,7 @@ type struct SymbolResolver {
         return SymbolResolver {
             llvm_module: null,
             type_mapper: null,
+            abi:         null,
             functions:   null,
             globals:     null,
             ctx:         null,
@@ -64,10 +66,12 @@ type struct SymbolResolver {
     }
 
     wire(mut &this, llvm_module: LModule*, type_mapper: TypeMapper*,
+         abi: AbiClassifier*,
          functions: FunctionRegistry*, globals: GlobalRegistry*,
          ctx: CompilationContext*) -> void {
         this.llvm_module = llvm_module;
         this.type_mapper = type_mapper;
+        this.abi         = abi;
         this.functions   = functions;
         this.globals     = globals;
         this.ctx         = ctx;
@@ -93,9 +97,8 @@ type struct SymbolResolver {
     /// `byval(%T)` attributes the defining module attached, without
     /// re-running classification.
     build_function_plan(mut &this, ft: FunctionType*) -> SignaturePlan {
-        return Abi::classify_signature(
-            this.type_mapper, ft.param_types,
-            ft.return_type, ft.is_variadic);
+        return this.abi.classify_signature(
+            ft.param_types, ft.return_type, ft.is_variadic);
     }
 
 
@@ -149,7 +152,7 @@ type struct SymbolResolver {
             // module attached.
             const xplan: SignaturePlan = this.build_function_plan(ft);
             if (xplan.sret_slot && xplan.return_plan.pointee_ty.is_valid()) {
-                Abi::apply_sret_attribute(fn_val, xplan.return_plan.pointee_ty);
+                this.abi.apply_sret_attribute(fn_val, xplan.return_plan.pointee_ty);
             }
             const sret_off_x: u32 = if (xplan.sret_slot) { 1 } else { 0 } as u32;
             for (mut xi: i64 = 0; xi < xplan.param_plans.length; xi++) {
@@ -157,7 +160,7 @@ type struct SymbolResolver {
                 if (xpp.cls == ArgClass::Indirect
                         && xpp.attr == AbiAttr::ByVal
                         && xpp.pointee_ty.is_valid()) {
-                    Abi::apply_byval_attribute(
+                    this.abi.apply_byval_attribute(
                         fn_val, (xi as u32) + sret_off_x, xpp.pointee_ty);
                 }
             }

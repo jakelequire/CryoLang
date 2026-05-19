@@ -9,6 +9,7 @@ namespace Compiler::Codegen::Context;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Abi;
 import Compiler::Codegen::State::LoopStack;
 import Compiler::Codegen::State::ValueTable;
 import Compiler::Codegen::State::FunctionRegistry;
@@ -48,6 +49,11 @@ type struct CodegenContext {
     llvm_module: LModule;
     builder:     LBuilder;
     type_mapper: TypeMapper;
+
+    // -- ABI lowering classifier (SysV x86-64 today; per-target later).
+    //    Owns the cached LLVM attribute-kind IDs and holds a back-pointer
+    //    to `type_mapper`, set by `wire()`. --
+    abi: AbiClassifier;
 
     // -- Local-scope bindings (named values + push/pop_scope undo log) --
     values: ValueTable;
@@ -105,6 +111,7 @@ type struct CodegenContext {
             llvm_module: mod,
             builder:     builder,
             type_mapper: TypeMapper::new(ctx.type_arena, ctx.intern_table),
+            abi:         AbiClassifier::null(),
 
             values:    ValueTable::new(),
             functions: FunctionRegistry::new(),
@@ -131,16 +138,20 @@ type struct CodegenContext {
     wire(mut &this) -> void {
         this.flow.wire(&this.builder, &this.loops);
 
-        this.resolver.wire(&this.llvm_module, &this.type_mapper,
+        this.abi.wire(&this.type_mapper);
+
+        this.resolver.wire(&this.llvm_module, &this.type_mapper, &this.abi,
                            &this.functions, &this.globals, this.ctx);
 
         this.intrinsics.wire(&this.llvm_module, &this.builder);
 
         this.expr_ops.wire(&this.llvm_module, &this.builder, &this.type_mapper,
+                           &this.abi,
                            &this.values, &this.functions, &this.flow,
                            &this.resolver, &this.intrinsics, &this.diag, this.ctx);
 
         this.decl.wire(&this.llvm_module, &this.builder, &this.type_mapper,
+                       &this.abi,
                        &this.values, &this.functions, &this.globals,
                        &this.str_cache, &this.flow, &this.resolver,
                        &this.expr_ops, &this.intrinsics, &this.diag, this.ctx);
