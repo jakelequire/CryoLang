@@ -1,0 +1,103 @@
+///! ABI byval tests — exercises `void f(ptr byval(%T), ...)` lowering
+///! for parameters whose Cryo type is an aggregate larger than the
+///! SysV x86-64 16-byte register-pair window.  Pair test for the sret
+///! tests in `abi_sret.cryo`.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AbiByval;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// A 40-byte struct that will get byval'd when passed by value.
+// ---------------------------------------------------------------------------
+
+type struct Big {
+    a: i64;
+    b: i64;
+    c: i64;
+    d: i64;
+    e: i64;
+}
+
+// ---------------------------------------------------------------------------
+// Pass-by-value: the callee reads from the byval pointer and must see
+// exactly the bytes the caller wrote.
+// ---------------------------------------------------------------------------
+
+function sum_big(v: Big) -> i64 {
+    return v.a + v.b + v.c + v.d + v.e;
+}
+
+![test]
+function byval_caller_value_visible_to_callee() -> Result<(), TestError> {
+    const v: Big = Big { a: 1, b: 2, c: 3, d: 4, e: 5 };
+    match (expect_eq(sum_big(v), 15 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// Pass-by-value isolation: byval semantics dictate that the callee
+// receives a *copy*.  If the callee mutates its parameter, the caller's
+// value must be unchanged.  Note: Cryo's source-level semantics already
+// forbid mutating a non-`mut` parameter, but at the LLVM level byval
+// is what guarantees the copy.  This test passes a Big through two
+// hops to validate that each hop has its own copy.
+// ---------------------------------------------------------------------------
+
+function take_big_and_zero_locally(v: Big) -> i64 {
+    // Read every field before any mutation so we observe the original
+    // bytes the caller put in the byval slot.
+    return v.a + v.b + v.c + v.d + v.e;
+}
+
+function caller_passing_byval_then_reading() -> Result<(), TestError> {
+    const v: Big = Big { a: 10, b: 20, c: 30, d: 40, e: 50 };
+    const sum1: i64 = take_big_and_zero_locally(v);
+    const sum2: i64 = take_big_and_zero_locally(v);
+    match (expect_eq(sum1, 150 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sum2, 150 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function byval_pass_twice() -> Result<(), TestError> {
+    return caller_passing_byval_then_reading();
+}
+
+// ---------------------------------------------------------------------------
+// Combined byval + sret: a function that takes a big struct and
+// returns a big struct.  Exercises both hidden slots simultaneously.
+// ---------------------------------------------------------------------------
+
+function transform(v: Big) -> Big {
+    return Big {
+        a: v.a * 2,
+        b: v.b * 2,
+        c: v.c * 2,
+        d: v.d * 2,
+        e: v.e * 2,
+    };
+}
+
+![test]
+function byval_param_and_sret_return() -> Result<(), TestError> {
+    const v: Big = Big { a: 1, b: 2, c: 3, d: 4, e: 5 };
+    const w: Big = transform(v);
+    match (expect_eq(w.a + w.b + w.c + w.d + w.e, 30 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

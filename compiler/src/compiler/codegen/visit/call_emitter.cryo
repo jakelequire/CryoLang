@@ -20,6 +20,7 @@ namespace Compiler::Codegen::Visit::CallEmitter;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::TypeMap;
+import Compiler::Codegen::Abi;
 import Compiler::Codegen::Context;
 import Compiler::Codegen::State::VisitorState;
 import Compiler::Codegen::Visit::ExprDispatch;
@@ -353,35 +354,30 @@ type struct CallEmitter {
                     }
                     if (callee_t != null && callee_t.kind == TypeKind::Function) {
                         const ft: FunctionType* = callee_t as FunctionType*;
-                        // Map return type.
-                        const ret_ty: LType = this.cg.type_mapper.map_type(ft.return_type);
-                        if (!ret_ty.is_valid()) {
+                        // Route the LLVM function type through the ABI seam
+                        // so sret/byval lowering matches the callee — the
+                        // callee here is a function pointer loaded from a
+                        // local, so `LLVMIsAFunction(callee)` is null and
+                        // the call-site attribute-query path can't recover
+                        // the ABI on its own.  We compute the plan from
+                        // the Cryo FunctionType and pass it explicitly via
+                        // `codegen_call_with_plan`.
+                        const plan: SignaturePlan = Abi::classify_signature(
+                            this.cg.type_mapper, ft.param_types,
+                            ft.return_type, false);
+                        if (!plan.llvm_fn_type.is_valid()) {
                             this.state.last_value = LValue::null();
                             this.state.last_is_lvalue = false;
                             return;
                         }
-                        // Map parameter types.
-                        const param_count: u32 = ft.param_types.length as u32;
-                        mut fn_type: LType = LType::null();
-                        if (param_count == 0) {
-                            fn_type = LType::function_type(ret_ty, null, 0, false);
-                        } else {
-                            const pbuf: void* = intrinsics::malloc(param_count as u64 * 8);
-                            const pslots: void** = pbuf as void**;
-                            mut valid: boolean = true;
-                            for (mut pi: u32 = 0; pi < param_count; pi++) {
-                                const pt: LType = this.cg.type_mapper.map_type(ft.param_types[pi]);
-                                if (!pt.is_valid()) { valid = false; break; }
-                                pslots[pi] = pt.raw;
-                            }
-                            if (!valid) {
-                                intrinsics::free(pbuf);
-                                this.state.last_value = LValue::null();
-                                this.state.last_is_lvalue = false;
-                                return;
-                            }
-                            fn_type = LType::function_type(ret_ty, pbuf, param_count, false);
-                            intrinsics::free(pbuf);
+                        const fn_type: LType = plan.llvm_fn_type;
+                        // Map ret_ty for the void-name choice below; the
+                        // seam used `void` when sret applied, otherwise
+                        // the Direct return slot's type.
+                        mut ret_ty: LType = LType::void_type();
+                        if (!plan.sret_slot
+                                && plan.return_plan.llvm_slots.length > 0) {
+                            ret_ty = plan.return_plan.llvm_slots[0];
                         }
                         // Load the function pointer from the alloca.
                         const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
@@ -392,11 +388,14 @@ type struct CallEmitter {
                             const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
                             call_args.push(Pair<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
                         }
-                        // Build the call.
+                        // Build the call via the plan-aware path so sret
+                        // is marshalled and byval/sret attributes land on
+                        // the call instruction.
                         const void_ty: LType = LType::void_type();
                         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
                         mut call_result: LValue = LValue::null();
-                        call_result = this.cg.expr_ops.codegen_call(fn_ptr, fn_type, call_args, call_name);
+                        call_result = this.cg.expr_ops.codegen_call_with_plan(
+                            fn_ptr, fn_type, plan, call_args, call_name);
                         this.state.last_value = call_result;
                         this.state.last_is_lvalue = false;
                         return;
@@ -687,33 +686,24 @@ type struct CallEmitter {
             }
             if (ma_fn_type != null) {
                 const ft: FunctionType* = ma_fn_type;
-                const ret_ty: LType = this.cg.type_mapper.map_type(ft.return_type);
-                if (!ret_ty.is_valid()) {
+                // Route the LLVM function type through the ABI seam so
+                // sret/byval lowering matches the callee.  See the
+                // sibling fn-pointer site higher in this file for the
+                // full rationale; same situation here — the callee is
+                // a function pointer loaded from a struct field.
+                const plan: SignaturePlan = Abi::classify_signature(
+                    this.cg.type_mapper, ft.param_types,
+                    ft.return_type, false);
+                if (!plan.llvm_fn_type.is_valid()) {
                     this.state.last_value = LValue::null();
                     this.state.last_is_lvalue = false;
                     return;
                 }
-                const param_count: u32 = ft.param_types.length as u32;
-                mut llvm_fn_type: LType = LType::null();
-                if (param_count == 0) {
-                    llvm_fn_type = LType::function_type(ret_ty, null, 0, false);
-                } else {
-                    const pbuf: void* = intrinsics::malloc(param_count as u64 * 8);
-                    const pslots: void** = pbuf as void**;
-                    mut all_valid: boolean = true;
-                    for (mut pi: u32 = 0; pi < param_count; pi++) {
-                        const pty: LType = this.cg.type_mapper.map_type(ft.param_types[pi]);
-                        if (!pty.is_valid()) { all_valid = false; break; }
-                        pslots[pi] = pty.raw;
-                    }
-                    if (!all_valid) {
-                        intrinsics::free(pbuf);
-                        this.state.last_value = LValue::null();
-                        this.state.last_is_lvalue = false;
-                        return;
-                    }
-                    llvm_fn_type = LType::function_type(ret_ty, pbuf, param_count, false);
-                    intrinsics::free(pbuf);
+                const llvm_fn_type: LType = plan.llvm_fn_type;
+                mut ret_ty: LType = LType::void_type();
+                if (!plan.sret_slot
+                        && plan.return_plan.llvm_slots.length > 0) {
+                    ret_ty = plan.return_plan.llvm_slots[0];
                 }
                 // Load the fn-pointer value from the field (rvalue).
                 const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,ma);
@@ -732,7 +722,8 @@ type struct CallEmitter {
                 const void_ty: LType = LType::void_type();
                 const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
                 mut call_result: LValue = LValue::null();
-                call_result = this.cg.expr_ops.codegen_call(fn_ptr, llvm_fn_type, fnp_args, call_name);
+                call_result = this.cg.expr_ops.codegen_call_with_plan(
+                    fn_ptr, llvm_fn_type, plan, fnp_args, call_name);
                 this.state.last_value = call_result;
                 this.state.last_is_lvalue = false;
                 return;
@@ -1027,6 +1018,39 @@ type struct CallEmitter {
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+
+        // Phase 3 — small-aggregate return coercion.  When an extern
+        // "C" function was declared with a register-shaped integer
+        // return (`classify_return_extern_c` for ≤ 8 byte aggregates),
+        // the call instruction yields an integer but the source-level
+        // type is a struct.  Bridge the gap by spilling the integer
+        // through a stack temp and re-loading it at the struct type;
+        // this is the inverse of the coercion the callee will do on
+        // its return.  We detect the situation by the mismatch between
+        // the call-result LLVM type (Integer) and the expected source
+        // type (Struct / Class / Enum aggregate).  Phase 1 sret is
+        // already handled inside `codegen_call` (returns a struct
+        // value loaded from the sret slot), so this branch doesn't
+        // conflict with that path.
+        if (result.is_valid() && node.resolved_type.is_valid()) {
+            const got_raw: void* = llvm::LLVMTypeOf(result.raw);
+            const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+            if (expected_lty.is_valid()
+                    && type_kind_of(got_raw) == LTypeKind::Integer
+                    && type_kind_of(expected_lty.raw) == LTypeKind::Struct) {
+                const cur_bb_c: LBasicBlock = this.cg.builder.get_insert_block();
+                if (cur_bb_c.is_valid()) {
+                    const fn_c: LValue = cur_bb_c.get_parent();
+                    if (fn_c.is_valid()) {
+                        const slot_c: LValue = this.cg.flow.create_entry_alloca(
+                            fn_c, "ret.coerce", expected_lty);
+                        this.cg.builder.build_store(result, slot_c);
+                        result = this.cg.builder.build_load(
+                            expected_lty, slot_c, "ret.coerced");
+                    }
+                }
+            }
+        }
 
         // Emit `unreachable` after calls to divergent functions.  Two
         // cases handled here:

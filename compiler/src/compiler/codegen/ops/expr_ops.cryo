@@ -497,6 +497,57 @@ type struct ExprOps {
         return this.codegen_call_direct(callee, callee_type, args, name);
     }
 
+    /// Variant of `codegen_call` for callees whose ABI cannot be
+    /// recovered from LLVM function-attribute queries — primarily
+    /// function-pointer invocations where `LLVMIsAFunction(callee)`
+    /// is null and `sret_pointee_of` / `byval_pointee_of_param`
+    /// silently return null.  Caller supplies the `SignaturePlan`
+    /// it computed from the Cryo `FunctionType`, and this routine
+    /// marshals the sret slot (if any), invokes
+    /// `codegen_call_direct`, applies sret + byval call-site
+    /// attributes from the plan, and loads the result back out of
+    /// the sret slot when applicable.  The `callee_type` must equal
+    /// `plan.llvm_fn_type`.
+    codegen_call_with_plan(mut &this, callee: LValue, callee_type: LType,
+                           plan: SignaturePlan, args: Pair<LValue, TypeRef>[],
+                           name: string) -> LValue {
+        const sret_pointee: LType = if (plan.sret_slot) {
+            plan.return_plan.pointee_ty
+        } else {
+            LType::null()
+        };
+
+        if (sret_pointee.is_valid()) {
+            const cur_bb: LBasicBlock = this.builder.get_insert_block();
+            mut fn_for_alloca: LValue = LValue::null();
+            if (cur_bb.is_valid()) {
+                fn_for_alloca = cur_bb.get_parent();
+            }
+            if (!fn_for_alloca.is_valid()) {
+                return this.codegen_call_direct(callee, callee_type, args, name);
+            }
+            const slot: LValue = this.flow.create_entry_alloca(
+                fn_for_alloca, "sret.tmp", sret_pointee);
+
+            mut marshalled: Pair<LValue, TypeRef>[] = [];
+            marshalled.push(Pair<LValue, TypeRef>::new(slot, TypeRef::invalid()));
+            for (mut ai: i64 = 0; ai < args.length; ai++) {
+                marshalled.push(args[ai]);
+            }
+
+            const call_val: LValue = this.codegen_call_direct(
+                callee, callee_type, marshalled, "");
+            Abi::apply_call_site_attrs_from_plan(call_val, &plan);
+
+            return this.builder.build_load(sret_pointee, slot, name);
+        }
+
+        const call_val: LValue = this.codegen_call_direct(
+            callee, callee_type, args, name);
+        Abi::apply_call_site_attrs_from_plan(call_val, &plan);
+        return call_val;
+    }
+
     /// The pre-Phase-1 call lowering: coerce integer widths to match
     /// the callee's expected param types, then `build_call`.  Split out
     /// of `codegen_call` so the sret-marshalling wrapper can call
@@ -630,6 +681,24 @@ type struct ExprOps {
 
         out_value = this.builder.build_call(callee_type, callee, buf, n, name);
         intrinsics::free(buf);
+
+        // Phase 2 — propagate `byval(%T)` from the callee's parameter
+        // attributes onto the matching call-site slots.  The existing
+        // struct → ptr coercion above already arranged for each byval
+        // slot to be a pointer-to-temp; adding the attribute tells the
+        // backend this is a by-value copy (not aliasing).  Skipped for
+        // function-pointer callees: `byval_pointee_of_param` is gated
+        // by `LLVMIsAFunction` and silently returns null in that case
+        // (tracked under the function-pointer ABI gap).
+        if (out_value.is_valid()) {
+            for (mut bi: u32 = 0; bi < n; bi++) {
+                const pointee_b: LType = Abi::byval_pointee_of_param(callee, bi);
+                if (pointee_b.is_valid()) {
+                    Abi::apply_byval_call_attribute(out_value, bi, pointee_b);
+                }
+            }
+        }
+
         return out_value;
     }
 

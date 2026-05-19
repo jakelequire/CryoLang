@@ -351,14 +351,21 @@ type struct DeclarationEmitter {
             }
         }
 
-        // Build the LLVM function type via the ABI seam.  Phase 1: the
-        // classifier promotes >16-byte aggregate returns to `Indirect`
-        // (sret), so the produced LLVM signature is `void f(ptr sret(%T),
-        // ...)`.  Phase 1's attribute attachment happens just below.
+        // Build the LLVM function type via the ABI seam.  Phase 1 + 2:
+        // the classifier promotes >16-byte aggregates to `Indirect`
+        // (sret on returns, byval on params), so the produced LLVM
+        // signature looks like `void f(ptr sret(%T), ptr byval(%P), …)`.
+        // Phase 1/2 attribute attachment happens just below.
         const param_count: u32 = fixed_param_count(node);
 
         mut fn_type:    LType         = LType::null();
         mut sret_pointee: LType       = LType::null();   // null ⇒ no sret
+        // Captured plan from the seam.  Used after `add_function` to
+        // walk param classifications and apply `byval(%T)` to any
+        // Indirect parameter.  Empty when the main-widening branch
+        // builds `fn_type` open-coded (main can't have aggregate
+        // parameters in source, so byval never applies there).
+        mut plan_param_plans: ParamPlan[] = [];
         if (is_program_main && param_count == 0) {
             // The C ABI entry point is `int main(int argc, char** argv)`.
             // _start always passes argc/argv, and the stdlib's
@@ -394,6 +401,7 @@ type struct DeclarationEmitter {
             if (plan.sret_slot) {
                 sret_pointee = plan.return_plan.pointee_ty;
             }
+            plan_param_plans = plan.param_plans;
         }
 
         // Add the function to the LLVM module.
@@ -407,6 +415,21 @@ type struct DeclarationEmitter {
         // signature stays `void f(ptr sret(%T), ...)` end-to-end.
         if (sret_pointee.is_valid()) {
             Abi::apply_sret_attribute(fn_val, sret_pointee);
+        }
+
+        // Phase 2: attach `byval(%T)` to each LLVM parameter slot whose
+        // source param is a large aggregate.  The LLVM index for source
+        // param `i` is `i + sret_inc` (sret takes slot 0 if present).
+        // Skipped when the main-widening branch ran (empty plan_param_plans).
+        const sret_inc_fn: u32 = if (sret_pointee.is_valid()) { 1 } else { 0 } as u32;
+        for (mut pi: i64 = 0; pi < plan_param_plans.length; pi++) {
+            const pp_fn: ParamPlan = plan_param_plans[pi];
+            if (pp_fn.cls == ArgClass::Indirect
+                    && pp_fn.attr == AbiAttr::ByVal
+                    && pp_fn.pointee_ty.is_valid()) {
+                const llvm_idx: u32 = (pi as u32) + sret_inc_fn;
+                Abi::apply_byval_attribute(fn_val, llvm_idx, pp_fn.pointee_ty);
+            }
         }
 
         // Register under qualified name (module scope).
@@ -926,6 +949,16 @@ type struct DeclarationEmitter {
         const buf: void* = intrinsics::malloc(total_params as u64 * 8);
         const slots: void** = buf as void**;
 
+        // Parallel array tracking the byval pointee for each LLVM
+        // parameter slot.  `LType::null()` for slots that are NOT
+        // byval (sret slot, receiver, scalar params, struct params
+        // ≤16 bytes).  Walked after `add_function` to attach the
+        // `byval(%T)` attribute to the right LLVM indices.
+        mut byval_pointees: LType[] = [];
+        for (mut bi: u32 = 0; bi < total_params; bi++) {
+            byval_pointees.push(LType::null());
+        }
+
         mut idx: u32 = 0;
         if (has_sret_slot) {
             slots[idx] = LType::pointer_to(LType::i8()).raw;
@@ -956,7 +989,22 @@ type struct DeclarationEmitter {
                        && param.type_annotation == null) {
                 mapped_param = target_mapped;
             } else {
-                mapped_param = this.type_mapper.map_type(param.resolved_type);
+                // Non-receiver param: run it through the seam so a
+                // >16-byte aggregate is lowered to a byval `ptr`
+                // slot, matching what `build_function_ltype` will
+                // produce for cross-module externs of this method.
+                const pplan: ParamPlan = Abi::classify_param(
+                    this.type_mapper, param.resolved_type);
+                if (pplan.cls == ArgClass::Indirect
+                        && pplan.attr == AbiAttr::ByVal
+                        && pplan.pointee_ty.is_valid()) {
+                    mapped_param = LType::pointer_to(LType::i8());
+                    byval_pointees[idx] = pplan.pointee_ty;
+                } else if (pplan.llvm_slots.length > 0) {
+                    mapped_param = pplan.llvm_slots[0];
+                } else {
+                    mapped_param = this.type_mapper.map_type(param.resolved_type);
+                }
             }
             if (!mapped_param.is_valid()) {
                 params_valid = false;
@@ -983,6 +1031,16 @@ type struct DeclarationEmitter {
         // expects the other.
         if (sret_pointee.is_valid()) {
             Abi::apply_sret_attribute(fn_val, sret_pointee);
+        }
+
+        // Attach `byval(%T)` to any parameter slot the classifier
+        // promoted to Indirect.  `byval_pointees` is indexed by LLVM
+        // slot, so we can just walk it.
+        for (mut bvi: u32 = 0; bvi < total_params; bvi++) {
+            const pointee_bv: LType = byval_pointees[bvi as i64];
+            if (pointee_bv.is_valid()) {
+                Abi::apply_byval_attribute(fn_val, bvi, pointee_bv);
+            }
         }
 
         // Register under the combined key built above.  Also register against the
@@ -1058,46 +1116,52 @@ type struct DeclarationEmitter {
             if (func == null) { continue; }
 
             const name_str: string = intern.resolve(func.name);
+            const param_count: u32 = fixed_param_count(func);
 
-            // Extern functions use their bare name (C linkage).
-            const ret_ty: LType = this.map_return_type(func);
-            if (!ret_ty.is_valid()) {
+            // Route the extern declaration through the Phase 1 + 2 + 3
+            // extern-C seam so the LLVM function type matches the SysV
+            // C ABI: large aggregate returns get sret, large aggregate
+            // params get byval, small aggregate returns are coerced
+            // into a register-sized integer (Phase 3).
+            mut params: TypeRef[] = [];
+            for (mut pi: u32 = 0; pi < param_count; pi++) {
+                const param_pi: VarDeclNode* = func.parameters[pi];
+                if (param_pi != null && param_pi.resolved_type.is_valid()) {
+                    params.push(param_pi.resolved_type);
+                }
+            }
+            const plan: SignaturePlan = Abi::classify_signature_extern_c(
+                this.type_mapper, params,
+                func.resolved_return_type, func.is_variadic);
+            if (!plan.llvm_fn_type.is_valid()) {
                 this.diag.emit_warning_at_span(ErrorCode::E0643_RETURN_TYPE_ERROR,
-                    format("codegen: extern function '%s': failed to map return type", name_str),
+                    format("codegen: extern function '%s': failed to classify signature", name_str),
                     func.span);
                 continue;
             }
-            const param_count: u32 = fixed_param_count(func);
-
-            mut fn_type: LType = LType::null();
-            if (param_count == 0) {
-                fn_type = LType::function_type(ret_ty, null, 0, func.is_variadic);
-            } else {
-                const buf: void* = intrinsics::malloc(param_count as u64 * 8);
-                const slots: void** = buf as void**;
-                mut params_ok: boolean = true;
-                for (mut j: u32 = 0; j < param_count; j++) {
-                    const param: VarDeclNode* = func.parameters[j];
-                    const mapped_ep: LType = this.type_mapper.map_type(param.resolved_type);
-                    if (!mapped_ep.is_valid()) {
-                        this.diag.emit_warning_at_span(ErrorCode::E0642_PARAM_TYPE_ERROR,
-                            format("codegen: extern function '%s': failed to map parameter %d type", name_str, j as i32),
-                            param.span);
-                        params_ok = false;
-                        break;
-                    }
-                    slots[j] = mapped_ep.raw;
-                }
-                if (!params_ok) {
-                    intrinsics::free(buf);
-                    continue;
-                }
-                fn_type = LType::function_type(ret_ty, buf, param_count, func.is_variadic);
-                intrinsics::free(buf);
-            }
+            const fn_type: LType = plan.llvm_fn_type;
 
             // Use bare name for C linkage.
             const fn_val: LValue = this.llvm_module.add_function(name_str, fn_type);
+
+            // Apply sret + byval attributes for any Indirect slots the
+            // classifier produced.  Phase 3's `Direct`-with-coercion
+            // small-aggregate slot is *not* an attribute — it lowers
+            // to a plain integer return that the call site bitcasts.
+            if (plan.sret_slot && plan.return_plan.pointee_ty.is_valid()) {
+                Abi::apply_sret_attribute(fn_val, plan.return_plan.pointee_ty);
+            }
+            const sret_off_ex: u32 = if (plan.sret_slot) { 1 } else { 0 } as u32;
+            for (mut xi: i64 = 0; xi < plan.param_plans.length; xi++) {
+                const xpp: ParamPlan = plan.param_plans[xi];
+                if (xpp.cls == ArgClass::Indirect
+                        && xpp.attr == AbiAttr::ByVal
+                        && xpp.pointee_ty.is_valid()) {
+                    Abi::apply_byval_attribute(
+                        fn_val, (xi as u32) + sret_off_ex, xpp.pointee_ty);
+                }
+            }
+
             this.functions.register(func.name, fn_val);
         }
     }
@@ -1289,10 +1353,27 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
+            const llvm_idx: u32 = llvm_param_base + i;
             const arg: LValue = LValue {
-                raw: llvm::LLVMGetParam(fn_val.raw, llvm_param_base + i),
+                raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
             };
+
+            // Phase 2 — byval: the LLVM parameter at this slot is a
+            // `ptr` pointing at a caller-allocated copy of the value.
+            // We bind that pointer directly to the source name (same
+            // pattern `&this` uses in `codegen_method_prologue`) so
+            // member-access GEPs and `load(name)` reach the right
+            // memory.  An alloca-and-store would type-mismatch (`ptr`
+            // stored into an alloca-of-struct) and lose the byval
+            // semantics besides.
+            const byval_pointee: LType =
+                Abi::byval_pointee_of_param(fn_val, llvm_idx);
+            if (byval_pointee.is_valid()) {
+                this.values.set(param.name, arg);
+                continue;
+            }
+
+            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
             this.builder.build_store(arg, alloca);
             this.values.set(param.name, alloca);
         }
@@ -1572,8 +1653,21 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
             const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
+
+            // Phase 2 — byval on a method's non-receiver param: see
+            // `codegen_function_prologue` for the rationale.  Binding
+            // the byval `ptr` directly preserves the copy semantics
+            // and matches the LLVM signature.
+            const byval_pointee_m: LType =
+                Abi::byval_pointee_of_param(fn_val, param_idx);
+            if (byval_pointee_m.is_valid()) {
+                this.values.set(param.name, arg);
+                param_idx += 1;
+                continue;
+            }
+
+            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
             this.builder.build_store(arg, alloca);
             this.values.set(param.name, alloca);
             param_idx += 1;
