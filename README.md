@@ -3,6 +3,9 @@
   <h1>The Cryo Programming Language</h1>
   <p><i>A statically-typed, compiled systems language with a self-hosted compiler and an LLVM 20 backend.</i></p>
   <h3><b>1.0.0</b></h3>
+  <p>
+    <a href="https://github.com/jakelequire/CryoLang/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/jakelequire/CryoLang/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI (build + tests + stage-3=stage-4 selfhost)"/></a>
+  </p>
 </div>
 
 ---
@@ -422,7 +425,8 @@ The compiler runs a multi-pass pipeline driven from [`compiler/src/compiler/inst
 ```
 Source → Lex → Parse → Module Resolution → Declaration Collection → Type Resolution
        → Type Lowering → Specialisation (monomorphisation) → Semantic Analysis
-       → Move Check → Drop Insertion (analyzer wired, synthesis gated off)
+       → Move Check → Drop Insertion (scope-exit synthesis active;
+         loop fixed-point reanalysis gated)
        → IR Generation (LLVM 20) → Linking (clang) → Native binary
 ```
 

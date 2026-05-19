@@ -9,10 +9,10 @@ expect ongoing development on top of a stable surface.
 |---|---|
 | `compiler/` | Self-hosted compiler (written in Cryo). **Active.** |
 | `stdlib/` | Standard library (written in Cryo). **Active.** |
-| `legacy/bootstrap/` | Retired C++23 bootstrap, kept in the tree for historical reference only. **Do not modify.** It will not build against the current language. |
-| `experimental/stdlib-next/` | Parked stdlib rewrite. **Don't depend on this.** |
 | `tools/CryoLSP/` | Language Server Protocol implementation. Built via `make lsp`. **Active.** |
-| `tools/CryoFormat/`, `tools/CryoAnalyzer/`, `tools/NewCryoLSP/` | Exploratory; not built by default. |
+| `tools/CryoAnalyzer/` | VS Code extension front-end for `cryolsp`. Built and installed via `make install-lsp`. **Active.** |
+| `tools/CryoFormat/` | Exploratory formatter; not built by default. |
+| `legacy/bootstrap/` | Retired C++23 bootstrap, kept in the tree for historical reference only. **Do not modify.** It will not build against the current language. |
 
 ## Building
 
@@ -90,5 +90,6 @@ A few conventions worth knowing:
   and content-addressed cache.
 - No cross-compilation; the host toolchain is the target.
 - `process::Command` is POSIX-only.
-- `tools/CryoFormat`, `tools/CryoAnalyzer`, and `tools/NewCryoLSP` are
-  exploratory and not built by default. Only `tools/CryoLSP` ships.
+- `tools/CryoFormat` is exploratory and not built by default. The shipped
+  tooling is `tools/CryoLSP` (the LSP server, `make lsp`) and
+  `tools/CryoAnalyzer` (the VS Code extension, `make install-lsp`).
