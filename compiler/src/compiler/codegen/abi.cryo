@@ -1,0 +1,484 @@
+/// ABI Lowering
+///
+/// Turns a Cryo function signature into an *ABI-lowered* LLVM signature
+/// plus a per-parameter / per-return lowering plan that codegen consults
+/// at every declaration site, call site, prologue, and `return`.
+///
+/// The classifier is the single source of truth for "how does this
+/// parameter / return value cross the function-call boundary".  Codegen
+/// must never inspect Cryo types directly to decide that — it asks the
+/// plan.
+///
+/// Phased rollout (see docs / commit history):
+///   * **Phase 0 (this file's initial form)**: classify *every* value as
+///     `Direct`, producing the same LLVM signature codegen built before
+///     the seam existed.  This proves the seam is wired correctly via
+///     `make selfhost-check` (stage-3 == stage-4 byte-identical) before
+///     any actual ABI logic lands.
+///   * Phase 1+: extend `classify_param` / `classify_return` with sret /
+///     byval / eightbyte rules.
+///
+/// Target scope: SysV x86-64 only.  AArch64 and Win64 plug in later
+/// behind the same `classify_signature` interface.
+
+namespace Compiler::Codegen::Abi;
+
+import Compiler::Codegen;
+import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::TypeMap;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+
+
+// ============================================================================
+// ArgClass / AbiAttr / ParamPlan / SignaturePlan
+// ============================================================================
+
+/// How a single Cryo parameter or return value is transmitted at the
+/// LLVM-IR boundary.
+type enum ArgClass {
+    /// Pass / return the value as-is in one register-sized LLVM slot.
+    /// `llvm_slots.length == 1`.
+    Direct;
+    /// Split into exactly two register-sized eightbytes (SysV x86-64
+    /// rule 3).  `llvm_slots.length == 2`.
+    DirectPair;
+    /// Passed via a hidden pointer.  For a parameter this lowers to a
+    /// single `ptr byval(%T)`; for a return value to a hidden first
+    /// `ptr sret(%T)` parameter and an LLVM-level `void` return.
+    /// `llvm_slots.length == 1` (the pointer).
+    Indirect;
+    /// Zero-sized value — produces no LLVM slot at all.
+    /// `llvm_slots.length == 0`.
+    Ignore;
+}
+
+/// Optional attribute that codegen must attach to the LLVM parameter
+/// slot (and the matching call-site argument).  Carried separately from
+/// `ArgClass` so the call site can inspect both axes cheaply.
+type enum AbiAttr {
+    None;
+    ByVal;     // attached to a parameter slot whose class is `Indirect`
+    SRet;      // attached to the hidden return-pointer parameter
+}
+
+type struct ParamPlan {
+    /// The Cryo source-language type this plan was derived from.  Kept
+    /// around so call sites can re-lower / inspect the value's
+    /// home-language form (e.g. for `coerce_return_value`'s widening).
+    cryo_type:  TypeRef;
+    /// How the value crosses the boundary.
+    cls:      ArgClass;
+    /// The LLVM types this parameter expands to (0, 1, or 2 slots).
+    llvm_slots: LType[];
+    /// Optional attribute to attach to the LLVM parameter slot.
+    attr:       AbiAttr;
+    /// For `Indirect` parameters / returns: the underlying pointee LLVM
+    /// type so codegen can emit `byval(%T)` / `sret(%T)` correctly.
+    /// `LType::null()` when not applicable.
+    pointee_ty: LType;
+}
+
+type struct SignaturePlan {
+    /// Classification of the return value.  `Indirect` means the LLVM
+    /// function takes a hidden first parameter (`ptr sret(%T)`) and
+    /// returns void.
+    return_plan:  ParamPlan;
+    /// One plan per source-language parameter (excluding the variadic
+    /// trailing `args...` bucket which lowers to LLVM's `...` marker
+    /// outside this seam).
+    param_plans:  ParamPlan[];
+    /// The fully-lowered LLVM function type.  Built by `build_llvm_fn_type`
+    /// from the slot list each plan contributes.
+    llvm_fn_type: LType;
+    /// True iff `return_plan.cls == Indirect`, in which case LLVM
+    /// param 0 is the result pointer.  Cached here so prologue / call /
+    /// return sites don't have to re-derive it.
+    sret_slot:    boolean;
+    /// Mirrors LLVMFunctionType's `is_variadic` flag for callers that
+    /// already have the `SignaturePlan` and don't want to thread the
+    /// original FunctionDeclNode through.
+    is_variadic:  boolean;
+}
+
+
+// ============================================================================
+// Public entry points
+// ============================================================================
+
+/// Classify a free-function / extern signature.  `params` is the
+/// source-language parameter list (excluding the variadic trailing
+/// bucket); `return_type` may be invalid for `void`/`unit` returns.
+function classify_signature(mut type_mapper: TypeMapper*,
+                            params: TypeRef[],
+                            return_type: TypeRef,
+                            is_variadic: boolean) -> SignaturePlan {
+    const return_plan: ParamPlan = classify_return(type_mapper, return_type);
+
+    mut param_plans: ParamPlan[] = [];
+    for (mut i: i64 = 0; i < params.length; i++) {
+        param_plans.push(classify_param(type_mapper, params[i]));
+    }
+
+    const sret: boolean = return_plan.cls == ArgClass::Indirect;
+    const llvm_fn_ty: LType = build_llvm_fn_type(
+        return_plan, param_plans, is_variadic);
+
+    return SignaturePlan {
+        return_plan:  return_plan,
+        param_plans:  param_plans,
+        llvm_fn_type: llvm_fn_ty,
+        sret_slot:    sret,
+        is_variadic:  is_variadic,
+    };
+}
+
+/// Classify a method signature.  The implicit receiver (a `&this` /
+/// `mut &this` pointer, or a by-value `this` struct copy in the rare
+/// case where the user wrote `this` by value) is always treated as
+/// `Direct`: it is either already a pointer or a value the caller has
+/// passed in a register the same way the underlying scalar would be.
+/// Future phases may revisit by-value `this` once eightbyte
+/// classification lands; for now structures-by-value go through the
+/// same Direct path as today.
+///
+/// `this_llvm_ty` is the LLVM type of the receiver slot — typically
+/// `T*` for the common `&this`/implicit form.  Passing it in directly
+/// keeps this function decoupled from the receiver-resolution logic in
+/// `declare_method`.
+function classify_method_signature(mut type_mapper: TypeMapper*,
+                                   this_llvm_ty: LType,
+                                   has_explicit_self: boolean,
+                                   params: TypeRef[],
+                                   return_type: TypeRef,
+                                   is_variadic: boolean) -> SignaturePlan {
+    // For methods we don't yet feed the receiver through the classifier;
+    // pre-pend a `Direct` plan for it so call sites see a uniform
+    // `param_plans` shape.  Once eightbyte classification arrives this
+    // is the seam where by-value `this` will be split correctly.
+    const return_plan: ParamPlan = classify_return(type_mapper, return_type);
+
+    mut param_plans: ParamPlan[] = [];
+    if (this_llvm_ty.is_valid()) {
+        mut slots: LType[] = [];
+        slots.push(this_llvm_ty);
+        param_plans.push(ParamPlan {
+            cryo_type:  TypeRef::invalid(),
+            cls:      ArgClass::Direct,
+            llvm_slots: slots,
+            attr:       AbiAttr::None,
+            pointee_ty: LType::null(),
+        });
+    }
+    for (mut i: i64 = 0; i < params.length; i++) {
+        param_plans.push(classify_param(type_mapper, params[i]));
+    }
+
+    const sret: boolean = return_plan.cls == ArgClass::Indirect;
+    const llvm_fn_ty: LType = build_llvm_fn_type(
+        return_plan, param_plans, is_variadic);
+
+    return SignaturePlan {
+        return_plan:  return_plan,
+        param_plans:  param_plans,
+        llvm_fn_type: llvm_fn_ty,
+        sret_slot:    sret,
+        is_variadic:  is_variadic,
+    };
+}
+
+
+// ============================================================================
+// Per-type classification (Phase 0: everything Direct)
+// ============================================================================
+
+/// Phase 0: every parameter is `Direct` with one slot whose LLVM type
+/// is `type_mapper.map_type(t)`.  Phase 2 will promote aggregates >16
+/// bytes to `Indirect` (byval ptr); Phase 3 splits ≤16-byte aggregates
+/// into eightbyte register pairs.
+function classify_param(mut type_mapper: TypeMapper*, t: TypeRef) -> ParamPlan {
+    mut slots: LType[] = [];
+    if (t.is_valid()) {
+        const lty: LType = type_mapper.map_type(t);
+        if (lty.is_valid()) {
+            slots.push(lty);
+        }
+    }
+    return ParamPlan {
+        cryo_type:  t,
+        cls:      ArgClass::Direct,
+        llvm_slots: slots,
+        attr:       AbiAttr::None,
+        pointee_ty: LType::null(),
+    };
+}
+
+/// Phase 1: returns large aggregates (>16 bytes, struct / class / ADT
+/// enum) flow through a hidden sret pointer; everything else is Direct.
+/// Void/unit/invalid → Ignore (LLVM void return, no slot consumed).
+///
+/// Tuples and Optional<T> are also aggregates at the LLVM level, but
+/// Cryo-internal code passes them by value today; classifying them as
+/// `Indirect` here without a matching update at every call site would
+/// break selfhost-check, so they continue as `Direct` for now.  When
+/// the call-site marshalling is sret-aware they can join.
+function classify_return(mut type_mapper: TypeMapper*, t: TypeRef) -> ParamPlan {
+    if (!t.is_valid()) {
+        mut slots: LType[] = [];
+        slots.push(LType::void_type());
+        return ParamPlan {
+            cryo_type:  t,
+            cls:      ArgClass::Ignore,
+            llvm_slots: slots,
+            attr:       AbiAttr::None,
+            pointee_ty: LType::null(),
+        };
+    }
+    const arena: TypeArena* = type_mapper.arena;
+    const ty: Type* = arena.lookup(t.id);
+    if (ty == null || ty.kind == TypeKind::Void || ty.kind == TypeKind::Unit) {
+        mut slots: LType[] = [];
+        slots.push(LType::void_type());
+        return ParamPlan {
+            cryo_type:  t,
+            cls:      ArgClass::Ignore,
+            llvm_slots: slots,
+            attr:       AbiAttr::None,
+            pointee_ty: LType::null(),
+        };
+    }
+
+    // Unwrap aliases / instantiations to the concrete kind so a
+    // `type alias Foo = LargeStruct` follows the same rule as
+    // returning `LargeStruct` directly.
+    mut concrete: Type* = ty;
+    if (concrete.kind == TypeKind::TypeAlias) {
+        const alias: TypeAliasType* = concrete as TypeAliasType*;
+        if (alias.has_target()) {
+            const tgt: Type* = arena.lookup(alias.target.id);
+            if (tgt != null) { concrete = tgt; }
+        }
+    }
+    if (concrete.kind == TypeKind::InstantiatedType) {
+        const inst: InstantiatedType* = concrete as InstantiatedType*;
+        if (inst.has_resolved_type()) {
+            const res: Type* = arena.lookup(inst.resolved_type.id);
+            if (res != null) { concrete = res; }
+        }
+    }
+
+    const is_aggregate: boolean = match (concrete.kind) {
+        TypeKind::Struct => { true }
+        TypeKind::Class  => { true }
+        TypeKind::Enum   => {
+            // Simple enums lower to i32 (size 4); ADT enums lower to a
+            // struct that may well exceed 16 bytes.  The size_bytes()
+            // gate below filters either way, so accept both here.
+            true
+        }
+        _ => { false }
+    };
+
+    if (is_aggregate && concrete.size_bytes() > 16) {
+        // sret: LLVM function returns void; LLVM param 0 is `ptr` with
+        // `sret(%T)`.  Record the underlying LLVM struct/class type in
+        // `pointee_ty` so `declare_function` can build the attribute
+        // payload.
+        const pointee: LType = type_mapper.map_type(t);
+        mut slots: LType[] = [];
+        slots.push(LType::pointer_to(LType::i8()));
+        return ParamPlan {
+            cryo_type:  t,
+            cls:      ArgClass::Indirect,
+            llvm_slots: slots,
+            attr:       AbiAttr::SRet,
+            pointee_ty: pointee,
+        };
+    }
+
+    const lty: LType = type_mapper.map_type(t);
+    mut slots: LType[] = [];
+    slots.push(lty);
+    return ParamPlan {
+        cryo_type:  t,
+        cls:      ArgClass::Direct,
+        llvm_slots: slots,
+        attr:       AbiAttr::None,
+        pointee_ty: LType::null(),
+    };
+}
+
+
+// ============================================================================
+// LLVM function type assembly
+// ============================================================================
+
+/// Concatenate every plan's `llvm_slots` (return prepended when
+/// `Indirect`, parameters in order) into the slot array LLVM's
+/// `LLVMFunctionType` consumes.  Returns the assembled function type.
+///
+/// The plans are passed by value here.  Cryo's move-checker emits a
+/// "use of moved value" warning when the caller re-uses these to stamp
+/// out a `SignaturePlan` after this call, but it is a *warning only*
+/// today (the same shape appears throughout `instance.cryo`); no actual
+/// double-drop happens because nothing in `ParamPlan` owns heap memory
+/// uniquely.  A future move-check tightening should reconsider this seam.
+function build_llvm_fn_type(return_plan:  ParamPlan,
+                            param_plans:  ParamPlan[],
+                            is_variadic:  boolean) -> LType {
+    // Step 1: pick the LLVM return type.  `Indirect` returns become
+    // `void` because the value is written through the hidden sret
+    // pointer; everything else uses the single Direct slot.  Ignore
+    // returns also use `void` (their slots[0] was preset to void).
+    mut ret_ty: LType = LType::void_type();
+    if (return_plan.cls != ArgClass::Indirect
+            && return_plan.llvm_slots.length > 0) {
+        ret_ty = return_plan.llvm_slots[0];
+    }
+
+    // Step 2: count parameter slots.  `Indirect` return contributes a
+    // hidden first ptr slot; each parameter contributes 0, 1, or 2.
+    mut total: u32 = 0;
+    if (return_plan.cls == ArgClass::Indirect) { total += 1; }
+    for (mut i: i64 = 0; i < param_plans.length; i++) {
+        total += param_plans[i].llvm_slots.length as u32;
+    }
+
+    if (total == 0) {
+        if (!ret_ty.is_valid()) { return LType::null(); }
+        return LType::function_type(ret_ty, null, 0, is_variadic);
+    }
+
+    const buf: void* = intrinsics::malloc(total as u64 * 8);
+    const slots: void** = buf as void**;
+    mut idx: u32 = 0;
+    mut all_valid: boolean = ret_ty.is_valid();
+
+    // The hidden sret slot is always `ptr` (pointer to the return type).
+    if (return_plan.cls == ArgClass::Indirect) {
+        slots[idx] = LType::pointer_to(LType::i8()).raw;
+        idx += 1;
+    }
+
+    for (mut pi: i64 = 0; pi < param_plans.length; pi++) {
+        const pp: ParamPlan = param_plans[pi];
+        for (mut si: i64 = 0; si < pp.llvm_slots.length; si++) {
+            const slot: LType = pp.llvm_slots[si];
+            if (!slot.is_valid()) { all_valid = false; }
+            slots[idx] = slot.raw;
+            idx += 1;
+        }
+    }
+
+    if (!all_valid) {
+        intrinsics::free(buf);
+        return LType::null();
+    }
+
+    const fn_ty: LType = LType::function_type(ret_ty, buf, total, is_variadic);
+    intrinsics::free(buf);
+    return fn_ty;
+}
+
+
+// ============================================================================
+// Convenience accessors
+// ============================================================================
+
+/// Number of LLVM parameter slots produced by a plan.  Equivalent to
+/// the loop in `build_llvm_fn_type` for the param-count axis but
+/// exposed so callers (prologue, call site) can walk `LLVMGetParam`
+/// indices without re-running the assembly.
+function llvm_param_count(plan: SignaturePlan*) -> u32 {
+    mut total: u32 = 0;
+    if (plan.sret_slot) { total += 1; }
+    for (mut i: i64 = 0; i < plan.param_plans.length; i++) {
+        total += plan.param_plans[i].llvm_slots.length as u32;
+    }
+    return total;
+}
+
+
+// ============================================================================
+// Attribute helpers (sret / byval)
+// ============================================================================
+//
+// `LLVMGetEnumAttributeKindForName` returns a stable-for-the-process
+// integer for each named attribute; we cache the IDs for "sret" and
+// "byval" so the lookup runs once.  These are *type* attributes (they
+// carry the pointee type), which matches modern LLVM semantics where
+// `sret(%T)` / `byval(%T)` are required since opaque pointers landed.
+
+mut g_sret_kind:  u32 = 0;
+mut g_byval_kind: u32 = 0;
+
+function sret_attr_kind() -> u32 {
+    if (g_sret_kind == 0) {
+        g_sret_kind = llvm::LLVMGetEnumAttributeKindForName("sret", 4);
+    }
+    return g_sret_kind;
+}
+
+function byval_attr_kind() -> u32 {
+    if (g_byval_kind == 0) {
+        g_byval_kind = llvm::LLVMGetEnumAttributeKindForName("byval", 5);
+    }
+    return g_byval_kind;
+}
+
+/// Apply an `sret(%T)` type attribute to LLVM parameter slot 0 of a
+/// function declaration.  LLVM's attribute-index convention is
+/// 1-based, so "param 0" is index 1.
+function apply_sret_attribute(fn_val: LValue, pointee_ty: LType) -> void {
+    if (!fn_val.is_valid() || !pointee_ty.is_valid()) { return; }
+    const ctx: LContext = LContext::global();
+    const kind: u32 = sret_attr_kind();
+    const attr: void* = llvm::LLVMCreateTypeAttribute(ctx.raw, kind, pointee_ty.raw);
+    llvm::LLVMAddAttributeAtIndex(fn_val.raw, 1, attr);
+}
+
+/// Apply an `sret(%T)` type attribute to a call instruction's hidden
+/// first argument.  Mirrors `apply_sret_attribute` but for the call
+/// site (the function-side attribute is independent of the call-site
+/// attribute in LLVM; both must be set for the optimiser and verifier
+/// to treat the hidden slot correctly).
+function apply_sret_call_attribute(call_val: LValue, pointee_ty: LType) -> void {
+    if (!call_val.is_valid() || !pointee_ty.is_valid()) { return; }
+    const ctx: LContext = LContext::global();
+    const kind: u32 = sret_attr_kind();
+    const attr: void* = llvm::LLVMCreateTypeAttribute(ctx.raw, kind, pointee_ty.raw);
+    llvm::LLVMAddCallSiteAttribute(call_val.raw, 1, attr);
+}
+
+/// Detect whether an LLVM function declaration was built with an
+/// `sret(%T)` attribute on its hidden first parameter.  Returns
+/// `LType::null()` when the function is not sret; otherwise returns
+/// the pointee type (`%T`) so call sites can allocate a matching
+/// result slot.
+///
+/// Used by `codegen_call` to decide whether to marshal a hidden
+/// first argument — this avoids needing a SignaturePlan cache because
+/// the attribute IS the persistent record of the classification.
+function sret_pointee_of(fn_val: LValue) -> LType {
+    if (!fn_val.is_valid()) { return LType::null(); }
+    // The attribute APIs only accept function-typed LLVMValueRefs.  At
+    // call sites the "callee" can be a function pointer loaded from a
+    // struct field (e.g. a virtual method through a vtable, or a
+    // function value bound to a local) — passing such a value to
+    // `LLVMGetEnumAttributeAtIndex` is undefined behaviour and crashes
+    // LLVM in practice.  `LLVMIsAFunction` does the isa cast for us
+    // and returns null for non-functions, gating the query safely.
+    const as_fn: void* = llvm::LLVMIsAFunction(fn_val.raw);
+    if (as_fn == null) { return LType::null(); }
+    const kind: u32 = sret_attr_kind();
+    const attr_raw: void* = llvm::LLVMGetEnumAttributeAtIndex(fn_val.raw, 1, kind);
+    if (attr_raw == null) { return LType::null(); }
+    const pointee_raw: void* = llvm::LLVMGetTypeAttributeValue(attr_raw);
+    if (pointee_raw == null) { return LType::null(); }
+    return LType { raw: pointee_raw };
+}
