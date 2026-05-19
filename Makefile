@@ -12,9 +12,10 @@
 #   uninstall        Remove the install.sh symlinks
 #   clean            Remove compiler + stdlib build outputs
 
-ROOT     := $(CURDIR)
-PIN      := $(ROOT)/bin/cryo
-STAGE2   := $(ROOT)/compiler/build/bin/cryo
+ROOT       := $(CURDIR)
+PIN        := $(ROOT)/bin/cryo
+STAGE2     := $(ROOT)/compiler/build/bin/cryo
+LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
 
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
@@ -69,6 +70,13 @@ cryo: stdlib
 $(STAGE2):
 	@$(MAKE) --no-print-directory cryo
 
+# File-target rule for the stdlib static library so `test` rebuilds it
+# when stdlib/.bin has been wiped (e.g. by selfhost-check) but the
+# compiler binary still exists. Without this, `make selfhost-check &&
+# make test` fails at link with "cannot find libcryo.a".
+$(LIBCRYO_A):
+	@$(MAKE) --no-print-directory stdlib
+
 # ---- pin refresh ------------------------------------------------------
 # After running 'make cryo', commit the new bin/cryo + bin/cryo.pin.txt
 # so a fresh clone can reproduce this state.
@@ -118,10 +126,10 @@ selfhost-check: $(PIN)
 # project layout and the framework surface (`![test]`, `![ignore]`,
 # `![should_panic]`).  Pass arguments through with `make test ARGS=...`
 # (e.g. `make test ARGS="--ignored some_filter"`).
-test: $(STAGE2)
+test: $(STAGE2) $(LIBCRYO_A)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
-test-list: $(STAGE2)
+test-list: $(STAGE2) $(LIBCRYO_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 
 # ---- system install via symlink ---------------------------------------
