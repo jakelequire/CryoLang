@@ -17,6 +17,14 @@ PIN        := $(ROOT)/bin/cryo
 STAGE2     := $(ROOT)/compiler/build/bin/cryo
 LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
 
+# C-side helpers for the ABI tests.  Compiled with the host cc to a
+# static archive that `tests/cryoconfig` links via -L./helpers
+# -labihelpers — see tests/helpers/abi_helpers.c for the contract.
+TEST_HELPERS_DIR := $(ROOT)/tests/helpers
+TEST_HELPERS_C   := $(TEST_HELPERS_DIR)/abi_helpers.c
+TEST_HELPERS_O   := $(TEST_HELPERS_DIR)/abi_helpers.o
+TEST_HELPERS_A   := $(TEST_HELPERS_DIR)/libabihelpers.a
+
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
 LSP_BUILD_DIR := $(ROOT)/tools/CryoLSP/build
@@ -126,10 +134,17 @@ selfhost-check: $(PIN)
 # project layout and the framework surface (`![test]`, `![ignore]`,
 # `![should_panic]`).  Pass arguments through with `make test ARGS=...`
 # (e.g. `make test ARGS="--ignored some_filter"`).
-test: $(STAGE2) $(LIBCRYO_A)
+# Build the C-side test helpers archive.  Uses cc + ar from the host
+# toolchain.  Only rebuilds when the .c source changes.
+$(TEST_HELPERS_A): $(TEST_HELPERS_C)
+	@echo "==> Building ABI test helpers archive"
+	@cc -O0 -fPIC -c -o $(TEST_HELPERS_O) $<
+	@ar rcs $@ $(TEST_HELPERS_O)
+
+test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
-test-list: $(STAGE2) $(LIBCRYO_A)
+test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 
 # ---- system install via symlink ---------------------------------------
@@ -145,3 +160,4 @@ clean:
 	@rm -rf compiler/build stdlib/.bin
 	@rm -rf tools/CryoLSP/build
 	@rm -f bin/cryolsp
+	@rm -f $(TEST_HELPERS_O) $(TEST_HELPERS_A)

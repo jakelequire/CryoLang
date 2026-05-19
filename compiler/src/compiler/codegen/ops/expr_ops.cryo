@@ -577,6 +577,23 @@ type struct ExprOps {
             llvm::LLVMGetParamTypes(callee_type.raw, param_types_buf);
         }
 
+        // §3.2 — DirectPair param expansion path.  When the callee's
+        // LLVM signature has more parameter slots than the source
+        // arg list provides, the surplus came from a 9–16 byte
+        // aggregate that was lowered to two register slots by
+        // `classify_param_extern_c`.  Re-route to the expansion-
+        // aware marshalling routine; the 1:1 path below stays the
+        // hot, unchanged shape for every other call site.  No
+        // current Cryo-internal code triggers this branch
+        // (classify_param does not promote ≤ 16 byte aggregates to
+        // DirectPair), so selfhost is unaffected.
+        if (param_types_buf != null && expected_count > n) {
+            const r: LValue = this.codegen_call_direct_dp_expand(
+                callee, callee_type, args, param_types_buf, expected_count, name);
+            intrinsics::free(param_types_buf);
+            return r;
+        }
+
         // Build argument array, coercing integer widths where needed.
         const buf: void* = intrinsics::malloc(n as u64 * 8);
         const slots: void** = buf as void**;
@@ -646,6 +663,26 @@ type struct ExprOps {
                     } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer) {
                         const target: LType = LType { raw: expected_ty };
                         arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(this.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
+                    } else if ((ek == LTypeKind::Integer
+                                || ek == LTypeKind::Float
+                                || ek == LTypeKind::Double)
+                               && ak == LTypeKind::Struct) {
+                        // §3.2 / §3.3 — `extern "C"` small-aggregate
+                        // param.  The callee's LLVM signature has a
+                        // register-sized scalar slot (integer for
+                        // INTEGER class, float/double for SSE class)
+                        // where the Cryo source type is a ≤ 8-byte
+                        // struct lowered via `classify_param_extern_c`.
+                        // Spill the struct value to a slot typed as
+                        // the scalar and reload it; the scalar's
+                        // storage size (≥ struct size for the ≤ 8-byte
+                        // case) covers the struct's bytes, so the
+                        // round-trip is safe.  This is the inverse of
+                        // the receiver-side load on the C side.
+                        const slot_lty: LType = LType { raw: expected_ty };
+                        const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.coerce");
+                        this.builder.build_store(arg_val, slot_p);
+                        arg_val = this.builder.build_load(slot_lty, slot_p, "arg.coerced");
                     }
                 } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
                     // Both integers: coerce widths if needed.  Picking
@@ -704,6 +741,163 @@ type struct ExprOps {
         }
 
         return out_value;
+    }
+
+
+    /// §3.2 — DirectPair param expansion variant of
+    /// `codegen_call_direct`.  Walks source args alongside expected
+    /// LLVM slots, materialising one source-struct arg into two LLVM
+    /// scalar args when the source is a 9–16 byte aggregate and the
+    /// next two expected slots are register-shaped (Integer / Float
+    /// / Double).  Reached only via the early dispatch in
+    /// `codegen_call_direct` (when `expected_count > n`); no
+    /// Cryo-internal call site hits this today.
+    codegen_call_direct_dp_expand(mut &this, callee: LValue, callee_type: LType,
+                                  args: Pair<LValue, TypeRef>[],
+                                  param_types_buf: void*, expected_count: u32,
+                                  name: string) -> LValue {
+        const n: u32 = args.length as u32;
+        const param_types: void** = param_types_buf as void**;
+        const buf: void* = intrinsics::malloc(expected_count as u64 * 8);
+        const slots: void** = buf as void**;
+
+        mut source_idx: u32 = 0;
+        mut llvm_slot_idx: u32 = 0;
+        while (source_idx < n && llvm_slot_idx < expected_count) {
+            mut arg_val: LValue = args[source_idx as i64].first;
+            const arg_ty_ref: TypeRef = args[source_idx as i64].second;
+            const expected_ty: void* = param_types[llvm_slot_idx];
+            const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
+            const ek: LTypeKind = type_kind_of(expected_ty);
+            const ak: LTypeKind = type_kind_of(actual_ty);
+
+            // Detect 9–16 byte struct → two-register expansion.  The
+            // source must be a struct value (LLVM-level), the next
+            // expected slot must be present, and the source's Cryo
+            // size must fall in the (8, 16] window.
+            mut do_dp: boolean = false;
+            if (ak == LTypeKind::Struct
+                    && llvm_slot_idx + 1 < expected_count
+                    && (ek == LTypeKind::Integer
+                        || ek == LTypeKind::Float
+                        || ek == LTypeKind::Double)
+                    && arg_ty_ref.is_valid()) {
+                const next_ty: void* = param_types[llvm_slot_idx + 1];
+                const nk: LTypeKind = type_kind_of(next_ty);
+                if (nk == LTypeKind::Integer
+                        || nk == LTypeKind::Float
+                        || nk == LTypeKind::Double) {
+                    const src_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
+                    if (src_t != null) {
+                        const sz: u64 = src_t.size_bytes();
+                        if (sz > 8 && sz <= 16) {
+                            do_dp = true;
+                        }
+                    }
+                }
+            }
+
+            if (do_dp) {
+                // Spill struct to a temp typed as the source struct;
+                // GEP at byte offsets 0 and 8 (via an i8 base type)
+                // for the two halves; load each at its slot's LLVM
+                // type.  Allocating with the source struct guarantees
+                // the temp is at least `sz` bytes; the loads of lo/hi
+                // never read past the alloca because lo's type fits
+                // in [0..8) and hi's type fits in [8..sz).
+                const struct_lty: LType = LType { raw: actual_ty };
+                const temp: LValue = this.builder.build_alloca(struct_lty, "arg.dp.tmp");
+                this.builder.build_store(arg_val, temp);
+
+                // Lo half: load directly from temp (offset 0).
+                const lo_lty: LType = LType { raw: expected_ty };
+                const lo_val: LValue = this.builder.build_load(lo_lty, temp, "arg.dp.lo");
+
+                // Hi half: GEP `i8, ptr %temp, i64 8` then load.
+                const i8_ty: LType = LType::i8();
+                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_arr: void** = idx_buf as void**;
+                const eight: LValue = LType::const_int(LType::i64(), 8, false);
+                idx_arr[0] = eight.raw;
+                const hi_ptr: LValue = this.builder.build_gep(
+                    i8_ty, temp, idx_buf, 1, "arg.dp.hi.ptr");
+                intrinsics::free(idx_buf);
+
+                const hi_lty: LType = LType { raw: param_types[llvm_slot_idx + 1] };
+                const hi_val: LValue = this.builder.build_load(hi_lty, hi_ptr, "arg.dp.hi");
+
+                slots[llvm_slot_idx] = lo_val.raw;
+                slots[llvm_slot_idx + 1] = hi_val.raw;
+                llvm_slot_idx += 2;
+                source_idx += 1;
+                continue;
+            }
+
+            // 1:1 mapping with the same coercion shapes as the main
+            // `codegen_call_direct` loop — kept inline so this path
+            // is fully self-contained.
+            if (arg_val.is_valid() && ek != ak) {
+                if (ek == LTypeKind::Pointer && ak == LTypeKind::Struct) {
+                    mut handled: boolean = false;
+                    const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
+                    if (opcode == 27) {
+                        const ptr_operand: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                        if (ptr_operand != null) {
+                            arg_val = LValue { raw: ptr_operand };
+                            handled = true;
+                        }
+                    }
+                    if (!handled) {
+                        const st: LType = LType { raw: actual_ty };
+                        const tmp: LValue = this.builder.build_alloca(st, "arg.ref");
+                        this.builder.build_store(arg_val, tmp);
+                        arg_val = tmp;
+                    }
+                } else if (ek == LTypeKind::Struct && ak == LTypeKind::Pointer) {
+                    const st: LType = LType { raw: expected_ty };
+                    arg_val = this.builder.build_load(st, arg_val, "arg.deref");
+                } else if ((ek == LTypeKind::Integer
+                            || ek == LTypeKind::Float
+                            || ek == LTypeKind::Double)
+                           && ak == LTypeKind::Struct) {
+                    const slot_lty: LType = LType { raw: expected_ty };
+                    const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.coerce");
+                    this.builder.build_store(arg_val, slot_p);
+                    arg_val = this.builder.build_load(slot_lty, slot_p, "arg.coerced");
+                }
+            } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
+                const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
+                const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
+                if (aw < ew) {
+                    const target: LType = LType { raw: expected_ty };
+                    mut src_signed: boolean = false;
+                    if (arg_ty_ref.is_valid()) {
+                        const at_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
+                        if (at_t != null && at_t.kind == TypeKind::Int) {
+                            const it: IntType* = at_t as IntType*;
+                            src_signed = it.int_kind.is_signed();
+                        }
+                    }
+                    if (src_signed) {
+                        arg_val = this.builder.build_sext(arg_val, target, "arg.widen");
+                    } else {
+                        arg_val = this.builder.build_zext(arg_val, target, "arg.widen");
+                    }
+                } else if (aw > ew) {
+                    const target: LType = LType { raw: expected_ty };
+                    arg_val = this.builder.build_trunc(arg_val, target, "arg.trunc");
+                }
+            }
+
+            slots[llvm_slot_idx] = arg_val.raw;
+            llvm_slot_idx += 1;
+            source_idx += 1;
+        }
+
+        const out: LValue = this.builder.build_call(
+            callee_type, callee, buf, expected_count, name);
+        intrinsics::free(buf);
+        return out;
     }
 
 

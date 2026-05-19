@@ -17,8 +17,49 @@ type struct DivT {
     rem:  i32;
 }
 
+// Mirror of libc `lldiv_t`: `{long long quot, long long rem}`.  16
+// bytes total — exercises the §3.1 DirectPair return path (two full
+// INTEGER eightbytes, lowered to LLVM `{i64, i64}`).
+type struct LLDivT {
+    quot: i64;
+    rem:  i64;
+}
+
+// 12-byte struct used to exercise the lo=i64 / hi=i32 DirectPair
+// return path against a C-side helper (libabihelpers).  Three i32s
+// total 12 bytes; SysV classifies as `{a:i32 + b:i32 -> i64 eightbyte,
+// c:i32 -> i32 eightbyte}`.
+type struct ThreeI32 {
+    a: i32;
+    b: i32;
+    c: i32;
+}
+
+// 8-byte struct used to exercise §3.2 small-aggregate extern-C param
+// passing.  Two i32s pack into a single INTEGER eightbyte (lowered to
+// LLVM `i64` on the wire).
+type struct TwoI32 {
+    a: i32;
+    b: i32;
+}
+
+// 16-byte all-double struct used to exercise the §3.3 SSE eightbyte
+// classification on returns.  SysV places both fields in XMM registers
+// (XMM0:XMM1) and the LLVM lowering should produce `{double, double}`,
+// not `{i64, i64}` — if the integer fallback fires, the call-site
+// register selection mismatches the callee's actual register use.
+type struct TwoDoubles {
+    a: f64;
+    b: f64;
+}
+
 extern "C" {
     function div(numerator: i32, denominator: i32) -> DivT;
+    function lldiv(numerator: i64, denominator: i64) -> LLDivT;
+    function abi_make_three_i32(a: i32, b: i32, c: i32) -> ThreeI32;
+    function abi_sum_two_i32(s: TwoI32) -> i32;
+    function abi_sum_three_i32(s: ThreeI32) -> i32;
+    function abi_make_two_doubles(a: f64, b: f64) -> TwoDoubles;
 }
 
 // 17 / 5 = quot=3 rem=2.  If the ABI for this 8-byte by-value
@@ -47,6 +88,133 @@ function libc_div_negative_dividend() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     match (expect_eq(r.rem, -1 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// §3.1 DirectPair return: lldiv_t is a 16-byte struct that SysV
+// classifies as two INTEGER eightbytes — returned in `%rax:%rdx`.
+// The Cryo extern declaration should lower to `{i64, i64} @lldiv(...)`
+// and the call site should coerce back to LLDivT via store-then-load.
+// If the DirectPair path is wrong, one or both fields read garbage.
+//
+// Kept inputs within i32 range to dodge an orthogonal i64-literal
+// lowering bug (large integer literals truncate to i32 on the way to
+// the call site).  The DirectPair mechanism itself is exercised by
+// the i64 return-struct fields regardless of how big the args are;
+// the negative test below covers the high-bits / sign-bit path.
+![test]
+function libc_lldiv_struct_return_directpair() -> Result<(), TestError> {
+    const r: LLDivT = lldiv(2000000000 as i64, 7 as i64);
+    // 2_000_000_000 / 7 = 285_714_285 rem 5.
+    match (expect_eq(r.quot, 285714285 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(r.rem, 5 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// §3.2 small-aggregate extern-C param: an 8-byte struct passed by
+// value lowers to a single LLVM `i64` argument.  The Cryo call site
+// spills the struct to a stack slot typed as the int, then loads it
+// back as the int; the C callee reads `s.a` and `s.b` out of the
+// register half-words.  Cross-checks that both halves arrive intact.
+![test]
+function helper_sum_two_i32_small_aggregate_param() -> Result<(), TestError> {
+    const s: TwoI32 = TwoI32 { a: 12 as i32, b: 30 as i32 };
+    const r: i32 = abi_sum_two_i32(s);
+    return expect_eq(r, 42 as i32);
+}
+
+![test]
+function helper_sum_two_i32_negative_halves() -> Result<(), TestError> {
+    // Negative halves catch sign-bit corruption in the i32 → i64 packing.
+    const s: TwoI32 = TwoI32 { a: -100 as i32, b: 25 as i32 };
+    const r: i32 = abi_sum_two_i32(s);
+    return expect_eq(r, -75 as i32);
+}
+
+// §3.2 DirectPair param expansion: a 12-byte struct passed by value
+// lowers to two LLVM scalar args (`i64`, `i32`) under SysV.  The Cryo
+// call site spills the struct to a stack temp and GEPs+loads each
+// eightbyte; the C callee reads `s.a + s.b` out of the first
+// register and `s.c` out of the second.  Exercises the
+// `codegen_call_direct_dp_expand` path.
+![test]
+function helper_sum_three_i32_directpair_param() -> Result<(), TestError> {
+    const s: ThreeI32 = ThreeI32 { a: 10 as i32, b: 20 as i32, c: 30 as i32 };
+    const r: i32 = abi_sum_three_i32(s);
+    return expect_eq(r, 60 as i32);
+}
+
+![test]
+function helper_sum_three_i32_directpair_negative() -> Result<(), TestError> {
+    // Negative values in both eightbytes — catches sign-extension
+    // mistakes when the lo half (i32+i32 packed into i64) is read.
+    const s: ThreeI32 = ThreeI32 { a: -5 as i32, b: 3 as i32, c: -100 as i32 };
+    const r: i32 = abi_sum_three_i32(s);
+    return expect_eq(r, -102 as i32);
+}
+
+// §3.3 SSE eightbyte return: a 16-byte `{double, double}` struct
+// rides %xmm0:%xmm1, NOT %rax:%rdx.  The Cryo extern declaration
+// must lower the return to LLVM `{double, double}` for the call-
+// site register selection to agree with what the C side actually
+// writes.  If the integer fallback fires (incorrectly producing
+// `{i64, i64}`), LLVM expects the result in %rax:%rdx and reads
+// garbage — caught here by comparing both fields.
+![test]
+function helper_make_two_doubles_sse() -> Result<(), TestError> {
+    const r: TwoDoubles = abi_make_two_doubles(3.5 as f64, -7.25 as f64);
+    match (expect_close_f64(r.a, 3.5 as f64, 0.0001 as f64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_close_f64(r.b, -7.25 as f64, 0.0001 as f64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// §3.1 DirectPair with mismatched eightbyte sizes: a 12-byte struct
+// returns as `{i64, i32}` under SysV.  Verifies the `hi_size = sz - 8`
+// path in the classifier and the store-then-load coercion at the call
+// site reads back the trailing 4-byte field intact.
+![test]
+function helper_make_three_i32_directpair() -> Result<(), TestError> {
+    const r: ThreeI32 = abi_make_three_i32(101 as i32, 202 as i32, 303 as i32);
+    match (expect_eq(r.a, 101 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(r.b, 202 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(r.c, 303 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function libc_lldiv_negative_dividend() -> Result<(), TestError> {
+    // Negative numerator + truncate-toward-zero semantics: cross-checks
+    // the sign-bit of each eightbyte half on the wider register pair.
+    const r: LLDivT = lldiv(-100 as i64, 3 as i64);
+    match (expect_eq(r.quot, -33 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(r.rem, -1 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }

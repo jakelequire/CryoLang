@@ -1018,30 +1018,54 @@ type struct CallEmitter {
         result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
 
         // Phase 3 — small-aggregate return coercion.  When an extern
-        // "C" function was declared with a register-shaped integer
-        // return (`classify_return_extern_c` for ≤ 8 byte aggregates),
-        // the call instruction yields an integer but the source-level
-        // type is a struct.  Bridge the gap by spilling the integer
-        // through a stack temp and re-loading it at the struct type;
-        // this is the inverse of the coercion the callee will do on
-        // its return.  We detect the situation by the mismatch between
-        // the call-result LLVM type (Integer) and the expected source
-        // type (Struct / Class / Enum aggregate).  Phase 1 sret is
-        // already handled inside `codegen_call` (returns a struct
-        // value loaded from the sret slot), so this branch doesn't
-        // conflict with that path.
+        // "C" function was declared with a register-shaped return
+        // (`classify_return_extern_c` for ≤ 8 byte aggregates via
+        // `Direct`-with-coercion, or 9–16 byte aggregates via
+        // `DirectPair` wrapped in an anonymous `{lo, hi}` struct), the
+        // call instruction yields a different LLVM type than the
+        // source struct.  Bridge the gap by spilling the value through
+        // a stack temp and re-loading it at the source struct type;
+        // both layouts agree byte-for-byte by construction, so the
+        // store-then-load round-trips correctly (this is the inverse
+        // of the coercion the callee will do on its return).
+        //
+        // Detect the situation by an LLVM-type mismatch between the
+        // call-result type and the expected source type.  Allowed got
+        // kinds: Integer (≤ 8 byte case) or Struct (DirectPair case).
+        // Phase 1 sret is already handled inside `codegen_call`
+        // (returns a struct value loaded from the sret slot whose type
+        // matches the expected struct), so the equal-types short-
+        // circuit below skips this path there.
         if (result.is_valid() && node.resolved_type.is_valid()) {
             const got_raw: void* = llvm::LLVMTypeOf(result.raw);
             const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-            if (expected_lty.is_valid()
-                    && type_kind_of(got_raw) == LTypeKind::Integer
-                    && type_kind_of(expected_lty.raw) == LTypeKind::Struct) {
+            const got_kind: LTypeKind = type_kind_of(got_raw);
+            const needs_coerce: boolean = expected_lty.is_valid()
+                && got_raw != expected_lty.raw
+                && (got_kind == LTypeKind::Integer
+                    || got_kind == LTypeKind::Struct
+                    || got_kind == LTypeKind::Float
+                    || got_kind == LTypeKind::Double)
+                && type_kind_of(expected_lty.raw) == LTypeKind::Struct;
+            if (needs_coerce) {
                 const cur_bb_c: LBasicBlock = this.cg.builder.get_insert_block();
                 if (cur_bb_c.is_valid()) {
                     const fn_c: LValue = cur_bb_c.get_parent();
                     if (fn_c.is_valid()) {
+                        // Alloca with the LARGER of the two sizes so
+                        // the store of the (possibly padded) DirectPair
+                        // never writes past the slot.  Both shapes
+                        // describe the same source-level value so
+                        // their storage sizes agree in practice, but
+                        // padding rules differ between a named struct
+                        // with field alignment and an anonymous
+                        // `{i64, i32}` whose tail packs the leftover
+                        // bytes only — alloca'ing as the call-result
+                        // type and reloading as the source type
+                        // covers both directions safely.
+                        const got_lty: LType = LType { raw: got_raw };
                         const slot_c: LValue = this.cg.flow.create_entry_alloca(
-                            fn_c, "ret.coerce", expected_lty);
+                            fn_c, "ret.coerce", got_lty);
                         this.cg.builder.build_store(result, slot_c);
                         result = this.cg.builder.build_load(
                             expected_lty, slot_c, "ret.coerced");
