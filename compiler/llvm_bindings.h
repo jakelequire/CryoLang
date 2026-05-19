@@ -155,6 +155,18 @@ LLVMTypeRef LLVMGetElementType(LLVMTypeRef Ty);
 
 
 /* ===================================================================
+ * Types — Vector
+ * ===================================================================
+ *
+ * SysV x86-64 packs two `float` fields that share an eightbyte into a
+ * single `<2 x float>` SSE register slot.  The classifier emits this
+ * type for multi-float SSE buckets via `LType::vector_of(f32, 2)`.
+ */
+
+LLVMTypeRef LLVMVectorType(LLVMTypeRef ElementType, unsigned ElementCount);
+
+
+/* ===================================================================
  * Values — General
  * =================================================================== */
 

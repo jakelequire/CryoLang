@@ -1017,35 +1017,37 @@ type struct CallEmitter {
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
 
-        // Phase 3 — small-aggregate return coercion.  When an extern
-        // "C" function was declared with a register-shaped return
-        // (`classify_return_extern_c` for ≤ 8 byte aggregates via
-        // `Direct`-with-coercion, or 9–16 byte aggregates via
-        // `DirectPair` wrapped in an anonymous `{lo, hi}` struct), the
-        // call instruction yields a different LLVM type than the
-        // source struct.  Bridge the gap by spilling the value through
-        // a stack temp and re-loading it at the source struct type;
-        // both layouts agree byte-for-byte by construction, so the
-        // store-then-load round-trips correctly (this is the inverse
-        // of the coercion the callee will do on its return).
-        //
-        // Detect the situation by an LLVM-type mismatch between the
-        // call-result type and the expected source type.  Allowed got
-        // kinds: Integer (≤ 8 byte case) or Struct (DirectPair case).
-        // Phase 1 sret is already handled inside `codegen_call`
-        // (returns a struct value loaded from the sret slot whose type
-        // matches the expected struct), so the equal-types short-
-        // circuit below skips this path there.
+        // Phase 3 — small-aggregate return coercion.  When the callee
+        // was declared with a register-shaped return (Direct-with-
+        // coercion for ≤ 8 byte aggregates, or DirectPair wrapped in
+        // an anonymous `{lo, hi}` literal struct for 9–16 byte
+        // aggregates), the call instruction yields a different LLVM
+        // type than the source struct.  Bridge the gap by spilling the
+        // value through a stack temp and re-loading it at the source
+        // struct type; both layouts agree byte-for-byte by
+        // construction, so the store-then-load round-trips correctly
+        // (this is the inverse of the coercion the callee will do on
+        // its return).  Phase 1 sret is already handled inside
+        // `codegen_call` (returns a struct value loaded from the sret
+        // slot whose type matches the expected struct), so the
+        // equal-types short-circuit below skips this path there.
         if (result.is_valid() && node.resolved_type.is_valid()) {
             const got_raw: void* = llvm::LLVMTypeOf(result.raw);
             const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
             const got_kind: LTypeKind = type_kind_of(got_raw);
+            // Detect a coercion-needed mismatch.  The call result type
+            // differs from the source-level expected type for any
+            // §3.1 / §3.2 / §3.3 / §3.5 Direct-with-coercion or
+            // DirectPair return; reshape via spill-then-reload at the
+            // expected type.  Same-handle (no classification mismatch)
+            // returns skip the coerce.
             const needs_coerce: boolean = expected_lty.is_valid()
                 && got_raw != expected_lty.raw
                 && (got_kind == LTypeKind::Integer
                     || got_kind == LTypeKind::Struct
                     || got_kind == LTypeKind::Float
-                    || got_kind == LTypeKind::Double)
+                    || got_kind == LTypeKind::Double
+                    || got_kind == LTypeKind::Vector)
                 && type_kind_of(expected_lty.raw) == LTypeKind::Struct;
             if (needs_coerce) {
                 const cur_bb_c: LBasicBlock = this.cg.builder.get_insert_block();
