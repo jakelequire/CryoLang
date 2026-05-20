@@ -888,25 +888,26 @@ type struct Executor {
         if (args.has_flag("quiet"))   { cmd = format("%s --quiet",   cmd); }
         if (args.has_flag("q"))       { cmd = format("%s -q",        cmd); }
 
-        // Export the compiler path + stdlib root so the test runtime's
-        // compile-fail helpers (`std::test::compile`) can invoke this very
-        // compiler on snippets.  CRYO = this binary (via /proc/self/exe);
-        // CRYO_STDLIB = the stdlib root this build resolved, made absolute
-        // so it resolves from the helper's temp working directory.
+        // Resolve this compiler's own path (via /proc/self/exe) and the
+        // absolute stdlib root this build used. Both are needed to drive the
+        // compile-fail cases under tests/negative/ — `cmd_test` runs this
+        // very compiler on each of those files.
+        mut self_exe: string = "";
         mut exe_buf: i8* = malloc(4096) as i8*;
         const exe_len: i64 = readlink("/proc/self/exe", exe_buf, 4096);
         if (exe_len > 0 && exe_len < 4096) {
             exe_buf[exe_len as u64] = 0;
-            setenv("CRYO", exe_buf as string, 1);
+            self_exe = format("%s", exe_buf as string);
         }
         free(exe_buf as void*);
+        mut stdlib_abs: string = "";
         if (strlen(result.stdlib_root) > 0) {
             mut std_abs: i8* = malloc(4096) as i8*;
             const resolved: i8* = realpath(result.stdlib_root, std_abs);
             if (resolved != null) {
-                setenv("CRYO_STDLIB", std_abs as string, 1);
+                stdlib_abs = format("%s", std_abs as string);
             } else {
-                setenv("CRYO_STDLIB", result.stdlib_root, 1);
+                stdlib_abs = result.stdlib_root;
             }
             free(std_abs as void*);
         }
@@ -921,7 +922,161 @@ type struct Executor {
             fprintf(g_stderr, "Error: failed to spawn '%s'\n", result.output_path);
             return 1;
         }
-        return ((status >> 8) & 0xff) as int;
+        mut exit_code: int = ((status >> 8) & 0xff) as int;
+
+        // Compile-fail suite: run each tests/negative/*.cryo file through
+        // `cryo check` and assert it fails with its declared error code.
+        // Skipped under --list (which only enumerates the runtime tests).
+        if (!args.has_flag("list")) {
+            const proj_root: string = Executor::dir_of(config_path);
+            const neg_dir: string = format("%s/tests/negative", proj_root);
+            mut pattern: string = "";
+            if (args.positional_count() > 0) { pattern = args.input_file(); }
+            const neg_failures: i32 =
+                Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir, pattern);
+            if (neg_failures > 0 && exit_code == 0) {
+                exit_code = 1;
+            }
+        }
+        return exit_code;
+    }
+
+    /// Directory portion of `path` (everything before the last `/`), or
+    /// "." when there is no slash. Used to locate tests/negative relative
+    /// to the resolved cryoconfig.
+    static dir_of(path: string) -> string {
+        const n: u64 = strlen(path);
+        if (n == 0) { return "."; }
+        mut i: i64 = (n - 1) as i64;
+        while (i >= 0) {
+            const c: i8 = *(ptr_add(path as void*, i as u64) as i8*);
+            if (c == 47) {                       // '/'
+                if (i == 0) { return "/"; }
+                const buf: i8* = malloc((i as u64) + 1) as i8*;
+                mut k: u64 = 0;
+                while (k < i as u64) {
+                    buf[k] = *(ptr_add(path as void*, k) as i8*);
+                    k = k + 1;
+                }
+                buf[i as u64] = 0;
+                return buf as string;
+            }
+            i = i - 1;
+        }
+        return ".";
+    }
+
+    /// Read a file's full contents, or "" if it can't be opened.
+    static read_file_or_empty(path: string) -> string {
+        if (!File::exists(path)) { return ""; }
+        mut f: File = File::new(path);
+        match (f.load()) {
+            Result::Ok(_)  => { return f.content(); }
+            Result::Err(_) => { return ""; }
+        }
+    }
+
+    /// Pull the expected error code out of a `![config(negative, <code>)]`
+    /// directive in `content`. Returns "" if absent.
+    static neg_code_from(content: string) -> string {
+        const marker: i8* = strstr(content, "config(negative");
+        if (marker == null) { return ""; }
+        mut p: i8* = ptr_add(marker as void*,
+            strlen("config(negative") as u64) as i8*;
+        // Skip the separator: comma and any spaces.
+        loop {
+            const c: i8 = *p;
+            if (c == 44 || c == 32) {            // ',' or ' '
+                p = ptr_add(p as void*, 1) as i8*;
+            } else {
+                break;
+            }
+        }
+        // Capture the code token up to ')' / ',' / ' ' / ']' / NUL.
+        mut buf: i8[24];
+        mut i: u64 = 0;
+        loop {
+            const c: i8 = *p;
+            if (c == 41 || c == 44 || c == 32 || c == 93 || c == 0) { break; }
+            if (i >= 23) { break; }
+            buf[i] = c;
+            i = i + 1;
+            p = ptr_add(p as void*, 1) as i8*;
+        }
+        buf[i] = 0;
+        return format("%s", &buf[0] as string);
+    }
+
+    /// Run every compile-fail case under `neg_dir`. Each file is compiled
+    /// on its own with `cryo check`; it must fail AND emit the code named by
+    /// its `![config(negative, <code>)]` directive. A case that compiles
+    /// cleanly, or emits a different code, is a real failure. `pattern`,
+    /// when non-empty, filters by filename substring (mirrors the runtime
+    /// runner's positional filter). Returns the number that misbehaved.
+    static run_negative_suite(self_exe: string, stdlib_abs: string,
+                              neg_dir: string, pattern: string) -> i32 {
+        const dp: void* = opendir(neg_dir);
+        if (dp == null) { return 0; }            // no tests/negative → nothing to do
+
+        const tmp: string = format("/tmp/cryo_negtest_%d.out", getpid());
+        mut failures: i32 = 0;
+        mut ran: i32 = 0;
+        mut entry: void* = readdir(dp);
+        while (entry != null) {
+            const name: string = dirent_name(entry);
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                entry = readdir(dp); continue;
+            }
+            if (dirent_type(entry) != 0) { entry = readdir(dp); continue; }
+            const nlen: u64 = strlen(name);
+            if (nlen <= 5) { entry = readdir(dp); continue; }
+            const ext: string = ptr_add(name as void*, (nlen - 5) as u64) as string;
+            if (strcmp(ext, ".cryo") != 0) { entry = readdir(dp); continue; }
+            if (strlen(pattern) > 0 && strstr(name, pattern) == null) {
+                entry = readdir(dp); continue;
+            }
+
+            const full: string = format("%s/%s", neg_dir, name);
+            const content: string = Executor::read_file_or_empty(full);
+            const expected: string = Executor::neg_code_from(content);
+            printf("test (negative) %s ... ", name);
+            if (strlen(expected) == 0) {
+                printf("FAILED (no ![config(negative, <code>)] directive)\n");
+                failures += 1; ran += 1; entry = readdir(dp); continue;
+            }
+
+            mut runcmd: string;
+            if (strlen(stdlib_abs) > 0) {
+                runcmd = format("%s check %s --stdlib=%s > %s 2>&1",
+                    self_exe, full, stdlib_abs, tmp);
+            } else {
+                runcmd = format("%s check %s > %s 2>&1", self_exe, full, tmp);
+            }
+            fflush(null);
+            system(runcmd);
+            const out: string = Executor::read_file_or_empty(tmp);
+            const want: string = format("error[%s]", expected);
+            if (strstr(out, want) != null) {
+                printf("ok\n");
+            } else {
+                printf("FAILED (expected %s)\n", expected);
+                failures += 1;
+            }
+            ran += 1;
+            entry = readdir(dp);
+        }
+        closedir(dp);
+        unlink(tmp);
+
+        if (ran > 0) {
+            if (failures == 0) {
+                printf("\ncompile-fail result: ok. %d passed\n", ran);
+            } else {
+                printf("\ncompile-fail result: FAILED. %d passed; %d failed\n",
+                    ran - failures, failures);
+            }
+        }
+        return failures;
     }
 
     /// `cryo check <file>`: frontend + semantic analysis, no codegen.

@@ -18,9 +18,6 @@
 ///                                 unless `--ignored` is passed
 ///   ![should_panic]           : function (`![test]`-marked): test passes
 ///                                 only if it panics or returns Err
-///   ![xfail]                  : function (`![test]`-marked): test is
-///                                 expected to fail; failing → `xfail`
-///                                 (pass), passing → `XPASS` (failure)
 ///   ![config(testing)]        : namespace: marks the file as a testing
 ///                                 module; only built under `cryo test`
 ///   ![deprecated]             : any decl: deprecation marker
@@ -154,7 +151,7 @@ public:
 function is_known_builtin(name: string) -> boolean {
     return match (name) {
         "inline" | "noinline" | "entry" | "test" | "ignore"
-        | "should_panic" | "xfail" | "config" | "deprecated" | "align"
+        | "should_panic" | "config" | "deprecated" | "align"
         | "repr" | "link" | "target" | "allow" | "warn" | "deny"
         | "derive"
         // `![sink]`: marks a method as consuming its receiver.
@@ -262,7 +259,7 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
         // test-mode validator — directive_processing only checks each
         // directive's own shape and target.
         "inline" | "noinline" | "entry" | "test"
-        | "ignore" | "should_panic" | "xfail" => {
+        | "ignore" | "should_panic" => {
             if (argc != 0) {
                 emit_arity_error(ctx, dir, name, 0, argc);
             }
@@ -289,7 +286,7 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
         // gates the file in/out under `cryo test`.  Future flavors (e.g. a
         // `bench` flavor for benchmarks) plug in here.
         "config" => {
-            if (argc != 1) {
+            if (argc < 1) {
                 emit_arity_error(ctx, dir, name, 1, argc);
                 return;
             }
@@ -298,8 +295,12 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
             // Nested call shape: `config(not(<atom>))` etc.  Only `not(...)`
             // is recognised today; vocabulary expansion (any/all) plugs in
             // here.  Placement is unrestricted; platform gates can attach
-            // to any decl.
+            // to any decl.  Single-arg form.
             if (a.kind == DirectiveArgKind::Nested) {
+                if (argc != 1) {
+                    emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
                 if (a.nested == null
                         || strcmp(a.nested.directive_kind, "not") != 0) {
                     const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
@@ -317,15 +318,41 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
                 return;
             }
 
+            // Compile-fail flavor: `config(negative, <CODE>)` marks a whole
+            // file as a compile-fail test.  `cryo test` skips these files in
+            // the shared test build and instead compiles each on its own,
+            // asserting it fails with `<CODE>`.  Must sit on a namespace,
+            // like `config(testing)`.
+            if (strcmp(a.name, "negative") == 0) {
+                if (argc != 2) {
+                    const code: ErrorCode = ErrorCode::E0150_DIRECTIVE_BAD_ARITY;
+                    const msg: string =
+                        "directive `![config(negative, <code>)]` takes exactly one expected error code";
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                    return;
+                }
+                if (target != DirectiveTarget::Module) {
+                    emit_placement_error(ctx, dir, name, "namespace", target);
+                }
+                return;
+            }
+
+            // Every remaining flavor is single-arg.
+            if (argc != 1) {
+                emit_arity_error(ctx, dir, name, 1, argc);
+                return;
+            }
+
             // OS-atom flavor: `config(windows)` etc.  No placement
             // restriction; these gate any declaration.
             if (is_cfg_os_atom(a.name)) {
                 return;
             }
 
-            // Build-mode flavor: today only `testing` is recognised, and it
-            // must live on a namespace.  Misspelled flavors fall through to
-            // the catch-all error.
+            // Build-mode flavor: `testing`, which must live on a namespace.
+            // Misspelled flavors fall through to the catch-all error.
             if (strcmp(a.name, "testing") == 0) {
                 if (target != DirectiveTarget::Module) {
                     emit_placement_error(ctx, dir, name, "namespace", target);
@@ -335,7 +362,7 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
 
             const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
             const msg: string = format(
-                "directive `![config]`: unknown flavor `%s` (expected `testing`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
+                "directive `![config]`: unknown flavor `%s` (expected `testing`, `negative`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
                 a.name);
             mut diag: Diagnostic = Diagnostic::error(code, msg);
             diag = diag.at(dir.span);
@@ -574,7 +601,7 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
             // `is_known_builtin` above.
             mut cands: string[] = [
                 "inline", "noinline", "entry", "test", "ignore",
-                "should_panic", "xfail", "config", "deprecated", "align",
+                "should_panic", "config", "deprecated", "align",
                 "repr", "link", "target", "allow", "warn", "deny",
                 "derive", "sink",
                 "windows", "linux", "macos", "unix", "not"
@@ -971,8 +998,7 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
             if (t == DirectiveTarget::Function
                     && (strcmp(d.directive_kind, "test")         == 0
                      || strcmp(d.directive_kind, "ignore")       == 0
-                     || strcmp(d.directive_kind, "should_panic") == 0
-                     || strcmp(d.directive_kind, "xfail")        == 0)) {
+                     || strcmp(d.directive_kind, "should_panic") == 0)) {
                 if (!has_test_directive) {
                     first_test_dir_span = d.span;
                     first_test_dir_name = d.directive_kind;
