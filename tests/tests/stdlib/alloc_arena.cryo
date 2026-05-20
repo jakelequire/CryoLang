@@ -1,0 +1,174 @@
+///! Arena — bump allocator: allocate / alignment / used+capacity / reset.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::AllocArena;
+
+import std::core::result;
+import std::core::ptr;
+import std::alloc::layout;
+import std::alloc::allocator;
+import std::alloc::arena;
+import std::test::error;
+import std::test::assert;
+
+// True when `addr` is a multiple of `align` (a power of two).
+function is_aligned(addr: u64, align: u64) -> boolean {
+    return (addr & (align - 1)) == 0;
+}
+
+![test]
+function new_arena_is_empty() -> Result<(), TestError> {
+    mut a: Arena = Arena::new();
+    const cap: u64 = a.capacity();
+    const used: u64 = a.used();
+    a.drop();
+    match (expect_eq(cap, 0)) {
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(used, 0);
+}
+
+![test]
+function allocate_returns_usable_memory() -> Result<(), TestError> {
+    mut a: Arena = Arena::new();
+    mut wrote_back: i32 = 0;
+    match (a.allocate(Layout::new(4, 4))) {
+        Result::Ok(nn) => {
+            const ip: i32* = nn.as_ptr() as i32*;
+            *ip = 1234567;
+            wrote_back = *ip;
+        }
+        Result::Err(_) => { a.drop(); return bail(Str::new("allocate(4,4) failed")); }
+    }
+    a.drop();
+    return expect_eq(wrote_back, 1234567);
+}
+
+![test]
+function allocate_distinct_pointers() -> Result<(), TestError> {
+    mut a: Arena = Arena::new();
+    mut p0: u64 = 0;
+    mut p1: u64 = 0;
+    match (a.allocate(Layout::new(8, 8))) {
+        Result::Ok(nn) => { p0 = nn.as_ptr() as u64; }
+        Result::Err(_) => { a.drop(); return bail(Str::new("first allocate failed")); }
+    }
+    match (a.allocate(Layout::new(8, 8))) {
+        Result::Ok(nn) => { p1 = nn.as_ptr() as u64; }
+        Result::Err(_) => { a.drop(); return bail(Str::new("second allocate failed")); }
+    }
+    a.drop();
+    return expect_ne(p0, p1);
+}
+
+![test]
+function allocate_respects_alignment() -> Result<(), TestError> {
+    mut a: Arena = Arena::new();
+    // Misalign the bump offset with a single odd byte first...
+    match (a.allocate(Layout::new(1, 1))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("priming alloc failed")); }
+    }
+    // ...then demand 8-byte alignment and confirm the pointer honors it.
+    mut aligned: boolean = false;
+    match (a.allocate(Layout::new(8, 8))) {
+        Result::Ok(nn) => { aligned = is_aligned(nn.as_ptr() as u64, 8); }
+        Result::Err(_) => { a.drop(); return bail(Str::new("aligned alloc failed")); }
+    }
+    a.drop();
+    return expect(aligned, Str::new("8-byte request must return an 8-aligned pointer"));
+}
+
+![test]
+function zero_sized_allocation_errors() -> Result<(), TestError> {
+    mut a: Arena = Arena::new();
+    const r: Result<NonNull<u8>, AllocError> = a.allocate(Layout::new(0, 1));
+    a.drop();
+    return expect_err(&r, Str::new("zero-sized request must be rejected"));
+}
+
+![test]
+function used_and_capacity_track_allocations() -> Result<(), TestError> {
+    mut a: Arena = Arena::with_chunk_size(1024);
+    match (a.allocate(Layout::new(8, 8))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("allocate failed")); }
+    }
+    const used: u64 = a.used();
+    const cap: u64 = a.capacity();
+    a.drop();
+    match (expect_eq(used, 8)) {     // exactly the bytes handed out
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cap, 1024);     // one full chunk's worth of capacity
+}
+
+![test]
+function large_request_gets_own_chunk() -> Result<(), TestError> {
+    // A request larger than the chunk size is given a chunk sized to fit
+    // rather than rejected.
+    mut a: Arena = Arena::with_chunk_size(64);
+    match (a.allocate(Layout::new(100, 1))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("oversized allocate failed")); }
+    }
+    const cap: u64 = a.capacity();
+    a.drop();
+    return expect(cap >= 100, Str::new("oversized request needs a chunk >= 100 bytes"));
+}
+
+![test]
+function overflow_allocates_additional_chunk() -> Result<(), TestError> {
+    // chunk_size 16 holds two 8-byte slots; a third forces a new chunk.
+    mut a: Arena = Arena::with_chunk_size(16);
+    mut ok: boolean = true;
+    match (a.allocate(Layout::new(8, 8))) { Result::Ok(_) => { } Result::Err(_) => { ok = false; } }
+    match (a.allocate(Layout::new(8, 8))) { Result::Ok(_) => { } Result::Err(_) => { ok = false; } }
+    match (a.allocate(Layout::new(8, 8))) { Result::Ok(_) => { } Result::Err(_) => { ok = false; } }
+    const cap: u64 = a.capacity();
+    const used: u64 = a.used();
+    a.drop();
+    match (expect(ok, Str::new("all three allocations should succeed"))) {
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(cap, 32)) {     // two 16-byte chunks
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(used, 24);      // 16 in the first chunk + 8 in the second
+}
+
+![test]
+function reset_releases_and_arena_reusable() -> Result<(), TestError> {
+    mut a: Arena = Arena::with_chunk_size(256);
+    match (a.allocate(Layout::new(16, 8))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("pre-reset allocate failed")); }
+    }
+    a.reset();
+    const cap_after_reset: u64 = a.capacity();
+    const used_after_reset: u64 = a.used();
+    // The arena is still usable after reset: a fresh allocation succeeds.
+    mut reusable: boolean = false;
+    match (a.allocate(Layout::new(16, 8))) {
+        Result::Ok(_)  => { reusable = true; }
+        Result::Err(_) => { }
+    }
+    a.drop();
+    match (expect_eq(cap_after_reset, 0)) {     // reset released every chunk
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(used_after_reset, 0)) {
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(reusable, Str::new("arena must be reusable after reset"));
+}
+
+// with_chunk_size(0) is a caller bug and panics; the forked runner counts
+// the abort as a pass.
+![test]
+![should_panic]
+function with_chunk_size_zero_panics() -> Result<(), TestError> {
+    mut a: Arena = Arena::with_chunk_size(0);
+    a.drop();
+    return Result::Ok(());
+}

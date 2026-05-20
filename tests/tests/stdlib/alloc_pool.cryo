@@ -1,0 +1,128 @@
+///! Pool — fixed-slot allocator: allocate / reuse / layout match / alignment.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::AllocPool;
+
+import std::core::result;
+import std::core::ptr;
+import std::alloc::layout;
+import std::alloc::allocator;
+import std::alloc::pool;
+import std::test::error;
+import std::test::assert;
+
+// True when `addr` is a multiple of `align` (a power of two).
+function is_aligned(addr: u64, align: u64) -> boolean {
+    return (addr & (align - 1)) == 0;
+}
+
+![test]
+function allocate_slot_returns_usable_memory() -> Result<(), TestError> {
+    mut p: Pool = Pool::new(Layout::new(16, 8));
+    // Use a value that needs all 8 bytes, so this also proves the slot is
+    // wide enough.  Bind it to a typed const: a bare i64 literal wider than
+    // i32 passed directly to expect_eq defaults to i32 and truncates.
+    const want: i64 = 9000000001;
+    mut wrote_back: i64 = 0;
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => {
+            const lp: i64* = nn.as_ptr() as i64*;
+            *lp = want;
+            wrote_back = *lp;
+        }
+        Result::Err(_) => { p.drop(); return bail(Str::new("allocate_slot failed")); }
+    }
+    p.drop();
+    return expect_eq(wrote_back, want);
+}
+
+![test]
+function allocate_slot_distinct() -> Result<(), TestError> {
+    mut p: Pool = Pool::new(Layout::new(16, 8));
+    mut a: u64 = 0;
+    mut b: u64 = 0;
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => { a = nn.as_ptr() as u64; }
+        Result::Err(_) => { p.drop(); return bail(Str::new("first allocate failed")); }
+    }
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => { b = nn.as_ptr() as u64; }
+        Result::Err(_) => { p.drop(); return bail(Str::new("second allocate failed")); }
+    }
+    p.drop();
+    return expect_ne(a, b);
+}
+
+![test]
+function deallocate_then_allocate_reuses_slot() -> Result<(), TestError> {
+    // Free list is LIFO: a freed slot is the next one handed out.
+    mut p: Pool = Pool::new(Layout::new(16, 8));
+    mut a: u64 = 0;
+    mut b: u64 = 0;
+    mut c: u64 = 0;
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => { a = nn.as_ptr() as u64; }
+        Result::Err(_) => { p.drop(); return bail(Str::new("allocate A failed")); }
+    }
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => { b = nn.as_ptr() as u64; }
+        Result::Err(_) => { p.drop(); return bail(Str::new("allocate B failed")); }
+    }
+    p.deallocate_slot(NonNull::new(a as u8*));
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => { c = nn.as_ptr() as u64; }
+        Result::Err(_) => { p.drop(); return bail(Str::new("allocate C failed")); }
+    }
+    p.drop();
+    match (expect_ne(a, b)) {                  // A and B are different slots
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(c, a);                     // C reuses the freed A
+}
+
+![test]
+function allocate_via_trait_matching_layout() -> Result<(), TestError> {
+    mut p: Pool = Pool::new(Layout::new(16, 8));
+    const r: Result<NonNull<u8>, AllocError> = p.allocate(Layout::new(16, 8));
+    const ok: boolean = r.is_ok();
+    p.drop();
+    return expect(ok, Str::new("matching-layout allocate should succeed"));
+}
+
+![test]
+function allocate_mismatched_layout_errors() -> Result<(), TestError> {
+    // The pool serves 16-byte slots; an 8-byte request is the wrong size.
+    mut p: Pool = Pool::new(Layout::new(16, 8));
+    const r: Result<NonNull<u8>, AllocError> = p.allocate(Layout::new(8, 8));
+    p.drop();
+    return expect_err(&r, Str::new("size mismatch must be rejected (InvalidLayout)"));
+}
+
+![test]
+function slots_are_aligned() -> Result<(), TestError> {
+    mut p: Pool = Pool::new(Layout::new(16, 16));
+    mut aligned: boolean = false;
+    match (p.allocate_slot()) {
+        Result::Ok(nn) => { aligned = is_aligned(nn.as_ptr() as u64, 16); }
+        Result::Err(_) => { p.drop(); return bail(Str::new("allocate_slot failed")); }
+    }
+    p.drop();
+    return expect(aligned, Str::new("16-aligned slot layout must yield 16-aligned slots"));
+}
+
+// A slot must be at least a pointer wide so the intrusive free list fits.
+![test]
+![should_panic]
+function slot_smaller_than_pointer_panics() -> Result<(), TestError> {
+    mut p: Pool = Pool::new(Layout::new(4, 4));
+    p.drop();
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function block_size_zero_panics() -> Result<(), TestError> {
+    mut p: Pool = Pool::with_block_size(Layout::new(16, 8), 0);
+    p.drop();
+    return Result::Ok(());
+}

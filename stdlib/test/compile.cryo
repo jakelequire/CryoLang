@@ -1,0 +1,230 @@
+///! Compile-fail / diagnostic assertions for `cryo test`.
+///!
+///! These let an ordinary `![test]` assert how the compiler reacts to a
+///! Cryo SOURCE STRING — that it is rejected with a specific diagnostic,
+///! or that it compiles cleanly — without that source ever being part of
+///! the test binary. (A snippet that fails to compile could not live as a
+///! normal `![test]` function: the whole test binary would fail to build.
+///! Passing the snippet as data and checking it in a child compiler is how
+///! Rust's `trybuild` / `compiletest` work too.)
+///!
+///! ```cryo
+///! ![test]
+///! function string_arg_rejected() -> Result<(), TestError> {
+///!     return expect_compile_error(
+///!         Str::new("namespace S; function cf(x: i32) -> void {}\n\
+///!                   function main() -> int { cf(\"bad\"); return 0; }"),
+///!         Str::new("E0214"));
+///! }
+///! ```
+///!
+///! Mechanism: the snippet is written to a temp file and type-checked with
+///! `cryo check <file>` (frontend only — no codegen, no link, no project).
+///! `cryo test` exports `$CRYO` (the compiler's own path) and `$CRYO_STDLIB`
+///! (the resolved stdlib root) before running the test binary; these helpers
+///! read them. Running a test binary directly (not through `cryo test`)
+///! without `$CRYO` set fails the assertion with a clear `TestError::Other`
+///! rather than a confusing miscompare.
+
+namespace std::test::compile;
+
+import core::result;
+import core::slice;
+import core::intrinsics;
+import collections::str;
+import collections::string;
+import fs::file;
+import fs::path;
+import io::error;
+import io::traits;
+import process::command;
+import process::child;
+import ffi::libc;
+import test::error;
+
+/// Per-process counter so repeated calls in one test get distinct temp
+/// files. Forked test children each start from 0 but differ by PID, so
+/// the on-disk names stay globally unique.
+mut g_diag_counter: u64 = 0;
+
+// ============================================================================
+// CheckResult: the outcome of type-checking a snippet
+// ============================================================================
+
+type struct CheckResult {
+    /// True if the compiler exited non-zero (the snippet was rejected).
+    failed: boolean;
+    /// Combined stdout+stderr of the compiler, for diagnostic matching
+    /// and for echoing back in a failure message.
+    out:    String;
+}
+
+implement trait Drop for struct CheckResult {
+    drop(mut &this) -> void {
+        this.out.drop();
+    }
+}
+
+// ============================================================================
+// Public assertions
+// ============================================================================
+
+/// `Ok(())` iff `source` fails to compile AND the compiler emits
+/// `error[<expected_code>]` (pass the bare code, e.g. `Str::new("E0214")`).
+/// On any other outcome returns an `Err` whose message echoes what the
+/// compiler actually said, so a diff is easy to read.
+function expect_compile_error(source: Str, expected_code: Str) -> Result<(), TestError> {
+    match (check_snippet(source)) {
+        Result::Ok(res) => {
+            mut r: CheckResult = res;
+            if (!r.failed) {
+                r.drop();
+                return Result::Err(TestError::failed(
+                    Str::new("expected a compile error, but the snippet compiled cleanly")));
+            }
+            // Needle: the rendered `error[CODE]` header the compiler prints.
+            mut needle: String = String::from_str(Str::new("error["));
+            needle.push_str(expected_code);
+            needle.push_str(Str::new("]"));
+            const found: boolean = contains(r.out.as_str(), needle.as_str());
+            needle.drop();
+            if (found) {
+                r.drop();
+                return Result::Ok(());
+            }
+            mut msg: String = String::from_str(Str::new("expected diagnostic error["));
+            msg.push_str(expected_code);
+            msg.push_str(Str::new("], but the compiler emitted:\n"));
+            msg.push_str(r.out.as_str());
+            const err: TestError = TestError::failed(msg.as_str());
+            msg.drop();
+            r.drop();
+            return Result::Err(err);
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+/// `Ok(())` iff `source` compiles cleanly (frontend exits zero). Use this
+/// for over-rejection guards: code the diagnostics must NOT flag.
+function expect_compiles(source: Str) -> Result<(), TestError> {
+    match (check_snippet(source)) {
+        Result::Ok(res) => {
+            mut r: CheckResult = res;
+            if (!r.failed) {
+                r.drop();
+                return Result::Ok(());
+            }
+            mut msg: String = String::from_str(
+                Str::new("expected the snippet to compile, but the compiler emitted:\n"));
+            msg.push_str(r.out.as_str());
+            const err: TestError = TestError::failed(msg.as_str());
+            msg.drop();
+            r.drop();
+            return Result::Err(err);
+        }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+/// Write `source` to a temp file and type-check it with `cryo check`.
+/// Returns the captured outcome, or an `Err` (TestError::Other) if the
+/// environment isn't wired up or the spawn fails.
+function check_snippet(source: Str) -> Result<CheckResult, TestError> {
+    // Compiler path comes from `cryo test` via $CRYO.
+    const cryo_raw: i8* = intrinsics::getenv("CRYO");
+    if (cryo_raw == null) {
+        return Result::Err(TestError::other(Str::new(
+            "compile-fail tests need $CRYO (the compiler path); run them via `cryo test`")));
+    }
+    const cryo_path: Str = Str::new(cryo_raw as string);
+
+    // Stdlib root is optional but needed for snippets that import std.
+    const stdlib_raw: i8* = intrinsics::getenv("CRYO_STDLIB");
+    const have_stdlib: boolean = (stdlib_raw != null);
+    mut stdlib_flag: String = String::new();
+    if (have_stdlib) {
+        stdlib_flag = String::from_str(Str::new("--stdlib="));
+        stdlib_flag.push_str(Str::new(stdlib_raw as string));
+    }
+
+    // Unique temp file path. snprintf NUL-terminates and returns the
+    // length, so the buffer doubles as a C string for unlink().
+    mut namebuf: i8[96];
+    g_diag_counter = g_diag_counter + 1;
+    const n: i32 = intrinsics::snprintf(&namebuf[0], 96,
+        "/tmp/cryo_diag_%d_%llu.cryo", libc::getpid(), g_diag_counter);
+    const fname: Str = Str::from_raw(&namebuf[0] as u8*, n as u64);
+
+    // Write the snippet.
+    match (File::create(Path::from_str(fname))) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.write_all(source.as_bytes())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => {
+                    f.drop();
+                    if (have_stdlib) { stdlib_flag.drop(); }
+                    return Result::Err(TestError::other(Str::new("could not write snippet temp file")));
+                }
+            }
+            f.drop();
+        }
+        Result::Err(_) => {
+            if (have_stdlib) { stdlib_flag.drop(); }
+            return Result::Err(TestError::other(Str::new("could not create snippet temp file")));
+        }
+    }
+
+    // Type-check it: `cryo check <file> [--stdlib=...]`.
+    mut cmd: Command = Command::new(cryo_path);
+    cmd.arg(Str::new("check"));
+    cmd.arg(fname);
+    if (have_stdlib) { cmd.arg(stdlib_flag.as_str()); }
+
+    mut failed: boolean = false;
+    mut combined: String = String::new();
+    mut spawned: boolean = true;
+    match (cmd.output()) {
+        Result::Ok(out) => {
+            mut o: Output = out;
+            failed = !o.status().success();
+            combined.push_str(Str::from_bytes(o.stdout()));
+            combined.push_str(Str::from_bytes(o.stderr()));
+            o.drop();
+        }
+        Result::Err(_) => { spawned = false; }
+    }
+    cmd.drop();
+    if (have_stdlib) { stdlib_flag.drop(); }
+    libc::unlink(&namebuf[0] as u8*);
+
+    if (!spawned) {
+        combined.drop();
+        return Result::Err(TestError::other(Str::new(
+            "could not spawn the compiler ($CRYO); is the path correct?")));
+    }
+    return Result::Ok(CheckResult { failed: failed, out: combined });
+}
+
+/// Byte-wise substring test over two `Str` views. Inputs here (compiler
+/// output, short error codes) are small, so the naive O(n*m) scan is fine.
+function contains(haystack: Str, needle: Str) -> boolean {
+    const hl: u64 = haystack.length();
+    const nl: u64 = needle.length();
+    if (nl == 0) { return true; }
+    if (nl > hl) { return false; }
+    mut i: u64 = 0;
+    const stop: u64 = hl - nl;
+    while (i <= stop) {
+        if (haystack.sub_bytes(i, i + nl).equals(&needle)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}

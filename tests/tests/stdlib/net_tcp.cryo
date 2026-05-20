@@ -1,0 +1,106 @@
+///! TcpListener / TcpStream — loopback round-trip over 127.0.0.1.
+///!
+///! Single-threaded: on Linux, connect() to a listening socket completes
+///! immediately by queuing into the backlog, so the same thread can
+///! connect then accept.  A PID-derived high port keeps concurrent test
+///! runs from colliding without needing a local_addr() accessor (which
+///! TcpListener doesn't expose).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetTcp;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::core::drop;
+import std::collections::str;
+import std::io::error;
+import std::io::traits;
+import std::net::ip;
+import std::net::socket_addr;
+import std::net::tcp;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+![test]
+function loopback_round_trip() -> Result<(), TestError> {
+    const port: u16 = (20000 + (libc::getpid() % 20000)) as u16;
+
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(port))) {
+        Result::Ok(l)  => { l }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1 failed")); }
+    };
+    mut client: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("connect failed")); }
+    };
+    mut server: TcpStream = match (listener.accept()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { client.drop(); listener.drop(); return bail(Str::new("accept failed")); }
+    };
+
+    // client -> server
+    match (client.write_all(Str::new("ping").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("client write failed")); }
+    }
+    mut sbuf: u8[16];
+    mut sgot: u64 = 0;
+    match (server.read_all(&sbuf[0], 4)) {
+        Result::Ok(n)  => { sgot = n; }
+        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("server read failed")); }
+    }
+    const ping_ok: boolean = slices_eq(Slice::from_raw(&sbuf[0], sgot), Str::new("ping").as_bytes());
+
+    // server -> client
+    match (server.write_all(Str::new("pong").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("server write failed")); }
+    }
+    mut cbuf: u8[16];
+    mut cgot: u64 = 0;
+    match (client.read_all(&cbuf[0], 4)) {
+        Result::Ok(n)  => { cgot = n; }
+        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("client read failed")); }
+    }
+    const pong_ok: boolean = slices_eq(Slice::from_raw(&cbuf[0], cgot), Str::new("pong").as_bytes());
+
+    server.drop();
+    client.drop();
+    listener.drop();
+
+    match (expect(ping_ok, Str::new("server should receive \"ping\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(pong_ok, Str::new("client should receive \"pong\""));
+}
+
+![test]
+function connect_to_unbound_port_fails() -> Result<(), TestError> {
+    // A high port with nothing listening should refuse the connection.
+    const port: u16 = (40000 + (libc::getpid() % 20000)) as u16;
+    const r: Result<TcpStream, IoError> = TcpStream::connect(SocketAddr::localhost_v4(port));
+    const is_err: boolean = r.is_err();
+    match (r) {
+        Result::Ok(s)  => { mut stream: TcpStream = s; stream.drop(); }   // unexpected
+        Result::Err(_) => { }
+    }
+    return expect(is_err, Str::new("connecting to an unbound port should fail"));
+}

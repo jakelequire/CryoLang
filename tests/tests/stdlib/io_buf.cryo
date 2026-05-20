@@ -1,0 +1,308 @@
+///! BufWriter / BufReader — coalescing, overflow, bypass, flush, refill.
+///!
+///! Tests run against in-memory Write/Read doubles so behavior is
+///! hermetic (no fds, no syscalls). `MemSink` counts how many writes
+///! actually reach it, which is how we observe that buffering coalesces.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoBuf;
+
+import std::core::intrinsics;
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::core::drop;
+import std::collections::str;
+import std::collections::string;
+import std::io::error;
+import std::io::traits;
+import std::io::buf;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// In-memory Write sink: appends every byte it receives into a heap buffer
+// and counts how many times `write` was actually called (a proxy for the
+// syscall count a real sink would pay).
+// ============================================================================
+
+type struct MemSink {
+    buf: u8*;
+    cap: u64;
+    len: u64;
+    writes: u64;
+
+    static new(cap: u64) -> MemSink {
+        const raw: void* = intrinsics::malloc(cap);
+        return MemSink { buf: raw as u8*, cap: cap, len: 0, writes: 0 };
+    }
+
+    as_slice(&this) -> Slice<u8> {
+        return Slice::from_raw(this.buf, this.len);
+    }
+}
+
+implement trait Write for struct MemSink {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        const n: u64 = bytes.length();
+        if (n > 0) {
+            intrinsics::memcpy(
+                (this.buf + this.len) as void*,
+                bytes.as_ptr() as void*,
+                n
+            );
+            this.len = this.len + n;
+        }
+        this.writes = this.writes + 1;
+        return Result::Ok(n);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return Result::Ok(());
+    }
+}
+
+implement trait Drop for struct MemSink {
+    drop(mut &this) -> void {
+        if (this.buf != null) {
+            intrinsics::free(this.buf as void*);
+            this.buf = null;
+        }
+    }
+}
+
+// ============================================================================
+// In-memory Read source: serves bytes from a borrowed Str. `chunk` caps
+// how many bytes a single `read` returns (0 = no cap), letting us simulate
+// a dribbling source that forces BufReader to refill repeatedly.
+// ============================================================================
+
+type struct MemSource {
+    src: Str;
+    pos: u64;
+    chunk: u64;
+    reads: u64;
+
+    static new(src: Str, chunk: u64) -> MemSource {
+        return MemSource { src: src, pos: 0, chunk: chunk, reads: 0 };
+    }
+}
+
+implement trait Read for struct MemSource {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        const bytes: Slice<u8> = this.src.as_bytes();
+        mut n: u64 = bytes.length() - this.pos;
+        if (n > length) { n = length; }
+        if (this.chunk > 0 && n > this.chunk) { n = this.chunk; }
+        if (n > 0) {
+            intrinsics::memcpy(
+                buffer as void*,
+                (bytes.as_ptr() + this.pos) as void*,
+                n
+            );
+            this.pos = this.pos + n;
+        }
+        this.reads = this.reads + 1;
+        return Result::Ok(n);
+    }
+}
+
+// Byte-wise slice equality used by the content assertions.
+function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+// ============================================================================
+// BufWriter
+// ============================================================================
+
+![test]
+function small_writes_are_coalesced() -> Result<(), TestError> {
+    mut sink: MemSink = MemSink::new(256);
+    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 16);
+    match (bw.write(Str::new("ab").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write ab failed")); } }
+    match (bw.write(Str::new("cd").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write cd failed")); } }
+    match (bw.write(Str::new("ef").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write ef failed")); } }
+    // Nothing should have reached the sink yet; it's all buffered.
+    const writes_before: u64 = sink.writes;
+    const buffered: u64 = bw.buffered();
+    match (bw.flush()) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("flush failed")); } }
+    const writes_after: u64 = sink.writes;
+    const content_ok: boolean = slices_eq(sink.as_slice(), Str::new("abcdef").as_bytes());
+    bw.drop();
+    sink.drop();
+
+    match (expect_eq(writes_before, 0)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(buffered, 6)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(writes_after, 1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } } // one coalesced flush
+    return expect(content_ok, Str::new("flushed bytes should be \"abcdef\""));
+}
+
+![test]
+function overflow_triggers_flush() -> Result<(), TestError> {
+    // Capacity 4: "abc" buffers, then "def" overflows and forces a flush
+    // of "abc" before buffering "def".
+    mut sink: MemSink = MemSink::new(256);
+    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 4);
+    match (bw.write(Str::new("abc").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write abc failed")); } }
+    match (bw.write(Str::new("def").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write def failed")); } }
+    const sink_len_mid: u64 = sink.len;          // "abc" flushed by overflow
+    const buffered_mid: u64 = bw.buffered();      // "def" still buffered
+    const partial_ok: boolean = slices_eq(sink.as_slice(), Str::new("abc").as_bytes());
+    match (bw.flush()) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("flush failed")); } }
+    const all_ok: boolean = slices_eq(sink.as_slice(), Str::new("abcdef").as_bytes());
+    bw.drop();
+    sink.drop();
+
+    match (expect_eq(sink_len_mid, 3)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(buffered_mid, 3)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect(partial_ok, Str::new("overflow should have flushed \"abc\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(all_ok, Str::new("final content should be \"abcdef\""));
+}
+
+![test]
+function large_write_bypasses_buffer() -> Result<(), TestError> {
+    // A chunk larger than the buffer is sent straight to the sink with no
+    // double-copy; nothing is left buffered.
+    mut sink: MemSink = MemSink::new(256);
+    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 4);
+    match (bw.write(Str::new("abcdefgh").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("large write failed")); } }
+    const buffered: u64 = bw.buffered();
+    const writes: u64 = sink.writes;
+    const content_ok: boolean = slices_eq(sink.as_slice(), Str::new("abcdefgh").as_bytes());
+    bw.drop();
+    sink.drop();
+
+    match (expect_eq(buffered, 0)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(writes, 1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(content_ok, Str::new("bypassed write should land verbatim"));
+}
+
+![test]
+function drop_flushes_pending() -> Result<(), TestError> {
+    // No explicit flush: BufWriter::drop must push the buffered bytes.
+    mut sink: MemSink = MemSink::new(256);
+    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 16);
+    match (bw.write(Str::new("hello").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write failed")); } }
+    bw.drop();                                    // flush happens here
+    const content_ok: boolean = slices_eq(sink.as_slice(), Str::new("hello").as_bytes());
+    const writes: u64 = sink.writes;
+    sink.drop();
+
+    match (expect_eq(writes, 1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(content_ok, Str::new("drop should have flushed \"hello\""));
+}
+
+![test]
+function clear_discards_buffered() -> Result<(), TestError> {
+    mut sink: MemSink = MemSink::new(256);
+    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 16);
+    match (bw.write(Str::new("abc").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("write failed")); } }
+    bw.clear();                                   // throw the buffered bytes away
+    match (bw.flush()) { Result::Ok(_) => { } Result::Err(_) => { bw.drop(); sink.drop(); return bail(Str::new("flush failed")); } }
+    const sink_len: u64 = sink.len;
+    bw.drop();
+    sink.drop();
+    return expect_eq(sink_len, 0);                // nothing made it to the sink
+}
+
+// ============================================================================
+// BufReader
+// ============================================================================
+
+![test]
+function read_serves_buffered_bytes() -> Result<(), TestError> {
+    mut src: MemSource = MemSource::new(Str::new("hello"), 0);
+    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
+    mut out: u8[16];
+    mut got: u64 = 0;
+    match (br.read(&out[0], 5)) {
+        Result::Ok(n) => { got = n; }
+        Result::Err(_) => { br.drop(); return bail(Str::new("read failed")); }
+    }
+    const content_ok: boolean = slices_eq(Slice::from_raw(&out[0], got), Str::new("hello").as_bytes());
+    // One underlying read filled the buffer; the 5-byte read came from it.
+    const src_reads: u64 = src.reads;
+    br.drop();
+
+    match (expect_eq(got, 5)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect(content_ok, Str::new("should read back \"hello\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(src_reads, 1);
+}
+
+![test]
+function read_line_splits_on_newline() -> Result<(), TestError> {
+    mut src: MemSource = MemSource::new(Str::new("line1\nline2\n"), 0);
+    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 32);
+
+    mut l1: String = String::new();
+    match (br.read_line(&l1)) { Result::Ok(_) => { } Result::Err(_) => { l1.drop(); br.drop(); return bail(Str::new("read_line 1 failed")); } }
+    const l1_ok: boolean = slices_eq(l1.as_str().as_bytes(), Str::new("line1\n").as_bytes());
+
+    mut l2: String = String::new();
+    match (br.read_line(&l2)) { Result::Ok(_) => { } Result::Err(_) => { l1.drop(); l2.drop(); br.drop(); return bail(Str::new("read_line 2 failed")); } }
+    const l2_ok: boolean = slices_eq(l2.as_str().as_bytes(), Str::new("line2\n").as_bytes());
+
+    mut l3: String = String::new();
+    mut eof_len: u64 = 99;
+    match (br.read_line(&l3)) { Result::Ok(n) => { eof_len = n; } Result::Err(_) => { l1.drop(); l2.drop(); l3.drop(); br.drop(); return bail(Str::new("read_line 3 failed")); } }
+
+    l1.drop(); l2.drop(); l3.drop();
+    br.drop();
+
+    match (expect(l1_ok, Str::new("first line should be \"line1\\n\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect(l2_ok, Str::new("second line should be \"line2\\n\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(eof_len, 0);                  // third read_line hits EOF
+}
+
+![test]
+function dribbling_source_reassembles_line() -> Result<(), TestError> {
+    // chunk=1: the source returns one byte per underlying read, forcing
+    // BufReader to refill many times. read_line must still assemble the
+    // whole line.
+    mut src: MemSource = MemSource::new(Str::new("abcdef\n"), 1);
+    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
+    mut line: String = String::new();
+    match (br.read_line(&line)) { Result::Ok(_) => { } Result::Err(_) => { line.drop(); br.drop(); return bail(Str::new("read_line failed")); } }
+    const ok: boolean = slices_eq(line.as_str().as_bytes(), Str::new("abcdef\n").as_bytes());
+    // 7 bytes at 1 byte/read = 7 reads to deliver the line.
+    const reads: u64 = src.reads;
+    line.drop();
+    br.drop();
+
+    match (expect(ok, Str::new("dribbled line should reassemble to \"abcdef\\n\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(reads >= 7, Str::new("a 1-byte-chunk source needs >= 7 reads"));
+}
+
+![test]
+function available_tracks_buffered_bytes() -> Result<(), TestError> {
+    mut src: MemSource = MemSource::new(Str::new("hello"), 0);
+    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
+    mut avail: u64 = 0;
+    match (br.fill_buf()) {
+        Result::Ok(filled) => { avail = filled.length(); }
+        Result::Err(_) => { br.drop(); return bail(Str::new("fill_buf failed")); }
+    }
+    const reported: u64 = br.available();
+    br.consume(2);
+    const after_consume: u64 = br.available();
+    br.drop();
+
+    match (expect_eq(avail, 5)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(reported, 5)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(after_consume, 3);            // consume(2) advanced the cursor
+}

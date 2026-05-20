@@ -1,0 +1,173 @@
+///! File — open/create, write→read round-trip, seek, error paths.
+///!
+///! Each test owns a PID-unique file under /tmp and unlinks it before
+///! returning, so the suite leaves no residue and tolerates concurrent
+///! runs on the same machine.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FsFile;
+
+import std::core::intrinsics;
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::core::drop;
+import std::collections::str;
+import std::io::error;
+import std::io::traits;
+import std::fs::path;
+import std::fs::file;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+// Fill `buf` with "/tmp/cryo_fs_<tag>_<pid>.dat" and return a Path over
+// it.  The Path borrows `buf`, so the caller must keep it alive.
+function temp_path(buf: i8*, tag: string) -> Path {
+    const n: i32 = intrinsics::snprintf(buf, 96, "/tmp/cryo_fs_%s_%d.dat", tag, libc::getpid());
+    return Path::from_str(Str::from_raw(buf as u8*, n as u64));
+}
+
+// Byte-wise slice equality.
+function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+![test]
+function write_then_read_roundtrip() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = temp_path(&namebuf[0], "roundtrip");
+    const payload: Str = Str::new("Hello, Cryo!\n");
+
+    // Create + write.
+    match (File::create(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.write_all(payload.as_bytes())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("write_all failed")); }
+            }
+            f.drop();
+        }
+        Result::Err(_) => { return bail(Str::new("File::create failed")); }
+    }
+
+    // Reopen + read back.
+    mut readbuf: u8[64];
+    mut got: u64 = 0;
+    mut ok: boolean = false;
+    match (File::open(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.read_all(&readbuf[0], 64)) {
+                Result::Ok(n)  => { got = n; }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("read_all failed")); }
+            }
+            f.drop();
+            ok = slices_eq(Slice::from_raw(&readbuf[0], got), payload.as_bytes());
+        }
+        Result::Err(_) => { libc::unlink(&namebuf[0] as u8*); return bail(Str::new("File::open failed")); }
+    }
+    libc::unlink(&namebuf[0] as u8*);
+
+    match (expect_eq(got, 13)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("read-back bytes should equal what was written"));
+}
+
+![test]
+function seek_set_reads_from_offset() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = temp_path(&namebuf[0], "seek");
+    const payload: Str = Str::new("Hello, Cryo!\n");   // 'C' is at offset 7
+
+    match (File::create(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.write_all(payload.as_bytes())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("write_all failed")); }
+            }
+            f.drop();
+        }
+        Result::Err(_) => { return bail(Str::new("File::create failed")); }
+    }
+
+    mut readbuf: u8[64];
+    mut got: u64 = 0;
+    mut new_pos: u64 = 999;
+    mut ok: boolean = false;
+    match (File::open(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.seek_set(7)) {
+                Result::Ok(pos) => { new_pos = pos; }
+                Result::Err(_)  => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("seek_set failed")); }
+            }
+            match (f.read_all(&readbuf[0], 64)) {
+                Result::Ok(n)  => { got = n; }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("read after seek failed")); }
+            }
+            f.drop();
+            ok = slices_eq(Slice::from_raw(&readbuf[0], got), Str::new("Cryo!\n").as_bytes());
+        }
+        Result::Err(_) => { libc::unlink(&namebuf[0] as u8*); return bail(Str::new("File::open failed")); }
+    }
+    libc::unlink(&namebuf[0] as u8*);
+
+    match (expect_eq(new_pos, 7)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(got, 6)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("reading from offset 7 should yield \"Cryo!\\n\""));
+}
+
+![test]
+function open_nonexistent_errors() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = temp_path(&namebuf[0], "does_not_exist");
+    // Make sure it really isn't there from a prior run.
+    libc::unlink(&namebuf[0] as u8*);
+    const r: Result<File, IoError> = File::open(p);
+    const is_err: boolean = r.is_err();
+    match (r) {
+        Result::Ok(handle) => { mut f: File = handle; f.drop(); }   // shouldn't happen
+        Result::Err(_)     => { }
+    }
+    return expect(is_err, Str::new("opening a missing file must fail"));
+}
+
+![test]
+function create_new_fails_when_exists() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = temp_path(&namebuf[0], "exclusive");
+
+    // First create succeeds.
+    match (File::create(p)) {
+        Result::Ok(handle) => { mut f: File = handle; f.drop(); }
+        Result::Err(_)     => { return bail(Str::new("initial create failed")); }
+    }
+
+    // create_new (O_EXCL) on an existing file must fail.
+    mut options: OpenOptions = OpenOptions::new();
+    options = options.write(true).create_new(true);
+    const r: Result<File, IoError> = options.open(p);
+    const is_err: boolean = r.is_err();
+    match (r) {
+        Result::Ok(handle) => { mut f: File = handle; f.drop(); }
+        Result::Err(_)     => { }
+    }
+    libc::unlink(&namebuf[0] as u8*);
+    return expect(is_err, Str::new("create_new on an existing file must fail"));
+}
