@@ -7,6 +7,7 @@ import std::core::result;
 import std::core::option;
 import std::core::iter;
 import std::core::slice;
+import std::core::drop;
 import std::collections::array;
 import std::test::error;
 import std::test::assert;
@@ -190,3 +191,46 @@ function iter_count_reports_length_in_O1() -> Result<(), TestError> {
     return expect_eq(got, want);
 }
 
+
+// ============================================================================
+// clear() drops owned elements — pin the H1 fix.  `clear` used to just
+// set length=0, leaking every element's resources for owning `T`.  It now
+// drops the `[0, length)` prefix (like `drop`), keeping capacity.  A
+// counting-drop Probe makes the element drops observable.
+// ============================================================================
+
+mut g_arr_drops: i32 = 0;
+
+type struct DropProbe {
+    tag: i32;
+    static new(tag: i32) -> DropProbe { return DropProbe { tag: tag }; }
+}
+
+implement trait Drop for struct DropProbe {
+    drop(mut &this) -> void { g_arr_drops = g_arr_drops + 1; }
+}
+
+![test]
+function clear_drops_each_owned_element() -> Result<(), TestError> {
+    g_arr_drops = 0;
+    mut arr: Array<DropProbe> = Array::new();
+    arr.push(DropProbe::new(1));
+    arr.push(DropProbe::new(2));
+    arr.push(DropProbe::new(3));
+    arr.clear();                       // must drop all 3 elements
+    const after_clear: i32 = g_arr_drops;
+    const after_len: u64 = arr.length();
+    // Capacity is retained, so the array stays usable after clear.
+    arr.push(DropProbe::new(4));
+    arr.drop();                        // drops the 1 remaining element
+    const after_drop: i32 = g_arr_drops;
+
+    match (expect_eq(after_clear, 3)) {   // clear dropped exactly 3
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_len, 0)) {     // length reset
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // 3 from clear + 1 from drop; no double-drop of the cleared elements.
+    return expect_eq(after_drop, 4);
+}
