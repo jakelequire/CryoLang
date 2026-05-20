@@ -2883,10 +2883,17 @@ public:
             // correct vtable slot for virtual dispatch; it's also the
             // foundation for precise direct-call overload selection.
             this.resolve_method_overload(call, callee as MemberAccessNode*);
+            this.check_method_call_arg_types(call, callee as MemberAccessNode*);
             return this.resolve_method_call(callee as MemberAccessNode*);
         }
         if (callee_node.kind == NodeKind::ScopeResolution) {
-            return this.resolve_scope_call(callee as ScopeResolutionNode*, call);
+            const scope_ret: TypeRef = this.resolve_scope_call(
+                callee as ScopeResolutionNode*, call);
+            if (scope_ret.is_valid()) {
+                this.check_scope_call_arg_types(
+                    callee as ScopeResolutionNode*, call);
+            }
+            return scope_ret;
         }
 
         return this.resolve_expr(callee);
@@ -2911,9 +2918,10 @@ public:
     ///     defaulted call.  Passing *more* args than a non-variadic
     ///     function declares is unambiguously wrong regardless of defaults.
     ///
-    /// Per-argument type-compatibility checking is still unimplemented;
-    /// `TypeChecker::check_function_call` (types/checker.cryo) has the
-    /// logic but is not yet wired into this path.
+    /// Once arity matches, each argument is also type-checked against its
+    /// declared parameter via `check_call_arg_types` (below), which reuses
+    /// `TypeChecker::check_compatibility` and flags hard category
+    /// mismatches (e.g. a `string` passed where an `i32` is expected).
     check_call_arity(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
         // Explicit generic calls (`f<T>(...)`) route through specialization;
         // skip rather than risk a template/instance param-count mismatch.
@@ -3036,7 +3044,370 @@ public:
             }
 
             this.ctx.diagnostics.emit(diag);
+            return;
         }
+
+        // Both arity checks passed (got == expected).  Type-check each
+        // argument against its declared parameter type.
+        this.check_args_against_params(call, ft.param_types);
+    }
+
+    /// Per-argument type checking for a call whose argument list aligns
+    /// 1:1 with `param_types` (free-function params, or a method's
+    /// non-receiver params).  Conservative by design: an argument is
+    /// flagged ONLY when `check_compatibility(arg, param)` bottoms out at
+    /// `Incompatible` — a hard category mismatch such as passing a
+    /// `string` where an `i32` is expected.  Every coercion the back end
+    /// already performs (numeric widen/narrow, sign change, `&T`→`T*`,
+    /// `void*`↔`T*`, class upcast, …) maps to `ImplicitConvert` /
+    /// `ExplicitCast` and is intentionally left alone, so this never
+    /// rejects code codegen would have compiled correctly.  Generic /
+    /// template / not-yet-instantiated types are skipped (opaque before
+    /// monomorphization); the specialized instance is re-checked once
+    /// every `T` is concrete.
+    check_args_against_params(mut &this, call: CallExprNode*,
+                              param_types: TypeRef[]) -> void {
+        const n: i64 = param_types.length;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i >= call.arguments.length) { break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const arg_ty:   TypeRef = arg.resolved_type;
+            const param_ty: TypeRef = param_types[i];
+            if (!this.arg_type_is_concrete(arg_ty))   { continue; }
+            if (!this.arg_type_is_concrete(param_ty)) { continue; }
+            const compat: TypeCompatibility =
+                this.checker.check_compatibility(arg_ty, param_ty);
+            if (compat == TypeCompatibility::Incompatible) {
+                // Pointer-vs-reference spelling and reference mutability
+                // are not category mismatches: codegen passes a raw
+                // pointer for `&T`, `&mut T` and `T*` alike.
+                // `check_compatibility` models `&T`→`T*` but not the
+                // reverse or `&T`↔`&mut T`, so guard those here before
+                // flagging.
+                if (this.indirection_compatible(arg_ty, param_ty)) { continue; }
+                // A Cryo enum is represented as its integer discriminant,
+                // so passing one to an integer parameter (the C-ABI
+                // pattern for `type enum E : i32 { ... }` used across the
+                // LLVM bindings, e.g. `LLVMSetLinkage(g, LLinkage::Private)`)
+                // is representation-correct — mirror the enum→bool rule.
+                if (this.enum_int_compatible(arg_ty, param_ty)) { continue; }
+                this.emit_type_mismatch_with_value(
+                    ErrorCode::E0214_ARGUMENT_MISMATCH,
+                    arg.span,
+                    param_ty,
+                    arg_ty,
+                    format("argument %lld doesn't match the parameter's declared type",
+                           i + 1),
+                    SourceSpan::none(),
+                    arg);
+            }
+        }
+    }
+
+    /// Per-argument type checking for an instance method call
+    /// (`receiver.method(args)`).  Runs after `resolve_method_overload`,
+    /// which has already populated `receiver.resolved_type` and every
+    /// argument's `resolved_type`.  Conservative, mirroring the
+    /// free-function gate: it gathers every candidate named `member.member`
+    /// with the call's arity from BOTH the receiver's inherent methods
+    /// (class base chain / struct / enum) AND its trait impls (including
+    /// trait impls on primitive receivers).  It type-checks only when a
+    /// single distinct signature emerges (overrides with an identical
+    /// signature collapse to one); a genuine overload — more than one
+    /// distinct signature — is skipped, since picking the target then
+    /// needs the resolver's full matching.  Each argument is checked
+    /// against its non-receiver parameter via `check_args_against_params`.
+    check_method_call_arg_types(mut &this, call: CallExprNode*,
+                                member: MemberAccessNode*) -> void {
+        const obj_type: TypeRef = member.object.resolved_type;
+        if (!obj_type.is_valid()) { return; }
+
+        // Unwrap pointer / reference / resolved-instantiation to the
+        // nominal receiver, matching `resolve_method_overload`.
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = base_t as PointerType*;
+                base_t = this.arena.lookup(pt.pointee.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = base_t as ReferenceType*;
+                base_t = this.arena.lookup(rt.referent.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { return; }
+                base_t = this.arena.lookup(inst.resolved_type.id);
+            } else {
+                break;
+            }
+            unwrap_depth += 1;
+        }
+        if (base_t == null) { return; }
+
+        const argc: i64 = call.arguments.length;
+        mut found:     boolean   = false;
+        mut ambiguous: boolean   = false;
+        mut chosen:    TypeRef[] = [];
+
+        // -- Inherent methods (class base chain / struct / enum) --
+        // Primitives have no inherent methods; their trait impls are
+        // gathered below, so don't bail on them here.
+        mut methods_ref: MethodInfo[] = [];
+        mut start_cls: ClassType* = null;
+        match (base_t.kind) {
+            TypeKind::Class => {
+                start_cls = base_t as ClassType*;
+                methods_ref = start_cls.methods;
+            }
+            TypeKind::Struct => { methods_ref = (base_t as StructType*).methods; }
+            TypeKind::Enum   => { methods_ref = (base_t as EnumType*).methods; }
+            _ => { }
+        }
+        mut walk: ClassType* = start_cls;
+        mut cur: MethodInfo[] = methods_ref;
+        mut depth: i32 = 0;
+        while (depth < 16) {
+            for (mut mi: i64 = 0; mi < cur.length; mi++) {
+                const m: MethodInfo = cur[mi];
+                if (!m.name.equals(member.member)) { continue; }
+                if (m.param_types.length != argc) { continue; }
+                if (!found) {
+                    found = true;
+                    chosen = m.param_types;
+                } else if (!this.same_param_sig(chosen, m.param_types)) {
+                    ambiguous = true;
+                }
+            }
+            if (walk == null) { break; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            walk = parent_t as ClassType*;
+            cur = walk.methods;
+            depth += 1;
+        }
+
+        // -- Trait-impl methods (registered off the receiver's canonical
+        // name; covers `implement trait T for U`, including primitive U).
+        // Same non-receiver param construction as `match_methods_on_impl_block`.
+        if (!ambiguous && this.ctx.generic_registry != null) {
+            mut target_name: SymbolStr = SymbolStr::empty();
+            match (base_t.kind) {
+                TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
+                TypeKind::Struct => { target_name = (base_t as StructType*).qualified_name; }
+                TypeKind::Enum   => { target_name = (base_t as EnumType*).qualified_name; }
+                TypeKind::Int | TypeKind::Float | TypeKind::Bool
+                | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
+                    target_name = this.intern.intern(base_t.display_name());
+                }
+                _ => { }
+            }
+            if (target_name.is_valid()) {
+                const this_amp: SymbolStr = this.intern.intern("&this");
+                const this_val: SymbolStr = this.intern.intern("this");
+                const traits: SymbolStr[] =
+                    this.ctx.generic_registry.traits_implemented_by(target_name);
+                for (mut ti: i64 = 0; ti < traits.length; ti++) {
+                    if (ambiguous) { break; }
+                    const block: ImplBlockNode* =
+                        this.ctx.generic_registry.lookup_trait_impl(
+                            traits[ti], target_name);
+                    if (block == null) { continue; }
+                    for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
+                        const mn: MethodNode* = block.methods[bmi];
+                        if (mn == null || mn.func == null) { continue; }
+                        const fn_node: FunctionDeclNode* = mn.func;
+                        if (!fn_node.name.equals(member.member)) { continue; }
+                        mut tparams: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp)) { continue; }
+                            if (pp.name.equals(this_val)) { continue; }
+                            tparams.push(pp.resolved_type);
+                        }
+                        if (tparams.length != argc) { continue; }
+                        if (!found) {
+                            found = true;
+                            chosen = tparams;
+                        } else if (!this.same_param_sig(chosen, tparams)) {
+                            ambiguous = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!found || ambiguous) { return; }
+        this.check_args_against_params(call, chosen);
+    }
+
+    /// True when one side is an enum and the other an integer.  A Cryo
+    /// enum lowers to its integer discriminant, so enum↔int argument
+    /// passing is representation-correct (the C-ABI interop pattern), not
+    /// a category mismatch — consistent with `check_compatibility`'s
+    /// existing enum→bool allowance.
+    enum_int_compatible(&this, a: TypeRef, b: TypeRef) -> boolean {
+        const at: Type* = this.arena.lookup(a.id);
+        const bt: Type* = this.arena.lookup(b.id);
+        if (at == null || bt == null) { return false; }
+        if (at.kind == TypeKind::Enum && bt.kind == TypeKind::Int) { return true; }
+        if (at.kind == TypeKind::Int && bt.kind == TypeKind::Enum) { return true; }
+        return false;
+    }
+
+    /// Structural equality of two parameter-type lists by length and
+    /// arena TypeRef id.  Used to collapse a base method and its identical
+    /// override into a single candidate signature.
+    same_param_sig(&this, a: TypeRef[], b: TypeRef[]) -> boolean {
+        if (a.length != b.length) { return false; }
+        for (mut i: i64 = 0; i < a.length; i++) {
+            if (a[i].id != b[i].id) { return false; }
+        }
+        return true;
+    }
+
+    /// Per-argument type checking for a `Type::method(args)` /
+    /// `Module::func(args)` scope-resolution call.  Called only after
+    /// `resolve_scope_call` resolved the callee, so an undefined symbol
+    /// has already reported its own error and won't be double-flagged.
+    /// Conservative: looks the combined `scope::member` symbol up in the
+    /// declaration index and checks only when exactly ONE function-typed
+    /// overload is registered (a unique static method or module function).
+    /// Enum-variant constructors (not function-typed under this key),
+    /// overloaded statics, and generic templates are skipped.
+    check_scope_call_arg_types(mut &this, scope: ScopeResolutionNode*,
+                               call: CallExprNode*) -> void {
+        if (this.ctx.decl_index == null) { return; }
+
+        // Mirror `resolve_scope_call`'s lookup symbol (specialize generic
+        // scope args), then skip anything generic — the monomorphizer
+        // re-checks specialized instances once every `T` is concrete.
+        mut lookup_sym: SymbolStr = scope.scope_name;
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+        }
+        if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
+
+        const scope_str:  string = this.intern.resolve(lookup_sym);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        if (strlen(scope_str) == 0 || strlen(member_str) == 0) { return; }
+        const combined: SymbolStr = this.intern.intern(
+            format("%s::%s", scope_str, member_str));
+
+        const overloads: TypeRef[] =
+            this.ctx.decl_index.lookup_func_type_overloads(combined);
+        if (overloads.length != 1) { return; }
+        const ot: Type* = this.arena.lookup(overloads[0].id);
+        if (ot == null || ot.kind != TypeKind::Function) { return; }
+        const ft: FunctionType* = ot as FunctionType*;
+        if (ft.is_variadic) { return; }
+        // Arity is not (yet) reported for scope calls; only type-check when
+        // the counts already line up so we don't misalign the comparison.
+        if (ft.param_types.length != call.arguments.length) { return; }
+        this.check_args_against_params(call, ft.param_types);
+    }
+
+    /// One level of pointer/reference indirection peeled off `t`, or an
+    /// invalid TypeRef when `t` is neither a pointer nor a reference.
+    peel_indirection(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return TypeRef::invalid(); }
+        if (ty.kind == TypeKind::Pointer) {
+            const pt: PointerType* = ty as PointerType*;
+            return pt.pointee;
+        }
+        if (ty.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = ty as ReferenceType*;
+            return rt.referent;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// True when `arg` and `param` describe the same underlying type up
+    /// to one level of pointer/reference spelling — covering `&T`↔`&mut T`,
+    /// `&T`↔`T*`, and value↔`&T`/`T*` (call-site auto-ref, e.g. passing a
+    /// `&this` receiver — which resolves to the value type — to a
+    /// `&T` parameter).  Codegen lowers all of these to a raw pointer, so
+    /// `check_call_arg_types` must not treat them as a category mismatch.
+    ///
+    /// At least one side must actually be an indirection (otherwise this
+    /// is a plain value↔value comparison that was already judged
+    /// `Incompatible`, e.g. `string` → `i32`, and must stay flagged).  The
+    /// underlying types must themselves be non-`Incompatible`, so
+    /// `string` → `&i32` and `i32*` → `&String` are still rejected.
+    indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        const a_peeled: TypeRef = this.peel_indirection(arg_ty);
+        const p_peeled: TypeRef = this.peel_indirection(param_ty);
+        if (!a_peeled.is_valid() && !p_peeled.is_valid()) { return false; }
+        const a_in: TypeRef = if (a_peeled.is_valid()) { a_peeled } else { arg_ty };
+        const p_in: TypeRef = if (p_peeled.is_valid()) { p_peeled } else { param_ty };
+        if (a_in.equals(p_in)) { return true; }
+        // Derived → Base upcast through the indirection (e.g. a value
+        // `Derived` receiver forwarded to a `Base*`/`&Base` parameter, as
+        // the visitor pattern does throughout the compiler).
+        // `check_compatibility` only models this for `Derived*`→`Base*`,
+        // not for the peeled value types, so check it explicitly.
+        if (this.checker.is_subclass_of(a_in, p_in)) { return true; }
+        const c: TypeCompatibility = this.checker.check_compatibility(a_in, p_in);
+        return c != TypeCompatibility::Incompatible;
+    }
+
+    /// Whether `t` is concrete enough for `check_call_arg_types` to judge.
+    /// False for generic params, bounded params, function templates,
+    /// function (pointer) types, and instantiations not yet resolved to a
+    /// concrete type — all opaque before monomorphization.  Recurses
+    /// through the structural type constructors (pointer / reference /
+    /// array / optional / tuple) so a generic buried inside `&T` or
+    /// `(T, i32)` is skipped too.  Nominal types (struct / class / enum /
+    /// primitives) are concrete leaves.
+    arg_type_is_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::GenericParam)     { return false; }
+        if (ty.kind == TypeKind::BoundedParam)     { return false; }
+        if (ty.kind == TypeKind::FunctionTemplate) { return false; }
+        if (ty.kind == TypeKind::Function)         { return false; }
+        // Unit `()` is zero-sized and `void`/`void*` is C's universal
+        // pointer; both are interchangeable with several representations
+        // (the unit literal even resolves to `void*`), so they are never
+        // a meaningful category mismatch.  Skip rather than risk a false
+        // positive (e.g. `HashSet` = `HashMap<T, ()>` passing `()`).
+        if (ty.kind == TypeKind::Unit)             { return false; }
+        if (ty.kind == TypeKind::Void)             { return false; }
+        if (ty.kind == TypeKind::Pointer) {
+            const pt: PointerType* = ty as PointerType*;
+            return this.arg_type_is_concrete(pt.pointee);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = ty as ReferenceType*;
+            return this.arg_type_is_concrete(rt.referent);
+        }
+        if (ty.kind == TypeKind::Array) {
+            const at: ArrayType* = ty as ArrayType*;
+            return this.arg_type_is_concrete(at.element);
+        }
+        if (ty.kind == TypeKind::Optional) {
+            const ot: OptionalType* = ty as OptionalType*;
+            return this.arg_type_is_concrete(ot.wrapped);
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const tt: TupleType* = ty as TupleType*;
+            for (mut i: i64 = 0; i < tt.elements.length; i++) {
+                if (!this.arg_type_is_concrete(tt.elements[i])) { return false; }
+            }
+            return true;
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return false; }
+        }
+        return true;
     }
 
     /// Free-function overload resolution.  Walks the overloads registered
