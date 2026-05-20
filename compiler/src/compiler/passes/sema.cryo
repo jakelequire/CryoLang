@@ -2831,6 +2831,14 @@ public:
         }
         this.expected_type = saved_expected;
 
+        // Auto-ref: flag by-value arguments bound to reference (`&T`)
+        // parameters so codegen passes their address.  `param_types` (used
+        // above for expected-type propagation) carries the callee's
+        // non-receiver parameter source types for free / method / scope
+        // calls alike — including generic `&T`, which is exactly the case
+        // the auto-ref fixes (e.g. `println(x)` over `println<T>(&T)`).
+        this.flag_autoref_from_params(call, param_types);
+
         const callee: ExpressionNode* = call.callee;
         const callee_node: ASTNode* = callee as ASTNode*;
 
@@ -3048,7 +3056,8 @@ public:
         }
 
         // Both arity checks passed (got == expected).  Type-check each
-        // argument against its declared parameter type.
+        // argument against its declared parameter type.  (Auto-ref of
+        // value args to `&T` params is handled once in `resolve_call`.)
         this.check_args_against_params(call, ft.param_types);
     }
 
@@ -3256,6 +3265,46 @@ public:
         if (at.kind == TypeKind::Enum && bt.kind == TypeKind::Int) { return true; }
         if (at.kind == TypeKind::Int && bt.kind == TypeKind::Enum) { return true; }
         return false;
+    }
+
+    /// True when `t` resolves to a reference (`&T` / `&mut T`) type.
+    is_reference_type(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        return ty != null && ty.kind == TypeKind::Reference;
+    }
+
+    /// True when `t` resolves to a reference OR pointer — i.e. the value is
+    /// already an address and must not be auto-ref'd again.
+    is_ref_or_ptr_type(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        return ty.kind == TypeKind::Reference || ty.kind == TypeKind::Pointer;
+    }
+
+    /// Mark every by-value argument that lands on a reference (`&T`)
+    /// parameter with `autoref`, so codegen takes its address instead of
+    /// passing the value.  `param_types` are the callee's non-receiver
+    /// parameter source types, aligned 1:1 with `call.arguments` (which
+    /// never include the receiver).  Arguments that are already a
+    /// reference/pointer (explicit `&x`) are left untouched.  This runs for
+    /// generic `&T` parameters too — value→`&T` is exactly the case the
+    /// auto-ref fixes (e.g. `println(x)` where `println<T>(value: &T)`).
+    flag_autoref_from_params(mut &this, call: CallExprNode*,
+                             param_types: TypeRef[]) -> void {
+        const lim: i64 = if (param_types.length < call.arguments.length) {
+            param_types.length
+        } else {
+            call.arguments.length
+        };
+        for (mut j: i64 = 0; j < lim; j++) {
+            if (!this.is_reference_type(param_types[j])) { continue; }
+            const arg: ExpressionNode* = call.arguments[j];
+            if (arg == null) { continue; }
+            if (this.is_ref_or_ptr_type(arg.resolved_type)) { continue; }
+            arg.autoref = true;
+        }
     }
 
     /// Structural equality of two parameter-type lists by length and
@@ -3470,7 +3519,17 @@ public:
             const ot: Type* = this.arena.lookup(overloads[oi].id);
             if (ot == null || ot.kind != TypeKind::Function) { continue; }
             const fn_ty: FunctionType* = ot as FunctionType*;
-            if (fn_ty.param_types.length != arg_types.length) { continue; }
+            // Variadic functions (e.g. `printf(fmt, ...)`) match any arg
+            // count >= their fixed prefix; only the fixed params are
+            // type-checked below.  Without this, a variadic call with extra
+            // args fails to pin whenever the name has >1 overload (e.g.
+            // `printf` declared in both `core::intrinsics` and `ffi::libc`),
+            // and codegen then can't resolve the callee.
+            if (fn_ty.is_variadic) {
+                if (arg_types.length < fn_ty.param_types.length) { continue; }
+            } else if (fn_ty.param_types.length != arg_types.length) {
+                continue;
+            }
             mut all_match: boolean = true;
             for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
                 if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) {
