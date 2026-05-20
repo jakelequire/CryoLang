@@ -197,34 +197,16 @@ type struct AbiClassifier {
         };
     }
 
-    /// Variant of `classify_signature` for `extern "C"` declarations.
-    /// Uses `classify_return_extern_c` (Phase 3 coercion for small
-    /// aggregate returns) and `classify_param_extern_c` (Phase 3
-    /// coercion for ≤ 8 byte aggregate params) instead of the Cryo-
-    /// internal variants.  See the comments on the `_extern_c` helpers
-    /// for the gating rationale.
+    /// `extern "C"` signature classification.  Now identical to the
+    /// Cryo-internal `classify_signature` — both callees lower small
+    /// aggregates the same way (byval for >16 bytes, register coercion
+    /// for <=8, DirectPair for 9-16).  Retained as an alias for the
+    /// extern-declare call site.
     classify_signature_extern_c(mut &this,
                                 params: TypeRef[],
                                 return_type: TypeRef,
                                 is_variadic: boolean) -> SignaturePlan {
-        const return_plan: ParamPlan = this.classify_return_extern_c(return_type);
-
-        mut param_plans: ParamPlan[] = [];
-        for (mut i: i64 = 0; i < params.length; i++) {
-            param_plans.push(this.classify_param_extern_c(params[i]));
-        }
-
-        const sret: boolean = return_plan.cls == ArgClass::Indirect;
-        const llvm_fn_ty: LType = build_llvm_fn_type(
-            return_plan, param_plans, is_variadic);
-
-        return SignaturePlan {
-            return_plan:  return_plan,
-            param_plans:  param_plans,
-            llvm_fn_type: llvm_fn_ty,
-            sret_slot:    sret,
-            is_variadic:  is_variadic,
-        };
+        return this.classify_signature(params, return_type, is_variadic);
     }
 
     /// Classify a method signature.  The implicit receiver (a `&this` /
@@ -287,30 +269,27 @@ type struct AbiClassifier {
     // Per-type classification
     // ========================================================================
 
-    /// Phase 2 — `classify_param` promotes parameter aggregates whose
-    /// `computed_size` exceeds the SysV x86-64 register-pair window
-    /// (16 bytes) to `Indirect` with `ByVal`.  Their LLVM slot becomes
-    /// a single `ptr`; the actual struct LLVM type is recorded in
-    /// `pointee_ty` so callers/callees can attach the `byval(%T)`
-    /// attribute that defines the copy semantics.
+    /// Classify a parameter for the SysV x86-64 ABI:
+    ///   - > 16 byte aggregate → `Indirect` + `ByVal` (a single `ptr`
+    ///     slot, with the struct type in `pointee_ty`).
+    ///   - ≤ 8 byte aggregate → one register-shaped eightbyte slot
+    ///     (`Direct`, `pointee_ty` set as the coercion sentinel).
+    ///   - 9–16 byte aggregate → two eightbyte slots (`DirectPair`).
+    /// Each eightbyte's slot type is chosen by `eightbyte_slot_type`
+    /// (SSE / INTEGER / `<2 x float>`).
     ///
-    /// Phase 3 ≤16 byte aggregate coercion is *not yet* applied to
-    /// Cryo-internal parameter passing — the §3.5 follow-up.  The
-    /// prologue and `declare_method` slot-assembly code paths are
-    /// already DirectPair-ready (no-op until this classifier flips),
-    /// but flipping classify_param surfaces a self-bootstrap heap-
-    /// corruption issue we haven't isolated: stage-3 (the compiler
-    /// built by stage-2 from current source) segfaults inside
-    /// `LLVMBuildGlobalStringPtr` when the compiler's own
-    /// `StringCache::get_or_create` is called.  Suspected cause is
-    /// the LBuilder ≤ 8 byte coercion mismatch surfacing through
-    /// some path the simple repros don't catch.  Until isolated,
-    /// Cryo-internal params keep the legacy "plain `Direct(struct)`"
-    /// shape; extern-C calls continue to use
-    /// `classify_param_extern_c` for the full Phase 3 surface.
+    /// This is the same surface for Cryo-internal and `extern "C"`
+    /// callees; `classify_param_extern_c` is retained only as an alias.
+    /// The call-argument marshaller (`codegen_call_direct` /
+    /// `codegen_call_direct_dp_expand`) and the prologue
+    /// (`codegen_function_prologue` / `codegen_method_prologue`) consume
+    /// these plans symmetrically — see `agg_register_size` for how the
+    /// call site recovers the coerced aggregate's size from the *lowered*
+    /// LLVM type (which stays correct even when an argument carries an
+    /// unresolved `InstantiatedType` whose Cryo `size_bytes()` is 0).
     ///
-    /// §3.4 — Tuple, Optional, and ADT enum (Result) follow the same
-    /// SysV byval rule as Struct / Class.
+    /// Tuple, Optional, and ADT enum (Result) follow the same SysV rules
+    /// as Struct / Class.
     classify_param(mut &this, t: TypeRef) -> ParamPlan {
         const tm: TypeMapper* = this.type_mapper;
         if (!t.is_valid()) {
@@ -366,95 +345,6 @@ type struct AbiClassifier {
             _ => { false }
         };
 
-        if (is_aggregate && concrete.size_bytes() > 16) {
-            // Phase 2: large aggregate → byval.
-            const pointee: LType = tm.map_type(t);
-            mut slots_iv: LType[] = [];
-            slots_iv.push(LType::pointer_to(LType::i8()));
-            return ParamPlan {
-                cryo_type:  t,
-                cls:      ArgClass::Indirect,
-                llvm_slots: slots_iv,
-                attr:       AbiAttr::ByVal,
-                pointee_ty: pointee,
-            };
-        }
-
-        // ≤ 16 byte aggregates: legacy plain `Direct(struct)` for
-        // Cryo-internal callers (§3.5 param-side follow-up).  Extern-
-        // C paths go through `classify_param_extern_c` and DO get the
-        // Phase 3 Direct-with-coercion / DirectPair shapes.
-        mut slots: LType[] = [];
-        const lty: LType = tm.map_type(t);
-        if (lty.is_valid()) { slots.push(lty); }
-        return ParamPlan {
-            cryo_type:  t,
-            cls:      ArgClass::Direct,
-            llvm_slots: slots,
-            attr:       AbiAttr::None,
-            pointee_ty: LType::null(),
-        };
-    }
-
-    /// Phase 3 — `extern "C"` parameter classification.  Mirrors
-    /// `classify_param`'s >16-byte byval rule and adds the small-
-    /// aggregate INTEGER-eightbyte coercion (≤ 8 bytes → single
-    /// register-sized integer slot).  The 9–16 byte aggregate param
-    /// case (DirectPair) is *not* promoted here yet — that requires
-    /// call-site slot expansion that hasn't landed; tracking under
-    /// HANDOFF §3.2.  Real C code that takes a 9–16 byte struct by
-    /// value will ABI-mismatch until that gap is closed; today no
-    /// such function is exercised by the test suite.
-    classify_param_extern_c(mut &this, t: TypeRef) -> ParamPlan {
-        const tm: TypeMapper* = this.type_mapper;
-        if (!t.is_valid()) {
-            return ParamPlan {
-                cryo_type:  t,
-                cls:      ArgClass::Direct,
-                llvm_slots: [],
-                attr:       AbiAttr::None,
-                pointee_ty: LType::null(),
-            };
-        }
-
-        const arena: TypeArena* = tm.arena;
-        const ty: Type* = arena.lookup(t.id);
-        if (ty == null) {
-            mut slots_fb: LType[] = [];
-            const lty_fb: LType = tm.map_type(t);
-            if (lty_fb.is_valid()) { slots_fb.push(lty_fb); }
-            return ParamPlan {
-                cryo_type:  t,
-                cls:      ArgClass::Direct,
-                llvm_slots: slots_fb,
-                attr:       AbiAttr::None,
-                pointee_ty: LType::null(),
-            };
-        }
-
-        mut concrete: Type* = ty;
-        if (concrete.kind == TypeKind::TypeAlias) {
-            const alias: TypeAliasType* = concrete as TypeAliasType*;
-            if (alias.has_target()) {
-                const tgt: Type* = arena.lookup(alias.target.id);
-                if (tgt != null) { concrete = tgt; }
-            }
-        }
-        if (concrete.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = concrete as InstantiatedType*;
-            if (inst.has_resolved_type()) {
-                const res: Type* = arena.lookup(inst.resolved_type.id);
-                if (res != null) { concrete = res; }
-            }
-        }
-
-        const is_aggregate: boolean = match (concrete.kind) {
-            TypeKind::Struct => { true }
-            TypeKind::Class  => { true }
-            TypeKind::Enum   => { true }
-            _ => { false }
-        };
-
         if (is_aggregate) {
             const sz: u64 = concrete.size_bytes();
             if (sz > 16) {
@@ -471,12 +361,12 @@ type struct AbiClassifier {
                 };
             }
             if (sz > 0 && sz <= 8) {
-                // Phase 3: ≤ 8-byte aggregate → single eightbyte.
-                // SSE (§3.3) chooses `double`/`float` when the bucket
-                // is one float-class field that fully occupies it;
-                // otherwise INTEGER.  Call site spills the struct
-                // value to a temp and loads it back as the scalar;
-                // callee does the inverse on its side.
+                // ≤ 8-byte aggregate → single eightbyte slot.  The
+                // eightbyte is classified SSE (`double`/`float` when the
+                // bucket is one float-class field that fully occupies it)
+                // or INTEGER otherwise.  The call site spills the struct
+                // value to a temp and reloads it as the scalar; the
+                // prologue does the inverse on the callee side.
                 const orig: LType = tm.map_type(t);
                 const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
                 if (slot.is_valid()) {
@@ -487,20 +377,15 @@ type struct AbiClassifier {
                         cls:      ArgClass::Direct,
                         llvm_slots: slots_d,
                         attr:       AbiAttr::None,
-                        pointee_ty: orig,
+                        pointee_ty: orig,   // coercion target
                     };
                 }
             }
             if (sz > 8 && sz <= 16) {
-                // Phase 3 — DirectPair param: split into two
-                // eightbyte slots, classified independently (§3.3
-                // SSE-or-INTEGER per bucket).  The call site
-                // expands a single source-struct arg into two LLVM
-                // arg slots: spill struct → temp, GEP+load lo, GEP
-                // at +8 → load hi.  Cryo-internal callers continue
-                // to pass these as `Direct(struct)` via
-                // `classify_param`, so this path is reachable only
-                // from extern-C call sites.
+                // 9–16 byte aggregate → DirectPair (two eightbyte slots,
+                // each classified independently).  The call site expands
+                // the single source-struct arg into two LLVM arg slots;
+                // the prologue reassembles them into a source-typed alloca.
                 const orig: LType = tm.map_type(t);
                 const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
                 const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
@@ -513,12 +398,14 @@ type struct AbiClassifier {
                         cls:      ArgClass::DirectPair,
                         llvm_slots: slots_dp,
                         attr:       AbiAttr::None,
-                        pointee_ty: orig,
+                        pointee_ty: orig,   // coercion target
                     };
                 }
             }
         }
 
+        // Non-aggregate, or an aggregate whose eightbyte classification
+        // bailed: plain `Direct` of the mapped LLVM type.
         mut slots: LType[] = [];
         const lty: LType = tm.map_type(t);
         if (lty.is_valid()) { slots.push(lty); }
@@ -531,9 +418,17 @@ type struct AbiClassifier {
         };
     }
 
-    /// Phase 3 §3.3 — classify a single eightbyte bucket of an
-    /// aggregate type into its SysV class slot.  Returns the LLVM
-    /// type that should occupy this eightbyte register slot.
+    /// `extern "C"` parameter classification.  Identical to the
+    /// Cryo-internal `classify_param` (same byval / register-coercion /
+    /// DirectPair surface), so this is now a thin alias kept only for
+    /// naming symmetry with `classify_signature_extern_c`.
+    classify_param_extern_c(mut &this, t: TypeRef) -> ParamPlan {
+        return this.classify_param(t);
+    }
+
+    /// Classify a single eightbyte bucket of an aggregate type into its
+    /// SysV class slot.  Returns the LLVM type that should occupy this
+    /// eightbyte register slot.
     ///
     /// The bucket is the half-open byte interval `[bucket_start,
     /// bucket_end)` of the aggregate (typically `[0..8)` or
@@ -656,148 +551,25 @@ type struct AbiClassifier {
         };
     }
 
-    /// Phase 1 + 3 extern-C return classification.  Variant of
-    /// `classify_return` that promotes ≤ 8 byte aggregate returns to
-    /// Direct-with-coercion (Phase 3) in addition to Phase 1's sret rule.
-    /// Cryo-internal functions continue to use `classify_return` (no
-    /// Phase 3 applied), so selfhost is not affected.
+    /// `extern "C"` return classification.  Identical to the
+    /// Cryo-internal `classify_return` (same sret / register-coercion /
+    /// DirectPair surface), so this is now a thin alias kept only for
+    /// naming symmetry with `classify_signature_extern_c`.
     classify_return_extern_c(mut &this, t: TypeRef) -> ParamPlan {
-        const tm: TypeMapper* = this.type_mapper;
-        if (!t.is_valid()) {
-            mut slots: LType[] = [];
-            slots.push(LType::void_type());
-            return ParamPlan {
-                cryo_type:  t,
-                cls:      ArgClass::Ignore,
-                llvm_slots: slots,
-                attr:       AbiAttr::None,
-                pointee_ty: LType::null(),
-            };
-        }
-        const arena: TypeArena* = tm.arena;
-        const ty: Type* = arena.lookup(t.id);
-        if (ty == null || ty.kind == TypeKind::Void || ty.kind == TypeKind::Unit) {
-            mut slots: LType[] = [];
-            slots.push(LType::void_type());
-            return ParamPlan {
-                cryo_type:  t,
-                cls:      ArgClass::Ignore,
-                llvm_slots: slots,
-                attr:       AbiAttr::None,
-                pointee_ty: LType::null(),
-            };
-        }
-
-        mut concrete: Type* = ty;
-        if (concrete.kind == TypeKind::TypeAlias) {
-            const alias: TypeAliasType* = concrete as TypeAliasType*;
-            if (alias.has_target()) {
-                const tgt: Type* = arena.lookup(alias.target.id);
-                if (tgt != null) { concrete = tgt; }
-            }
-        }
-        if (concrete.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = concrete as InstantiatedType*;
-            if (inst.has_resolved_type()) {
-                const res: Type* = arena.lookup(inst.resolved_type.id);
-                if (res != null) { concrete = res; }
-            }
-        }
-
-        const is_aggregate: boolean = match (concrete.kind) {
-            TypeKind::Struct => { true }
-            TypeKind::Class  => { true }
-            TypeKind::Enum   => { true }
-            _ => { false }
-        };
-
-        if (is_aggregate) {
-            const sz: u64 = concrete.size_bytes();
-            if (sz > 16) {
-                // Phase 1: large aggregate → sret.
-                const pointee: LType = tm.map_type(t);
-                mut slots: LType[] = [];
-                slots.push(LType::pointer_to(LType::i8()));
-                return ParamPlan {
-                    cryo_type:  t,
-                    cls:      ArgClass::Indirect,
-                    llvm_slots: slots,
-                    attr:       AbiAttr::SRet,
-                    pointee_ty: pointee,
-                };
-            }
-            if (sz > 0 && sz <= 8) {
-                // Phase 3: single eightbyte, coerced to a register.
-                // SSE (§3.3) chooses `double`/`float` when the bucket
-                // is one float-class field that fully occupies it;
-                // otherwise INTEGER.
-                const orig: LType = tm.map_type(t);
-                const slot: LType = this.eightbyte_slot_type(concrete, 0, sz);
-                if (slot.is_valid()) {
-                    mut slots_d: LType[] = [];
-                    slots_d.push(slot);
-                    return ParamPlan {
-                        cryo_type:  t,
-                        cls:      ArgClass::Direct,
-                        llvm_slots: slots_d,
-                        attr:       AbiAttr::None,
-                        pointee_ty: orig,   // coercion target
-                    };
-                }
-            }
-            if (sz > 8 && sz <= 16) {
-                // Phase 3 — DirectPair: split into two eightbytes.
-                // Each bucket classified independently (§3.3): SSE
-                // when all fields in the bucket are float-class and
-                // the bucket has exactly one such field, INTEGER
-                // otherwise.  Mixed return types like `{double, i64}`
-                // for `struct {double a; long b;}` arise naturally.
-                const orig: LType = tm.map_type(t);
-                const lo_slot: LType = this.eightbyte_slot_type(concrete, 0, 8);
-                const hi_slot: LType = this.eightbyte_slot_type(concrete, 8, sz);
-                if (!lo_slot.is_valid() || !hi_slot.is_valid()) {
-                    // Defensive: fall through to Direct on an
-                    // unexpected size (shouldn't trigger for the
-                    // 9..16 window, but bail safely if it does).
-                } else {
-                    mut slots_dp: LType[] = [];
-                    slots_dp.push(lo_slot);
-                    slots_dp.push(hi_slot);
-                    return ParamPlan {
-                        cryo_type:  t,
-                        cls:      ArgClass::DirectPair,
-                        llvm_slots: slots_dp,
-                        attr:       AbiAttr::None,
-                        pointee_ty: orig,   // coercion target
-                    };
-                }
-            }
-        }
-
-        const lty: LType = tm.map_type(t);
-        mut slots: LType[] = [];
-        slots.push(lty);
-        return ParamPlan {
-            cryo_type:  t,
-            cls:      ArgClass::Direct,
-            llvm_slots: slots,
-            attr:       AbiAttr::None,
-            pointee_ty: LType::null(),
-        };
+        return this.classify_return(t);
     }
 
-    /// §3.5 — unified return classification covering Phase 1 (sret for
-    /// > 16 byte aggregates), Phase 3 ≤8 byte Direct-with-coercion, and
-    /// Phase 3 9–16 byte DirectPair.  Same rules as the previous
-    /// `_extern_c` variant; the gating distinction is gone now that
-    /// `codegen_return` knows how to coerce a struct value into the
-    /// declared register-shaped return type.
+    /// Classify a return value: sret for > 16 byte aggregates, ≤ 8 byte
+    /// Direct-with-coercion, and 9–16 byte DirectPair.  Used for both
+    /// Cryo-internal and extern-C returns now that `codegen_return`
+    /// knows how to coerce a struct value into the declared
+    /// register-shaped return type.
     ///
-    /// §3.4 — Tuples, Optional<T>, and Result<T,E> (an ADT enum) all
-    /// classify as aggregates and follow the SysV rules.  Tuple lives
-    /// at `TypeKind::Tuple`, Optional at `TypeKind::Optional`, Result
-    /// at `TypeKind::Enum`.  All flow through the same size-based
-    /// promotion paths below.
+    /// Tuples, Optional<T>, and Result<T,E> (an ADT enum) all classify
+    /// as aggregates and follow the SysV rules.  Tuple lives at
+    /// `TypeKind::Tuple`, Optional at `TypeKind::Optional`, Result at
+    /// `TypeKind::Enum`.  All flow through the same size-based promotion
+    /// paths below.
     classify_return(mut &this, t: TypeRef) -> ParamPlan {
         const tm: TypeMapper* = this.type_mapper;
         if (!t.is_valid()) {
@@ -854,8 +626,8 @@ type struct AbiClassifier {
                 // accept both here.  Result<T,E> lives here.
                 true
             }
-            TypeKind::Tuple    => { true }   // §3.4
-            TypeKind::Optional => { true }   // §3.4
+            TypeKind::Tuple    => { true }
+            TypeKind::Optional => { true }
             _ => { false }
         };
 
@@ -1058,13 +830,14 @@ type struct AbiClassifier {
         if (plan.sret_slot && plan.return_plan.pointee_ty.is_valid()) {
             this.apply_sret_call_attribute(call_val, plan.return_plan.pointee_ty);
         }
-        const sret_off: u32 = if (plan.sret_slot) { 1 } else { 0 } as u32;
         for (mut i: i64 = 0; i < plan.param_plans.length; i++) {
             const pp: ParamPlan = plan.param_plans[i];
             if (pp.cls == ArgClass::Indirect
                     && pp.attr == AbiAttr::ByVal
                     && pp.pointee_ty.is_valid()) {
-                this.apply_byval_call_attribute(call_val, (i as u32) + sret_off, pp.pointee_ty);
+                const slot_i: u32 = llvm_slot_index_of_param(
+                    plan.param_plans, plan.sret_slot, i);
+                this.apply_byval_call_attribute(call_val, slot_i, pp.pointee_ty);
             }
         }
     }
@@ -1112,6 +885,26 @@ function llvm_param_count(plan: SignaturePlan*) -> u32 {
         total += plan.param_plans[i].llvm_slots.length as u32;
     }
     return total;
+}
+
+/// LLVM slot index at which source parameter `param_idx` begins.
+/// Accounts for the hidden `sret` slot (slot 0 when present) and for any
+/// earlier parameters that expand to more than one LLVM slot — a
+/// DirectPair parameter occupies two slots, so every parameter after it
+/// is shifted.  Per-parameter attribute application (`byval`) MUST use
+/// this rather than the source ordinal `param_idx + sret_off`: with
+/// DirectPair params the ordinal no longer equals the LLVM slot index,
+/// and a `byval(%T)` attached at the wrong index lands on an incompatible
+/// (non-pointer) slot — an LLVM verifier failure.
+function llvm_slot_index_of_param(param_plans: ParamPlan[],
+                                  sret: boolean, param_idx: i64) -> u32 {
+    mut idx: u32 = if (sret) { 1 } else { 0 } as u32;
+    mut i: i64 = 0;
+    while (i < param_idx && i < param_plans.length) {
+        idx += param_plans[i].llvm_slots.length as u32;
+        i += 1;
+    }
+    return idx;
 }
 
 /// Concatenate every plan's `llvm_slots` (return prepended when
