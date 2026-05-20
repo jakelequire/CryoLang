@@ -1,0 +1,160 @@
+///! Command / Child — spawn known binaries, check exit status, capture
+///! stdout.  Uses tiny outputs only (the H3 stderr-drain deadlock means
+///! large captures are unsafe).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ProcessCommand;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::core::drop;
+import std::collections::array;
+import std::collections::str;
+import std::io::error;
+import std::io::traits;
+import std::process::command;
+import std::process::child;
+import std::test::error;
+import std::test::assert;
+
+// Compare an Array<u8> against the bytes of a Str.
+function array_eq_str(arr: &Array<u8>, s: Str) -> boolean {
+    const b: Slice<u8> = s.as_bytes();
+    if (arr.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < arr.length()) {
+        match (arr.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+![test]
+function true_command_succeeds() -> Result<(), TestError> {
+    mut cmd: Command = Command::new(Str::new("/bin/true"));
+    mut success: boolean = false;
+    mut code: i32 = -1;
+    match (cmd.status()) {
+        Result::Ok(st) => { success = st.success(); code = st.exit_code().unwrap_or(-1); }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("/bin/true status failed")); }
+    }
+    cmd.drop();
+    match (expect(success, Str::new("/bin/true should report success"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(code, 0);
+}
+
+![test]
+function false_command_fails() -> Result<(), TestError> {
+    mut cmd: Command = Command::new(Str::new("/bin/false"));
+    mut success: boolean = true;
+    mut code: i32 = -1;
+    match (cmd.status()) {
+        Result::Ok(st) => { success = st.success(); code = st.exit_code().unwrap_or(-1); }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("/bin/false status failed")); }
+    }
+    cmd.drop();
+    match (expect_false(success, Str::new("/bin/false should not report success"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(code, 1);
+}
+
+![test]
+function missing_program_exits_127() -> Result<(), TestError> {
+    // execvp fails in the child, which _exit(127)s — the conventional
+    // "command not found" status.
+    mut cmd: Command = Command::new(Str::new("/no/such/cryo_program_xyzzy"));
+    mut code: i32 = -1;
+    match (cmd.status()) {
+        Result::Ok(st) => { code = st.exit_code().unwrap_or(-1); }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("spawn of missing program errored")); }
+    }
+    cmd.drop();
+    return expect_eq(code, 127);
+}
+
+![test]
+function echo_stdout_via_pipe() -> Result<(), TestError> {
+    // Capture stdout through the public Child.stdout pipe handle.
+    mut cmd: Command = Command::new(Str::new("/bin/echo"));
+    cmd.arg(Str::new("hello"));
+    cmd.stdout(Stdio::Piped);
+
+    mut acc: Array<u8> = Array::new();
+    mut chunk: u8[64];
+    mut success: boolean = false;
+    match (cmd.spawn()) {
+        Result::Ok(handle) => {
+            mut c: Child = handle;
+            match (c.stdout) {
+                Option::Some(mut h) => {
+                    loop {
+                        match (h.read(&chunk[0], 64)) {
+                            Result::Ok(n) => {
+                                if (n == 0) { break; }
+                                mut i: u64 = 0;
+                                while (i < n) { acc.push(chunk[i]); i++; }
+                            }
+                            Result::Err(_) => {
+                                c.drop(); cmd.drop(); acc.drop();
+                                return bail(Str::new("reading child stdout failed"));
+                            }
+                        }
+                    }
+                }
+                Option::None => { }
+            }
+            c.stdout = Option::None;
+            match (c.wait()) {
+                Result::Ok(st) => { success = st.success(); }
+                Result::Err(_) => { c.drop(); cmd.drop(); acc.drop(); return bail(Str::new("wait failed")); }
+            }
+            c.drop();
+        }
+        Result::Err(_) => { cmd.drop(); acc.drop(); return bail(Str::new("spawn /bin/echo failed")); }
+    }
+    cmd.drop();
+    const content_ok: boolean = array_eq_str(&acc, Str::new("hello\n"));
+    acc.drop();
+
+    match (expect(success, Str::new("/bin/echo should succeed"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(content_ok, Str::new("echo hello should print \"hello\\n\""));
+}
+
+![test]
+function output_captures_stdout() -> Result<(), TestError> {
+    // The convenience `output()` path: spawn + wait + collect, with the
+    // arguments echoed back joined by a space.
+    mut cmd: Command = Command::new(Str::new("/bin/echo"));
+    cmd.arg(Str::new("foo"));
+    cmd.arg(Str::new("bar"));
+    mut success: boolean = false;
+    mut content_ok: boolean = false;
+    match (cmd.output()) {
+        Result::Ok(out) => {
+            mut o: Output = out;
+            success = o.status.success();
+            content_ok = array_eq_str(&o.stdout, Str::new("foo bar\n"));
+            o.drop();
+        }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("output() failed")); }
+    }
+    cmd.drop();
+    match (expect(success, Str::new("echo foo bar should succeed"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(content_ok, Str::new("output().stdout should be \"foo bar\\n\""));
+}

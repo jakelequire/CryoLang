@@ -1,0 +1,123 @@
+///! Ip / SocketAddr — IPv4 parse/format, rejection cases, v6 limits.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetIp;
+
+import std::core::result;
+import std::core::option;
+import std::collections::str;
+import std::net::ip;
+import std::net::socket_addr;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function parse_localhost_octets() -> Result<(), TestError> {
+    match (IpV4Addr::parse(Str::new("127.0.0.1"))) {
+        Option::Some(v4) => {
+            match (expect_eq(v4.octet(0), 127)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            match (expect_eq(v4.octet(1), 0))   { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            match (expect_eq(v4.octet(2), 0))   { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            match (expect_eq(v4.octet(3), 1))   { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            return expect(v4.is_loopback(), Str::new("127.0.0.1 should be loopback"));
+        }
+        Option::None => { return bail(Str::new("127.0.0.1 should parse")); }
+    }
+}
+
+![test]
+function parse_unspecified() -> Result<(), TestError> {
+    match (IpV4Addr::parse(Str::new("0.0.0.0"))) {
+        Option::Some(v4) => {
+            return expect(v4.is_unspecified(), Str::new("0.0.0.0 should be unspecified"));
+        }
+        Option::None => { return bail(Str::new("0.0.0.0 should parse")); }
+    }
+}
+
+![test]
+function to_u32_is_big_endian() -> Result<(), TestError> {
+    const v4: IpV4Addr = IpV4Addr::new(1, 2, 3, 4);
+    const want: u32 = 16909060;            // 0x01020304
+    return expect_eq(v4.to_u32(), want);
+}
+
+![test]
+function parse_rejects_out_of_range_octet() -> Result<(), TestError> {
+    const r: boolean = IpV4Addr::parse(Str::new("256.0.0.1")).is_some();
+    return expect_false(r, Str::new("256.0.0.1 has an out-of-range octet"));
+}
+
+![test]
+function parse_rejects_too_few_parts() -> Result<(), TestError> {
+    const r: boolean = IpV4Addr::parse(Str::new("1.2.3")).is_some();
+    return expect_false(r, Str::new("1.2.3 has too few octets"));
+}
+
+![test]
+function parse_rejects_too_many_parts() -> Result<(), TestError> {
+    const r: boolean = IpV4Addr::parse(Str::new("1.2.3.4.5")).is_some();
+    return expect_false(r, Str::new("1.2.3.4.5 has too many octets"));
+}
+
+![test]
+function parse_rejects_trailing_dot() -> Result<(), TestError> {
+    const r: boolean = IpV4Addr::parse(Str::new("1.2.3.")).is_some();
+    return expect_false(r, Str::new("1.2.3. has a trailing separator"));
+}
+
+![test]
+function parse_rejects_empty() -> Result<(), TestError> {
+    const r: boolean = IpV4Addr::parse(Str::new("")).is_some();
+    return expect_false(r, Str::new("empty string is not an address"));
+}
+
+![test]
+function ipaddr_parse_v4_is_ipv4() -> Result<(), TestError> {
+    match (IpAddr::parse(Str::new("10.0.0.1"))) {
+        Option::Some(addr) => {
+            match (expect(addr.is_ipv4(), Str::new("10.0.0.1 should be v4"))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            return expect_false(addr.is_ipv6(), Str::new("10.0.0.1 should not be v6"));
+        }
+        Option::None => { return bail(Str::new("10.0.0.1 should parse")); }
+    }
+}
+
+![test]
+function ipaddr_parse_rejects_garbage() -> Result<(), TestError> {
+    const r: boolean = IpAddr::parse(Str::new("not.an.ip.addr")).is_some();
+    return expect_false(r, Str::new("garbage should not parse"));
+}
+
+// IPv6 textual parsing is not implemented (audit H6); IpAddr::parse falls
+// through to the v4 parser, which rejects the colon form. This pins the
+// current limitation rather than asserting v6 works.
+![test]
+function ipaddr_parse_v6_unsupported() -> Result<(), TestError> {
+    const r: boolean = IpAddr::parse(Str::new("::1")).is_some();
+    return expect_false(r, Str::new("v6 textual parse is not implemented (returns None)"));
+}
+
+![test]
+function socket_addr_parse_v4() -> Result<(), TestError> {
+    match (SocketAddr::parse_v4(Str::new("127.0.0.1:8080"))) {
+        Option::Some(sa) => {
+            const want_port: u16 = 8080;
+            match (expect_eq(sa.port, want_port)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            return expect(sa.ip.is_ipv4(), Str::new("parsed socket addr should hold a v4 ip"));
+        }
+        Option::None => { return bail(Str::new("127.0.0.1:8080 should parse")); }
+    }
+}
+
+![test]
+function socket_addr_rejects_missing_port() -> Result<(), TestError> {
+    const r: boolean = SocketAddr::parse_v4(Str::new("127.0.0.1")).is_some();
+    return expect_false(r, Str::new("address without a port should not parse"));
+}
+
+![test]
+function socket_addr_rejects_port_overflow() -> Result<(), TestError> {
+    const r: boolean = SocketAddr::parse_v4(Str::new("127.0.0.1:99999")).is_some();
+    return expect_false(r, Str::new("port above 65535 should not parse"));
+}
