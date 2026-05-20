@@ -154,6 +154,27 @@ type struct CallEmitter {
         return false;
     }
 
+    /// Produce the ADDRESS of a value for auto-ref (a by-value argument
+    /// passed to a `&T` parameter).  When `v` is a `load` instruction we
+    /// recover its pointer operand — the original lvalue's address — so a
+    /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
+    /// literal, a global like a string constant, a computed value) we spill
+    /// it to a fresh stack slot and return that slot's address.
+    address_of_value(&this, v: LValue) -> LValue {
+        // LLVMOpcode::Load == 27.  On non-instruction values (globals,
+        // constants) GetInstructionOpcode won't return 27, so we fall
+        // through to the spill path.
+        const opcode: i32 = llvm::LLVMGetInstructionOpcode(v.raw);
+        if (opcode == 27) {
+            const operand: void* = llvm::LLVMGetOperand(v.raw, 0);
+            if (operand != null) { return LValue { raw: operand }; }
+        }
+        const ty: LType = LType { raw: llvm::LLVMTypeOf(v.raw) };
+        const slot: LValue = this.cg.builder.build_alloca(ty, "argref");
+        this.cg.builder.build_store(v, slot);
+        return slot;
+    }
+
 
     // ========================================================================
     // Main emit
@@ -957,7 +978,15 @@ type struct CallEmitter {
             args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
-            const arg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
+            mut arg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
+            // Auto-ref: sema flagged this by-value argument as bound to a
+            // reference (`&T`) parameter, so pass the value's ADDRESS, not
+            // the value itself.  Without this, a scalar would be `inttoptr`'d
+            // and a pointer-shaped value (`string`) passed one indirection
+            // short, then dereferenced by the callee → crash.
+            if (node.arguments[i].autoref && arg.is_valid()) {
+                arg = this.address_of_value(arg);
+            }
             args.push(Pair<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
         }
 
