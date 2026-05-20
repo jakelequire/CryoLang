@@ -110,12 +110,27 @@ type struct Array<T, A = GlobalAlloc> {
         return this.length == 0;
     }
 
-    /// Bounds-checked read by value.
-    get(&this, index: u64) -> Option<T> {
+    /// Bounds-checked read by value. Gated on `T: Copy`: the result is
+    /// an independent bitwise duplicate while the array retains ownership
+    /// of the stored element, so handing back a copy is only sound when
+    /// `T` carries no `Drop` obligation. For owning `T`, borrow in place
+    /// with `get_ptr` (or move an element out with `swap_remove`/`pop`).
+    get(&this, index: u64) -> Option<T> where T: Copy {
         if (index >= this.length) {
             return Option::None;
         }
         return Option::Some(this.ptr[index]);
+    }
+
+    /// Bounds-checked borrow. Returns a pointer to the element in place;
+    /// the array keeps ownership, so this is sound for every `T` (Copy or
+    /// owning). The pointer is invalidated by any reallocating method
+    /// (`push`, `reserve`, `shrink_to_fit`).
+    get_ptr(&this, index: u64) -> Option<T*> {
+        if (index >= this.length) {
+            return Option::None;
+        }
+        return Option::Some(mem::offset(this.ptr, index as i64));
     }
 
     /// Raw pointer. Invalidated by any method that may reallocate
@@ -130,13 +145,13 @@ type struct Array<T, A = GlobalAlloc> {
         return Slice::from_raw(this.ptr, this.length);
     }
 
-    /// Iterate over the elements in order. The iterator yields each
-    /// element by value (bitcopy); like `get`, this is sound for
-    /// `Copy`-shaped `T` and a borrow-style use for owning `T`: do
-    /// not drop the yielded value, since the storage still belongs
-    /// to the array. The iterator is invalidated by any reallocating
-    /// method on the array (`push`, `reserve`, `shrink_to_fit`).
-    iter(&this) -> SliceIter<T> {
+    /// Iterate over the elements in order, yielding each by value
+    /// (bitwise copy). Gated on `T: Copy` for the same reason as `get`:
+    /// a yielded owning value would alias storage the array still owns.
+    /// For owning `T`, walk by index with `length()` + `get_ptr`. The
+    /// iterator is invalidated by any reallocating method on the array
+    /// (`push`, `reserve`, `shrink_to_fit`).
+    iter(&this) -> SliceIter<T> where T: Copy {
         return SliceIter<T> { ptr: this.ptr, remaining: this.length };
     }
 

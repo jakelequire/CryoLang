@@ -78,39 +78,48 @@ are always Direct.
 | `void` / `Unit`     | —         | `Ignore` (LLVM `void`, no slot)                                               |
 | Scalar / primitive  | —         | `Direct` (one LLVM slot = source type)                                        |
 | Aggregate           | 0 / inv.  | falls back to `Direct` (whatever `map_type` says)                             |
-| Aggregate           | 1–8       | `Direct` with coercion — one register-sized slot (see §3 for slot type)       |
+| Aggregate           | 1–8       | `Direct` with coercion — one register-sized slot (slot type per the eightbyte rules below) |
 | Aggregate           | 9–16      | `DirectPair` — two register-sized slots, wrapped in `{lo, hi}` literal struct |
 | Aggregate           | > 16      | `Indirect` with `SRet` — hidden first `ptr sret(%T)` parameter, LLVM returns `void` |
 
 ### Parameters
 
-Today only the `extern "C"` parameter classifier
-(`classify_param_extern_c`) applies the full Phase 3 rules; the
-Cryo-internal `classify_param` keeps the legacy "≤ 16 byte aggregate ⇒
-plain `Direct(struct)`" behavior pending the §3.5 param-side follow-up.
-The prologue (`codegen_function_prologue` and `codegen_method_prologue`)
-and `declare_method`'s LLVM slot assembly are already DirectPair-ready
-— they query `classify_param` per source param, walk LLVM slot indices
-by `plan.llvm_slots.length`, and reconstruct the source struct from
-`(lo, hi)` slots via store-at-+0 / store-at-+8. Flipping the
-classifier exercises those paths but currently surfaces a self-bootstrap
-heap-corruption issue inside LLVM's `BuildGlobalStringPtr` from the
-compiler's own `StringCache::get_or_create`; the suspected cause is an
-LBuilder ≤ 8 byte coercion mismatch we haven't isolated.  Both paths
-agree for byval and non-aggregate values:
+The parameter classifier is unified: `classify_param` applies the same
+rules for **both** Cryo-internal and `extern "C"` callees, so the table
+below is the single rule for parameters.
+`classify_param_extern_c` / `classify_return_extern_c` /
+`classify_signature_extern_c` survive only as thin aliases that delegate
+to the unified classifiers.
 
 | Source kind         | Size      | Plan                                                                          |
 |---------------------|-----------|-------------------------------------------------------------------------------|
-| Scalar / primitive  | —         | `Direct`                                                                      |
-| Aggregate           | 1–8       | extern-C: `Direct` with coercion. Internal: plain `Direct(struct)`.           |
-| Aggregate           | 9–16      | extern-C: `DirectPair`.            Internal: plain `Direct(struct)`.          |
+| Scalar / primitive  | —         | `Direct` (one LLVM slot = source type)                                        |
+| Aggregate           | 1–8       | `Direct` with coercion — one register-sized slot (slot type per the eightbyte rules below) |
+| Aggregate           | 9–16      | `DirectPair` — two register-sized slots                                       |
 | Aggregate           | > 16      | `Indirect` with `ByVal` — single `ptr byval(%T)` slot                         |
 
-The split exists because flipping the internal param classifier
-requires coordinated prologue work (the prologue's per-source-param
-slot iteration assumes one LLVM slot per source param, which
-DirectPair breaks). The return-side §3.5 work is complete; the
-param-side internal flip remains a planned follow-up.
+The prologue (`codegen_function_prologue` and `codegen_method_prologue`)
+and `declare_method`'s LLVM slot assembly consume these plans
+symmetrically: they query `classify_param` per source param, walk LLVM
+slot indices by `plan.llvm_slots.length` (so a DirectPair param advances
+the index by two), and reconstruct the source struct from `(lo, hi)`
+slots via store-at-+0 / store-at-+8.
+
+Because a source parameter can now contribute more than one LLVM slot,
+per-parameter attribute attachment (`byval(%T)`) computes the parameter's
+starting LLVM slot via `llvm_slot_index_of_param` (which accounts for the
+hidden sret slot and earlier DirectPair expansions) rather than the raw
+source ordinal — attaching at the ordinal would land the attribute on an
+incompatible slot once any earlier parameter is a DirectPair.
+
+The call site recovers a coerced aggregate's size from the **lowered LLVM
+type** (`agg_register_size`), not the Cryo `size_bytes()`. This is
+load-bearing: an argument can carry an unresolved `InstantiatedType`
+whose `size_bytes()` is 0 even though `map_type` lowers it to a correct
+16-byte struct, and a `string` literal can be implicitly coerced to a
+`Str` parameter as a bare `i8*`. Reading the size off the value/lowered
+type (with a slot-budget fallback when the source carries no struct size)
+keeps the call site's slot count in agreement with the callee.
 
 ## 3. Eightbyte slot classification
 
@@ -178,6 +187,13 @@ the LLVM-actual and LLVM-expected types disagree:
 
 - `Integer | Float | Double | Vector` expected, `Struct` actual:
   ≤ 8 byte aggregate param — spill struct, reload as scalar/vector.
+- `Integer | Float | Double | Vector` expected, `Pointer` actual where
+  the arg is an ≤ 8 byte aggregate by *address* (an lvalue, or a `T*` /
+  `&T` to the aggregate, detected via `agg_register_size`): load the
+  register through the pointer. This takes priority over the generic
+  `Integer ← Pointer` `ptrtoint` below — `ptrtoint`-ing the address
+  would pass the pointer where the callee expects the aggregate's bytes
+  (e.g. an 8-byte `LBuilder` reached through `this.builder: LBuilder*`).
 - `Struct` expected, `Integer | Float | Double | Vector` actual:
   the arg came from a register-shaped aggregate return; reshape into
   the named struct.
@@ -187,10 +203,13 @@ the LLVM-actual and LLVM-expected types disagree:
 - Various `Integer ↔ Pointer`, `Struct ↔ Pointer` cases for receiver /
   reference plumbing (pre-existing, not ABI-driven).
 
-DirectPair param expansion (a single source-struct arg expanding into
-two LLVM scalar slots) is handled by
-`codegen_call_direct_dp_expand`, dispatched from `codegen_call_direct`
-when `expected_count > n`.
+DirectPair param expansion (a single source aggregate expanding into two
+LLVM register slots) is handled by `codegen_call_direct_dp_expand`,
+dispatched from `codegen_call_direct` when `expected_count > n`. It
+handles all three argument shapes — struct value (spill to temp), lvalue
+address, and pointer/reference to the aggregate — loading `lo` at +0 and
+`hi` at +8, with a slot-budget fallback for sources that carry no struct
+size (e.g. a `string` literal coerced to a `Str` parameter).
 
 ### Defining-side coercion (callee)
 

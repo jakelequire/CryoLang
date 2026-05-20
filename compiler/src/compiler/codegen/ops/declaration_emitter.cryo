@@ -422,16 +422,20 @@ type struct DeclarationEmitter {
         }
 
         // Phase 2: attach `byval(%T)` to each LLVM parameter slot whose
-        // source param is a large aggregate.  The LLVM index for source
-        // param `i` is `i + sret_inc` (sret takes slot 0 if present).
-        // Skipped when the main-widening branch ran (empty plan_param_plans).
-        const sret_inc_fn: u32 = if (sret_pointee.is_valid()) { 1 } else { 0 } as u32;
+        // source param is a large aggregate.  The LLVM slot index of a
+        // source param accounts for the hidden sret slot AND for earlier
+        // params that expanded to multiple slots (DirectPair = 2), so it
+        // is computed via `llvm_slot_index_of_param` rather than the raw
+        // source ordinal.  Skipped when the main-widening branch ran
+        // (empty plan_param_plans).
+        const sret_present_fn: boolean = sret_pointee.is_valid();
         for (mut pi: i64 = 0; pi < plan_param_plans.length; pi++) {
             const pp_fn: ParamPlan = plan_param_plans[pi];
             if (pp_fn.cls == ArgClass::Indirect
                     && pp_fn.attr == AbiAttr::ByVal
                     && pp_fn.pointee_ty.is_valid()) {
-                const llvm_idx: u32 = (pi as u32) + sret_inc_fn;
+                const llvm_idx: u32 = llvm_slot_index_of_param(
+                    plan_param_plans, sret_present_fn, pi);
                 this.abi.apply_byval_attribute(fn_val, llvm_idx, pp_fn.pointee_ty);
             }
         }
@@ -856,8 +860,8 @@ type struct DeclarationEmitter {
             sret_pointee = ret_plan.pointee_ty;
         } else if (ret_plan.cls == ArgClass::DirectPair
                 && ret_plan.llvm_slots.length == 2) {
-            // §3.5 DirectPair return: wrap the two eightbyte slots in
-            // an anonymous LLVM literal struct so the signature reads
+            // DirectPair return: wrap the two eightbyte slots in an
+            // anonymous LLVM literal struct so the signature reads
             // e.g. `{i64, i64}` — matches what `build_llvm_fn_type`
             // produces for free functions taking the same return.
             const dp_buf: void* = intrinsics::malloc(2 * 8);
@@ -959,8 +963,8 @@ type struct DeclarationEmitter {
         const has_sret_slot: boolean = sret_pointee.is_valid();
         const sret_inc: u32 = if (has_sret_slot) { 1 } else { 0 } as u32;
 
-        // §3.5 — pre-classify each non-receiver source param so we
-        // know how many LLVM slots it contributes (DirectPair = 2,
+        // Pre-classify each non-receiver source param so we know how
+        // many LLVM slots it contributes (DirectPair = 2,
         // everything else = 1).  Receivers (`&this` / by-value
         // `this`) always contribute one slot; the override logic
         // keeps them out of the seam.  We build each plan in
@@ -1222,14 +1226,14 @@ type struct DeclarationEmitter {
             if (plan.sret_slot && plan.return_plan.pointee_ty.is_valid()) {
                 this.abi.apply_sret_attribute(fn_val, plan.return_plan.pointee_ty);
             }
-            const sret_off_ex: u32 = if (plan.sret_slot) { 1 } else { 0 } as u32;
             for (mut xi: i64 = 0; xi < plan.param_plans.length; xi++) {
                 const xpp: ParamPlan = plan.param_plans[xi];
                 if (xpp.cls == ArgClass::Indirect
                         && xpp.attr == AbiAttr::ByVal
                         && xpp.pointee_ty.is_valid()) {
-                    this.abi.apply_byval_attribute(
-                        fn_val, (xi as u32) + sret_off_ex, xpp.pointee_ty);
+                    const exslot: u32 = llvm_slot_index_of_param(
+                        plan.param_plans, plan.sret_slot, xi);
+                    this.abi.apply_byval_attribute(fn_val, exslot, xpp.pointee_ty);
                 }
             }
 
@@ -1443,8 +1447,8 @@ type struct DeclarationEmitter {
                 continue;
             }
 
-            // §3.5 — query the classifier so we know how many LLVM
-            // slots this source param consumes.  Direct ≤ 8 byte
+            // Query the classifier so we know how many LLVM slots this
+            // source param consumes.  Direct ≤ 8 byte
             // aggregate: one register-shaped slot whose bytes match
             // the source struct (opaque-pointer store at the source-
             // typed alloca round-trips).  DirectPair 9–16 byte: two
@@ -1776,9 +1780,9 @@ type struct DeclarationEmitter {
                 continue;
             }
 
-            // §3.5 — DirectPair: two LLVM slots, store lo at +0 and
-            // hi at +8 of a source-typed alloca.  Other Direct
-            // shapes (≤ 8 byte coerced and plain) use a single slot.
+            // DirectPair: two LLVM slots, store lo at +0 and hi at +8
+            // of a source-typed alloca.  Other Direct shapes (≤ 8 byte
+            // coerced and plain) use a single slot.
             const pplan_m: ParamPlan = this.abi.classify_param(param.resolved_type);
             if (pplan_m.cls == ArgClass::DirectPair
                     && pplan_m.llvm_slots.length == 2) {
