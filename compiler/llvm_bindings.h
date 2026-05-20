@@ -420,6 +420,10 @@ LLVMTargetDataRef    LLVMCreateTargetDataLayout(LLVMTargetMachineRef T);
 char                *LLVMCopyStringRepOfTargetData(LLVMTargetDataRef TD);
 void                 LLVMDisposeTargetData(LLVMTargetDataRef TD);
 
+/* Module-owned data layout + type sizing (no dispose: owned by module) */
+LLVMTargetDataRef    LLVMGetModuleDataLayout(LLVMModuleRef M);
+unsigned long long   LLVMABISizeOfType(LLVMTargetDataRef TD, LLVMTypeRef Ty);
+
 /* Emit object/assembly to file */
 LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M,
                                      const char *Filename, int codegen, char **ErrorMessage);
