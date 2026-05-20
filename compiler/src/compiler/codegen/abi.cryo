@@ -294,16 +294,23 @@ type struct AbiClassifier {
     /// `pointee_ty` so callers/callees can attach the `byval(%T)`
     /// attribute that defines the copy semantics.
     ///
-    /// Phase 3 (eightbyte classification for ≤16-byte aggregates) plugs
-    /// in at the `is_aggregate && size <= 16` branch.
+    /// Phase 3 ≤16 byte aggregate coercion is *not yet* applied to
+    /// Cryo-internal parameter passing — the §3.5 follow-up.  The
+    /// prologue and `declare_method` slot-assembly code paths are
+    /// already DirectPair-ready (no-op until this classifier flips),
+    /// but flipping classify_param surfaces a self-bootstrap heap-
+    /// corruption issue we haven't isolated: stage-3 (the compiler
+    /// built by stage-2 from current source) segfaults inside
+    /// `LLVMBuildGlobalStringPtr` when the compiler's own
+    /// `StringCache::get_or_create` is called.  Suspected cause is
+    /// the LBuilder ≤ 8 byte coercion mismatch surfacing through
+    /// some path the simple repros don't catch.  Until isolated,
+    /// Cryo-internal params keep the legacy "plain `Direct(struct)`"
+    /// shape; extern-C calls continue to use
+    /// `classify_param_extern_c` for the full Phase 3 surface.
     ///
-    /// Same caveat as `classify_return` w.r.t. tuples / Optional /
-    /// Result: they are aggregates at the LLVM level but their Cryo-
-    /// internal call sites pass them as struct values today; classifying
-    /// them as `Indirect` here without a coordinated call-site update
-    /// would break selfhost.  Until those internals route through the
-    /// seam, only user-declared struct / class / ADT-enum parameters
-    /// promote.
+    /// §3.4 — Tuple, Optional, and ADT enum (Result) follow the same
+    /// SysV byval rule as Struct / Class.
     classify_param(mut &this, t: TypeRef) -> ParamPlan {
         const tm: TypeMapper* = this.type_mapper;
         if (!t.is_valid()) {
@@ -319,8 +326,6 @@ type struct AbiClassifier {
         const arena: TypeArena* = tm.arena;
         const ty: Type* = arena.lookup(t.id);
         if (ty == null) {
-            // Unmappable type — leave the legacy Direct shape so the
-            // caller bails the same way it did pre-Phase-2.
             mut slots_fb: LType[] = [];
             const lty_fb: LType = tm.map_type(t);
             if (lty_fb.is_valid()) { slots_fb.push(lty_fb); }
@@ -333,9 +338,9 @@ type struct AbiClassifier {
             };
         }
 
-        // Follow type aliases / instantiated types to the concrete kind
-        // so a `type alias Foo = LargeStruct` follows the same rule as
-        // a direct `LargeStruct` parameter.  Mirrors `classify_return`.
+        // Follow type aliases / instantiated types to the concrete
+        // kind so a `type alias Foo = LargeStruct` follows the same
+        // rule as a direct `LargeStruct` parameter.
         mut concrete: Type* = ty;
         if (concrete.kind == TypeKind::TypeAlias) {
             const alias: TypeAliasType* = concrete as TypeAliasType*;
@@ -353,13 +358,16 @@ type struct AbiClassifier {
         }
 
         const is_aggregate: boolean = match (concrete.kind) {
-            TypeKind::Struct => { true }
-            TypeKind::Class  => { true }
-            TypeKind::Enum   => { true }
+            TypeKind::Struct   => { true }
+            TypeKind::Class    => { true }
+            TypeKind::Enum     => { true }
+            TypeKind::Tuple    => { true }
+            TypeKind::Optional => { true }
             _ => { false }
         };
 
         if (is_aggregate && concrete.size_bytes() > 16) {
+            // Phase 2: large aggregate → byval.
             const pointee: LType = tm.map_type(t);
             mut slots_iv: LType[] = [];
             slots_iv.push(LType::pointer_to(LType::i8()));
@@ -372,6 +380,10 @@ type struct AbiClassifier {
             };
         }
 
+        // ≤ 16 byte aggregates: legacy plain `Direct(struct)` for
+        // Cryo-internal callers (§3.5 param-side follow-up).  Extern-
+        // C paths go through `classify_param_extern_c` and DO get the
+        // Phase 3 Direct-with-coercion / DirectPair shapes.
         mut slots: LType[] = [];
         const lty: LType = tm.map_type(t);
         if (lty.is_valid()) { slots.push(lty); }

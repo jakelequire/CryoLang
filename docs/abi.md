@@ -87,8 +87,17 @@ are always Direct.
 Today only the `extern "C"` parameter classifier
 (`classify_param_extern_c`) applies the full Phase 3 rules; the
 Cryo-internal `classify_param` keeps the legacy "≤ 16 byte aggregate ⇒
-plain `Direct(struct)`" behavior. Both paths agree for byval and
-non-aggregate values:
+plain `Direct(struct)`" behavior pending the §3.5 param-side follow-up.
+The prologue (`codegen_function_prologue` and `codegen_method_prologue`)
+and `declare_method`'s LLVM slot assembly are already DirectPair-ready
+— they query `classify_param` per source param, walk LLVM slot indices
+by `plan.llvm_slots.length`, and reconstruct the source struct from
+`(lo, hi)` slots via store-at-+0 / store-at-+8. Flipping the
+classifier exercises those paths but currently surfaces a self-bootstrap
+heap-corruption issue inside LLVM's `BuildGlobalStringPtr` from the
+compiler's own `StringCache::get_or_create`; the suspected cause is an
+LBuilder ≤ 8 byte coercion mismatch we haven't isolated.  Both paths
+agree for byval and non-aggregate values:
 
 | Source kind         | Size      | Plan                                                                          |
 |---------------------|-----------|-------------------------------------------------------------------------------|
