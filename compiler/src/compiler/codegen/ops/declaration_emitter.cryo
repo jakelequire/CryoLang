@@ -958,7 +958,65 @@ type struct DeclarationEmitter {
         // `add_function` below, mirroring `declare_function`.
         const has_sret_slot: boolean = sret_pointee.is_valid();
         const sret_inc: u32 = if (has_sret_slot) { 1 } else { 0 } as u32;
-        const total_params: u32 = user_param_count
+
+        // §3.5 — pre-classify each non-receiver source param so we
+        // know how many LLVM slots it contributes (DirectPair = 2,
+        // everything else = 1).  Receivers (`&this` / by-value
+        // `this`) always contribute one slot; the override logic
+        // keeps them out of the seam.  We build each plan in
+        // final form to avoid re-assigning across move-checker
+        // boundaries.
+        mut user_plans: ParamPlan[] = [];
+        mut total_user_slots: u32 = 0;
+        for (mut i: u32 = 0; i < fixed_user_count; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null) {
+                mut empty_slots: LType[] = [];
+                user_plans.push(ParamPlan {
+                    cryo_type:  TypeRef::invalid(),
+                    cls:      ArgClass::Direct,
+                    llvm_slots: empty_slots,
+                    attr:       AbiAttr::None,
+                    pointee_ty: LType::null(),
+                });
+                continue;
+            }
+            const param_name_pre: string = intern.resolve(param.name);
+            const is_amp_this: boolean =
+                intrinsics::strcmp(param_name_pre, "&this") == 0 && this_ty.is_valid();
+            const is_val_this: boolean =
+                intrinsics::strcmp(param_name_pre, "this") == 0
+                && target_mapped.is_valid() && param.type_annotation == null;
+            if (is_amp_this) {
+                mut s_amp: LType[] = [];
+                s_amp.push(this_ty);
+                total_user_slots += 1;
+                user_plans.push(ParamPlan {
+                    cryo_type:  param.resolved_type,
+                    cls:      ArgClass::Direct,
+                    llvm_slots: s_amp,
+                    attr:       AbiAttr::None,
+                    pointee_ty: LType::null(),
+                });
+            } else if (is_val_this) {
+                mut s_val: LType[] = [];
+                s_val.push(target_mapped);
+                total_user_slots += 1;
+                user_plans.push(ParamPlan {
+                    cryo_type:  param.resolved_type,
+                    cls:      ArgClass::Direct,
+                    llvm_slots: s_val,
+                    attr:       AbiAttr::None,
+                    pointee_ty: LType::null(),
+                });
+            } else {
+                const pplan_n: ParamPlan = this.abi.classify_param(param.resolved_type);
+                total_user_slots += pplan_n.llvm_slots.length as u32;
+                user_plans.push(pplan_n);
+            }
+        }
+
+        const total_params: u32 = total_user_slots
             + (if (prepend_implicit_this) { 1 } else { 0 } as u32)
             + sret_inc;
 
@@ -967,8 +1025,7 @@ type struct DeclarationEmitter {
 
         // Parallel array tracking the byval pointee for each LLVM
         // parameter slot.  `LType::null()` for slots that are NOT
-        // byval (sret slot, receiver, scalar params, struct params
-        // ≤16 bytes).  Walked after `add_function` to attach the
+        // byval.  Walked after `add_function` to attach the
         // `byval(%T)` attribute to the right LLVM indices.
         mut byval_pointees: LType[] = [];
         for (mut bi: u32 = 0; bi < total_params; bi++) {
@@ -987,47 +1044,44 @@ type struct DeclarationEmitter {
 
         mut params_valid: boolean = true;
         for (mut i: u32 = 0; i < fixed_user_count; i++) {
-            const param: VarDeclNode* = func.parameters[i];
-            if (param == null) { continue; }
-            const param_name: string = intern.resolve(param.name);
-
-            // For `&this` and `mut &this`, force the LLVM type to `T*`;
-            // parser-synthesized reference annotations may not round-trip
-            // through the arena correctly for every method.
-            // For by-value `this` with NO type annotation (parser-synthesized
-            // self form), use the struct type directly.  But `this: Lexer*`
-            // a user-written explicit annotation on a param named `this`
-            // is just a regular typed parameter; map via resolved_type.
-            mut mapped_param: LType = LType::null();
-            if (intrinsics::strcmp(param_name, "&this") == 0 && this_ty.is_valid()) {
-                mapped_param = this_ty;
-            } else if (intrinsics::strcmp(param_name, "this") == 0 && target_mapped.is_valid()
-                       && param.type_annotation == null) {
-                mapped_param = target_mapped;
-            } else {
-                // Non-receiver param: run it through the seam so a
-                // >16-byte aggregate is lowered to a byval `ptr`
-                // slot, matching what `build_function_ltype` will
-                // produce for cross-module externs of this method.
-                const pplan: ParamPlan = this.abi.classify_param(
-                    param.resolved_type);
-                if (pplan.cls == ArgClass::Indirect
-                        && pplan.attr == AbiAttr::ByVal
-                        && pplan.pointee_ty.is_valid()) {
-                    mapped_param = LType::pointer_to(LType::i8());
-                    byval_pointees[idx] = pplan.pointee_ty;
-                } else if (pplan.llvm_slots.length > 0) {
-                    mapped_param = pplan.llvm_slots[0];
+            const pplan: ParamPlan = user_plans[i as i64];
+            if (pplan.cls == ArgClass::Indirect
+                    && pplan.attr == AbiAttr::ByVal
+                    && pplan.pointee_ty.is_valid()) {
+                slots[idx] = LType::pointer_to(LType::i8()).raw;
+                byval_pointees[idx] = pplan.pointee_ty;
+                idx += 1;
+                continue;
+            }
+            if (pplan.llvm_slots.length == 0) {
+                // Defensive: fall back to map_type so we don't emit
+                // a malformed signature.  This branch only fires for
+                // null params (which the loop above produced an
+                // empty plan for).
+                const param: VarDeclNode* = func.parameters[i];
+                const fallback: LType = if (param != null) {
+                    this.type_mapper.map_type(param.resolved_type)
                 } else {
-                    mapped_param = this.type_mapper.map_type(param.resolved_type);
+                    LType::null()
+                };
+                if (!fallback.is_valid()) {
+                    params_valid = false;
+                    break;
                 }
+                slots[idx] = fallback.raw;
+                idx += 1;
+                continue;
             }
-            if (!mapped_param.is_valid()) {
-                params_valid = false;
-                break;
+            for (mut si: i64 = 0; si < pplan.llvm_slots.length; si++) {
+                const slot_ty: LType = pplan.llvm_slots[si];
+                if (!slot_ty.is_valid()) {
+                    params_valid = false;
+                    break;
+                }
+                slots[idx] = slot_ty.raw;
+                idx += 1;
             }
-            slots[idx] = mapped_param.raw;
-            idx += 1;
+            if (!params_valid) { break; }
         }
 
         if (!params_valid) {
@@ -1070,11 +1124,13 @@ type struct DeclarationEmitter {
         // overloads share the same `Type::method` form).
         // The arity tracked in the function registry is the *source-level*
         // arity (counting any implicit `&this`, but *not* the hidden
-        // sret slot).  Call-site lookups in `call_emitter.cryo` count
-        // source arguments and need to match what extern registrations
-        // record (which is `ft.param_types.length` — also source-level).
-        // Subtracting `sret_inc` keeps both registration paths aligned.
-        const registry_arity: u32 = total_params - sret_inc;
+        // sret slot, and *not* counting per-source-param LLVM slot
+        // expansion like DirectPair).  Call-site lookups in
+        // `call_emitter.cryo` count source arguments and need to match
+        // what extern registrations record (`ft.param_types.length` —
+        // also source-level).
+        const registry_arity: u32 = user_param_count
+            + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
         this.functions.register(combined_sym, fn_val);
         this.functions.register_with_arity(combined_sym, registry_arity, fn_val);
         this.functions.register(mangled_sym, fn_val);
@@ -1350,7 +1406,7 @@ type struct DeclarationEmitter {
         // source parameter).  Source parameters start at LLVM index 1.
         // Codegen_return reads the same slot via LLVMGetParam(fn, 0).
         const is_sret_fn: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
-        const llvm_param_base: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
+        mut llvm_idx: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
 
         const fixed_count: u32 = fixed_param_count(node);
         for (mut i: u32 = 0; i < fixed_count; i++) {
@@ -1368,11 +1424,6 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            const llvm_idx: u32 = llvm_param_base + i;
-            const arg: LValue = LValue {
-                raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
-            };
-
             // Phase 2 — byval: the LLVM parameter at this slot is a
             // `ptr` pointing at a caller-allocated copy of the value.
             // We bind that pointer directly to the source name (same
@@ -1384,13 +1435,57 @@ type struct DeclarationEmitter {
             const byval_pointee: LType =
                 this.abi.byval_pointee_of_param(fn_val, llvm_idx);
             if (byval_pointee.is_valid()) {
+                const arg: LValue = LValue {
+                    raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
+                };
                 this.values.set(param.name, arg);
+                llvm_idx += 1;
+                continue;
+            }
+
+            // §3.5 — query the classifier so we know how many LLVM
+            // slots this source param consumes.  Direct ≤ 8 byte
+            // aggregate: one register-shaped slot whose bytes match
+            // the source struct (opaque-pointer store at the source-
+            // typed alloca round-trips).  DirectPair 9–16 byte: two
+            // register-shaped slots, lo + hi, stored at offsets 0
+            // and 8 of a source-typed alloca.  Plain Direct: one
+            // slot whose type matches the source, store as before.
+            const pplan: ParamPlan = this.abi.classify_param(param.resolved_type);
+            if (pplan.cls == ArgClass::DirectPair
+                    && pplan.llvm_slots.length == 2) {
+                const alloca: LValue = this.flow.create_entry_alloca(
+                    fn_val, param_name, param_ty);
+                const lo_arg: LValue = LValue {
+                    raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
+                };
+                const hi_arg: LValue = LValue {
+                    raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx + 1),
+                };
+                this.builder.build_store(lo_arg, alloca);
+                // GEP at byte offset 8 via i8 base, mirroring the
+                // call-site DirectPair expansion.
+                const i8_ty: LType = LType::i8();
+                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_slots: void** = idx_buf as void**;
+                const eight: LValue = LType::const_int(LType::i64(), 8, false);
+                idx_slots[0] = eight.raw;
+                const hi_ptr: LValue = this.builder.build_gep(
+                    i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
+                intrinsics::free(idx_buf);
+                this.builder.build_store(hi_arg, hi_ptr);
+                this.values.set(param.name, alloca);
+                llvm_idx += 2;
                 continue;
             }
 
             const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
+            const arg: LValue = LValue {
+                raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
+            };
             this.builder.build_store(arg, alloca);
             this.values.set(param.name, alloca);
+            llvm_idx += 1;
         }
 
         // For variadic functions with an `args...` bucket, set up a va_list
@@ -1668,8 +1763,6 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
-
             // Phase 2 — byval on a method's non-receiver param: see
             // `codegen_function_prologue` for the rationale.  Binding
             // the byval `ptr` directly preserves the copy semantics
@@ -1677,11 +1770,42 @@ type struct DeclarationEmitter {
             const byval_pointee_m: LType =
                 this.abi.byval_pointee_of_param(fn_val, param_idx);
             if (byval_pointee_m.is_valid()) {
+                const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
                 this.values.set(param.name, arg);
                 param_idx += 1;
                 continue;
             }
 
+            // §3.5 — DirectPair: two LLVM slots, store lo at +0 and
+            // hi at +8 of a source-typed alloca.  Other Direct
+            // shapes (≤ 8 byte coerced and plain) use a single slot.
+            const pplan_m: ParamPlan = this.abi.classify_param(param.resolved_type);
+            if (pplan_m.cls == ArgClass::DirectPair
+                    && pplan_m.llvm_slots.length == 2) {
+                const alloca: LValue = this.flow.create_entry_alloca(
+                    fn_val, param_name, param_ty);
+                const lo_arg: LValue = LValue {
+                    raw: llvm::LLVMGetParam(fn_val.raw, param_idx),
+                };
+                const hi_arg: LValue = LValue {
+                    raw: llvm::LLVMGetParam(fn_val.raw, param_idx + 1),
+                };
+                this.builder.build_store(lo_arg, alloca);
+                const i8_ty: LType = LType::i8();
+                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_slots: void** = idx_buf as void**;
+                const eight: LValue = LType::const_int(LType::i64(), 8, false);
+                idx_slots[0] = eight.raw;
+                const hi_ptr: LValue = this.builder.build_gep(
+                    i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
+                intrinsics::free(idx_buf);
+                this.builder.build_store(hi_arg, hi_ptr);
+                this.values.set(param.name, alloca);
+                param_idx += 2;
+                continue;
+            }
+
+            const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
             const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
             this.builder.build_store(arg, alloca);
             this.values.set(param.name, alloca);
