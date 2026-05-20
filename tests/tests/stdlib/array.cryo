@@ -8,6 +8,7 @@ import std::core::option;
 import std::core::iter;
 import std::core::slice;
 import std::collections::array;
+import std::collections::string;
 import std::test::error;
 import std::test::assert;
 
@@ -188,5 +189,57 @@ function iter_count_reports_length_in_O1() -> Result<(), TestError> {
     arr.drop();
     const want: u64 = 4;
     return expect_eq(got, want);
+}
+
+![test]
+function get_ptr_reads_in_place_and_none_oob() -> Result<(), TestError> {
+    // `get_ptr` borrows the element rather than copying it. Reading
+    // through the returned pointer must observe the stored value, and
+    // an out-of-range index must yield None.
+    mut arr: Array<i32> = Array::new();
+    arr.push(100);
+    arr.push(200);
+    mut val: i32 = -1;
+    match (arr.get_ptr(1)) {
+        Option::Some(p) => { val = *p; }
+        Option::None    => { }
+    }
+    mut oob_present: boolean = true;
+    match (arr.get_ptr(5)) {
+        Option::Some(_) => { oob_present = true; }
+        Option::None    => { oob_present = false; }
+    }
+    arr.drop();
+    match (expect_eq(val, 200)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!oob_present,
+        Str::new("get_ptr(5) on length-2 should be None"));
+}
+
+![test]
+function get_ptr_borrows_owning_elements_no_double_free() -> Result<(), TestError> {
+    // The headline soundness case: `get` is gated on `T: Copy`, so
+    // owning elements are read through `get_ptr`, which borrows in
+    // place. The array retains ownership, so `arr.drop()` frees each
+    // String exactly once. If the borrow ever copied, dropping the
+    // copy here plus the array's element drop would double-free and
+    // the test process would abort.
+    mut arr: Array<String> = Array::new();
+    arr.push(String::from_str(Str::new("alpha")));
+    arr.push(String::from_str(Str::new("beta")));
+    mut ok: boolean = false;
+    match (arr.get_ptr(1)) {
+        Option::Some(p) => {
+            const s: Str = p.as_str();
+            const want: Str = Str::new("beta");
+            ok = s.equals(&want);
+        }
+        Option::None => { }
+    }
+    arr.drop();
+    return expect(ok,
+        Str::new("get_ptr should borrow 'beta' from the array in place"));
 }
 
