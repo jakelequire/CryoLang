@@ -561,6 +561,35 @@ type struct TypeChecker {
         return TypeCompatibility::Identical;
     }
 
+    /// True when `from` -> `to` is a *lossy* numeric conversion: integer
+    /// width-narrowing (e.g. i64 -> u8), float narrowing (f64 -> f32), or
+    /// float -> int (drops the fraction and may overflow).  Codegen lowers
+    /// each of these to a silent `trunc` / `fptrunc` / `fptosi`, so an
+    /// implicit one at a call site silently corrupts the value
+    /// (`take_u8(300_i64)` -> 44).  Same-width signedness reinterpretation
+    /// (i32 <-> u32) and any widening preserve the representation and are
+    /// deliberately NOT flagged, so the FFI-heavy `i32` -> `u64` argument
+    /// pattern stays legal.  Char/enum are left to their existing rules.
+    is_lossy_numeric_narrowing(&this, from: TypeRef, to: TypeRef) -> boolean {
+        const f: Type* = this.arena.lookup(from.id);
+        const t: Type* = this.arena.lookup(to.id);
+        if (f == null || t == null) { return false; }
+        if (f.kind == TypeKind::Int && t.kind == TypeKind::Int) {
+            const fi: IntType* = f as IntType*;
+            const ti: IntType* = t as IntType*;
+            return fi.bit_width() > ti.bit_width();
+        }
+        if (f.kind == TypeKind::Float && t.kind == TypeKind::Float) {
+            const ff: FloatType* = f as FloatType*;
+            const tf: FloatType* = t as FloatType*;
+            return ff.bit_width() > tf.bit_width();
+        }
+        if (f.kind == TypeKind::Float && t.kind == TypeKind::Int) {
+            return true;
+        }
+        return false;
+    }
+
 
     // ----------------------------------------------------------------
     // Operation type checking
