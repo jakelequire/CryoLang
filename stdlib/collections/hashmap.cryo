@@ -109,13 +109,15 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     /// value second). Iteration order is bucket-major and undefined
     /// across resizes; do not rely on it.
     ///
-    /// Yielded keys and values are bitcopies of the live entries; the
-    /// iterator is a borrow-style view, so do not drop the yielded
-    /// pair's members for owning `K` / `V` (the storage still belongs
-    /// to the map). The iterator is invalidated by any mutation that
-    /// inserts, removes, or resizes; same contract as `as_ptr` /
-    /// `get_ptr`.
-    iter(&this) -> HashMapIter<K, V> {
+    /// Yielded keys and values are bitcopies of the live entries.
+    /// Gated on `K: Copy, V: Copy` so an owning `K`/`V` can't be
+    /// duplicated out (which would alias map-owned storage and
+    /// double-free). To walk a map of owning types, traverse the
+    /// buckets in place with `bucket_count()` + `get_bucket()`. The
+    /// iterator is invalidated by any mutation that inserts, removes,
+    /// or resizes; same contract as `as_ptr` / `get_ptr`.
+    iter(&this) -> HashMapIter<K, V>
+    where K: Copy, V: Copy {
         return HashMapIter<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
@@ -128,13 +130,20 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     // Lookup
     // ========================================================================
 
-    contains_key(&this, key: &K) -> boolean 
+    contains_key(&this, key: &K) -> boolean
     where K: Hash + Eq {
-        return this.get(key).is_some();
+        // Borrow rather than copy out, so this stays sound for owning V
+        // (a `where V: Copy` on `get` would otherwise leak in here).
+        return this.get_ptr(key).is_some();
     }
 
+    /// Look up a value by key, returning a bitwise copy. Gated on
+    /// `V: Copy` for the same reason as `Array::get`: handing back a
+    /// duplicate of an owning value would alias storage the map still
+    /// owns, double-freeing on drop. For owning `V`, borrow in place
+    /// with `get_ptr` (or move it out with `remove`).
     get(&this, key: &K) -> Option<V>
-    where K: Hash + Eq {
+    where K: Hash + Eq, V: Copy {
         if (this.bucket_count == 0) {
             return Option::None;
         }

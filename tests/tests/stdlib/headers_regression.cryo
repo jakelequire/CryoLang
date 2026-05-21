@@ -1,0 +1,68 @@
+///! Regression test for the `Headers::get` double-free.
+///!
+///! `Headers::get` (and `Request::param`) used to return the stored
+///! value via a bitwise `HashMap::get`, handing back a `String` whose
+///! buffer aliased the map's storage. Dropping the result then
+///! double-freed the map's buffer — reachable from any handler that
+///! reads a header (the router docs even tell callers to `.drop()` it).
+///!
+///! `HashMap::get` is now gated on `V: Copy`, and `Headers::get`
+///! deep-clones, so the returned value owns its own buffer. This test
+///! takes a value, drops it, and then confirms the map still holds an
+///! intact copy (a double-free or use-after-free would surface here,
+///! and the implicit drop of `Headers` at scope exit would crash).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HeadersRegression;
+
+import std::core::result;
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::net::http::headers;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function get_returns_independent_owned_copy() -> Result<(), TestError> {
+    mut h: Headers = Headers::new();
+    h.insert(Str::new("Content-Type"), Str::new("application/json"));
+
+    // First lookup: a deep-cloned owned value, then dropped. Under the
+    // old bitwise get this freed the map's stored buffer.
+    match (h.get(Str::new("content-type"))) {
+        Option::Some(mut first) => {
+            const matched: boolean =
+                first.as_str().equals(&Str::new("application/json"));
+            first.drop();
+            if (!matched) {
+                h.drop();
+                return bail(Str::new("first get returned wrong value"));
+            }
+        }
+        Option::None => {
+            h.drop();
+            return bail(Str::new("first get missed an inserted header"));
+        }
+    }
+
+    // The map still owns its value: contains is true and a second get
+    // still returns it. If the first drop had freed map storage these
+    // would read freed memory.
+    const still_present: boolean = h.contains(Str::new("content-type"));
+
+    match (h.get(Str::new("content-type"))) {
+        Option::Some(mut second) => {
+            const ok: boolean =
+                still_present &&
+                second.as_str().equals(&Str::new("application/json"));
+            second.drop();
+            h.drop();
+            return expect(ok, Str::new("second get still returns the value"));
+        }
+        Option::None => {
+            h.drop();
+            return bail(Str::new("second get lost the header"));
+        }
+    }
+}
