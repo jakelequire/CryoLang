@@ -2379,6 +2379,42 @@ public:
                 rhs = this.resolve_expr(bin.right);
             }
             this.check_assignment_lvalue(bin.left);
+            // Plain `=` must type-check the value against the slot, mirroring
+            // the declaration-init and return paths (which both call
+            // can_assign).  Without this, `x = "str"` (x: i32) and narrowing
+            // assignments like `u8_var = i64_expr` compiled silently.
+            // Compound assignment ops (`+=`, `<<=`, ...) are deliberately
+            // excluded: their RHS need not be assignable to the LHS
+            // (e.g. `ptr += 1`), and the implied binary op is validated on
+            // its own.  Widening (e.g. i32 -> i64) stays legal because it is
+            // ImplicitConvert, which can_assign accepts.  Non-concrete
+            // (generic `T`, unit, void, function) operands are skipped, just
+            // like the call-arg path (arg_type_is_concrete): trait default
+            // method bodies are checked once with `T` still abstract.
+            // `indirection_compatible` exempts pointer/reference spelling
+            // (`&T` ↔ `T*`, value ↔ `&T`, Derived → Base): address-of yields
+            // a reference type that codegen lowers identically to the pointer
+            // slot, e.g. `cursor = &node.next` (`&Entry*` into `Entry**`).
+            // It only fires when a side is an indirection, so scalar
+            // narrowing (`u8 = i64`) is still rejected.
+            if (bin.op.lexeme == "="
+                && lhs.is_valid() && rhs.is_valid()
+                && this.arg_type_is_concrete(lhs)
+                && this.arg_type_is_concrete(rhs)
+                && !this.checker.can_assign(rhs, lhs)
+                && !this.indirection_compatible(rhs, lhs)) {
+                const value_span: SourceSpan =
+                    if (bin.right != null) { bin.right.span }
+                    else { bin.span };
+                this.emit_type_mismatch_with_value(
+                    ErrorCode::E0200_TYPE_MISMATCH,
+                    value_span,
+                    lhs,
+                    rhs,
+                    "the value assigned here doesn't match the type of the assignment target",
+                    bin.left.span,
+                    bin.right);
+            }
             return lhs;
         }
 
@@ -3234,8 +3270,48 @@ public:
                            i + 1),
                     SourceSpan::none(),
                     arg);
+            } else if (this.checker.is_lossy_numeric_narrowing(arg_ty, param_ty)
+                       && !this.int_literal_fits_target(arg, param_ty)) {
+                // A representation-losing numeric conversion (integer/float
+                // narrowing or float->int) would silently `trunc` the value
+                // at codegen, e.g. `take_u8(300_i64)` arriving as 44.  The
+                // spec (§2.9) requires an explicit `as` cast for these.  An
+                // integer literal that fits the target is exempt: it
+                // materializes as a correct constant (e.g. `push_byte(91)`).
+                this.emit_type_mismatch_with_value(
+                    ErrorCode::E0214_ARGUMENT_MISMATCH,
+                    arg.span,
+                    param_ty,
+                    arg_ty,
+                    format("argument %lld narrows the value and would silently truncate; add an explicit `as` cast",
+                           i + 1),
+                    SourceSpan::none(),
+                    arg);
             }
         }
+    }
+
+    /// True when `arg` is an integer literal whose value fits the target
+    /// integer type's bit width.  Such a literal is materialized as a
+    /// correct constant by codegen (e.g. `push_byte(91)` into a `u8`), so
+    /// the call-arg narrowing check must not flag it.  Oversized literals
+    /// (`take_u8(300)`) and runtime-typed narrowing still fall through to
+    /// the error.  Mirrors the bound logic in `resolve_integer_literal`.
+    int_literal_fits_target(&this, arg: ExpressionNode*, target: TypeRef) -> boolean {
+        if (!is_numeric_literal_expr(arg)) { return false; }
+        const lit: LiteralNode* = arg as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        const t: Type* = this.arena.lookup(target.id);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        const it: IntType* = t as IntType*;
+        const w: u64 = it.int_kind.bit_width();
+        mut max_mag: u64 = 0;
+        if (w == 8)       { max_mag = 255; }
+        else if (w == 16) { max_mag = 65535; }
+        else if (w == 32) { max_mag = 4294967295; }
+        else if (w == 64) { max_mag = SEMA_U64_MAX; }
+        if (max_mag == 0) { return false; }
+        return !int_literal_exceeds(lit.value, max_mag);
     }
 
     /// Per-argument type checking for an instance method call
@@ -5842,8 +5918,50 @@ public:
         return TypeRef::invalid();
     }
 
+    /// True when a cast crosses between a memory aggregate (struct / class /
+    /// tuple / array) and a scalar-or-pointer type.  Such a cast has no valid
+    /// LLVM lowering: `codegen_cast` falls through to an aggregate `bitcast`
+    /// that the verifier rejects, surfacing as an E0900 backend crash instead
+    /// of a clean diagnostic.  int<->pointer, pointer<->pointer, and the
+    /// numeric / enum / char / bool casts all have real lowerings and stay
+    /// legal (§2.9 makes `as` the programmer's responsibility).
+    is_aggregate_scalar_cast(&this, from: TypeRef, to: TypeRef) -> boolean {
+        mut f: Type* = this.arena.lookup(from.id);
+        mut t: Type* = this.arena.lookup(to.id);
+        if (f == null || t == null) { return false; }
+        if (f.kind == TypeKind::InstantiatedType) {
+            const fi: InstantiatedType* = f as InstantiatedType*;
+            if (!fi.has_resolved_type()) { return false; }
+            f = this.arena.lookup(fi.resolved_type.id);
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const ti: InstantiatedType* = t as InstantiatedType*;
+            if (!ti.has_resolved_type()) { return false; }
+            t = this.arena.lookup(ti.resolved_type.id);
+        }
+        if (f == null || t == null) { return false; }
+        // `Class` is intentionally NOT an aggregate here: a class instance is
+        // a heap pointer at the LLVM level, so `Class` <-> pointer / integer
+        // lowers to a valid pointercast / ptrtoint (e.g. the `this as
+        // Visitor*` upcast used throughout the compiler).  Only by-value
+        // aggregates (struct / tuple / fixed array) have no scalar lowering.
+        const f_agg: boolean = f.kind == TypeKind::Struct
+                            || f.kind == TypeKind::Tuple  || f.kind == TypeKind::Array;
+        const t_agg: boolean = t.kind == TypeKind::Struct
+                            || t.kind == TypeKind::Tuple  || t.kind == TypeKind::Array;
+        const f_scl: boolean = f.kind == TypeKind::Int    || f.kind == TypeKind::Float
+                            || f.kind == TypeKind::Bool   || f.kind == TypeKind::Char
+                            || f.kind == TypeKind::String || f.kind == TypeKind::Pointer
+                            || f.kind == TypeKind::Reference || f.kind == TypeKind::Enum;
+        const t_scl: boolean = t.kind == TypeKind::Int    || t.kind == TypeKind::Float
+                            || t.kind == TypeKind::Bool   || t.kind == TypeKind::Char
+                            || t.kind == TypeKind::String || t.kind == TypeKind::Pointer
+                            || t.kind == TypeKind::Reference || t.kind == TypeKind::Enum;
+        return (f_agg && t_scl) || (f_scl && t_agg);
+    }
+
     resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
-        this.resolve_expr(cast.expression);
+        const from_ty: TypeRef = this.resolve_expr(cast.expression);
         // Resolve the target type annotation if TypeResolution didn't reach it
         // (e.g., cast used as an initializer rather than a standalone expression).
         if (!cast.has_resolved_target() && cast.target_annotation != null
@@ -5855,6 +5973,19 @@ public:
             if (target.is_valid()) {
                 cast.set_resolved_target(target);
             }
+        }
+        const to_ty: TypeRef = cast.resolved_target;
+        // Reject casts with no valid representation (aggregate <-> scalar):
+        // these have no LLVM lowering and otherwise crash the backend with a
+        // bare E0900 verifier failure.  Skip non-concrete (generic) operands.
+        if (from_ty.is_valid() && to_ty.is_valid()
+            && this.arg_type_is_concrete(from_ty)
+            && this.arg_type_is_concrete(to_ty)
+            && this.is_aggregate_scalar_cast(from_ty, to_ty)) {
+            this.ctx.emit_error_at(
+                ErrorCode::E0208_INVALID_CAST,
+                "invalid cast between an aggregate type (struct/class/tuple/array) and a scalar or pointer: there is no valid representation for this conversion",
+                cast.span);
         }
         return cast.resolved_target;
     }
