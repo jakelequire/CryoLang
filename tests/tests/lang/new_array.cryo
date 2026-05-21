@@ -1,0 +1,54 @@
+///! Array allocation (`new T[n]`) — raw heap allocation of `n` elements,
+///! returning `T*`.  See docs/cryo.md § 15.2.  The memory is uninitialized
+///! and no constructors run; these tests write across the full extent so an
+///! under-sized allocation would corrupt the heap or fault.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::NewArray;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type struct Pt { x: i32; y: i32; }
+
+// Primitive element type whose name is a keyword (`new int[100]`): exercises
+// both the parser (keyword type name) and that the [n] size is honored.
+![test]
+function new_primitive_array() -> Result<(), TestError> {
+    const arr: int* = new int[100];
+    for (mut i: i32 = 0; i < 100; i++) { arr[i] = i * i; }
+    expect_eq(arr[0], 0)?;
+    expect_eq(arr[50], 2500)?;
+    expect_eq(arr[99], 9801)?;     // last element — out of bounds if size ignored
+    free(arr as void*);
+    return Result::Ok(());
+}
+
+// Runtime element count (not a constant literal).
+![test]
+function new_array_runtime_count() -> Result<(), TestError> {
+    const n: i32 = 256;
+    const buf: u8* = new u8[n];
+    buf[0]   = 0xAB as u8;
+    buf[255] = 0xCD as u8;
+    expect_eq(buf[0] as i32, 171)?;
+    expect_eq(buf[255] as i32, 205)?;
+    free(buf as void*);
+    return Result::Ok(());
+}
+
+// Named struct element (8 bytes each): index 9 lands at byte offset 72, well
+// past a single element — proves `new Pt[10]` allocates 10, not 1.
+![test]
+function new_struct_array() -> Result<(), TestError> {
+    const pts: Pt* = new Pt[10];
+    pts[9].x = 99;
+    pts[9].y = 42;
+    pts[0].x = 1;
+    expect_eq(pts[9].x, 99)?;
+    expect_eq(pts[9].y, 42)?;
+    expect_eq(pts[0].x, 1)?;
+    free(pts as void*);
+    return Result::Ok(());
+}

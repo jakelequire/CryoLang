@@ -220,6 +220,9 @@ type enum TypeAnnotation {
     Tuple(TupleAnnotation*);
     Optional(OptionalAnnotation*);
     Generic(GenericAnnotation*);
+    /// `typeof(expr)` in type position (decltype-style): resolves to the
+    /// static type of the operand expression. See TypeofAnnotation.
+    Typeof(TypeofAnnotation*);
     /// `This` placeholder inside trait declarations and impl blocks.
     /// The parser captures it as a tagged sentinel; sema later resolves it
     /// to the implementing type (Phase B.1).
@@ -323,6 +326,20 @@ implement enum TypeAnnotation {
                 };
                 *result = TypeAnnotation::Generic(g);
             }
+            TypeAnnotation::Typeof(to) => {
+                const t: TypeofAnnotation* = malloc(sizeof(TypeofAnnotation)) as TypeofAnnotation*;
+                // Shallow-share the operand expression: cloning expression
+                // nodes isn't available from the AST root module, and a
+                // non-generic `typeof` operand resolves to a single concrete
+                // type, so sharing is safe.  Carry the cached `resolved` so a
+                // clone taken after sema keeps the already-derived type.
+                *t = TypeofAnnotation {
+                    operand:  to.operand,
+                    resolved: to.resolved,
+                    span:     to.span,
+                };
+                *result = TypeAnnotation::Typeof(t);
+            }
             TypeAnnotation::ThisType(t) => {
                 const tt: ThisTypeAnnotation* = malloc(sizeof(ThisTypeAnnotation)) as ThisTypeAnnotation*;
                 *tt = ThisTypeAnnotation { span: t.span };
@@ -396,6 +413,23 @@ type struct GenericAnnotation {
     base: TypeAnnotation*;
     args: TypeAnnotation*[];
     span: SourceSpan;
+}
+
+/// `typeof(expr)` used in type position (decltype-style); resolves to the
+/// static type of `operand`.
+type struct TypeofAnnotation {
+    /// The operand expression, stored opaquely as `void*` (really an
+    /// `ExpressionNode*`).  The AST root module can't import
+    /// `Compiler::AST::Expression` without a module cycle, so the pointer is
+    /// kept untyped here; the parser stashes it and sema casts it back to
+    /// `ExpressionNode*` to resolve the operand's type.
+    operand:  void*;
+    /// The operand's static type, cached by sema (which alone can resolve an
+    /// expression's type, and only once the operand is in scope).  The
+    /// TypeResolver returns this directly — it has no expression resolver of
+    /// its own.  `TypeRef::invalid()` until sema fills it.
+    resolved: TypeRef;
+    span:     SourceSpan;
 }
 
 /// `This` placeholder. Carries no name; the implementing type is supplied

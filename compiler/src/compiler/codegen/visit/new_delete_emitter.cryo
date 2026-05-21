@@ -84,6 +84,16 @@ type struct NewDeleteEmitter {
     // ========================================================================
 
     emit_new(mut &this, visitor: ASTVisitor*, node: NewExprNode*) -> void {
+        // Array allocation `new T[n]` is handled up front: it allocates raw
+        // memory and the element may be a primitive (`new int[100]`) whose
+        // name is a keyword not in the decl index, so the type_name lookup
+        // below would fail.  emit_new_array reads the element type from the
+        // sema-resolved `T*` result type instead.
+        if (node.has_array_size()) {
+            this.emit_new_array(visitor, node);
+            return;
+        }
+
         // Resolve the type name: try current module's qualified form first,
         // then fall back to the DI's bare→qualified mapping, then the raw
         // name (for already-qualified cases and cross-module aliases).
@@ -310,6 +320,96 @@ type struct NewDeleteEmitter {
 
         this.state.last_value = obj_ptr;
         this.state.last_is_lvalue = false;
+    }
+
+    // ========================================================================
+    // new T[n]  — raw array allocation
+    // ========================================================================
+
+    /// Lower `new T[n]` to `malloc(n * sizeof(T))` cast to `T*`.  The memory
+    /// is left uninitialized — no constructors run — matching the doc's
+    /// `const arr: int* = new int[100]` example and the low-level framing of
+    /// §15.2 (use `Array<T>` when you want constructed/managed elements).
+    /// The element type is read from the sema-resolved `T*` result type so
+    /// primitive elements (whose name is a keyword, not a decl-index entry)
+    /// resolve the same way user types do.
+    emit_new_array(mut &this, visitor: ASTVisitor*, node: NewExprNode*) -> void {
+        const result_t: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+        if (result_t == null || result_t.kind != TypeKind::Pointer) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
+                "codegen: 'new T[n]': could not resolve element type",
+                node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const elem_ref: TypeRef = (result_t as PointerType*).pointee;
+        const elem_t: Type* = this.cg.lookup_type_by_id(elem_ref.id);
+        const elem_llvm: LType = this.cg.type_mapper.map_type(elem_ref);
+
+        // Element byte size (same kind-derivation as emit_new: virtual
+        // size_bytes() returns 0 for aggregates, so read computed_size).
+        mut elem_size: u64 = 0;
+        if (elem_t != null) {
+            if (elem_t.kind == TypeKind::Class) {
+                elem_size = (elem_t as ClassType*).computed_size;
+            } else if (elem_t.kind == TypeKind::Struct) {
+                elem_size = (elem_t as StructType*).computed_size;
+            } else if (elem_t.kind == TypeKind::Enum) {
+                elem_size = (elem_t as EnumType*).computed_size;
+            } else {
+                elem_size = elem_t.size_bytes();
+            }
+        }
+        if (elem_size == 0) { elem_size = 1; }
+
+        // Element count expression → i64.
+        mut count_val: LValue = this.dispatch.codegen_rvalue(visitor, node.array_size);
+        if (!count_val.is_valid()) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        count_val = this.widen_to_i64(count_val);
+
+        const elem_size_val: LValue = LType::const_int(LType::i64(), elem_size, false);
+        const total: LValue = this.cg.builder.build_mul(
+            count_val, elem_size_val, "new.arr.bytes");
+
+        const malloc_fn: LValue = this.cg.resolver.resolve_function(
+            this.cg.intern_str("malloc"));
+        if (!malloc_fn.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                "codegen: 'new T[n]': 'malloc' not declared", node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+        mut malloc_args: Pair<LValue, TypeRef>[] = [];
+        malloc_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
+        const raw_ptr: LValue = this.cg.expr_ops.codegen_call(
+            malloc_fn, malloc_ty, malloc_args, "new.arr");
+
+        mut elem_ptr: LValue = raw_ptr;
+        if (elem_llvm.is_valid()) {
+            elem_ptr = this.cg.builder.build_pointer_cast(
+                raw_ptr, LType::pointer_to(elem_llvm), "new.arr.cast");
+        }
+        this.state.last_value = elem_ptr;
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Widen an integer value to i64 for use as a malloc byte count.  Array
+    /// element counts are non-negative, so a narrower value is zero-extended;
+    /// an i64 passes through; a wider value is truncated (defensive).
+    widen_to_i64(mut &this, v: LValue) -> LValue {
+        const raw_ty: void* = llvm::LLVMTypeOf(v.raw);
+        if (type_kind_of(raw_ty) != LTypeKind::Integer) { return v; }
+        const bits: u32 = llvm::LLVMGetIntTypeWidth(raw_ty);
+        if (bits == 64) { return v; }
+        if (bits > 64)  { return this.cg.builder.build_trunc(v, LType::i64(), "new.arr.cnt"); }
+        return this.cg.builder.build_zext(v, LType::i64(), "new.arr.cnt");
     }
 
     // ========================================================================
