@@ -222,6 +222,43 @@ public:
         return this.ctx.decl_index.lookup_global(name);
     }
 
+    /// Resolve any `typeof(expr)` inside a type annotation and cache the
+    /// operand's static type on the annotation, so the TypeResolver (which
+    /// has no expression resolver) can hand it back when it resolves the
+    /// annotation moments later.  Recurses through the wrapper kinds a
+    /// `typeof` can hide under (`typeof(x)*`, `&typeof(x)`, `typeof(x)[]`,
+    /// `typeof(x)?`, `Array<typeof(x)>`, `[typeof(x), …]`).  Must be called
+    /// with the operand in scope — i.e. from sema while visiting the
+    /// statement that carries the annotation.  No-op for annotations with no
+    /// `typeof`.
+    prime_typeof_annotation(mut &this, ann: TypeAnnotation*) -> void {
+        if (ann == null) { return; }
+        match (ann) {
+            TypeAnnotation::Typeof(to) => {
+                if (!to.resolved.is_valid() && to.operand != null) {
+                    const operand: ExpressionNode* = to.operand as ExpressionNode*;
+                    const ty: TypeRef = this.resolve_expr(operand);
+                    if (ty.is_valid()) { to.resolved = ty; }
+                }
+            }
+            TypeAnnotation::Pointer(p)   => { this.prime_typeof_annotation(p.inner); }
+            TypeAnnotation::Reference(r) => { this.prime_typeof_annotation(r.inner); }
+            TypeAnnotation::Array(a)     => { this.prime_typeof_annotation(a.element); }
+            TypeAnnotation::Optional(o)  => { this.prime_typeof_annotation(o.inner); }
+            TypeAnnotation::Generic(g)   => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    this.prime_typeof_annotation(g.args[i]);
+                }
+            }
+            TypeAnnotation::Tuple(t)     => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    this.prime_typeof_annotation(t.elements[i]);
+                }
+            }
+            _ => {}
+        }
+    }
+
 
     // ================================================================
     // Did-you-mean candidate collectors
@@ -1227,6 +1264,30 @@ public:
                 if (!this.block_contains_break(ls.body)) { return true; }
                 return this.block_always_returns(ls.body);
             }
+            NodeKind::SwitchStatement => {
+                // A switch guarantees a return iff it has a `default` (so no
+                // value can slip past unmatched) AND every case body returns.
+                // A body that ends in `break` exits to the merge rather than
+                // returning, so `stmt_always_returns` on it is false and such
+                // a switch correctly fails this check.
+                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
+                mut has_default: boolean = false;
+                for (mut i: i64 = 0; i < sw.cases.length; i++) {
+                    const c: CaseStmtNode* = sw.cases[i];
+                    if (c == null) { return false; }
+                    if (c.is_default) { has_default = true; }
+                    if (!this.stmt_always_returns(c.body as StatementNode*)) {
+                        return false;
+                    }
+                }
+                return has_default;
+            }
+            NodeKind::DoWhileStatement => {
+                // The body runs at least once, so if it unconditionally
+                // returns the loop returns before the condition is tested.
+                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                return this.stmt_always_returns(dw.body);
+            }
             NodeKind::ExpressionStatement => {
                 const es: ExprStmtNode* = stmt as ExprStmtNode*;
                 return this.expr_is_divergent(es.expression);
@@ -1544,6 +1605,9 @@ public:
         // binding evaluate to null.
         if (!var_node.has_resolved_type() && var_node.type_annotation != null
                 && this.ctx.type_resolver != null) {
+            // Resolve any `typeof(expr)` operands now, while their operands
+            // are in scope; the TypeResolver reads the cached type below.
+            this.prime_typeof_annotation(var_node.type_annotation);
             mut res_ctx: ResolutionContext = ResolutionContext::new(
                 this.ctx.source_file, "");
             const vtype: TypeRef = this.ctx.type_resolver.resolve(
@@ -1986,6 +2050,7 @@ public:
         this.check_match_exhaustive(node.subject, subject_type, node.arms,
             node.span);
         this.check_duplicate_default_arm(node.arms);
+        this.check_range_patterns(node.arms, subject_type);
     }
 
     /// A match may have at most one wildcard (`_`) arm. A second one is
@@ -2014,6 +2079,59 @@ public:
                         arm.span);
                 }
                 seen_default = true;
+            }
+        }
+    }
+
+    /// Validate `lo..hi` range patterns (`'0'..'9'`, `1..10`) against the
+    /// match subject.  Two checks, both real correctness concerns:
+    ///   * the bound kind must fit the subject — a `char` range needs a
+    ///     `char` subject, and an integer range needs an integer (or `char`)
+    ///     subject.  Codegen decodes char vs integer bounds with different
+    ///     readers, so a mismatch would silently compare the wrong value.
+    ///   * the low bound must not exceed the high bound; `9..0` matches
+    ///     nothing and is almost always a typo.
+    /// A range never makes a match exhaustive (its value universe stays
+    /// open), so this adds no exhaustiveness bookkeeping — non-enum matches
+    /// still require a `_` arm via `check_match_exhaustive`.
+    check_range_patterns(mut &this, arms: MatchArmNode*[],
+                          subject_type: TypeRef) -> void {
+        const base: Type* = this.unwrap_to_enum(subject_type);
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
+                const pat: PatternNode* = arm.patterns[j];
+                if (pat == null || pat.pattern_kind != PatternKind::Range) {
+                    continue;
+                }
+
+                if (base != null) {
+                    if (pat.literal_kind == LiteralKind::Char
+                        && base.kind != TypeKind::Char) {
+                        this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                            "char range pattern requires a `char` subject",
+                            pat.span);
+                    } else if (pat.literal_kind == LiteralKind::Integer
+                        && base.kind != TypeKind::Int
+                        && base.kind != TypeKind::Char) {
+                        this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                            "integer range pattern requires an integer subject",
+                            pat.span);
+                    }
+                }
+
+                const lo: i64 = sema_decode_range_bound(
+                    this.intern.resolve(pat.value), pat.literal_kind);
+                const hi: i64 = sema_decode_range_bound(
+                    this.intern.resolve(pat.high_value), pat.literal_kind);
+                if (lo > hi) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0628_PATTERN_MATCHING_ERROR,
+                        format("range pattern lower bound (%lld) exceeds upper bound (%lld)",
+                               lo, hi),
+                        pat.span);
+                }
             }
         }
     }
@@ -2173,7 +2291,7 @@ public:
     }
 
     override visit(mut &this, node: SwitchStmtNode*) -> void {
-        this.resolve_expr(node.expression);
+        const subject_type: TypeRef = this.resolve_expr(node.expression);
         this.switch_depth += 1;
         for (mut i: i64 = 0; i < node.cases.length; i++) {
             const cs: CaseStmtNode* = node.cases[i];
@@ -2182,6 +2300,115 @@ public:
             if (cs.body != null)  { this.visit(cs.body); }
         }
         this.switch_depth -= 1;
+        this.check_switch_applicable(node, subject_type);
+    }
+
+    /// Switchability class of a (already-unwrapped) type:
+    ///   0 = ordinal (integer / char / bool) — compared by value
+    ///   1 = fieldless enum — compared by tag
+    ///   2 = enum WITH payloads — needs `match` to destructure
+    ///   3 = string — needs `match` (value compare would test addresses)
+    ///   4 = floating-point — equality is unreliable; use comparisons
+    ///   5 = other structured type (struct/class/tuple/array/…) — use `match`
+    ///  -1 = unknown / unresolved
+    switch_type_class(&this, base: Type*) -> i32 {
+        if (base == null) { return -1; }
+        match (base.kind) {
+            TypeKind::Int    => { return 0; }
+            TypeKind::Char   => { return 0; }
+            TypeKind::Bool   => { return 0; }
+            TypeKind::Float  => { return 4; }
+            TypeKind::String => { return 3; }
+            TypeKind::Enum   => {
+                const et: EnumType* = base as EnumType*;
+                if (et.is_simple_enum()) { return 1; }
+                return 2;
+            }
+            _                => { return 5; }
+        }
+    }
+
+    /// Validate that a `switch` dispatches on something it can actually
+    /// compare — an integer, char, bool, or fieldless enum — and that each
+    /// `case` value matches the subject.  Anything else gets a tailored
+    /// diagnostic pointing at the right tool (`match`, or plain comparisons).
+    /// Runs in sema so `cryo check` rejects it cleanly, before codegen would
+    /// emit a bad `icmp` (which would crash on aggregates/floats or silently
+    /// compare addresses for strings/payload-carrying enums).
+    check_switch_applicable(mut &this, node: SwitchStmtNode*,
+                            subject_type: TypeRef) -> void {
+        if (!subject_type.is_valid()) { return; }
+        const base: Type* = this.unwrap_to_enum(subject_type);
+        const sc: i32 = this.switch_type_class(base);
+        if (sc == -1) { return; }   // unresolved; a prior pass will diagnose
+
+        if (sc != 0 && sc != 1) {
+            this.emit_switch_subject_error(node, subject_type, sc);
+            return;   // the subject is the real problem; skip per-case noise
+        }
+
+        // Each case value must be the same flavor as the subject (ordinal
+        // vs. the exact same enum); otherwise the `icmp` would compare
+        // unrelated values.
+        for (mut i: i64 = 0; i < node.cases.length; i++) {
+            const cs: CaseStmtNode* = node.cases[i];
+            if (cs == null || cs.is_default || cs.value == null) { continue; }
+            const ct: TypeRef = cs.value.resolved_type;
+            if (!ct.is_valid()) { continue; }
+            const cbase: Type* = this.unwrap_to_enum(ct);
+            const cc: i32 = this.switch_type_class(cbase);
+
+            mut ok: boolean = false;
+            if (sc == 0) {
+                ok = (cc == 0);                       // ordinal ↔ ordinal
+            } else {
+                ok = (cc == 1 && cbase == base);      // same fieldless enum
+            }
+            if (!ok) {
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0200_TYPE_MISMATCH,
+                    format("`case` value of type `%s` is not comparable to the switch subject of type `%s`",
+                        this.type_display_name(ct),
+                        this.type_display_name(subject_type)));
+                d = d.at(cs.value.span);
+                d = d.with_note("every `case` value must have the same type as the value being switched on");
+                this.ctx.diagnostics.emit(d);
+            }
+        }
+    }
+
+    /// Emit the "switch isn't applicable to this type" diagnostic, tailored
+    /// to *why* (payload enum, string, float, or other) with a concrete
+    /// next step.  `sc` is the subject's `switch_type_class` (2..5).
+    emit_switch_subject_error(mut &this, node: SwitchStmtNode*,
+                              subject_type: TypeRef, sc: i32) -> void {
+        const name: string = this.type_display_name(subject_type);
+        const span: SourceSpan = node.expression.span;
+        mut msg:   string = "";
+        mut note1: string = "";
+        mut note2: string = "";
+        if (sc == 2) {
+            msg   = format("`switch` cannot match on enum `%s`: it has variants that carry payloads", name);
+            note1 = "`switch` compares by value and cannot bind variant payloads";
+            note2 = "use a `match` expression instead — it destructures variant fields and checks exhaustiveness";
+        } else if (sc == 3) {
+            msg   = format("`switch` cannot match on `%s` values", name);
+            note1 = "`switch` compares by value, so it would test string addresses rather than contents";
+            note2 = "use a `match` expression with string patterns instead";
+        } else if (sc == 4) {
+            msg   = format("`switch` cannot match on floating-point type `%s`", name);
+            note1 = "floating-point equality is unreliable, so `switch` does not allow it";
+            note2 = "use `if` / `else if` comparisons instead";
+        } else {
+            msg   = format("`switch` cannot match on type `%s`", name);
+            note1 = "`switch` supports integer, char, bool, and fieldless enum values";
+            note2 = "use a `match` expression for structured types";
+        }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0209_INVALID_OPERATION, msg);
+        d = d.at(span);
+        d = d.with_note(note1);
+        d = d.with_note(note2);
+        this.ctx.diagnostics.emit(d);
     }
 
 
@@ -2216,9 +2443,16 @@ public:
             NodeKind::SizeofExpression  => { this.arena.get_u64() }
             NodeKind::AlignofExpression => { this.arena.get_u64() }
             NodeKind::TypeofExpression  => {
+                // `typeof` is a type-level construct (decltype): it resolves
+                // to a type, not a runtime value, so it is only valid in type
+                // position (`const y: typeof(x) = ...`, `e as typeof(x)`).
+                // Using it as a value has no meaning here.
                 const te: TypeofExprNode* = expr as TypeofExprNode*;
                 this.resolve_expr(te.operand);
-                this.arena.get_string()
+                this.ctx.emit_error_at(ErrorCode::E0209_INVALID_OPERATION,
+                    "`typeof` may only be used in type position (e.g. `const y: typeof(x)`)",
+                    expr.span);
+                TypeRef::invalid()
             }
             NodeKind::DeleteExpression  => {
                 const de: DeleteExprNode* = expr as DeleteExprNode*;
@@ -5966,6 +6200,9 @@ public:
         // (e.g., cast used as an initializer rather than a standalone expression).
         if (!cast.has_resolved_target() && cast.target_annotation != null
                 && this.ctx.type_resolver != null) {
+            // Allow `e as typeof(x)`: prime the operand's type before the
+            // TypeResolver reads it.
+            this.prime_typeof_annotation(cast.target_annotation);
             mut res_ctx: ResolutionContext = ResolutionContext::new(
                 this.ctx.source_file, "");
             const target: TypeRef = this.ctx.type_resolver.resolve(
@@ -6072,6 +6309,7 @@ public:
         // statement or as an expression.
         this.check_match_exhaustive(match_expr.subject, subject_type,
             match_expr.arms, match_expr.span);
+        this.check_range_patterns(match_expr.arms, subject_type);
 
         if (outer_expected.is_valid()) {
             return outer_expected;
@@ -6513,7 +6751,19 @@ public:
         if (new_expr.has_struct_init()) {
             this.resolve_struct_literal(new_expr.struct_init);
         }
-        const base: TypeRef = this.lookup_type_by_sym(new_expr.type_name);
+        // Array allocation `new T[n]`: type-check the size expression so it's
+        // a real value (codegen reads it to size the malloc).
+        if (new_expr.has_array_size()) {
+            this.resolve_expr(new_expr.array_size);
+        }
+        mut base: TypeRef = this.lookup_type_by_sym(new_expr.type_name);
+        // Primitive element types (`new int[100]`, `new u8[1024]`) are not in
+        // the decl index — the name is a primitive keyword, not a user type —
+        // so fall back to primitive resolution.  This is what makes
+        // `new int[100]` resolve to `int*` rather than failing.
+        if (!base.is_valid() && this.ctx.type_resolver != null) {
+            base = this.ctx.type_resolver.resolve_primitive(new_expr.type_name);
+        }
         if (base.is_valid()) {
             return this.arena.get_pointer_to(base);
         }
@@ -6748,6 +6998,74 @@ function parse_tuple_index(s: string) -> i64 {
         acc = acc * 10 + ((c - '0') as i64);
     }
     return acc;
+}
+
+/// Decode a range-pattern bound's interned text into a signed value for the
+/// `lo <= hi` ordering check.  This mirrors the codegen-side decoders
+/// (`decode_char_lexeme` / `parse_int_lexeme`) but is kept here so sema does
+/// not reach across into the codegen layer — the same convention the other
+/// sema-local literal helpers (`parse_tuple_index`, `int_literal_text_is_zero`)
+/// already follow.  Best-effort: a malformed lexeme (which the parser should
+/// already have rejected) decodes to 0 rather than raising a second error.
+function sema_decode_range_bound(s: string, kind: LiteralKind) -> i64 {
+    if (s == null) { return 0; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return 0; }
+
+    if (kind == LiteralKind::Char) {
+        // The lexer hands over the text *between* the quotes, so `'\n'`
+        // arrives as the two chars `\` `n`.  Resolve the C-style escapes.
+        if (len >= 2 && s[0] == '\\') {
+            const esc: char = s[1];
+            if (esc == 'n')  { return 10; }
+            if (esc == 't')  { return 9; }
+            if (esc == 'r')  { return 13; }
+            if (esc == '0')  { return 0; }
+            if (esc == '\\') { return 92; }
+            if (esc == '\'') { return 39; }
+            if (esc == '"')  { return 34; }
+            if (esc == 'a')  { return 7; }
+            if (esc == 'b')  { return 8; }
+            if (esc == 'f')  { return 12; }
+            if (esc == 'v')  { return 11; }
+            if (esc == 'x' && len >= 4) {
+                return sema_hex_digit(s[2]) * 16 + sema_hex_digit(s[3]);
+            }
+            return esc as i64;
+        }
+        return s[0] as i64;
+    }
+
+    // Integer bound: optional sign, then 0x/0o/0b/decimal, '_' separators.
+    mut i: i64 = 0;
+    mut negate: boolean = false;
+    if (s[0] == '-') { negate = true; i = 1; }
+    else if (s[0] == '+') { i = 1; }
+
+    mut base: i64 = 10;
+    if (i + 1 < len && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X')) { base = 16; i += 2; }
+    else if (i + 1 < len && s[i] == '0' && (s[i+1] == 'b' || s[i+1] == 'B')) { base = 2; i += 2; }
+    else if (i + 1 < len && s[i] == '0' && (s[i+1] == 'o' || s[i+1] == 'O')) { base = 8; i += 2; }
+
+    mut acc: i64 = 0;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i += 1; continue; }
+        const digit: i64 = sema_hex_digit(c);
+        if (digit < 0 || digit >= base) { break; }
+        acc = acc * base + digit;
+        i += 1;
+    }
+    if (negate) { return 0 - acc; }
+    return acc;
+}
+
+/// Value of a single hex digit (0-9, a-f, A-F), or -1 if not a hex digit.
+function sema_hex_digit(c: char) -> i64 {
+    if (c >= '0' && c <= '9') { return (c - '0') as i64; }
+    if (c >= 'a' && c <= 'f') { return (c - 'a' + 10) as i64; }
+    if (c >= 'A' && c <= 'F') { return (c - 'A' + 10) as i64; }
+    return -1;
 }
 
 

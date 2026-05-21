@@ -966,7 +966,18 @@ public:
     /// Parse a new expression: new Type(args) or new Type[size]
     parse_new_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'new'
-        const type_tok: Token = this.consume(TokenType::Identifier, "type name");
+        // The target type is usually a user-defined name (Identifier), but
+        // `new T[n]` array allocation also accepts a primitive element type
+        // whose name is a keyword (`new int[100]`, `new u8[1024]`).  Accept
+        // either: a primitive keyword's lexeme ("int", "u8", ...) interns the
+        // same way an identifier would, and resolve_new_expr falls back to
+        // primitive resolution for it.
+        mut type_tok: Token = this.current();
+        if (this.is_primitive_type_token()) {
+            this.advance();
+        } else {
+            type_tok = this.consume(TokenType::Identifier, "type name");
+        }
         const type_name: SymbolStr = this.intern_lexeme(type_tok);
         mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
 
@@ -1301,7 +1312,7 @@ public:
                 TokenType::KwFalse         => { LiteralKind::Boolean }
                 _                          => { LiteralKind::Integer }
             });
-            return pat;
+            return this.finish_range_pattern(pat);
         }
 
         // Negative number literal: -123
@@ -1312,7 +1323,7 @@ public:
             mut pat: PatternNode* = new PatternNode(PatternKind::Literal, this.span_from(start));
             pat.set_value(this.ctx.intern(neg_value));
             pat.set_literal_kind(LiteralKind::Integer);
-            return pat;
+            return this.finish_range_pattern(pat);
         }
 
         // Identifier pattern (binding)
@@ -1326,6 +1337,68 @@ public:
         this.report_error(ErrorCode::E0113_INVALID_PATTERN,
             format("expected pattern, found '%s'", this.current().lexeme));
         return null;
+    }
+
+    /// If the next token is `..`, extend a just-parsed literal pattern into
+    /// an inclusive range pattern (`lo..hi`, matching `lo <= x <= hi`).  The
+    /// low bound is already in `pat` (its `value` + `literal_kind`); this
+    /// consumes `..` and the high-bound literal, records the high text in
+    /// `high_value`, and flips the kind to `Range`.  Returns `pat`
+    /// unchanged when there is no `..`.
+    ///
+    /// Only integer and char literals form a range, and both ends must be
+    /// the same kind: the two bounds share a single `literal_kind`, so a
+    /// mixed `'a'..9` would make codegen decode one end with the wrong
+    /// reader.  Such cases are rejected here rather than silently miscompiled.
+    finish_range_pattern(mut &this, pat: PatternNode*) -> PatternNode* {
+        if (!this.check(TokenType::DotDot)) { return pat; }
+
+        if (pat.literal_kind != LiteralKind::Integer
+            && pat.literal_kind != LiteralKind::Char) {
+            this.report_error(ErrorCode::E0113_INVALID_PATTERN,
+                "range patterns require integer or char bounds");
+            return pat;
+        }
+
+        this.advance(); // consume '..'
+
+        // High bound: an optional leading '-' then a numeric / char literal.
+        mut neg: boolean = false;
+        if (this.check(TokenType::Minus)) {
+            this.advance();
+            neg = true;
+        }
+
+        const hi_tok: Token = this.current();
+        mut hi_kind: LiteralKind = LiteralKind::Integer;
+        if (hi_tok.kind == TokenType::NumericConstant) {
+            hi_kind = LiteralKind::Integer;
+        } else if (hi_tok.kind == TokenType::CharConstant) {
+            hi_kind = LiteralKind::Char;
+        } else {
+            this.report_error(ErrorCode::E0113_INVALID_PATTERN,
+                format("expected a literal high bound after '..', found '%s'",
+                       hi_tok.lexeme));
+            return pat;
+        }
+
+        if (neg && hi_kind != LiteralKind::Integer) {
+            this.report_error(ErrorCode::E0113_INVALID_PATTERN,
+                "'-' is only valid before an integer range bound");
+            return pat;
+        }
+        if (hi_kind != pat.literal_kind) {
+            this.report_error(ErrorCode::E0113_INVALID_PATTERN,
+                "range pattern bounds must be the same kind (both char or both integer)");
+            return pat;
+        }
+
+        this.advance(); // consume the high-bound literal
+        mut hi_text: string = hi_tok.lexeme;
+        if (neg) { hi_text = "-" + hi_text; }
+        pat.set_high_value(this.ctx.intern(hi_text));
+        pat.set_pattern_kind(PatternKind::Range);
+        return pat;
     }
 
     /// Parse an enum pattern: EnumName::Variant or EnumName::Variant(bindings)
@@ -1729,6 +1802,24 @@ public:
                 span: this.span_from_token(tok),
             };
             return new TypeAnnotation::ThisType(tt);
+        }
+
+        // `typeof(expr)` in type position (decltype): resolves to the operand
+        // expression's static type.  The operand is stored opaquely (the AST
+        // root can't name ExpressionNode); sema casts it back and derives the
+        // type, caching it in `resolved`.  Value-position `typeof` is parsed
+        // separately as a TypeofExprNode (parse_typeof_expression).
+        if (tok.kind == TokenType::KwTypeof) {
+            this.advance();
+            this.consume(TokenType::LParen, "'('");
+            const operand: ExpressionNode* = this.parse_expression();
+            this.consume(TokenType::RParen, "')'");
+            const to: TypeofAnnotation* = new TypeofAnnotation {
+                operand:  operand as void*,
+                resolved: TypeRef::invalid(),
+                span:     this.span_from_token(tok),
+            };
+            return new TypeAnnotation::Typeof(to);
         }
 
         // Primitive types

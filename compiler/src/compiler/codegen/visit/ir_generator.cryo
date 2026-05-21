@@ -1480,22 +1480,101 @@ public:
     }
 
     override visit(mut &this, node: DoWhileStmtNode*) -> void {
-        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-            "codegen: 'do { ... } while (...)' statements are not implemented; use 'while' or 'loop' instead",
-            node.span);
+        const current_fn: LValue = this.get_current_function();
+        const blocks: LoopBlocks = this.cg.flow.codegen_do_while_header(current_fn);
+        // Body first (runs at least once).
+        this.cg.builder.position_at_end(blocks.body_bb);
+        if (node.body != null) {
+            this.dispatch.generate_statement(this,node.body);
+        }
+        this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
+        // Then the condition: loop back to the body while it holds.
+        this.cg.builder.position_at_end(blocks.cond_bb);
+        const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
+        this.cg.loops.pop();
+        this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
+    /// Lower a `switch` to a linear chain of equality tests — there is no
+    /// implicit fallthrough, so each case is an independent block that jumps
+    /// to the merge when done.  The subject and each case value are compared
+    /// with `icmp eq` (works for integers and simple enums, both i32-class at
+    /// the LLVM level); `default` is the fallback when no case matches.
+    /// `break` inside a case exits to the merge; `continue` passes through to
+    /// the enclosing loop (a switch doesn't catch it — see sema).
     override visit(mut &this, node: SwitchStmtNode*) -> void {
-        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-            "codegen: 'switch' statements are not implemented; use 'match' instead",
-            node.span);
+        if (node.expression == null) { return; }
+        const current_fn: LValue = this.get_current_function();
+        if (!current_fn.is_valid()) { return; }
+
+        const subject: LValue = this.dispatch.codegen_rvalue(this,node.expression);
+        if (!subject.is_valid()) { return; }
+        const subj_ty: TypeRef = node.expression.resolved_type;
+
+        const ncases: i64 = node.cases.length;
+        mut case_bbs: LBasicBlock[] = [];
+        for (mut i: i64 = 0; i < ncases; i++) {
+            case_bbs.push(LBasicBlock::append(current_fn, format("switch.case%lld", i)));
+        }
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "switch.end");
+
+        // `break` exits the switch; `continue` is forwarded to whatever loop
+        // encloses the switch (null when there is none — sema rejects a bare
+        // `continue` here, and codegen_continue no-ops on a null target).
+        const enclosing_continue: LBasicBlock = this.cg.loops.current_continue();
+        this.cg.loops.push(merge_bb, enclosing_continue);
+
+        // Locate the (at most one) default case.
+        mut default_idx: i64 = -1;
+        for (mut i: i64 = 0; i < ncases; i++) {
+            if (node.cases[i] != null && node.cases[i].is_default) {
+                default_idx = i;
+            }
+        }
+
+        // Equality-test chain: each non-default case branches to its body on a
+        // match, otherwise falls through to the next test.
+        for (mut i: i64 = 0; i < ncases; i++) {
+            const c: CaseStmtNode* = node.cases[i];
+            if (c == null || c.is_default) { continue; }
+            const next_bb: LBasicBlock =
+                LBasicBlock::append(current_fn, format("switch.test%lld", i));
+            const case_val: LValue = this.dispatch.codegen_rvalue(this,c.value);
+            const coerced: LValue = this.cg.expr_ops.coerce_icmp_operands(
+                subject, case_val, subj_ty);
+            const cmp: LValue = this.cg.builder.build_icmp(
+                LIntPredicate::EQ, subject, coerced, "switch.cmp");
+            this.cg.builder.build_cond_br(cmp, case_bbs[i], next_bb);
+            this.cg.builder.position_at_end(next_bb);
+        }
+        // No case matched: fall to `default` if present, else past the switch.
+        if (default_idx >= 0) {
+            this.cg.builder.build_br(case_bbs[default_idx]);
+        } else {
+            this.cg.builder.build_br(merge_bb);
+        }
+
+        // Emit each case body.  No fallthrough: a body that doesn't otherwise
+        // terminate branches to the merge.
+        for (mut i: i64 = 0; i < ncases; i++) {
+            const c: CaseStmtNode* = node.cases[i];
+            if (c == null) { continue; }
+            this.cg.builder.position_at_end(case_bbs[i]);
+            if (c.body != null) {
+                this.dispatch.generate_statement(this,c.body as StatementNode*);
+            }
+            this.cg.flow.branch_if_not_terminated(merge_bb);
+        }
+
+        this.cg.loops.pop();
+        this.cg.builder.position_at_end(merge_bb);
     }
 
-    override visit(mut &this, node: CaseStmtNode*) -> void {
-        this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-            "codegen: 'case' statements are not implemented; use 'match' arms instead",
-            node.span);
-    }
+    /// Case bodies are emitted directly by `visit(SwitchStmtNode*)`, so a
+    /// standalone CaseStmtNode is never reached during codegen; this is a
+    /// defensive no-op rather than an error.
+    override visit(mut &this, node: CaseStmtNode*) -> void {}
 }
 
 

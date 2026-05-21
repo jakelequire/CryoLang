@@ -328,6 +328,12 @@ type struct PatternEmitter {
                             format("%s.cmp", name_prefix));
                     }
                 }
+            } else if (pat.pattern_kind == PatternKind::Range) {
+                // Inclusive `lo..hi` range: `lo <= subject && subject <= hi`.
+                // String subjects can't form a range (sema rejects them), so
+                // this always operates on the integer/char subject directly.
+                cmp = this.codegen_range_compare(pat, minfo.subject_ty,
+                                                 subject, name_prefix);
             } else if (pat.pattern_kind == PatternKind::Enum) {
                 // Enum pattern: compare the subject's tag to the variant tag.
                 if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
@@ -382,45 +388,9 @@ type struct PatternEmitter {
     /// instead of a zero-extended-from-i32 `0x00000000FFFFFFFF`.
     codegen_pattern_value(mut &this, pat: PatternNode*, subj_ty: TypeRef) -> LValue {
         if (pat.pattern_kind == PatternKind::Literal) {
-            // `pat.literal_kind` (set by the parser) says how to read the
-            // interned `value` text.  It can't be guessed from the text:
-            // `0` (Integer) and `'0'` (Char) both intern to "0", and
-            // `true`/`false` intern to "true"/"false".  The old length
-            // heuristic ("1 char ⇒ char literal") mis-emitted every
-            // single-digit integer pattern as a char and every boolean
-            // pattern as 0; so e.g. `match (n) { 0 => ... }` never fired.
             const intern: InternTable* = this.cg.get_intern();
-            const text: string = intern.resolve(pat.value);
-            if (pat.literal_kind == LiteralKind::Char) {
-                return LType::const_int(LType::i32(),
-                                        decode_char_lexeme(text), false);
-            }
-            if (pat.literal_kind == LiteralKind::Boolean) {
-                const bval: u64 = if (text == "true") { 1 } else { 0 };
-                return LType::const_int(LType::i1(), bval, false);
-            }
-            if (pat.literal_kind == LiteralKind::Integer) {
-                // Build the literal at the subject's integer width so the
-                // icmp operands match without a lossy widen.  Falls back to
-                // i32 when the subject type isn't a resolvable integer.
-                mut lit_ty: LType = LType::i32();
-                mut lit_signed: boolean = true;
-                const subj_t: Type* = this.cg.lookup_type_by_id(subj_ty.id);
-                if (subj_t != null && subj_t.kind == TypeKind::Int) {
-                    const mapped: LType = this.cg.type_mapper.map_type(subj_ty);
-                    if (mapped.is_valid()
-                            && type_kind_of(mapped.raw) == LTypeKind::Integer) {
-                        lit_ty = mapped;
-                    }
-                    lit_signed = this.cg.int_type_is_signed(subj_ty);
-                }
-                return LType::const_int(lit_ty, parse_int_lexeme(text), lit_signed);
-            }
-            // String / Float literal patterns don't lower to an `icmp`
-            // operand here: a string pattern is routed through the caller's
-            // string-compare branch before reaching this, and a float
-            // literal pattern is not currently supported.
-            return LValue::null();
+            return this.lower_scalar_literal(intern.resolve(pat.value),
+                                             pat.literal_kind, subj_ty);
         } else if (pat.pattern_kind == PatternKind::Identifier) {
             // Identifier pattern: could be an enum variant name.
             // Look it up as a named value or try to resolve as an enum discriminant.
@@ -437,5 +407,81 @@ type struct PatternEmitter {
             return LValue::null();
         }
         return LValue::null();
+    }
+
+    /// Lower a single scalar literal (char / boolean / integer) to an LLVM
+    /// constant for an `icmp` against the match subject.  `lit_kind` (set by
+    /// the parser) says how to read the interned `text`: it can't be guessed
+    /// from the text alone — `0` (Integer) and `'0'` (Char) both intern to
+    /// "0", and `true`/`false` intern to "true"/"false".  Integer literals
+    /// are built at the subject's width and signedness so the icmp operands
+    /// match without a lossy widen.  Shared by the single-literal pattern
+    /// path (`codegen_pattern_value`) and both bounds of a range pattern
+    /// (`codegen_range_compare`).
+    lower_scalar_literal(mut &this, text: string, lit_kind: LiteralKind,
+                         subj_ty: TypeRef) -> LValue {
+        if (lit_kind == LiteralKind::Char) {
+            return LType::const_int(LType::i32(),
+                                    decode_char_lexeme(text), false);
+        }
+        if (lit_kind == LiteralKind::Boolean) {
+            const bval: u64 = if (text == "true") { 1 } else { 0 };
+            return LType::const_int(LType::i1(), bval, false);
+        }
+        if (lit_kind == LiteralKind::Integer) {
+            mut lit_ty: LType = LType::i32();
+            mut lit_signed: boolean = true;
+            const subj_t: Type* = this.cg.lookup_type_by_id(subj_ty.id);
+            if (subj_t != null && subj_t.kind == TypeKind::Int) {
+                const mapped: LType = this.cg.type_mapper.map_type(subj_ty);
+                if (mapped.is_valid()
+                        && type_kind_of(mapped.raw) == LTypeKind::Integer) {
+                    lit_ty = mapped;
+                }
+                lit_signed = this.cg.int_type_is_signed(subj_ty);
+            }
+            return LType::const_int(lit_ty, parse_int_lexeme(text), lit_signed);
+        }
+        // String / Float literal patterns don't lower to an `icmp` operand:
+        // a string pattern is routed through the caller's string-compare
+        // branch, and float literal patterns are not currently supported.
+        return LValue::null();
+    }
+
+    /// Emit the boolean test for an inclusive `lo..hi` range pattern:
+    /// `lo <= subject && subject <= hi`.  Both bounds are lowered at the
+    /// subject's integer width (see `lower_scalar_literal`) and the compare
+    /// predicate follows the subject's signedness — a `char` subject is
+    /// `TypeKind::Char` (not `Int`), so `int_type_is_signed` reports
+    /// unsigned, which is what we want (char code points are non-negative
+    /// and stored as unsigned i32).  Returns null if either bound fails to
+    /// lower, leaving the caller to treat the arm as a non-matching miss.
+    codegen_range_compare(mut &this, pat: PatternNode*, subj_ty: TypeRef,
+                          subject: LValue, name_prefix: string) -> LValue {
+        const intern: InternTable* = this.cg.get_intern();
+        const lo_val: LValue = this.lower_scalar_literal(
+            intern.resolve(pat.value), pat.literal_kind, subj_ty);
+        const hi_val: LValue = this.lower_scalar_literal(
+            intern.resolve(pat.high_value), pat.literal_kind, subj_ty);
+        if (!lo_val.is_valid() || !hi_val.is_valid()) { return LValue::null(); }
+
+        const lo_c: LValue = this.cg.expr_ops.coerce_icmp_operands(
+            subject, lo_val, subj_ty);
+        const hi_c: LValue = this.cg.expr_ops.coerce_icmp_operands(
+            subject, hi_val, subj_ty);
+
+        mut ge_pred: LIntPredicate = LIntPredicate::UGE;
+        mut le_pred: LIntPredicate = LIntPredicate::ULE;
+        if (this.cg.int_type_is_signed(subj_ty)) {
+            ge_pred = LIntPredicate::SGE;
+            le_pred = LIntPredicate::SLE;
+        }
+
+        const ge_lo: LValue = this.cg.builder.build_icmp(ge_pred, subject, lo_c,
+            format("%s.ge", name_prefix));
+        const le_hi: LValue = this.cg.builder.build_icmp(le_pred, subject, hi_c,
+            format("%s.le", name_prefix));
+        return this.cg.builder.build_and(ge_lo, le_hi,
+            format("%s.range", name_prefix));
     }
 }

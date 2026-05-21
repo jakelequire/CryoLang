@@ -506,7 +506,7 @@ Only `mut` bindings can be assigned to.
 | `*` | Dereference (unary). |
 | `sizeof(T)` | Compile-time size of `T` in bytes. |
 | `alignof(T)` | Compile-time alignment of `T` in bytes. |
-| `typeof(expr)` | Compile-time type of `expr`. |
+| `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style). |
 | `new` `delete` | Heap allocation / deallocation. |
 
 > **Reserved.** `?.`, `..` (in expression position), and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax).
@@ -530,6 +530,16 @@ function load(path: string) -> Result<Config, IoError> {
     const text: String = read_file(path)?;     // returns Err(e) on failure
     return Result::Ok(parse_config(text));
 }
+```
+
+**Type-of (`typeof`).** `typeof(expr)` resolves to the static type of `expr` and is used **in type position** — anywhere a type annotation is expected: variable bindings, pointer/array/optional wrappers, generic arguments, and `as` cast targets. It is a compile-time construct that names a type, not a value, so it cannot appear where a value is expected. `expr` is only type-checked, never evaluated.
+
+```cryo
+const x: i32 = read_count();
+const y: typeof(x) = 0;        // y : i32
+const p: typeof(x)* = &x;      // p : i32*
+const n: i64 = 5;
+const back = n as typeof(x);   // back : i32
 ```
 
 ### 5.7 Operator Precedence
@@ -665,7 +675,7 @@ const name: string = match (n) {
 
 ### 6.9 Switch / Case
 
-A traditional `switch` is also available for integer and enum values. There is no implicit fallthrough; each case is independent.
+A traditional `switch` is also available for **integer, `char`, `bool`, and fieldless enum** values — anything compared by value. There is no implicit fallthrough; each case is independent.
 
 ```cryo
 switch (value) {
@@ -674,6 +684,8 @@ switch (value) {
     default: { println("other"); }
 }
 ```
+
+A `switch` on anything else is a compile error that points you at the right tool: enums whose variants carry payloads, strings, and other structured types require a `match` (which destructures and checks exhaustiveness), and floating-point values require explicit comparisons.
 
 In idiomatic code, prefer `match`; it supports richer patterns and enforces exhaustiveness. `switch` is provided for familiarity and for low-level integer dispatch.
 
@@ -1490,6 +1502,8 @@ delete p;
 ```cryo
 const arr: int* = new int[100];
 ```
+
+`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** and no constructors run — it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
 
 **Higher level (`Box<T>` and the collections).** Prefer `Box<T>` over raw `malloc` for owning a single heap value, and prefer `Array<T>` / `String` / `HashMap<K, V>` over manual allocation for collections. They handle reservation, growth, and cleanup, and they implement `Drop`.
 
