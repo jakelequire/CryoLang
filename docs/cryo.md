@@ -423,9 +423,10 @@ intrinsic function malloc(size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
 intrinsic function memcpy(dest: void*, src: void*, count: u64) -> void*;
 intrinsic function strlen(str: string) -> u64;
-intrinsic function println(format: string, args...) -> i32;
-intrinsic function format(fmt: string, args...) -> string;
+intrinsic function printf(format: string, args...) -> i32;
 ```
+
+The user-facing `print` / `println` / `eprint` / `eprintln` are *not* intrinsics — they live in `std::fmt` and forward to the variadic `printf` family. Only the raw C-shaped primitives above are intrinsics.
 
 The complete list of intrinsics is the file [`stdlib/core/intrinsics.cryo`](../stdlib/core/intrinsics.cryo). User code does not typically declare its own intrinsics; they are a contract between the standard library and the compiler.
 
@@ -1778,7 +1779,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::option` | `Option<T>` (`Some` / `None`) and its methods |
 | `core::result` | `Result<T, E>` (`Ok` / `Err`) and its methods |
 | `core::primitives` | Methods on built-in types (`i32::max_value`, `char::is_digit`, …) |
-| `core::intrinsics` | Compiler intrinsics including `print`, `println`, `printf`, `format`, `malloc`, `free`, `memcpy` |
+| `core::intrinsics` | Compiler intrinsics including `printf`, `malloc`, `free`, `memcpy` (the `print`/`println` family lives in `std::fmt`) |
 | `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>` |
 | `alloc::box` | `Box<T>` |
 

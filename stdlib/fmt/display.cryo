@@ -588,84 +588,61 @@ where W: Write {
 const PRINT_BUFFER_SIZE: u64 = 256;
 
 // ============================================================================
-// print / println helpers
+// print / println: printf-style variadic output
 // ============================================================================
+//
+// `println("%s is %d", name, age)` forwards the variadic bucket to libc's
+// `vprintf` (stdout) and appends a newline.  Format specifiers follow C
+// `printf`: `%d`/`%i`, `%u`, `%s`, `%f`, `%x`, `%c`, `%p`, `%%`, plus
+// width/precision.  They are NOT type-checked against the arguments (this is
+// the C variadic ABI); a wrong specifier is undefined behaviour, exactly as
+// in C.  For type-safe, Display-based formatting, build a `String` via
+// `format_to_string` and the `Display` trait.
 
-/// Format `value` to stdout. Collapses to one `write(2)` when the
-/// formatted output fits in `PRINT_BUFFER_SIZE`; larger values flush
-/// incrementally.
-function print<T>(value: &T) -> Result<(), FmtError>
-where T: Display {
-    mut out: Stdout = stdout();
-    mut buffer: u8[256];
-    mut sink: LineBuf<Stdout> = LineBuf::new(&out, &buffer[0], PRINT_BUFFER_SIZE);
-    mut f: Formatter<LineBuf<Stdout>> = Formatter::new(&sink);
-    match (value.fmt(&f)) {
-        Result::Ok(_) => { }
-        Result::Err(err) => { return Result::Err(err); }
-    }
-    match (sink.flush_buffer()) {
-        Result::Ok(_) => { return Result::Ok(()); }
-        Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-    }
+/// Write a printf-style formatted string to stdout.  Returns the number of
+/// bytes written, or a negative value on error (libc `printf` convention).
+function print(fmt: string, args...) -> i32 {
+    return intrinsics::vprintf(fmt, args);
 }
 
-/// Format `value` to stdout followed by a newline, in one syscall
-/// when the output fits in `PRINT_BUFFER_SIZE`.
-function println<T>(value: &T) -> Result<(), FmtError>
-where T: Display {
-    mut out: Stdout = stdout();
-    mut buffer: u8[256];
-    mut sink: LineBuf<Stdout> = LineBuf::new(&out, &buffer[0], PRINT_BUFFER_SIZE);
-    mut f: Formatter<LineBuf<Stdout>> = Formatter::new(&sink);
-    match (value.fmt(&f)) {
-        Result::Ok(_) => { }
-        Result::Err(err) => { return Result::Err(err); }
-    }
-    match (sink.write_byte(0x0A)) {
-        Result::Ok(_) => { }
-        Result::Err(err) => { return Result::Err(err); }
-    }
-    match (sink.flush_buffer()) {
-        Result::Ok(_) => { return Result::Ok(()); }
-        Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-    }
+/// Like `print`, followed by a newline.
+function println(fmt: string, args...) -> i32 {
+    const n: i32 = intrinsics::vprintf(fmt, args);
+    if (n < 0) { return n; }
+    intrinsics::putchar(0x0A);
+    return n + 1;
 }
 
-function eprint<T>(value: &T) -> Result<(), FmtError>
-where T: Display {
-    mut out: Stderr = stderr();
-    mut buffer: u8[256];
-    mut sink: LineBuf<Stderr> = LineBuf::new(&out, &buffer[0], PRINT_BUFFER_SIZE);
-    mut f: Formatter<LineBuf<Stderr>> = Formatter::new(&sink);
-    match (value.fmt(&f)) {
-        Result::Ok(_) => { }
-        Result::Err(err) => { return Result::Err(err); }
+// Lazily-opened stderr stream for the `eprint` family.  libc's `stderr`
+// global FILE* isn't reachable by name from Cryo, so `fdopen(2)` yields an
+// equivalent stream over fd 2.  Cached to avoid leaking a FILE per call; each
+// write is flushed since this fdopen'd stream is fully-buffered (unlike a
+// real tty stderr).
+mut g_fmt_stderr: void*;
+
+private function fmt_stderr_stream() -> void* {
+    if (g_fmt_stderr == null) {
+        g_fmt_stderr = intrinsics::fdopen(2, "w");
     }
-    match (sink.flush_buffer()) {
-        Result::Ok(_) => { return Result::Ok(()); }
-        Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-    }
+    return g_fmt_stderr;
 }
 
-function eprintln<T>(value: &T) -> Result<(), FmtError>
-where T: Display {
-    mut out: Stderr = stderr();
-    mut buffer: u8[256];
-    mut sink: LineBuf<Stderr> = LineBuf::new(&out, &buffer[0], PRINT_BUFFER_SIZE);
-    mut f: Formatter<LineBuf<Stderr>> = Formatter::new(&sink);
-    match (value.fmt(&f)) {
-        Result::Ok(_) => { }
-        Result::Err(err) => { return Result::Err(err); }
-    }
-    match (sink.write_byte(0x0A)) {
-        Result::Ok(_) => { }
-        Result::Err(err) => { return Result::Err(err); }
-    }
-    match (sink.flush_buffer()) {
-        Result::Ok(_) => { return Result::Ok(()); }
-        Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-    }
+/// Write a printf-style formatted string to stderr.  Same specifier rules as
+/// `print` (see above).  Returns the number of bytes `vfprintf` reported.
+function eprint(fmt: string, args...) -> i32 {
+    const stream: void* = fmt_stderr_stream();
+    const n: i32 = intrinsics::vfprintf(stream, fmt, args);
+    intrinsics::fflush(stream);
+    return n;
+}
+
+/// Like `eprint`, followed by a newline.
+function eprintln(fmt: string, args...) -> i32 {
+    const stream: void* = fmt_stderr_stream();
+    const n: i32 = intrinsics::vfprintf(stream, fmt, args);
+    intrinsics::fputc(0x0A, stream);
+    intrinsics::fflush(stream);
+    return n;
 }
 
 // ============================================================================
