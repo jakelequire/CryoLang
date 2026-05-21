@@ -912,6 +912,29 @@ type struct CallEmitter {
         }
 
         if (!callee_val.is_valid()) {
+            // A `.drop()` on a `Copy` receiver is a no-op: a bitwise-duplicable
+            // value owns no resources, so there is nothing to release.  Copy
+            // types deliberately carry no `drop` method (having one would make
+            // them non-Copy), so the call legitimately fails to resolve — emit
+            // nothing rather than erroring.  This is what lets a generic
+            // `where T: Drop` container instantiate for a Copy element type:
+            // e.g. `Array<PodType>::drop`, whose body calls `element.drop()`
+            // per slot before freeing the buffer.  Gated on `Copy` so a failed
+            // drop resolution on a genuinely-owning type still surfaces.
+            if (node.callee.kind == NodeKind::MemberAccess) {
+                const dma: MemberAccessNode* = node.callee as MemberAccessNode*;
+                const drop_sym: SymbolStr = intern.intern("drop");
+                if (dma.member.equals(drop_sym)
+                        && OwnershipQuery::is_copy(this.cg.get_arena(),
+                               this.cg.ctx.generic_registry,
+                               this.cg.get_intern(),
+                               dma.object.resolved_type)) {
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+            }
+
             // Build a rich diagnostic that names the callee (when available)
             // and labels the receiver for member/scope calls.
             mut msg: string = "codegen: call expression: callee function not found";
