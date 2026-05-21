@@ -1620,9 +1620,10 @@ type struct ExprOps {
     /// than Win64's 8-byte char* so both platforms fit in the same
     /// storage) and calls `@llvm.va_start` on the pointer.  Binds
     /// `args_name` to the alloca so that references in the body resolve
-    /// to the va_list pointer.  Stashes the args name on `this` so
-    /// `codegen_return` can emit `va_end` before every `ret`
-    /// instruction.
+    /// to the va_list pointer (a `void*`).  The body wraps it in a safe
+    /// `VaArgs` via `VaArgs::new(args)` to read typed values, or forwards
+    /// it directly to a C `v*printf` callee.  Stashes the args name on
+    /// `this` so `codegen_return` can emit `va_end` before every `ret`.
     emit_va_start_for_variadic(mut &this, fn_val: LValue, args_name: SymbolStr) -> void {
         if (!args_name.is_valid()) {
             this.current_variadic_arg_id = 0;
@@ -1633,10 +1634,10 @@ type struct ExprOps {
             fn_val, this.resolve(args_name), va_list_ty);
         const va_start_fn: LValue = this.declare_va_start();
         const va_start_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_start_fn.raw) };
-        mut args: Pair<LValue, TypeRef>[] = [];
-        args.push(Pair<LValue, TypeRef>::new(va_list_alloca, TypeRef::invalid()));
+        mut sargs: Pair<LValue, TypeRef>[] = [];
+        sargs.push(Pair<LValue, TypeRef>::new(va_list_alloca, TypeRef::invalid()));
         mut _result: LValue = LValue::null();
-        _result = this.codegen_call(va_start_fn, va_start_ty, args, "");
+        _result = this.codegen_call(va_start_fn, va_start_ty, sargs, "");
         this.values.set(args_name, va_list_alloca);
         this.current_variadic_arg_id = args_name.id;
     }

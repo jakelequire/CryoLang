@@ -1,0 +1,87 @@
+///! VaArgs: a safe, typed wrapper over a C-ABI variadic argument list.
+///!
+///! A function declared with a trailing `args...` bucket mirrors C's variadic
+///! calling convention (so it stays ABI-compatible for `printf`-style interop).
+///! The compiler emits `va_start`/`va_end` around the body and binds `args` to
+///! the raw `va_list` pointer (a `void*`). Wrap that pointer in a `VaArgs` to
+///! read typed values without hand-rolling `va_arg`:
+///!
+///!     function logf(fmt: string, args...) -> void {
+///!         mut va: VaArgs = VaArgs::new(args);
+///!         const count: i32 = va.next();        // ![implicit]: T inferred = i32
+///!         const name:  string = va.next();
+///!         intrinsics::vfprintf(stderr(), fmt, args);  // or forward the raw list
+///!     }
+///!
+///! Limits, inherited from C varargs (not fixable by any wrapper):
+///!   * Not count-safe: nothing records how many args were passed or their
+///!     types. The callee must know arity/types out of band (a format string,
+///!     a leading count, a sentinel).
+///!   * Default argument promotions apply: a variadic call promotes `i8`/`i16`/
+///!     `boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore only
+///!     implemented for the promoted scalar set; `va.next<i8>()` is a
+///!     compile error by design — read it as `i32` and narrow.
+
+namespace std::core::varargs;
+
+import core::intrinsics;
+import core::marker;
+import core::drop;
+
+// ============================================================================
+// VaArg: types that can be plucked from a va_list
+// ============================================================================
+
+/// A type that can be read as the next variadic argument. Implemented for the
+/// C-promoted scalar set only (see the module note on argument promotion).
+type trait VaArg {
+    /// Read the next argument of type `This` from the va_list `p` points at,
+    /// advancing it. `p` is the raw `va_list` pointer (`VaArgs::as_ptr`).
+    static __pluck(p: void*) -> This;
+}
+
+implement trait VaArg for i32    { static __pluck(p: void*) -> i32    { return intrinsics::va_arg_i32(p); } }
+implement trait VaArg for u32    { static __pluck(p: void*) -> u32    { return intrinsics::va_arg_u32(p); } }
+implement trait VaArg for i64    { static __pluck(p: void*) -> i64    { return intrinsics::va_arg_i64(p); } }
+implement trait VaArg for u64    { static __pluck(p: void*) -> u64    { return intrinsics::va_arg_u64(p); } }
+implement trait VaArg for f64    { static __pluck(p: void*) -> f64    { return intrinsics::va_arg_f64(p); } }
+implement trait VaArg for string { static __pluck(p: void*) -> string { return intrinsics::va_arg_string(p); } }
+
+// ============================================================================
+// VaArgs: the variadic-argument handle
+// ============================================================================
+
+/// Single-pointer wrapper over the active va_list. `ptr` is the raw `va_list`
+/// pointer — the `args` identifier the compiler binds in a variadic body.
+type struct VaArgs {
+    ptr: void*;
+
+    /// Wrap a variadic body's `args` bucket: `VaArgs::new(args)`. `va` is the
+    /// raw `va_list` pointer the compiler binds for the `args...` parameter.
+    static new(va: void*) -> VaArgs {
+        return VaArgs { ptr: va };
+    }
+
+    /// The raw `va_list` pointer, for forwarding the remaining arguments to a
+    /// C `v*`-family function (`vfprintf`, `vsnprintf`, ...). Equivalent to
+    /// passing the original `args` identifier.
+    as_ptr(&this) -> void* {
+        return this.ptr;
+    }
+
+    /// Read the next variadic argument as `T` (one of the promoted scalar
+    /// types), advancing the list. `![implicit]` lets the type be recovered
+    /// from the call's expected type, so `const n: i64 = va.next();` works;
+    /// `va.next<i64>()` is the explicit form.
+    ![implicit]
+    next<T>(&this) -> T where T: VaArg {
+        return T::__pluck(this.ptr);
+    }
+}
+
+// `VaArgs` is a single borrowed pointer: bitwise-copyable and owns nothing.
+// `Copy` keeps move-check / drop-insertion from treating it as an owned value;
+// the no-op `Drop` satisfies generic `where T: Drop` bounds. The va_list
+// lifecycle is the compiler's (`va_start`/`va_end`), not `VaArgs`'s.
+implement trait Copy for VaArgs { }
+implement trait Drop for VaArgs { drop(mut &this) -> void {} }
