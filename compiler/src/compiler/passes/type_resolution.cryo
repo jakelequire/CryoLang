@@ -1345,6 +1345,12 @@ type struct TypeResolutionPasses {
         mut runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
         mut sig_count: i64 = 0;
 
+        // Track resolved free-function signatures within this module to
+        // reject exact redefinitions (E0206). Overloads differ in their
+        // FunctionType, so only same-name + same-signature collides.
+        mut seen_fn_names: u32[] = [];
+        mut seen_fn_types: u32[] = [];
+
         // Walk top-level statements
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
@@ -1358,6 +1364,35 @@ type struct TypeResolutionPasses {
                         func.generic_params, &runner.res_ctx);
                     runner.resolve_func_signature(func, &func_ctx);
                     sig_count++;
+
+                    if (func.resolved_return_type.is_valid()) {
+                        mut fparams: TypeRef[] = [];
+                        for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                            const fp: VarDeclNode* = func.parameters[p];
+                            if (fp != null && fp.resolved_type.is_valid()) {
+                                fparams.push(fp.resolved_type);
+                            }
+                        }
+                        const fsig: TypeRef = arena.get_function(
+                            func.resolved_return_type, fparams, func.is_variadic);
+                        mut redefined: boolean = false;
+                        for (mut k: i64 = 0; k < seen_fn_names.length; k++) {
+                            if (seen_fn_names[k] == func.name.id
+                                && seen_fn_types[k] == fsig.id) {
+                                redefined = true;
+                                break;
+                            }
+                        }
+                        if (redefined) {
+                            ctx.emit_error_at(ErrorCode::E0206_REDEFINED_FUNCTION,
+                                format("function `%s` is defined multiple times with the same signature",
+                                    ctx.resolve_str(func.name)),
+                                func.span);
+                        } else {
+                            seen_fn_names.push(func.name.id);
+                            seen_fn_types.push(fsig.id);
+                        }
+                    }
                 }
                 NodeKind::StructDeclaration => {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
