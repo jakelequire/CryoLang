@@ -55,3 +55,50 @@ function f64_is_copy() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// A user-defined Copy type can live in an `Array` (which is `where T: Drop`)
+// AND be read out by value with `.get()` (which is `where T: Copy`).  This
+// is the parity-with-primitives behaviour: a Copy type trivially satisfies
+// `Drop` (its drop is a no-op) so the container instantiates, while staying
+// Copy so `get` is available.  The array drops at scope end with no error
+// and no leak (its element-drops are no-ops, then it frees the buffer).
+
+type enum PodTag { Num(i64); Flag; }      // all-primitive payloads → Copy
+
+![test]
+function copy_pod_struct_in_array_get() -> Result<(), TestError> {
+    mut xs: Array<PodPair> = Array<PodPair>::new();
+    xs.push(PodPair { a: 1, b: 2 });
+    xs.push(PodPair { a: 3, b: 4 });
+    match (xs.get(1)) {
+        Option::Some(p) => {
+            expect_eq(p.a, 3)?;
+            expect_eq(p.b, 4)?;
+        }
+        Option::None => {
+            return Result::Err(TestError::failed(
+                Str::new("expected Some from Array<PodPair>::get")));
+        }
+    }
+    return expect_eq(xs.length() as i32, 2);
+}
+
+![test]
+function copy_pod_enum_in_array_get() -> Result<(), TestError> {
+    mut ts: Array<PodTag> = Array<PodTag>::new();
+    ts.push(PodTag::Num(42));
+    ts.push(PodTag::Flag);
+    mut sum: i64 = 0;
+    for (mut i: u64 = 0; i < ts.length(); i++) {
+        match (ts.get(i)) {
+            Option::Some(t) => {
+                match (t) {
+                    PodTag::Num(n) => { sum = sum + n; }
+                    PodTag::Flag   => { sum = sum + 1; }
+                }
+            }
+            Option::None => { }
+        }
+    }
+    return expect_eq(sum as i32, 43);   // 42 + 1
+}

@@ -1272,10 +1272,31 @@ type struct Monomorphizer {
         // extension to support pointer impl targets like `for u8*`.
         const drop_name: SymbolStr = this.intern_table.intern("Drop");
         if (drop_name.is_valid() && trait_name.equals(drop_name)) {
+            // Pointers/references are non-owning aliases.  Delegate
+            // `T*: Drop` to `T: Drop` so primitive pointers auto-pass while
+            // pointers to user types require the pointee to impl `Drop`.  This
+            // is checked BEFORE the `Copy` rule below: a pointer is itself
+            // `Copy`, but a `where T: Drop` container of `T*` must still drop
+            // its elements through the pointee's real `Drop` — answering
+            // "satisfied" off the pointer's own Copy-ness would wrongly
+            // instantiate a container drop whose body derefs to a non-Copy
+            // pointee that has no `drop` method.
             const t_ptr: Type* = this.arena.lookup(ty.id);
             if (t_ptr != null && t_ptr.kind == TypeKind::Pointer) {
                 const pt: PointerType* = t_ptr as PointerType*;
                 return this.type_implements_trait(pt.pointee, trait_name, depth + 1);
+            }
+
+            // A non-pointer `Copy` type owns no resources, so dropping it is a
+            // no-op: it trivially satisfies `Drop`.  This lets user-defined
+            // POD types (all-Copy fields, no `drop`) live in `where T: Drop`
+            // containers (`Array`, `Box`, …) exactly the way primitives do —
+            // which carry explicit no-op `Drop` impls in core/drop.cryo —
+            // while staying `Copy` so `Array::get` still works.  The matching
+            // codegen/sema rules emit nothing for a `.drop()` on such a type.
+            if (OwnershipQuery::is_copy(this.arena, this.generic_registry,
+                                         this.intern_table, ty)) {
+                return true;
             }
         }
 

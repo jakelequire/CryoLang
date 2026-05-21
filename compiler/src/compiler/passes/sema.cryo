@@ -41,6 +41,7 @@ import Compiler::Types::Compound;
 import Compiler::Types::Generic;
 import Compiler::Types::Arena;
 import Compiler::Types::Checker;
+import Compiler::Types::Ownership;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::QualifiedName;
@@ -4545,6 +4546,116 @@ public:
         return false;
     }
 
+    /// Find an inherent method named `name` on a generic template's AST —
+    /// struct/class body methods plus any non-trait `implement` blocks.
+    /// Returns its FunctionDeclNode (carrying the `where` bounds) or null.
+    find_template_method(&this, ast_node: ASTNode*, name: SymbolStr) -> FunctionDeclNode* {
+        if (ast_node == null) { return null; }
+        if (ast_node.kind == NodeKind::StructDeclaration) {
+            const d: StructDeclNode* = ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                const m: MethodNode* = d.methods[i];
+                if (m != null && m.func != null && m.func.name.equals(name)) {
+                    return m.func;
+                }
+            }
+        } else if (ast_node.kind == NodeKind::ClassDeclaration) {
+            const d: ClassDeclNode* = ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                const m: MethodNode* = d.methods[i];
+                if (m != null && m.func != null && m.func.name.equals(name)) {
+                    return m.func;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// When a method isn't found on a generic receiver, check whether the
+    /// receiver's *template* defines that method but gated behind a `where`
+    /// clause its concrete type arguments don't satisfy — e.g.
+    /// `Array<String>.get()`, where `get` is `where T: Copy` but `String`
+    /// isn't `Copy`.  If so, emit a precise diagnostic naming the unmet bound
+    /// (with a borrow hint for `Copy`) and return true; otherwise return
+    /// false so the caller falls back to the generic "no method" message.
+    try_diagnose_method_bound_failure(mut &this, obj_type: TypeRef,
+                                       member: MemberAccessNode*) -> boolean {
+        const reg: GenericRegistry* = this.ctx.get_generic_registry();
+        if (reg == null || this.ctx.monomorphizer == null) { return false; }
+
+        // Peel ref/ptr to find the InstantiatedType wrapper that carries the
+        // concrete type arguments.
+        mut t: Type* = this.arena.lookup(obj_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::InstantiatedType) { break; }
+            if (t.kind == TypeKind::Reference) {
+                t = this.arena.lookup((t as ReferenceType*).referent.id);
+            } else if (t.kind == TypeKind::Pointer) {
+                t = this.arena.lookup((t as PointerType*).pointee.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+
+        const tmpl: TemplateEntry* = reg.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return false; }
+        if (tmpl.param_names.length != inst.type_args.length) { return false; }
+
+        const func: FunctionDeclNode* =
+            this.find_template_method(tmpl.ast_node, member.member);
+        if (func == null || func.trait_bounds.length == 0) { return false; }
+
+        // Find the first bound whose concrete argument doesn't satisfy it.
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
+            const bound: TraitBound = func.trait_bounds[bi];
+            mut concrete: TypeRef = TypeRef::invalid();
+            for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
+                if (tmpl.param_names[pi].equals(bound.type_parameter)) {
+                    concrete = inst.type_args[pi];
+                    break;
+                }
+            }
+            if (!concrete.is_valid()) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef = bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (this.ctx.monomorphizer.type_implements_trait(concrete, trait_name, 0)) {
+                    continue;
+                }
+                // Unmet bound — build the diagnostic.
+                const method_str: string = this.intern.resolve(member.member);
+                const trait_str:  string = this.intern.resolve(trait_name);
+                const param_str:  string = this.intern.resolve(bound.type_parameter);
+                const conc_str:   string = this.type_display_name(concrete);
+                const primary: SourceSpan = if (member.member_span.has_location()) {
+                    member.member_span
+                } else {
+                    member.span
+                };
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                    format("the trait bound `%s: %s` is not satisfied",
+                        conc_str, trait_str));
+                d = d.at(primary);
+                d = d.with_note(format("method `%s` requires `%s: %s`",
+                    method_str, param_str, trait_str));
+                if (strcmp(trait_str, "Copy") == 0) {
+                    d = d.help(format(
+                        "`%s` owns resources, so it isn't `Copy`; borrow the element in place with `get_ptr` instead of copying it out with `%s`",
+                        conc_str, method_str));
+                }
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+        }
+        return false;
+    }
+
     resolve_method_call(mut &this, member: MemberAccessNode*) -> TypeRef {
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid → upstream error already emitted, stay silent
@@ -4665,6 +4776,21 @@ public:
             return field_ret;
         }
 
+        // A `.drop()` on a `Copy` receiver is a no-op: a bitwise-duplicable
+        // value owns no resources, so there is nothing to release.  Copy
+        // types deliberately carry no `drop` method (one would make them
+        // non-Copy), so the lookups above legitimately found nothing — accept
+        // the call as a no-op of type `void` instead of erroring.  This lets
+        // generic `where T: Drop` containers (`Array`, `Box`, …) instantiate
+        // for Copy element types, whose drop bodies call `element.drop()` per
+        // slot; codegen emits nothing for the call (see call_emitter).
+        if (member.member.equals(this.intern.intern("drop"))
+                && OwnershipQuery::is_copy(this.arena,
+                       this.ctx.get_generic_registry(), this.intern, lookup_ref)) {
+            member.set_resolved_type(this.arena.get_void());
+            return this.arena.get_void();
+        }
+
         // Inputs were valid but method not found.  Before emitting the
         // generic "method not found" diagnostic, ask the monomorphizer
         // whether a trait impl that COULD have provided this method has
@@ -4712,6 +4838,14 @@ public:
                 this.ctx.emit_diagnostic(diag);
                 return TypeRef::invalid();
             }
+        }
+
+        // Inherent method gated by an unsatisfied `where` clause — e.g.
+        // `Array<String>.get()`, where `get` requires `T: Copy` but `String`
+        // owns heap data.  Report the specific unmet bound (and, for `Copy`,
+        // point at the borrowing alternative) instead of a bare "no method".
+        if (this.try_diagnose_method_bound_failure(obj_type, member)) {
+            return TypeRef::invalid();
         }
 
         // Generic "no method found": clean source-snippet message with
