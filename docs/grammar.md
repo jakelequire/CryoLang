@@ -161,8 +161,10 @@ GenericArgs        ::= "<" Type ("," Type)* ">"
 (* Operators and their precedence/associativity are summarised below. *)
 
 Expr               ::= Assign
-Assign             ::= Conditional (AssignOp Assign)?
+Assign             ::= Coalesce (AssignOp Assign)?
 AssignOp           ::= "=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|="
+Coalesce           ::= Pipe ("??" Coalesce)?            (* null-coalescing, right-assoc *)
+Pipe               ::= Conditional (("|>" | "<|") Conditional)*   (* pipeline, left-assoc *)
 
 Conditional        ::= BinaryExpr ("?" Expr ":" Conditional)?
 BinaryExpr         ::= UnaryExpr (BinOp UnaryExpr)*
@@ -179,6 +181,7 @@ PostfixOp          ::= "(" ArgList? ")"
                      | "[" Expr "]"
                      | ("." | "->") Ident GenericArgs?
                      | "::" Ident GenericArgs?
+                     | "?"                              (* error propagation / try *)
                      | "++" | "--"
 
 ArgList            ::= Expr ("," Expr)*
