@@ -104,6 +104,12 @@ public:
     current_owner_type: TypeRef;
     body_count:  i64;                      // counter for debug output
 
+    // -- Loop/switch nesting (for break/continue validation) --
+    // `break` is legal inside any loop or switch; `continue` only inside a
+    // loop. Tracked as depths so nested constructs restore correctly.
+    loop_depth:   i32;
+    switch_depth: i32;
+
     // -- Expected type hint (set by DeclStmt for initializer resolution) --
     expected_type: TypeRef;
 
@@ -132,6 +138,8 @@ public:
         this.this_is_mut    = false;
         this.current_owner_type = TypeRef::invalid();
         this.body_count     = 0;
+        this.loop_depth     = 0;
+        this.switch_depth   = 0;
         this.expected_type  = TypeRef::invalid();
     }
 
@@ -1905,11 +1913,15 @@ public:
 
     override visit(mut &this, node: WhileStmtNode*) -> void {
         this.resolve_expr(node.condition);
+        this.loop_depth += 1;
         this.dispatch_stmt(node.body);
+        this.loop_depth -= 1;
     }
 
     override visit(mut &this, node: DoWhileStmtNode*) -> void {
+        this.loop_depth += 1;
         this.dispatch_stmt(node.body);
+        this.loop_depth -= 1;
         this.resolve_expr(node.condition);
     }
 
@@ -1945,7 +1957,9 @@ public:
         }
         if (node.condition != null) { this.resolve_expr(node.condition); }
         if (node.update != null)    { this.resolve_expr(node.update); }
+        this.loop_depth += 1;
         this.dispatch_stmt(node.body);
+        this.loop_depth -= 1;
 
         this.restore_scope(save);
     }
@@ -1965,6 +1979,37 @@ public:
         }
         this.check_match_exhaustive(node.subject, subject_type, node.arms,
             node.span);
+        this.check_duplicate_default_arm(node.arms);
+    }
+
+    /// A match may have at most one wildcard (`_`) arm. A second one is
+    /// dead code and almost always a mistake, so flag it as E0114. Bare
+    /// identifier-binding arms are not counted: they bind a name rather
+    /// than being the literal default, and shadowing is checked elsewhere.
+    check_duplicate_default_arm(mut &this, arms: MatchArmNode*[]) -> void {
+        mut seen_default: boolean = false;
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            mut is_default: boolean = false;
+            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
+                const pat: PatternNode* = arm.patterns[j];
+                if (pat == null) { continue; }
+                if (pat.pattern_kind == PatternKind::Wildcard) {
+                    is_default = true;
+                    break;
+                }
+            }
+            if (is_default) {
+                if (seen_default) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0114_DUPLICATE_DEFAULT,
+                        "duplicate `_` arm: a match may have at most one wildcard arm",
+                        arm.span);
+                }
+                seen_default = true;
+            }
+        }
     }
 
     /// Check that a match expression / statement covers every variant of
@@ -2096,7 +2141,25 @@ public:
     }
 
     override visit(mut &this, node: LoopStmtNode*) -> void {
+        this.loop_depth += 1;
         this.dispatch_stmt(node.body);
+        this.loop_depth -= 1;
+    }
+
+    override visit(mut &this, node: BreakStmtNode*) -> void {
+        // `break` is legal inside any loop or switch.
+        if (this.loop_depth == 0 && this.switch_depth == 0) {
+            this.ctx.emit_error_at(ErrorCode::E0400_INVALID_BREAK,
+                "`break` outside of a loop or switch", node.span);
+        }
+    }
+
+    override visit(mut &this, node: ContinueStmtNode*) -> void {
+        // `continue` only applies to loops, not switch.
+        if (this.loop_depth == 0) {
+            this.ctx.emit_error_at(ErrorCode::E0401_INVALID_CONTINUE,
+                "`continue` outside of a loop", node.span);
+        }
     }
 
     override visit(mut &this, node: UnsafeBlockStmtNode*) -> void {
@@ -2105,12 +2168,14 @@ public:
 
     override visit(mut &this, node: SwitchStmtNode*) -> void {
         this.resolve_expr(node.expression);
+        this.switch_depth += 1;
         for (mut i: i64 = 0; i < node.cases.length; i++) {
             const cs: CaseStmtNode* = node.cases[i];
             if (cs == null) { continue; }
             if (cs.value != null) { this.resolve_expr(cs.value); }
             if (cs.body != null)  { this.visit(cs.body); }
         }
+        this.switch_depth -= 1;
     }
 
 
@@ -2195,6 +2260,25 @@ public:
         if (this.expected_type.is_valid()) {
             const exp: Type* = this.arena.lookup(this.expected_type.id);
             if (exp != null && exp.kind == TypeKind::Int) {
+                const it: IntType* = exp as IntType*;
+                // Bound the literal by what fits in the target's bit width
+                // (its unsigned max). This catches genuine overflow such as
+                // `u8 = 99999999` while still admitting bit-pattern / two's-
+                // complement initializers up to the width. 128-bit bounds
+                // exceed u64, so they are left unchecked here.
+                const w: u64 = it.int_kind.bit_width();
+                mut max_mag: u64 = 0;
+                if (w == 8)       { max_mag = 255; }
+                else if (w == 16) { max_mag = 65535; }
+                else if (w == 32) { max_mag = 4294967295; }
+                else if (w == 64) { max_mag = SEMA_U64_MAX; }
+                if (max_mag != 0 && int_literal_exceeds(lit.value, max_mag)) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0010_NUMBER_TOO_LARGE,
+                        format("integer literal `%s` is out of range for type `%s`",
+                            lit.value, it.int_kind.to_string()),
+                        lit.span);
+                }
                 return this.expected_type;
             }
         }
@@ -2290,6 +2374,17 @@ public:
             }
             this.check_assignment_lvalue(bin.left);
             return lhs;
+        }
+
+        // Constant division/remainder by a literal zero is always a fault
+        // (UB in the backend). Catch it before operand types matter.
+        if ((bin.op.lexeme == "/" || bin.op.lexeme == "%")
+            && is_zero_int_literal(bin.right)) {
+            this.ctx.emit_error_at(
+                ErrorCode::E0226_DIVISION_BY_ZERO,
+                if (bin.op.lexeme == "/") { "division by zero" }
+                else { "remainder with a zero divisor" },
+                bin.span);
         }
 
         // Non-assignment binary ops: when one operand is a numeric literal
@@ -2433,6 +2528,14 @@ public:
                 }
                 this.check_assignment_lvalue(aa.array);
             }
+            NodeKind::Literal => {
+                // A literal is a value, never a place. `5 = 3` and the
+                // like can never be a valid assignment target.
+                this.ctx.emit_error_at(
+                    ErrorCode::E0232_INVALID_ASSIGNMENT_TARGET,
+                    "cannot assign to a literal; the left-hand side of an assignment must be a place (variable, field, or index)",
+                    lhs.span);
+            }
             // UnaryExpression (deref), CallExpression result, etc.: accept.
             _ => {}
         }
@@ -2441,6 +2544,21 @@ public:
     resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
         const operand_type: TypeRef = this.resolve_expr(unary.operand);
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
+
+        // `&` requires a place. The address of a literal would point at a
+        // transient temporary, so reject `&5`, `&"x"`, etc. Synthesized
+        // address-of (e.g. the `<=>` desugar) is exempt: it deliberately
+        // borrows a compiler-materialized temporary.
+        if (unary.op.lexeme == "&"
+            && !unary.is_synthetic
+            && unary.operand != null
+            && unary.operand.kind == NodeKind::Literal) {
+            this.ctx.emit_error_at(
+                ErrorCode::E0223_INVALID_ADDRESS_OF,
+                "cannot take the address of a literal; `&` requires a place (variable, field, or index)",
+                unary.span);
+            return TypeRef::invalid();
+        }
 
         // `*this` is transparent at the type level.  Receivers are tagged
         // with the bare owner type (`Foo`, not `&Foo`) per the parser's
@@ -3350,15 +3468,76 @@ public:
 
         const overloads: TypeRef[] =
             this.ctx.decl_index.lookup_func_type_overloads(combined);
-        if (overloads.length != 1) { return; }
-        const ot: Type* = this.arena.lookup(overloads[0].id);
-        if (ot == null || ot.kind != TypeKind::Function) { return; }
-        const ft: FunctionType* = ot as FunctionType*;
-        if (ft.is_variadic) { return; }
-        // Arity is not (yet) reported for scope calls; only type-check when
-        // the counts already line up so we don't misalign the comparison.
-        if (ft.param_types.length != call.arguments.length) { return; }
-        this.check_args_against_params(call, ft.param_types);
+        if (overloads.length == 1) {
+            const ot: Type* = this.arena.lookup(overloads[0].id);
+            if (ot != null && ot.kind == TypeKind::Function) {
+                const ft: FunctionType* = ot as FunctionType*;
+                // Arity is not (yet) reported for scope calls; only
+                // type-check when the counts already line up so we don't
+                // misalign the comparison.
+                if (!ft.is_variadic
+                    && ft.param_types.length == call.arguments.length) {
+                    this.check_args_against_params(call, ft.param_types);
+                }
+            }
+            return;
+        }
+
+        // The callee isn't a function-typed entry (the common case for an
+        // inherent static method, which is registered as MethodInfo on its
+        // owning type). Fall back to checking against that signature.
+        this.check_static_scope_method_args(lookup_sym, scope, call);
+    }
+
+    /// Argument type-check for a `Type::method(args)` static call whose
+    /// callee is an inherent static method registered as `MethodInfo` on
+    /// the type (not in the function-type overload table). Mirrors the
+    /// inherent-method gather in `check_method_call_arg_types`: type-check
+    /// only when a single static signature of the call's arity is found,
+    /// so genuine overloads stay deferred to the resolver.
+    check_static_scope_method_args(mut &this, lookup_sym: SymbolStr,
+                                   scope: ScopeResolutionNode*,
+                                   call: CallExprNode*) -> void {
+        mut type_ref: TypeRef = this.lookup_type_by_sym(lookup_sym);
+        if (!type_ref.is_valid() && !lookup_sym.equals(scope.scope_name)) {
+            type_ref = this.lookup_type_by_sym(scope.scope_name);
+        }
+        if (!type_ref.is_valid()) { return; }
+
+        mut t: Type* = this.arena.lookup(type_ref.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return; }
+            t = this.arena.lookup(inst.resolved_type.id);
+        }
+        if (t == null) { return; }
+
+        mut methods: MethodInfo[] = [];
+        match (t.kind) {
+            TypeKind::Struct => { methods = (t as StructType*).methods; }
+            TypeKind::Class  => { methods = (t as ClassType*).methods; }
+            TypeKind::Enum   => { methods = (t as EnumType*).methods; }
+            _ => { return; }
+        }
+
+        const argc: i64 = call.arguments.length;
+        mut found:     boolean   = false;
+        mut ambiguous: boolean   = false;
+        mut chosen:    TypeRef[] = [];
+        for (mut mi: i64 = 0; mi < methods.length; mi++) {
+            const m: MethodInfo = methods[mi];
+            if (!m.is_static) { continue; }
+            if (!m.name.equals(scope.member_name)) { continue; }
+            if (m.param_types.length != argc) { continue; }
+            if (!found) {
+                found = true;
+                chosen = m.param_types;
+            } else if (!this.same_param_sig(chosen, m.param_types)) {
+                ambiguous = true;
+            }
+        }
+        if (!found || ambiguous) { return; }
+        this.check_args_against_params(call, chosen);
     }
 
     /// One level of pointer/reference indirection peeled off `t`, or an
@@ -5694,6 +5873,7 @@ public:
 
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
+        this.check_duplicate_default_arm(match_expr.arms);
 
         // Propagate the outer expected_type (from `const x: T = match ...`,
         // return types, etc.) into each arm's last expression so integer
@@ -6340,6 +6520,79 @@ function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
     const lit: LiteralNode* = expr as LiteralNode*;
     return lit.literal_kind == LiteralKind::Integer
         || lit.literal_kind == LiteralKind::Float;
+}
+
+/// u64 max (2^64-1). Hoisted into a typed const so it adopts u64 rather
+/// than wrapping negative when used inline (see integer_literals.cryo).
+const SEMA_U64_MAX: u64 = 18446744073709551615;
+
+/// True when `expr` is an integer literal whose value denotes zero in any
+/// radix, ignoring digit separators: `0`, `0x0`, `0b0`, `00`, `0_0`, ...
+function is_zero_int_literal(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::Literal) { return false; }
+    const lit: LiteralNode* = expr as LiteralNode*;
+    if (lit.literal_kind != LiteralKind::Integer) { return false; }
+    return int_literal_text_is_zero(lit.value);
+}
+
+function int_literal_text_is_zero(s: string) -> boolean {
+    if (s == null) { return false; }
+    const len: i64 = strlen(s) as i64;
+    mut i: i64 = 0;
+    if (len >= 2 && s[0] == '0') {
+        const c1: char = s[1];
+        if (c1 == 'x' || c1 == 'X' || c1 == 'b'
+            || c1 == 'B' || c1 == 'o' || c1 == 'O') { i = 2; }
+    }
+    mut saw_digit: boolean = false;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i = i + 1; continue; }
+        if (c != '0') { return false; }
+        saw_digit = true;
+        i = i + 1;
+    }
+    return saw_digit;
+}
+
+/// True when the integer-literal text `s` denotes a magnitude strictly
+/// greater than `max_mag` (or overflows u64, which exceeds any type whose
+/// bound fits in u64). Honors `0x`/`0b`/`0o` prefixes and `_` separators.
+/// Returns false on malformed text so other passes own that diagnostic.
+function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
+    if (s == null) { return false; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return false; }
+    mut i: i64 = 0;
+    mut radix: u64 = 10;
+    if (len >= 2 && s[0] == '0') {
+        const c1: char = s[1];
+        if (c1 == 'x' || c1 == 'X') { radix = 16; i = 2; }
+        else if (c1 == 'b' || c1 == 'B') { radix = 2; i = 2; }
+        else if (c1 == 'o' || c1 == 'O') { radix = 8; i = 2; }
+    }
+    mut acc: u64 = 0;
+    mut saw_digit: boolean = false;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i = i + 1; continue; }
+        mut d: u64 = 0;
+        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
+        else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
+        else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
+        else { return false; }
+        if (d >= radix) { return false; }
+        saw_digit = true;
+        // Overflow-checked acc = acc*radix + d. Past u64 it can only be
+        // larger than any in-range bound, so report "exceeds".
+        if (acc > (SEMA_U64_MAX - d) / radix) { return true; }
+        acc = acc * radix + d;
+        i = i + 1;
+    }
+    if (!saw_digit) { return false; }
+    return acc > max_mag;
 }
 
 /// Parse a member-name SymbolStr as a non-negative tuple index. Returns
