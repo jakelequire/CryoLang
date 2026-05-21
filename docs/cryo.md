@@ -497,6 +497,9 @@ Only `mut` bindings can be assigned to.
 | `=>` | Pattern-to-body separator inside `match`. |
 | `::` | Scope resolution: static methods, enum variants, module members. |
 | `?` `:` | Ternary conditional. |
+| `?` (postfix) | Error propagation ("try"): on a `Result`/`Option`, yields the `Ok`/`Some` payload, else returns the `Err`/`None` from the enclosing function. |
+| `??` | Null-coalescing: `opt ?? fallback` yields a `Some`'s payload, else `fallback` (evaluated only when `opt` is `None`). |
+| `\|>` `<\|` | Pipeline: thread a value into a call (`x \|> f(a)` ⇒ `f(x, a)`; `f(a) <\| x` ⇒ `f(a, x)`). |
 | `as` | Explicit type cast. |
 | `.` | Member access. |
 | `&` | Address-of (unary). |
@@ -506,7 +509,28 @@ Only `mut` bindings can be assigned to.
 | `typeof(expr)` | Compile-time type of `expr`. |
 | `new` `delete` | Heap allocation / deallocation. |
 
-> **Reserved.** `?.`, `??`, `\|>`, `..` (in expression position), and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax).
+> **Reserved.** `?.`, `..` (in expression position), and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax).
+
+**Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** — `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead — `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
+
+```cryo
+const out: int = data |> parse |> validate(strict);   // validate(parse(data), strict)
+```
+
+**Null-coalescing (`??`).** `opt ?? fallback` unwraps an `Option<T>` to its `T`, substituting `fallback` when it is `None`. The left operand is evaluated once and `fallback` only when needed. `??` is right-associative and binds looser than the pipes, so a chain reads as `a ?? (b ?? c)`: every operand but the last is an `Option<T>`, and the final `c` is the bare `T`.
+
+```cryo
+const port: u16 = config_port() ?? env_port() ?? 8080;
+```
+
+**Error propagation (`?`).** A postfix `?` on a `Result<T, E>` evaluates to `T` when the value is `Ok`, and otherwise returns that `Err(e)` unchanged from the enclosing function; on an `Option<T>` it yields `T` for `Some` and returns `None`. The enclosing function's return type must be a matching `Result` / `Option`. It is the concise form of a `match` that re-returns the error.
+
+```cryo
+function load(path: string) -> Result<Config, IoError> {
+    const text: String = read_file(path)?;     // returns Err(e) on failure
+    return Result::Ok(parse_config(text));
+}
+```
 
 ### 5.7 Operator Precedence
 
@@ -515,20 +539,22 @@ From **lowest** to **highest**:
 | Level | Operators | Associativity |
 | --- | --- | --- |
 | 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | Right |
-| 2 | `? :` (ternary) | Right |
-| 3 | `\|\|` | Left |
-| 4 | `&&` | Left |
-| 5 | `\|` | Left |
-| 6 | `^` | Left |
-| 7 | `&` | Left |
-| 8 | `==` `!=` | Left |
-| 9 | `<` `>` `<=` `>=` `<=>` | Left |
-| 10 | `<<` `>>` | Left |
-| 11 | `+` `-` | Left |
-| 12 | `*` `/` `%` | Left |
-| 13 | `as` | Left |
-| 14 | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right |
-| 15 | `()` `[]` `.` `->` `++` `--` (postfix) | Left |
+| 2 | `??` (null-coalescing) | Right |
+| 3 | `\|>` `<\|` (pipeline) | Left |
+| 4 | `? :` (ternary) | Right |
+| 5 | `\|\|` | Left |
+| 6 | `&&` | Left |
+| 7 | `\|` | Left |
+| 8 | `^` | Left |
+| 9 | `&` | Left |
+| 10 | `==` `!=` | Left |
+| 11 | `<` `>` `<=` `>=` `<=>` | Left |
+| 12 | `<<` `>>` | Left |
+| 13 | `+` `-` | Left |
+| 14 | `*` `/` `%` | Left |
+| 15 | `as` | Left |
+| 16 | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right |
+| 17 | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix) | Left |
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
@@ -1873,9 +1899,7 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
 | `yield` | Parser accepts a `yield` expression; no generator semantics exist. |
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
-| Null-coalescing `??` | Token reserved; not consumed by the parser. |
-| Pipe `\|>` | Token reserved; not consumed by the parser. |
-| Range expressions `a..b` / `a..=b` | Reserved in expression position. Range **patterns** (`'0'..'9'` inside a `match` arm) **are** implemented. |
+| Range expressions `a..b` / `a..=b` | Reserved in expression position. |
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
@@ -1927,7 +1951,9 @@ Expressions are stratified by precedence; each level delegates to the next-highe
 
 ```
 expression          = assignment_expr
-assignment_expr     = conditional_expr [ assignment_op assignment_expr ]
+assignment_expr     = coalesce_expr [ assignment_op assignment_expr ]
+coalesce_expr       = pipe_expr [ "??" coalesce_expr ]
+pipe_expr           = conditional_expr { ( "|>" | "<|" ) conditional_expr }
 conditional_expr    = logical_or_expr [ "?" expression ":" conditional_expr ]
 logical_or_expr     = logical_and_expr { "||" logical_and_expr }
 logical_and_expr    = bitwise_or_expr { "&&" bitwise_or_expr }
