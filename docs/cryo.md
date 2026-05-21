@@ -371,13 +371,33 @@ function smaller<T>(a: T, b: T) -> T
 
 ### 4.3 Variadic Functions
 
-A trailing `...` marks a function as variadic. Variadic functions are primarily used at the FFI boundary to interoperate with C's `printf`-family.
+A trailing `...` marks a function as variadic. The signature mirrors C's variadic calling convention, so variadic functions stay ABI-compatible with the `printf`-family at the FFI boundary.
 
 ```cryo
-function printf(format: string, args: ...) -> i32;
+// FFI / intrinsic declarations: a bare `...` bucket, no body.
+intrinsic function printf(format: string, args...) -> i32;
 ```
 
-User-defined variadic functions follow the same convention; they expand to C's `va_list` mechanism through the runtime.
+A user-defined variadic function names the bucket (`args...`). The compiler emits `va_start`/`va_end` around the body and binds `args` to the raw `va_list` pointer. Wrap it in a `VaArgs` (`std::core::varargs`, in the prelude) to read typed values without hand-rolling `va_arg`:
+
+```cryo
+function sum(count: i32, args...) -> i64 {
+    mut va: VaArgs = VaArgs::new(args);
+    mut total: i64 = 0;
+    for (mut i: i32 = 0; i < count; i++) {
+        const v: i64 = va.next();      // ![implicit]: T inferred from `v`'s type
+        total += v;
+    }
+    return total;
+}
+```
+
+`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [§ 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee — equivalently, pass the original `args` identifier.
+
+Two limits are inherited from C varargs and no wrapper can remove them:
+
+- **Not count-safe.** Nothing records how many arguments were passed or their types; the callee must learn that out of band (a format string, a leading count, a sentinel).
+- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next<i8>()` is a compile error — read it as `i32` and narrow. Pass `i64`-typed values when reading with `next<i64>()`.
 
 ### 4.4 Extern Functions
 
@@ -1551,6 +1571,7 @@ type struct AlignedData {
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]` | any decl | Adjust the level of a named lint over the decl. |
 | `![derive(Trait, …)]` | struct / class / enum | Auto-derive one or more traits. |
 | `![sink]` | method | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics. |
+| `![implicit]` | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = …` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(…)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]` | any decl | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match. |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum | Memory layout control. See [§ 17.3](#173-memory-layout). |
 | `![align(N)]` | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout). |

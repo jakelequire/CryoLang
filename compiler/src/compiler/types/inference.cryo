@@ -1,0 +1,183 @@
+///! Local type-inference engine.
+///!
+///! `InferCtx` is the compiler's single structural unifier for generic
+///! type-argument inference. It holds a template's open generic params (by
+///! arena id) and their accumulating bindings; `unify(formal, actual)` walks a
+///! pair in lock-step, binding an open param the first time it meets a concrete
+///! actual and rejecting on a later conflict.
+///!
+///! Today its sole driver is the monomorphizer's call-site inference
+///! (`unify_for_inference` delegates here). It is deliberately self-contained
+///! (no dependency on the monomorphizer or generic registry) so later phases
+///! can reuse it — e.g. return-type-driven inference for `![implicit]`
+///! callees — and so the scattered `expected_type` propagation in sema can
+///! eventually migrate onto one engine.
+
+namespace Compiler::Types::Inference;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
+import Compiler::Types::Arena;
+
+
+/// Find the `InstantiatedType` arena wrapper whose `resolved_type` is
+/// `concrete`. Used to recover a concrete struct/enum/class actual's generic
+/// args during unification (the actual was already specialized to the concrete
+/// type, e.g. `HashMap_String_GlobalAlloc`, so the args live on its wrapper).
+/// Shared with the monomorphizer's receiver-inference path.
+function find_inst_wrapping(arena: TypeArena*, concrete: TypeRef) -> TypeRef {
+    if (arena == null || !concrete.is_valid()) { return TypeRef::invalid(); }
+    const total: i64 = arena.types.length;
+    for (mut i: i64 = 0; i < total; i++) {
+        const t: Type* = arena.types[i];
+        if (t == null) { continue; }
+        if (t.kind != TypeKind::InstantiatedType) { continue; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (!inst.has_resolved_type()) { continue; }
+        if (inst.resolved_type.id == concrete.id) {
+            return TypeRef::new(t.id, arena);
+        }
+    }
+    return TypeRef::invalid();
+}
+
+
+/// Structural inference context: `param_ids` are the template's open generic
+/// params (arena ids); `bindings[i]` is the concrete type bound to
+/// `param_ids[i]` (invalid until solved). Parallel arrays mirror the
+/// monomorphizer's prior scratch layout so the two share semantics exactly.
+type struct InferCtx {
+    arena:     TypeArena*;
+    param_ids: u64[];
+    bindings:  TypeRef[];
+
+    /// Empty context for a template: one unbound slot per open param.
+    static for_template(arena: TypeArena*, param_ids: u64[]) -> InferCtx {
+        mut binds: TypeRef[] = [];
+        for (mut i: i64 = 0; i < param_ids.length; i++) {
+            binds.push(TypeRef::invalid());
+        }
+        return InferCtx { arena: arena, param_ids: param_ids, bindings: binds };
+    }
+
+    /// Adopt a caller-owned side-table (param ids + in-progress bindings).
+    /// Lets the monomorphizer keep its accumulating scratch across the
+    /// per-(formal,actual) `unify` loop while routing the algorithm here.
+    static adopt(arena: TypeArena*, param_ids: u64[], bindings: TypeRef[]) -> InferCtx {
+        return InferCtx { arena: arena, param_ids: param_ids, bindings: bindings };
+    }
+
+    /// Index of `id` in the open-param list, or -1 if `id` is not a param
+    /// this context is solving for.
+    binding_index(&this, id: u64) -> i64 {
+        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
+            if (this.param_ids[i] == id) { return i; }
+        }
+        return -1;
+    }
+
+    /// True once every open param has been bound to a concrete type.
+    all_solved(&this) -> boolean {
+        for (mut i: i64 = 0; i < this.bindings.length; i++) {
+            if (!this.bindings[i].is_valid()) { return false; }
+        }
+        return true;
+    }
+
+    /// Recursive structural unifier. Walks `formal` and `actual` in lock-step.
+    /// When `formal` is one of this context's open generic params, records
+    /// `actual` (or rejects on conflict). Reference-formal vs value-actual is
+    /// permitted (Cryo's `&this`-style transparency: a `mut &T` formal accepts
+    /// a `T` lvalue at the call site), as is the `&T`/`*T` cross-peel sema's
+    /// address-of can surface. Returns true when every nested constraint
+    /// matches.
+    unify(mut &this, formal: TypeRef, actual: TypeRef) -> boolean {
+        if (!formal.is_valid() || !actual.is_valid()) { return false; }
+        const ft: Type* = this.arena.lookup(formal.id);
+        const at: Type* = this.arena.lookup(actual.id);
+        if (ft == null || at == null) { return false; }
+
+        // Generic param: bind it. Must be one of this template's open params;
+        // a foreign generic we can't make sense of is rejected.
+        if (ft.kind == TypeKind::GenericParam || ft.kind == TypeKind::BoundedParam) {
+            const idx: i64 = this.binding_index(formal.id);
+            if (idx < 0) { return false; }
+            const existing: TypeRef = this.bindings[idx];
+            if (existing.is_valid()) {
+                return existing.id == actual.id;
+            }
+            this.bindings[idx] = actual;
+            return true;
+        }
+
+        // Reference: tolerate mismatched ref-ness. `&T` vs `&T` peels both;
+        // `&T` vs `T` peels just the formal; `&T` vs `*T` peels both.
+        if (ft.kind == TypeKind::Reference) {
+            const fr: ReferenceType* = ft as ReferenceType*;
+            if (at.kind == TypeKind::Reference) {
+                const ar: ReferenceType* = at as ReferenceType*;
+                return this.unify(fr.referent, ar.referent);
+            }
+            if (at.kind == TypeKind::Pointer) {
+                const ap2: PointerType* = at as PointerType*;
+                return this.unify(fr.referent, ap2.pointee);
+            }
+            return this.unify(fr.referent, actual);
+        }
+        if (at.kind == TypeKind::Reference) {
+            const ar: ReferenceType* = at as ReferenceType*;
+            return this.unify(formal, ar.referent);
+        }
+
+        // Pointer: structural Pointer-vs-Pointer, plus a Pointer-vs-Reference
+        // cross-peel for `T*` formal against a source-level `&value`.
+        if (ft.kind == TypeKind::Pointer) {
+            const fp: PointerType* = ft as PointerType*;
+            if (at.kind == TypeKind::Pointer) {
+                const ap: PointerType* = at as PointerType*;
+                return this.unify(fp.pointee, ap.pointee);
+            }
+            if (at.kind == TypeKind::Reference) {
+                const ar2: ReferenceType* = at as ReferenceType*;
+                return this.unify(fp.pointee, ar2.referent);
+            }
+        }
+
+        // InstantiatedType vs InstantiatedType: same base + recursive args.
+        if (ft.kind == TypeKind::InstantiatedType && at.kind == TypeKind::InstantiatedType) {
+            const fi: InstantiatedType* = ft as InstantiatedType*;
+            const ai: InstantiatedType* = at as InstantiatedType*;
+            if (fi.generic_base.id != ai.generic_base.id) { return false; }
+            if (fi.type_args.length != ai.type_args.length) { return false; }
+            for (mut i: i64 = 0; i < fi.type_args.length; i++) {
+                if (!this.unify(fi.type_args[i], ai.type_args[i])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // InstantiatedType formal vs concrete struct/enum/class actual: find
+        // the matching InstantiatedType wrapper in the arena and unify against
+        // it so the recursive arg walk can recover concrete bindings.
+        if (ft.kind == TypeKind::InstantiatedType
+                && (at.kind == TypeKind::Struct
+                    || at.kind == TypeKind::Class
+                    || at.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, actual);
+            if (wrapper.is_valid()) {
+                return this.unify(formal, wrapper);
+            }
+            return false;
+        }
+        if (ft.kind == TypeKind::InstantiatedType) {
+            return false;
+        }
+
+        // Identical typerefs (primitives, same arena slot) succeed trivially.
+        if (formal.id == actual.id) { return true; }
+        return false;
+    }
+}

@@ -29,6 +29,7 @@ import Compiler::AST::Expression;
 import Compiler::AST::Specializer;
 import Compiler::AST::Pattern;
 import Compiler::Types::Substitution;
+import Compiler::Types::Inference;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Ownership;
@@ -130,6 +131,15 @@ type struct Monomorphizer {
     // own generic param IDs from create_generic_param).
     inference_param_ids: u64[];
 
+    // Expected type of the expression currently being walked, when it sits in
+    // an expected-type position (a typed `const/mut x: T = <expr>` initializer).
+    // Drives return-type inference for `![implicit]` callees: an omitted
+    // generic arg that arg-unification can't pin is recovered by unifying the
+    // callee's return type against this.  Invalid outside such positions; the
+    // call-expression walk clears it before recursing into arg/callee
+    // sub-expressions so only the directly-bound call inherits it.
+    current_expected_type: TypeRef;
+
     // In-progress spec context.  Set by specialize_request before calling
     // resolve_specialized_ast on a struct/class spec, cleared after.  Lets
     // resolve_arg_type_for_inference look up `this.field` types via the
@@ -180,6 +190,7 @@ type struct Monomorphizer {
             nested_visited:        [],
             inference_bindings:    [],
             inference_param_ids:   [],
+            current_expected_type: TypeRef::invalid(),
             current_spec_inst_id:  0,
             current_spec_struct:   null,
             scope_names:           [],
@@ -1198,7 +1209,7 @@ type struct Monomorphizer {
         mut probe_ref: TypeRef = receiver;
         const recv_t: Type* = this.arena.lookup(receiver.id);
         if (recv_t != null && recv_t.kind != TypeKind::InstantiatedType) {
-            const wrapper: TypeRef = this.find_inst_wrapping(receiver);
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, receiver);
             if (wrapper.is_valid()) { probe_ref = wrapper; }
         }
 
@@ -1692,7 +1703,21 @@ type struct Monomorphizer {
                     if (inner_node.kind == NodeKind::VariableDeclaration) {
                         const vd: VarDeclNode* = inner as VarDeclNode*;
                         if (vd.initializer != null) {
+                            // Push the declared type as the expected type so an
+                            // `![implicit]` initializer (`const v: T = make()`)
+                            // can infer its generic arg from `T`.
+                            const saved_exp: TypeRef = this.current_expected_type;
+                            mut exp: TypeRef = vd.resolved_type;
+                            if (!exp.is_valid() && vd.type_annotation != null
+                                    && this.type_resolver != null && res_ctx != null) {
+                                exp = this.type_resolver.resolve(vd.type_annotation, res_ctx);
+                            }
+                            if (exp.is_valid() && subst != null) {
+                                exp = subst.apply(exp, this.arena);
+                            }
+                            this.current_expected_type = exp;
                             this.discover_inferred_calls_in_expr(vd.initializer, res_ctx, subst, names, types);
+                            this.current_expected_type = saved_exp;
                         }
                     }
                 }
@@ -1893,12 +1918,18 @@ type struct Monomorphizer {
         match (node.kind) {
             NodeKind::CallExpression => {
                 const call: CallExprNode* = expr as CallExprNode*;
+                // Arg/callee sub-expressions don't inherit this call's expected
+                // type; clear it across the recursion and restore for the call's
+                // own inference (only the directly-bound call carries it).
+                const saved_exp: TypeRef = this.current_expected_type;
+                this.current_expected_type = TypeRef::invalid();
                 for (mut i: i64 = 0; i < call.arguments.length; i++) {
                     this.discover_inferred_calls_in_expr(call.arguments[i], res_ctx, subst, names, types);
                 }
                 if (call.callee != null) {
                     this.discover_inferred_calls_in_expr(call.callee, res_ctx, subst, names, types);
                 }
+                this.current_expected_type = saved_exp;
                 this.try_infer_function_call(call, res_ctx, subst, names, types);
                 this.try_infer_method_call(call, subst, names, types);
             }
@@ -2555,8 +2586,38 @@ type struct Monomorphizer {
                 this.unify_for_inference(param.resolved_type, actual);
             }
         }
+
+        // Return-type-driven inference for `![implicit]` callees: any generic
+        // param still unbound after arg unification is recovered by unifying
+        // the template's declared return type against the call's expected type
+        // (the type of the `const x: T = ...` this call initializes).  Bare
+        // `T` return types bind directly; compound return types (`Option<T>`,
+        // `T*`) bind structurally via the same unifier.
+        if (tmpl_func.is_implicit && this.current_expected_type.is_valid()
+                && tmpl_func.resolved_return_type.is_valid()) {
+            mut any_unbound: boolean = false;
+            for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+                if (!this.inference_bindings[i].is_valid()) { any_unbound = true; break; }
+            }
+            if (any_unbound) {
+                this.unify_for_inference(
+                    tmpl_func.resolved_return_type, this.current_expected_type);
+            }
+        }
+
+        mut fn_all_bound: boolean = true;
         for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-            if (!this.inference_bindings[i].is_valid()) { return; }
+            if (!this.inference_bindings[i].is_valid()) { fn_all_bound = false; break; }
+        }
+        if (!fn_all_bound) {
+            // An `![implicit]` callee with no explicit args that we still
+            // couldn't pin had no usable expected type (or a return type the
+            // expected type didn't determine): report it precisely instead of
+            // letting codegen later fail with a misleading "not in scope".
+            if (tmpl_func.is_implicit && explicit_args.length == 0) {
+                this.emit_cannot_infer(call, tmpl_func.name);
+            }
+            return;
         }
 
         // Where-clause bound check at the call site.  If the inferred
@@ -2659,6 +2720,23 @@ type struct Monomorphizer {
         diag = diag.help(format(
             "implement `%s` for `%s`, or pass an argument of a type that already does",
             trait_str, concrete_str));
+        this.diagnostics.emit(diag);
+    }
+
+    /// Emit E0307 for an `![implicit]` call whose generic type argument could
+    /// not be recovered: there was no expected type at the call site (it isn't
+    /// the initializer of a typed binding) and no argument pins the parameter.
+    /// Points at the call and suggests writing the type argument explicitly.
+    emit_cannot_infer(mut &this, call: CallExprNode*, fn_name: SymbolStr) -> void {
+        const fn_str: string = this.intern_table.resolve(fn_name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            format("cannot infer the type argument for `%s`", fn_str));
+        diag = diag.at(call.span);
+        diag = diag.with_note(
+            "`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
+        diag = diag.help(format(
+            "write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
         this.diagnostics.emit(diag);
     }
 
@@ -3240,8 +3318,39 @@ type struct Monomorphizer {
                 }
             }
             if (!ok) { return; }
+
+            // Return-type-driven inference for `![implicit]` methods: a
+            // method-level generic still unbound after arg unification is
+            // recovered by unifying the declared return type against the
+            // call's expected type.  Needed for receiver-only reads like
+            // `const v: T = args.next()` where the method takes no args and
+            // `T` appears solely in the return position.  Resolve the return
+            // annotation in `method_ctx` so its generic params carry the same
+            // fresh ids as `inference_param_ids`.
+            if (orig_func.is_implicit && this.current_expected_type.is_valid()) {
+                mut ret_ty: TypeRef = TypeRef::invalid();
+                if (orig_func.return_type_annotation != null
+                        && this.type_resolver != null) {
+                    ret_ty = this.type_resolver.resolve(
+                        orig_func.return_type_annotation, &method_ctx);
+                }
+                if (!ret_ty.is_valid()) {
+                    ret_ty = orig_func.resolved_return_type;
+                }
+                if (ret_ty.is_valid()) {
+                    this.unify_for_inference(ret_ty, this.current_expected_type);
+                }
+            }
+
+            mut m_all_bound: boolean = true;
             for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-                if (!this.inference_bindings[i].is_valid()) { return; }
+                if (!this.inference_bindings[i].is_valid()) { m_all_bound = false; break; }
+            }
+            if (!m_all_bound) {
+                if (orig_func.is_implicit && call.generic_args.length == 0) {
+                    this.emit_cannot_infer(call, orig_func.name);
+                }
+                return;
             }
         }
 
@@ -3551,139 +3660,19 @@ type struct Monomorphizer {
     /// given concrete type.  Used by the unifier to walk back from a
     /// monomorphized struct/class/enum to its `(base, args)` wrapper so
     /// type-arg recovery works against still-generic formals.
-    find_inst_wrapping(&this, concrete: TypeRef) -> TypeRef {
-        if (!concrete.is_valid()) { return TypeRef::invalid(); }
-        const total: i64 = this.arena.types.length;
-        for (mut i: i64 = 0; i < total; i++) {
-            const t: Type* = this.arena.types[i];
-            if (t == null) { continue; }
-            if (t.kind != TypeKind::InstantiatedType) { continue; }
-            const inst: InstantiatedType* = t as InstantiatedType*;
-            if (!inst.has_resolved_type()) { continue; }
-            if (inst.resolved_type.id == concrete.id) {
-                return TypeRef::new(t.id, this.arena);
-            }
-        }
-        return TypeRef::invalid();
-    }
-
-    /// Recursive structural unifier for inference.  Walks `formal` and
-    /// `actual` in lock-step.  When `formal` is a generic param of the
-    /// template, records `actual` into `this.inference_bindings` (or
-    /// rejects on conflict).  Reference-formal vs value-actual is
-    /// permitted (Cryo's `&this`-style transparency: a `mut &T` formal
-    /// accepts a `T` lvalue at the call site).  Returns true when every
-    /// nested constraint matches.  The bindings buffer and the param-id
-    /// list live on the struct (rather than as pointer-to-array args)
-    /// because write-through-`(*ptr_to_array)[i] = value` has historically
-    /// not lowered correctly.
-    /// Callers populate `this.inference_param_ids` before invoking; for
+    /// Recursive structural unifier for inference. Delegates to the shared
+    /// `InferCtx` engine (types/inference.cryo): adopts the in-progress
+    /// scratch side-table (`inference_param_ids` + `inference_bindings`),
+    /// unifies one (formal, actual) pair, and writes the accumulated bindings
+    /// back. Callers populate `this.inference_param_ids` before invoking; for
     /// free-fn calls that's the template's `entry.param_type_ids`; for
     /// method-call specs it's the method's own generic-param TypeRef IDs.
     unify_for_inference(mut &this, formal: TypeRef, actual: TypeRef) -> boolean {
-        if (!formal.is_valid() || !actual.is_valid()) { return false; }
-        const ft: Type* = this.arena.lookup(formal.id);
-        const at: Type* = this.arena.lookup(actual.id);
-        if (ft == null || at == null) { return false; }
-
-        // Generic param: bind it.  Constraint: must come from this
-        // template's param list (otherwise the formal references a
-        // generic from somewhere else and we can't make sense of it).
-        if (ft.kind == TypeKind::GenericParam || ft.kind == TypeKind::BoundedParam) {
-            for (mut i: i64 = 0; i < this.inference_param_ids.length; i++) {
-                if (this.inference_param_ids[i] == formal.id) {
-                    const existing: TypeRef = this.inference_bindings[i];
-                    if (existing.is_valid()) {
-                        return existing.id == actual.id;
-                    }
-                    this.inference_bindings[i] = actual;
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // Reference: tolerate mismatched ref-ness.  `&T` vs `&T` peels
-        // both sides; `&T` vs `T` peels just the formal so a `&T`
-        // formal absorbs a bare-value actual.  `&T` vs `*T` (sema's
-        // address-of returns Reference, but some inference paths still
-        // surface a Pointer for the same source-level `&x`) peels both
-        // and unifies the inner types.
-        if (ft.kind == TypeKind::Reference) {
-            const fr: ReferenceType* = ft as ReferenceType*;
-            if (at.kind == TypeKind::Reference) {
-                const ar: ReferenceType* = at as ReferenceType*;
-                return this.unify_for_inference(fr.referent, ar.referent);
-            }
-            if (at.kind == TypeKind::Pointer) {
-                const ap2: PointerType* = at as PointerType*;
-                return this.unify_for_inference(fr.referent, ap2.pointee);
-            }
-            return this.unify_for_inference(fr.referent, actual);
-        }
-        if (at.kind == TypeKind::Reference) {
-            const ar: ReferenceType* = at as ReferenceType*;
-            return this.unify_for_inference(formal, ar.referent);
-        }
-
-        // Pointer: structural Pointer-vs-Pointer, plus a Pointer-vs-
-        // Reference cross-peel for the canonical case where the formal
-        // is declared `T*` and the caller wrote `&value` (sema's
-        // address-of produces a Reference).  Both sides are peeled to
-        // their pointee/referent so the recursive unifier sees the
-        // same type at the next level.
-        if (ft.kind == TypeKind::Pointer) {
-            const fp: PointerType* = ft as PointerType*;
-            if (at.kind == TypeKind::Pointer) {
-                const ap: PointerType* = at as PointerType*;
-                return this.unify_for_inference(fp.pointee, ap.pointee);
-            }
-            if (at.kind == TypeKind::Reference) {
-                const ar2: ReferenceType* = at as ReferenceType*;
-                return this.unify_for_inference(fp.pointee, ar2.referent);
-            }
-        }
-
-        // InstantiatedType vs InstantiatedType: same base + recursive args.
-        if (ft.kind == TypeKind::InstantiatedType && at.kind == TypeKind::InstantiatedType) {
-            const fi: InstantiatedType* = ft as InstantiatedType*;
-            const ai: InstantiatedType* = at as InstantiatedType*;
-            if (fi.generic_base.id != ai.generic_base.id) { return false; }
-            if (fi.type_args.length != ai.type_args.length) { return false; }
-            for (mut i: i64 = 0; i < fi.type_args.length; i++) {
-                if (!this.unify_for_inference(fi.type_args[i], ai.type_args[i])) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        // InstantiatedType formal vs concrete struct/enum/class actual:
-        // the actual was already specialized down to the concrete type
-        // (e.g. `HashMap_String_GlobalAlloc_GlobalAlloc` struct).  Find
-        // the matching InstantiatedType wrapper in the arena (the one
-        // whose resolved_type is `actual`), then unify against it so
-        // the recursive arg walk can recover concrete bindings.  This
-        // is the path that lets `alloc_entry(this, ...)` infer K, V, A
-        // from the concrete `this` value at the inferred call site.
-        if (ft.kind == TypeKind::InstantiatedType
-                && (at.kind == TypeKind::Struct
-                    || at.kind == TypeKind::Class
-                    || at.kind == TypeKind::Enum)) {
-            const wrapper: TypeRef = this.find_inst_wrapping(actual);
-            if (wrapper.is_valid()) {
-                return this.unify_for_inference(formal, wrapper);
-            }
-            return false;
-        }
-        if (ft.kind == TypeKind::InstantiatedType) {
-            return false;
-        }
-
-        // Identical typerefs (most concrete cases: primitives, the same
-        // arena slot for identical structs) succeed trivially.
-        if (formal.id == actual.id) { return true; }
-        return false;
+        mut ctx: InferCtx = InferCtx::adopt(
+            this.arena, this.inference_param_ids, this.inference_bindings);
+        const ok: boolean = ctx.unify(formal, actual);
+        this.inference_bindings = ctx.bindings;
+        return ok;
     }
 
     /// Walk a block statement and resolve type annotations on all local

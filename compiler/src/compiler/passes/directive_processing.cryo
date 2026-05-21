@@ -160,6 +160,10 @@ function is_known_builtin(name: string) -> boolean {
         // or `mut &this`.  Used for methods that semantically take
         // ownership but want the borrow-style call ergonomics.
         | "sink"
+        // `![implicit]`: lets the inference engine recover omitted generic
+        // type args at a call site by unifying the callee's return type
+        // against the call's expected type (return-type-driven inference).
+        | "implicit"
         // Bare-atom forms of the cfg/config gate.  These are sugar for
         // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
         | "windows" | "linux" | "macos" | "unix"
@@ -278,6 +282,19 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
             }
             if (target != DirectiveTarget::Method) {
                 emit_placement_error(ctx, dir, name, "method", target);
+            }
+        }
+
+        // `![implicit]`: zero args; function- or method-target.  Whether the
+        // generic params are actually recoverable from the return type is
+        // proven (or rejected with E0307) at the call site by the inference
+        // engine, so no deeper shape check is needed here.
+        "implicit" => {
+            if (argc != 0) {
+                emit_arity_error(ctx, dir, name, 0, argc);
+            }
+            if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                emit_placement_error(ctx, dir, name, "function or method", target);
             }
         }
 
@@ -798,6 +815,10 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
             fn.is_inline = false;
             return;
         }
+        if (strcmp(name, "implicit") == 0) {
+            fn.is_implicit = true;
+            return;
+        }
     }
 
     // Layout effects on user-defined types.  The validator above has
@@ -856,6 +877,10 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                 return;
             }
             m.is_sink = true;
+            return;
+        }
+        if (strcmp(name, "implicit") == 0) {
+            if (m.func != null) { m.func.is_implicit = true; }
             return;
         }
     }

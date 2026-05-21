@@ -351,6 +351,8 @@ LLVMValueRef LLVMBuildFCmp(LLVMBuilderRef B, int Op, LLVMValueRef LHS,
 LLVMValueRef LLVMBuildAlloca(LLVMBuilderRef B, LLVMTypeRef Ty, const char *Name);
 LLVMValueRef LLVMBuildLoad2(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef PointerVal,
                             const char *Name);
+LLVMValueRef LLVMBuildVAArg(LLVMBuilderRef B, LLVMValueRef List, LLVMTypeRef Ty,
+                            const char *Name);
 LLVMValueRef LLVMBuildStore(LLVMBuilderRef B, LLVMValueRef Val, LLVMValueRef Ptr);
 LLVMValueRef LLVMBuildGEP2(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Pointer,
                            LLVMValueRef *Indices, unsigned NumIndices, const char *Name);
