@@ -21,6 +21,7 @@ import Compiler::AST::Expression;
 import Compiler::AST::Statement;
 import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
+import Compiler::Lex;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Resolver::SymbolStr;
@@ -61,8 +62,36 @@ type struct MoveChecker {
     /// site in a combined rustc-style multi-span snippet.
     moved_keys:  u32[];
     moved_spans: SourceSpan[];
+    /// Parallel to `moved_keys`: whether the move was *storage-
+    /// duplicating* (a `let`/`var` initializer, an assignment RHS, or an
+    /// aggregate-literal field — all of which bitwise-copy the value into
+    /// a new owning binding that is independently dropped) rather than a
+    /// plain call argument. Cryo passes non-Copy by-value parameters by
+    /// hidden reference (autoref), so a bare identifier in an argument
+    /// position is usually a borrow, not a move. Only real moves can
+    /// double-free across a loop back-edge, so loop-carried detection
+    /// keys on this flag — that is what keeps autoref'd arguments (e.g.
+    /// `topo_contains(order, i)`) from being flagged.
+    moved_real:  boolean[];
+
+    /// Loop-carried-move detection state.  A loop body is walked twice:
+    /// a silent discovery pass (`suppress_emit`) that records, via
+    /// `capture_decls` + `captured_decl_keys`, which bindings are
+    /// declared inside the body so they can be excluded (a body-local is
+    /// fresh each iteration), and a real pass with the surviving outer
+    /// bindings staged in `carried_keys` so a re-move at the top of the
+    /// loop is reported as a use-after-move on the next iteration.
+    suppress_emit:      boolean;
+    capture_decls:      boolean;
+    captured_decl_keys: u32[];
+    carried_keys:       u32[];
 
     fired: i64;
+    /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
+    /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
+    /// the pipeline before codegen, so the double-freeing binary is
+    /// never emitted.
+    fatal: i64;
 
     static new(ctx: CompilationContext*) -> MoveChecker {
         return MoveChecker {
@@ -73,7 +102,13 @@ type struct MoveChecker {
             types:       HashMap<u32, TypeRef>::new(),
             moved_keys:  [],
             moved_spans: [],
+            moved_real:  [],
+            suppress_emit:      false,
+            capture_decls:      false,
+            captured_decl_keys: [],
+            carried_keys:       [],
             fired: 0,
+            fatal: 0,
         };
     }
 
@@ -81,6 +116,11 @@ type struct MoveChecker {
         this.types       = HashMap<u32, TypeRef>::new();
         this.moved_keys  = [];
         this.moved_spans = [];
+        this.moved_real  = [];
+        this.suppress_emit      = false;
+        this.capture_decls      = false;
+        this.captured_decl_keys = [];
+        this.carried_keys       = [];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -91,6 +131,36 @@ type struct MoveChecker {
     register_binding(mut &this, name: SymbolStr, ty: TypeRef) -> void {
         if (!name.is_valid()) { return; }
         this.types.insert(name.id, ty);
+        // During a loop body's discovery walk, record bindings declared
+        // inside the body so they're excluded from the carried set: a
+        // body-local is a fresh binding each iteration, not a value
+        // carried across the back-edge.
+        if (this.capture_decls) {
+            this.captured_decl_keys.push(name.id);
+        }
+    }
+
+    is_body_local(&this, key: u32, from: i64) -> boolean {
+        for (mut i: i64 = from; i < this.captured_decl_keys.length; i++) {
+            if (this.captured_decl_keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    truncate_captured(mut &this, n: i64) -> void {
+        while (this.captured_decl_keys.length > n) { this.captured_decl_keys.pop(); }
+    }
+
+    truncate_carried(mut &this, n: i64) -> void {
+        while (this.carried_keys.length > n) { this.carried_keys.pop(); }
+    }
+
+    is_carried(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.carried_keys.length; i++) {
+            if (this.carried_keys[i] == name.id) { return true; }
+        }
+        return false;
     }
 
     is_moved(&this, name: SymbolStr) -> boolean {
@@ -119,11 +189,43 @@ type struct MoveChecker {
         return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
     }
 
-    mark_moved(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+    mark_moved(mut &this, name: SymbolStr, span: SourceSpan, real: boolean) -> void {
         if (!name.is_valid()) { return; }
-        if (this.is_moved(name)) { return; }
+        if (this.is_moved(name)) {
+            // Already moved: upgrade to a real (storage-duplicating) move
+            // if this site is one, so a borrow-then-move sequence still
+            // registers for loop-carried detection.
+            if (real) {
+                for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+                    if (this.moved_keys[i] == name.id) { this.moved_real[i] = true; }
+                }
+            }
+            return;
+        }
         this.moved_keys.push(name.id);
         this.moved_spans.push(span);
+        this.moved_real.push(real);
+    }
+
+    /// Clear the moved state for `name` (it has been reinitialized by an
+    /// assignment).  Compacts the parallel (key, span) stacks in place.
+    /// Modelling revival is what keeps the loop-carried check from
+    /// flagging the safe `consume(x); x = make();` reinit-each-iteration
+    /// pattern.
+    unmark_moved(mut &this, name: SymbolStr) -> void {
+        if (!name.is_valid()) { return; }
+        mut keep_keys:  u32[]        = [];
+        mut keep_spans: SourceSpan[] = [];
+        mut keep_real:  boolean[]    = [];
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == name.id) { continue; }
+            keep_keys.push(this.moved_keys[i]);
+            keep_spans.push(this.moved_spans[i]);
+            keep_real.push(this.moved_real[i]);
+        }
+        this.moved_keys  = keep_keys;
+        this.moved_spans = keep_spans;
+        this.moved_real  = keep_real;
     }
 
     /// Snapshot the moved-set as the current array length. Restore
@@ -139,6 +241,7 @@ type struct MoveChecker {
         while (this.moved_keys.length > checkpoint) {
             this.moved_keys.pop();
             this.moved_spans.pop();
+            this.moved_real.pop();
         }
     }
 
@@ -163,6 +266,29 @@ type struct MoveChecker {
         }
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
+    }
+
+    /// A value declared outside a loop, moved inside it via a storage-
+    /// duplicating move, and read again on the next iteration: the move
+    /// re-runs every pass over the same storage, so an owning value is
+    /// dropped (freed) more than once — a double free.  Unlike the
+    /// within-iteration use-after-move (warn-only, imprecise), this is an
+    /// unambiguous true positive, so it is a hard error: it increments
+    /// `fatal`, failing the pass and aborting the pipeline before codegen
+    /// so the double-freeing binary is never emitted.
+    emit_loop_carried(mut &this, name: SymbolStr, use_span: SourceSpan) -> void {
+        const headline: string = format(
+            "value '%s' moved inside a loop is used again on the next iteration",
+            this.intern.resolve(name));
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0452_USE_AFTER_MOVE, headline);
+        diag = diag.at_with_label(use_span,
+            "moved here, then re-read on the next iteration (double free)");
+        diag = diag.help(
+            "declare the value inside the loop, reassign it after the move, or move out of a per-iteration binding");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
     }
 
     walk_program(mut &this, root: ProgramNode*) -> void {
@@ -233,7 +359,7 @@ type struct MoveChecker {
             NodeKind::ReturnStatement => {
                 const r: ReturnStmtNode* = stmt as ReturnStmtNode*;
                 if (r.expression != null) {
-                    this.walk_expr_move(r.expression);
+                    this.walk_expr_move(r.expression, true);
                 }
             }
             NodeKind::ExpressionStatement => {
@@ -267,26 +393,95 @@ type struct MoveChecker {
             NodeKind::WhileStatement => {
                 const w: WhileStmtNode* = stmt as WhileStmtNode*;
                 if (w.condition != null) { this.walk_expr_read(w.condition); }
-                const snap: i64 = this.snapshot_moves();
-                if (w.body != null) { this.walk_stmt(w.body); }
-                this.restore_moves(snap);
+                this.walk_loop_body(w.body);
             }
             NodeKind::ForStatement => {
                 const f: ForStmtNode* = stmt as ForStmtNode*;
                 if (f.condition != null) { this.walk_expr_read(f.condition); }
                 if (f.update != null)    { this.walk_expr_read(f.update); }
-                const snap: i64 = this.snapshot_moves();
-                if (f.body != null)      { this.walk_stmt(f.body); }
-                this.restore_moves(snap);
+                this.walk_loop_body(f.body);
+            }
+            NodeKind::DoWhileStatement => {
+                const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                this.walk_loop_body(d.body);
+                if (d.condition != null) { this.walk_expr_read(d.condition); }
+            }
+            NodeKind::LoopStatement => {
+                const lp: LoopStmtNode* = stmt as LoopStmtNode*;
+                this.walk_loop_body(lp.body);
             }
             _ => {}
         }
     }
 
+    /// Walk a loop body with loop-carried-move detection.
+    ///
+    /// A binding declared OUTSIDE the loop that the body leaves in the
+    /// Moved state at the back-edge is read again at the top of the next
+    /// iteration — a use-after-move that the single-walk Phase-1 model
+    /// missed because it restored the moved-set after each loop. Because
+    /// the move re-executes every pass over the same storage, an owning
+    /// value's `drop` runs more than once → double free.
+    ///
+    /// The body is walked twice: a silent discovery walk records which
+    /// outer bindings survive moved (excluding body-local declarations,
+    /// which are fresh each iteration), then a real walk with those
+    /// bindings staged as moved-on-entry surfaces the re-move at its
+    /// site. Branch handling stays conservative (snapshot/restore), so
+    /// only UNCONDITIONAL loop-carried moves are flagged — zero false
+    /// positives, at the cost of missing moves guarded by an inner `if`.
+    walk_loop_body(mut &this, body: StatementNode*) -> void {
+        if (body == null) { return; }
+        // All bookkeeping uses persistent parallel-array stacks with
+        // length checkpoints (like `moved_keys`), so nested loops just
+        // push and truncate — no array reassignment, no aliasing.
+        const snap:       i64 = this.snapshot_moves();
+        const cap_snap:   i64 = this.captured_decl_keys.length;
+        const carry_snap: i64 = this.carried_keys.length;
+
+        // --- discovery walk: silent, capture body-local declarations ---
+        const prev_suppress: boolean = this.suppress_emit;
+        const prev_capture:  boolean = this.capture_decls;
+        this.suppress_emit = true;
+        this.capture_decls = true;
+        this.walk_stmt(body);
+        this.suppress_emit = prev_suppress;
+        this.capture_decls = prev_capture;
+
+        // Stage outer bindings the body left moved at the back-edge as
+        // carried.  Skip body-locals (fresh each iteration) and bindings
+        // whose only move was an autoref'd call argument (`moved_real`
+        // false) — those don't duplicate the value into a dropped copy.
+        for (mut i: i64 = snap; i < this.moved_keys.length; i++) {
+            const k: u32 = this.moved_keys[i];
+            if (!this.moved_real[i]) { continue; }
+            if (this.is_body_local(k, cap_snap)) { continue; }
+            this.carried_keys.push(k);
+        }
+        this.truncate_captured(cap_snap);
+        this.restore_moves(snap);
+
+        // --- real walk: carried bindings are moved-on-entry, so the
+        //     re-move at the top of the body reports use-after-move.
+        //     The staged span is irrelevant — emit_loop_carried reports
+        //     at the use site. ---
+        for (mut i: i64 = carry_snap; i < this.carried_keys.length; i++) {
+            this.moved_keys.push(this.carried_keys[i]);
+            this.moved_spans.push(SourceSpan::none());
+            this.moved_real.push(true);
+        }
+        this.walk_stmt(body);
+
+        // A loop may run zero times; body-internal moves don't propagate
+        // to the following code.
+        this.truncate_carried(carry_snap);
+        this.restore_moves(snap);
+    }
+
     walk_var_decl(mut &this, vd: VarDeclNode*) -> void {
         if (vd == null) { return; }
         if (vd.initializer != null) {
-            this.walk_expr_move(vd.initializer);
+            this.walk_expr_move(vd.initializer, true);
         }
         if (!vd.is_global) {
             this.register_binding(vd.name, vd.resolved_type);
@@ -295,11 +490,13 @@ type struct MoveChecker {
 
     /// Walk an expression in "move" context: bare identifiers of
     /// non-Copy types are marked Moved, sub-expressions descend in
-    /// "read" context.
-    walk_expr_move(mut &this, expr: ExpressionNode*) -> void {
+    /// "read" context.  `real` marks storage-duplicating move sites
+    /// (let/var init, assignment RHS, aggregate-literal field) versus
+    /// autoref'd call arguments; see `moved_real`.
+    walk_expr_move(mut &this, expr: ExpressionNode*, real: boolean) -> void {
         if (expr == null) { return; }
         if (expr.kind == NodeKind::Identifier) {
-            this.handle_ident(expr as IdentifierNode*, true);
+            this.handle_ident(expr as IdentifierNode*, true, real);
             return;
         }
         // For other shapes, descend in read mode by default; the
@@ -315,7 +512,7 @@ type struct MoveChecker {
     walk_expr_read(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
-            NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false);    }
+            NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false, false); }
             NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                 }
             NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);             }
             NodeKind::UnaryExpression    => { this.read_unary(expr as UnaryExprNode*);               }
@@ -355,7 +552,10 @@ type struct MoveChecker {
             if (OwnershipQuery::method_consumes_receiver(this.arena, m)) {
                 const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
                 if (ma.object != null) {
-                    this.walk_expr_move(ma.object);
+                    // A consuming receiver (`mut this` / `![sink]`) is a
+                    // real move: the value is taken and dropped by the
+                    // callee, so a loop-carried receiver double-frees.
+                    this.walk_expr_move(ma.object, true);
                     receiver_moved = true;
                 }
             }
@@ -363,14 +563,31 @@ type struct MoveChecker {
         if (!receiver_moved && c.callee != null) {
             this.walk_expr_read(c.callee);
         }
+        // Plain by-value arguments are passed by autoref (hidden
+        // reference), so a bare identifier here is a borrow, not a
+        // storage-duplicating move: real=false keeps loop-carried
+        // detection from flagging them while still recording the move
+        // for the within-function warn-only surface.
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
-            this.walk_expr_move(c.arguments[i]);
+            this.walk_expr_move(c.arguments[i], false);
         }
         return;
     }
 
     read_binary(mut &this, b: BinaryExprNode*) -> void {
         if (b == null) { return; }
+        // Plain assignment to a bare identifier is a pure write: it
+        // reinitializes the binding rather than reading it. Walk only the
+        // RHS, then clear the binding's moved state so a moved-then-
+        // reassigned local is Live again. This is what keeps the
+        // loop-carried check from flagging the safe reinit-each-iteration
+        // pattern (`consume(x); x = make();`).
+        if (b.op.kind == TokenType::Equal && b.left != null
+                && b.left.kind == NodeKind::Identifier) {
+            if (b.right != null) { this.walk_expr_read(b.right); }
+            this.unmark_moved((b.left as IdentifierNode*).name);
+            return;
+        }
         if (b.left != null)  { this.walk_expr_read(b.left); }
         if (b.right != null) { this.walk_expr_read(b.right); }
         return;
@@ -403,8 +620,10 @@ type struct MoveChecker {
 
     read_struct_lit(mut &this, sl: StructLiteralNode*) -> void {
         if (sl == null) { return; }
+        // Field initializers bitwise-copy the value into a new owning
+        // aggregate that is independently dropped: a real move.
         for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-            this.walk_expr_move(sl.field_inits[i].value);
+            this.walk_expr_move(sl.field_inits[i].value, true);
         }
         return;
     }
@@ -412,7 +631,7 @@ type struct MoveChecker {
     read_tuple_lit(mut &this, tl: TupleLiteralNode*) -> void {
         if (tl == null) { return; }
         for (mut i: i64 = 0; i < tl.elements.length; i++) {
-            this.walk_expr_move(tl.elements[i]);
+            this.walk_expr_move(tl.elements[i], true);
         }
         return;
     }
@@ -420,7 +639,7 @@ type struct MoveChecker {
     read_array_lit(mut &this, al: ArrayLiteralNode*) -> void {
         if (al == null) { return; }
         for (mut i: i64 = 0; i < al.elements.length; i++) {
-            this.walk_expr_move(al.elements[i]);
+            this.walk_expr_move(al.elements[i], true);
         }
         return;
     }
@@ -443,13 +662,16 @@ type struct MoveChecker {
 
     read_new(mut &this, n: NewExprNode*) -> void {
         if (n == null) { return; }
+        // `new T(args)` constructor parameters are autoref'd like ordinary
+        // call arguments, so treat them as borrows (real=false).
         for (mut i: i64 = 0; i < n.arguments.length; i++) {
-            this.walk_expr_move(n.arguments[i]);
+            this.walk_expr_move(n.arguments[i], false);
         }
         return;
     }
 
-    handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean) -> void {
+    handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean,
+                 real: boolean) -> void {
         if (ident == null) { return; }
         const name: SymbolStr = ident.name;
         const ty: TypeRef = this.lookup_type(name);
@@ -462,6 +684,15 @@ type struct MoveChecker {
         if (_is_copy) { return; }
 
         if (this.is_moved(name)) {
+            // A real move site re-reading an already-moved binding upgrades
+            // it (borrow-then-move), even when emission is suppressed.
+            if (in_move_context && real) { this.mark_moved(name, ident.span, true); }
+            if (this.suppress_emit) { return; }
+            if (this.is_carried(name)) {
+                // Moved on a previous iteration of the enclosing loop.
+                this.emit_loop_carried(name, ident.span);
+                return;
+            }
             const move_span: SourceSpan = this.moved_at_span(name);
             const headline: string = format("use of moved value '%s'",
                 this.intern.resolve(name));
@@ -470,7 +701,7 @@ type struct MoveChecker {
             return;
         }
         if (in_move_context) {
-            this.mark_moved(name, ident.span);
+            this.mark_moved(name, ident.span, real);
         }
     }
 }
@@ -483,9 +714,16 @@ type struct MoveCheckPass {
         mut checker: MoveChecker = MoveChecker::new(ctx);
         checker.walk_program(root);
         if (ctx.debug_mode) {
-            cdebug("[MoveCheck] %lld diagnostics emitted\n", checker.fired);
+            cdebug("[MoveCheck] %lld diagnostics emitted (%lld fatal)\n",
+                checker.fired, checker.fatal);
         }
-        // Warn-only mode: never fail the pass.
+        // Within-iteration use-after-move stays warn-only (imprecise).
+        // Loop-carried moves are unambiguous double frees: fail the pass
+        // so the pipeline aborts before codegen (MoveCheck is
+        // fatal_on_failure).
+        if (checker.fatal > 0) {
+            return PassResult::failure(checker.fatal as u32);
+        }
         return PassResult::ok();
     }
 }
