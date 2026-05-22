@@ -111,8 +111,10 @@ Constructor        ::= Ident "(" ParamList? ")"
                        (":" Ident "(" ArgList? ")")? Block
 Destructor         ::= "~" Ident "(" ")" Block
 
-EnumDecl           ::= "type"? "enum" Ident Generics?
+EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
                        "{" (EnumVariant ("," | ";"))* "}"
+                       (* the optional ":" Type is the explicit discriminant
+                          base type, e.g. `type enum Foo : i32 { ... }` *)
 EnumVariant        ::= Ident
                      | Ident "=" NumLit
                      | Ident "(" Type ("," Type)* ")"
@@ -152,7 +154,9 @@ MethodImpl         ::= ("virtual" | "override")? "static"?
                        ("where" WhereClause)? Block
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
-GenericParam       ::= Ident (":" Ident ("+" Ident)*)?
+GenericParam       ::= Ident (":" Ident ("+" Ident)*)? ("=" Type)?
+                       (* the optional "=" Type is a default type argument,
+                          e.g. `<A = GlobalAlloc>` *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
 
 
@@ -162,7 +166,8 @@ GenericArgs        ::= "<" Type ("," Type)* ">"
 
 Expr               ::= Assign
 Assign             ::= Coalesce (AssignOp Assign)?
-AssignOp           ::= "=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|="
+AssignOp           ::= "=" | "+=" | "-=" | "*=" | "/=" | "%="
+                     | "&=" | "|=" | "^=" | "<<=" | ">>="
 Coalesce           ::= Pipe ("??" Coalesce)?            (* null-coalescing, right-assoc *)
 Pipe               ::= Conditional (("|>" | "<|") Conditional)*   (* pipeline, left-assoc *)
 
@@ -223,7 +228,8 @@ DoWhile            ::= "do" Block "while" "(" Expr ")" ";"
 For                ::= "for" "(" ForInit Expr ";" Expr ")" Block
 ForInit            ::= VarDecl | Ident ":" Type ("=" Expr)? ";"
 
-Match              ::= "match" "("? Expr ")"? "{" MatchArm* "}"
+Match              ::= "match" "(" Expr ")" "{" MatchArm* "}"
+                       (* the parentheses around the subject are required *)
 MatchArm           ::= Pattern ("|" Pattern)* "=>" (Block | Expr ","?)
 
 Switch             ::= "switch" "(" Expr ")" "{" CaseClause* "}"
