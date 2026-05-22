@@ -114,6 +114,14 @@ public:
     // -- Expected type hint (set by DeclStmt for initializer resolution) --
     expected_type: TypeRef;
 
+    // -- Match-arm payload binding names (by intern id), per function. --
+    // A `match` arm pattern like `Variant(p)` binds `p` to a *temporary*
+    // copy of the matched value's payload (codegen alloca's the subject),
+    // so returning a pointer/reference to `p` dangles once the function
+    // returns.  These ids let `visit(ReturnStmtNode)` reject that escape
+    // (E0455) at compile time instead of miscompiling into a use-after-free.
+    payload_binding_ids: u32[];
+
 
     // ================================================================
     // Construction
@@ -142,6 +150,7 @@ public:
         this.loop_depth     = 0;
         this.switch_depth   = 0;
         this.expected_type  = TypeRef::invalid();
+        this.payload_binding_ids = [];
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -978,6 +987,10 @@ public:
             for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
                 const pb: PatternBinding* = enum_pat.binding_at(j);
                 if (pb == null) { continue; }
+                // Remember this binding so a `return` that escapes a
+                // pointer/reference to it is caught (E0455).  The payload
+                // lives in a match temporary that dies at function return.
+                if (pb.name.is_valid()) { this.payload_binding_ids.push(pb.name.id); }
                 if (j < payload_types.length && payload_types[j].is_valid()) {
                     this.register_local(pb.name, payload_types[j]);
                 } else if (subject_type.is_valid()) {
@@ -1010,6 +1023,7 @@ public:
         this.return_type_ann = func.return_type_annotation;
         this.this_type       = fn_this_type;
         this.this_is_mut = false;
+        this.payload_binding_ids = [];
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
@@ -1971,7 +1985,177 @@ public:
                         node.expression);
                 }
             }
+            if (this.return_type.is_valid()) {
+                this.check_return_payload_escape(node.expression, this.return_type);
+            }
         }
+    }
+
+    // -- Match-payload borrow-escape detection (E0455) ------------------
+    //
+    // A `match` arm pattern `Variant(p)` binds `p` to the payload of a
+    // value the codegen materialises into a stack temporary, so a
+    // pointer/reference to `p` is only valid until the enclosing function
+    // returns.  Returning such a borrow (e.g. `JsonValue::as_object`'s old
+    // `match (this) { Object(o) => Some(o) }`) compiled fine but produced a
+    // dangling pointer → use-after-free at runtime.  These checks reject
+    // the escape at compile time.  Returning the payload BY VALUE (a move /
+    // copy, e.g. `Option::unwrap`'s `return value`) is unaffected: the
+    // discriminator is whether the return type carries a *pointer* to the
+    // binding's value type.
+
+    is_payload_binding(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.payload_binding_ids.length; i++) {
+            if (this.payload_binding_ids[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Type identity that tolerates arena-id differences for the same
+    /// named type.  Under `cryo check` (single-file frontend) a generic
+    /// instantiation like `Option<Inner*>` can carry an `Inner` whose arena
+    /// id differs from the `Inner` a match payload binding resolves to, even
+    /// though they are the same struct.  Fall back to comparing qualified
+    /// names so the borrow-escape check fires under `check` as well as a
+    /// full build.
+    types_equivalent(&this, a: TypeRef, b: TypeRef) -> boolean {
+        if (a.id == b.id) { return true; }
+        const ta: Type* = this.arena.lookup(a.id);
+        const tb: Type* = this.arena.lookup(b.id);
+        if (ta == null || tb == null) { return false; }
+        if (ta.kind != tb.kind) { return false; }
+        if (ta.kind == TypeKind::Struct || ta.kind == TypeKind::Class ||
+            ta.kind == TypeKind::Enum) {
+            const qa: SymbolStr = this.arena.get_qualified_name(a);
+            const qb: SymbolStr = this.arena.get_qualified_name(b);
+            return qa.is_valid() && qb.is_valid() && qa.equals(qb);
+        }
+        return false;
+    }
+
+    /// True when `t` is a pointer/reference whose pointee is the same type
+    /// as `v` (by id or, robustly, by qualified name).
+    is_ptr_or_ref_to(&this, t: TypeRef, v: TypeRef) -> boolean {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::Pointer) {
+            return this.types_equivalent((ty as PointerType*).pointee, v);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            return this.types_equivalent((ty as ReferenceType*).referent, v);
+        }
+        return false;
+    }
+
+    /// True when the return type carries a pointer/reference to `v` —
+    /// directly (`v*` / `&v`) or as a payload of an Option/Result-shaped
+    /// instantiation (`Option<v*>`, `Result<v*, E>`).  Returning the
+    /// payload by value (return type carries `v`, not `v*`) is NOT a match.
+    ret_carries_pointer_to(&this, ret_ty: TypeRef, v: TypeRef) -> boolean {
+        if (this.is_ptr_or_ref_to(ret_ty, v)) { return true; }
+        const t: Type* = this.arena.lookup(ret_ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.is_ptr_or_ref_to(inst.type_args[i], v)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// True when `callee` names a variant of the enum `ret_ty` resolves to,
+    /// so `Some`/`Ok`/`Err`-style constructors are recognised while plain
+    /// function calls (which merely borrow their argument) are not.
+    callee_names_ret_variant(&this, callee: ExpressionNode*, ret_ty: TypeRef) -> boolean {
+        if (callee == null) { return false; }
+        mut leaf: SymbolStr = SymbolStr::empty();
+        if (callee.kind == NodeKind::Identifier) {
+            leaf = (callee as IdentifierNode*).name;
+        } else if (callee.kind == NodeKind::ScopeResolution) {
+            leaf = (callee as ScopeResolutionNode*).member_name;
+        } else {
+            return false;
+        }
+        if (!leaf.is_valid()) { return false; }
+        const et: Type* = this.unwrap_to_enum(ret_ty);
+        if (et == null || et.kind != TypeKind::Enum) { return false; }
+        const e: EnumType* = et as EnumType*;
+        for (mut i: i64 = 0; i < e.variants.length; i++) {
+            if (e.variants[i].name.equals(leaf)) { return true; }
+        }
+        return false;
+    }
+
+    /// Trailing value expression of a match-expression arm body (a braced
+    /// block's last expression statement, or a bare expression statement).
+    arm_tail_expr(&this, stmt: StatementNode*) -> ExpressionNode* {
+        if (stmt == null) { return null; }
+        if (stmt.kind == NodeKind::ExpressionStatement) {
+            return (stmt as ExprStmtNode*).expression;
+        }
+        if (stmt.kind == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
+            for (mut i: i64 = blk.statements.length - 1; i >= 0; i -= 1) {
+                const s: StatementNode* = blk.statements[i];
+                if (s == null) { continue; }
+                if (s.kind == NodeKind::ExpressionStatement) {
+                    return (s as ExprStmtNode*).expression;
+                }
+                return null;
+            }
+        }
+        return null;
+    }
+
+    check_return_payload_escape(mut &this, e: ExpressionNode*, ret_ty: TypeRef) -> void {
+        if (e == null) { return; }
+        // Bare payload binding returned directly as a pointer/reference.
+        if (e.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = e as IdentifierNode*;
+            if (this.is_payload_binding(id.name)
+                    && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
+                this.emit_payload_escape(e.span);
+            }
+            return;
+        }
+        // `Some(p)` / `Ok(p)` / `Err(p)` wrapping a bare payload binding.
+        if (e.kind == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            if (c.arguments.length == 1 && c.arguments[0] != null
+                    && c.arguments[0].kind == NodeKind::Identifier
+                    && this.callee_names_ret_variant(c.callee, ret_ty)) {
+                const id: IdentifierNode* = c.arguments[0] as IdentifierNode*;
+                if (this.is_payload_binding(id.name)
+                        && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
+                    this.emit_payload_escape(c.arguments[0].span);
+                }
+            }
+            return;
+        }
+        // `return match (...) { arm => <tail> }` and `if`-expression results.
+        if (e.kind == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                const arm: MatchArmNode* = me.arms[i];
+                if (arm == null) { continue; }
+                this.check_return_payload_escape(this.arm_tail_expr(arm.body), ret_ty);
+            }
+            return;
+        }
+        if (e.kind == NodeKind::IfExpression) {
+            const ie: IfExprNode* = e as IfExprNode*;
+            this.check_return_payload_escape(ie.then_expr, ret_ty);
+            this.check_return_payload_escape(ie.else_expr, ret_ty);
+            return;
+        }
+    }
+
+    emit_payload_escape(mut &this, span: SourceSpan) -> void {
+        this.ctx.emit_error_at(
+            ErrorCode::E0455_DANGLING_POINTER,
+            "cannot return a pointer or reference to a value bound by `match`: the payload lives in a temporary that is freed when the function returns. Return it by value (move the payload out) instead.",
+            span);
     }
 
     override visit(mut &this, node: IfStmtNode*) -> void {
