@@ -1304,7 +1304,25 @@ type struct Monomorphizer {
         if (!target_name.is_valid()) { return false; }
         const impl_block: ImplBlockNode* =
             this.generic_registry.lookup_trait_impl(trait_name, target_name);
-        if (impl_block == null) { return false; }
+        if (impl_block == null) {
+            // No `implement trait Drop` for this type — but a non-Copy
+            // type whose destructor is written as an inherent `drop`
+            // method still satisfies Drop: drop-insertion and codegen
+            // both resolve `.drop()` to the inherent method (mirroring
+            // `is_copy`, which already treats an inherent `drop` as
+            // non-Copy).  Without this, a `where T: Drop` container
+            // (`Box<T>`, `Rc<T>`, `Array<T>`, …) rejects any T whose
+            // destructor is inline rather than a trait impl, and
+            // `Box<T>::drop` is never instantiated → E0636 at codegen.
+            // Container types always carry a trait Drop impl, so they
+            // never reach this branch and keep the `where T: Drop` check
+            // below.
+            if (drop_name.is_valid() && trait_name.equals(drop_name)) {
+                return OwnershipQuery::has_inherent_drop(this.arena,
+                    this.generic_registry, this.intern_table, ty);
+            }
+            return false;
+        }
         if (impl_block.where_bounds.length == 0) { return true; }
         // Build a fresh substitution from the impl's generic params to
         // the concrete type's args. For `implement<T> trait Eq for Option<T>`

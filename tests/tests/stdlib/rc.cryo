@@ -92,3 +92,35 @@ function mutate_through_pointer_is_seen_by_clones() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// A type whose destructor is an INLINE `drop` method rather than
+// `implement trait Drop`. Counts how many times drop runs.
+type struct InlineDropRc {
+    counter_ptr: i32*;
+    drop(mut &this) -> void { *this.counter_ptr = *this.counter_ptr + 1; }
+}
+
+// C3 regression: a payload whose destructor is an inline `drop` method
+// must satisfy Rc's `where T: Drop`, so `Rc<InlineDropRc>` instantiates
+// and runs the inner drop when the last handle is dropped. Previously
+// this failed with `E0636: no method 'drop' found` at codegen.
+![test]
+function rc_inline_drop_payload_compiles_and_drops() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    mut r: Rc<InlineDropRc> = Rc::new(InlineDropRc { counter_ptr: &count });
+    r.drop();
+    return expect_eq(count, 1);
+}
+
+// C4 regression: dropping the same Rc handle twice is idempotent — the
+// second drop is a no-op, so there is no over-decrement and no
+// use-after-free on the freed inner header. (The second `.drop()` is a
+// warn-only use-after-move.)
+![test]
+function rc_double_drop_is_idempotent() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    mut r: Rc<InlineDropRc> = Rc::new(InlineDropRc { counter_ptr: &count });
+    r.drop();
+    r.drop();
+    return expect_eq(count, 1);
+}
