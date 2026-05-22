@@ -1,0 +1,97 @@
+///! Discarded owning temporaries — pin that an expression statement whose
+///! result is a freshly-produced owning value (a call result or struct
+///! literal) is dropped rather than leaked.
+///!
+///! drop_insertion only ever dropped NAMED bindings, so a discarded temporary
+///! such as `make_owned();` or `Res { id: 1 };` was never freed. The pass now
+///! materializes such a temporary into a hidden local and drops it at
+///! statement end. The gate is strict: only call/struct-literal results of an
+///! owning (non-Copy, droppable) type qualify, so void/Copy results and
+///! consuming calls (`x.drop()`, `consume(a)`) pass through unchanged and are
+///! never double-freed.
+///!
+///! Each `Probe::drop()` bumps a module-level counter. The temp drop fires at
+///! statement end, so tests read the counter right after the statement (or
+///! after a wrapping block when a named binding also drops at scope exit).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::DiscardedTempDrops;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset_drop_count() -> void { g_drop_count = 0; }
+function drop_count()       -> i32  { return g_drop_count; }
+
+type struct Probe {
+    tag: i32;
+    static make(tag: i32) -> Probe { return Probe { tag: tag }; }
+    clone_bumped(&this) -> Probe { return Probe { tag: this.tag + 1 }; }
+}
+
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+function returns_int() -> i32 { return 7; }
+
+// A discarded struct literal is an owning temporary and must drop.
+![test]
+function discarded_struct_literal_drops() -> Result<(), TestError> {
+    reset_drop_count();
+    Probe { tag: 1 };
+    return expect_eq(drop_count(), 1);
+}
+
+// A discarded owning call result must drop.
+![test]
+function discarded_call_result_drops() -> Result<(), TestError> {
+    reset_drop_count();
+    Probe::make(1);
+    return expect_eq(drop_count(), 1);
+}
+
+// A discarded owning method result drops at statement end; the (non-consumed)
+// receiver still drops at scope exit.
+![test]
+function discarded_method_result_drops() -> Result<(), TestError> {
+    reset_drop_count();
+    {
+        const base: Probe = Probe::make(1);
+        base.clone_bumped();   // owning result discarded -> drops here
+    }                          // base drops at block end
+    return expect_eq(drop_count(), 2);
+}
+
+// A discarded Copy result must NOT be dropped (and must not crash).
+![test]
+function discarded_copy_result_no_drop() -> Result<(), TestError> {
+    reset_drop_count();
+    returns_int();
+    return expect_eq(drop_count(), 0);
+}
+
+// An explicit `.drop()` returns void: no temp drop is synthesized, and the
+// consumed receiver is not dropped again at scope exit (no double-free).
+![test]
+function explicit_drop_not_double_freed() -> Result<(), TestError> {
+    reset_drop_count();
+    {
+        const p: Probe = Probe::make(1);
+        p.drop();
+    }
+    return expect_eq(drop_count(), 1);
+}
+
+// A discarded owning temporary inside a loop drops once per iteration.
+![test]
+function discarded_temp_in_loop_drops_each_iteration() -> Result<(), TestError> {
+    reset_drop_count();
+    for (mut i: i32 = 0; i < 3; i++) {
+        Probe::make(i);
+    }
+    return expect_eq(drop_count(), 3);
+}

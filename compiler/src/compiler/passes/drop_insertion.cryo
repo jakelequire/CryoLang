@@ -106,6 +106,10 @@ type struct DropInserter {
     fired:        i64;
     inserted:     i64;
 
+    /// Monotonic counter for naming hidden locals synthesized to hold and
+    /// drop discarded owning temporaries (see emit_discarded_temp_drop).
+    discard_seq:  i64;
+
     static new(ctx: CompilationContext*) -> DropInserter {
         return DropInserter {
             ctx:             ctx,
@@ -124,6 +128,7 @@ type struct DropInserter {
             moved_lines:     [],
             fired:           0,
             inserted:        0,
+            discard_seq:     0,
         };
     }
 
@@ -538,7 +543,19 @@ type struct DropInserter {
             NodeKind::ExpressionStatement => {
                 const e: ExprStmtNode* = stmt as ExprStmtNode*;
                 if (e.expression != null) { this.walk_expr_read(e.expression); }
-                out.push(stmt);
+                // A discarded owning temporary (e.g. `make_owned();` or
+                // `Res { id: 1 };`) is never bound, so without this it is
+                // never dropped — a leak. Materialize it into a hidden local
+                // and drop it at statement end. Consuming forms whose result
+                // is void/Copy (e.g. `x.drop();`, `consume(a);`) fail the
+                // owning-type gate and pass through unchanged; the receiver/
+                // argument moves were already recorded by walk_expr_read.
+                if (e.expression != null
+                        && this.discarded_owning_temp(e.expression)) {
+                    this.emit_discarded_temp_drop(e.expression, out, stmt.span);
+                } else {
+                    out.push(stmt);
+                }
                 false
             }
             NodeKind::DeclarationStatement => {
@@ -1063,26 +1080,78 @@ type struct DropInserter {
         this.append_drops_to_depth(out, boundary);
     }
 
-    maybe_append_drop(mut &this, out: StatementNode*[]*, idx: i64) -> void {
-        const key:  u32       = this.binding_names[idx];
-        const ty:   TypeRef   = this.binding_types[idx];
-        const span: SourceSpan = this.binding_spans[idx];
-        if (this.is_moved_id(key)) { return; }
-        if (this.is_copy(ty))      { return; }
-        // The binding's type might lack a drop method (rare for non-Copy
-        // types, but possible for primitives that escape Copy through
-        // an alias).  Skip in that case; emitting a `.drop()` on a
-        // type without a drop method would fail at codegen.
+    /// True if a value of type `ty` must be dropped at scope/statement exit:
+    /// non-Copy and carrying a drop (inherent or via the `Drop` trait). The
+    /// type might lack a drop method (rare for non-Copy types, but possible
+    /// for primitives that escape Copy through an alias) — emitting `.drop()`
+    /// on such a type would fail at codegen, so those are excluded.
+    type_needs_drop(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid())   { return false; }
+        if (this.is_copy(ty)) { return false; }
         if (!OwnershipQuery::has_inherent_drop(this.arena, this.registry,
                                                 this.intern, ty) &&
             !OwnershipQuery::type_implements_drop(this.arena, this.registry,
                                                     this.intern, ty)) {
-            return;
+            return false;
         }
+        return true;
+    }
+
+    maybe_append_drop(mut &this, out: StatementNode*[]*, idx: i64) -> void {
+        const key:  u32       = this.binding_names[idx];
+        const ty:   TypeRef   = this.binding_types[idx];
+        const span: SourceSpan = this.binding_spans[idx];
+        if (this.is_moved_id(key))   { return; }
+        if (!this.type_needs_drop(ty)) { return; }
         const sym: SymbolStr = SymbolStr::from_id(key);
         const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
         if (stmt != null) {
             out.push(stmt);
+            this.inserted += 1;
+        }
+    }
+
+    /// An expression-statement whose result is a freshly-produced owning
+    /// value that the statement discards: a call (including enum-variant
+    /// constructors, which parse as calls) or a struct literal whose result
+    /// type needs dropping. Bare identifiers, member/array access, casts,
+    /// etc. are deliberately excluded — their result aliases an existing
+    /// binding (already tracked for drop) rather than a new temporary, so
+    /// synthesizing a drop here would double-free. `new` is excluded too: it
+    /// yields a raw pointer (Copy), which the type gate rejects anyway.
+    discarded_owning_temp(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        if (expr.kind != NodeKind::CallExpression &&
+            expr.kind != NodeKind::StructLiteral) {
+            return false;
+        }
+        return this.type_needs_drop(expr.resolved_type);
+    }
+
+    /// Materialize a discarded owning temporary into a hidden local and drop
+    /// it at statement end, rewriting `<expr>;` into
+    ///     const __drop_tmpN: T = <expr>;
+    ///     __drop_tmpN.drop();
+    /// This reuses the ordinary local-var codegen (which keys the alloca by
+    /// name and stores the rvalue) and the standard synthesized drop call, so
+    /// no codegen change is needed. The hidden local is NOT registered as a
+    /// scope binding, so the scope-exit pass won't drop it a second time; the
+    /// drop fires at statement end, matching where most systems languages
+    /// destroy a discarded temporary.
+    emit_discarded_temp_drop(mut &this, expr: ExpressionNode*,
+                              out: StatementNode*[]*, span: SourceSpan) -> void {
+        const ty: TypeRef = expr.resolved_type;
+        const name: SymbolStr = this.intern.intern(
+            format("__drop_tmp%d", this.discard_seq));
+        this.discard_seq = this.discard_seq + 1;
+        const vd: VarDeclNode* = new VarDeclNode(name, span);
+        vd.set_resolved_type(ty);
+        vd.set_initializer(expr);
+        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        out.push(ds as StatementNode*);
+        const drop_stmt: StatementNode* = this.make_drop_call(name, ty, span);
+        if (drop_stmt != null) {
+            out.push(drop_stmt);
             this.inserted += 1;
         }
     }
