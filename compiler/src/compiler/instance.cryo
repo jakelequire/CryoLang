@@ -1237,8 +1237,47 @@ type struct CompilerInstance {
         // later modules during Phase 5 (TypeResolution).  Splitting into
         // 6a (mono) and 6b (validation+sema) ensures every module has
         // completed monomorphization before any validation runs.
+        // Phase 6a-i: DirectiveProcessing for ALL modules first. This must
+        // complete for every module before any Monomorphization runs.
+        // Mono clones generic templates, and a template's `![repr]` /
+        // `![align]` layout flags are only set once *its* module's
+        // DirectiveProcessing has run. The mono worklist is global and
+        // drained per-module, so a spec requested by an early module would
+        // otherwise be cloned before its (later) template module's
+        // directives were processed, silently dropping the layout onto
+        // every instantiation. (Mono lists `DirectivesProcessed` as an
+        // *optional* requirement, so the pass framework won't enforce this
+        // ordering for us — we sequence it explicitly here.)
+        pipeline.set_passes([PassID::DirectiveProcessing]);
+        {
+            mut init6ai: ProvisionSet = ProvisionSet::empty();
+            init6ai.mark(Provision::ASTValidated);
+            init6ai.mark(Provision::NamesResolved);
+            init6ai.mark(Provision::TypesResolved);
+            init6ai.mark(Provision::StructFieldsSynced);
+            pipeline.validate_with_initial(init6ai);
+        }
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure(ctx);
+            }
+            pipeline.reset();
+        }
+
+        // Phase 6a-ii: Monomorphization + GenericExpressionResolution for
+        // ALL modules, now that every template carries its final layout.
         pipeline.set_passes([
-            PassID::DirectiveProcessing,
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
         ]);
@@ -1248,6 +1287,7 @@ type struct CompilerInstance {
             initial6a.mark(Provision::NamesResolved);
             initial6a.mark(Provision::TypesResolved);
             initial6a.mark(Provision::StructFieldsSynced);
+            initial6a.mark(Provision::DirectivesProcessed);
             pipeline.validate_with_initial(initial6a);
         }
 
@@ -1263,6 +1303,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TemplatesRegistered);
             ctx.provisions.mark(Provision::TypesResolved);
             ctx.provisions.mark(Provision::StructFieldsSynced);
+            ctx.provisions.mark(Provision::DirectivesProcessed);
             if (!pipeline.run_all(ctx)) {
                 return this.project_failure(ctx);
             }

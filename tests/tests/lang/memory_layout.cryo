@@ -164,3 +164,54 @@ function repr_transparent_matches_inner() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// ---------------------------------------------------------------------------
+// Generic structs: `![repr(...)]` / `![align(N)]` must apply to every
+// monomorphized instantiation, not just non-generic decls. Regression for
+// the silent FFI/ABI mismatch where layout directives on generic structs
+// were dropped during specialization (each spec got default layout).
+// ---------------------------------------------------------------------------
+
+![repr(packed)]
+type struct GenPacked<T> {
+    a: u8;
+    b: T;
+}
+
+![test]
+function generic_repr_packed_applies_to_instantiation() -> Result<(), TestError> {
+    // Construct so the monomorphizer specializes GenPacked<i32>.
+    mut v: GenPacked<i32> = GenPacked<i32> { a: 1, b: 2 };
+    const sink: i32 = (v.a as i32) + v.b;
+    // packed { u8, i32 }: no padding => 5 bytes, alignment 1.
+    match (expect_eq(sizeof(GenPacked<i32>) as u64, 5 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(alignof(GenPacked<i32>) as u64, 1 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(sink, 3);
+}
+
+![align(16)]
+type struct GenAligned<T> {
+    v: T;
+}
+
+![test]
+function generic_align_applies_to_instantiation() -> Result<(), TestError> {
+    mut a: GenAligned<i32> = GenAligned<i32> { v: 7 };
+    const sink: i32 = a.v;
+    // ![align(16)] raises size and alignment of the { i32 } spec to 16.
+    match (expect_eq(sizeof(GenAligned<i32>) as u64, 16 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(alignof(GenAligned<i32>) as u64, 16 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(sink, 7);
+}
