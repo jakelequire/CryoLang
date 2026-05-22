@@ -1,0 +1,28 @@
+// E0452: a value declared outside a loop and moved (storage-duplicating)
+// inside it is read again on the next iteration — a loop-carried
+// use-after-move. The move re-runs every pass over the same storage, so
+// `Heap`'s drop frees `a.p` once per iteration: a double free. MoveCheck
+// rejects this before codegen so the crashing binary is never emitted.
+//
+// Regression for the loop-move double-free (audit finding C1): the
+// move-checker previously snapshot/restored its moved-set per iteration,
+// treating `a` as live each pass, and emitted no diagnostic at all.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::LoopCarriedMove;
+
+type struct Heap {
+    p: void*;
+}
+
+implement trait Drop for struct Heap {
+    drop(mut &this) -> void { free(this.p); }
+}
+
+function main() -> int {
+    mut a: Heap = Heap { p: malloc(16) };
+    for (mut i: int = 0; i < 3; i++) {
+        mut b: Heap = a;   // moves `a` every iteration -> double free
+    }
+    return 0;
+}
