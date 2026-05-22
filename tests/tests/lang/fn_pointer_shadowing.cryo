@@ -1,0 +1,75 @@
+///! Regression: a function-pointer binding (parameter or local) must shadow a
+///! global function of the same name when called as `name()`.
+///!
+///! `resolve_direct_call` used to consult the global function table BEFORE the
+///! local scope, so `name()` dispatched to a colliding global function even
+///! when a local parameter of function-pointer type was in scope. Two failures
+///! flowed from this:
+///!   * a silent miscompilation — the wrong function was called at runtime;
+///!   * a hard E0200 pointing into stdlib/core/option.cryo whenever a program
+///!     defined a top-level `function f`, because `Option::or_else`'s closure
+///!     parameter is named `f` and the prelude always instantiates `Option`.
+///!
+///! These tests pin both: the local must win at runtime, and the global must
+///! remain reachable from ordinary code.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::FnPointerShadowing;
+
+import std::core::result;
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+// Global functions whose bare names collide with the parameters below.
+function g() -> i32 { return 99; }
+function seven() -> i32 { return 7; }
+
+// `f` collides with the closure parameter of Option::or_else / and_then / map.
+// Before the fix, the mere existence of this global broke every Option<T>
+// instantiation in the program (E0200 in stdlib/core/option.cryo).
+function f() -> i32 { return 314; }
+
+// Param `g` (function pointer) shadows the global `g` when called as `g()`.
+function apply_g(g: () -> i32) -> i32 {
+    return g();
+}
+
+// Same, but through a generic function — exercises the monomorphized path.
+function apply_t<T>(g: () -> T) -> T {
+    return g();
+}
+
+function some42() -> Option<i32> {
+    return Option::Some(42);
+}
+
+![test]
+function fn_pointer_param_shadows_global() -> Result<(), TestError> {
+    // `g` is bound to `seven`; must call the parameter (7), not global g (99).
+    return expect_eq(apply_g(seven), 7);
+}
+
+![test]
+function generic_fn_pointer_param_shadows_global() -> Result<(), TestError> {
+    return expect_eq(apply_t<i32>(seven), 7);
+}
+
+![test]
+function or_else_param_wins_over_global_f() -> Result<(), TestError> {
+    // or_else's parameter `f` must win over the top-level `function f`.
+    const none: Option<i32> = Option::None;
+    const got: Option<i32> = none.or_else(some42);
+    match (got) {
+        Option::Some(v) => { return expect_eq(v, 42); }
+        Option::None => {
+            return expect(false, Str::new("or_else should have produced Some(42)"));
+        }
+    }
+}
+
+![test]
+function global_f_still_callable() -> Result<(), TestError> {
+    // The global `f` must remain reachable from ordinary code.
+    return expect_eq(f(), 314);
+}

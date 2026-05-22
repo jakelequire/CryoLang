@@ -3459,8 +3459,27 @@ public:
             // declared param types match the call's arg types, and pin
             // its overload-specific mangled name to `resolved_callee` so
             // codegen can look up the right LLVM function directly.
-            this.check_call_arity(call, ident);
-            this.try_pin_overload_mangled_callee(call, ident);
+            // A local binding of function-pointer type shadows any global
+            // function of the same name (lexical scoping; see
+            // resolve_direct_call). The arity check and overload-callee
+            // pinning below are global-function-oriented: they would emit a
+            // spurious arity diagnostic against the shadowed global and pin
+            // its mangled symbol to `resolved_callee`, which codegen honors
+            // first — making the call dispatch to the global at runtime.
+            // Skip both when a local function pointer shadows, and let
+            // resolve_direct_call route through the local.
+            mut fp_shadows_global: boolean = false;
+            const fp_shadow: TypeRef = this.lookup_local(ident.name);
+            if (fp_shadow.is_valid()) {
+                const fp_shadow_t: Type* = this.arena.lookup(fp_shadow.id);
+                if (fp_shadow_t != null && fp_shadow_t.kind == TypeKind::Function) {
+                    fp_shadows_global = true;
+                }
+            }
+            if (!fp_shadows_global) {
+                this.check_call_arity(call, ident);
+                this.try_pin_overload_mangled_callee(call, ident);
+            }
             return this.resolve_direct_call(ident);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
@@ -4251,6 +4270,27 @@ public:
     }
 
     resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
+        // A local binding (parameter or variable) of function-pointer type
+        // shadows any global function of the same name, per lexical scoping.
+        // This must be checked BEFORE the global function table: otherwise a
+        // call like `f()` inside `Option::or_else(f: () -> Option<T>)` binds
+        // to a user's top-level `function f` (a hard E0200 when the return
+        // types differ), and more generally any function-pointer parameter
+        // that collides with a global function name silently calls the wrong
+        // function. `resolve_identifier` already resolves locals before
+        // globals; this aligns the direct-call path with that precedence.
+        const fp_local: TypeRef = this.lookup_local(ident.name);
+        if (fp_local.is_valid()) {
+            const fp_t: Type* = this.arena.lookup(fp_local.id);
+            if (fp_t != null && fp_t.kind == TypeKind::Function) {
+                const fp_fn: FunctionType* = fp_t as FunctionType*;
+                // Set the identifier's resolved_type to the FunctionType so
+                // codegen can build the correct LLVM call through the pointer.
+                ident.set_resolved_type(fp_local);
+                return fp_fn.return_type;
+            }
+        }
+
         const func_ret: TypeRef = this.lookup_func_return(ident.name);
         if (func_ret.is_valid()) {
             // If the return type is an unresolved generic (e.g., Result<T, E>
@@ -4281,19 +4321,6 @@ public:
         // Constructor call (e.g., Dog("Buddy"))
         const type_ref: TypeRef = this.lookup_type_by_sym(ident.name);
         if (type_ref.is_valid()) { return type_ref; }
-
-        // Function pointer call: local variable with FunctionType (e.g., `default_fn()`)
-        const local_type: TypeRef = this.lookup_local(ident.name);
-        if (local_type.is_valid()) {
-            const local_t: Type* = this.arena.lookup(local_type.id);
-            if (local_t != null && local_t.kind == TypeKind::Function) {
-                const fn_t: FunctionType* = local_t as FunctionType*;
-                // Set the identifier's resolved_type to the FunctionType so
-                // codegen can build the correct LLVM call through the pointer.
-                ident.set_resolved_type(local_type);
-                return fn_t.return_type;
-            }
-        }
 
         const name: string = this.intern.resolve(ident.name);
         mut diag: Diagnostic = Diagnostic::error(
