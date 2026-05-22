@@ -119,3 +119,34 @@ function box_drop_calls_pointee_drop() -> Result<(), TestError> {
     }
     return expect_eq(after, 99);
 }
+
+// A type whose destructor is written as an INLINE `drop` method rather
+// than `implement trait Drop`. Counts how many times drop runs.
+type struct InlineDropBox {
+    counter_ptr: i32*;
+    drop(mut &this) -> void { *this.counter_ptr = *this.counter_ptr + 1; }
+}
+
+// C3 regression: a payload whose destructor is an inline `drop` method
+// must satisfy Box's `where T: Drop`, so `Box<InlineDropBox>`
+// instantiates and runs the inner drop. Previously this failed with
+// `E0636: no method 'drop' found` at codegen.
+![test]
+function box_inline_drop_payload_compiles_and_drops() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    mut b: Box<InlineDropBox> = Box::new(InlineDropBox { counter_ptr: &count });
+    b.drop();
+    return expect_eq(count, 1);
+}
+
+// C4 regression: dropping a Box twice is idempotent — the second drop is
+// a no-op, so the inner drop runs exactly once and there is no double
+// free. (The second `.drop()` is a warn-only use-after-move.)
+![test]
+function box_double_drop_is_idempotent() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    mut b: Box<InlineDropBox> = Box::new(InlineDropBox { counter_ptr: &count });
+    b.drop();
+    b.drop();
+    return expect_eq(count, 1);
+}

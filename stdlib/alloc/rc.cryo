@@ -42,7 +42,11 @@ type struct RcInner<T, A> {
 // ============================================================================
 
 type struct Rc<T, A = GlobalAlloc> {
-    inner: NonNull<RcInner<T, A>>;
+    // Raw (nullable) so each handle's `drop` can null it and stay
+    // idempotent: a double drop of the same handle is a no-op rather
+    // than an over-decrement / use-after-free. Non-null while the handle
+    // is live; only the post-drop husk holds null.
+    inner: RcInner<T, A>*;
 
     /// Allocate a new `Rc` backed by `GlobalAlloc` with an initial count
     /// of 1.  Panics if the allocator refuses the request; use
@@ -82,7 +86,7 @@ type struct Rc<T, A = GlobalAlloc> {
                 inner_ptr.count = 1;
                 inner_ptr.value = value;
                 inner_ptr.alloc = alloc;
-                return Result::Ok(Rc<T, GlobalAlloc> { inner: typed });
+                return Result::Ok(Rc<T, GlobalAlloc> { inner: inner_ptr });
             }
             Result::Err(err) => { return Result::Err(err); }
         }
@@ -101,7 +105,7 @@ type struct Rc<T, A = GlobalAlloc> {
                 inner_ptr.count = 1;
                 inner_ptr.value = value;
                 inner_ptr.alloc = a;
-                return Result::Ok(Rc<T, A> { inner: typed });
+                return Result::Ok(Rc<T, A> { inner: inner_ptr });
             }
             Result::Err(err) => { return Result::Err(err); }
         }
@@ -111,7 +115,7 @@ type struct Rc<T, A = GlobalAlloc> {
     /// reference count; the two handles are interchangeable.  Allocator
     /// is shared through the inner pointer; no copy needed.
     clone(&this) -> Rc<T, A> {
-        const inner_ptr: RcInner<T, A>* = this.inner.as_ptr();
+        const inner_ptr: RcInner<T, A>* = this.inner;
         inner_ptr.count = inner_ptr.count + 1;
         return Rc<T, A> { inner: this.inner };
     }
@@ -120,14 +124,14 @@ type struct Rc<T, A = GlobalAlloc> {
     /// assertions; acting on this value in a running program is rarely
     /// the right move.
     strong_count(&this) -> u64 {
-        return this.inner.as_ptr().count;
+        return this.inner.count;
     }
 
     /// Raw pointer to the shared value.  Valid for as long as *any*
     /// clone of this `Rc` is still alive; dereferencing after the last
     /// `drop` is undefined.
     as_ptr(&this) -> T* {
-        return &this.inner.as_ptr().value;
+        return &this.inner.value;
     }
 
 }
@@ -147,7 +151,12 @@ type struct Rc<T, A = GlobalAlloc> {
 implement<T, A> trait Drop for struct Rc<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {
-        const inner_ptr: RcInner<T, A>* = this.inner.as_ptr();
+        // Idempotent per handle: null `this.inner` after decrementing so a
+        // second drop of the *same* handle is a no-op rather than an
+        // over-decrement (and, for the last owner, a use-after-free on the
+        // freed header). Other live clones keep their own non-null inner.
+        if (this.inner == null) { return; }
+        const inner_ptr: RcInner<T, A>* = this.inner;
         inner_ptr.count--;
         if (inner_ptr.count == 0) {
             // Last owner: drop the shared value before freeing the inner.
@@ -156,7 +165,8 @@ where T: Drop, A: Allocator {
             // doesn't reach into memory we're freeing.
             mut alloc: A = inner_ptr.alloc;
             const header: Layout = Layout::of<RcInner<T, A>>();
-            alloc.deallocate(this.inner.cast<u8>(), header);
+            alloc.deallocate(NonNull::new(this.inner as u8*), header);
         }
+        this.inner = null;
     }
 }

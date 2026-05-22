@@ -19,7 +19,10 @@ import alloc::layout;
 import alloc::allocator;
 
 type struct Box<T, A = GlobalAlloc> {
-    ptr:   NonNull<T>;
+    // Raw (nullable) so `drop` can null it and stay idempotent: a
+    // double drop is a no-op rather than a double free. Non-null for the
+    // whole live lifetime; only the post-drop husk holds null.
+    ptr:   T*;
     alloc: A;
 
     /// Allocate heap storage via `GlobalAlloc` and move `value` into it.
@@ -64,7 +67,7 @@ type struct Box<T, A = GlobalAlloc> {
                 const typed: NonNull<T> = raw.cast<T>();
                 const typed_ptr: T* = typed.as_ptr();
                 *typed_ptr = value;
-                return Result::Ok(Box<T, GlobalAlloc> { ptr: typed, alloc: alloc });
+                return Result::Ok(Box<T, GlobalAlloc> { ptr: typed_ptr, alloc: alloc });
             }
             Result::Err(err) => { return Result::Err(err); }
         }
@@ -81,7 +84,7 @@ type struct Box<T, A = GlobalAlloc> {
                 const typed: NonNull<T> = raw.cast<T>();
                 const typed_ptr: T* = typed.as_ptr();
                 *typed_ptr = value;
-                return Result::Ok(Box<T, A> { ptr: typed, alloc: a });
+                return Result::Ok(Box<T, A> { ptr: typed_ptr, alloc: a });
             }
             Result::Err(err) => { return Result::Err(err); }
         }
@@ -95,8 +98,11 @@ type struct Box<T, A = GlobalAlloc> {
     /// should reconstitute the allocator + pointer themselves and
     /// build `Box<T, A> { ptr: ..., alloc: ... }` directly.
     static from_raw(raw: T*) -> Box<T, GlobalAlloc> {
+        if (raw == null) {
+            intrinsics::panic("Box::from_raw called with a null pointer", FILE, LINE);
+        }
         return Box<T, GlobalAlloc> {
-            ptr:   NonNull::new(raw),
+            ptr:   raw,
             alloc: GlobalAlloc::new()
         };
     }
@@ -104,7 +110,7 @@ type struct Box<T, A = GlobalAlloc> {
     /// Raw pointer to the owned value.  Valid for the lifetime of the
     /// `Box`; dereferencing after `drop` is undefined.
     as_ptr(&this) -> T* {
-        return this.ptr.as_ptr();
+        return this.ptr;
     }
 
     /// Give up ownership and return the raw pointer.  The caller becomes
@@ -118,7 +124,7 @@ type struct Box<T, A = GlobalAlloc> {
     /// this function; for `GlobalAlloc` that's a no-op.
     into_raw(mut this) -> T* {
         const { ptr, alloc }: Box<T, A> = this;
-        return ptr.as_ptr();
+        return ptr;
     }
 
     /// Bridge alias for `into_raw`, kept so legacy callers reading the
@@ -126,7 +132,7 @@ type struct Box<T, A = GlobalAlloc> {
     /// give up ownership and return the raw pointer.
     leak(mut this) -> T* {
         const { ptr, alloc }: Box<T, A> = this;
-        return ptr.as_ptr();
+        return ptr;
     }
 
 }
@@ -147,9 +153,14 @@ type struct Box<T, A = GlobalAlloc> {
 implement<T, A> trait Drop for struct Box<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {
-        const t_ptr: T* = this.ptr.as_ptr();
-        (*t_ptr).drop();
+        // Idempotent: a second drop of the same Box is a no-op rather
+        // than a double free (matches the rest of the stdlib, whose Drop
+        // impls all null their pointer). `into_raw`/`leak` consume the
+        // Box so this path doesn't run after them.
+        if (this.ptr == null) { return; }
+        (*this.ptr).drop();
         const block: Layout = Layout::of<T>();
-        this.alloc.deallocate(this.ptr.cast<u8>(), block);
+        this.alloc.deallocate(NonNull::new(this.ptr as u8*), block);
+        this.ptr = null;
     }
 }
