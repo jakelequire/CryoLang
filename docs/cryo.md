@@ -1913,7 +1913,9 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
 | `yield` | Parser accepts a `yield` expression; no generator semantics exist. |
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
-| Range expressions `a..b` / `a..=b` | Reserved in expression position. |
+| Optional type `T?` | Parsed as a postfix `?` on a type annotation, but it lowers to a distinct internal `Optional` type that is not wired into the type system: `T?` does not unify with `Option<T>` and has no codegen. Write `Option<T>` explicitly instead. |
+| Lambda / closure expressions `(x: T) -> U { ... }` | Parsed (non-capturing, with explicit parameter and return types), but codegen is incomplete — calling one fails to compile or crashes at runtime. Where a function-pointer type (`(T) -> U`) is expected, pass a named function instead. |
+| Range expressions `a..b` / `a..=b` | The `..` token is recognised but reserved in expression position; `..=` is not tokenised at all. Construct ranges with the `Range<T>` / `RangeInclusive<T>` types directly (e.g. `RangeInclusive::new(a, b)`). |
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
