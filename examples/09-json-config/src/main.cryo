@@ -10,13 +10,14 @@
 ///!   • `TryFrom<&JsonValue>` — the stdlib implements it for
 ///!     `boolean`, `i64`, `u64`, `f64`, and `Str`. Third-party types
 ///!     can implement it to slot into the same machinery.
-///!   • Generic `get_or<T>` / `get_or_in<T>` for numeric/bool fields;
-///!     a dedicated `get_str_or` / `get_str_or_in` for `Str` fields
-///!     (the generic version on struct-typed `T` hits a current mono
-///!     limitation — see comment near the helpers).
-///!         get_or(&root, key, fallback)              -> T   (numeric/bool)
-///!         get_str_or(&root, key, fallback)          -> Str
-///!   • Walking a JSON array of strings via `get_array` + raw indexing.
+///!   • Generic `get_or<T>` for numeric/bool fields; a dedicated
+///!     `get_str_or` for `Str` fields (the generic version on struct-typed
+///!     `T` hits a current mono limitation — see comment near the helpers).
+///!         get_or(&value, key, fallback)             -> T   (numeric/bool)
+///!         get_str_or(&value, key, fallback)         -> Str
+///!     Nested objects are reached with `JsonValue::get` (a `JsonValue*`),
+///!     then read with the same `&JsonValue` getters.
+///!   • Walking a JSON array of strings via `JsonValue::length` + `at`.
 ///!
 ///! Run with:  cryo run
 
@@ -85,29 +86,7 @@ where T: TryFrom<&JsonValue> {
     }
 }
 
-function get_or_in<T>(parent: &JsonObject, key: Str, fallback: T) -> T
-where T: TryFrom<&JsonValue> {
-    match (parent.get(key)) {
-        Option::Some(value_ptr) => {
-            return T::try_from(value_ptr).unwrap_or(fallback);
-        }
-        Option::None => { return fallback; }
-    }
-}
-
 function get_str_or(parent: &JsonValue, key: Str, fallback: Str) -> Str {
-    match (parent.get(key)) {
-        Option::Some(value_ptr) => {
-            match (value_ptr.as_str()) {
-                Option::Some(s) => { return s; }
-                Option::None    => { return fallback; }
-            }
-        }
-        Option::None => { return fallback; }
-    }
-}
-
-function get_str_or_in(parent: &JsonObject, key: Str, fallback: Str) -> Str {
     match (parent.get(key)) {
         Option::Some(value_ptr) => {
             match (value_ptr.as_str()) {
@@ -126,18 +105,22 @@ function get_str_or_in(parent: &JsonObject, key: Str, fallback: Str) -> Str {
 
 function read_string_array(parent: &JsonValue, key: Str) -> Array<String> {
     mut out: Array<String> = Array::new();
-    match (parent.get_array(key)) {
-        Option::Some(arr_ptr) => {
-            const n: u64 = arr_ptr.length();
+    // `get` returns a `JsonValue*` into stable heap storage; walk it with
+    // `length` + `at` (both return through that stable pointer) rather than
+    // borrowing the inline `Array` payload, which can't be returned safely.
+    match (parent.get(key)) {
+        Option::Some(arr_val) => {
+            const n: u64 = arr_val.length();
             mut i: u64 = 0;
             while (i < n) {
-                // Index straight into the underlying T* — `Array::get`
-                // would copy the JsonValue and double-free at scope
-                // exit on owning variants.
-                const element_ptr: JsonValue* = &arr_ptr.ptr[i];
-                match (element_ptr.as_str()) {
-                    Option::Some(view) => {
-                        out.push(String::from_str(view));
+                match (arr_val.at(i)) {
+                    Option::Some(element_ptr) => {
+                        match (element_ptr.as_str()) {
+                            Option::Some(view) => {
+                                out.push(String::from_str(view));
+                            }
+                            Option::None => { }
+                        }
                     }
                     Option::None => { }
                 }
@@ -159,19 +142,19 @@ function build_config(root: &JsonValue) -> ServerConfig {
         get_str_or(root, Str::new("service"), Str::new("unknown"))
     );
 
-    // Nested `server` block — descend once, then read fields off
-    // the borrowed JsonObject.  Numeric/bool fields use the generic
-    // `get_or_in<T>`; the Str field uses the dedicated extractor.
+    // Nested `server` block — descend once with `get` (a `JsonValue*`
+    // into stable heap storage), then read fields off that value with the
+    // same `&JsonValue` getters used at the top level.
     mut host: String;
     mut port: u16;
     mut tls:  boolean;
-    match (root.get_object(Str::new("server"))) {
+    match (root.get(Str::new("server"))) {
         Option::Some(server) => {
             host = String::from_str(
-                get_str_or_in(server, Str::new("host"), Str::new("127.0.0.1"))
+                get_str_or(server, Str::new("host"), Str::new("127.0.0.1"))
             );
-            port = get_or_in(server, Str::new("port"), 8080 as u64) as u16;
-            tls  = get_or_in(server, Str::new("tls"), false);
+            port = get_or(server, Str::new("port"), 8080 as u64) as u16;
+            tls  = get_or(server, Str::new("tls"), false);
         }
         Option::None => {
             intrinsics::printf("  (warn) 'server' block missing; using defaults\n");
@@ -183,10 +166,10 @@ function build_config(root: &JsonValue) -> ServerConfig {
 
     mut max_connections: u32;
     mut timeout_seconds: u32;
-    match (root.get_object(Str::new("limits"))) {
+    match (root.get(Str::new("limits"))) {
         Option::Some(limits) => {
-            max_connections = get_or_in(limits, Str::new("max_connections"), 64 as u64) as u32;
-            timeout_seconds = get_or_in(limits, Str::new("timeout_seconds"), 30 as u64) as u32;
+            max_connections = get_or(limits, Str::new("max_connections"), 64 as u64) as u32;
+            timeout_seconds = get_or(limits, Str::new("timeout_seconds"), 30 as u64) as u32;
         }
         Option::None => {
             intrinsics::printf("  (warn) 'limits' block missing; using defaults\n");
