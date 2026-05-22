@@ -164,6 +164,22 @@ type struct DropInserter {
 
     register_binding(mut &this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
         if (!name.is_valid()) { return; }
+        // A freshly declared binding starts live. The moved-set is keyed by
+        // intern name id and `pop_scope` does NOT clear it, so a sibling
+        // scope that reuses a name moved in an earlier (now-popped) scope
+        // would inherit that stale move and never be dropped — a leak.
+        // Clear the stale entry here so the new binding is droppable again.
+        //
+        // Guard on "no other live binding of this name": when this
+        // declaration shadows a still-live OUTER binding, the move-set entry
+        // may belong to that outer binding (name-keying can't tell them
+        // apart), and reviving it would let an already-moved outer be
+        // dropped — a double-free. In that case we keep the move recorded
+        // and accept that the inner shadow may leak (fail-safe under-drop,
+        // consistent with the rest of this pass).
+        if (!this.name_is_live(name)) {
+            this.unmark_moved(name);
+        }
         this.types_keys.push(name.id);
         this.types_refs.push(ty);
         this.binding_names.push(name.id);
@@ -210,6 +226,34 @@ type struct DropInserter {
         if (this.is_moved(name)) { return; }
         this.moved_keys.push(name.id);
         this.moved_lines.push(span.start_line as i32);
+    }
+
+    /// True if a binding with `name` is currently live (registered in an
+    /// as-yet-unpopped scope). Lets `register_binding` distinguish a fresh
+    /// re-declaration (clear stale move state) from one that shadows a live
+    /// outer binding (keep it; see register_binding).
+    name_is_live(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.binding_names.length; i++) {
+            if (this.binding_names[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Clear move state for `name`. Length-preserving: matched slots are
+    /// tombstoned with id 0 (the reserved invalid SymbolStr id, never a
+    /// real binding name) rather than removed. This keeps the array-length
+    /// checkpoints used by snapshot_moves/restore_moves and the branch-join
+    /// (moves_since_keys/set_moves_tail) exactly valid; is_moved_id and
+    /// binding_in_outer_scope are only ever queried with valid ids, so a 0
+    /// tombstone is inert.
+    unmark_moved(mut &this, name: SymbolStr) -> void {
+        if (!name.is_valid()) { return; }
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == name.id) {
+                this.moved_keys[i] = 0;
+            }
+        }
     }
 
     snapshot_moves(&this) -> i64 {

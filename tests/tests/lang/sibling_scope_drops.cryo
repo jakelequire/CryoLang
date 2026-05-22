@@ -1,0 +1,98 @@
+///! Sibling-scope move state — pin that the drop-insertion moved-set (keyed by
+///! intern name id in passes/drop_insertion.cryo) does not leak across sibling
+///! scopes that reuse a binding name.
+///!
+///! `pop_scope` truncates the per-scope binding arrays but never cleared the
+///! moved-set, so a name moved in one block used to suppress the drop of a
+///! freshly-declared same-named binding in a later sibling block (a leak).
+///! `register_binding` now clears stale move state for a genuinely-fresh
+///! re-declaration, while PRESERVING it when the new binding shadows a still-
+///! live outer one — reviving an already-moved outer would double-free it.
+///!
+///! Observable side-effect: each `Probe::drop()` bumps a module-level counter.
+///! Bindings are moved into a same-scope sink (not a by-value parameter, whose
+///! drop is a separate open issue) so the counts are unambiguous.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::SiblingScopeDrops;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset_drop_count() -> void { g_drop_count = 0; }
+function drop_count()       -> i32  { return g_drop_count; }
+
+type struct Probe {
+    tag: i32;
+    static new(tag: i32) -> Probe { return Probe { tag: tag }; }
+}
+
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+// Baseline: two siblings with DISTINCT names both drop. If this fails the
+// other tests are meaningless.
+![test]
+function baseline_two_siblings_distinct_names_drop() -> Result<(), TestError> {
+    reset_drop_count();
+    { const a: Probe = Probe::new(1); }
+    { const b: Probe = Probe::new(2); }
+    return expect_eq(drop_count(), 2);
+}
+
+// The regression: first block moves `a` into a same-scope sink (which drops);
+// the second block declares a FRESH `a` that must still drop. Before the fix
+// the stale move on the name `a` suppressed the second drop (count was 1).
+![test]
+function sibling_reuse_after_move_still_drops() -> Result<(), TestError> {
+    reset_drop_count();
+    { const a: Probe = Probe::new(1); const sink: Probe = a; }
+    { const a: Probe = Probe::new(2); }
+    return expect_eq(drop_count(), 2);
+}
+
+// Three sibling blocks reusing the same name across all of them.
+![test]
+function sibling_reuse_three_times() -> Result<(), TestError> {
+    reset_drop_count();
+    { const x: Probe = Probe::new(1); const sink: Probe = x; }
+    { const x: Probe = Probe::new(2); }
+    { const x: Probe = Probe::new(3); }
+    return expect_eq(drop_count(), 3);
+}
+
+// Sibling reuse must also drop when nested inside a branch (the moved-set
+// snapshot/restore around the branch must not be corrupted by the clear).
+![test]
+function sibling_reuse_inside_branch_drops() -> Result<(), TestError> {
+    reset_drop_count();
+    if (drop_count() == 0) {
+        { const a: Probe = Probe::new(1); const sink: Probe = a; }
+        { const a: Probe = Probe::new(2); }
+    }
+    return expect_eq(drop_count(), 2);
+}
+
+// Safety: when an inner block re-declares a name whose OUTER binding was
+// moved, the outer's move state must survive — otherwise the moved outer is
+// revived and double-freed. The outer value is moved into a same-scope sink
+// that drops exactly once; the inner shadow leaks fail-safe (documented).
+// Exactly ONE drop proves no double-free (the buggy unconditional-clear path
+// would drop the outer value twice plus the inner, giving 3).
+![test]
+function outer_shadow_does_not_double_free() -> Result<(), TestError> {
+    reset_drop_count();
+    // Wrapped in a block so the scenario's scope-exit drops fire BEFORE the
+    // count is read (function-scope drops would otherwise run after the
+    // `return` expression is evaluated).
+    {
+        const c: Probe = Probe::new(1);
+        const sink: Probe = c;        // c moved -> sink owns the value
+        { const c: Probe = Probe::new(2); }
+    }
+    return expect_eq(drop_count(), 1);
+}
