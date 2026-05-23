@@ -896,3 +896,84 @@ function match_expr_arm_yields_local_dropped_once() -> Result<(), TestError> {
     expect_eq(tag, 4)?;
     return expect_eq(g_try_drop_count, 1);
 }
+
+// ============================================================================
+// Mixed-signedness integer widening
+//
+// When two integer operands differ in BOTH width and signedness, the
+// narrower operand must be extended according to ITS OWN signedness
+// (zext for unsigned, sext for signed) — not the left/result type's.
+// Regression: codegen_binary used a single signedness flag for both
+// operands, so an unsigned narrow operand paired with a signed wider one
+// was sign-extended, silently corrupting any value with the narrow type's
+// top bit set (e.g. `i32(0) + u16(40000)` produced -25536).
+// ============================================================================
+
+![test]
+function widen_unsigned_rhs_zero_extends() -> Result<(), TestError> {
+    const a: i32 = 0;
+    const b: u16 = 40000;       // top bit set; sext would give -25536
+    const got: i32 = a + b;
+    return expect_eq(got, 40000 as i32);
+}
+
+![test]
+function widen_unsigned_lhs_zero_extends() -> Result<(), TestError> {
+    // The mirror case: narrow operand on the left.
+    const a: u16 = 40000;
+    const b: i32 = 0;
+    const got: i32 = a + b;
+    return expect_eq(got, 40000 as i32);
+}
+
+![test]
+function mixed_sign_compare_extends_each_operand() -> Result<(), TestError> {
+    const c: i32 = -1;
+    const d: u8 = 200;          // sext would make this -56, flipping the result
+    expect_true(c < d, Str::new("-1 < u8(200) should be true"))?;
+    const e: i64 = 200;
+    const f: u8 = 200;
+    return expect_true(e == f, Str::new("i64(200) == u8(200) should be true"));
+}
+
+![test]
+function mixed_sign_bitor_zero_extends() -> Result<(), TestError> {
+    const g: i32 = 1;
+    const h: u16 = 0xFF00;      // sext would set the high 16 bits
+    const got: i32 = g | h;
+    return expect_eq(got, 0xFF01 as i32);
+}
+
+// ============================================================================
+// Float `!=` is IEEE-correct (unordered)
+//
+// `!=` must lower to `fcmp une`, the negation of `==` (`fcmp oeq`), so
+// that `NaN != NaN` is true. Regression: it lowered to `fcmp one`
+// (ordered), which returns false for any NaN operand and silently broke
+// `f32::is_nan` / `f64::is_nan` (both defined as `this != this`).
+// ============================================================================
+
+![test]
+function nan_is_not_equal_to_itself() -> Result<(), TestError> {
+    mut z: f64 = 0.0;
+    const nan: f64 = z / z;     // runtime NaN (project builds with optimize=false)
+    expect_true(nan != nan, Str::new("nan != nan should be true (une)"))?;
+    return expect_false(nan == nan, Str::new("nan == nan should be false (oeq)"));
+}
+
+![test]
+function nan_self_compare_is_nan() -> Result<(), TestError> {
+    mut z: f64 = 0.0;
+    const nan: f64 = z / z;
+    expect_true(nan.is_nan(), Str::new("f64::is_nan(NaN) should be true"))?;
+    const x: f64 = 1.5;
+    return expect_false(x.is_nan(), Str::new("f64::is_nan(1.5) should be false"));
+}
+
+![test]
+function ordinary_float_inequality_unaffected() -> Result<(), TestError> {
+    const x: f64 = 1.5;
+    const y: f64 = 0.0;
+    expect_false(x != x, Str::new("1.5 != 1.5 should be false"))?;
+    return expect_true(x != y, Str::new("1.5 != 0.0 should be true"));
+}
