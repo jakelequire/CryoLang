@@ -1622,15 +1622,22 @@ Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does *
 
 ### 16.3 Move Checking
 
-Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_check.cryo`](../compiler/src/compiler/passes/move_check.cryo)). Passing a non-`Copy` value to another function moves it; using the binding after the move is reported as a warning. Reassigning re-initialises the binding.
+Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_check.cryo`](../compiler/src/compiler/passes/move_check.cryo)). A *storage-duplicating* move — binding a non-`Copy` value to a new name, assigning it, or placing it in an aggregate literal — transfers ownership; using the original afterward is reported. Passing a value to a function is a *borrow* (arguments are passed by hidden reference, and the callee does not drop them), **not** a move, so a value stays usable after a call. Reassigning re-initialises the binding.
 
 ```cryo
-const buf: Buffer = make_buffer(1024);
-consume(buf);     // moves buf
-use(buf);         // ⚠ use-after-move (warn-only)
+const a: Buffer = make_buffer(1024);
+const b: Buffer = a;   // moves a -> b (storage-duplicating)
+use(a);                // ⚠ use of moved value 'a' (warning)
 ```
 
-The check emits warnings rather than hard errors so that legitimate idioms that exercise the move-tracker's edge cases (loop bodies that re-initialise a moved binding, conditional moves whose join the analyser can't yet prove sound) compile through. Treat the warnings as authoritative; promotion to errors is on the post-1.0 roadmap once the join-point analyser matures.
+Ordinary use-after-move stays a **warning**: drop-insertion already skips dropping a moved-from source, so the original still names live memory until the destination is dropped — the read is logically wrong but not, on its own, a memory error. (Whether a *second* `.drop()` is a double free depends on the type — `Rc`/`Box` make it idempotent, a naive `free`-in-`drop` does not — so the compiler cannot decide it in general and leaves it to the warning.)
+
+Two move/ownership hazards that *are* unambiguous memory errors, independent of any type's `drop` body, are **hard errors**:
+
+- **Loop-carried move** (`E0452`) — a value moved inside a loop and re-read on the next iteration would be freed twice.
+- **Returning the address of a local** (`E0455`) — `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine — those are caller-backed.)
+
+Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 1.4](#14-types-and-type-safety) and [§ 15](#15-pointers-and-memory)). Move tracking is a best-effort aid, not a soundness boundary.
 
 ---
 
