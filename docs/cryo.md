@@ -231,6 +231,31 @@ function apply(f: (int) -> int, x: int) -> int {
 
 This is how `Option::map`, `Result::and_then`, and the iterator combinators take their callback.
 
+A function value can be a named function or a **lambda expression**:
+`(params) -> Ret { body }`, or `(params) -> Ret expr` for a single-expression
+body. Each parameter and the return type are written out explicitly. Lambdas
+are non-capturing — the body may reference globals, other functions, and its
+own parameters, but not locals of the enclosing function (a reference to one is
+a "cannot find value" error, not a silent capture).
+
+```cryo
+const inc: (int) -> int       = (n: int) -> int { return n + 1; };
+const add: (int, int) -> int  = (a: int, b: int) -> int { return a + b; };
+
+apply(inc, 41);                                   // 42 (named-as-value)
+apply((n: int) -> int { return n * 2; }, 21);     // 42 (inline)
+```
+
+A combinator that must infer a *new* type parameter from the callback's return
+type — for example `Option::map<U>` — currently needs that type argument
+written out, because inferring a generic from a function argument's return type
+is not yet supported (this applies equally to named functions):
+
+```cryo
+const some: Option<int> = Option::Some(5);
+const out:  Option<int> = some.map<int>((n: int) -> int { return n * 10; });
+```
+
 ### 2.6 Tuple Types
 
 A tuple groups a fixed number of heterogeneous values into one compound. **Tuple types and tuple literals use square brackets.** Round parentheses are reserved for grouping and the unit type.
@@ -282,6 +307,31 @@ const a: i64 = 42;
 const b: i32 = a as i32;          // narrowing: programmer's responsibility
 const p: u8* = some_string as u8*; // pointer reinterpretation
 ```
+
+### 2.10 Optional Types (`T?`)
+
+`T?` is shorthand for `Option<T>`. It is pure sugar — the parser rewrites `T?`
+to `Option<T>`, so the two are the *same* type. A `T?` value carries all of
+`Option`'s methods (`is_some`, `is_none`, `unwrap_or`, `map`, …) and is freely
+assignable to and from `Option<T>`. The suffix works in every type position:
+variable, parameter, return type, struct field, and generic argument.
+
+```cryo
+const slot: int? = Option::Some(7);   // int?  is  Option<int>
+const back: Option<int> = slot;       // interchangeable both ways
+
+function first(xs: int[]) -> int? {   // optional return
+    if (xs.length == 0) { return Option::None; }
+    return Option::Some(xs[0]);
+}
+
+type struct Config {
+    port: u16?;                       // optional field
+}
+```
+
+`T?` nests like any other type argument: `Option<int?>` is
+`Option<Option<int>>`.
 
 ---
 
@@ -1913,8 +1963,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
 | `yield` | Parser accepts a `yield` expression; no generator semantics exist. |
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
-| Optional type `T?` | Parsed as a postfix `?` on a type annotation, but it lowers to a distinct internal `Optional` type that is not wired into the type system: `T?` does not unify with `Option<T>` and has no codegen. Write `Option<T>` explicitly instead. |
-| Lambda / closure expressions `(x: T) -> U { ... }` | Parsed (non-capturing, with explicit parameter and return types), but codegen is incomplete — calling one fails to compile or crashes at runtime. Where a function-pointer type (`(T) -> U`) is expected, pass a named function instead. |
 | Range expressions `a..b` / `a..=b` | The `..` token is recognised but reserved in expression position; `..=` is not tokenised at all. Construct ranges with the `Range<T>` / `RangeInclusive<T>` types directly (e.g. `RangeInclusive::new(a, b)`). |
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
