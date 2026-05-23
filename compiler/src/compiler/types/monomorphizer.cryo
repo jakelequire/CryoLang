@@ -2049,7 +2049,57 @@ type struct Monomorphizer {
                     return this.scope_types[si];
                 }
             }
+            // An identifier naming a global function passed as a
+            // function-typed argument (`opt.map(tentimes)`): recover its
+            // signature from the declaration index so the unifier can bind a
+            // generic that appears only inside the callback's type, e.g.
+            // `(T) -> U` against `(int) -> int`.  Only when exactly one
+            // overload exists; an ambiguous name can't be resolved here
+            // without the formal to disambiguate against.
+            if (this.decl_index != null) {
+                mut fns: TypeRef[] = this.decl_index.lookup_func_type_overloads(
+                    this.decl_index.resolve_qualified(id.name));
+                if (fns.length == 0) {
+                    fns = this.decl_index.lookup_func_type_overloads(id.name);
+                }
+                if (fns.length == 1) {
+                    const fnt: Type* = this.arena.lookup(fns[0].id);
+                    if (fnt != null && fnt.kind == TypeKind::Function) {
+                        return fns[0];
+                    }
+                }
+            }
             return TypeRef::invalid();
+        }
+        if (node.kind == NodeKind::LambdaExpression) {
+            // A lambda argument's type is its function-pointer signature,
+            // built from the parameter annotations and the explicit return
+            // annotation.  Sema runs after mono, so neither the lambda nor its
+            // params carry a resolved_type yet; resolve straight from the
+            // annotations.  This binds a generic that appears only in the
+            // callback's return (`(T) -> U`) from a lambda actual like
+            // `opt.map((n: int) -> int { return n * 10; })`.  A lambda with no
+            // return annotation yields invalid (inference simply skips it).
+            if (this.type_resolver == null) { return TypeRef::invalid(); }
+            const lam: LambdaExprNode* = expr as LambdaExprNode*;
+            mut lam_ctx: ResolutionContext = ResolutionContext::new("", "");
+            mut p_types: TypeRef[] = [];
+            for (mut i: i64 = 0; i < lam.parameters.length; i++) {
+                const p: VarDeclNode* = lam.parameters[i];
+                if (p == null) { return TypeRef::invalid(); }
+                mut pty: TypeRef = p.resolved_type;
+                if (!pty.is_valid() && p.type_annotation != null) {
+                    pty = this.type_resolver.resolve(p.type_annotation, &lam_ctx);
+                }
+                if (!pty.is_valid()) { return TypeRef::invalid(); }
+                p_types.push(pty);
+            }
+            mut r_ty: TypeRef = lam.return_type;
+            if (!r_ty.is_valid() && lam.return_type_ann != null) {
+                r_ty = this.type_resolver.resolve(lam.return_type_ann, &lam_ctx);
+            }
+            if (!r_ty.is_valid()) { return TypeRef::invalid(); }
+            return this.arena.get_function(r_ty, p_types, false);
         }
         if (node.kind == NodeKind::UnaryExpression) {
             // `&x` produces a pointer to x.  Wrap the operand's type
