@@ -1661,11 +1661,11 @@ type struct AlignedData {
 
 | Directive | Target | Description |
 | --- | --- | --- |
-| `![inline]` | function | Hints the optimiser to inline the function. |
-| `![noinline]` | function | Forbids inlining even when the optimiser would otherwise. |
-| `![deprecated]` / `![deprecated("msg")]` | any decl | Marks a declaration as deprecated; the compiler warns on use. |
-| `![link("name")]` | extern fn / extern block | Override the linker symbol used to resolve the function. |
-| `![allow(name)]` / `![warn(name)]` / `![deny(name)]` | any decl | Adjust the level of a named lint over the decl. |
+| `![inline]` | function | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).* |
+| `![noinline]` | function | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.* |
+| `![deprecated]` / `![deprecated("msg")]` | any decl | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.* |
+| `![link("name")]` | extern fn | Override the linker symbol used to resolve an extern function: Cryo callers use the declared name while the symbol resolved at link time is `name`. |
+| `![allow(name)]` / `![warn(name)]` / `![deny(name)]` | any decl | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* |
 | `![derive(Trait, …)]` | struct / class / enum | Auto-derive one or more traits. |
 | `![sink]` | method | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics. |
 | `![implicit]` | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = …` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(…)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |

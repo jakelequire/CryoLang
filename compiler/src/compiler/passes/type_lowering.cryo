@@ -98,8 +98,118 @@ type struct TypeLoweringPasses {
             cdebug("[TypeLowering] Computed layouts for %lld types\n", computed);
         }
 
+        // Reject infinitely-sized recursive value types.  Any struct/class
+        // the fixpoint could not settle which contains itself by value
+        // (directly or transitively, through non-pointer fields) has no
+        // finite size; the front end otherwise accepted it and left it at
+        // size 0, miscompiling downstream.  Pointer/reference fields break
+        // the chain, so `struct Node { next: Node* }` stays legal.
+        for (mut ri: i64 = 0; ri < arena.type_count(); ri++) {
+            const rty: Type* = arena.types[ri];
+            if (rty == null) { continue; }
+            if (rty.kind != TypeKind::Struct && rty.kind != TypeKind::Class) {
+                continue;
+            }
+            if (layout_settled(rty)) { continue; }
+            if (!reaches_by_value(arena, rty, rty.id, 0)) { continue; }
+
+            mut tname: string = "<type>";
+            if (rty.kind == TypeKind::Struct) {
+                tname = (rty as StructType*).display_name();
+            } else {
+                tname = (rty as ClassType*).display_name();
+            }
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0236_RECURSIVE_TYPE,
+                format("recursive type `%s` has infinite size", tname));
+            diag = diag.help(
+                "break the cycle with a pointer or `Box` indirection (store the self-referential field behind a `*`)");
+            ctx.emit_diagnostic(diag);
+        }
+
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
+}
+
+/// Resolve `ty` past type aliases and instantiated-type wrappers to the
+/// underlying concrete type.  Depth-guarded against malformed chains.
+function lowering_resolve_concrete(arena: TypeArena*, ty: Type*) -> Type* {
+    mut c: Type* = ty;
+    mut d: i32 = 0;
+    while (c != null && d < 16) {
+        if (c.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = c as TypeAliasType*;
+            if (al.has_target()) { c = arena.lookup(al.target.id); d += 1; continue; }
+            return c;
+        }
+        if (c.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = c as InstantiatedType*;
+            if (it.has_resolved_type()) { c = arena.lookup(it.resolved_type.id); d += 1; continue; }
+            return c;
+        }
+        return c;
+    }
+    return c;
+}
+
+/// Follow one by-value child type-ref.  If the child concretely *is*
+/// `target_id`, that closes a containment cycle; otherwise recurse when
+/// the child is another by-value aggregate.  Pointer / reference children
+/// break the chain (a pointer to a type is finite-size).
+function by_value_child_reaches(arena: TypeArena*, child_ref: TypeRef,
+                                target_id: u64, depth: i32) -> boolean {
+    const child: Type* = lowering_resolve_concrete(arena, arena.lookup(child_ref.id));
+    if (child == null) { return false; }
+    if (child.kind == TypeKind::Pointer || child.kind == TypeKind::Reference) {
+        return false;
+    }
+    if (child.id == target_id) { return true; }
+    return reaches_by_value(arena, child, target_id, depth + 1);
+}
+
+/// True iff `target_id` is reachable from `container` through by-value
+/// containment (struct/class fields, tuple elements, fixed-array
+/// elements).  Detects infinitely-sized recursive value types.  Depth
+/// guarded so a cyclic graph terminates even before the target is found.
+function reaches_by_value(arena: TypeArena*, container: Type*,
+                          target_id: u64, depth: i32) -> boolean {
+    if (container == null || depth > 128) { return false; }
+
+    if (container.kind == TypeKind::Struct) {
+        const st: StructType* = container as StructType*;
+        for (mut i: i64 = 0; i < st.fields.length; i++) {
+            if (by_value_child_reaches(arena, st.fields[i].field_type, target_id, depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (container.kind == TypeKind::Class) {
+        const ct: ClassType* = container as ClassType*;
+        for (mut i: i64 = 0; i < ct.fields.length; i++) {
+            if (by_value_child_reaches(arena, ct.fields[i].field_type, target_id, depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (container.kind == TypeKind::Tuple) {
+        const tt: TupleType* = container as TupleType*;
+        for (mut i: i64 = 0; i < tt.elements.length; i++) {
+            if (by_value_child_reaches(arena, tt.elements[i], target_id, depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (container.kind == TypeKind::Array) {
+        const at: ArrayType* = container as ArrayType*;
+        if (at.is_fixed()) {
+            return by_value_child_reaches(arena, at.element, target_id, depth);
+        }
+        return false;
+    }
+    return false;
 }
 
 

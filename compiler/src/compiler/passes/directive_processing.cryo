@@ -819,6 +819,16 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
             fn.is_implicit = true;
             return;
         }
+        if (strcmp(name, "link") == 0) {
+            // The validator already checked arity (1) and that the arg is
+            // a string literal; record the override for codegen.
+            if (dir.args.length == 1
+                    && dir.args[0].kind == DirectiveArgKind::StringLit) {
+                fn.link_name     = dir.args[0].str_value;
+                fn.has_link_name = true;
+            }
+            return;
+        }
     }
 
     // Layout effects on user-defined types.  The validator above has
@@ -1100,6 +1110,32 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
                     cdebug("[DirectiveProcessing] %s '%s' on method (%lld args) at %s:%u:%u\n",
                         mtag, md.directive_kind, md.args.length,
                         md.span.file, md.span.start_line, md.span.start_col);
+                }
+            }
+        }
+
+        // Descend into extern-block functions so per-function directives
+        // like `![link("sym")]` are validated + applied; the block is the
+        // top-level statement, its functions aren't otherwise visited here.
+        if (decl.kind == NodeKind::ExternBlock) {
+            const eb: ExternBlockNode* = decl as ExternBlockNode*;
+            for (mut ei: i64 = 0; ei < eb.functions.length; ei++) {
+                const ef: FunctionDeclNode* = eb.functions[ei];
+                if (ef == null) { continue; }
+                for (mut ej: i64 = 0; ej < ef.attached_directives.length; ej++) {
+                    const ed: DirectiveNode* = ef.attached_directives[ej];
+                    if (ed == null) { continue; }
+                    validate_builtin(ctx, ed, DirectiveTarget::Extern);
+                    apply_effects(ctx, ed, ef as DeclarationNode*);
+                    const e_rec: DirectiveRecord = DirectiveRecord {
+                        kind: ed.directive_kind,
+                        node: ed,
+                        decl: ef as DeclarationNode*,
+                        qualified_name: SymbolStr::empty(),
+                        span: ed.span,
+                    };
+                    registry.add(e_rec);
+                    count += 1;
                 }
             }
         }

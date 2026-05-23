@@ -15,6 +15,7 @@ import std::core::convert;
 import std::collections::str;
 import std::collections::string;
 import std::fmt::display;
+import std::fmt::float;
 import std::test::error;
 import std::test::assert;
 
@@ -463,4 +464,47 @@ function println_percent_escape() -> Result<(), TestError> {
 ![test]
 function print_returns_byte_count_no_newline() -> Result<(), TestError> {
     return expect_eq(print("abc"), 3);
+}
+
+// ============================================================================
+// Float fixed-point formatting — rounds (not truncates)
+//
+// Regression: `write_fixed` truncated the fraction, so a representable
+// value printed as a *different* one (3.14159 -> "3.141589").  It must
+// round half-up, and a fraction that rounds to 1.0 must carry into the
+// integer part.
+// ============================================================================
+
+// `Str` is a borrowed view, so the formatted-bytes buffer must stay
+// alive for the whole comparison: do the format + compare inside one
+// frame and never return the `Str`.
+function expect_f64_fmt(v: f64, want: string) -> Result<(), TestError> {
+    mut buf: u8[64];
+    const n: u64 = v.to_buf(&buf[0]);
+    const got: Str = Str::from_raw(&buf[0], n);
+    const w: Str = Str::new(want);
+    return expect(got.equals(&w), Str::new(want));
+}
+
+![test]
+function float_format_rounds_last_digit() -> Result<(), TestError> {
+    // Rounded, not truncated to "3.141589".
+    return expect_f64_fmt(3.14159, "3.141590");
+}
+
+![test]
+function float_format_simple_fraction() -> Result<(), TestError> {
+    return expect_f64_fmt(0.1, "0.100000");
+}
+
+![test]
+function float_format_rounding_carry_into_integer() -> Result<(), TestError> {
+    // 9.9999996 rounds to 10.000000 at 6 dp — the fraction rolls over and
+    // must carry into the integer part.
+    return expect_f64_fmt(9.9999996, "10.000000");
+}
+
+![test]
+function float_format_whole_number() -> Result<(), TestError> {
+    return expect_f64_fmt(1.0, "1.000000");
 }

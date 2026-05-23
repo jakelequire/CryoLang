@@ -6357,20 +6357,25 @@ public:
 
         // Allow access when we're inside a method of the declaring type.
         // current_owner_type stays valid for static methods too, where
-        // `this_type` is invalid by design.
+        // `this_type` is invalid by design.  For `protected` members the
+        // access is also allowed from subclasses of the declaring type.
         if (this.current_owner_type.is_valid()) {
             const owner: Type* = this.unwrap_to_base_type(this.current_owner_type);
-            if (owner != null && declaring_t != null && owner.id == declaring_t.id) {
-                return;
+            if (owner != null && declaring_t != null) {
+                if (owner.id == declaring_t.id) { return; }
+                if (field.is_protected && this.is_subclass_of(owner, declaring_t.id)) {
+                    return;
+                }
             }
         }
 
+        const vis_word: string = if (field.is_protected) { "protected" } else { "private" };
         const field_str: string = this.intern.resolve(field_name);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            format("field `%s` of `%s` is private", field_str, declaring_name));
+            format("field `%s` of `%s` is %s", field_str, declaring_name, vis_word));
         diag = diag.at_with_label(span,
-            format("private field accessed outside `%s`", declaring_name));
+            format("%s field accessed outside `%s`", vis_word, declaring_name));
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -6419,20 +6424,47 @@ public:
         if (method == null) { return; }
         if (method.is_public) { return; }
 
+        // Inside the declaring type, or — for `protected` methods — inside
+        // a subclass of it, the call is allowed.
         if (this.current_owner_type.is_valid()) {
             const owner: Type* = this.unwrap_to_base_type(this.current_owner_type);
-            if (owner != null && declaring_t != null && owner.id == declaring_t.id) {
-                return;
+            if (owner != null && declaring_t != null) {
+                if (owner.id == declaring_t.id) { return; }
+                if (method.is_protected && this.is_subclass_of(owner, declaring_t.id)) {
+                    return;
+                }
             }
         }
 
+        const vis_word: string = if (method.is_protected) { "protected" } else { "private" };
         const method_str: string = this.intern.resolve(method_name);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
-            format("method `%s` of `%s` is private", method_str, declaring_name));
+            format("method `%s` of `%s` is %s", method_str, declaring_name, vis_word));
         diag = diag.at_with_label(span,
-            format("private method called outside `%s`", declaring_name));
+            format("%s method called outside `%s`", vis_word, declaring_name));
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// True when `candidate` is `ancestor_id` itself or descends from it
+    /// through the class `base_class` chain.  Used by visibility
+    /// enforcement to permit `protected` access from subclasses.  Depth
+    /// guarded against cyclic inheritance graphs.
+    is_subclass_of(mut &this, candidate: Type*, ancestor_id: u64) -> boolean {
+        mut cur: Type* = candidate;
+        mut depth: i32 = 0;
+        while (cur != null && depth < 32) {
+            if (cur.id == ancestor_id) { return true; }
+            if (cur.kind != TypeKind::Class) { return false; }
+            const cc: ClassType* = cur as ClassType*;
+            if (cc.has_base && cc.base_class.is_valid()) {
+                cur = this.arena.lookup(cc.base_class.id);
+            } else {
+                return false;
+            }
+            depth += 1;
+        }
+        return false;
     }
 
     resolve_member_access(mut &this, member: MemberAccessNode*) -> TypeRef {
