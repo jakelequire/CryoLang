@@ -122,6 +122,12 @@ public:
     // (E0455) at compile time instead of miscompiling into a use-after-free.
     payload_binding_ids: u32[];
 
+    // Names of the current function's parameters (and `this`).  These are
+    // autoref'd / caller-backed, so `&param` is a re-borrow of caller
+    // storage, NOT a stack-slot escape — `check_return_stack_address` uses
+    // this to flag only `&<body-local>` returns.
+    param_ids: u32[];
+
 
     // ================================================================
     // Construction
@@ -151,6 +157,7 @@ public:
         this.switch_depth   = 0;
         this.expected_type  = TypeRef::invalid();
         this.payload_binding_ids = [];
+        this.param_ids = [];
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -1024,6 +1031,7 @@ public:
         this.this_type       = fn_this_type;
         this.this_is_mut = false;
         this.payload_binding_ids = [];
+        this.param_ids = [];
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
@@ -1051,11 +1059,13 @@ public:
             } else {
                 this.register_local_with_mut(param.name, ty, param.is_mutable);
                 this.record_local_kw_span(param.name, param.kw_span);
+                this.param_ids.push(param.name.id);
             }
         }
 
         if (fn_this_type.is_valid()) {
             this.register_local_with_mut(this.this_sym, fn_this_type, this.this_is_mut);
+            this.param_ids.push(this.this_sym.id);
         }
     }
 
@@ -1988,6 +1998,70 @@ public:
             if (this.return_type.is_valid()) {
                 this.check_return_payload_escape(node.expression, this.return_type);
             }
+            // H5: returning `&local` / `&param` is a dangling pointer — the
+            // stack slot is freed when the function returns.
+            this.check_return_stack_address(node.expression);
+        }
+    }
+
+    /// True when `name` resolves to a function-local binding or parameter
+    /// (registered in `locals` by `enter_function` / `register_local`).
+    /// Globals are resolved through the scope chain and are absent here,
+    /// so `&GLOBAL` is correctly not treated as a stack escape.
+    is_local_or_param(&this, name: SymbolStr) -> boolean {
+        match (this.locals.get(&name.id)) {
+            Option::Some(_) => { return true; }
+            Option::None    => { return false; }
+        }
+    }
+
+    /// True when `name` is one of the current function's parameters (or
+    /// `this`).  Parameters are autoref'd (caller-backed), so `&param`
+    /// re-borrows caller storage rather than escaping a stack slot.
+    is_param(&this, name: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
+            if (this.param_ids[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Reject `return &x` where `x` is a local variable or parameter:
+    /// taking the address of a stack slot and returning it produces a
+    /// dangling pointer (use-after-free at the call site).  Looks through
+    /// `if`/`match` tail positions like the payload-escape check.
+    check_return_stack_address(mut &this, e: ExpressionNode*) -> void {
+        if (e == null) { return; }
+        if (e.kind == NodeKind::IfExpression) {
+            const ie: IfExprNode* = e as IfExprNode*;
+            this.check_return_stack_address(ie.then_expr);
+            this.check_return_stack_address(ie.else_expr);
+            return;
+        }
+        if (e.kind == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                const arm: MatchArmNode* = me.arms[i];
+                if (arm == null) { continue; }
+                this.check_return_stack_address(this.arm_tail_expr(arm.body));
+            }
+            return;
+        }
+        if (e.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            if (u.op.lexeme == "&" && u.operand != null
+                    && u.operand.kind == NodeKind::Identifier) {
+                const id: IdentifierNode* = u.operand as IdentifierNode*;
+                // Only a function-body local is a genuine stack-slot escape.
+                // Parameters and `this` are autoref'd (caller-backed), so
+                // `&param` re-borrows the caller's storage (this is the
+                // `return &this` builder-chaining idiom) and is safe.
+                if (this.is_local_or_param(id.name) && !this.is_param(id.name)) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0455_DANGLING_POINTER,
+                        "cannot return the address of a local variable: it lives on this function's stack frame and is freed when the function returns. Return the value by move, or a heap allocation, instead.",
+                        e.span);
+                }
+            }
         }
     }
 
@@ -2728,6 +2802,7 @@ public:
         this.this_type       = TypeRef::invalid();
         this.this_is_mut     = false;
         this.payload_binding_ids = [];
+        this.param_ids = [];
         this.expected_type   = TypeRef::invalid();
         this.loop_depth      = 0;
         this.switch_depth    = 0;
