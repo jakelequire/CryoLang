@@ -1076,7 +1076,7 @@ type struct ExprOps {
 
     /// Generate IR for a binary expression.  Handles arithmetic,
     /// comparison, logical short-circuit, and assignment operators.
-    codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef) -> LValue {
+    codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1263,6 +1263,28 @@ type struct ExprOps {
             is_signed = ik.is_signed();
         }
 
+        // Right operand's OWN signedness.  When the narrower operand is the
+        // RHS it must be zero-/sign-extended according to its own type, not
+        // the left/result type's: pairing an unsigned narrow RHS (e.g. u16)
+        // with a signed wider LHS (e.g. i32) and sign-extending it silently
+        // corrupts every value with the RHS's top bit set.  Follow the
+        // InstantiatedType chain exactly like `t` above so generic contexts
+        // behave identically to concrete ones.
+        mut rhs_is_signed: boolean = false;
+        mut rt: Type* = this.lookup_type_by_id(rhs_type.id);
+        mut rbd: i32 = 0;
+        while (rt != null && rt.kind == TypeKind::InstantiatedType && rbd < 5) {
+            const rinst: InstantiatedType* = rt as InstantiatedType*;
+            if (rinst.has_resolved_type()) {
+                rt = this.lookup_type_by_id(rinst.resolved_type.id);
+            } else { break; }
+            rbd += 1;
+        }
+        if (rt != null && rt.kind == TypeKind::Int) {
+            const rint: IntType* = rt as IntType*;
+            rhs_is_signed = rint.int_kind.is_signed();
+        }
+
         // Normalize integer operand widths.
         // LLVM requires both operands to binary ops (icmp, add, shl, etc.)
         // to have the same type.  If they differ (e.g., i32 vs i64),
@@ -1287,7 +1309,7 @@ type struct ExprOps {
                     }
                 } else if (rhs_w < lhs_w) {
                     const target: LType = LType { raw: lhs_ty };
-                    if (is_signed) {
+                    if (rhs_is_signed) {
                         rhs = this.builder.build_sext(rhs, target, "widen");
                     } else {
                         rhs = this.builder.build_zext(rhs, target, "widen");
@@ -1361,7 +1383,11 @@ type struct ExprOps {
             }
             TokenType::ExclaimEqual => {
                 out_value = if (is_float) {
-                    this.builder.build_fcmp(LRealPredicate::ONE, lhs, rhs, "netmp")
+                    // UNE (unordered-or-not-equal), not ONE: IEEE requires
+                    // `NaN != NaN` to be true, and `!=` must be the negation
+                    // of `==` (OEQ).  ONE (ordered) wrongly returns false for
+                    // any NaN operand, breaking f32/f64::is_nan.
+                    this.builder.build_fcmp(LRealPredicate::UNE, lhs, rhs, "netmp")
                 } else {
                     this.builder.build_icmp(LIntPredicate::NE, lhs, rhs, "netmp")
                 };

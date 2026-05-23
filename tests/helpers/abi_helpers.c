@@ -71,3 +71,54 @@ TwoFloats abi_make_two_floats(float a, float b) {
 float abi_sum_two_floats(TwoFloats s) {
     return s.a + s.b;
 }
+
+
+// ----- §3.3 SSE eightbyte: floats nested inside member aggregates ----------
+//
+// These exercise the *recursive* SysV eightbyte classification: a float
+// buried inside a nested struct / array still makes its eightbyte SSE
+// class.  A direct-fields-only classifier wrongly demotes them to
+// INTEGER, so Cryo would pass/return them in GP registers while clang
+// (here) uses XMM — and both fields read back garbage.
+
+// 16-byte struct whose first eightbyte is a *nested* struct holding one
+// double, second eightbyte a plain double.  Both eightbytes are SSE.
+typedef struct InnerD { double v; } InnerD;
+typedef struct OuterD { InnerD inner; double y; } OuterD;
+
+OuterD abi_make_outer_d(double a, double b) {
+    OuterD s; s.inner.v = a; s.y = b;
+    return s;
+}
+
+double abi_sum_outer_d(OuterD s) {
+    return s.inner.v + s.y;
+}
+
+// 4-byte struct wrapping a nested single-float struct.  The whole value
+// is one SSE eightbyte (a single `float`) rolling in %xmm0.
+typedef struct InnerF { float v; } InnerF;
+typedef struct WrapF  { InnerF inner; } WrapF;
+
+WrapF abi_make_wrap_f(float a) {
+    WrapF s; s.inner.v = a;
+    return s;
+}
+
+float abi_wrap_f_get(WrapF s) {
+    return s.inner.v;
+}
+
+// 8-byte struct holding a fixed array of two floats.  Both floats share
+// one eightbyte → `<2 x float>` SSE, exercising the array branch of the
+// recursive leaf walk.
+typedef struct ArrF2 { float v[2]; } ArrF2;
+
+ArrF2 abi_make_arr_f2(float a, float b) {
+    ArrF2 s; s.v[0] = a; s.v[1] = b;
+    return s;
+}
+
+float abi_sum_arr_f2(ArrF2 s) {
+    return s.v[0] + s.v[1];
+}

@@ -63,6 +63,36 @@ type struct TwoFloats {
     b: f32;
 }
 
+// 16-byte struct whose first eightbyte is a NESTED struct holding one
+// f64, second eightbyte a plain f64.  Both eightbytes are SSE.  The
+// recursive eightbyte classifier must descend into `inner` to see the
+// float — a direct-fields-only walk classifies eightbyte 0 as INTEGER
+// (its only direct field, `inner`, has kind Struct, not Float) and the
+// value crosses the ABI in %rax instead of %xmm0.
+type struct InnerD {
+    v: f64;
+}
+type struct OuterD {
+    inner: InnerD;
+    y:     f64;
+}
+
+// 4-byte struct wrapping a nested single-f32 struct.  One SSE eightbyte
+// lowering to a scalar `float` (rides %xmm0).
+type struct InnerF {
+    v: f32;
+}
+type struct WrapF {
+    inner: InnerF;
+}
+
+// 8-byte struct holding a fixed array of two f32s.  Both floats share
+// one eightbyte ⇒ `<2 x float>` SSE — exercises the array branch of the
+// recursive leaf walk.
+type struct ArrF2 {
+    v: f32[2];
+}
+
 extern "C" {
     function div(numerator: i32, denominator: i32) -> DivT;
     function lldiv(numerator: i64, denominator: i64) -> LLDivT;
@@ -72,6 +102,12 @@ extern "C" {
     function abi_make_two_doubles(a: f64, b: f64) -> TwoDoubles;
     function abi_make_two_floats(a: f32, b: f32) -> TwoFloats;
     function abi_sum_two_floats(s: TwoFloats) -> f32;
+    function abi_make_outer_d(a: f64, b: f64) -> OuterD;
+    function abi_sum_outer_d(s: OuterD) -> f64;
+    function abi_make_wrap_f(a: f32) -> WrapF;
+    function abi_wrap_f_get(s: WrapF) -> f32;
+    function abi_make_arr_f2(a: f32, b: f32) -> ArrF2;
+    function abi_sum_arr_f2(s: ArrF2) -> f32;
 }
 
 // 17 / 5 = quot=3 rem=2.  If the ABI for this 8-byte by-value
@@ -247,6 +283,66 @@ function helper_sum_two_floats_sse_param() -> Result<(), TestError> {
     const s: TwoFloats = TwoFloats { a: 1.5 as f32, b: 2.5 as f32 };
     const r: f32 = abi_sum_two_floats(s);
     return expect_close_f64(r as f64, 4.0 as f64, 0.0001 as f64);
+}
+
+// Nested-float SSE return: `OuterD` is 16 bytes, both eightbytes SSE,
+// but eightbyte 0's float lives inside the nested `inner` struct.  The
+// recursive classifier must lower the return to `{double, double}`
+// (xmm0:xmm1); the old direct-fields walk produced `{i64, double}` and
+// the first field read back garbage from %rax.
+![test]
+function helper_make_outer_d_nested_double_sse() -> Result<(), TestError> {
+    const r: OuterD = abi_make_outer_d(4.0 as f64, 5.0 as f64);
+    match (expect_close_f64(r.inner.v, 4.0 as f64, 0.0001 as f64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_close_f64(r.y, 5.0 as f64, 0.0001 as f64);
+}
+
+// Nested-float SSE param: passing `OuterD` by value must place both
+// eightbytes in XMM registers; the C side sums `inner.v + y`.
+![test]
+function helper_sum_outer_d_nested_double_param() -> Result<(), TestError> {
+    const s: OuterD = OuterD { inner: InnerD { v: 6.5 as f64 }, y: 3.5 as f64 };
+    const r: f64 = abi_sum_outer_d(s);
+    return expect_close_f64(r, 10.0 as f64, 0.0001 as f64);
+}
+
+// Nested single-f32 return: `WrapF` (4 bytes) is one SSE eightbyte
+// lowering to a scalar `float`.  The nested `inner.v` must be seen
+// through the wrapper struct; otherwise the value rides %eax not %xmm0.
+![test]
+function helper_make_wrap_f_nested_float_sse() -> Result<(), TestError> {
+    const r: WrapF = abi_make_wrap_f(3.25 as f32);
+    return expect_close_f64(r.inner.v as f64, 3.25 as f64, 0.0001 as f64);
+}
+
+![test]
+function helper_wrap_f_nested_float_param() -> Result<(), TestError> {
+    const s: WrapF = WrapF { inner: InnerF { v: 7.75 as f32 } };
+    const r: f32 = abi_wrap_f_get(s);
+    return expect_close_f64(r as f64, 7.75 as f64, 0.0001 as f64);
+}
+
+// Fixed float-array struct: `ArrF2` (8 bytes) packs two f32s into one
+// SSE eightbyte (`<2 x float>`).  Exercises the array branch of the
+// recursive leaf walk on both the return and param paths.
+![test]
+function helper_make_arr_f2_sse() -> Result<(), TestError> {
+    const r: ArrF2 = abi_make_arr_f2(1.25 as f32, 2.75 as f32);
+    match (expect_close_f64(r.v[0] as f64, 1.25 as f64, 0.0001 as f64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_close_f64(r.v[1] as f64, 2.75 as f64, 0.0001 as f64);
+}
+
+![test]
+function helper_sum_arr_f2_sse_param() -> Result<(), TestError> {
+    const s: ArrF2 = ArrF2 { v: [3.5 as f32, 1.5 as f32] };
+    const r: f32 = abi_sum_arr_f2(s);
+    return expect_close_f64(r as f64, 5.0 as f64, 0.0001 as f64);
 }
 
 ![test]

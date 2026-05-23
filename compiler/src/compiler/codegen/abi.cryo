@@ -122,6 +122,18 @@ type struct SignaturePlan {
 // AbiClassifier
 // ============================================================================
 //
+/// A flattened scalar leaf of an aggregate, produced by
+/// `AbiClassifier::collect_abi_leaves` and consumed by
+/// `eightbyte_slot_type`.  `offset` is the leaf's absolute byte offset
+/// inside the top-level aggregate; `is_float`/`is_f32` carry its SysV
+/// class so a bucket whose every leaf is a float is classified SSE even
+/// when those floats live inside nested structs / arrays.
+type struct AbiLeaf {
+    offset:   u64;
+    is_float: boolean;
+    is_f32:   boolean;
+}
+
 // Per-codegen-context object that owns the ABI seam.  Constructed once
 // in `CodegenContext::new` (via `AbiClassifier::null()`) and wired in
 // `CodegenContext::wire()` with a back-pointer to the per-context
@@ -432,8 +444,9 @@ type struct AbiClassifier {
     ///
     /// The bucket is the half-open byte interval `[bucket_start,
     /// bucket_end)` of the aggregate (typically `[0..8)` or
-    /// `[8..16)`).  Walks the struct/class fields whose offsets fall
-    /// in the interval and applies SysV's classification rules:
+    /// `[8..16)`).  Recursively flattens the aggregate's scalar leaf
+    /// fields (descending into nested structs / fixed arrays) whose
+    /// offsets fall in the interval and applies SysV's rules:
     ///   - All fields are floats AND the bucket has exactly one field
     ///     that fully fills the bucket-relevant bytes ⇒ SSE class.
     ///     Slot type is `double` (for f64) or `float` (for f32).
@@ -448,79 +461,147 @@ type struct AbiClassifier {
     /// F32 in a half-occupied 8-byte bucket, or F32+F64) falls back to
     /// INTEGER.
     eightbyte_slot_type(mut &this, ty: Type*, bucket_start: u64, bucket_end: u64) -> LType {
-        const tm: TypeMapper* = this.type_mapper;
-        const arena: TypeArena* = tm.arena;
         const bucket_size: u64 = bucket_end - bucket_start;
 
-        // Field access depends on the kind: StructType, ClassType.
-        // Other kinds (Enum, primitives, etc.) don't expose a uniform
-        // field list — fall back to INTEGER.
-        mut fields: FieldInfo[] = [];
-        match (ty.kind) {
-            TypeKind::Struct => {
-                const st: StructType* = ty as StructType*;
-                fields = st.fields;
-            }
-            TypeKind::Class => {
-                const ct: ClassType* = ty as ClassType*;
-                fields = ct.fields;
-            }
-            _ => {
-                return eightbyte_integer_type(bucket_size);
-            }
-        }
+        // Recursively flatten the aggregate into its scalar leaf fields so
+        // a float nested inside a member struct / fixed array still
+        // contributes SSE class to its eightbyte.  SysV classifies
+        // eightbytes recursively; a direct-fields-only walk wrongly
+        // demoted `struct { struct { f64 } inner; f64 y; }` (and similar)
+        // to INTEGER class, so the value crossed the C ABI in GP registers
+        // while clang/gcc used XMM — silently corrupting extern-C interop.
+        const leaves: AbiLeaf[] = this.collect_abi_leaves(ty, 0, 0);
 
-        mut last_in_bucket_idx: i64 = -1;
-        mut field_count_in_bucket: i64 = 0;
+        mut count: i64 = 0;
         mut all_floats: boolean = true;
         mut all_f32: boolean = true;
+        mut single_is_f32: boolean = false;
 
-        for (mut i: i64 = 0; i < fields.length; i++) {
-            const f_off: u64 = fields[i].offset;
-            // Field belongs to this bucket iff its starting offset
-            // falls inside `[bucket_start, bucket_end)`.  Spans that
-            // cross the boundary (offset < bucket_end <= offset+size)
-            // are rare for natural layouts and would force INTEGER
-            // class on both halves under SysV's merging rule.  Treat
-            // them as INTEGER by leaving `all_floats=false` and the
-            // field count > 1.
-            if (f_off >= bucket_start && f_off < bucket_end) {
-                last_in_bucket_idx = i;
-                field_count_in_bucket += 1;
-                const ft: Type* = arena.lookup(fields[i].field_type.id);
-                if (ft == null || ft.kind != TypeKind::Float) {
+        for (mut i: i64 = 0; i < leaves.length; i++) {
+            const off: u64 = leaves[i].offset;
+            // A leaf belongs to this bucket iff its offset falls inside
+            // `[bucket_start, bucket_end)`.  (Leaves that straddle the
+            // boundary don't arise for natural layouts; scalar leaves are
+            // ≤ 8 bytes and naturally aligned.)
+            if (off >= bucket_start && off < bucket_end) {
+                count += 1;
+                if (!leaves[i].is_float) {
                     all_floats = false;
                     all_f32 = false;
                 } else {
-                    const flt: FloatType* = ft as FloatType*;
-                    if (flt.float_kind != FloatKind::F32) {
-                        all_f32 = false;
-                    }
+                    single_is_f32 = leaves[i].is_f32;
+                    if (!leaves[i].is_f32) { all_f32 = false; }
                 }
             }
         }
 
-        if (field_count_in_bucket == 1 && all_floats) {
-            const f_idx: i64 = last_in_bucket_idx;
-            const ft: Type* = arena.lookup(fields[f_idx].field_type.id);
-            if (ft != null && ft.kind == TypeKind::Float) {
-                const flt: FloatType* = ft as FloatType*;
-                if (flt.float_kind == FloatKind::F64) { return LType::f64(); }
-                return LType::f32();
-            }
+        // Single float-class leaf fully owning the bucket ⇒ SSE.
+        if (count == 1 && all_floats) {
+            if (single_is_f32) { return LType::f32(); }
+            return LType::f64();
         }
 
-        // Multi-float SSE: two F32s packing into one eightbyte slot
-        // lower to `<2 x float>`.  Only fires for a full eightbyte
-        // (bucket_size == 8) holding exactly two F32 fields — that's
-        // the only shape the SysV rules promote to SSEUP-style packing
-        // (any other count/size combo would either fit a single-field
-        // branch or trip the alignment rules into INTEGER).
-        if (field_count_in_bucket == 2 && all_f32 && bucket_size == 8) {
+        // Two F32 leaves packing one full eightbyte ⇒ `<2 x float>`, the
+        // SSE-vector shape clang emits for `struct { float a, b; }`.
+        if (count == 2 && all_f32 && bucket_size == 8) {
             return LType::vector_of(LType::f32(), 2);
         }
 
+        // Mixed / integer / empty bucket ⇒ INTEGER class.
         return eightbyte_integer_type(bucket_size);
+    }
+
+    /// Recursively flatten an aggregate into its scalar leaf fields,
+    /// recording each leaf's absolute byte offset (relative to the
+    /// top-level aggregate) and whether it is a float (SSE class).
+    /// Nested structs, classes, and fixed-size arrays are expanded so a
+    /// float buried inside a nested aggregate still contributes SSE class
+    /// to its eightbyte — matching how clang/gcc classify SysV
+    /// eightbytes.  Everything else (ints, pointers, enums, tuples,
+    /// optionals, dynamic-array fat pointers) becomes a single
+    /// INTEGER-class leaf.  `depth` guards against pathological /
+    /// recursive value types (which the front end can currently accept).
+    collect_abi_leaves(mut &this, ty: Type*, base: u64, depth: i32) -> AbiLeaf[] {
+        mut out: AbiLeaf[] = [];
+        if (ty == null || depth > 16) { return out; }
+        const arena: TypeArena* = this.type_mapper.arena;
+
+        // Resolve aliases / instantiated wrappers to the concrete kind so
+        // a nested `type alias` or generic field is classified by what it
+        // actually is.
+        mut c: Type* = ty;
+        mut guard: i32 = 0;
+        while (c != null && guard < 8) {
+            if (c.kind == TypeKind::TypeAlias) {
+                const al: TypeAliasType* = c as TypeAliasType*;
+                if (al.has_target()) {
+                    const tg: Type* = arena.lookup(al.target.id);
+                    if (tg != null) { c = tg; guard += 1; continue; }
+                }
+                break;
+            }
+            if (c.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = c as InstantiatedType*;
+                if (inst.has_resolved_type()) {
+                    const rs: Type* = arena.lookup(inst.resolved_type.id);
+                    if (rs != null) { c = rs; guard += 1; continue; }
+                }
+                break;
+            }
+            break;
+        }
+        if (c == null) { return out; }
+
+        match (c.kind) {
+            TypeKind::Float => {
+                const flt: FloatType* = c as FloatType*;
+                out.push(AbiLeaf {
+                    offset:   base,
+                    is_float: true,
+                    is_f32:   flt.float_kind == FloatKind::F32,
+                });
+            }
+            TypeKind::Struct => {
+                const st: StructType* = c as StructType*;
+                for (mut i: i64 = 0; i < st.fields.length; i++) {
+                    const ft: Type* = arena.lookup(st.fields[i].field_type.id);
+                    const sub: AbiLeaf[] = this.collect_abi_leaves(
+                        ft, base + st.fields[i].offset, depth + 1);
+                    for (mut j: i64 = 0; j < sub.length; j++) { out.push(sub[j]); }
+                }
+            }
+            TypeKind::Class => {
+                const ct: ClassType* = c as ClassType*;
+                for (mut i: i64 = 0; i < ct.fields.length; i++) {
+                    const ft: Type* = arena.lookup(ct.fields[i].field_type.id);
+                    const sub: AbiLeaf[] = this.collect_abi_leaves(
+                        ft, base + ct.fields[i].offset, depth + 1);
+                    for (mut j: i64 = 0; j < sub.length; j++) { out.push(sub[j]); }
+                }
+            }
+            TypeKind::Array => {
+                const at: ArrayType* = c as ArrayType*;
+                const elem: Type* = arena.lookup(at.element.id);
+                mut stride: u64 = 0;
+                if (elem != null) { stride = elem.size_bytes(); }
+                if (at.is_fixed() && elem != null && stride > 0) {
+                    for (mut k: i64 = 0; k < at.size; k++) {
+                        const sub: AbiLeaf[] = this.collect_abi_leaves(
+                            elem, base + (k as u64) * stride, depth + 1);
+                        for (mut j: i64 = 0; j < sub.length; j++) { out.push(sub[j]); }
+                    }
+                } else {
+                    // Dynamic array (fat pointer) or unsized element ⇒ INTEGER.
+                    out.push(AbiLeaf { offset: base, is_float: false, is_f32: false });
+                }
+            }
+            _ => {
+                // Int, Bool, Char, Pointer, Enum, Tuple, Optional, etc.:
+                // a single INTEGER-class leaf at this offset.
+                out.push(AbiLeaf { offset: base, is_float: false, is_f32: false });
+            }
+        }
+        return out;
     }
 
     /// Phase 3 — Direct-with-coercion: small (≤ 8 byte) aggregate
