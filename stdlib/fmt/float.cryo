@@ -134,20 +134,31 @@ function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
 /// `value >= 0` and is within LARGE/SMALL thresholds; caller has
 /// routed NaN/Inf/zero/scientific cases already.
 function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
-    const integer_part: u64 = value as u64;
+    mut integer_part: u64 = value as u64;
+
+    if (decimals == 0) {
+        return integer_part.to_decimal_buf(buffer);
+    }
+
+    // Round the fractional part half-up at the requested precision rather
+    // than truncating.  Truncation prints a representable value as a
+    // *different* one (e.g. 3.14159 -> "3.141589", off by one in the last
+    // digit).  When rounding rolls the fraction over to 1.0 (e.g.
+    // 0.9999996 at 6 dp), carry into the integer part so the two halves
+    // stay consistent.  The fixed-point path only runs for
+    // |v| < 1e16, so the carry adds at most one integer digit and the
+    // 32-byte caller buffer never overflows.
+    const scale: f64 = pow_of_ten(decimals);
+    const scale_u: u64 = scale as u64;
+    mut frac_scaled: u64 = ((value - (integer_part as f64)) * scale + 0.5) as u64;
+    if (frac_scaled >= scale_u) {
+        frac_scaled = frac_scaled - scale_u;
+        integer_part = integer_part + 1;
+    }
+
     mut cursor: u64 = integer_part.to_decimal_buf(buffer);
-
-    if (decimals == 0) { return cursor; }
-
     buffer[cursor] = 0x2E; // '.'
     cursor = cursor + 1;
-
-    const scale: f64 = pow_of_ten(decimals);
-    // Truncate the fractional part at the requested precision.
-    // Round-toward-zero matches `value as u64` on the integer side
-    // for consistency; a half-up bias here would make the integer
-    // and fraction halves use different rounding modes.
-    const frac_scaled: u64 = ((value - (integer_part as f64)) * scale) as u64;
     cursor = cursor + frac_scaled.to_decimal_padded_buf(buffer + cursor, decimals);
     return cursor;
 }
