@@ -246,15 +246,21 @@ apply(inc, 41);                                   // 42 (named-as-value)
 apply((n: int) -> int { return n * 2; }, 21);     // 42 (inline)
 ```
 
-A combinator that must infer a *new* type parameter from the callback's return
-type — for example `Option::map<U>` — currently needs that type argument
-written out, because inferring a generic from a function argument's return type
-is not yet supported (this applies equally to named functions):
+A combinator that infers a *new* type parameter from the callback's return
+type — for example `Option::map<U>` — does so automatically: `U` is bound from
+the callback's signature, so the type argument may be omitted. This works the
+same whether the callback is a lambda or a named function:
 
 ```cryo
 const some: Option<int> = Option::Some(5);
-const out:  Option<int> = some.map<int>((n: int) -> int { return n * 10; });
+const out:  Option<int> = some.map((n: int) -> int { return n * 10; });  // U = int, inferred
+
+function tentimes(n: int) -> int { return n * 10; }
+const out2: Option<int> = some.map(tentimes);                            // U = int, inferred
 ```
+
+The explicit form is still accepted (`some.map<int>(...)`) and is required only
+when the type parameter appears *nowhere* the call can infer it from.
 
 ### 2.6 Tuple Types
 

@@ -4,11 +4,14 @@
 ///! `(T, ...) -> R` type. They can be bound to a local, called directly, and
 ///! passed as a function-pointer argument.
 ///!
-///! Note on generic higher-order methods: inferring a method's own type
-///! parameter from a function argument's return type is a separate, pre-
-///! existing limitation (it affects named functions identically), so generic
-///! combinators like `Option::map<U>` need the type argument written out —
-///! `opt.map<i32>(lambda)`. See `lambda_with_explicit_generic_map` below.
+///! Generic higher-order inference: a generic type parameter that appears
+///! ONLY in the return position of a function-typed argument (`(T) -> U`) is
+///! inferred from the callback, so generic combinators like `Option::map<U>`
+///! work without an explicit type argument — `opt.map(lambda)` and
+///! `opt.map(named_fn)` both infer `U`. Named functions and lambdas behave
+///! identically here (it was never a lambda-only limitation). The explicit
+///! form still works (`opt.map<i32>(lambda)`); see
+///! `lambda_with_explicit_generic_map` below.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::Lambdas;
@@ -28,6 +31,22 @@ function apply2(f: (i32, i32) -> i32, a: i32, b: i32) -> i32 {
 
 function twice(f: (i32) -> i32, x: i32) -> i32 {
     return f(f(x));
+}
+
+// Named functions usable as function-typed arguments below.
+function tentimes(n: i32) -> i32 { return n * 10; }
+function add2(a: i32, b: i32) -> i32 { return a + b; }
+
+// Free generic combinators whose own type parameter `U` appears ONLY in the
+// return position of the function-typed argument — the case that previously
+// required an explicit `<U>`.  `U` is now inferred from the callback's return
+// type for both named-function and lambda arguments.
+function applymap<U>(f: (i32) -> U, x: i32) -> U {
+    return f(x);
+}
+
+function combine<U>(f: (i32, i32) -> U, a: i32, b: i32) -> U {
+    return f(a, b);
 }
 
 ![test]
@@ -72,4 +91,42 @@ function lambda_with_explicit_generic_map() -> Result<(), TestError> {
     const some: Option<i32> = Option::Some(5);
     const mapped: Option<i32> = some.map<i32>((n: i32) -> i32 { return n * 10; });
     return expect_eq(mapped.unwrap_or(0), 50);
+}
+
+// --- Generic inference from a function-typed argument (no explicit `<U>`) ---
+
+// Method combinator `Option::map<U>` with `U` inferred from a NAMED function.
+![test]
+function map_infers_generic_from_named_fn() -> Result<(), TestError> {
+    const some: Option<i32> = Option::Some(5);
+    const mapped: Option<i32> = some.map(tentimes);
+    return expect_eq(mapped.unwrap_or(0), 50);
+}
+
+// Same method combinator with `U` inferred from a LAMBDA (no explicit `<U>`).
+![test]
+function map_infers_generic_from_lambda() -> Result<(), TestError> {
+    const some: Option<i32> = Option::Some(5);
+    const mapped: Option<i32> = some.map((n: i32) -> i32 { return n * 10; });
+    return expect_eq(mapped.unwrap_or(0), 50);
+}
+
+// Free-function combinator: `U` inferred from a named-function argument.
+![test]
+function free_fn_infers_generic_from_named_fn() -> Result<(), TestError> {
+    return expect_eq(applymap(tentimes, 5), 50);
+}
+
+// Free-function combinator: `U` inferred from a lambda argument.
+![test]
+function free_fn_infers_generic_from_lambda() -> Result<(), TestError> {
+    return expect_eq(applymap((n: i32) -> i32 { return n + 1; }, 41), 42);
+}
+
+// Multi-parameter function-typed argument: arity-2 callback, `U` inferred.
+![test]
+function infer_generic_from_multi_param_fn_arg() -> Result<(), TestError> {
+    const from_named: i32 = combine(add2, 20, 22);
+    const from_lambda: i32 = combine((p: i32, q: i32) -> i32 { return p * q; }, 6, 7);
+    return expect_eq(from_named + from_lambda, 84);
 }
