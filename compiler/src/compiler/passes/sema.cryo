@@ -2645,6 +2645,7 @@ public:
                 this.arena.get_void()
             }
             NodeKind::TryExpression     => { this.resolve_try_expr(expr as TryExprNode*) }
+            NodeKind::LambdaExpression  => { this.resolve_lambda(expr as LambdaExprNode*) }
             _ => { TypeRef::invalid() }
         };
 
@@ -2652,6 +2653,116 @@ public:
             expr.set_resolved_type(result);
         }
         return result;
+    }
+
+    /// Type-check a lambda expression and give it a function-pointer type.
+    ///
+    /// A lambda is a self-contained, NON-capturing function: its body is
+    /// type-checked in a fresh per-function scope holding only the lambda's
+    /// own parameters, so it can reference globals and other functions but not
+    /// the enclosing function's locals. (A reference to an outer local
+    /// surfaces as an ordinary "not found" error rather than miscompiling into
+    /// a broken capture — closures with environments are not implemented.)
+    ///
+    /// Without this pass, lambda bodies were never type-checked: body
+    /// expressions had no `resolved_type`, so codegen produced a function with
+    /// no `ret` (an `unreachable`), and calling it crashed at runtime.
+    resolve_lambda(mut &this, node: LambdaExprNode*) -> TypeRef {
+        mut res_ctx: ResolutionContext = ResolutionContext::new(
+            this.ctx.source_file, "");
+
+        // Resolve parameter types from their annotations.
+        mut param_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null) { continue; }
+            mut pty: TypeRef = p.resolved_type;
+            if (!pty.is_valid() && p.type_annotation != null
+                    && this.ctx.type_resolver != null) {
+                pty = this.ctx.type_resolver.resolve(p.type_annotation, &res_ctx);
+                if (pty.is_valid()) { p.resolved_type = pty; }
+            }
+            if (!pty.is_valid()) { pty = this.arena.get_void(); }
+            param_types.push(pty);
+        }
+
+        // Resolve the return type (explicit `-> T`; defaults to unit/void).
+        mut ret_ty: TypeRef = node.return_type;
+        if (!ret_ty.is_valid()) {
+            if (node.return_type_ann != null && this.ctx.type_resolver != null) {
+                ret_ty = this.ctx.type_resolver.resolve(node.return_type_ann, &res_ctx);
+            }
+            if (!ret_ty.is_valid()) { ret_ty = this.arena.get_void(); }
+            node.set_return_type(ret_ty);
+        }
+
+        // Save the enclosing function's per-function state, then install a
+        // fresh context for the lambda body. Cryo does not drop on field
+        // reassignment (mirrors enter_function's `this.locals = HashMap::new()`),
+        // so aliasing the saved maps and restoring them later is sound.
+        const saved_locals:    HashMap<u32, TypeRef>    = this.locals;
+        const saved_muts:      HashMap<u32, boolean>    = this.local_muts;
+        const saved_kw:        HashMap<u32, SourceSpan> = this.local_kw_spans;
+        const saved_undo_keys: u32[]                    = this.undo_keys;
+        const saved_undo_prev: TypeRef[]                = this.undo_prev;
+        const saved_undo_muts: boolean[]                = this.undo_muts;
+        const saved_undo_kw:   SourceSpan[]             = this.undo_kw_spans;
+        const saved_ret:       TypeRef                  = this.return_type;
+        const saved_ret_ann:   TypeAnnotation*          = this.return_type_ann;
+        const saved_this:      TypeRef                  = this.this_type;
+        const saved_this_mut:  boolean                  = this.this_is_mut;
+        const saved_payload:   u32[]                    = this.payload_binding_ids;
+        const saved_expected:  TypeRef                  = this.expected_type;
+        const saved_loop:      i32                      = this.loop_depth;
+        const saved_switch:    i32                      = this.switch_depth;
+
+        this.locals         = HashMap<u32, TypeRef>::new();
+        this.local_muts     = HashMap<u32, boolean>::new();
+        this.local_kw_spans = HashMap<u32, SourceSpan>::new();
+        this.undo_keys      = [];
+        this.undo_prev      = [];
+        this.undo_muts      = [];
+        this.undo_kw_spans  = [];
+        this.return_type     = ret_ty;
+        this.return_type_ann = node.return_type_ann;
+        this.this_type       = TypeRef::invalid();
+        this.this_is_mut     = false;
+        this.payload_binding_ids = [];
+        this.expected_type   = TypeRef::invalid();
+        this.loop_depth      = 0;
+        this.switch_depth    = 0;
+
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            const p: VarDeclNode* = node.parameters[pi];
+            if (p == null) { continue; }
+            this.register_local_with_mut(p.name, p.resolved_type, p.is_mutable);
+        }
+
+        // Type-check the body (resolves body expressions, checks returns
+        // against the lambda's declared return type).
+        if (node.body != null) {
+            node.body.accept(this);
+        }
+
+        // Restore the enclosing function's state.
+        this.locals         = saved_locals;
+        this.local_muts     = saved_muts;
+        this.local_kw_spans = saved_kw;
+        this.undo_keys      = saved_undo_keys;
+        this.undo_prev      = saved_undo_prev;
+        this.undo_muts      = saved_undo_muts;
+        this.undo_kw_spans  = saved_undo_kw;
+        this.return_type     = saved_ret;
+        this.return_type_ann = saved_ret_ann;
+        this.this_type       = saved_this;
+        this.this_is_mut     = saved_this_mut;
+        this.payload_binding_ids = saved_payload;
+        this.expected_type   = saved_expected;
+        this.loop_depth      = saved_loop;
+        this.switch_depth    = saved_switch;
+
+        // The lambda's value type is its function-pointer signature.
+        return this.arena.get_function(ret_ty, param_types, false);
     }
 
 

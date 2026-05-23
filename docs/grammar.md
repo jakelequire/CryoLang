@@ -205,7 +205,12 @@ Primary            ::= Literal
                      | "typeof"  "(" Expr ")"
                      | IfExpr
                      | Match
+                     | Lambda
                      | "(" Expr ")"
+
+Lambda             ::= "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Type
+                       (Block | Expr)            (* non-capturing function literal *)
+LambdaParam        ::= Ident (":" Type)?
 
 StructLit          ::= Ident GenericArgs?
                        "{" Ident ":" Expr ("," Ident ":" Expr)* ","? "}"
@@ -258,6 +263,7 @@ Type               ::= BaseType "*"+                       (* pointer *)
                      | "[" Type ("," Type)* "]"            (* tuple *)
                      | "(" (Type ("," Type)*)? ")" "->" Type  (* fn *)
                      | "()"                                (* unit *)
+                     | Type "?"                            (* optional: T? desugars to Option<T> *)
                      | BaseType
 BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"
