@@ -2893,7 +2893,19 @@ public:
                 return this.expected_type;
             }
         }
-        return this.arena.get_i32();
+        // No integer expected-type hint: default to i32 when the magnitude
+        // fits, otherwise widen to the narrowest type that holds it.  A
+        // bare literal larger than i32 — e.g. an i64::MIN magnitude reaching
+        // a variadic `printf` with no param type to adopt — would otherwise
+        // silently truncate to its low 32 bits.  i32 stays the default for
+        // in-range literals so ordinary code is unaffected.
+        if (!int_literal_exceeds(lit.value, SEMA_I32_MAX_MAG)) {
+            return this.arena.get_i32();
+        }
+        if (!int_literal_exceeds(lit.value, SEMA_I64_MAX_MAG)) {
+            return this.arena.get_i64();
+        }
+        return this.arena.get_u64();
     }
 
     /// Resolve the type of a float literal.
@@ -3584,6 +3596,16 @@ public:
                     // Only call/scope kinds; Literal, Identifier, etc., have
                     // their own types and would only get confused (e.g. i32
                     // literal widening to i64 under a u64 param slot).
+                    push_expected = true;
+                } else if (is_negative_numeric_literal_expr(arg)) {
+                    // A negative numeric literal (`-9223372036854775808`)
+                    // wraps its magnitude in a UnaryExpression.  Without the
+                    // param type, the magnitude defaults to i32 and a wide
+                    // bit pattern (i64::MIN) truncates to its low 32 bits = 0
+                    // before codegen sees it.  Push the param type so the
+                    // magnitude adopts the slot's width.  (Bare positive
+                    // literals are still left to their own form to avoid
+                    // surprise i32 -> i64 widening under wider param slots.)
                     push_expected = true;
                 }
             }
@@ -7461,8 +7483,8 @@ function sema_const_int_index(expr: ExpressionNode*) -> i64 {
 /// True when `expr` is a bare integer or float literal node; used by
 /// resolve_binary to decide whether to push the other operand's type as
 /// expected_type.  Negative literals (`-5`) parse as UnaryExpression
-/// wrapping the literal and aren't matched here; that's a separate
-/// promotion case to handle if it surfaces.
+/// wrapping the literal and aren't matched here; see
+/// `is_negative_numeric_literal_expr` for that case.
 function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
     if (expr == null) { return false; }
     const node: ASTNode* = expr as ASTNode*;
@@ -7472,9 +7494,33 @@ function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
         || lit.literal_kind == LiteralKind::Float;
 }
 
+/// True when `expr` is a negated numeric literal: a UnaryExpression with a
+/// `-` operator wrapping an integer/float literal (`-9223372036854775808`).
+/// These need the surrounding expected type pushed onto the inner
+/// magnitude literal — otherwise the magnitude defaults to i32 and a wide
+/// bit pattern (i64::MIN's 2^63 magnitude) truncates to its low 32 bits,
+/// which negate to 0.  The magnitude itself is checked, not the unary
+/// node, so callers can decide whether to forward their expected type.
+function is_negative_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::UnaryExpression) { return false; }
+    const u: UnaryExprNode* = expr as UnaryExprNode*;
+    if (u.op.lexeme != "-") { return false; }
+    return is_numeric_literal_expr(u.operand);
+}
+
 /// u64 max (2^64-1). Hoisted into a typed const so it adopts u64 rather
 /// than wrapping negative when used inline (see integer_literals.cryo).
 const SEMA_U64_MAX: u64 = 18446744073709551615;
+
+/// i32 / i64 positive maxima, hoisted into typed consts for the same
+/// reason as SEMA_U64_MAX: an inline `9223372036854775807` compared
+/// against a u64 param truncates under the bootstrap.  Used by
+/// `resolve_integer_literal` to pick a default width that holds the
+/// literal's magnitude when no expected type is in scope.
+const SEMA_I32_MAX_MAG: u64 = 2147483647;
+const SEMA_I64_MAX_MAG: u64 = 9223372036854775807;
 
 /// True when `expr` is an integer literal whose value denotes zero in any
 /// radix, ignoring digit separators: `0`, `0x0`, `0b0`, `00`, `0_0`, ...
