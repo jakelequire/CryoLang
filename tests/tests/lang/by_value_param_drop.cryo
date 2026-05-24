@@ -1,0 +1,93 @@
+///! By-value owning parameters are dropped at function exit.
+///!
+///! A non-Copy value passed BY VALUE is moved into the callee, which then
+///! owns it and must drop it when the function returns — unless it is moved
+///! out again (returned, stored in a returned aggregate, or explicitly
+///! dropped). Each `Probe::drop()` bumps a module counter (same harness as
+///! drop_glue.cryo); tests assert the exact count, so a missed drop (leak)
+///! or an extra drop (double free) both fail.
+///!
+///! The `this` receiver is deliberately NOT in scope here: a by-value `this`
+///! is dropped by the caller, not the callee (covered elsewhere).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ByValueParamDrop;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Probe { tag: i32; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+type struct Holder { p: Probe; }
+
+// Consumes the value: reads a field but never moves it out. The callee owns
+// it, so it is dropped exactly once here.
+function take_probe(p: Probe) -> i32 { return p.tag; }
+
+// Moves the param out via the return value: the caller receives ownership
+// and drops it, so the param must NOT be dropped in the callee.
+function passthrough_probe(p: Probe) -> Probe { return p; }
+
+// Stores the param into a returned aggregate: ownership moves into the
+// Holder, dropped once (via field glue) when the Holder goes out of scope.
+function into_holder(p: Probe) -> Holder { return Holder { p: p }; }
+
+// Borrows: the caller keeps ownership and drops it; the callee drops nothing.
+function inspect_probe(p: &Probe) -> i32 { return p.tag; }
+
+![test]
+function by_value_param_dropped_once() -> Result<(), TestError> {
+    reset();
+    const tag: i32 = take_probe(Probe { tag: 7 });
+    const drops: i32 = count();
+    match (expect_eq(tag, 7)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(drops, 1);
+}
+
+![test]
+function returned_param_dropped_once_by_caller() -> Result<(), TestError> {
+    reset();
+    mut got: Probe = passthrough_probe(Probe { tag: 3 });
+    // got owns the value; drop it explicitly and confirm exactly one drop.
+    got.drop();
+    return expect_eq(count(), 1);
+}
+
+![test]
+function param_stored_in_aggregate_dropped_once() -> Result<(), TestError> {
+    reset();
+    {
+        // Holder owns the moved-in Probe; field drop-glue runs once at the
+        // end of this block. Holder has no explicit Drop, so it can't be
+        // `.drop()`-ed directly — scope exit is the drop point.
+        mut h: Holder = into_holder(Probe { tag: 9 });
+    }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function borrowed_param_dropped_once_by_caller() -> Result<(), TestError> {
+    reset();
+    mut local: Probe = Probe { tag: 5 };
+    const tag: i32 = inspect_probe(&local);
+    const before: i32 = count();   // borrow did not drop it
+    local.drop();
+    match (expect_eq(before, 0)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(tag, 5)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count(), 1);
+}
