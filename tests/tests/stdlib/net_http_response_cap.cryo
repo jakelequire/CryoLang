@@ -1,0 +1,65 @@
+///! HTTP response body cap + namespace-qualified-call resolution.
+///!
+///! `Response::parse` must reject an oversized `Content-Length` up front
+///! rather than sizing a buffer to a hostile peer's declared length (remote
+///! DoS).  Mirrors the server-side cap in `request.cryo` (MAX_BODY = 16 MiB).
+///!
+///! This file ALSO regression-guards the resolver fix that lets it exist: it
+///! pulls the generic `Request/Response::parse<R: Read>` into the shared test
+///! binary alongside json.cryo's `parser::parse(src: Str)`.  Before the fix,
+///! the monomorphizer matched `parse` by bare leaf name and bound json's
+///! call to the HTTP static method, failing its `where R: Read` bound
+///! (E0306).  If that regresses, json.cryo stops compiling.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HttpResponseCap;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::array;
+import std::io::error;
+import std::io::traits;
+import std::net::http::response;
+import std::test::error;
+import std::test::assert;
+
+// Serve bytes from a Str so the response parser has something to read.
+type struct ByteReader { data: Str; pos: u64; }
+implement trait Read for struct ByteReader {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        mut n: u64 = 0;
+        while (n < length && this.pos < this.data.length()) {
+            match (this.data.byte_at(this.pos)) {
+                Option::Some(b) => { buffer[n] = b; }
+                Option::None    => { break; }
+            }
+            this.pos = this.pos + 1;
+            n = n + 1;
+        }
+        return Result::Ok(n);
+    }
+}
+
+function parses(head: string) -> boolean {
+    mut r: ByteReader = ByteReader { data: Str::new(head), pos: 0 };
+    match (Response::parse(&r)) {
+        Result::Ok(_)  => { return true; }
+        Result::Err(_) => { return false; }
+    }
+}
+
+![test]
+function oversized_content_length_rejected() -> Result<(), TestError> {
+    // ~93 GB declared length — must be refused before allocating.
+    return expect(
+        !parses("HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\n"),
+        Str::new("oversized Content-Length must be rejected"));
+}
+
+![test]
+function small_body_still_parses() -> Result<(), TestError> {
+    return expect(
+        parses("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"),
+        Str::new("a small, valid body must still parse"));
+}

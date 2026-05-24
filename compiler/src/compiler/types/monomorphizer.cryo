@@ -71,6 +71,20 @@ type struct SpecializationEntry {
 }
 
 
+/// True when `s` ends with `suffix`.  Used by scope-qualified template
+/// lookup to match a candidate's qualified name against the call's scope.
+function mono_str_ends_with(s: string, suffix: string) -> boolean {
+    const sl: i64 = strlen(s) as i64;
+    const fl: i64 = strlen(suffix) as i64;
+    if (fl > sl) { return false; }
+    mut i: i64 = 0;
+    while (i < fl) {
+        if (s[sl - fl + i] != suffix[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 // ============================================================================
 // Monomorphizer: worklist engine
 // ============================================================================
@@ -2453,6 +2467,46 @@ type struct Monomorphizer {
     /// Tries the current consuming module first, then walks the registry's
     /// declarations to find a function template whose unqualified name matches.
     /// Returns null when nothing matches or the match isn't a function template.
+    /// Scope-aware variant of `find_function_template_for_call` for a
+    /// module-qualified call (`scope::name`): finds a free-function template
+    /// whose leaf is `name` AND whose defining module equals `scope_q` (the
+    /// call's resolved scope namespace).  This is what keeps a namespace
+    /// qualifier load-bearing: `parser::parse` must NOT bind to an unrelated
+    /// type's static method `Request::parse<R>` just because both share the
+    /// leaf `parse` (which then fails its `where R: Read` bound, E0306).  A
+    /// type's static method has the type as its module/scope, so it won't
+    /// match a module namespace here.
+    find_scoped_function_template(mut &this, name: SymbolStr,
+                                  scope: SymbolStr) -> TemplateEntry* {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null || !scope.is_valid()) { return null; }
+        // Match by qualified-name suffix against the scope AS WRITTEN, e.g.
+        // `mem::offset` accepts `std::core::mem::offset` (suffix
+        // `::mem::offset`) but a same-leaf static method
+        // `std::net::http::request::Request::parse` does NOT (its suffix is
+        // `::Request::parse`).  This is independent of `resolve_qualified`,
+        // which doesn't reliably expand a module alias to its full path.
+        const scope_str: string = this.intern_table.resolve(scope);
+        const name_str: string  = this.intern_table.resolve(name);
+        const tail: string      = format("%s::%s", scope_str, name_str);
+        const sep_tail: string  = format("::%s", tail);
+        const tail_len: i64     = strlen(tail) as i64;
+        const total: i64 = registry.template_count();
+        for (mut i: i64 = 0; i < total; i++) {
+            const cand: TemplateEntry* = &registry.entries[i];
+            if (cand == null) { continue; }
+            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (!cand.name.equals(name)) { continue; }
+            const qn: string = this.intern_table.resolve(cand.qualified_name);
+            // qn ends with `::scope::name`, or IS exactly `scope::name`.
+            if (mono_str_ends_with(qn, sep_tail)) { return cand; }
+            if (strlen(qn) as i64 == tail_len && mono_str_ends_with(qn, tail)) {
+                return cand;
+            }
+        }
+        return null;
+    }
+
     find_function_template_for_call(mut &this, name: SymbolStr) -> TemplateEntry* {
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
@@ -2584,7 +2638,13 @@ type struct Monomorphizer {
                         this.decl_index.lookup_type(qualified_scope)
                     };
                 if (!scope_as_type.is_valid() && !qscope_as_type.is_valid()) {
-                    entry = this.find_function_template_for_call(callee_name);
+                    // Scope-qualified call to a non-type scope (a module
+                    // alias): only accept a free-function template that
+                    // actually lives in that module.  A bare leaf-name match
+                    // would wrongly bind `parser::parse` to a same-named
+                    // static method on an unrelated type (e.g.
+                    // `Request::parse<R> where R: Read`) and fail its bound.
+                    entry = this.find_scoped_function_template(callee_name, callee_scope);
                 }
                 // Static-method-on-generic-struct case: scope IS a known
                 // type AND it's a generic template (e.g. `Slice<T>`).  The
@@ -4081,6 +4141,15 @@ type struct Monomorphizer {
         const base_t: Type* = this.arena.lookup(entry.base_type.id);
         if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
         const base_et: EnumType* = base_t as EnumType*;
+
+        // Propagate the explicit discriminant base (`type enum E<T> : i64`)
+        // to the specialization so a SIMPLE enum spec lowers its tag at the
+        // declared width.  The base is normally a concrete primitive;
+        // route through `subst` anyway so it stays correct under any binding.
+        if (base_et.discriminant_type.is_valid()) {
+            et.set_discriminant_type(
+                subst.apply(base_et.discriminant_type, this.arena));
+        }
 
         for (mut i: i64 = 0; i < base_et.variants.length; i++) {
             const base_variant: EnumVariantInfo = base_et.variants[i];
