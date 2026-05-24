@@ -1,0 +1,111 @@
+///! core::clone for heap-owning types — String, Array, Box, HashMap.
+///!
+///! A heap-owning `Clone` must allocate independent storage: mutating one
+///! copy must not disturb the other, and — critically — dropping both must
+///! not double-free a shared buffer. Each test mutates the clone and then
+///! drops both copies; a shallow (buffer-aliasing) clone would double-free
+///! the originals' storage at the second drop and crash the test.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::CloneOwnedT;
+
+import std::core::result;
+import std::core::option;
+import std::core::clone;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::collections::hashmap;
+import std::alloc::box;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// String
+// ============================================================================
+
+![test]
+function string_clone_is_independent() -> Result<(), TestError> {
+    mut a: String = String::from_str(Str::new("original heap string"));
+    const orig_len: u64 = a.length();
+    mut b: String = a.clone();
+    const equal_after_clone: boolean = a.as_str().equals(&b.as_str());
+    b.push_str(Str::new("-extended"));   // mutate the clone only
+    const a_unchanged: u64 = a.length(); // independent: still orig_len
+    const b_grown: boolean = b.length() > orig_len;
+    a.drop();
+    b.drop();
+    match (expect_true(equal_after_clone,
+        Str::new("clone should equal the source"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(a_unchanged, orig_len)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(b_grown, Str::new("mutated clone should have grown"));
+}
+
+// ============================================================================
+// Array
+// ============================================================================
+
+![test]
+function array_clone_is_independent() -> Result<(), TestError> {
+    mut a: Array<String> = Array<String>::new();
+    a.push(String::from_str(Str::new("one-heap")));
+    a.push(String::from_str(Str::new("two-heap")));
+    mut b: Array<String> = a.clone();
+    b.push(String::from_str(Str::new("three-heap")));  // mutate the clone only
+    const alen: u64 = a.length();   // independent: still 2
+    const blen: u64 = b.length();   // 3
+    a.drop();                        // shallow clone would alias these buffers
+    b.drop();                        // ...and double-free here
+    const want_a: u64 = 2;
+    const want_b: u64 = 3;
+    match (expect_eq(alen, want_a)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(blen, want_b);
+}
+
+// ============================================================================
+// Box
+// ============================================================================
+
+![test]
+function box_clone_owns_independent_value() -> Result<(), TestError> {
+    mut a: Box<String> = Box::new(String::from_str(Str::new("boxed-heap-value")));
+    mut b: Box<String> = a.clone();
+    const equal: boolean = (*a.ptr).as_str().equals(&(*b.ptr).as_str());
+    const blen: u64 = (*b.ptr).length();
+    a.drop();
+    b.drop();
+    match (expect_true(equal, Str::new("boxed clone should equal source"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const want: u64 = 16;   // "boxed-heap-value"
+    return expect_eq(blen, want);
+}
+
+// ============================================================================
+// HashMap
+// ============================================================================
+
+![test]
+function hashmap_clone_is_independent() -> Result<(), TestError> {
+    mut a: HashMap<String, String> = HashMap<String, String>::new();
+    a.insert(String::from_str(Str::new("k1")), String::from_str(Str::new("v1-heap")));
+    a.insert(String::from_str(Str::new("k2")), String::from_str(Str::new("v2-heap")));
+    mut b: HashMap<String, String> = a.clone();
+    b.insert(String::from_str(Str::new("k3")), String::from_str(Str::new("v3-heap")));
+    const alen: u64 = a.length();   // independent: still 2
+    const blen: u64 = b.length();   // 3
+    a.drop();                        // shallow clone would alias entry buffers
+    b.drop();                        // ...and double-free here
+    const want_a: u64 = 2;
+    const want_b: u64 = 3;
+    match (expect_eq(alen, want_a)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(blen, want_b);
+}

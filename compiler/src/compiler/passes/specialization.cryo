@@ -336,6 +336,33 @@ function register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
     if (node.is_trait_impl()) {
         const trait_name: SymbolStr = extract_root_name(node.trait_annotation);
         if (trait_name.is_valid()) {
+            // Coherence: a second *source-level* impl of the same trait for the
+            // same target type is a conflict (the dispatcher can only pick one,
+            // silently). This runs once per source impl during the single
+            // TemplateRegistration pass, so a prior entry under the same
+            // (trait, target) key with a *distinct* node is a candidate
+            // redefinition. Two guards keep it free of false positives:
+            //   - argument-less traits only: the registry key uses the trait's
+            //     *root* name, which conflates `From<i8>` and `From<i16>`.
+            //   - same source file: the key also uses the target's *simple*
+            //     name, which conflates same-named types in different modules
+            //     (one file = one namespace, so same-file simple-name identity
+            //     is exact). Cross-module orphan conflicts are future work.
+            const prior: ImplBlockNode* =
+                registry.lookup_trait_impl(trait_name, node.target_type);
+            if (prior != null && prior != node
+                    && !trait_ann_has_type_args(node.trait_annotation)
+                    && !trait_ann_has_type_args(prior.trait_annotation)
+                    && prior.span.has_location() && node.span.has_location()
+                    && node.span.file == prior.span.file) {
+                const tname: string = ctx.get_intern_table().resolve(trait_name);
+                const gname: string = ctx.get_intern_table().resolve(node.target_type);
+                ctx.emit_error_at(
+                    ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                    format("conflicting implementations of trait `%s` for type `%s`: a trait may be implemented at most once per type",
+                           tname, gname),
+                    node.span);
+            }
             registry.register_trait_impl(trait_name, node.target_type, node);
         }
     }
@@ -354,6 +381,22 @@ function extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
         TypeAnnotation::Reference(r) => { extract_root_name(r.inner) }
         TypeAnnotation::Pointer(p) => { extract_root_name(p.inner) }
         _ => { SymbolStr::empty() }
+    };
+}
+
+/// True when a trait annotation carries type arguments (e.g. `From<i8>`).
+/// The (trait, target) coherence key is keyed by the trait's *root* name
+/// only, which conflates `From<i8>` and `From<i16>` for the same target —
+/// both legitimate, distinct impls. The E0308 duplicate-impl check is
+/// therefore restricted to argument-less traits, where root-name identity
+/// is exact. Generic-trait coherence (same trait args) is future work.
+function trait_ann_has_type_args(ann: TypeAnnotation*) -> boolean {
+    if (ann == null) { return false; }
+    return match (*ann) {
+        TypeAnnotation::Generic(_) => { true }
+        TypeAnnotation::Reference(r) => { trait_ann_has_type_args(r.inner) }
+        TypeAnnotation::Pointer(p) => { trait_ann_has_type_args(p.inner) }
+        _ => { false }
     };
 }
 
