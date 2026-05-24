@@ -1,0 +1,74 @@
+///! The partial-move double-free guard (E0453) must reject ONLY the unsound
+///! case — moving a non-Copy field out of an owned, drop-glued value. The
+///! safe shapes below must keep compiling AND dropping exactly once:
+///!
+///!  - the "replace" idiom through a borrowed `&this` receiver
+///!    (`mut old = this.f; this.f = new;`), as the stdlib's `set_body` uses;
+///!  - moving a `Copy` field out (bitwise-independent of the source).
+///!
+///! Each `Probe::drop()` bumps a module counter (same harness as
+///! drop_glue.cryo); tests assert the exact drop count — too few means a
+///! leak, too many means the double free we set out to prevent.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::MoveFieldOutOk;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Probe { tag: i32; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+type struct Cell { p: Probe; }
+implement Cell {
+    // Replace idiom: the receiver is borrowed (`mut &this`), so moving the
+    // old field value into a local is the caller's value to manage, not a
+    // glue-dropped place — allowed, and drops the old value exactly once.
+    replace(mut &this, np: Probe) -> Probe {
+        mut old: Probe = this.p;
+        this.p = np;
+        return old;
+    }
+}
+
+type struct Mixed { p: Probe; id: i32; }
+
+// ---- replace idiom through a borrowed receiver ---------------------------
+
+![test]
+function replace_idiom_drops_old_once() -> Result<(), TestError> {
+    reset();
+    {
+        mut c: Cell = Cell { p: Probe { tag: 1 } };
+        mut old: Probe = c.replace(Probe { tag: 2 });
+        old.drop();           // old (tag 1) dropped here, exactly once
+        // c.p (tag 2) dropped by glue at scope exit, exactly once
+    }
+    return expect_eq(count(), 2);
+}
+
+// ---- Copy field move-out is bitwise-independent (no double free) ---------
+
+![test]
+function copy_field_move_out_is_fine() -> Result<(), TestError> {
+    reset();
+    mut kept: i32 = 0;
+    {
+        mut m: Mixed = Mixed { p: Probe { tag: 7 }, id: 42 };
+        kept = m.id;          // Copy field: allowed, no drop, no aliasing
+        // m.p dropped by glue exactly once at scope exit
+    }
+    match (expect_eq(kept, 42)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count(), 1);
+}
