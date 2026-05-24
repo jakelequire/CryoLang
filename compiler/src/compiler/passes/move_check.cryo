@@ -495,6 +495,9 @@ type struct MoveChecker {
     /// autoref'd call arguments; see `moved_real`.
     walk_expr_move(mut &this, expr: ExpressionNode*, real: boolean) -> void {
         if (expr == null) { return; }
+        // A storage-duplicating move of a non-Copy field out of an owned
+        // value is a double free (no partial-move tracking). Reject it.
+        if (real) { this.check_field_move_out(expr); }
         if (expr.kind == NodeKind::Identifier) {
             this.handle_ident(expr as IdentifierNode*, true, real);
             return;
@@ -585,11 +588,16 @@ type struct MoveChecker {
         // reassigned local is Live again. This is what keeps the
         // loop-carried check from flagging the safe reinit-each-iteration
         // pattern (`consume(x); x = make();`).
-        if (b.op.kind == TokenType::Equal && b.left != null
-                && b.left.kind == NodeKind::Identifier) {
-            if (b.right != null) { this.walk_expr_read(b.right); }
-            this.unmark_moved((b.left as IdentifierNode*).name);
-            return;
+        if (b.op.kind == TokenType::Equal) {
+            // The RHS is a storage-duplicating move into the LHS place,
+            // regardless of whether the LHS is a bare binding or a field /
+            // index target — so a field-move-out on the RHS double-frees.
+            if (b.right != null) { this.check_field_move_out(b.right); }
+            if (b.left != null && b.left.kind == NodeKind::Identifier) {
+                if (b.right != null) { this.walk_expr_read(b.right); }
+                this.unmark_moved((b.left as IdentifierNode*).name);
+                return;
+            }
         }
         if (b.left != null)  { this.walk_expr_read(b.left); }
         if (b.right != null) { this.walk_expr_read(b.right); }
@@ -671,6 +679,93 @@ type struct MoveChecker {
             this.walk_expr_read(n.arguments[i]);
         }
         return;
+    }
+
+    /// True when `ty` is a pointer or reference: an address-sized handle
+    /// that does not own its referent.  A field projected through such a
+    /// handle reads heap or borrowed storage that is NOT drop-glued at
+    /// THIS scope's exit, so moving it out cannot double-free here.
+    is_ptr_or_ref(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || this.arena == null) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        return t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference;
+    }
+
+    /// True when `obj` names an owned, by-value place rooted in a local
+    /// binding or parameter: a bare identifier of value type, or a field
+    /// projection in which EVERY link is value-typed (no pointer/reference
+    /// deref anywhere in the chain).  Such a place is drop-glued at scope
+    /// exit, so moving a non-Copy field out of it double-frees.  A chain
+    /// that passes through a pointer or reference — `node.value` with
+    /// `node: HashNode*`, or `this.x` behind `&this` — points at heap or
+    /// borrowed storage whose drop is managed elsewhere, not synthesized
+    /// here, and is left alone (no false-positive rejection).
+    is_owned_value_place(&this, obj: ExpressionNode*) -> boolean {
+        if (obj == null) { return false; }
+        if (obj.kind == NodeKind::Identifier) {
+            // Key off the binding's DECLARED type, not the node's
+            // resolved type: inside a `&this` / `mut &this` method the
+            // `this` identifier (and any `&T` parameter) is auto-deref'd
+            // to its value type at the use site, but the binding itself is
+            // a Reference — a borrow we don't drop here.  A binding absent
+            // from the local map (global, function name) isn't a
+            // scope-glued local either.
+            const decl_ty: TypeRef = this.lookup_type((obj as IdentifierNode*).name);
+            if (!decl_ty.is_valid()) { return false; }
+            if (this.is_ptr_or_ref(decl_ty)) { return false; }
+            return true;
+        }
+        if (obj.kind == NodeKind::MemberAccess) {
+            // An intermediate field that is itself a pointer/reference
+            // derefs into heap or borrowed storage managed elsewhere.
+            if (this.is_ptr_or_ref(obj.resolved_type)) { return false; }
+            return this.is_owned_value_place((obj as MemberAccessNode*).object);
+        }
+        // Array elements, call results, casts, temporaries: not a simple
+        // owned-value place we can prove is glue-dropped at this scope.
+        return false;
+    }
+
+    /// Reject moving a non-Copy field out of an owned, drop-glued value.
+    ///
+    /// `mut x: String = h.name;` (and the `return` / assignment-RHS /
+    /// aggregate-literal forms) bitwise-copies the field's owning handle
+    /// into an independently dropped place.  Because `h` still owns
+    /// `name`, `h`'s scope-exit drop glue ALSO drops `name` — the same
+    /// heap pointer freed twice.  Cryo has no partial-move tracking, so
+    /// this is a hard error (E0453) rather than the silent heap
+    /// corruption it produced before.  The escape hatch is
+    /// `core::mem::swap` (leave the field a valid value to be dropped in
+    /// place) or a `Copy` field type.  Moving a field out THROUGH a
+    /// pointer/reference (heap or borrowed storage) is the caller's to
+    /// manage and is deliberately allowed — see `is_owned_value_place`.
+    check_field_move_out(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null || expr.kind != NodeKind::MemberAccess) { return; }
+        const ma: MemberAccessNode* = expr as MemberAccessNode*;
+        if (ma.object == null) { return; }
+        // The projected field must itself own a resource.  A Copy field is
+        // bitwise-independent of the source and safe to duplicate.
+        const field_ty: TypeRef = expr.resolved_type;
+        if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
+        // The source must be an owned, glue-dropped value place.
+        if (!this.is_owned_value_place(ma.object)) { return; }
+        this.emit_move_out_error(ma);
+    }
+
+    emit_move_out_error(mut &this, ma: MemberAccessNode*) -> void {
+        const field: string = this.intern.resolve(ma.member);
+        const headline: string = format(
+            "cannot move field '%s' out of a value that owns a destructor", field);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0453_DOUBLE_FREE, headline);
+        diag = diag.at_with_label(ma.span,
+            "moving this field out leaves the source to drop it again at scope exit (double free)");
+        diag = diag.help(
+            "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
     }
 
     handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean,
