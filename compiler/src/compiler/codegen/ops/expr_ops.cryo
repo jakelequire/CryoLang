@@ -1331,6 +1331,19 @@ type struct ExprOps {
             }
         }
 
+        // Mixed-sign integer comparison must compare TRUE integer values.
+        // Choosing one signed/unsigned icmp predicate from a single operand
+        // reinterprets the other operand's bits: `(1_u32 > -1_i32)` wrongly
+        // returns false because UGT reads -1 as 4294967295.  The operands
+        // are already width-normalized above (each extended per its own
+        // signedness), so the value-preserving form is exact for every width.
+        if (!is_float && this.is_int_compare_op(op_kind) &&
+                t_kind == TypeKind::Int &&
+                rt != null && rt.kind == TypeKind::Int &&
+                is_signed != rhs_is_signed) {
+            return this.codegen_mixed_sign_compare(op_kind, is_signed, lhs, rhs);
+        }
+
         match (op_kind) {
             // Arithmetic
             TokenType::Plus => {
@@ -1445,6 +1458,87 @@ type struct ExprOps {
             _ => { out_value = LValue::null(); }
         }
         return out_value;
+    }
+
+    /// True for the six integer comparison operators.
+    is_int_compare_op(&this, op: TokenType) -> boolean {
+        return op == TokenType::LAngle      || op == TokenType::RAngle ||
+               op == TokenType::LessEqual   || op == TokenType::GreaterEqual ||
+               op == TokenType::EqualEqual  || op == TokenType::ExclaimEqual;
+    }
+
+    /// Swap a comparison operator's sense (`<`↔`>`, `<=`↔`>=`).  `==`/`!=`
+    /// are symmetric and returned unchanged.  Used to re-express an
+    /// unsigned-LHS mixed comparison from the signed operand's perspective.
+    flip_compare_op(&this, op: TokenType) -> TokenType {
+        match (op) {
+            TokenType::LAngle       => { return TokenType::RAngle; }
+            TokenType::RAngle       => { return TokenType::LAngle; }
+            TokenType::LessEqual    => { return TokenType::GreaterEqual; }
+            TokenType::GreaterEqual => { return TokenType::LessEqual; }
+            _                       => { return op; }
+        }
+    }
+
+    /// Value-preserving comparison of a signed against an unsigned integer
+    /// of the same (already width-normalized) LLVM width.  A negative signed
+    /// value is mathematically less than EVERY unsigned value; a
+    /// non-negative one compares bit-for-bit as unsigned.  This is the fix
+    /// for the order-dependent bug where a single predicate reinterprets one
+    /// operand's bits (`(1_u32 > -1_i32)` must be true, not false).
+    ///
+    /// Note this also makes equality value-correct: `-1_i32 == 4294967295_u32`
+    /// is FALSE (distinct integers) rather than bit-equal true.
+    codegen_mixed_sign_compare(mut &this, op_kind: TokenType,
+                               lhs_is_signed: boolean,
+                               lhs: LValue, rhs: LValue) -> LValue {
+        // Normalize to (s = signed operand, u = unsigned operand) and an
+        // operator read from the signed operand's perspective, so the logic
+        // below is always `s <op> u`.
+        mut s:  LValue    = lhs;
+        mut u:  LValue    = rhs;
+        mut op: TokenType = op_kind;
+        if (!lhs_is_signed) {
+            s  = rhs;
+            u  = lhs;
+            op = this.flip_compare_op(op_kind);
+        }
+        const s_ty: LType = LType { raw: llvm::LLVMTypeOf(s.raw) };
+        const zero: LValue = LType::const_int(s_ty, 0, false);
+        const s_neg: LValue =
+            this.builder.build_icmp(LIntPredicate::SLT, s, zero, "ms.neg");
+        const s_nonneg: LValue =
+            this.builder.build_icmp(LIntPredicate::SGE, s, zero, "ms.nonneg");
+        mut out: LValue = LValue::null();
+        match (op) {
+            TokenType::LAngle => {
+                const c: LValue = this.builder.build_icmp(LIntPredicate::ULT, s, u, "ms.ult");
+                out = this.builder.build_or(s_neg, c, "ms.lt");
+            }
+            TokenType::LessEqual => {
+                const c: LValue = this.builder.build_icmp(LIntPredicate::ULE, s, u, "ms.ule");
+                out = this.builder.build_or(s_neg, c, "ms.le");
+            }
+            TokenType::RAngle => {
+                const c: LValue = this.builder.build_icmp(LIntPredicate::UGT, s, u, "ms.ugt");
+                out = this.builder.build_and(s_nonneg, c, "ms.gt");
+            }
+            TokenType::GreaterEqual => {
+                const c: LValue = this.builder.build_icmp(LIntPredicate::UGE, s, u, "ms.uge");
+                out = this.builder.build_and(s_nonneg, c, "ms.ge");
+            }
+            TokenType::EqualEqual => {
+                // s == u  ⟺  s ≥ 0  AND  bits equal (s<0 ⇒ s≠u since u≥0).
+                const c: LValue = this.builder.build_icmp(LIntPredicate::EQ, s, u, "ms.eqbits");
+                out = this.builder.build_and(s_nonneg, c, "ms.eq");
+            }
+            TokenType::ExclaimEqual => {
+                const c: LValue = this.builder.build_icmp(LIntPredicate::NE, s, u, "ms.nebits");
+                out = this.builder.build_or(s_neg, c, "ms.ne");
+            }
+            _ => { out = LValue::null(); }
+        }
+        return out;
     }
 
     /// Generate IR for a unary expression.
