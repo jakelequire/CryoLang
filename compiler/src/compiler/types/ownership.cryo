@@ -568,7 +568,7 @@ type struct OwnershipQuery {
     /// an unresolved first-param type return false conservatively;
     /// the worst that happens is a missed consume diagnostic; the
     /// alternative would be a false-positive use-after-move warning.
-    static method_consumes_receiver(arena: TypeArena*,
+    static method_consumes_receiver(arena: TypeArena*, intern: InternTable*,
                                      method: MethodNode*) -> boolean {
         if (method == null) { return false; }
         if (method.is_static)         { return false; }
@@ -577,12 +577,26 @@ type struct OwnershipQuery {
         if (method.func.parameters.length == 0) { return false; }
         const recv: VarDeclNode* = method.func.parameters[0];
         if (recv == null || !recv.has_resolved_type()) { return false; }
+        // Only an explicit by-value `this` receiver consumes. The receiver
+        // token is named "this" (by-value) or "&this" (reference); a method
+        // that omits the receiver and starts with an ordinary parameter —
+        // e.g. the visitor pattern's `visit(node: X*)`, which uses an
+        // implicit borrow receiver and whose first parameter is `node`, not
+        // `this` — must NOT be read as consuming its receiver. Keying on the
+        // parameter NAME (rather than its type) is what makes this precise:
+        // a non-receiver first parameter can be any type, including a bare
+        // value, so a type-only check would misclassify it.
+        if (intern != null) {
+            if (recv.name.id != intern.intern("this").id) { return false; }
+        }
         if (arena == null) { return false; }
         const t: Type* = arena.lookup(recv.resolved_type.id);
         if (t == null) { return false; }
-        // Reference receivers (`&this` / `mut &this`) borrow.
-        if (t.kind == TypeKind::Reference) { return false; }
-        // Anything else on the first parameter is a by-value receiver.
+        // Reference / pointer receivers (`&this` / `mut &this`) borrow.
+        if (t.kind == TypeKind::Reference || t.kind == TypeKind::Pointer) {
+            return false;
+        }
+        // A by-value `this` receiver: taken and dropped by the callee.
         return true;
     }
 
@@ -625,17 +639,17 @@ type struct OwnershipQuery {
         const tmpl: TemplateEntry* = registry.get_template(qname);
         if (tmpl != null) {
             if (tmpl.ast_node != null &&
-                OwnershipQuery::ast_method_consumes(arena, tmpl.ast_node,
+                OwnershipQuery::ast_method_consumes(arena, intern, tmpl.ast_node,
                                                     tmpl.node_kind, method_name)) {
                 return true;
             }
-            if (OwnershipQuery::impl_blocks_method_consumes(arena, tmpl, method_name)) {
+            if (OwnershipQuery::impl_blocks_method_consumes(arena, intern, tmpl, method_name)) {
                 return true;
             }
         }
         const owner_ast: ASTNode* = registry.lookup_inherent_owner(qname);
         if (owner_ast != null &&
-            OwnershipQuery::ast_method_consumes(arena, owner_ast, owner_ast.kind,
+            OwnershipQuery::ast_method_consumes(arena, intern, owner_ast, owner_ast.kind,
                                                 method_name)) {
             return true;
         }
@@ -644,7 +658,8 @@ type struct OwnershipQuery {
 
     /// Scan a struct/class decl's inline methods for one named `method_name`
     /// that consumes its receiver.
-    static ast_method_consumes(arena: TypeArena*, node: ASTNode*,
+    static ast_method_consumes(arena: TypeArena*, intern: InternTable*,
+                               node: ASTNode*,
                                kind: NodeKind, method_name: SymbolStr) -> boolean {
         if (node == null) { return false; }
         if (kind == NodeKind::StructDeclaration) {
@@ -653,7 +668,7 @@ type struct OwnershipQuery {
                 const m: MethodNode* = decl.methods[i];
                 if (m == null || m.func == null) { continue; }
                 if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, m)) { return true; }
+                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
             }
             return false;
         }
@@ -663,7 +678,7 @@ type struct OwnershipQuery {
                 const m: MethodNode* = decl.methods[i];
                 if (m == null || m.func == null) { continue; }
                 if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, m)) { return true; }
+                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
             }
             return false;
         }
@@ -673,7 +688,8 @@ type struct OwnershipQuery {
     /// Scan all impl-blocks attached to `tmpl` (where enum and many struct
     /// inherent methods live) for one named `method_name` that consumes its
     /// receiver.
-    static impl_blocks_method_consumes(arena: TypeArena*, tmpl: TemplateEntry*,
+    static impl_blocks_method_consumes(arena: TypeArena*, intern: InternTable*,
+                                       tmpl: TemplateEntry*,
                                        method_name: SymbolStr) -> boolean {
         if (tmpl == null) { return false; }
         for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
@@ -683,7 +699,7 @@ type struct OwnershipQuery {
                 const m: MethodNode* = ib.methods[j];
                 if (m == null || m.func == null) { continue; }
                 if (m.func.name.equals(method_name) &&
-                    OwnershipQuery::method_consumes_receiver(arena, m)) { return true; }
+                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
             }
         }
         return false;

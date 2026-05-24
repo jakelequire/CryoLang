@@ -1,0 +1,62 @@
+///! A method declared without an explicit `&this`/`this` receiver (using
+///! the implicit borrow receiver, as the compiler's own visitor methods do —
+///! `visit(node: X*)`) must NOT be treated as consuming its receiver. The
+///! receiver is borrowed, so the *caller* still owns it and drops it exactly
+///! once at scope exit.
+///!
+///! Regression: `method_consumes_receiver` previously keyed only on the first
+///! parameter's TYPE, so an implicit-receiver method whose first parameter is
+///! a non-reference (e.g. `peek(extra: i32)`) was misread as a by-value
+///! receiver — the move checker false-flagged the receiver as moved (E0452)
+///! AND drop-insertion suppressed the caller's drop, leaking the receiver.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ImplicitReceiverDrop;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Res {
+    tag: i32;
+    // Implicit borrow receiver: no `&this`, but the body reads `this`.
+    peek(extra: i32) -> i32 { return this.tag + extra; }
+}
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+![test]
+function implicit_receiver_call_does_not_consume() -> Result<(), TestError> {
+    reset();
+    mut sum: i32 = 0;
+    {
+        mut r: Res = Res { tag: 10 };
+        sum = r.peek(5);    // implicit-receiver call: borrows r, must not move it
+    }                       // r dropped here exactly once (not leaked, not doubled)
+    match (expect_eq(sum, 15)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function implicit_receiver_call_twice_then_dropped_once() -> Result<(), TestError> {
+    reset();
+    mut a: i32 = 0;
+    mut b: i32 = 0;
+    {
+        mut r: Res = Res { tag: 100 };
+        a = r.peek(1);      // first call must not consume r...
+        b = r.peek(2);      // ...so a second call is fine.
+    }
+    match (expect_eq(a + b, 203)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count(), 1);
+}
