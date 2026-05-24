@@ -220,6 +220,148 @@ type struct OwnershipQuery {
         return true;
     }
 
+    // ========================================================================
+    // needs_drop: does scope-exit drop glue have to run for `ty`?
+    // ========================================================================
+    //
+    // True when a value of `ty` owns a resource that must be released at
+    // scope exit — either it (or a base/template) carries a user-written
+    // `drop`, or it is an aggregate transitively containing such a type.
+    //
+    // This is the complement of `is_copy` for concrete value types, with one
+    // deliberate difference: it returns FALSE for generic params, traits,
+    // and unresolved types.  Those are never dropped directly (drop_insertion
+    // only runs on monomorphized bodies, where every droppable position is
+    // concrete); reporting them as needs-drop would make codegen synthesise a
+    // drop call it cannot lower.
+    //
+    // A type that carries its OWN user drop returns true immediately and the
+    // recursion stops: Cryo's convention is that a hand-written `drop`
+    // releases everything the value owns, so drop-glue codegen must call that
+    // drop and NOT also recurse into the fields (which would double-free).
+    static needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+                      intern: InternTable*, ty: TypeRef) -> boolean {
+        return OwnershipQuery::needs_drop_at_depth(arena, registry, intern, ty, 0);
+    }
+
+    static needs_drop_at_depth(arena: TypeArena*, registry: GenericRegistry*,
+                               intern: InternTable*, ty: TypeRef,
+                               depth: i32) -> boolean {
+        if (depth >= 32) { return false; }
+        if (arena == null) { return false; }
+        const t: Type* = arena.lookup(ty.id);
+        if (t == null) { return false; }
+        const k: TypeKind = t.kind;
+
+        // Scalars and address-sized handles never own their referent.
+        if (k == TypeKind::Void    || k == TypeKind::Unit  ||
+            k == TypeKind::Bool    || k == TypeKind::Int   ||
+            k == TypeKind::Float   || k == TypeKind::Char  ||
+            k == TypeKind::String  || k == TypeKind::Never ||
+            k == TypeKind::Pointer || k == TypeKind::Reference ||
+            k == TypeKind::Function) {
+            return false;
+        }
+
+        // A user-written drop (trait impl or inherent method) is
+        // authoritative and self-contained: stop here.
+        if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty) ||
+            OwnershipQuery::type_implements_drop(arena, registry, intern, ty)) {
+            return true;
+        }
+
+        if (k == TypeKind::Array) {
+            const at: ArrayType* = t as ArrayType*;
+            // Dynamic arrays own a heap buffer via the Array<T> Drop impl,
+            // caught above by has_inherent_drop; a bare fixed array drops
+            // iff its element type does.
+            if (at.is_dynamic()) { return false; }
+            return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
+                                                       at.element, depth + 1);
+        }
+        if (k == TypeKind::Optional) {
+            const ot: OptionalType* = t as OptionalType*;
+            return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
+                                                       ot.wrapped, depth + 1);
+        }
+        if (k == TypeKind::Tuple) {
+            const tt: TupleType* = t as TupleType*;
+            return OwnershipQuery::any_needs_drop(arena, registry, intern,
+                                                  tt.elements, depth + 1);
+        }
+        if (k == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            return OwnershipQuery::any_field_needs_drop(arena, registry, intern,
+                                                        st.fields, depth + 1);
+        }
+        if (k == TypeKind::Class) {
+            const ct: ClassType* = t as ClassType*;
+            return OwnershipQuery::any_field_needs_drop(arena, registry, intern,
+                                                        ct.fields, depth + 1);
+        }
+        if (k == TypeKind::Enum) {
+            const et: EnumType* = t as EnumType*;
+            return OwnershipQuery::any_variant_needs_drop(arena, registry, intern,
+                                                          et.variants, depth + 1);
+        }
+        if (k == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = t as TypeAliasType*;
+            if (!al.target.is_valid()) { return false; }
+            return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
+                                                       al.target, depth + 1);
+        }
+        if (k == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
+                                                           inst.resolved_type, depth + 1);
+            }
+            return false;
+        }
+        // Generic params, traits, templates, error placeholders: not a
+        // concrete droppable value position.
+        return false;
+    }
+
+    /// True when any element type in `tys` needs drop.
+    static any_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+                          intern: InternTable*, tys: TypeRef[],
+                          depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < tys.length; i++) {
+            if (OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
+                                                    tys[i], depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// True when any field's type needs drop.
+    static any_field_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+                                intern: InternTable*, fields: FieldInfo[],
+                                depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            if (OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
+                                                    fields[i].field_type, depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// True when any variant payload type needs drop.
+    static any_variant_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
+                                  intern: InternTable*, variants: EnumVariantInfo[],
+                                  depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < variants.length; i++) {
+            if (OwnershipQuery::any_needs_drop(arena, registry, intern,
+                                               variants[i].payload_types, depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Top-level Drop-impl predicate. Resolves `ty` to a registry-keyable
     /// name and reports whether `implement trait Drop for <leaf> { ... }`
     /// was registered. Returns false for unresolved or unnamed types.
@@ -442,6 +584,109 @@ type struct OwnershipQuery {
         if (t.kind == TypeKind::Reference) { return false; }
         // Anything else on the first parameter is a by-value receiver.
         return true;
+    }
+
+    /// Receiver-type + method-name fallback for `method_consumes_receiver`,
+    /// used by drop-insertion when a call's `resolved_method` is null (e.g. a
+    /// monomorphized generic method call that sema did not pin).  Looks the
+    /// method up on `recv_ty`'s template / impl-blocks and reports whether
+    /// any matching overload consumes the receiver.  Without this, an
+    /// `![sink]` combinator like `Option<T>::unwrap` fails to mark its
+    /// receiver moved and drop glue double-frees the payload it copied out.
+    ///
+    /// Safe-biased: a false "consumes" only suppresses a glue drop (a leak),
+    /// never adds one (which could double-free).  Overloads where any match
+    /// consumes therefore answer true.
+    static type_method_consumes(arena: TypeArena*, registry: GenericRegistry*,
+                                intern: InternTable*, recv_ty: TypeRef,
+                                method_name: SymbolStr) -> boolean {
+        if (arena == null || registry == null || intern == null) { return false; }
+        if (!method_name.is_valid()) { return false; }
+        const t: Type* = arena.lookup(recv_ty.id);
+        if (t == null) { return false; }
+        // Peel reference / pointer / instantiation to the named type.
+        if (t.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = t as ReferenceType*;
+            return OwnershipQuery::type_method_consumes(arena, registry, intern,
+                                                        rt.referent, method_name);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            const pt: PointerType* = t as PointerType*;
+            return OwnershipQuery::type_method_consumes(arena, registry, intern,
+                                                        pt.pointee, method_name);
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            return OwnershipQuery::type_method_consumes(arena, registry, intern,
+                                                        inst.generic_base, method_name);
+        }
+        const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, recv_ty);
+        if (!qname.is_valid()) { return false; }
+        const tmpl: TemplateEntry* = registry.get_template(qname);
+        if (tmpl != null) {
+            if (tmpl.ast_node != null &&
+                OwnershipQuery::ast_method_consumes(arena, tmpl.ast_node,
+                                                    tmpl.node_kind, method_name)) {
+                return true;
+            }
+            if (OwnershipQuery::impl_blocks_method_consumes(arena, tmpl, method_name)) {
+                return true;
+            }
+        }
+        const owner_ast: ASTNode* = registry.lookup_inherent_owner(qname);
+        if (owner_ast != null &&
+            OwnershipQuery::ast_method_consumes(arena, owner_ast, owner_ast.kind,
+                                                method_name)) {
+            return true;
+        }
+        return false;
+    }
+
+    /// Scan a struct/class decl's inline methods for one named `method_name`
+    /// that consumes its receiver.
+    static ast_method_consumes(arena: TypeArena*, node: ASTNode*,
+                               kind: NodeKind, method_name: SymbolStr) -> boolean {
+        if (node == null) { return false; }
+        if (kind == NodeKind::StructDeclaration) {
+            const decl: StructDeclNode* = node as StructDeclNode*;
+            for (mut i: i64 = 0; i < decl.methods.length; i++) {
+                const m: MethodNode* = decl.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_name) &&
+                    OwnershipQuery::method_consumes_receiver(arena, m)) { return true; }
+            }
+            return false;
+        }
+        if (kind == NodeKind::ClassDeclaration) {
+            const decl: ClassDeclNode* = node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < decl.methods.length; i++) {
+                const m: MethodNode* = decl.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_name) &&
+                    OwnershipQuery::method_consumes_receiver(arena, m)) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// Scan all impl-blocks attached to `tmpl` (where enum and many struct
+    /// inherent methods live) for one named `method_name` that consumes its
+    /// receiver.
+    static impl_blocks_method_consumes(arena: TypeArena*, tmpl: TemplateEntry*,
+                                       method_name: SymbolStr) -> boolean {
+        if (tmpl == null) { return false; }
+        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
+            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
+            if (ib == null) { continue; }
+            for (mut j: i64 = 0; j < ib.methods.length; j++) {
+                const m: MethodNode* = ib.methods[j];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_name) &&
+                    OwnershipQuery::method_consumes_receiver(arena, m)) { return true; }
+            }
+        }
+        return false;
     }
 
     /// Strip a qualified name down to its bare leaf: the segment after

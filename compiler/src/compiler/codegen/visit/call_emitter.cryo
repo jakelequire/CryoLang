@@ -67,12 +67,17 @@ type struct CallEmitter {
     dispatch:     ExprDispatch*;
     enum_variant: EnumVariantEmitter*;
 
+    /// Monotonic counter for naming the synthetic locals that hold enum
+    /// payload pointers during drop-glue expansion (see emit_enum_drop_glue).
+    glue_seq:     i64;
+
     static null() -> CallEmitter {
         return CallEmitter {
             cg:           null,
             state:        null,
             dispatch:     null,
             enum_variant: null,
+            glue_seq:     0,
         };
     }
 
@@ -933,6 +938,24 @@ type struct CallEmitter {
                     this.state.last_is_lvalue = false;
                     return;
                 }
+                // Drop glue: a `.drop()` on a non-Copy aggregate that carries
+                // no user-written drop (so resolution failed) is expanded into
+                // in-place drops of its droppable parts.  Reuses the same
+                // `.drop()` lowering recursively (a field that itself lacks a
+                // user drop re-enters this path).  In-place + idempotent leaf
+                // drops mean re-dropping an already-released part is a no-op.
+                if (dma.member.equals(drop_sym)
+                        && OwnershipQuery::needs_drop(this.cg.get_arena(),
+                               this.cg.ctx.generic_registry,
+                               this.cg.get_intern(),
+                               dma.object.resolved_type)) {
+                    if (this.emit_drop_glue(visitor, dma.object,
+                                            dma.object.resolved_type)) {
+                        this.state.last_value = LValue::null();
+                        this.state.last_is_lvalue = false;
+                        return;
+                    }
+                }
             }
 
             // Build a rich diagnostic that names the callee (when available)
@@ -1157,5 +1180,188 @@ type struct CallEmitter {
 
         this.state.last_value = result;
         this.state.last_is_lvalue = false;
+    }
+
+    /// Drop-glue expansion for an aggregate with no user-written `drop`.
+    /// Returns true when the receiver type is a kind glue handles, so the
+    /// caller suppresses the "no method" error.  Structs/classes recurse
+    /// into each droppable field in place; other aggregate kinds are not yet
+    /// expanded and return true as a no-op (keeping today's behavior).
+    emit_drop_glue(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
+                   ty: TypeRef) -> boolean {
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return false; }
+
+        // Peel InstantiatedType wrappers to the concrete underlying type.
+        mut cur: TypeRef = ty;
+        mut t: Type* = arena.lookup(cur.id);
+        mut guard: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { break; }
+            cur = inst.resolved_type;
+            t = arena.lookup(cur.id);
+            guard = guard + 1;
+        }
+        if (t == null) { return false; }
+
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            this.emit_field_drops(visitor, receiver, st.fields);
+            return true;
+        }
+        if (t.kind == TypeKind::Class) {
+            const ct: ClassType* = t as ClassType*;
+            this.emit_field_drops(visitor, receiver, ct.fields);
+            return true;
+        }
+        if (t.kind == TypeKind::Enum) {
+            const et: EnumType* = t as EnumType*;
+            this.emit_enum_drop_glue(visitor, receiver, et, cur);
+            return true;
+        }
+        // Optional / tuple / fixed-array glue is not yet emitted.  Returning
+        // true (no-op) keeps these compiling with today's behavior rather
+        // than erroring; user-written `T?` desugars to Option<T> (an Enum,
+        // handled above), so this only affects bare fixed arrays/tuples of
+        // owned elements.
+        return true;
+    }
+
+    /// Synthesize `receiver.field.drop()` for each field whose type needs
+    /// drop, routed through the normal `.drop()` lowering (which handles user
+    /// drops, Copy no-ops, and recursive glue).  In place: the member access
+    /// yields a pointer into the receiver, so a leaf drop nulls that storage
+    /// and any later re-drop is a no-op.
+    emit_field_drops(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
+                     fields: FieldInfo[]) -> void {
+        const arena: TypeArena* = this.cg.get_arena();
+        const registry: GenericRegistry* = this.cg.ctx.generic_registry;
+        const intern: InternTable* = this.cg.get_intern();
+        const drop_sym: SymbolStr = intern.intern("drop");
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f: FieldInfo = fields[i];
+            if (!OwnershipQuery::needs_drop(arena, registry, intern, f.field_type)) {
+                continue;
+            }
+            mut field_access: MemberAccessNode* = new MemberAccessNode(
+                receiver, f.name, receiver.span, receiver.span);
+            field_access.set_resolved_type(f.field_type);
+            mut drop_access: MemberAccessNode* = new MemberAccessNode(
+                field_access as ExpressionNode*, drop_sym,
+                receiver.span, receiver.span);
+            mut call: CallExprNode* = new CallExprNode(
+                drop_access as ExpressionNode*, receiver.span);
+            mut stmt: ExprStmtNode* = new ExprStmtNode(
+                call as ExpressionNode*, receiver.span);
+            stmt.accept(visitor);
+        }
+    }
+
+    /// Drop-glue for an enum with no user drop: switch on the discriminant
+    /// and drop the active variant's droppable payload(s) in place.  Mirrors
+    /// the tag-load + payload-GEP machinery in PatternEmitter; each payload is
+    /// registered as a synthetic named lvalue and dropped via the normal
+    /// `.drop()` lowering (so a payload that itself lacks a user drop recurses
+    /// through glue).  `enum_ref` is the concrete (peeled) enum TypeRef.
+    emit_enum_drop_glue(mut &this, visitor: ASTVisitor*, receiver: ExpressionNode*,
+                        et: EnumType*, enum_ref: TypeRef) -> void {
+        if (et == null) { return; }
+        if (et.is_simple_enum()) { return; }   // no payloads → nothing to drop
+
+        const arena: TypeArena* = this.cg.get_arena();
+        const registry: GenericRegistry* = this.cg.ctx.generic_registry;
+        const intern: InternTable* = this.cg.get_intern();
+        const drop_sym: SymbolStr = intern.intern("drop");
+
+        // Count variants with at least one droppable payload (switch arity).
+        mut ndrop: u32 = 0;
+        for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
+            if (OwnershipQuery::any_needs_drop(arena, registry, intern,
+                    et.variants[vi].payload_types, 0)) {
+                ndrop = ndrop + 1;
+            }
+        }
+        if (ndrop == 0) { return; }
+
+        // Borrow the receiver's storage (a pointer into it; never a copy).
+        const subject_ptr: LValue = this.dispatch.codegen_lvalue(visitor, receiver);
+        if (!subject_ptr.is_valid()) { return; }
+        const enum_llvm: LType = this.cg.type_mapper.map_type(enum_ref);
+        if (!enum_llvm.is_valid()) { return; }
+
+        // tag = enum.0 ; payload base = enum.1
+        const tag_ptr: LValue = this.cg.builder.build_struct_gep(
+            enum_llvm, subject_ptr, 0, "glue.tag.ptr");
+        if (!tag_ptr.is_valid()) { return; }
+        const tag: LValue = this.cg.builder.build_load(LType::i32(), tag_ptr, "glue.tag");
+        const payload_ptr: LValue = this.cg.builder.build_struct_gep(
+            enum_llvm, subject_ptr, 1, "glue.payload.ptr");
+        if (!payload_ptr.is_valid()) { return; }
+
+        const cur_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!cur_bb.is_valid()) { return; }
+        const fn: LValue = cur_bb.get_parent();
+        const after_bb: LBasicBlock = LBasicBlock::append(fn, "glue.after");
+        const sw: LValue = this.cg.builder.build_switch(tag, after_bb, ndrop);
+
+        for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
+            const v: EnumVariantInfo = et.variants[vi];
+            if (!OwnershipQuery::any_needs_drop(arena, registry, intern,
+                    v.payload_types, 0)) {
+                continue;   // C-style / all-Copy payloads: default arm (after_bb)
+            }
+            const drop_bb: LBasicBlock = LBasicBlock::append(fn, "glue.vdrop");
+            switch_add_case(sw, LType::const_int(LType::i32(), v.tag_value, false), drop_bb);
+            this.cg.builder.position_at_end(drop_bb);
+
+            mut running: u64 = 0;
+            for (mut pos: i64 = 0; pos < v.payload_types.length; pos++) {
+                const pt: TypeRef = v.payload_types[pos];
+                const ft: Type* = this.cg.lookup_type_by_id(pt.id);
+                if (OwnershipQuery::needs_drop(arena, registry, intern, pt)) {
+                    // field_ptr = payload base + running (byte offset)
+                    mut field_ptr_raw: LValue = payload_ptr;
+                    if (running != 0) {
+                        const byte_off: LValue = LType::const_int(LType::i64(), running, false);
+                        const obuf: void* = intrinsics::malloc(8);
+                        const obuf_arr: void** = obuf as void**;
+                        obuf_arr[0] = byte_off.raw;
+                        field_ptr_raw = this.cg.builder.build_gep(
+                            LType::i8(), payload_ptr, obuf, 1, "glue.field.ptr");
+                        intrinsics::free(obuf);
+                    }
+                    const field_llvm: LType = this.cg.type_mapper.map_type(pt);
+                    const field_ptr: LValue = this.cg.builder.build_bitcast(
+                        field_ptr_raw, LType::pointer_to(field_llvm), "glue.field.cast");
+                    // Register the payload pointer as a synthetic lvalue and
+                    // drop it via the normal `.drop()` path (handles user
+                    // drops, Copy no-ops, and recursive glue).
+                    const nm: SymbolStr = intern.intern(
+                        format("__glue_payload_%d", this.glue_seq));
+                    this.glue_seq = this.glue_seq + 1;
+                    this.cg.values.set(nm, field_ptr);
+                    mut id_node: IdentifierNode* = new IdentifierNode(nm, receiver.span);
+                    id_node.set_resolved_type(pt);
+                    mut da: MemberAccessNode* = new MemberAccessNode(
+                        id_node as ExpressionNode*, drop_sym, receiver.span, receiver.span);
+                    mut call: CallExprNode* = new CallExprNode(
+                        da as ExpressionNode*, receiver.span);
+                    mut stmt: ExprStmtNode* = new ExprStmtNode(
+                        call as ExpressionNode*, receiver.span);
+                    stmt.accept(visitor);
+                }
+                if (ft != null) { running = running + ft.size_bytes(); }
+            }
+
+            // Branch to the merge block from wherever payload drops left the
+            // insert point (a nested glue payload may have added blocks).
+            const end_bb: LBasicBlock = this.cg.builder.get_insert_block();
+            if (end_bb.is_valid() && !end_bb.has_terminator()) {
+                this.cg.builder.build_br(after_bb);
+            }
+        }
+
+        this.cg.builder.position_at_end(after_bb);
     }
 }

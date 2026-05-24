@@ -1,0 +1,154 @@
+///! Recursive drop glue (C1): destructors run for owned values nested in
+///! struct fields, enum payloads (Option/Result), and combinations thereof —
+///! WITHOUT a hand-written `drop` on the aggregate, and without double-freeing
+///! when the payload is also consumed manually.
+///!
+///! Before drop glue, a non-Copy value nested in an Option/Result/struct that
+///! lacked its own `Drop` impl silently leaked: the compiler only ever emitted
+///! a single top-level `binding.drop()` and never recursed into fields or
+///! payloads.  Glue (codegen, call_emitter) now expands a `.drop()` on such an
+///! aggregate into in-place drops of its droppable parts.
+///!
+///! The double-free cases are the dangerous direction (worse than the leak):
+///!  - a match arm that consumes its payload binding (`Some(s) => s.drop()`)
+///!    marks the subject moved so glue does not re-drop it;
+///!  - an `![sink]` combinator (`opt.unwrap()`) marks its receiver moved.
+///! Borrow-only matches leave the subject live so glue still frees it once.
+///!
+///! Each `Probe::drop()` bumps a module counter (same harness as
+///! discarded_temp_drops.cryo); tests assert the exact drop count.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::DropGlue;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::core::cmp;
+import std::collections::array;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Probe { tag: i32; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+// Eq so `Result<Probe, i32>` / `Option<Probe>` instantiate cleanly in the
+// multi-module test build (their `contains`/`Eq` methods are `where T: Eq`).
+implement trait Eq for struct Probe {
+    equals(&this, other: &Probe) -> boolean { return this.tag == other.tag; }
+}
+
+type struct Wrapper { p: Probe; }
+type struct Nested  { w: Wrapper; n: i32; }
+
+// ---- struct / class field glue -------------------------------------------
+
+![test]
+function struct_field_drops() -> Result<(), TestError> {
+    reset();
+    { mut a: Wrapper = Wrapper { p: Probe { tag: 1 } }; }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function nested_struct_field_drops() -> Result<(), TestError> {
+    reset();
+    { mut a: Nested = Nested { w: Wrapper { p: Probe { tag: 1 } }, n: 7 }; }
+    return expect_eq(count(), 1);
+}
+
+// ---- enum payload glue (Option / Result) ---------------------------------
+
+![test]
+function option_some_payload_drops() -> Result<(), TestError> {
+    reset();
+    { mut o: Option<Probe> = Option::Some(Probe { tag: 1 }); }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function option_none_no_drop() -> Result<(), TestError> {
+    reset();
+    { mut o: Option<Probe> = Option::None; }
+    return expect_eq(count(), 0);
+}
+
+![test]
+function result_ok_payload_drops() -> Result<(), TestError> {
+    reset();
+    { mut r: Result<Probe, i32> = Result::Ok(Probe { tag: 1 }); }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function result_err_no_payload_drop() -> Result<(), TestError> {
+    reset();
+    { mut r: Result<Probe, i32> = Result::Err(9); }
+    return expect_eq(count(), 0);
+}
+
+![test]
+function nested_enum_struct_drops() -> Result<(), TestError> {
+    reset();
+    { mut o: Option<Wrapper> = Option::Some(Wrapper { p: Probe { tag: 1 } }); }
+    return expect_eq(count(), 1);
+}
+
+// ---- consume vs borrow: no double-free, no missed drop -------------------
+
+![test]
+function match_consume_no_double_free() -> Result<(), TestError> {
+    reset();
+    {
+        mut o: Option<Probe> = Option::Some(Probe { tag: 1 });
+        match (o) {
+            Option::Some(s) => { s.drop(); }   // consumes payload
+            Option::None    => { }
+        }
+    }
+    // s.drop() is the sole drop; the subject's glue is suppressed.
+    return expect_eq(count(), 1);
+}
+
+![test]
+function match_borrow_only_drops_via_glue() -> Result<(), TestError> {
+    reset();
+    {
+        mut o: Option<Probe> = Option::Some(Probe { tag: 1 });
+        match (o) {
+            Option::Some(v) => { const t: i32 = v.tag; }   // borrow only
+            Option::None    => { }
+        }
+        // subject stays live -> glue drops the payload exactly once at exit.
+    }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function unwrap_consume_no_double_free() -> Result<(), TestError> {
+    reset();
+    {
+        const o: Option<Probe> = Option::Some(Probe { tag: 1 });
+        mut p: Probe = o.unwrap();   // ![sink]: marks o moved
+        p.drop();
+    }
+    return expect_eq(count(), 1);
+}
+
+// ---- container of owned elements -----------------------------------------
+
+![test]
+function array_of_owned_drops_each() -> Result<(), TestError> {
+    reset();
+    {
+        mut xs: Array<Probe> = Array<Probe>::new();
+        xs.push(Probe { tag: 1 });
+        xs.push(Probe { tag: 2 });
+    }
+    return expect_eq(count(), 2);
+}
