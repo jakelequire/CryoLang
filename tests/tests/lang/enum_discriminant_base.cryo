@@ -1,0 +1,61 @@
+///! Explicit enum discriminant base type: `type enum E : T { ... }`.  A simple
+///! (C-style) enum lowers its tag at the declared width T instead of the
+///! default i32, so (a) a large discriminant no longer truncates and (b) an
+///! FFI enum round-trips through the declared C ABI width.
+///!
+///! Regression for the audit finding "enum declared base type is discarded":
+///! `type enum Big : i64 { Hi = 4294967296; }` had `Big::Hi as i64` == 0
+///! because every simple enum was hardcoded to an i32 tag.  Covers value
+///! casts, `sizeof` (the ABI width), and matching on a by-value enum param.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::EnumDiscriminantBase;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type enum Big : i64 {
+    Lo = 1;
+    Hi = 4294967296;   // 0x1_0000_0000 — needs more than 32 bits
+}
+
+type enum Color : u8 {
+    Red   = 0;
+    Green = 1;
+    Blue  = 200;       // > i8 max; must zero-extend, not sign-extend
+}
+
+function classify(c: Color) -> i32 {
+    match (c) {
+        Color::Red   => { return 1; }
+        Color::Green => { return 2; }
+        Color::Blue  => { return 3; }
+    }
+}
+
+![test]
+function large_i64_discriminant_not_truncated() -> Result<(), TestError> {
+    match (expect_eq(Big::Hi as i64, 4294967296)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(Big::Lo as i64, 1);
+}
+
+![test]
+function u8_discriminant_zero_extends() -> Result<(), TestError> {
+    // 200 as u8 is 0xC8; widening to i32 must give 200, not -56.
+    return expect_eq(Color::Blue as i32, 200);
+}
+
+![test]
+function discriminant_width_drives_sizeof() -> Result<(), TestError> {
+    match (expect_eq(sizeof(Color) as i64, 1)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(sizeof(Big) as i64, 8);
+}
+
+![test]
+function match_on_by_value_nonI32_enum() -> Result<(), TestError> {
+    // By-value u8 enum parameter exercises the ABI at the declared width.
+    match (expect_eq(classify(Color::Blue), 3)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(Color::Red),  1)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(classify(Color::Green), 2);
+}

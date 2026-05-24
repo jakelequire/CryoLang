@@ -252,9 +252,17 @@ type struct ExprOps {
         // `s[i]: char`) fall through to the bitcast fallback and LLVM
         // rejects `bitcast i32 to i64` (bitcast requires same-size
         // operands).
-        const from_int: boolean = from_kind == TypeKind::Int || from_kind == TypeKind::Char;
+        // A SIMPLE enum is its integer discriminant at the LLVM level, so
+        // `E as int` / `int as E` is an integer cast at the discriminant's
+        // width (handled in the int<->int block below; the default tag is
+        // i32).  ADT enums are structs and fall through to the other paths.
+        const from_enum: boolean = from_kind == TypeKind::Enum &&
+                                   (src_type as EnumType*).is_simple_enum();
+        const to_enum: boolean = to_kind == TypeKind::Enum &&
+                                 (dst_type as EnumType*).is_simple_enum();
+        const from_int: boolean = from_kind == TypeKind::Int || from_kind == TypeKind::Char || from_enum;
         const from_float: boolean = from_kind == TypeKind::Float;
-        const to_int: boolean = to_kind == TypeKind::Int || to_kind == TypeKind::Char;
+        const to_int: boolean = to_kind == TypeKind::Int || to_kind == TypeKind::Char || to_enum;
         const to_float: boolean = to_kind == TypeKind::Float;
         // Treat `String` as a pointer type for cast classification;
         // strings are `i8*` at the LLVM level, so `string as i64` is
@@ -279,6 +287,19 @@ type struct ExprOps {
             } else if (from_kind == TypeKind::Char) {
                 from_bits = 32;
                 signed_src = false;
+            } else if (from_enum) {
+                // Width + signedness from the enum's discriminant base
+                // (`type enum E : u8` → 8/unsigned); default tag is i32.
+                from_bits = 32;
+                signed_src = true;
+                const fet: EnumType* = src_type as EnumType*;
+                if (fet.discriminant_type.is_valid()) {
+                    const fdt: Type* = this.lookup_type_by_id(fet.discriminant_type.id);
+                    if (fdt != null && fdt.kind == TypeKind::Int) {
+                        from_bits = (fdt as IntType*).int_kind.bit_width() as u32;
+                        signed_src = (fdt as IntType*).int_kind.is_signed();
+                    }
+                }
             }
             mut to_bits: u32 = 0;
             if (to_kind == TypeKind::Int) {
@@ -286,6 +307,15 @@ type struct ExprOps {
                 to_bits = to_it.int_kind.bit_width() as u32;
             } else if (to_kind == TypeKind::Char) {
                 to_bits = 32;
+            } else if (to_enum) {
+                to_bits = 32;
+                const tet: EnumType* = dst_type as EnumType*;
+                if (tet.discriminant_type.is_valid()) {
+                    const tdt: Type* = this.lookup_type_by_id(tet.discriminant_type.id);
+                    if (tdt != null && tdt.kind == TypeKind::Int) {
+                        to_bits = (tdt as IntType*).int_kind.bit_width() as u32;
+                    }
+                }
             }
             if (from_bits == 0 || to_bits == 0 || !val.is_valid()) {
                 return val;

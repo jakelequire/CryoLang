@@ -81,6 +81,11 @@ type trait Allocator {
     }
 }
 
+// Alignment `realloc` is guaranteed to honor: `max_align_t`, which is 16
+// bytes on every platform Cryo targets.  Anything stricter must be served by
+// an explicit aligned alloc + copy, never plain `realloc`.
+const MAX_REALLOC_ALIGN: u64 = 16;
+
 // ============================================================================
 // GlobalAlloc: platform allocator
 // ============================================================================
@@ -122,10 +127,14 @@ implement trait Allocator for struct GlobalAlloc {
         if (new_layout.size() == 0) {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
         }
-        // `realloc` handles alignment up to the platform maximum only.
-        // Fall back to allocate/copy/free when the caller wants stricter
-        // alignment than `realloc` can guarantee.
-        if (new_layout.alignment() > old_layout.alignment()) {
+        // `realloc` only guarantees alignment up to `max_align_t`
+        // (MAX_REALLOC_ALIGN = 16).  Any over-aligned type — a
+        // `![align(32)]`/`![align(64)]` aggregate or a SIMD vector — must go
+        // through allocate/copy/free even when its alignment is UNCHANGED on
+        // grow; otherwise realloc may return a merely-16-aligned buffer and
+        // every subsequent aligned load/store is UB.  (The old `new > old`
+        // guard missed exactly the same-over-alignment grow.)
+        if (new_layout.alignment() > MAX_REALLOC_ALIGN) {
             match (this.allocate(new_layout)) {
                 Result::Ok(new_ptr) => {
                     mut copy_size: u64 = old_layout.size();
