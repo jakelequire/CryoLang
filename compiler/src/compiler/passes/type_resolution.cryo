@@ -194,6 +194,19 @@ type struct TypeResolutionRunner {
     /// substituter already mapped to a concrete TypeRef) are ignored
     /// because they can't be the failure point.  Walks at most a few
     /// levels to avoid pathological annotations.
+    /// The NamedAnnotation iff `ann` is DIRECTLY a named type (not a
+    /// generic/optional/tuple wrapper).  Used to flag an unknown local-var
+    /// type like `bool` without mislabeling a generic whose ARG is the
+    /// culprit (`Tagged<bool>` would otherwise blame the resolvable base
+    /// `Tagged`); those wrapped forms are left to their existing handling.
+    top_level_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
+        if (ann == null) { return null; }
+        match (ann) {
+            TypeAnnotation::Named(n) => { return n; }
+            _ => { return null; }
+        }
+    }
+
     extract_unresolved_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
         mut cur: TypeAnnotation* = ann;
         mut depth: i32 = 0;
@@ -225,6 +238,13 @@ type struct TypeResolutionRunner {
     /// TypeResolution starts.
     collect_bare_type_names(&this) -> string[] {
         mut out: string[] = [];
+        // Seed with the primitive type names: they aren't in the arena leaf
+        // index, so without this a typo like `bool` couldn't suggest
+        // `boolean` (the actual spelling), nor `int`→`i32` etc.
+        out.push("boolean"); out.push("char"); out.push("string"); out.push("void");
+        out.push("i8"); out.push("i16"); out.push("i32"); out.push("i64");
+        out.push("u8"); out.push("u16"); out.push("u32"); out.push("u64");
+        out.push("f32"); out.push("f64");
         const intern: InternTable* = this.ctx.get_intern_table();
         mut it: HashMapIter<u32, u32> = this.arena.leaf_index.iter();
         loop {
@@ -381,8 +401,17 @@ type struct TypeResolutionRunner {
                             const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                             if (vtype.is_valid()) {
                                 var_node.resolved_type = vtype;
+                            } else if (this.top_level_named(var_node.type_annotation) != null) {
+                                // An explicit annotation naming an UNKNOWN type (e.g. `bool`
+                                // — the boolean type is `boolean`).  Emit a clean E0203 with
+                                // a did-you-mean rather than letting the invalid type reach
+                                // codegen (an LLVM verify crash) or be silently dropped.
+                                // This body is non-generic (gated at the caller), so the name
+                                // can't be a deferred generic param; `typeof(...)` and other
+                                // non-Named forms (inferred later) fail the extract guard.
+                                const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
+                                this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span);
                             }
-                            // Don't emit error for local vars; type inference may resolve them later
                         }
                     } else if (decl.kind == NodeKind::DestructureDeclaration) {
                         const dd: DestructureDeclNode* = decl as DestructureDeclNode*;
@@ -403,6 +432,12 @@ type struct TypeResolutionRunner {
                     const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                     if (vtype.is_valid()) {
                         var_node.resolved_type = vtype;
+                    } else if (this.top_level_named(var_node.type_annotation) != null) {
+                        // See the DeclStmt path above: a for-loop init like
+                        // `for (mut i: bool = ...)` naming an unknown type gets a
+                        // clean E0203 instead of a downstream codegen crash.
+                        const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
+                        this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span);
                     }
                 }
             }
