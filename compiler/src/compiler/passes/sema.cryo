@@ -3597,7 +3597,8 @@ public:
                     // their own types and would only get confused (e.g. i32
                     // literal widening to i64 under a u64 param slot).
                     push_expected = true;
-                } else if (is_negative_numeric_literal_expr(arg)) {
+                } else if (is_negative_numeric_literal_expr(arg) &&
+                           this.is_signed_int_type(param_types[i])) {
                     // A negative numeric literal (`-9223372036854775808`)
                     // wraps its magnitude in a UnaryExpression.  Without the
                     // param type, the magnitude defaults to i32 and a wide
@@ -3606,6 +3607,12 @@ public:
                     // magnitude adopts the slot's width.  (Bare positive
                     // literals are still left to their own form to avoid
                     // surprise i32 -> i64 widening under wider param slots.)
+                    //
+                    // ONLY for a SIGNED target: pushing an UNSIGNED param type
+                    // onto a negative literal silently coerces e.g. `-1` to
+                    // 4294967295 (`take_u32(-1)`), the exact footgun assignment
+                    // rejects.  Leaving it unpushed keeps the literal signed so
+                    // the same-width-sign-reinterpret arg gate below flags it.
                     push_expected = true;
                 }
             }
@@ -3933,6 +3940,31 @@ public:
                            i + 1),
                     SourceSpan::none(),
                     arg);
+            } else if (this.checker.is_same_width_sign_reinterpret(arg_ty, param_ty)
+                       && (is_numeric_literal_expr(arg) ||
+                           is_negative_numeric_literal_expr(arg))
+                       && !this.int_literal_fits_target(arg, param_ty)) {
+                // Same-width signedness reinterpretation (i32 <-> u32, i64 <->
+                // u64) preserves bits but flips the VALUE for any top-bit-set
+                // input: `take_u32(-1_i32)` silently arrives as 4294967295.
+                // Assignment already rejects this (E0200 via can_assign); the
+                // call-arg gate was the asymmetric hole.
+                //
+                // Targeted policy: flag only when the argument is a numeric
+                // LITERAL whose magnitude can't be represented in the target
+                // (`take_u32(-1)`) — a definite, statically-known wrong value.
+                // A literal that fits is exempt (`take_u32(5)`), and runtime
+                // i64<->u64 offset/length passing (pervasive and benign in
+                // practice) is left to the caller.
+                this.emit_type_mismatch_with_value(
+                    ErrorCode::E0214_ARGUMENT_MISMATCH,
+                    arg.span,
+                    param_ty,
+                    arg_ty,
+                    format("argument %lld reinterprets the sign of a same-width integer and would silently change its value; add an explicit `as` cast",
+                           i + 1),
+                    SourceSpan::none(),
+                    arg);
             }
         }
     }
@@ -3958,6 +3990,16 @@ public:
         else if (w == 64) { max_mag = SEMA_U64_MAX; }
         if (max_mag == 0) { return false; }
         return !int_literal_exceeds(lit.value, max_mag);
+    }
+
+    /// True when `ty` resolves to a signed integer type.  Used to decide
+    /// whether a negative numeric literal argument may adopt the parameter's
+    /// type: pushing a SIGNED slot's width is the i64::MIN fix; pushing an
+    /// UNSIGNED slot would silently turn `-1` into a huge value.
+    is_signed_int_type(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        return (t as IntType*).int_kind.is_signed();
     }
 
     /// Per-argument type checking for an instance method call
