@@ -136,6 +136,53 @@ function i64_negative_literal_still_negative() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
+// i64::MIN in argument / payload position.
+//
+// `-9223372036854775808` parses as `-(9223372036854775808)`, a
+// UnaryExpression over the 2^63 magnitude.  In const-init position the
+// declared i64 type flowed onto the magnitude, but in a call-argument or
+// enum-payload position resolve_call cleared expected_type for non-
+// call/scope/array args, so the magnitude defaulted to i32 and truncated
+// to its low 32 bits (0), negating to 0.  This silently corrupted JSON
+// parsing of i64::MIN (json/parser.cryo).
+//
+// Fix: resolve_call now pushes the param/payload type for negative
+// numeric literals, and resolve_integer_literal widens its default to
+// the narrowest type that holds the magnitude when no hint is in scope.
+![test]
+function i64_min_via_call_arg() -> Result<(), TestError> {
+    const got:  i64 = ilit_identity(-9223372036854775808);
+    const want: i64 = i64::min_value();
+    return expect_eq(got, want);
+}
+
+![test]
+function i64_min_via_enum_payload() -> Result<(), TestError> {
+    const n: ILitWrap = ILitWrap::Val(-9223372036854775808);
+    const want: i64 = i64::min_value();
+    match (n) {
+        ILitWrap::Val(v) => { return expect_eq(v, want); }
+    }
+}
+
+![test]
+function i64_max_via_call_arg() -> Result<(), TestError> {
+    const got:  i64 = ilit_identity(9223372036854775807);
+    const want: i64 = i64::max_value();
+    return expect_eq(got, want);
+}
+
+![test]
+function small_negative_arg_unaffected() -> Result<(), TestError> {
+    const got:  i64 = ilit_identity(-7);
+    const want: i64 = -7;
+    return expect_eq(got, want);
+}
+
+function ilit_identity(x: i64) -> i64 { return x; }
+
+type enum ILitWrap { Val(i64); }
+
 // Octal literals. The `0o` / `0O` prefix is the language's only octal
 // spelling (docs §1.4). The value parsers used to ignore the prefix
 // (`0o755` decoded to 0) and instead treated a bare leading zero as
