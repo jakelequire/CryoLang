@@ -103,6 +103,17 @@ type struct DropInserter {
     moved_keys:  u32[];
     moved_lines: i32[];
 
+    /// Payload-binding → owning-subject links, active only while walking a
+    /// match's arms.  When a match payload binding (e.g. `s` in
+    /// `match (opt) { Some(s) => ... }`) is marked moved (consumed), its
+    /// linked subject (`opt`) is marked moved too — so an early `return`
+    /// inside the arm doesn't drop the subject whose payload the arm just
+    /// released (drop glue would double-free it).  Parallel arrays keyed by
+    /// SymbolStr id; pushed by register_arm_pattern_bindings, popped by
+    /// check_and_unregister_arm_bindings.
+    link_payload: u32[];
+    link_subject: u32[];
+
     fired:        i64;
     inserted:     i64;
 
@@ -126,6 +137,8 @@ type struct DropInserter {
             loop_boundary:   [],
             moved_keys:      [],
             moved_lines:     [],
+            link_payload:    [],
+            link_subject:    [],
             fired:           0,
             inserted:        0,
             discard_seq:     0,
@@ -231,6 +244,15 @@ type struct DropInserter {
         if (this.is_moved(name)) { return; }
         this.moved_keys.push(name.id);
         this.moved_lines.push(span.start_line as i32);
+        // Propagate to a linked match subject: consuming a payload binding
+        // moves-from the subject it was extracted from, so the subject's glue
+        // must not also drop that payload.  Bounded recursion handles nested
+        // matches (a subject that is itself an outer match's payload).
+        for (mut i: i64 = 0; i < this.link_payload.length; i++) {
+            if (this.link_payload[i] == name.id) {
+                this.mark_moved(SymbolStr::from_id(this.link_subject[i]), span);
+            }
+        }
     }
 
     /// True if a binding with `name` is currently live (registered in an
@@ -789,9 +811,73 @@ type struct DropInserter {
     /// the failure arm of the `?` desugar) the cumulative drops of every
     /// live local, so a droppable local live across `expr?` is freed on
     /// the error path instead of leaked.
+    /// Register an arm's enum-pattern payload bindings in the types map
+    /// (detection only — never the scope, so no drop is synthesized for
+    /// them) using `proxy_ty` as a stand-in non-Copy type.  Returns the
+    /// count registered so the caller can check + unregister them.
+    register_arm_pattern_bindings(mut &this, arm: MatchArmNode*,
+                                  proxy_ty: TypeRef, subject_id: u32) -> i64 {
+        mut count: i64 = 0;
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: PatternNode* = arm.patterns[p];
+            if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
+            const epat: EnumPatternNode* = pat as EnumPatternNode*;
+            for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
+                const pb: PatternBinding* = epat.binding_at(pos);
+                if (pb == null || !pb.name.is_valid()) { continue; }
+                this.register_param_type(pb.name, proxy_ty);
+                this.link_payload.push(pb.name.id);
+                this.link_subject.push(subject_id);
+                count = count + 1;
+            }
+        }
+        return count;
+    }
+
+    /// Pop the last `count` types-map entries (the arm bindings just
+    /// registered, which sit on top after the arm body's own scope balanced
+    /// out) along with their subject links, and report whether any was
+    /// consumed (moved) within the arm.
+    check_and_unregister_arm_bindings(mut &this, count: i64) -> boolean {
+        mut consumed: boolean = false;
+        for (mut k: i64 = 0; k < count; k++) {
+            const idx: i64 = this.types_keys.length - 1;
+            if (idx < 0) { break; }
+            if (this.is_moved_id(this.types_keys[idx])) { consumed = true; }
+            this.types_keys.pop();
+            this.types_refs.pop();
+            if (this.link_payload.length > 0) {
+                this.link_payload.pop();
+                this.link_subject.pop();
+            }
+        }
+        return consumed;
+    }
+
     walk_match_arms(mut &this, subject: ExpressionNode*,
                     arms: MatchArmNode*[], is_expr: boolean) -> boolean {
         if (subject != null) { this.walk_expr_read(subject); }
+
+        // Subject-consumption tracking for drop-glue suppression.  When the
+        // subject is a bare owning binding (e.g. `match (opt) { ... }` where
+        // `opt: Option<String>`), a match payload binding is a copy that
+        // aliases the subject's heap.  If an arm consumes that binding
+        // (`s.drop()` or moving it out), the subject's own scope-exit glue
+        // would free the same storage again — a double-free.  We register
+        // each arm's payload bindings for consumption detection and, if any
+        // arm consumes one, mark the subject moved so its glue is suppressed.
+        // (Borrow-only arms leave the subject live so glue still frees it.)
+        mut subj_name: SymbolStr = SymbolStr::empty();
+        mut subj_ty:   TypeRef   = TypeRef::invalid();
+        if (subject != null && subject.kind == NodeKind::Identifier &&
+            OwnershipQuery::needs_drop(this.arena, this.registry, this.intern,
+                                       subject.resolved_type)) {
+            const sid: IdentifierNode* = subject as IdentifierNode*;
+            subj_name = sid.name;
+            subj_ty   = subject.resolved_type;
+        }
+        mut subject_consumed: boolean = false;
+
         // Each arm is a separate control-flow path; same
         // intersection/union join as walk_if, generalised over N arms.
         if (arms.length == 0) { return false; }
@@ -818,12 +904,30 @@ type struct DropInserter {
         for (mut a: i64 = 0; a < arm_count; a++) {
             const arm: MatchArmNode* = arms[a];
             if (arm == null || arm.body == null) { continue; }
+            // Register this arm's enum-payload bindings for consumption
+            // detection (types-map only, so they never get a spurious
+            // scope-exit drop).  The subject's own type is a sufficient
+            // non-Copy proxy: registration is used purely to make
+            // `.drop()` / move detection see the binding, never to emit a
+            // drop for it.
+            mut reg_count: i64 = 0;
+            if (subj_name.is_valid()) {
+                reg_count = this.register_arm_pattern_bindings(arm, subj_ty, subj_name.id);
+            }
             arm.body = this.wrap_early_exit(arm.body);
             const arm_div: boolean = if (is_expr) {
                 this.walk_stmt_in_place_value(arm.body)
             } else {
                 this.walk_stmt_in_place(arm.body)
             };
+            // A consumed payload binding means the subject was moved-from on
+            // this path; suppress its glue.  Checked before restore_moves so
+            // the in-arm move is still visible.  Always unregisters.
+            if (reg_count > 0) {
+                if (this.check_and_unregister_arm_bindings(reg_count)) {
+                    subject_consumed = true;
+                }
+            }
             if (arm_div) {
                 diverge_count += 1;
                 this.restore_moves(snap);
@@ -873,6 +977,14 @@ type struct DropInserter {
             }
         }
         this.set_moves_tail(snap, def_keys, def_lines);
+        // A payload binding was consumed by some arm → the owning subject is
+        // moved-from after the match.  Mark it so drop-insertion suppresses
+        // its scope-exit glue (preventing a double-free of the payload the
+        // arm already released).  Safe even when only one arm consumes: the
+        // non-consuming arms (e.g. `None`) carry no payload to leak.
+        if (subj_name.is_valid() && subject_consumed && subject != null) {
+            this.mark_moved(subj_name, subject.span);
+        }
         return false;
     }
 
@@ -1088,13 +1200,12 @@ type struct DropInserter {
     type_needs_drop(&this, ty: TypeRef) -> boolean {
         if (!ty.is_valid())   { return false; }
         if (this.is_copy(ty)) { return false; }
-        if (!OwnershipQuery::has_inherent_drop(this.arena, this.registry,
-                                                this.intern, ty) &&
-            !OwnershipQuery::type_implements_drop(this.arena, this.registry,
-                                                    this.intern, ty)) {
-            return false;
-        }
-        return true;
+        // A user drop OR a transitively-droppable aggregate (struct field,
+        // enum payload, tuple/array element).  The aggregate case is lowered
+        // by codegen drop-glue: a `binding.drop()` on a type with no
+        // user-written drop expands to in-place drops of its droppable parts.
+        return OwnershipQuery::needs_drop(this.arena, this.registry,
+                                          this.intern, ty);
     }
 
     maybe_append_drop(mut &this, out: StatementNode*[]*, idx: i64) -> void {
@@ -1257,15 +1368,29 @@ type struct DropInserter {
         // method (e.g. `Box::into_raw`).  This tells the synthesiser
         // not to emit a drop for the consumed binding.
         mut receiver_moved: boolean = false;
-        if (c.resolved_method != null && c.callee != null
-                && c.callee.kind == NodeKind::MemberAccess) {
-            const m: MethodNode* = c.resolved_method as MethodNode*;
-            if (OwnershipQuery::method_consumes_receiver(this.arena, m)) {
-                const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
-                if (ma.object != null) {
-                    this.walk_expr_move(ma.object);
-                    receiver_moved = true;
-                }
+        if (c.callee != null && c.callee.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+            // Does this method consume its receiver (`![sink]` or by-value
+            // `this`)?  Prefer the pinned `resolved_method`; fall back to a
+            // receiver-type + method-name lookup when sema left it null (the
+            // monomorphized-generic-method case — e.g. `opt.unwrap()`).  The
+            // fallback is essential now that drop glue makes the receiver
+            // droppable: without it, an `![sink]` combinator that copies a
+            // payload out would not mark the receiver moved, and glue would
+            // double-free that payload at scope exit.
+            mut consumes: boolean = false;
+            if (c.resolved_method != null) {
+                const m: MethodNode* = c.resolved_method as MethodNode*;
+                consumes = OwnershipQuery::method_consumes_receiver(this.arena, m);
+            }
+            if (!consumes && ma.object != null) {
+                consumes = OwnershipQuery::type_method_consumes(
+                    this.arena, this.registry, this.intern,
+                    ma.object.resolved_type, ma.member);
+            }
+            if (consumes && ma.object != null) {
+                this.walk_expr_move(ma.object);
+                receiver_moved = true;
             }
         }
         if (!receiver_moved && c.callee != null) {
