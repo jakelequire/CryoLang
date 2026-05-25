@@ -30,10 +30,6 @@ import std::collections::hashmap;
 import std::collections::pair;
 
 
-// ============================================================================
-// Helper: Pack two SymbolStr IDs into a u64 for method lookup keys
-// ============================================================================
-
 /// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single
 /// u64 key.  Uses the upper 32 bits for the type and lower 32 bits for the
 /// method name.  Uses bit shift instead of multiply-by-2^32, since the
@@ -43,19 +39,15 @@ function pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
 }
 
 
-// ============================================================================
-// Helper: Determine receiver shape for the v0.2 mangler from an AST node
-// ============================================================================
-
 /// Decode the receiver kind for a method given its AST.  This is the
 /// single source of truth used by every mangler call site so the
 /// produced symbol names converge.
 ///
-///   `&this`          → ImmutRef        (encoded as $s)
-///   `mut &this`      → MutRef          (encoded as $m)
-///   `this` (by value)→ None            (regular first param)
-///   no explicit self → ImmutRef        (implicit `&this` for non-static)
-///   static method    → None
+///   `&this`          -> ImmutRef        (encoded as $s)
+///   `mut &this`      -> MutRef          (encoded as $m)
+///   `this` (by value)-> None            (regular first param)
+///   no explicit self -> ImmutRef        (implicit `&this` for non-static)
+///   static method    -> None
 function method_receiver_kind(func: FunctionDeclNode*, is_static: boolean,
                               intern: InternTable*) -> ReceiverKind {
     if (is_static || func == null) { return ReceiverKind::None; }
@@ -98,27 +90,23 @@ function method_non_receiver_params(func: FunctionDeclNode*,
 }
 
 
-// ============================================================================
-// DeclarationIndex
-// ============================================================================
-
 type struct DeclarationIndex {
-    // Function name → return type
+    // Function name -> return type
     func_returns:   HashMap<u32, TypeRef>;
 
-    // Function name → FunctionType TypeRef (full signature in the arena)
+    // Function name -> FunctionType TypeRef (full signature in the arena)
     func_type_refs: HashMap<u32, TypeRef>;
 
-    // Packed(type_id, method_id) → return type
+    // Packed(type_id, method_id) -> return type
     method_returns: HashMap<u64, TypeRef>;
 
-    // Type name → TypeRef (for struct, class, enum, trait lookups)
+    // Type name -> TypeRef (for struct, class, enum, trait lookups)
     type_map:       HashMap<u32, TypeRef>;
 
-    // Global variable name → TypeRef
+    // Global variable name -> TypeRef
     global_vars:    HashMap<u32, TypeRef>;
 
-    // Reverse: TypeRef.id → SymbolStr.id (for looking up a type's name)
+    // Reverse: TypeRef.id -> SymbolStr.id (for looking up a type's name)
     type_reverse:   HashMap<u64, u32>;
 
     // Per-module declaration ownership.
@@ -137,17 +125,17 @@ type struct DeclarationIndex {
                                       // same private `const NAME = ...` without
                                       // colliding at link time.
 
-    // Bare name → qualified name mapping.
+    // Bare name -> qualified name mapping.
     // When a function is registered under both "printf" and
-    // "std::core::intrinsics::printf", this maps the bare id → qualified id.
+    // "std::core::intrinsics::printf", this maps the bare id -> qualified id.
     // Used by codegen to resolve auto-imported identifiers.
     bare_to_qualified:   HashMap<u32, u32>;
 
-    // Qualified function name → mangled LLVM symbol name.
+    // Qualified function name -> mangled LLVM symbol name.
     // Computed once at registration time so codegen never mangles.
     mangled_names:       HashMap<u32, u32>;
 
-    // Array element TypeRef.id → concrete Array_<T> qualified name SymbolStr.id.
+    // Array element TypeRef.id -> concrete Array_<T> qualified name SymbolStr.id.
     // Populated by the specialization pass so codegen can resolve T[].method()
     // to the monomorphized Array_T struct without name reconstruction.
     array_elem_to_type:  HashMap<u64, u32>;
@@ -164,7 +152,7 @@ type struct DeclarationIndex {
     overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
     overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
 
-    // Bare-name → all qualified names ever registered for it.
+    // Bare-name -> all qualified names ever registered for it.
     // Populated by `register_name_mapping`.
     bare_alts:           Pair<u32, u32>[];    // .first = bare SymbolStr.id, .second = qualified SymbolStr.id
 
@@ -193,9 +181,7 @@ type struct DeclarationIndex {
     }
 
 
-    // ----------------------------------------------------------------
     // Registration (called by TypeResolution & Specialization passes)
-    // ----------------------------------------------------------------
 
     /// Register a function's return type.
     register_function(mut &this, name: SymbolStr, return_type: TypeRef) -> void {
@@ -283,7 +269,7 @@ type struct DeclarationIndex {
         const h: u64 = hash_int(qualified_name.id as u64);
         this.type_map.insert(qualified_name.id, ty);
 
-        // Reverse map: TypeRef.id → qualified name
+        // Reverse map: TypeRef.id -> qualified name
         const rh: u64 = hash_int(ty.id);
         this.type_reverse.insert(ty.id, qualified_name.id);
     }
@@ -305,7 +291,7 @@ type struct DeclarationIndex {
         };
     }
 
-    /// Register a reverse-only mapping (TypeRef → qualified name) without
+    /// Register a reverse-only mapping (TypeRef -> qualified name) without
     /// touching the forward type_map.  Used to make additional TypeRefs
     /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
     /// registered concrete type's qualified name.
@@ -316,7 +302,7 @@ type struct DeclarationIndex {
 
     /// Register a type alias that maps to an existing type without
     /// overwriting the reverse map.  Use this for aliases like
-    /// "double" → f64 or "int" → i32 so that reverse lookup returns
+    /// "double" -> f64 or "int" -> i32 so that reverse lookup returns
     /// the canonical name, not the alias.
     register_type_forward_only(mut &this, alias_name: SymbolStr, ty: TypeRef) -> void {
         const h: u64 = hash_int(alias_name.id as u64);
@@ -507,9 +493,7 @@ type struct DeclarationIndex {
     }
 
 
-    // ----------------------------------------------------------------
     // Lookups (called by Sema and future passes)
-    // ----------------------------------------------------------------
 
     /// Look up a function's return type by name.
     lookup_func_return(&this, name: SymbolStr) -> TypeRef {
@@ -567,9 +551,7 @@ type struct DeclarationIndex {
     }
 
 
-    // ----------------------------------------------------------------
     // Per-module registration (called alongside global registration)
-    // ----------------------------------------------------------------
 
     /// Register a function with its defining module for per-module enumeration.
     register_function_with_module(mut &this, name: SymbolStr, return_type: TypeRef,
@@ -605,7 +587,7 @@ type struct DeclarationIndex {
         // declaration can pick the right LLVM symbol when the bare-name slot
         // has been overwritten by another module's free function (e.g.,
         // `read` is the intrinsic in std::core::intrinsics AND a free
-        // function in std::fs::file; bare "read" → mangled-name maps to
+        // function in std::fs::file; bare "read" -> mangled-name maps to
         // whichever was registered last).
         this.register_overload_mangled(name, func_type_ref, mangled.value);
 
@@ -636,7 +618,7 @@ type struct DeclarationIndex {
         };
     }
 
-    /// Register a bare → qualified name mapping.
+    /// Register a bare -> qualified name mapping.
     /// Called by type_resolution when registering both forms.
     /// Also records the qualified name in the per-bare alternatives list
     /// so codegen can detect ambiguous bare-name fallbacks.
@@ -680,9 +662,7 @@ type struct DeclarationIndex {
         return result;
     }
 
-    // ----------------------------------------------------------------
     // Per-module queries (used by codegen to enumerate module exports)
-    // ----------------------------------------------------------------
 
     /// Get all function names defined in a specific module.
     get_functions_in_module(&this, module: SymbolStr) -> SymbolStr[] {
