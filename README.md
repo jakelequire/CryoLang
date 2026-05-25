@@ -2,7 +2,7 @@
   <img src="./assets/cryo-logo-1.png" alt="Cryo" width="180"/>
   <h1>The Cryo Programming Language</h1>
   <p><i>A statically-typed, compiled systems language with a self-hosted compiler and an LLVM 20 backend.</i></p>
-  <h3><b>1.0.0</b></h3>
+  <h3><b>v1.0.0</b></h3>
   <p>
     <a href="https://github.com/jakelequire/CryoLang/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/jakelequire/CryoLang/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI (build + tests + stage-3=stage-4 selfhost)"/></a>
   </p>
@@ -14,7 +14,7 @@
 namespace Hello;
 
 function main() -> int {
-    println("Hello, world!");
+    printf("Hello, world!");
     return 0;
 }
 ```
