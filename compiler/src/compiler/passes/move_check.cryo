@@ -189,6 +189,21 @@ type struct MoveChecker {
         return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
     }
 
+    /// Whether a value of this type owns a resource that the callee's
+    /// by-value-param drop would free — i.e. reusing it after a by-value
+    /// move could double-free.  Mirrors drop_insertion::type_needs_drop:
+    /// Copy types never drop (the short-circuit matters because primitives
+    /// carry a no-op `Drop` impl), and a non-Copy type drops only if it (or
+    /// a transitive part) owns a destructor.  A non-Copy *non-droppable*
+    /// type (e.g. builtin `string`, a primitive-only struct) is safe to
+    /// reuse after a by-value move: there is no drop to run twice.
+    type_needs_drop(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid())   { return false; }
+        if (this.is_copy(ty)) { return false; }
+        return OwnershipQuery::needs_drop(this.arena, this.registry,
+                                          this.intern, ty);
+    }
+
     mark_moved(mut &this, name: SymbolStr, span: SourceSpan, real: boolean) -> void {
         if (!name.is_valid()) { return; }
         if (this.is_moved(name)) {
@@ -566,16 +581,40 @@ type struct MoveChecker {
         if (!receiver_moved && c.callee != null) {
             this.walk_expr_read(c.callee);
         }
-        // Plain by-value arguments are passed by autoref (hidden
-        // reference) and the callee does not drop them, so an argument is a
-        // borrow, not a storage-duplicating move.  Walk them in READ
-        // context: this still flags using an already-moved value as an
-        // argument, but does NOT itself mark the argument moved — which is
-        // what makes use-after-move precise enough to be a hard error
-        // (the old `walk_expr_move(_, false)` recorded spurious moves and
-        // forced the diagnostic to stay warn-only).
+        // An argument's ownership effect depends on the parameter it binds
+        // to, a decision sema records as `arg.autoref`:
+        //   - autoref'd (lands on a `&T` parameter): codegen passes the
+        //     address and the callee never takes ownership — a borrow.  Walk
+        //     it in READ context: this still flags passing an already-moved
+        //     value, but does not itself mark the argument moved.
+        //   - genuine by-value (lands on a `T` parameter): the value is moved
+        //     into the callee, which drops it at its scope exit (see
+        //     drop_insertion's by-value-param drop).  This is a storage-
+        //     duplicating move of the caller's binding, so reusing it
+        //     afterwards drops the same storage twice.  Walk it in MOVE
+        //     context (real=true) so a later use reports use-after-move and a
+        //     loop-carried reuse — a guaranteed double free — is a hard error.
+        // This mirrors drop_insertion::read_call so both passes agree on which
+        // arguments transfer ownership; an earlier mismatch (move_check saw a
+        // borrow, drop_insertion saw a move) silently double-freed by-value
+        // owning arguments.  The `autoref` gate is what keeps this precise:
+        // walking every argument as a move (the old behavior) recorded
+        // spurious moves on borrows.  Copy args and explicit `&x`/pointer args
+        // fall out via the Copy / address-of guards in `walk_expr_move`.
+        // Only a by-value argument whose type actually needs drop can
+        // double-free on reuse; tracking non-droppable by-value args (e.g.
+        // builtin `string`) as moves would flag harmless reuse as use-after-
+        // move.  The drop side suppresses those drops the same way (its
+        // by-value-param drop is gated on `type_needs_drop`), so gating here
+        // keeps the two passes tracking the identical move set.
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
-            this.walk_expr_read(c.arguments[i]);
+            const arg: ExpressionNode* = c.arguments[i];
+            if (arg == null) { continue; }
+            if (!arg.autoref && this.type_needs_drop(arg.resolved_type)) {
+                this.walk_expr_move(arg, true);
+            } else {
+                this.walk_expr_read(arg);
+            }
         }
         return;
     }
