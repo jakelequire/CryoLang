@@ -1,8 +1,8 @@
-///! Semantic-tokens handler (LSP §3.6.27 — `textDocument/semanticTokens/full`).
+///! Semantic-tokens handler (LSP section 3.6.27 - `textDocument/semanticTokens/full`).
 ///!
 ///! Walks the override-file's AST and emits one `SemanticToken` per
 ///! identifier-bearing span, classified by what the AST says the name
-///! actually IS — function, method, type, parameter, field, etc. — not
+///! actually IS - function, method, type, parameter, field, etc. - not
 ///! by lexer token kind.  This is what fixes the "`from` colors as a
 ///! keyword inside `static from(...)`" bug: even though the lexer sees
 ///! `KwFrom`, the AST sees a `MethodNode` whose `name_span` covers those
@@ -10,11 +10,11 @@
 ///! renderer applies it on top of the TextMate keyword color.
 ///!
 ///! Order of operations:
-///!   1. Resolve URI → session → CompilationContext → ProgramNode.
+///!   1. Resolve URI -> session -> CompilationContext -> ProgramNode.
 ///!   2. Walk the program's top-level statements; for each declaration
 ///!      or expression that owns an identifier span, emit a
 ///!      `SemanticToken` into the collector.
-///!   3. Sort the collector by (line, char) — token emission order
+///!   3. Sort the collector by (line, char) - token emission order
 ///!      across the walk isn't guaranteed to be in source order.
 ///!   4. Encode as the LSP delta-line wire format.
 ///!
@@ -50,13 +50,11 @@ import Lsp::Server::LineIndex;
 import Lsp::Protocol::SemanticTokens;
 
 
-// ============================================================================
 // Per-request statics for receiver-name skip
-// ============================================================================
 //
 // Receiver parameters and the bare `this` expression land here as
 // VarDeclNodes / IdentifierNodes with names "this", "&this", "mut &this",
-// or "&mut this" — the parser stamps the literal source bytes as the
+// or "&mut this" - the parser stamps the literal source bytes as the
 // param name (parser.cryo:1138).  Emitting a `parameter` or `variable`
 // semantic token at those spans overlays the wrong colour onto the
 // `this` keyword (themes render `this` as `keyword`, but `parameter` /
@@ -82,7 +80,7 @@ mut g_intern: InternTable* = null;
 // or the parser failed and the AST holds spans pointing past the
 // current buffer's end).  We validate every span against this index in
 // emit_span and drop tokens whose target line/column don't exist in the
-// editor's current view of the file — better to emit no token for a
+// editor's current view of the file - better to emit no token for a
 // region than to paint at the wrong position.
 mut g_line_index: LineIndex* = null;
 
@@ -92,7 +90,7 @@ mut g_line_index: LineIndex* = null;
 // on tab, so `\tstatic` reports `static` at column 5 (visual cell), while
 // the LSP wire format wants character offset 1 (byte position after the
 // tab).  Without translation, a tab-indented identifier emits a token at
-// the wrong column AND with a clamped length — the editor renders the
+// the wrong column AND with a clamped length - the editor renders the
 // trailing bytes via TextMate fallback, producing the split-color
 // "{semantic-color}sta{textmate}tic" artefact the user reports.
 mut g_doc_text:        string = "";
@@ -100,12 +98,12 @@ mut g_doc_text_length: u64    = 0 as u64;
 
 // Absolute path of the file whose tokens we're emitting.  The
 // monomorphization pass (passes/specialization.cryo) APPENDS specialized
-// AST nodes from generic-instantiation sites — many of them originating
-// in stdlib templates — onto the *current* file's ProgramNode.  Those
+// AST nodes from generic-instantiation sites - many of them originating
+// in stdlib templates - onto the *current* file's ProgramNode.  Those
 // injected nodes carry the TEMPLATE's source span (pointing into stdlib),
 // not the consumer's.  Without filtering by file, the walker emits
 // tokens at line/col positions that don't correspond to anything in the
-// editor's open document — VS Code then paints those spans onto
+// editor's open document - VS Code then paints those spans onto
 // whatever happens to sit at those coordinates in the live buffer,
 // producing the catastrophic "random colors mid-identifier" artefact
 // the user is seeing.  emit_span drops every span whose file string
@@ -113,9 +111,7 @@ mut g_doc_text_length: u64    = 0 as u64;
 mut g_doc_file: string = "";
 
 
-// ============================================================================
 // Entry point
-// ============================================================================
 
 public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
                                         params: &JsonValue) -> JsonValue {
@@ -134,7 +130,7 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     if (!uri_str_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
     const uri: Str = uri_str_opt.unwrap_or(Str::from_cstr(""));
 
-    // -- Resolve session → CompilationContext → ProgramNode -----------
+    // -- Resolve session -> CompilationContext -> ProgramNode -----------
     const session_opt: Option<CompilerSession*> = sessions.get(uri);
     if (!session_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
     const session: CompilerSession* = session_opt.unwrap_or(null);
@@ -172,7 +168,7 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     // Pick up the editor buffer's line index so emit_span can validate
     // every span against the live source.  When the compiler holds a
     // stale AST (parse failed mid-edit, recompile is behind), spans may
-    // point past the current end of file or past a now-shorter line —
+    // point past the current end of file or past a now-shorter line -
     // emit_span drops them.
     g_line_index = null;
     g_doc_text = "";
@@ -196,8 +192,8 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     // -- Sort by (line, start_char) -----------------------------------
     // The delta-line encoding requires monotonically-non-decreasing
     // token positions.  Emission order from the walk follows source
-    // order for most nodes, but a few — type annotations on function
-    // returns, generic params — emit a name span that sits BEFORE the
+    // order for most nodes, but a few - type annotations on function
+    // returns, generic params - emit a name span that sits BEFORE the
     // body's emissions.  A stable sort keeps the result deterministic.
     sort_tokens(&tokens);
 
@@ -228,9 +224,7 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
 }
 
 
-// ============================================================================
-// Walker — recurses through declarations + statements + expressions
-// ============================================================================
+// Walker - recurses through declarations + statements + expressions
 
 function walk_program(prog: ProgramNode*, tokens: mut &Array<SemanticToken>) -> void {
     if (prog == null) { return; }
@@ -375,16 +369,14 @@ function st_walk_node(node: ASTNode*, tokens: mut &Array<SemanticToken>) -> void
         return;
     }
 
-    // Expressions reaching the top-level walker (rare — usually they
+    // Expressions reaching the top-level walker (rare - usually they
     // come in via walk_expr from a containing statement).  Forward to
     // the expression walker.
     walk_expr(node as ExpressionNode*, tokens);
 }
 
 
-// ============================================================================
 // Declaration walkers
-// ============================================================================
 
 function walk_function_decl(f: FunctionDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
     if (f == null) { return; }
@@ -406,7 +398,7 @@ function walk_method_decl(m: MethodNode*, tokens: mut &Array<SemanticToken>) -> 
     if (m == null || m.func == null) { return; }
     const f: FunctionDeclNode* = m.func;
     if (f.has_name_span()) {
-        // The method name span — this is where `from` / `new` / `delete`
+        // The method name span - this is where `from` / `new` / `delete`
         // are coloured `method` instead of `keyword`, because we know
         // contextually that this token site IS a method declaration.
         const mods: u32 = if (m.is_static) {
@@ -472,7 +464,7 @@ function walk_trait_decl(t: TraitDeclNode*, tokens: mut &Array<SemanticToken>) -
     }
     for (mut i: i64 = 0; i < t.methods.length; i++) {
         // Trait methods are FunctionDeclNode in the AST but represent
-        // methods semantically — colour them as methods.
+        // methods semantically - colour them as methods.
         const fn: FunctionDeclNode* = t.methods[i];
         if (fn != null && fn.has_name_span()) {
             emit_span(fn.name_span,
@@ -524,7 +516,7 @@ function walk_var_decl(v: VarDeclNode*, is_parameter: boolean,
     const is_receiver: boolean = is_receiver_name(v.name);
     // Receiver parameters (`&this`, `mut &this`, `this`, ...) keep the
     // literal source bytes as the parameter name.  Don't emit a
-    // `parameter` semantic token for them — the underlying TextMate
+    // `parameter` semantic token for them - the underlying TextMate
     // grammar already renders `this` as a keyword, and our overlay
     // would replace that with the parameter colour.
     if (v.has_name_span() && !is_receiver) {
@@ -593,9 +585,7 @@ function walk_enum_variant(v: EnumVariantNode*, tokens: mut &Array<SemanticToken
 }
 
 
-// ============================================================================
 // Expression walker
-// ============================================================================
 
 function walk_expr(e: ExpressionNode*, tokens: mut &Array<SemanticToken>) -> void {
     if (e == null) { return; }
@@ -658,7 +648,7 @@ function walk_expr(e: ExpressionNode*, tokens: mut &Array<SemanticToken>) -> voi
     if (e.kind == NodeKind::CastExpression) {
         // CastExprNode has fields: expr, target_type; walk the inner
         // expression and the type annotation.  We don't know the
-        // node's exact field names here; the cloner has them — but
+        // node's exact field names here; the cloner has them - but
         // for v1 just descend the span if we can't reach inner fields,
         // skip silently.  Real handling is added when needed.
         return;
@@ -723,7 +713,7 @@ function walk_call_expr(c: CallExprNode*, tokens: mut &Array<SemanticToken>) -> 
     if (c.callee != null) {
         if (c.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = c.callee as IdentifierNode*;
-            // Don't overlay `function` on a bare `this` call site —
+            // Don't overlay `function` on a bare `this` call site -
             // the AST shape `this(args)` is unusual but parses
             // legally and would otherwise paint over the keyword.
             if (!is_receiver_name(id.name)) {
@@ -751,7 +741,7 @@ function walk_new_expr(n: NewExprNode*, tokens: mut &Array<SemanticToken>) -> vo
     if (n == null) { return; }
     // NewExprNode doesn't carry a separate span for the type name;
     // the full `new TypeName(...)` span starts at `new`.  Skip
-    // type-name highlighting here for v1 — the TextMate grammar's
+    // type-name highlighting here for v1 - the TextMate grammar's
     // `[A-Z][a-zA-Z0-9_]*` rule handles bare type names well.
     for (mut i: i64 = 0; i < n.generic_args.length; i++) {
         walk_type_annotation(n.generic_args[i], tokens);
@@ -775,7 +765,7 @@ function walk_struct_literal(s: StructLiteralNode*, tokens: mut &Array<SemanticT
         // FieldInit's span covers the whole `name: value` source range.
         // Emitting `property` over that range overlaps the value tokens
         // (numbers, strings, etc.), and the LSP semantic-tokens client
-        // resolves overlaps by the first-claim winning — which paints
+        // resolves overlaps by the first-claim winning - which paints
         // literals with the property colour.  Trim to the field-name
         // sub-span using the interned name length so the value keeps
         // its own classification (or its TextMate colour if the walker
@@ -823,8 +813,8 @@ function walk_scope_resolution(s: ScopeResolutionNode*, is_callee: boolean,
     // ScopeResolutionNode doesn't store separate spans for `scope_name`
     // and `member_name`; only the combined `span` over `Scope::Member`.
     // We synthesize sub-spans from the interned string lengths:
-    //   • scope: starts at span.start_col, length = strlen(scope_name)
-    //   • member: ends at span.end_col, length = strlen(member_name)
+    //   - scope: starts at span.start_col, length = strlen(scope_name)
+    //   - member: ends at span.end_col, length = strlen(member_name)
     // The `::` separator and any generic-arg list (`<T,U>`) between
     // them are left to the TextMate grammar.  This is enough to give
     // `Vec` and `new` the right colors in `Vec<T>::new(...)`.
@@ -885,9 +875,7 @@ function walk_match_arm(arm: MatchArmNode*, tokens: mut &Array<SemanticToken>) -
 }
 
 
-// ============================================================================
-// Type-annotation walker — emits `type` tokens for named annotations
-// ============================================================================
+// Type-annotation walker - emits `type` tokens for named annotations
 
 function walk_type_annotation(ann: TypeAnnotation*, tokens: mut &Array<SemanticToken>) -> void {
     if (ann == null) { return; }
@@ -946,9 +934,7 @@ function walk_type_annotation(ann: TypeAnnotation*, tokens: mut &Array<SemanticT
 }
 
 
-// ============================================================================
 // Token emission + sorting
-// ============================================================================
 
 /// Emit a single token for `span`, classified as (`type_id`, `modifiers`).
 /// Converts compiler 1-based line/col to LSP 0-based, and clamps the
@@ -957,7 +943,7 @@ function walk_type_annotation(ann: TypeAnnotation*, tokens: mut &Array<SemanticT
 ///
 /// Validates the span against the editor buffer's line index when one
 /// is available: a token whose target line doesn't exist in the live
-/// source — or whose start column sits past the line's end — is
+/// source - or whose start column sits past the line's end - is
 /// silently dropped.  This is the safety net for stale spans coming
 /// out of a parse failure or a lagged recompile, which would otherwise
 /// paint at the wrong place after the user inserts a newline or shrinks
@@ -973,7 +959,7 @@ function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
     // ProgramNode for `main.cryo` ends up containing nodes whose spans
     // point into `option.cryo`, `array.cryo`, etc.  Without this guard
     // the walker emits tokens at those line/col positions in the open
-    // editor buffer, which lands them on entirely unrelated source —
+    // editor buffer, which lands them on entirely unrelated source -
     // exactly the catastrophic mis-coloring (e.g., a struct token
     // landing on `int = 5;`) the user reported.
     if (g_doc_file != "" && span.file != "" && !file_paths_equal(span.file, g_doc_file)) {
@@ -1010,7 +996,7 @@ function emit_span(span: SourceSpan, type_id: u32, modifiers: u32,
         if (line_bytes > 0 && line as u64 + 1 < g_line_index.line_count()) {
             line_bytes = line_bytes - 1;            // strip trailing \n
         }
-        // Trim a trailing \r if present (CRLF input — line_index counts
+        // Trim a trailing \r if present (CRLF input - line_index counts
         // \n only, so the \r sits inside line_bytes).
         if (line_bytes > 0 as u64 && (line_start + line_bytes - 1) < g_doc_text_length) {
             const last_byte: u8 = g_doc_text[(line_start + line_bytes - 1) as i64] as u8;
@@ -1065,7 +1051,7 @@ function file_paths_equal(a: string, b: string) -> boolean {
 /// cells and return the 0-indexed BYTE offset corresponding to the
 /// 1-indexed cell column `target_cell`.  Mirrors the lexer's column
 /// accounting (`SourceLocation::increment_char`): tab jumps to the
-/// next multiple of 4 (1-indexed → 1, 5, 9, ...), every other byte
+/// next multiple of 4 (1-indexed -> 1, 5, 9, ...), every other byte
 /// advances one cell.  This is the inverse used by the LSP to map
 /// parser-reported columns back to wire-format character offsets.
 function cell_col_to_byte_col(line: string, line_bytes: u64, target_cell: u32) -> u32 {
@@ -1089,15 +1075,15 @@ function cell_col_to_byte_col(line: string, line_bytes: u64, target_cell: u32) -
 
 /// In-place insertion sort by (line, start_char).  Token counts per
 /// file are modest (a few thousand at most for stdlib-sized files);
-/// insertion sort's O(n²) is fine and avoids allocating a temporary.
+/// insertion sort's O(n2) is fine and avoids allocating a temporary.
 /// Stable: ties preserve emission order, which matters for sub-token
 /// emissions on the same span (a future enhancement could legitimately
-/// emit overlapping tokens — e.g. modifier-stacking — and stable order
+/// emit overlapping tokens - e.g. modifier-stacking - and stable order
 /// keeps the result deterministic).
 function sort_tokens(tokens: mut &Array<SemanticToken>) -> void {
     // Index/mutate through the raw element pointer.  Cryo's `mut &Array<T>`
-    // reference doesn't support `tokens[i]` directly — only method calls
-    // (push/get/length) — so we drop to the underlying buffer for the
+    // reference doesn't support `tokens[i]` directly - only method calls
+    // (push/get/length) - so we drop to the underlying buffer for the
     // in-place sort.  No element is dropped or replaced wholesale, so the
     // Array invariants stay intact.
     const data: SemanticToken* = tokens.as_ptr();
@@ -1118,8 +1104,8 @@ function token_lt(a: SemanticToken, b: SemanticToken) -> boolean {
     if (a.line > b.line) { return false; }
     if (a.start_char != b.start_char) { return a.start_char < b.start_char; }
     // Same (line, start_char): wider tokens first.  Combined with the
-    // subsequent dedup pass — which drops anything overlapping with the
-    // previously-kept token — this collapses two identical-start tokens
+    // subsequent dedup pass - which drops anything overlapping with the
+    // previously-kept token - this collapses two identical-start tokens
     // to whichever covers more bytes.  That matches VS Code's TextMate
     // fallback for the non-covered tail: if our narrow emit also got an
     // equally-narrow duplicate, the wider one wins and we lose nothing.
@@ -1127,8 +1113,8 @@ function token_lt(a: SemanticToken, b: SemanticToken) -> boolean {
 }
 
 /// Walk the sorted token list and drop:
-///   • exact duplicates (same line, start_char, length, type, modifiers)
-///   • later tokens whose range starts inside the previously-kept
+///   - exact duplicates (same line, start_char, length, type, modifiers)
+///   - later tokens whose range starts inside the previously-kept
 ///     token's range
 ///
 /// In-place: rewrites the array's prefix and truncates.  Preserves sort
@@ -1145,7 +1131,7 @@ function dedup_overlapping(tokens: mut &Array<SemanticToken>) -> void {
     for (mut read: u64 = 1; read < n; read++) {
         const cur: SemanticToken = data[read];
 
-        // Exact duplicate of the last kept token → drop.
+        // Exact duplicate of the last kept token -> drop.
         if (cur.line == last.line && cur.start_char == last.start_char
                 && cur.length == last.length
                 && cur.token_type == last.token_type
@@ -1153,7 +1139,7 @@ function dedup_overlapping(tokens: mut &Array<SemanticToken>) -> void {
             continue;
         }
 
-        // Overlap on the same line → drop the later (narrower or
+        // Overlap on the same line -> drop the later (narrower or
         // duplicate-range) token, keeping the previously-emitted one.
         if (cur.line == last.line && cur.start_char < last_end_char) {
             continue;
@@ -1176,10 +1162,8 @@ function dedup_overlapping(tokens: mut &Array<SemanticToken>) -> void {
 }
 
 
-// ============================================================================
-// URI helpers — duplicated from hover/definition for now; consolidate
+// URI helpers - duplicated from hover/definition for now; consolidate
 // when the third copy lands.
-// ============================================================================
 
 const FILE_SCHEME:     string = "file://";
 const FILE_SCHEME_LEN: u64    = 7;

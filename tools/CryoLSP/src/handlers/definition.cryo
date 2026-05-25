@@ -2,16 +2,16 @@
 ///!
 ///! Locates the AST node under the cursor and resolves it to a target
 ///! declaration's name span.  Returns an LSP `Location { uri, range }`
-///! pointing at the declared identifier — so the editor jumps to the
+///! pointing at the declared identifier - so the editor jumps to the
 ///! exact name token, not the whole declaration.
 ///!
 ///! Dispatch order (mirrors hover):
 ///!
-///!   1. Cursor on a declaration's own name      → return self
-///!   2. `Foo::bar` (ScopeResolution)            → method, then function
-///!   3. `obj.method` (MemberAccess)             → method on receiver type
-///!   4. Identifier use site                     → resolver span → Symbol
-///!   5. Type token in an annotation             → declaring struct/class/etc.
+///!   1. Cursor on a declaration's own name      -> return self
+///!   2. `Foo::bar` (ScopeResolution)            -> method, then function
+///!   3. `obj.method` (MemberAccess)             -> method on receiver type
+///!   4. Identifier use site                     -> resolver span -> Symbol
+///!   5. Type token in an annotation             -> declaring struct/class/etc.
 ///!
 ///! Returns `null` (the LSP-spec "no definition" reply) when the cursor
 ///! lands somewhere that has no jump target (a literal, whitespace, a
@@ -111,7 +111,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 
     mut target_span: SourceSpan = SourceSpan::none();
 
-    // 1. Cursor on a declaration's own name → return that name span.
+    // 1. Cursor on a declaration's own name -> return that name span.
     //    "Go to definition" on the definition itself is a no-op jump
     //    in most editors, but emitting the span keeps the protocol
     //    consistent (the editor may choose to highlight, peek, etc.).
@@ -141,7 +141,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 
     // 1.6. Namespace-decl segment go-to (`std`, `net` in
     //      `namespace std::net::socket_addr;`) and qualified
-    //      `public module …;` decls.  Both lower into the same
+    //      `public module ...;` decls.  Both lower into the same
     //      `ModuleDeclNode`, so they share the dispatch.
     if (!target_span.has_location() && node.kind == NodeKind::ModuleDeclaration) {
         const md: ModuleDeclNode* = node as ModuleDeclNode*;
@@ -158,10 +158,10 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     // 1.7. Impl-block head:
     //        `implement [trait <Trait> for] [struct|enum|class] <Target>`
     //      Two sub-positions:
-    //        • cursor on a NamedAnnotation inside `trait_annotation`
-    //          → jump to the trait declaration
-    //        • cursor on `target_type_span`
-    //          → jump to the target type's declaration
+    //        - cursor on a NamedAnnotation inside `trait_annotation`
+    //          -> jump to the trait declaration
+    //        - cursor on `target_type_span`
+    //          -> jump to the target type's declaration
     //      The locator stops at ImplBlockNode for impl-head positions
     //      (it only descends into methods), so dispatch routes here.
     if (!target_span.has_location() && node.kind == NodeKind::ImplementationBlock) {
@@ -189,7 +189,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
         }
     }
 
-    // 2. `Foo::bar` — try method on `Foo`, then a free function `bar`.
+    // 2. `Foo::bar` - try method on `Foo`, then a free function `bar`.
     //    Mirrors hover's resolution; falls through when neither hits.
     if (!target_span.has_location() && node.kind == NodeKind::ScopeResolution) {
         const sr: ScopeResolutionNode* = node as ScopeResolutionNode*;
@@ -204,7 +204,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
                 target_span = f.name_span;
             } else {
                 // Last resort: jump to the type/module named on the
-                // scope side — useful for `Foo::Bar` where `Bar` is
+                // scope side - useful for `Foo::Bar` where `Bar` is
                 // a nested type or a constant on `Foo`.
                 const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, sr.scope_name);
@@ -215,19 +215,19 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
         }
     }
 
-    // 3. `obj.member` — receiver's resolved type → method or field on
+    // 3. `obj.member` - receiver's resolved type -> method or field on
     //    that type.  `find_innermost_node_at` returns MemberAccess only
     //    when the cursor is past the receiver (on the dot or member
     //    token), so cursor-on-receiver naturally falls through to (4).
     //
     //    Mirrors hover's resolution:
-    //      • `unwrap_to_carrier` peels Reference / Pointer /
-    //        InstantiatedType wrappers so `&Foo<T>` → `Foo`, since
+    //      - `unwrap_to_carrier` peels Reference / Pointer /
+    //        InstantiatedType wrappers so `&Foo<T>` -> `Foo`, since
     //        methods and fields register against the carrier TypeRef.
-    //      • `is_member_access_callee` decides field-first vs
+    //      - `is_member_access_callee` decides field-first vs
     //        method-first: `obj.member(args)` commits to a method,
     //        bare `obj.member` prefers a field of the same name.
-    //      • Each path falls through to the other on miss — function-
+    //      - Each path falls through to the other on miss - function-
     //        pointer fields and bare method references both exist.
     if (!target_span.has_location() && node.kind == NodeKind::MemberAccess) {
         const ma: MemberAccessNode* = node as MemberAccessNode*;
@@ -269,17 +269,17 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
         }
     }
 
-    // 4. Identifier use site → resolver's span→symbol map → declaring
+    // 4. Identifier use site -> resolver's span->symbol map -> declaring
     //    span on the symbol record.  Covers locals, params, fields
     //    accessed via plain identifiers, and free-function references.
-    //    Builtins (`i32`, `bool`, …) come back with an empty
+    //    Builtins (`i32`, `bool`, ...) come back with an empty
     //    declaring span and are filtered at the bottom.
     //
     //    `this` is special: it parses as an IdentifierNode but the
     //    resolver has no symbol entry for it (it's the synthesised
     //    receiver, not a user-bound name).  Recover the carrier type
     //    by finding the enclosing method's owner and jumping to that
-    //    struct/class/enum's name span — same trick hover uses.
+    //    struct/class/enum's name span - same trick hover uses.
     //
     //    `Symbol::declaring_span` is stamped at registration time and
     //    typically covers the whole decl statement.  Walk the target
@@ -289,7 +289,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     if (!target_span.has_location() && node.kind == NodeKind::Identifier) {
         const id_node: IdentifierNode* = node as IdentifierNode*;
 
-        // `this` → enclosing method's owner type.
+        // `this` -> enclosing method's owner type.
         if (id_node.name.is_valid()
                 && ctx.intern_table != null
                 && id_node.span.has_location()) {
@@ -308,7 +308,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
             }
         }
 
-        // Regular identifier path: resolver span → symbol → decl.
+        // Regular identifier path: resolver span -> symbol -> decl.
         if (!target_span.has_location() && ctx.resolver != null) {
             const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
             if (sym_id.is_valid()) {
@@ -323,7 +323,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 
     // 5. Cursor on a type token inside an annotation (the locator
     //    can't descend into TypeAnnotation, so the walk stops at the
-    //    enclosing decl — function, variable, field, type alias).
+    //    enclosing decl - function, variable, field, type alias).
     //    Find the innermost named segment under the cursor, then
     //    look up its declaring struct/class/enum/trait/typealias.
     if (!target_span.has_location()) {
@@ -349,13 +349,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 }
 
 
-// ============================================================================
-// Span narrowing
-// ============================================================================
-
-// ============================================================================
 // Import-segment helpers (mirror the hover dispatch)
-// ============================================================================
 
 /// Index into `imp.path_segments` whose span contains the cursor,
 /// or -1 when the cursor is on `import`, `;`, or a `::` separator.
@@ -439,7 +433,7 @@ function jump_to_namespace(graph: ModuleGraph*, literal: string) -> JsonValue {
 /// `ModuleDeclNode` in the program's statement list (the convention
 /// the parser establishes by lowering namespace decls into module
 /// decls).  Falls back to `SourceSpan::none()` when there's no
-/// namespace statement — keeps the caller's `has_location` filter
+/// namespace statement - keeps the caller's `has_location` filter
 /// from shipping a bad jump.
 function first_namespace_decl_span(prog: ProgramNode*) -> SourceSpan {
     if (prog == null) { return SourceSpan::none(); }
@@ -526,7 +520,7 @@ function drop_path_components(path: string, n: i64) -> string {
 }
 
 /// Build an LSP `Location` JSON pointing at the start of `fs_path`
-/// (line 0, col 0 — no useful sub-range).  Used when the target
+/// (line 0, col 0 - no useful sub-range).  Used when the target
 /// file isn't loaded so we can't pinpoint its namespace decl, but
 /// can still get the user to the right file.
 function build_file_start_location(fs_path: string) -> JsonValue {
@@ -543,14 +537,12 @@ function build_file_start_location(fs_path: string) -> JsonValue {
 }
 
 
-// ============================================================================
 // Span narrowing
-// ============================================================================
 
 /// Walk the module graph to find the decl node at `decl_span` and
 /// return its `name_span` (the narrow range covering just the
 /// declared identifier).  Falls back to `decl_span` itself when no
-/// decl can be located — e.g. synthetic spans from sema.  Used so
+/// decl can be located - e.g. synthetic spans from sema.  Used so
 /// jumps from identifier use sites land on the name rather than
 /// underlining the whole decl line.
 function narrow_to_name_span(graph: ModuleGraph*, decl_span: SourceSpan) -> SourceSpan {
@@ -573,9 +565,7 @@ function narrow_to_name_span(graph: ModuleGraph*, decl_span: SourceSpan) -> Sour
 }
 
 
-// ============================================================================
 // Annotation lookup on the located decl
-// ============================================================================
 
 /// Return the type-annotation tree attached to `node`, if any.
 /// Used by the type-token branch to find which named segment the
@@ -609,13 +599,11 @@ function annotation_for_node(node: ASTNode*) -> TypeAnnotation* {
 }
 
 
-// ============================================================================
 // JSON / span / URI helpers
 //
 // Duplicated from hover.cryo for now; consolidating into a shared
 // `Lsp::Protocol` helper module is a follow-up cleanup once a third
 // handler lands that needs them.
-// ============================================================================
 
 const FILE_SCHEME:     string = "file://";
 const FILE_SCHEME_LEN: u64    = 7;
@@ -623,7 +611,7 @@ const FILE_SCHEME_LEN: u64    = 7;
 /// Build an LSP `Location` JSON object from a span whose `file`
 /// field carries the absolute filesystem path (the parser stamps
 /// every span with the source it came from).  Reconstructs the URI
-/// by prepending `file://` — the inverse of `uri_to_fs_path`.
+/// by prepending `file://` - the inverse of `uri_to_fs_path`.
 function build_location_json(span: SourceSpan) -> JsonValue {
     mut uri_buf: String = String::with_capacity(strlen(span.file) + FILE_SCHEME_LEN);
     uri_buf.push_cstr(FILE_SCHEME);
@@ -650,7 +638,7 @@ function uri_to_fs_path(uri: Str) -> Str {
 }
 
 /// Read an integer field (`line` / `character`) from a JSON Position.
-/// Negative or non-integer values clamp to 0 — the LSP spec says
+/// Negative or non-integer values clamp to 0 - the LSP spec says
 /// positions must be non-negative, but malformed clients exist.
 function json_u32_field(obj: &JsonValue, key: string) -> u32 {
     match (obj.get(Str::from_cstr(key))) {
@@ -678,13 +666,13 @@ function json_u32_field(obj: &JsonValue, key: string) -> u32 {
 }
 
 /// Strip Reference, Pointer, and InstantiatedType wrappers from `ty`
-/// until a "carrier" type — the actual struct / class / enum the
-/// receiver names — is reached.  Method and field declarations
+/// until a "carrier" type - the actual struct / class / enum the
+/// receiver names - is reached.  Method and field declarations
 /// register against the carrier's TypeRef, never against the borrow
 /// form or the spec instantiation wrapper, so any DI lookup that
 /// expects to find `Foo::bar` from a `&Foo<T>` receiver must unwrap
 /// first.  Caps the chain at 6 hops as a safety net against
-/// malformed type arenas — a self-referential pointer would otherwise
+/// malformed type arenas - a self-referential pointer would otherwise
 /// loop forever.  Duplicated from hover.cryo for now; consolidates
 /// into a shared helper module once a third handler needs it.
 function unwrap_to_carrier(ty: TypeRef, arena: TypeArena*) -> TypeRef {

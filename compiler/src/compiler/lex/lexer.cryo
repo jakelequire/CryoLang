@@ -42,7 +42,6 @@ public:
 
     lex(&this) -> Token[] {
         LOG_DEBUG(LogComponent::Lexer, "[Lexer] lex() entry: file=%s", this.file.path());
-        // --- Load file content ---
         match (this.file.load()) {
             Result::Ok(_) => { /* File loaded successfully */ }
             Result::Err(err) => {
@@ -53,13 +52,11 @@ public:
 
         LOG_DEBUG(LogComponent::Lexer, "[Lexer] File loaded, size=%d bytes", this.file.size());
 
-        // --- Initialize buffer pointers ---
         this.buffer       = this.file.content();
         this.buffer_start = this.buffer;
         this.buffer_end   = intrinsics::ptr_add(this.buffer as void*, this.file.size() as i64) as string;
         this.current      = this.buffer_start;
 
-        // --- Lex all tokens ---
         mut tokens: Token[] = [];
 
         while (!this.at_end()) {
@@ -68,7 +65,6 @@ public:
             this.previous_token = tok;
         }
 
-        // --- Append EOF ---
         const eof: Token = this.make_token(TokenType::EOF, "");
         tokens.push(eof);
 
@@ -84,7 +80,7 @@ private:
             return this.make_token(TokenType::EOF, "");
         }
 
-        // --- Comments must be detected BEFORE advance() ---
+        // Comments must be detected BEFORE advance():
         // Check for // and /* patterns using peek/peek_ahead to avoid
         // relying on post-advance pointer arithmetic (this.current - 1).
         if (this.peek() == '/') {
@@ -112,27 +108,22 @@ private:
         const token_start: string = this.current;
         const c: char = this.advance();
 
-        // --- Identifier or keyword ---
         if (Lexer::is_alpha(c)) {
             return this.lex_identifier();
         }
 
-        // --- Number ---
         if (Lexer::is_digit(c)) {
             return this.lex_number();
         }
 
-        // --- String literal ---
         if (c == '"') {
             return this.lex_string(c);
         }
 
-        // --- Character literal ---
         if (c == '\'') {
             return this.lex_character();
         }
 
-        // --- Punctuators ---
         const punct_kind: TokenType = this.lex_punctuator(c);
         if (punct_kind != TokenType::Unknown) {
             const punct_len: u64 = (this.current as i64 - token_start as i64) as u64;
@@ -144,7 +135,6 @@ private:
         return this.emit_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, "Unexpected character");
     }
 
-    // --- Internal helper methods for lexing ---
     lex_identifier(&this) -> Token {
         // Back up one character: lex_token() already consumed the first char via advance()
         const start: string = intrinsics::ptr_add(this.current as void*, -1) as string;
@@ -171,7 +161,7 @@ private:
 
         mut is_special_base: boolean = false;
 
-        // --- Special base prefixes (0x, 0b, 0o) ---
+        // Special base prefixes (0x, 0b, 0o)
         if (*start == '0' && !this.at_end()) {
             const prefix: char = this.peek();
 
@@ -227,13 +217,11 @@ private:
             }
         }
 
-        // --- Decimal digits (skipped for special bases) ---
         if (!is_special_base) {
             while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
                 this.advance();
             }
 
-            // --- Decimal point ---
             if (!this.at_end() && this.peek() == '.') {
                 const next: char = this.peek_ahead(1);
                 if (Lexer::is_digit(next)) {
@@ -244,7 +232,6 @@ private:
                 }
             }
 
-            // --- Exponent ---
             if (!this.at_end() && (this.peek() == 'e' || this.peek() == 'E')) {
                 this.advance();
                 if (!this.at_end()) {
@@ -258,7 +245,7 @@ private:
             }
         }
 
-        // --- Type suffixes (u8, i32, f64, etc.) ---
+        // Type suffixes (u8, i32, f64, etc.)
         if (!this.at_end() && Lexer::is_alpha(this.peek())) {
             const suffix_start: string = this.current;
 
@@ -275,7 +262,6 @@ private:
             }
         }
 
-        // --- Build token ---
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = substr(start, 0, len);
 
@@ -292,7 +278,6 @@ private:
 
         const start: string = this.current;
 
-        // --- Consume string body ---
         while (!this.at_end() && this.peek() != quote) {
             if (this.peek() == '\\' && !this.at_end()) {
                 this.advance(); // consume backslash
@@ -307,7 +292,6 @@ private:
             }
         }
 
-        // --- Unterminated check ---
         if (this.at_end()) {
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated string literal at line %d", this.current_location.line);
             return this.emit_error_close_literal(
@@ -318,7 +302,7 @@ private:
 
         this.advance(); // consume closing quote
 
-        // --- Extract raw content (without surrounding quotes) ---
+        // Extract raw content without surrounding quotes:
         // `start` already points past the opening quote, so offset=0.
         // Subtract 1 for the closing quote that was just consumed.
         const raw_len: u64 = (this.current as i64 - start as i64 - 1) as u64;
@@ -340,7 +324,7 @@ private:
     lex_character(&this) -> Token {
         const start: string = this.current;
 
-        // --- Escape sequence ---
+        // Escape sequence
         if (this.peek() == '\\') {
             this.advance(); // consume backslash
             if (!this.at_end()) {
@@ -357,7 +341,7 @@ private:
                 }
             }
         } else {
-            // --- UTF-8 multi-byte character handling ---
+            // UTF-8 multi-byte character handling
             const first_byte: u8 = this.peek() as u8;
 
             if (first_byte < 0x80 as u8) {
@@ -396,7 +380,6 @@ private:
             }
         }
 
-        // --- Expect closing quote ---
         if (this.at_end() || this.peek() != '\'') {
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated character literal at line %d", this.current_location.line);
             return this.emit_error_close_literal(
@@ -406,7 +389,6 @@ private:
         }
         this.advance(); // consume closing '\''
 
-        // --- Build the lexeme from start to current ---
         // `start` points past the opening quote; subtract 1 for closing quote.
         const len: u64 = (this.current as i64 - start as i64 - 1) as u64;
         const lexeme: string = substr(start, 0, len);
@@ -420,14 +402,12 @@ private:
         const start: string = intrinsics::ptr_add(this.current as void*, -1) as string;
         const opener: char = *this.current as char;
 
-        // --- Line comment (//) ---
         if (opener == '/') {
             this.advance(); // consume second '/'
             while (!this.at_end() && this.peek() != '\n') {
                 this.advance();
             }
 
-        // --- Block comment (/* ... */) ---
         } else if (opener == '*') {
             this.advance(); // consume '*'
 
@@ -444,7 +424,6 @@ private:
             }
         }
 
-        // --- Build token ---
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = substr(start, 0, len);
 
@@ -457,7 +436,6 @@ private:
         const start: string = intrinsics::ptr_add(this.current as void*, -1) as string;
         mut doc_kind: TokenType = TokenType::Unknown;
 
-        // --- Line doc comment (///) ---
         if (this.peek() == '/' && this.peek_ahead(1) == '/') {
             doc_kind = TokenType::DocCommentLine;
             this.advance(); // consume second '/'
@@ -472,7 +450,6 @@ private:
                 this.advance();
             }
 
-        // --- Block doc comment (/**) ---
         } else if (this.peek() == '*' && this.peek_ahead(1) == '*') {
             doc_kind = TokenType::DocCommentBlock;
             this.advance(); // consume '*'
@@ -498,12 +475,10 @@ private:
                 this.advance();
             }
 
-        // --- Fallback ---
         } else {
             return this.lex_comment();
         }
 
-        // --- Build token ---
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = substr(start, 0, len);
 
@@ -644,7 +619,6 @@ private:
         while(!this.at_end() && Lexer::is_whitespace(this.peek())) {
             const c: char = this.peek();
             if (c == '\n') {
-                // Advance the string pointer on `current`
                 this.current = intrinsics::ptr_add(this.current as void*, 1) as string;
                 this.current_location.newline();
             } else {
@@ -760,7 +734,6 @@ private:
     }
 
 private:
-    // --- Internal static helper methods ---
     static is_alpha(c: char) -> boolean {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
     }
@@ -859,7 +832,6 @@ private:
             }
         }
 
-        // Null-terminate
         *(buf + wi) = '\0';
         return buf;
     }

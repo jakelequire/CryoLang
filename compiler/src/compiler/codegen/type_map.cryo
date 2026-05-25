@@ -23,9 +23,7 @@ import Compiler::Resolver::QualifiedName;
 import std::collections::pair;
 
 
-// ============================================================================
 // Cross-module shared type cache
-// ============================================================================
 //
 // Why this is a module-level singleton:
 // One CodegenContext (and one TypeMapper) is constructed per Cryo module.
@@ -87,7 +85,7 @@ function get_shared_type_cache() -> TypeMapperCache* {
 }
 
 /// Drop the shared type cache so the next codegen pass starts with an
-/// empty (TypeRef.id → LLVMTypeRef) map.  Required when running
+/// empty (TypeRef.id -> LLVMTypeRef) map.  Required when running
 /// multiple project compiles in the same process; TypeArena.next_id
 /// resets to 1 per compile, so cached entries from a prior compile
 /// would otherwise be returned for unrelated types in the new compile.
@@ -95,10 +93,6 @@ function reset_shared_type_cache() -> void {
     g_shared_type_cache = null;
 }
 
-
-// ============================================================================
-// TypeMapper
-// ============================================================================
 
 type struct TypeMapper {
     arena:  TypeArena*;
@@ -117,13 +111,11 @@ type struct TypeMapper {
             return LType::null();
         }
 
-        // Check cache first.
         const cached: LType = this.lookup_cache(ty.id);
         if (cached.is_valid()) {
             return cached;
         }
 
-        // Look up the Cryo type in the arena.
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null) {
             return LType::null();
@@ -183,9 +175,7 @@ type struct TypeMapper {
     }
 
 
-    // ========================================================================
     // Internal dispatch
-    // ========================================================================
 
     map_type_impl(mut &this, t: Type*) -> LType {
         return match (t.kind) {
@@ -217,21 +207,19 @@ type struct TypeMapper {
     }
 
 
-    // ========================================================================
     // Primitive type mappers
-    // ========================================================================
 
-    /// Unit type → empty struct {}
+    /// Unit type -> empty struct {}
     map_unit(mut &this) -> LType {
         return LType::literal_struct(null, 0, false);
     }
 
-    /// IntType → LLVMIntType with correct bit width.
+    /// IntType -> LLVMIntType with correct bit width.
     map_int(mut &this, t: IntType*) -> LType {
         return LType::int_type(t.int_kind.bit_width() as u32);
     }
 
-    /// FloatType → LLVMFloatType or LLVMDoubleType.
+    /// FloatType -> LLVMFloatType or LLVMDoubleType.
     map_float(mut &this, t: FloatType*) -> LType {
         return match (t.float_kind) {
             FloatKind::F32 => { LType::f32() }
@@ -239,7 +227,7 @@ type struct TypeMapper {
         };
     }
 
-    /// String → i8* (null-terminated C string pointer).
+    /// String -> i8* (null-terminated C string pointer).
     /// When a proper fat-pointer string type is introduced later,
     /// this will change to a named struct { i8*, i64 } with runtime support.
     map_string(mut &this) -> LType {
@@ -247,11 +235,9 @@ type struct TypeMapper {
     }
 
 
-    // ========================================================================
     // Compound type mappers
-    // ========================================================================
 
-    /// Pointer → LLVMPointerType(pointee, 0)
+    /// Pointer -> LLVMPointerType(pointee, 0)
     map_pointer(mut &this, t: PointerType*) -> LType {
         const pointee: LType = this.map_type(t.pointee);
         if (!pointee.is_valid()) {
@@ -266,7 +252,7 @@ type struct TypeMapper {
         return LType::pointer_to(pointee);
     }
 
-    /// Reference → pointer at IR level.
+    /// Reference -> pointer at IR level.
     map_reference(mut &this, t: ReferenceType*) -> LType {
         const referent: LType = this.map_type(t.referent);
         if (!referent.is_valid()) {
@@ -279,7 +265,7 @@ type struct TypeMapper {
         return LType::pointer_to(referent);
     }
 
-    /// Array → fixed: [N x T]; dynamic: { T*, i64, i64 }
+    /// Array -> fixed: [N x T]; dynamic: { T*, i64, i64 }
     /// Dynamic layout must match stdlib's `Array<T>` struct
     /// (`stdlib/collections/array.cryo`: ptr, len, cap) so that calls to
     /// `Array<T>::push`/`pop`/`reserve` operate on `T[]` fields safely.
@@ -305,7 +291,7 @@ type struct TypeMapper {
         return result;
     }
 
-    /// FunctionType → LLVMFunctionType(ret, params, is_variadic)
+    /// FunctionType -> LLVMFunctionType(ret, params, is_variadic)
     map_function(mut &this, t: FunctionType*) -> LType {
         // Function values are always passed as pointers in LLVM; you cannot
         // allocate a function type on the stack.  Return an opaque pointer type.
@@ -314,7 +300,7 @@ type struct TypeMapper {
         return LType::pointer_to(LType::i8());
     }
 
-    /// Tuple → anonymous struct { elem0, elem1, ... }
+    /// Tuple -> anonymous struct { elem0, elem1, ... }
     map_tuple(mut &this, t: TupleType*) -> LType {
         const n: u32 = t.elements.length as u32;
         const buf: void* = intrinsics::malloc(n as u64 * 8);
@@ -337,7 +323,7 @@ type struct TypeMapper {
         return result;
     }
 
-    /// Optional<T> → { T, i1 } (value + has_value flag)
+    /// Optional<T> -> { T, i1 } (value + has_value flag)
     map_optional(mut &this, t: OptionalType*) -> LType {
         const wrapped: LType = this.map_type(t.wrapped);
         if (!wrapped.is_valid()) { return LType::null(); }
@@ -352,19 +338,17 @@ type struct TypeMapper {
     }
 
 
-    // ========================================================================
     // User-defined type mappers
-    // ========================================================================
 
-    /// StructType → named LLVM struct with fields.
+    /// StructType -> named LLVM struct with fields.
     /// If already forward-declared (in cache), just returns it.
     ///
     /// Honours layout directives recorded on the StructType:
-    ///   * `repr_packed` → emit the LLVM struct as `packed`, so LLVM
+    ///   * `repr_packed` -> emit the LLVM struct as `packed`, so LLVM
     ///     skips per-field padding.  Matches `compute_struct_layout`'s
     ///     own packed branch so `sizeof(T)` and the LLVM-level type
     ///     agree.
-    ///   * `repr_transparent` → no codegen change needed beyond what
+    ///   * `repr_transparent` -> no codegen change needed beyond what
     ///     the field list already produces; layout equivalence to the
     ///     inner field is enforced by `compute_struct_layout`.
     map_struct(mut &this, t: StructType*) -> LType {
@@ -406,7 +390,7 @@ type struct TypeMapper {
         return llvm_ty;
     }
 
-    /// ClassType → struct with inheritance flattened (Itanium-ABI style):
+    /// ClassType -> struct with inheritance flattened (Itanium-ABI style):
     ///   [ vtable ptr, if any ancestor has virtual methods ]
     ///   [ root class's fields, then each derived class's fields in order ]
     ///   [ this class's own fields ]
@@ -469,7 +453,7 @@ type struct TypeMapper {
             idx = 1;
         }
 
-        // Emit fields in root → derived order so a Derived* shares a prefix
+        // Emit fields in root -> derived order so a Derived* shares a prefix
         // with Base* at the LLVM-struct level.
         for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
             const link: ClassType* = chain[ci];
@@ -489,7 +473,7 @@ type struct TypeMapper {
         return llvm_ty;
     }
 
-    /// EnumType → simple: i32; ADT: { i32, [N x int_align] payload }
+    /// EnumType -> simple: i32; ADT: { i32, [N x int_align] payload }
     /// where the payload's element type is chosen to match the largest
     /// variant's alignment.  Using `[N x i8]` for ptr-payloads broke
     /// because LLVM gives the struct only 4-byte alignment, putting the
@@ -498,8 +482,8 @@ type struct TypeMapper {
     /// alignment.  Match the alignment by promoting the array element
     /// type so LLVM's struct layout agrees with the source-side layout.
     /// The LLVM integer type for an enum's discriminant tag.  A SIMPLE
-    /// (C-style) enum with an explicit `: T` base lowers its tag — which is
-    /// the whole value — at T's width; everything else (ADT enums, and
+    /// (C-style) enum with an explicit `: T` base lowers its tag - which is
+    /// the whole value - at T's width; everything else (ADT enums, and
     /// simple enums without an annotation) keeps the default i32.  Used by
     /// map_enum and by the variant / pattern emitters so the tag width is
     /// consistent end-to-end.
@@ -609,11 +593,9 @@ type struct TypeMapper {
     }
 
 
-    // ========================================================================
     // Alias / Instantiated type mappers
-    // ========================================================================
 
-    /// TypeAlias → delegates to target type.
+    /// TypeAlias -> delegates to target type.
     map_type_alias(mut &this, t: TypeAliasType*) -> LType {
         if (t.has_target()) {
             return this.map_type(t.target);
@@ -621,7 +603,7 @@ type struct TypeMapper {
         return LType::null();
     }
 
-    /// InstantiatedType → delegates to resolved_type.
+    /// InstantiatedType -> delegates to resolved_type.
     /// By the time codegen runs, all instantiated types have been resolved
     /// by the monomorphization pass.
     map_instantiated(mut &this, t: InstantiatedType*) -> LType {
@@ -632,9 +614,7 @@ type struct TypeMapper {
     }
 
 
-    // ========================================================================
     // Cache
-    // ========================================================================
 
     /// Cache reads / writes go through the module-level shared cache so
     /// every module's TypeMapper participates in one cross-module dedup

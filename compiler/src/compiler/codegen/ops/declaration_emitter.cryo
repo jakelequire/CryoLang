@@ -52,10 +52,6 @@ import Compiler::Resolver::QualifiedName;
 import std::collections::pair;
 
 
-// ============================================================================
-// DeclarationEmitter
-// ============================================================================
-
 type struct DeclarationEmitter {
     llvm_module: LModule*;
     builder:     LBuilder*;
@@ -117,10 +113,8 @@ type struct DeclarationEmitter {
     }
 
 
-    // ========================================================================
     // Small ctx-routed accessors (inlined so DeclarationEmitter doesn't
     // have to import the parent Context module).
-    // ========================================================================
 
     get_intern(&this) -> InternTable* {
         const c: CompilationContext* = this.ctx;
@@ -167,11 +161,9 @@ type struct DeclarationEmitter {
 
 
 
-    // ========================================================================
     // Declaration emission.  Phase-1 (forward-declare types) and Phase-2
     // (declare functions, methods, externs, globals, vtables) of the codegen
     // pipeline; called by the Codegen pass before body emission begins.
-    // ========================================================================
 
     /// Walk the program and forward-declare all struct/class/enum types as
     /// named LLVM struct types.  This must run before function declarations
@@ -358,12 +350,12 @@ type struct DeclarationEmitter {
         // Build the LLVM function type via the ABI seam.  Phase 1 + 2:
         // the classifier promotes >16-byte aggregates to `Indirect`
         // (sret on returns, byval on params), so the produced LLVM
-        // signature looks like `void f(ptr sret(%T), ptr byval(%P), …)`.
+        // signature looks like `void f(ptr sret(%T), ptr byval(%P), ...)`.
         // Phase 1/2 attribute attachment happens just below.
         const param_count: u32 = fixed_param_count(node);
 
         mut fn_type:    LType         = LType::null();
-        mut sret_pointee: LType       = LType::null();   // null ⇒ no sret
+        mut sret_pointee: LType       = LType::null();   // null => no sret
         // Captured plan from the seam.  Used after `add_function` to
         // walk param classifications and apply `byval(%T)` to any
         // Indirect parameter.  Empty when the main-widening branch
@@ -460,7 +452,7 @@ type struct DeclarationEmitter {
         // Use TypeResolution's canonical-qualified target when available; it
         // resolves cross-module impl targets (e.g. `implement trait FmtWrite
         // for struct Stdout` in fmt::write where Stdout lives in io::stdio)
-        // by walking the bare→qualified table, so the impl's methods land
+        // by walking the bare->qualified table, so the impl's methods land
         // under the same key the type's defining module uses.  Without the
         // canonical resolution, we'd qualify with the CURRENT module and
         // produce `fmt::write::Stdout::write_str`, which `declare_method`
@@ -548,7 +540,7 @@ type struct DeclarationEmitter {
         }
         // Use the arena's canonical qualified name for specialized
         // classes so method keys match the DI registration.  Mirrors
-        // the struct path in `declare_struct_methods` — without the
+        // the struct path in `declare_struct_methods` - without the
         // canonical lookup, a spec'd `Bucket<u32, i32>` injected into
         // the consuming module would get keyed under that module's
         // namespace (e.g. `std::core::intrinsics::Bucket<u32, i32>`)
@@ -578,7 +570,7 @@ type struct DeclarationEmitter {
         // ClassType.methods + its base chain (populated by the type-resolution
         // pass) so the vtable is inheritance-complete: a subclass's vtable has
         // one slot per virtual method introduced anywhere in the ancestry,
-        // in the order of first introduction (root → leaf).  The slot's
+        // in the order of first introduction (root -> leaf).  The slot's
         // implementation is the most-derived override present in the chain,
         // falling back to the inherited base implementation when the subclass
         // doesn't override that slot.  Layout discipline is what makes call-site
@@ -596,11 +588,11 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// Walk the class's base chain (leaf → root) and collect the ordered
+    /// Walk the class's base chain (leaf -> root) and collect the ordered
     /// list of virtual-method slots.  New `is_virtual` methods append a
     /// new slot; `is_override` methods do NOT; they install into an
     /// existing slot at vtable-emission time.  The returned list is in
-    /// root → leaf declaration order, so every subclass's vtable extends
+    /// root -> leaf declaration order, so every subclass's vtable extends
     /// the base's layout with its own additions.
     collect_vtable_slots(mut &this, cls: ClassType*) -> VTableSlot[] {
         const arena: TypeArena* = this.get_arena();
@@ -647,7 +639,7 @@ type struct DeclarationEmitter {
         return slots;
     }
 
-    /// For a given vtable slot (name + param_types), walk leaf → root and
+    /// For a given vtable slot (name + param_types), walk leaf -> root and
     /// return the first matching method's LLVM function: the most-derived
     /// override, falling back to the inherited base implementation when
     /// the subclass doesn't override that specific overload.  Resolution
@@ -859,7 +851,7 @@ type struct DeclarationEmitter {
         // `classify_param(t -> map_type(t))` flow can't safely classify
         // them).  But the *return type* must agree with what
         // `build_function_ltype` would produce for a cross-module
-        // extern of this method — if it doesn't, externs declared via
+        // extern of this method - if it doesn't, externs declared via
         // the seam in another module would get sret while this
         // definition wouldn't, and call sites would crash on the
         // mismatch.  So we classify just the return here and let the
@@ -875,7 +867,7 @@ type struct DeclarationEmitter {
                 && ret_plan.llvm_slots.length == 2) {
             // DirectPair return: wrap the two eightbyte slots in an
             // anonymous LLVM literal struct so the signature reads
-            // e.g. `{i64, i64}` — matches what `build_llvm_fn_type`
+            // e.g. `{i64, i64}` - matches what `build_llvm_fn_type`
             // produces for free functions taking the same return.
             const dp_buf: void* = intrinsics::malloc(2 * 8);
             const dp_slots: void** = dp_buf as void**;
@@ -1113,7 +1105,7 @@ type struct DeclarationEmitter {
 
         // Attach `sret(%T)` to LLVM param 0 when the classifier promoted
         // the return.  This must match what `build_function_ltype`
-        // produces for a cross-module extern of this same method —
+        // produces for a cross-module extern of this same method -
         // otherwise the call site marshals one way and the callee
         // expects the other.
         if (sret_pointee.is_valid()) {
@@ -1144,7 +1136,7 @@ type struct DeclarationEmitter {
         // sret slot, and *not* counting per-source-param LLVM slot
         // expansion like DirectPair).  Call-site lookups in
         // `call_emitter.cryo` count source arguments and need to match
-        // what extern registrations record (`ft.param_types.length` —
+        // what extern registrations record (`ft.param_types.length` -
         // also source-level).
         const registry_arity: u32 = user_param_count
             + (if (prepend_implicit_this) { 1 } else { 0 } as u32);
@@ -1229,8 +1221,8 @@ type struct DeclarationEmitter {
             }
             const fn_type: LType = plan.llvm_fn_type;
 
-            // Use the bare source name for C linkage, unless `![link("…")]`
-            // overrode the linker symbol — then the LLVM declaration is
+            // Use the bare source name for C linkage, unless `![link("...")]`
+            // overrode the linker symbol - then the LLVM declaration is
             // named for the C library symbol while Cryo callers still
             // resolve through `func.name` via the registry below.
             mut link_str: string = name_str;
@@ -1239,7 +1231,7 @@ type struct DeclarationEmitter {
 
             // Apply sret + byval attributes for any Indirect slots the
             // classifier produced.  Phase 3's `Direct`-with-coercion
-            // small-aggregate slot is *not* an attribute — it lowers
+            // small-aggregate slot is *not* an attribute - it lowers
             // to a plain integer return that the call site bitcasts.
             if (plan.sret_slot && plan.return_plan.pointee_ty.is_valid()) {
                 this.abi.apply_sret_attribute(fn_val, plan.return_plan.pointee_ty);
@@ -1416,7 +1408,6 @@ type struct DeclarationEmitter {
             return LValue::null();
         }
 
-        // Create entry basic block.
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.builder.position_at_end(entry_bb);
 
@@ -1446,7 +1437,7 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            // Phase 2 — byval: the LLVM parameter at this slot is a
+            // Phase 2 - byval: the LLVM parameter at this slot is a
             // `ptr` pointing at a caller-allocated copy of the value.
             // We bind that pointer directly to the source name (same
             // pattern `&this` uses in `codegen_method_prologue`) so
@@ -1466,10 +1457,10 @@ type struct DeclarationEmitter {
             }
 
             // Query the classifier so we know how many LLVM slots this
-            // source param consumes.  Direct ≤ 8 byte
+            // source param consumes.  Direct <= 8 byte
             // aggregate: one register-shaped slot whose bytes match
             // the source struct (opaque-pointer store at the source-
-            // typed alloca round-trips).  DirectPair 9–16 byte: two
+            // typed alloca round-trips).  DirectPair 9-16 byte: two
             // register-shaped slots, lo + hi, stored at offsets 0
             // and 8 of a source-typed alloca.  Plain Direct: one
             // slot whose type matches the source, store as before.
@@ -1785,7 +1776,7 @@ type struct DeclarationEmitter {
                 return LValue::null();
             }
 
-            // Phase 2 — byval on a method's non-receiver param: see
+            // Phase 2 - byval on a method's non-receiver param: see
             // `codegen_function_prologue` for the rationale.  Binding
             // the byval `ptr` directly preserves the copy semantics
             // and matches the LLVM signature.
@@ -1799,7 +1790,7 @@ type struct DeclarationEmitter {
             }
 
             // DirectPair: two LLVM slots, store lo at +0 and hi at +8
-            // of a source-typed alloca.  Other Direct shapes (≤ 8 byte
+            // of a source-typed alloca.  Other Direct shapes (<= 8 byte
             // coerced and plain) use a single slot.
             const pplan_m: ParamPlan = this.abi.classify_param(param.resolved_type);
             if (pplan_m.cls == ArgClass::DirectPair
@@ -1851,11 +1842,9 @@ type struct DeclarationEmitter {
         return this.type_mapper.map_type(node.resolved_return_type);
     }
 
-    // ========================================================================
     // Intrinsics codegen.  Inline-lowers calls to compiler-recognized
     // intrinsics (ptr arithmetic, sext/zext, rotates, abort, panic, ...
     // dispatched by name through `try_emit_intrinsic_call`).
-    // ========================================================================
 
     auto_deref_to(mut &this, val: LValue, expected: LType) -> LValue {
         if (!val.is_valid() || !expected.is_valid()) { return val; }

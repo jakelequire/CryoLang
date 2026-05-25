@@ -5,7 +5,7 @@
 /// allocation, returns, variadic-arg lifecycle, and the coercions that
 /// keep LLVM verification happy.  Each helper assumes the caller has
 /// already evaluated any inputs (resolved AST nodes, computed LValues
-/// etc.) — these are the surface a visit() override reaches for after
+/// etc.) - these are the surface a visit() override reaches for after
 /// extracting what it needs from the AST.
 ///
 /// Holds back-pointers to the LLVM builder, module, type mapper, value
@@ -40,10 +40,6 @@ import Compiler::Resolver::InternTable;
 import Compiler::Lex;
 import std::collections::pair;
 
-
-// ============================================================================
-// ExprOps
-// ============================================================================
 
 type struct ExprOps {
     llvm_module: LModule*;
@@ -102,10 +98,8 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Small ctx-routed accessors (inlined so ExprOps doesn't have to
     // import the parent Context module).
-    // ========================================================================
 
     lookup_type_by_id(&this, id: u64) -> Type* {
         const c: CompilationContext* = this.ctx;
@@ -116,8 +110,8 @@ type struct ExprOps {
     /// Lowered byte size of the aggregate an argument feeds into
     /// register-shaped parameter slot(s), or 0 when the argument is not
     /// such an aggregate.  Used by the call-argument marshallers to
-    /// decide Direct-with-coercion (≤ 8 → one register) vs DirectPair
-    /// (9–16 → two registers) lowering of a small-aggregate parameter.
+    /// decide Direct-with-coercion (<= 8 -> one register) vs DirectPair
+    /// (9-16 -> two registers) lowering of a small-aggregate parameter.
     ///
     /// Three argument shapes carry an aggregate destined for registers:
     ///   - a loaded struct *value* (`ak == Struct`): size of `actual_ty`.
@@ -127,7 +121,7 @@ type struct ExprOps {
     ///     pointee maps to a struct.
     /// Sizes come from the lowered LLVM struct via the module data
     /// layout, so unresolved `InstantiatedType` wrappers (whose Cryo
-    /// `size_bytes()` would be 0) still classify correctly — `map_type`
+    /// `size_bytes()` would be 0) still classify correctly - `map_type`
     /// resolves them where the classifier's source-type unwrap cannot.
     agg_register_size(mut &this, actual_ty: void*,
                       arg_ty_ref: TypeRef, ak: LTypeKind) -> u64 {
@@ -178,9 +172,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // sizeof / alignof
-    // ========================================================================
 
     codegen_sizeof(mut &this, type_ref: TypeRef) -> LValue {
         const t: Type* = this.lookup_type_by_id(type_ref.id);
@@ -230,9 +222,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Casts
-    // ========================================================================
 
     codegen_cast(mut &this, val: LValue,
                  from_type: TypeRef, to_type: TypeRef) -> LValue {
@@ -267,8 +257,8 @@ type struct ExprOps {
         // Treat `String` as a pointer type for cast classification;
         // strings are `i8*` at the LLVM level, so `string as i64` is
         // semantically a ptrtoint (not a bitcast, which requires same-
-        // size operands and LLVM rejects for pointer ↔ integer).  Same
-        // for `i64 as string` (inttoptr) and `string ↔ some_other_pointer`
+        // size operands and LLVM rejects for pointer <-> integer).  Same
+        // for `i64 as string` (inttoptr) and `string <-> some_other_pointer`
         // (pointer_cast / no-op under opaque pointers).
         const from_ptr: boolean = from_kind == TypeKind::Pointer ||
                                   from_kind == TypeKind::Reference ||
@@ -289,7 +279,7 @@ type struct ExprOps {
                 signed_src = false;
             } else if (from_enum) {
                 // Width + signedness from the enum's discriminant base
-                // (`type enum E : u8` → 8/unsigned); default tag is i32.
+                // (`type enum E : u8` -> 8/unsigned); default tag is i32.
                 from_bits = 32;
                 signed_src = true;
                 const fet: EnumType* = src_type as EnumType*;
@@ -374,9 +364,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // String comparison
-    // ========================================================================
 
     /// Compare two i8* string values using strcmp.
     /// Returns i1: true if equal (==) or not equal (!=).
@@ -426,9 +414,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Local variable declaration
-    // ========================================================================
 
     /// Generate IR for a local variable declaration.
     /// `site_span` is the source span of the variable's declaration
@@ -514,9 +500,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Function call (with argument width / pointer coercion)
-    // ========================================================================
 
     /// Generate IR for a function call.  Coerces integer argument widths
     /// to match the callee's LLVM parameter types (e.g., i8->i32 for
@@ -529,9 +513,9 @@ type struct ExprOps {
     /// type isn't known (low-level callers wiring up malloc/free/abort
     /// with already-matched widths); invalid slots fall back to `zext`.
     codegen_call(mut &this, callee: LValue, callee_type: LType, args: Pair<LValue, TypeRef>[], name: string) -> LValue {
-        // Phase 1 — sret marshalling.  If the callee was declared with
+        // Phase 1 - sret marshalling.  If the callee was declared with
         // `sret(%T)` on parameter slot 0, the LLVM-level signature is
-        // `void f(ptr sret(%T), …source params…)`.  Allocate a result
+        // `void f(ptr sret(%T), ...source params...)`.  Allocate a result
         // slot, prepend its address as the hidden first argument,
         // apply the sret call-site attribute, and synthesise the
         // struct value back to upstream callers by loading from the
@@ -545,7 +529,7 @@ type struct ExprOps {
                 fn_for_alloca = cur_bb.get_parent();
             }
             if (!fn_for_alloca.is_valid()) {
-                // No enclosing function — extremely unusual; fall back
+                // No enclosing function - extremely unusual; fall back
                 // to the legacy path rather than crashing on alloca.
                 return this.codegen_call_direct(callee, callee_type, args, name);
             }
@@ -576,7 +560,7 @@ type struct ExprOps {
     }
 
     /// Variant of `codegen_call` for callees whose ABI cannot be
-    /// recovered from LLVM function-attribute queries — primarily
+    /// recovered from LLVM function-attribute queries - primarily
     /// function-pointer invocations where `LLVMIsAFunction(callee)`
     /// is null and `sret_pointee_of` / `byval_pointee_of_param`
     /// silently return null.  Caller supplies the `SignaturePlan`
@@ -653,12 +637,12 @@ type struct ExprOps {
 
         // DirectPair param expansion path.  When the callee's LLVM
         // signature has more parameter slots than the source arg list
-        // provides, the surplus came from a 9–16 byte aggregate that
+        // provides, the surplus came from a 9-16 byte aggregate that
         // `classify_param` lowered to two register slots (DirectPair).
         // Re-route to the expansion-aware marshalling routine; the 1:1
         // path below stays the hot shape for every other call site.
         // This fires for ordinary Cryo-internal calls (any function
-        // taking a 9–16 byte aggregate by value), not just extern-C.
+        // taking a 9-16 byte aggregate by value), not just extern-C.
         if (param_types_buf != null && expected_count > n) {
             const r: LValue = this.codegen_call_direct_dp_expand(
                 callee, callee_type, args, param_types_buf, expected_count, name);
@@ -677,8 +661,8 @@ type struct ExprOps {
                 const expected_ty: void* = param_types[i];
                 const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
                 // Compare by LLVM type kind first to dispatch to
-                // shape-aware coercion branches (ptr↔struct, ptr↔int,
-                // struct→scalar, etc.).  When kinds match we fall
+                // shape-aware coercion branches (ptr<->struct, ptr<->int,
+                // struct->scalar, etc.).  When kinds match we fall
                 // through to the equal-kinds branches further down
                 // and use direct void* identity (`expected_ty !=
                 // actual_ty`) to catch named-vs-literal struct
@@ -686,20 +670,20 @@ type struct ExprOps {
                 const ek: LTypeKind = type_kind_of(expected_ty);
                 const ak: LTypeKind = type_kind_of(actual_ty);
 
-                // A ≤ 8 byte aggregate parameter lowers to a single
+                // A <= 8 byte aggregate parameter lowers to a single
                 // register slot (Direct-with-coercion).  When the
                 // source arrives as a *pointer* (the address of an lvalue,
                 // or a `T*` / `&T` pointing at the aggregate) facing a
                 // register-shaped slot, the register must hold the
                 // aggregate's bytes, so load them through the pointer.
-                // The generic `Integer ← Pointer` branch below would
+                // The generic `Integer <- Pointer` branch below would
                 // otherwise `ptrtoint` the address itself and pass the
                 // pointer where the callee expects the aggregate's
                 // contents (e.g. the 8-byte `LBuilder` reached via
                 // `this.builder: LBuilder*`, whose `.raw` handle would
-                // become the struct's address — a runtime crash the
+                // become the struct's address - a runtime crash the
                 // verifier can't catch).  The struct-*value* case is
-                // handled by the Integer/Float/Double/Vector ← Struct
+                // handled by the Integer/Float/Double/Vector <- Struct
                 // branch below.
                 mut agg_coerced: boolean = false;
                 const ek_reg_c: boolean = ek == LTypeKind::Integer
@@ -723,7 +707,7 @@ type struct ExprOps {
                         // came from `codegen_rvalue` loading through
                         // some lvalue.  If we can recover that pre-load
                         // address (`val` is a Load whose only operand is
-                        // the original pointer), use it directly — that
+                        // the original pointer), use it directly - that
                         // preserves identity so callees that mutate the
                         // struct see the caller's memory.  Otherwise
                         // fall back to a fresh temp alloca + store +
@@ -780,7 +764,7 @@ type struct ExprOps {
                         // scalar slot (integer for INTEGER class,
                         // float/double for single-field SSE class,
                         // `<2 x float>` for two-F32 SSE class) where the
-                        // Cryo source type is a ≤ 8-byte struct.  Spill
+                        // Cryo source type is a <= 8-byte struct.  Spill
                         // the struct value to a slot typed as the
                         // scalar/vector and reload it; the slot's storage
                         // size matches the struct's byte width by
@@ -795,8 +779,8 @@ type struct ExprOps {
                                    || ak == LTypeKind::Float
                                    || ak == LTypeKind::Double
                                    || ak == LTypeKind::Vector)) {
-                        // Inverse case — the arg is a register-shaped
-                        // scalar/vector coming out of a ≤ 8-byte
+                        // Inverse case - the arg is a register-shaped
+                        // scalar/vector coming out of a <= 8-byte
                         // aggregate return (Direct-with-coercion), but
                         // the receiving param wants the source-level
                         // named struct.  Alloca with the scalar type so
@@ -865,9 +849,9 @@ type struct ExprOps {
         out_value = this.builder.build_call(callee_type, callee, buf, n, name);
         intrinsics::free(buf);
 
-        // Phase 2 — propagate `byval(%T)` from the callee's parameter
+        // Phase 2 - propagate `byval(%T)` from the callee's parameter
         // attributes onto the matching call-site slots.  The existing
-        // struct → ptr coercion above already arranged for each byval
+        // struct -> ptr coercion above already arranged for each byval
         // slot to be a pointer-to-temp; adding the attribute tells the
         // backend this is a by-value copy (not aliasing).  Skipped for
         // function-pointer callees: `byval_pointee_of_param` is gated
@@ -888,7 +872,7 @@ type struct ExprOps {
 
     /// DirectPair param expansion variant of `codegen_call_direct`.
     /// Walks source args alongside expected LLVM slots, materialising one
-    /// source aggregate into two LLVM register args when it is a 9–16
+    /// source aggregate into two LLVM register args when it is a 9-16
     /// byte aggregate facing a register pair.  The aggregate arrives as a
     /// struct value, an lvalue address, or a pointer/reference to the
     /// aggregate; `agg_register_size` recovers its size from the lowered
@@ -914,20 +898,20 @@ type struct ExprOps {
             const ek: LTypeKind = type_kind_of(expected_ty);
             const ak: LTypeKind = type_kind_of(actual_ty);
 
-            // Determine whether this source arg feeds a 9–16 byte
-            // DirectPair parameter — two consecutive register slots that
+            // Determine whether this source arg feeds a 9-16 byte
+            // DirectPair parameter - two consecutive register slots that
             // a single source aggregate splits across.
             //
             // The aggregate arrives either as a loaded struct *value*
             // (`ak == Struct`) or as the *address* of an lvalue
-            // (`ak == Pointer` facing a register-shaped expected slot — a
+            // (`ak == Pointer` facing a register-shaped expected slot - a
             // genuine pointer parameter always faces a `Pointer` slot, so
             // a register slot opposite a pointer source means the callee
             // split an aggregate into registers).
             //
             // Slot count comes from the *lowered* LLVM size when the
             // source is a recognisable aggregate (`actual_ty` for a
-            // value, `map_type(arg_ty_ref)` for a struct address) —
+            // value, `map_type(arg_ty_ref)` for a struct address) -
             // `map_type` resolves even unresolved `InstantiatedType`
             // wrappers whose Cryo `size_bytes()` would be 0, so it never
             // under-counts the way the classifier's source-type unwrap
@@ -964,7 +948,7 @@ type struct ExprOps {
                 }
             }
 
-            // DirectPair: a 9–16 byte aggregate fills two register slots.
+            // DirectPair: a 9-16 byte aggregate fills two register slots.
             mut do_dp: boolean = false;
             if (ek_is_reg && next_is_reg) {
                 if (agg_size > 8 && agg_size <= 16) {
@@ -1016,10 +1000,10 @@ type struct ExprOps {
                 continue;
             }
 
-            // Direct-with-coercion for a ≤ 8 byte aggregate passed by
+            // Direct-with-coercion for a <= 8 byte aggregate passed by
             // *address*: load it through the pointer into one register
-            // slot.  (The struct-*value* ≤ 8 case is handled by the
-            // Integer/Float/Double/Vector ← Struct branch below.)
+            // slot.  (The struct-*value* <= 8 case is handled by the
+            // Integer/Float/Double/Vector <- Struct branch below.)
             if (ek_is_reg && agg_size > 0 && agg_size <= 8 && !agg_from_value
                     && agg_ptr.is_valid()) {
                 const reg_lty: LType = LType { raw: expected_ty };
@@ -1032,7 +1016,7 @@ type struct ExprOps {
             }
 
             // 1:1 mapping with the same coercion shapes as the main
-            // `codegen_call_direct` loop — kept inline so this path
+            // `codegen_call_direct` loop - kept inline so this path
             // is fully self-contained.
             if (arg_val.is_valid() && ek != ak) {
                 if (ek == LTypeKind::Pointer && ak == LTypeKind::Struct) {
@@ -1100,9 +1084,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Binary / unary operations
-    // ========================================================================
 
     /// Generate IR for a binary expression.  Handles arithmetic,
     /// comparison, logical short-circuit, and assignment operators.
@@ -1127,9 +1109,9 @@ type struct ExprOps {
         if (t != null) { t_kind = t.kind; }
 
         // String ops.  Strings are null-terminated `i8*` at the LLVM level.
-        //   `==`/`!=` → strcmp
-        //   `+` string + string → append (concat into fresh heap buffer)
-        //   `+` string + int    → pointer advancement (GEP over i8)
+        //   `==`/`!=` -> strcmp
+        //   `+` string + string -> append (concat into fresh heap buffer)
+        //   `+` string + int    -> pointer advancement (GEP over i8)
         if (t_kind == TypeKind::String) {
             if (op_kind == TokenType::EqualEqual || op_kind == TokenType::ExclaimEqual) {
                 out_value = this.codegen_string_compare(lhs_val, rhs_val, op_kind);
@@ -1140,7 +1122,7 @@ type struct ExprOps {
                 // Both operands are already rvalues at this point.
                 const rhs_llvm: void* = llvm::LLVMTypeOf(rhs_val.raw);
                 if (rhs_llvm != null && type_kind_of(rhs_llvm) == LTypeKind::Integer) {
-                    // string + int → GEP i8 for pointer arithmetic.
+                    // string + int -> GEP i8 for pointer arithmetic.
                     // Caller uses this idiom for substring-from-offset,
                     // C-string walking, etc.
                     const buf: void* = intrinsics::malloc(8);
@@ -1151,7 +1133,7 @@ type struct ExprOps {
                     intrinsics::free(buf);
                     return out_value;
                 }
-                // string + string → call std::core::primitives::string::append.
+                // string + string -> call std::core::primitives::string::append.
                 // The stdlib already provides this as a method on
                 // `string`; every module gets it via cross-module extern
                 // declarations.
@@ -1251,7 +1233,7 @@ type struct ExprOps {
             return out_value;
         }
 
-        // Pointer + int / Pointer - int → GEP over the pointee type.
+        // Pointer + int / Pointer - int -> GEP over the pointee type.
         // LLVM rejects `add ptr, i64`; the arithmetic must be expressed
         // as a getelementptr with a scaled integer index.  Matches the
         // string-plus-int path above but for typed pointers (`i8*`,
@@ -1497,7 +1479,7 @@ type struct ExprOps {
                op == TokenType::EqualEqual  || op == TokenType::ExclaimEqual;
     }
 
-    /// Swap a comparison operator's sense (`<`↔`>`, `<=`↔`>=`).  `==`/`!=`
+    /// Swap a comparison operator's sense (`<`<->`>`, `<=`<->`>=`).  `==`/`!=`
     /// are symmetric and returned unchanged.  Used to re-express an
     /// unsigned-LHS mixed comparison from the signed operand's perspective.
     flip_compare_op(&this, op: TokenType) -> TokenType {
@@ -1558,7 +1540,7 @@ type struct ExprOps {
                 out = this.builder.build_and(s_nonneg, c, "ms.ge");
             }
             TokenType::EqualEqual => {
-                // s == u  ⟺  s ≥ 0  AND  bits equal (s<0 ⇒ s≠u since u≥0).
+                // s == u  <=>  s >= 0  AND  bits equal (s<0 => s!=u since u>=0).
                 const c: LValue = this.builder.build_icmp(LIntPredicate::EQ, s, u, "ms.eqbits");
                 out = this.builder.build_and(s_nonneg, c, "ms.eq");
             }
@@ -1595,9 +1577,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Coercions
-    // ========================================================================
 
     /// Reshape an icmp RHS to match the LHS width when the subject is a
     /// narrower integer than the pattern value.
@@ -1692,9 +1672,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Heap-box enum variant
-    // ========================================================================
 
     /// Heap-box an enum variant value for `new T::V(...)`.  Allocates
     /// `et.computed_size` bytes, bitcasts to the enum struct pointer
@@ -1748,9 +1726,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Variadic argument lifecycle
-    // ========================================================================
 
     /// Declare the `@llvm.va_start.p0` intrinsic in the current LLVM
     /// module.  Signature: `void (ptr)`: the argument is a pointer to
@@ -1816,9 +1792,7 @@ type struct ExprOps {
     }
 
 
-    // ========================================================================
     // Return statement
-    // ========================================================================
 
     codegen_return(mut &this, val: LValue, has_value: boolean, src_ty: TypeRef) -> void {
         if (has_value && val.is_valid()) {
@@ -1831,9 +1805,9 @@ type struct ExprOps {
             if (cur_bb.is_valid()) {
                 const fn: LValue = cur_bb.get_parent();
                 if (fn.is_valid()) {
-                    // Phase 1 — sret: if this function was declared
+                    // Phase 1 - sret: if this function was declared
                     // with `sret(%T)` on its hidden param 0, the
-                    // LLVM-level signature is `void f(ptr sret(%T), …)`.
+                    // LLVM-level signature is `void f(ptr sret(%T), ...)`.
                     // Store the returned value through that pointer
                     // and emit `ret void`, *before* the void-check
                     // below routes a unit-style return.  Callers
@@ -1872,8 +1846,8 @@ type struct ExprOps {
                         // Defining-side return coercion.  When the
                         // function's LLVM return type is a register-
                         // shaped scalar/pair (Integer/Float/Double/Vector
-                        // for ≤8 byte aggregates, anonymous `{lo, hi}`
-                        // Struct for 9–16 byte DirectPair returns) but
+                        // for <=8 byte aggregates, anonymous `{lo, hi}`
+                        // Struct for 9-16 byte DirectPair returns) but
                         // the source value is a struct, spill the
                         // struct to a stack temp and reload it at the
                         // declared LLVM return type.  Inverse of the
@@ -1908,7 +1882,7 @@ type struct ExprOps {
                 }
             }
             // Coerce the return value to the function's declared return
-            // type.  Handles common implicit conversions like u64↔ptr
+            // type.  Handles common implicit conversions like u64<->ptr
             // (stdlib uses this in `align_up`/`align_down`) and narrower
             // integer returns.
             const coerced: LValue = this.coerce_return_value(val, src_ty);
@@ -1963,7 +1937,7 @@ type struct ExprOps {
             return this.builder.build_ptr_to_int(val, want_lty, "ret.ptrtoint");
         }
 
-        // Struct → ptr: arises from `return this` / `return some_lvalue`
+        // Struct -> ptr: arises from `return this` / `return some_lvalue`
         // in a method whose return type is `&Self` (or any reference).
         // codegen_rvalue dutifully loads the struct from the receiver
         // pointer; the function signature wants the pointer back.  If
@@ -1997,7 +1971,7 @@ type struct ExprOps {
             }
         }
 
-        // Fixed-size array `[N x T]` → dynamic fat pointer `{T*, i64}`.
+        // Fixed-size array `[N x T]` -> dynamic fat pointer `{T*, i64}`.
         // Happens when a function typed `T[]` returns `[a, b, ...]` and
         // sema didn't propagate the dynamic expected_type into the
         // array-literal's resolved shape.  Stash the loaded array on the
