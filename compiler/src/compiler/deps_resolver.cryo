@@ -116,10 +116,23 @@ function resolve(top_config: ProjectConfig*,
         DepsLockfile::write(lock_path, &new_lock);
     }
 
-    outcome.lock = match (mode) {
-        ResolveMode::Build => { existing }
-        _                  => { new_lock }
-    };
+    // Each arm consumes BOTH lockfiles: one is moved into the outcome,
+    // the other is moved into a throwaway local so scope-exit drop glue
+    // reclaims it. Returning a match-expression that moved only one
+    // binding per arm left the other moved on some paths but not others,
+    // so its drop was suppressed on the path it survived - a leak (Build
+    // leaked new_lock; Fetch/Update leaked existing). Lockfile has no
+    // user `drop`, so we rely on glue via the discard binding.
+    match (mode) {
+        ResolveMode::Build => {
+            mut discard: Lockfile = new_lock;
+            outcome.lock = existing;
+        }
+        _ => {
+            mut discard: Lockfile = existing;
+            outcome.lock = new_lock;
+        }
+    }
     return outcome;
 }
 

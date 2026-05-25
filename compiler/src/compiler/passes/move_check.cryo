@@ -1,12 +1,14 @@
 ///! Move Check Pass: Phase 1 minimal scaffold.
 ///!
-///! Walks function bodies after sema and warns when a non-Copy local
-///! looks like it's being used after a `let`-RHS or call-arg move.
+///! Walks function bodies after sema and rejects a non-Copy local that
+///! is used after a `let`-RHS or call-arg move.
 ///! Phase 1 is deliberately small: only bare-identifier moves at let
-///! initializers and function-call arguments are tracked, branches
-///! are walked sequentially without state-merge, and use-after-move
-///! emits a warning rather than an error so we can observe the
-///! surface area before tightening to fatal.
+///! initializers and function-call arguments are tracked, and branches
+///! are walked sequentially without state-merge (snapshot/restore), which
+///! keeps the analysis conservative - it only fires on a use that is
+///! reachable from the move on a straight-line path, so it under-reports
+///! rather than over-reports. Because every diagnostic it does emit is an
+///! unambiguous double free, use-after-move is a hard error (fatal).
 
 namespace Compiler::Passes::MoveCheck;
 
@@ -268,19 +270,27 @@ type struct MoveChecker {
         this.fired += 1;
     }
 
-    /// Emit a use-after-move warning with a primary label at the use
+    /// Emit a use-after-move error with a primary label at the use
     /// site and a secondary label at the original move site. Renderer
     /// combines them into a single rustc-style snippet with `...`
     /// between non-adjacent line groups.
+    ///
+    /// This is a hard error (increments `fatal`): a non-Copy value read
+    /// after it was moved bitwise-copies a now-owned-elsewhere handle, so
+    /// the read either observes freed storage or sets up a second drop of
+    /// the same allocation - a double free.  The pass is fatal_on_failure,
+    /// so a non-zero `fatal` aborts the pipeline before codegen and the
+    /// unsound binary is never emitted.
     emit_use_after_move(mut &this, code: ErrorCode, headline: string,
                         use_span: SourceSpan, move_span: SourceSpan) -> void {
-        mut diag: Diagnostic = Diagnostic::warning(code, headline);
+        mut diag: Diagnostic = Diagnostic::error(code, headline);
         diag = diag.at_with_label(use_span, "value used here after move");
         if (move_span.has_location()) {
             diag = diag.also_at(move_span, "value moved here");
         }
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
+        this.fatal += 1;
     }
 
     /// A value declared outside a loop, moved inside it via a storage-
@@ -854,9 +864,9 @@ type struct MoveCheckPass {
             cdebug("[MoveCheck] %lld diagnostics emitted (%lld fatal)\n",
                 checker.fired, checker.fatal);
         }
-        // Within-iteration use-after-move stays warn-only (imprecise).
-        // Loop-carried moves are unambiguous double frees: fail the pass
-        // so the pipeline aborts before codegen (MoveCheck is
+        // Both within-iteration use-after-move and loop-carried moves are
+        // unambiguous double frees and increment `fatal`: fail the pass so
+        // the pipeline aborts before codegen (MoveCheck is
         // fatal_on_failure).
         if (checker.fatal > 0) {
             return PassResult::failure(checker.fatal as u32);

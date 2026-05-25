@@ -1083,9 +1083,19 @@ type struct DropInserter {
             return;
         }
         if (live_then && !live_else) {
-            // Only the then-branch falls through.  Its moves apply
-            // unconditionally past the if-stmt; there's no other
-            // surviving path to compare against.
+            // Only the then-branch falls through.  When there IS an else
+            // (it diverges - returns/breaks), the then-branch is the sole
+            // surviving path, so its moves apply unconditionally and need
+            // no warning.  When there is NO else, the move only happens
+            // when the condition held: it is a conditional move (a leak on
+            // the false path under the fail-safe under-drop), so flag each
+            // outer-scope binding moved only in the then-branch.
+            if (!has_else) {
+                for (mut i: i64 = 0; i < then_keys.length; i++) {
+                    if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
+                    this.emit_conditional_move_by_id(then_keys[i], then_lines[i]);
+                }
+            }
             this.set_moves_tail(snap, then_keys, then_lines);
             return;
         }
@@ -1148,7 +1158,10 @@ type struct DropInserter {
             name_str = "<binding>";
         }
         const line_u: u32 = if (line > 0) { line as u32 } else { 0 };
-        const span: SourceSpan = SourceSpan::new("", line_u, 0, line_u, 0);
+        // Anchor the diagnostic in the module being processed so the
+        // renderer can show a source snippet; an empty file produced a
+        // location-less, near-useless warning.
+        const span: SourceSpan = SourceSpan::new(this.ctx.source_file, line_u, 1, line_u, 1);
         const msg: string = format(
             "value '%s' is moved on some control-flow paths but not others",
             name_str);

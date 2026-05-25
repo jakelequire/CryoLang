@@ -52,6 +52,7 @@ import Compiler::Types::GenericRegistry;
 import Compiler::Types::Substitution;
 import Compiler::ModuleGraph;
 import std::collections::hashmap;
+import std::core::slice;
 import Utils::Logger;
 
 
@@ -3847,7 +3848,7 @@ public:
         // Both arity checks passed (got == expected).  Type-check each
         // argument against its declared parameter type.  (Auto-ref of
         // value args to `&T` params is handled once in `resolve_call`.)
-        this.check_args_against_params(call, ft.param_types);
+        this.check_args_against_params(call, ft.param_types.as_slice());
     }
 
     /// Per-argument type checking for a call whose argument list aligns
@@ -3864,14 +3865,14 @@ public:
     /// monomorphization); the specialized instance is re-checked once
     /// every `T` is concrete.
     check_args_against_params(mut &this, call: CallExprNode*,
-                              param_types: TypeRef[]) -> void {
-        const n: i64 = param_types.length;
+                              param_types: Slice<TypeRef>) -> void {
+        const n: i64 = param_types.length as i64;
         for (mut i: i64 = 0; i < n; i++) {
             if (i >= call.arguments.length) { break; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null) { continue; }
             const arg_ty:   TypeRef = arg.resolved_type;
-            const param_ty: TypeRef = param_types[i];
+            const param_ty: TypeRef = param_types.get(i as u64).unwrap();
             if (!this.arg_type_is_concrete(arg_ty))   { continue; }
             if (!this.arg_type_is_concrete(param_ty)) { continue; }
             const compat: TypeCompatibility =
@@ -4054,7 +4055,7 @@ public:
                     for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
                         chosen.push(m.param_types[ci]);
                     }
-                } else if (!this.same_param_sig(chosen, m.param_types)) {
+                } else if (!this.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
                     ambiguous = true;
                 }
             }
@@ -4106,13 +4107,22 @@ public:
                             if (pp.name.equals(this_val)) { continue; }
                             tparams.push(pp.resolved_type);
                         }
-                        if (tparams.length != argc) { continue; }
+                        if (tparams.length != argc) { tparams.drop(); continue; }
                         if (!found) {
                             found = true;
                             chosen = tparams;
-                        } else if (!this.same_param_sig(chosen, tparams)) {
-                            ambiguous = true;
-                            break;
+                        } else {
+                            // `tparams` is not moved into `chosen` on this path,
+                            // so drop it after the signature comparison to keep
+                            // it consumed on every control-flow path (no leak,
+                            // no conditional-move warning).
+                            const same: boolean =
+                                this.same_param_sig(chosen.as_slice(), tparams.as_slice());
+                            tparams.drop();
+                            if (!same) {
+                                ambiguous = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -4120,7 +4130,7 @@ public:
         }
 
         if (!found || ambiguous) { return; }
-        this.check_args_against_params(call, chosen);
+        this.check_args_against_params(call, chosen.as_slice());
     }
 
     /// True when one side is an enum and the other an integer.  A Cryo
@@ -4180,10 +4190,10 @@ public:
     /// Structural equality of two parameter-type lists by length and
     /// arena TypeRef id.  Used to collapse a base method and its identical
     /// override into a single candidate signature.
-    same_param_sig(&this, a: TypeRef[], b: TypeRef[]) -> boolean {
+    same_param_sig(&this, a: Slice<TypeRef>, b: Slice<TypeRef>) -> boolean {
         if (a.length != b.length) { return false; }
-        for (mut i: i64 = 0; i < a.length; i++) {
-            if (a[i].id != b[i].id) { return false; }
+        for (mut i: i64 = 0; i < a.length as i64; i++) {
+            if (a.get(i as u64).unwrap().id != b.get(i as u64).unwrap().id) { return false; }
         }
         return true;
     }
@@ -4229,7 +4239,7 @@ public:
                 // misalign the comparison.
                 if (!ft.is_variadic
                     && ft.param_types.length == call.arguments.length) {
-                    this.check_args_against_params(call, ft.param_types);
+                    this.check_args_against_params(call, ft.param_types.as_slice());
                 }
             }
             return;
@@ -4290,12 +4300,12 @@ public:
                 for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
                     chosen.push(m.param_types[ci]);
                 }
-            } else if (!this.same_param_sig(chosen, m.param_types)) {
+            } else if (!this.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
                 ambiguous = true;
             }
         }
         if (!found || ambiguous) { return; }
-        this.check_args_against_params(call, chosen);
+        this.check_args_against_params(call, chosen.as_slice());
     }
 
     /// One level of pointer/reference indirection peeled off `t`, or an
@@ -4672,20 +4682,25 @@ public:
         // the bottom of this function picks them up.  Non-matching kinds
         // (Pointer, Reference, etc. shouldn't reach here after the unwrap
         // loop) bail.
-        mut methods_ref: MethodInfo[] = [];
+        // `methods_ref` / `cur_methods` are non-owning VIEWS into method
+        // arrays the arena owns; modelling them as `Slice<MethodInfo>`
+        // (a Copy `(ptr,len)` pair) makes that explicit, so re-reading the
+        // start view for pass 2 is a borrow, not a use-after-move, and the
+        // views are never dropped (they alias arena storage).
+        mut methods_ref: Slice<MethodInfo> = Slice<MethodInfo>::from_raw(null, 0);
         mut start_cls: ClassType* = null;
         match (base_t.kind) {
             TypeKind::Class => {
                 start_cls = base_t as ClassType*;
-                methods_ref = start_cls.methods;
+                methods_ref = start_cls.methods.as_slice();
             }
             TypeKind::Struct => {
                 const sst: StructType* = base_t as StructType*;
-                methods_ref = sst.methods;
+                methods_ref = sst.methods.as_slice();
             }
             TypeKind::Enum => {
                 const est: EnumType* = base_t as EnumType*;
-                methods_ref = est.methods;
+                methods_ref = est.methods.as_slice();
             }
             TypeKind::Int | TypeKind::Float | TypeKind::Bool
             | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
@@ -4722,11 +4737,11 @@ public:
         // receiver type's.
         mut walk: ClassType* = start_cls;
         mut depth: i32 = 0;
-        mut cur_methods: MethodInfo[] = methods_ref;
+        mut cur_methods: Slice<MethodInfo> = methods_ref;
         mut owner_t: Type* = base_t;
         while (depth < 16) {
-            for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
-                const m: MethodInfo = cur_methods[mi];
+            for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
+                const m: MethodInfo = *(cur_methods.get_ptr(mi).unwrap());
                 if (!m.name.equals(member.member)) { continue; }
                 if (m.param_types.length != arg_types.length) { continue; }
                 mut exact: boolean = true;
@@ -4747,7 +4762,7 @@ public:
             const parent_t: Type* = this.arena.lookup(walk.base_class.id);
             if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
             walk = parent_t as ClassType*;
-            cur_methods = walk.methods;
+            cur_methods = walk.methods.as_slice();
             owner_t = parent_t;
             depth += 1;
         }
@@ -4778,8 +4793,8 @@ public:
             cur_methods = methods_ref;
             owner_t = base_t;
             while (depth < 16) {
-                for (mut mi: i64 = 0; mi < cur_methods.length; mi++) {
-                    const m: MethodInfo = cur_methods[mi];
+                for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
+                    const m: MethodInfo = *(cur_methods.get_ptr(mi).unwrap());
                     if (!m.name.equals(member.member)) { continue; }
                     if (m.param_types.length != arg_types.length) { continue; }
                     mut compat: boolean = true;
@@ -4865,7 +4880,7 @@ public:
                 const parent_t: Type* = this.arena.lookup(walk.base_class.id);
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
                 walk = parent_t as ClassType*;
-                cur_methods = walk.methods;
+                cur_methods = walk.methods.as_slice();
                 owner_t = parent_t;
                 depth += 1;
             }
