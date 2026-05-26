@@ -152,3 +152,64 @@ function array_of_owned_drops_each() -> Result<(), TestError> {
     }
     return expect_eq(count(), 2);
 }
+
+// ---- fixed-size T[N] arrays ----------------------------------------------
+//
+// Prior to this regression test, drop_glue did not recurse into the elements
+// of a bare fixed-size array: a `T[N]` local whose element type needed drop
+// (e.g. `Probe[2]`, `String[3]`) silently leaked at scope exit because the
+// codegen's `emit_drop_glue` had no `TypeKind::Array` arm and bailed as a
+// no-op.  call_emitter::emit_fixed_array_drops now synthesizes per-element
+// `arr[i].drop()` calls so glue lands once per element.
+
+![test]
+function fixed_array_of_owned_drops_each() -> Result<(), TestError> {
+    reset();
+    {
+        mut arr: Probe[3];
+        arr[0] = Probe { tag: 1 };
+        arr[1] = Probe { tag: 2 };
+        arr[2] = Probe { tag: 3 };
+    }
+    return expect_eq(count(), 3);
+}
+
+// ---- match subject hoisting ----------------------------------------------
+//
+// Prior to this regression test, a non-Identifier owning rvalue used as a
+// match subject (e.g. `match (compute()) { ... }`) leaked the value: the
+// subject temporary was invisible to the binding/scope-exit drop machinery,
+// and walk_match_arms's consumption-tracking gated on `subject.kind ==
+// Identifier`.  drop_insertion now hoists such subjects into a synthesized
+// local declared just before the match, so the standard binding-drop path
+// fires.  Verified by counting Probe::drop calls on a hoisted Option<Probe>.
+
+function make_probe() -> Option<Probe> { return Option::Some(Probe { tag: 1 }); }
+
+![test]
+function match_rvalue_subject_drops_via_glue() -> Result<(), TestError> {
+    reset();
+    {
+        match (make_probe()) {
+            Option::Some(_) => { }
+            Option::None    => { }
+        }
+    }
+    // The rvalue `make_probe()` is hoisted into a synthesized local; its
+    // scope-exit drop runs Option's enum glue which drops the inner Probe.
+    return expect_eq(count(), 1);
+}
+
+![test]
+function match_rvalue_subject_consumed_no_double_free() -> Result<(), TestError> {
+    reset();
+    {
+        match (make_probe()) {
+            Option::Some(p) => { const t: i32 = p.tag; }   // borrow only
+            Option::None    => { }
+        }
+    }
+    // Borrow-only arm: subject stays live, hoisted local's glue drops the
+    // payload exactly once.
+    return expect_eq(count(), 1);
+}

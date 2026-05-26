@@ -647,7 +647,23 @@ type struct DropInserter {
                 false
             }
             NodeKind::MatchStatement => {
-                const d: boolean = this.walk_match(stmt as MatchStmtNode*);
+                // If the subject is a non-Identifier rvalue of owning type
+                // (e.g. `match (compute()) { ... }`), the temporary holding
+                // the subject value is invisible to the binding/scope-exit
+                // drop machinery — match-arm consumption tracking only kicks
+                // in when subject.kind == Identifier (see walk_match_arms).
+                // Hoist the subject into a synthesized local declared just
+                // before the match so its scope-exit drop fires through the
+                // normal binding path, and the match itself sees an Identifier
+                // subject (engaging consumption tracking + drop-glue
+                // suppression for arms that move the payload out).
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                if (m != null && m.subject != null &&
+                    m.subject.kind != NodeKind::Identifier &&
+                    this.type_needs_drop(m.subject.resolved_type)) {
+                    this.hoist_match_subject(m, out);
+                }
+                const d: boolean = this.walk_match(m);
                 out.push(stmt);
                 d
             }
@@ -1337,6 +1353,37 @@ type struct DropInserter {
             out.push(drop_stmt);
             this.inserted += 1;
         }
+    }
+
+    /// Hoist a non-Identifier owning match subject into a synthesized local
+    /// declared just before the match, then rewrite the match's subject to
+    /// an Identifier referencing the new local.  The local enters the normal
+    /// binding registry on walk_var_decl, picking up scope-exit drop glue
+    /// like any other owning local; and walk_match_arms's consumption
+    /// tracking (gated on subject.kind == Identifier) now fires properly,
+    /// so an arm that moves the payload out suppresses the subject's glue.
+    hoist_match_subject(mut &this, m: MatchStmtNode*,
+                        out: StatementNode*[]*) -> void {
+        if (m == null || m.subject == null) { return; }
+        const span: SourceSpan = m.subject.span;
+        const ty: TypeRef = m.subject.resolved_type;
+        const name: SymbolStr = this.intern.intern(
+            format("__match_subj%d", this.discard_seq));
+        this.discard_seq = this.discard_seq + 1;
+        // Walk the subject in move context FIRST (it's the rvalue init).
+        this.walk_expr_move(m.subject);
+        mut vd: VarDeclNode* = new VarDeclNode(name, span);
+        vd.set_resolved_type(ty);
+        vd.set_initializer(m.subject);
+        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        out.push(ds as StatementNode*);
+        // Register the synthesized binding so scope-exit drop synthesis sees
+        // it.  walk_var_decl is the usual entry point but it also walks the
+        // initializer — which we just walked — so register directly.
+        this.register_binding(name, ty, span);
+        mut ident: IdentifierNode* = new IdentifierNode(name, span);
+        ident.set_resolved_type(ty);
+        m.subject = ident as ExpressionNode*;
     }
 
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).

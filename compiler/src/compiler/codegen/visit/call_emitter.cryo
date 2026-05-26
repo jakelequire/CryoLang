@@ -790,7 +790,15 @@ type struct CallEmitter {
             mut type_sym: SymbolStr = di.lookup_type_name(obj_ref);
             if (!type_sym.is_valid() && t != null && t.kind == TypeKind::Array) {
                 const arr_t: ArrayType* = t as ArrayType*;
-                type_sym = di.lookup_array_type_name(arr_t.element);
+                // Only dynamic arrays share the `Array_<T>` method registry —
+                // fixed-size `T[N]` has no methods of its own and must not be
+                // dispatched to `Array<T>::method` (e.g. `Array<T>::drop` would
+                // try to free a stack address).  Leaving type_sym empty for
+                // T[N] lets `.drop()` fall through to the drop-glue fallback,
+                // which synthesizes per-element drops.
+                if (arr_t.is_dynamic()) {
+                    type_sym = di.lookup_array_type_name(arr_t.element);
+                }
             }
 
             // Check for virtual dispatch: if the STATIC receiver type is a
@@ -1212,12 +1220,55 @@ type struct CallEmitter {
             this.emit_enum_drop_glue(visitor, receiver, et, cur);
             return true;
         }
-        // Optional / tuple / fixed-array glue is not yet emitted.  Returning
-        // true (no-op) keeps these compiling with today's behavior rather
-        // than erroring; user-written `T?` desugars to Option<T> (an Enum,
-        // handled above), so this only affects bare fixed arrays/tuples of
-        // owned elements.
+        if (t.kind == TypeKind::Array) {
+            const at: ArrayType* = t as ArrayType*;
+            // Dynamic arrays own their heap buffer via the Array<T> Drop impl
+            // (caught upstream by method resolution); only bare fixed-size
+            // arrays reach here.  Drop each element in place.
+            if (at.is_fixed() &&
+                OwnershipQuery::needs_drop(arena, this.cg.ctx.generic_registry,
+                                           this.cg.get_intern(), at.element)) {
+                this.emit_fixed_array_drops(visitor, receiver, at);
+            }
+            return true;
+        }
+        // Optional / tuple glue is not yet emitted.  Returning true (no-op)
+        // keeps these compiling with today's behavior rather than erroring;
+        // user-written `T?` desugars to Option<T> (an Enum, handled above),
+        // so this only affects bare tuples of owned elements.
         return true;
+    }
+
+    /// Drop each element of a fixed-size array in place via synthesized
+    /// `receiver[i].drop()` calls.  Re-enters the normal `.drop()` lowering
+    /// per element, so elements that themselves lack a user drop recurse
+    /// through glue (e.g. an array of structs of strings drops every string).
+    emit_fixed_array_drops(mut &this, visitor: ASTVisitor*,
+                           receiver: ExpressionNode*, at: ArrayType*) -> void {
+        if (at == null) { return; }
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return; }
+        const intern: InternTable* = this.cg.get_intern();
+        const drop_sym: SymbolStr = intern.intern("drop");
+        const idx_type: TypeRef = arena.get_i64();
+        const n: i64 = at.size;
+        for (mut i: i64 = 0; i < n; i++) {
+            const idx_str: string = format("%ld", i);
+            mut idx_lit: LiteralNode* = new LiteralNode(
+                idx_str, LiteralKind::Integer, receiver.span);
+            idx_lit.set_resolved_type(idx_type);
+            mut arr_access: ArrayAccessNode* = new ArrayAccessNode(
+                receiver, idx_lit as ExpressionNode*, receiver.span);
+            arr_access.set_resolved_type(at.element);
+            mut drop_access: MemberAccessNode* = new MemberAccessNode(
+                arr_access as ExpressionNode*, drop_sym,
+                receiver.span, receiver.span);
+            mut call: CallExprNode* = new CallExprNode(
+                drop_access as ExpressionNode*, receiver.span);
+            mut stmt: ExprStmtNode* = new ExprStmtNode(
+                call as ExpressionNode*, receiver.span);
+            stmt.accept(visitor);
+        }
     }
 
     /// Synthesize `receiver.field.drop()` for each field whose type needs
