@@ -370,8 +370,6 @@ entry_point = "src/tool/main.cryo"
 
 `[dependencies]` entries support `git = "..."` with a pin chosen from `version`, `tag`, `branch`, or `rev`. `cryo fetch` resolves every dependency, writes a `cryoconfig.lock`, and caches sources under `$CRYO_HOME` (or `$XDG_CACHE_HOME/cryo`, or `$HOME/.cache/cryo`).
 
-A worked example with a real C-linked dependency lives in [`examples/sqlite-import/`](./examples/sqlite-import/).
-
 ---
 
 ## Standard Library
@@ -461,8 +459,8 @@ CryoLang/
 │   └── bootstrap/        Retired C++23 bootstrap; kept for historical reference only
 ├── docs/                 Language reference (cryo.md), grammar, mangling spec
 ├── examples/             Standalone example projects
-│   ├── sqlite-import     Git-deps demo (links libsqlite3 via cqlite)
-│   ├── http-server       net::http server
+│   ├── 09-json-config    std::json parsing
+│   ├── 11-http-server    net::http server
 │   └── …
 ├── tests/                Repo-level test suite (uses ![test])
 ├── scripts/              Build helpers (selfhost-check, cryo-pin)
@@ -487,7 +485,7 @@ for the full 1.0 release notes.
 - Self-hosted compiler with byte-identical 3-round selfhost check.
 - Trait system with `where`-bound generics, monomorphisation, and trait impls on primitives.
 - Single-inheritance classes with virtual dispatch and destructors.
-- Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, range, or-patterns, guard clauses).
+- Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, exclusive range, or-patterns).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`.
 - I/O over `Read` / `Write` traits with buffered wrappers.
@@ -501,7 +499,11 @@ for the full 1.0 release notes.
 
 - Async / await / coroutines (currently parser-only).
 - Range expressions (`a..b`, `a..=b`) in expression position.
+- Inclusive range patterns (`1..=10`) and pattern guard clauses (`x if cond =>`).
+- Iterator adapters (`.map`, `.filter`, `.collect`, …) and `for x in iter` loops.
+- Capturing closures.
 - TLS, UDP, HTTP/2, and WebSocket for `net::http`.
+- Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, …).
 - Cross-compilation.
 
 A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax).

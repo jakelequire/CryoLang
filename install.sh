@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Cryo Programming Language — installer (v0.2.0).
+# Cryo Programming Language — installer (v1.0.0).
 #
 # Symlinks the committed self-hosted compiler at <repo>/bin/cryo into a
 # system bindir, and the standard library at <repo>/stdlib into a sibling
