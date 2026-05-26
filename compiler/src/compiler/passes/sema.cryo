@@ -149,6 +149,15 @@ public:
     lambda_outer_locals: HashMap<u32, TypeRef>;
     current_lambda:      LambdaExprNode*;
 
+    // Per-module monotonic counter for synthesised closure-struct names.
+    // Cross-module uniqueness comes from the namespace prefix; each
+    // visitor instance owns its own counter and never resets it after
+    // a closure has been minted.  Codegen has its own `lambda_counter`
+    // for non-capturing lambdas; we deliberately keep these separate
+    // (Sema synthesises only when captures are present, codegen mints
+    // for every lambda) so the namespaces don't have to coordinate.
+    closure_counter: u64;
+
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
                      ctx: CompilationContext*) : BaseASTVisitor() {
@@ -178,6 +187,7 @@ public:
         this.in_lambda_depth     = 0;
         this.lambda_outer_locals = HashMap<u32, TypeRef>::new();
         this.current_lambda      = null;
+        this.closure_counter     = 0;
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -1637,8 +1647,12 @@ public:
         // initializer is a lambda expression - any other shape would be
         // implicit variable typing, which Cryo doesn't offer.  Missing
         // initializer too is rejected: a fully-empty `const name;` has
-        // no shape to infer from.
-        if (var_node.type_annotation == null) {
+        // no shape to infer from.  Skip the check when the binding
+        // already carries a resolved type (synthesised declarations -
+        // closure-struct __call__ shadows, drop-insertion's flag
+        // locals - bypass parser-level annotation but always have
+        // their resolved_type stamped at construction time).
+        if (var_node.type_annotation == null && !var_node.has_resolved_type()) {
             const init: ExpressionNode* = var_node.initializer;
             const init_is_lambda: boolean = init != null
                 && (init as ASTNode*).kind == NodeKind::LambdaExpression;
@@ -2949,9 +2963,36 @@ public:
         this.in_lambda_depth     = saved_lambda_depth;
         this.current_lambda      = saved_current_lam;
 
-        // The lambda's value type is its function-pointer signature.
-        // (Capturing lambdas reuse this; later phases switch them to a
-        // synthesised closure-struct type.)
+        // Nested-capture propagation: when an inner lambda has captures
+        // and we're still inside an outer lambda, any captured name that
+        // isn't in the outer lambda's own locals (params + body-declared
+        // locals) must be captured by the outer lambda too - otherwise
+        // the outer lambda's `__call__` body, which materialises the
+        // inner closure-struct value, won't have the name in scope when
+        // codegen builds the field-init.  `this.locals` is now the
+        // outer lambda's locals (restored above), so `lookup_local`
+        // answers exactly that question.
+        if (node.is_capturing()
+                && saved_current_lam != null
+                && saved_lambda_depth > 0) {
+            for (mut ci: i64 = 0; ci < node.captured_names.length; ci++) {
+                const cap_name: SymbolStr = node.captured_names[ci];
+                if (!this.lookup_local(cap_name).is_valid()) {
+                    saved_current_lam.add_capture(
+                        cap_name,
+                        node.captured_types[ci],
+                        node.captured_spans[ci]);
+                }
+            }
+        }
+
+        // Capturing lambdas materialise as a synthesised closure-struct
+        // value, not a bare function pointer.  Non-capturing lambdas stay
+        // on the existing fn-pointer path - codegen still emits a
+        // standalone anonymous function for them via `lambda_emitter`.
+        if (node.is_capturing()) {
+            return this.synthesize_closure_struct(node);
+        }
         return this.arena.get_function(ret_ty, param_types, false);
     }
 
@@ -2994,6 +3035,222 @@ public:
             this.current_lambda.add_capture(ident.name, outer_ty, ident.span);
         }
         return outer_ty;
+    }
+
+    /// Mint a unique closure type name like `<ns>::__Closure_<N>`.  Cross-
+    /// module uniqueness comes from the namespace prefix; within a module
+    /// `closure_counter` monotonically increments so each capturing lambda
+    /// gets its own struct.
+    mint_closure_name(mut &this) -> SymbolStr {
+        const idx: u64 = this.closure_counter;
+        this.closure_counter += 1;
+        const ns_str: string = if (this.ctx.has_namespace()) {
+            this.ctx.namespace_display()
+        } else {
+            this.ctx.source_file
+        };
+        const name_str: string = format("%s::__Closure_%lld", ns_str, idx as i64);
+        return this.intern.intern(name_str);
+    }
+
+    /// Synthesise the closure-struct + `__call__` method for a capturing
+    /// lambda.  Returns the closure struct's TypeRef so the caller can
+    /// stamp it onto the LambdaExprNode's `resolved_type`.
+    ///
+    /// What gets built:
+    ///   - StructDeclNode named `<ns>::__Closure_<N>` with one FieldDeclNode
+    ///     per capture; visibility public, resolved_type stamped.
+    ///   - FunctionDeclNode named `__call__` with the lambda's params + return
+    ///     type, body = `{ const cap_i: T_i = this.cap_i; ...; <lambda body>; }`.
+    ///     The shadow bindings let the lambda body reuse the names it
+    ///     already references; codegen creates allocas for them and the
+    ///     body's identifier lookups resolve through `cg.values` as normal.
+    ///   - MethodNode wrapping that function; added to the StructDeclNode.
+    ///   - Arena StructType populated with FieldInfo + MethodInfo entries.
+    ///   - DeclarationIndex registrations for the struct + its methods.
+    ///   - The StructDeclNode appended to ProgramNode so subsequent passes
+    ///     (sema's own visit, MoveCheck, DropInsertion, Codegen) see it.
+    synthesize_closure_struct(mut &this, lambda: LambdaExprNode*) -> TypeRef {
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const intern_ptr: InternTable* = this.intern;
+        const arena_ptr: TypeArena* = this.arena;
+
+        const qual_name: SymbolStr = this.mint_closure_name();
+        const module_sym: SymbolStr = intern_ptr.intern(ctx_ptr.source_file);
+        const span: SourceSpan = lambda.span;
+
+        // 1. StructDeclNode + FieldDeclNodes.
+        mut struct_decl: StructDeclNode* = new StructDeclNode(qual_name, span);
+        // No `![repr]` directive applies; use Cryo-native layout.
+        struct_decl.repr_c = false;
+        struct_decl.repr_packed = false;
+        struct_decl.repr_transparent = false;
+        struct_decl.min_alignment = 0;
+
+        for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
+            const cap_name: SymbolStr = lambda.captured_names[i];
+            const cap_ty:   TypeRef   = lambda.captured_types[i];
+            mut field: FieldDeclNode* = new FieldDeclNode(cap_name, span);
+            field.set_visibility(Visibility::Public);
+            field.set_resolved_type(cap_ty);
+            struct_decl.add_field(field);
+        }
+
+        // 2. Register the StructType in the arena and populate fields.
+        const struct_ref: TypeRef = arena_ptr.create_struct(qual_name, module_sym);
+        const struct_t: Type* = arena_ptr.lookup(struct_ref.id);
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut infos: FieldInfo[] = [];
+            for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
+                infos.push(FieldInfo::new(
+                    lambda.captured_names[i],
+                    lambda.captured_types[i],
+                    true, false, false));
+            }
+            st.set_fields(infos);
+        }
+
+        // 3. FunctionDeclNode for `__call__`.  Receiver is implicit (no
+        //    explicit `&this` parameter); `register_methods_with_module`
+        //    synthesises the receiver pointer slot at registration time.
+        const call_name: SymbolStr = intern_ptr.intern("__call__");
+        mut call_fn: FunctionDeclNode* = new FunctionDeclNode(call_name, span);
+        call_fn.set_resolved_return_type(lambda.return_type);
+
+        for (mut i: i64 = 0; i < lambda.parameters.length; i++) {
+            call_fn.add_parameter(lambda.parameters[i]);
+        }
+
+        // 4. __call__ body: `{ const cap_i: T_i = this.cap_i; <lambda body> }`.
+        mut body_block: BlockStmtNode* = new BlockStmtNode(span);
+        const this_ident_sym: SymbolStr = this.this_sym;
+        for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
+            const cap_name: SymbolStr = lambda.captured_names[i];
+            const cap_ty:   TypeRef   = lambda.captured_types[i];
+
+            // `this`
+            mut this_ident: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
+            this_ident.set_resolved_type(struct_ref);
+
+            // `this.cap_i`
+            mut access: MemberAccessNode* = new MemberAccessNode(
+                this_ident as ExpressionNode*, cap_name, span, span);
+            access.set_resolved_type(cap_ty);
+
+            // `const cap_i: T_i = this.cap_i;`
+            mut shadow: VarDeclNode* = new VarDeclNode(cap_name, span);
+            shadow.set_mutable(false);
+            shadow.set_resolved_type(cap_ty);
+            shadow.set_initializer(access as ExpressionNode*);
+
+            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(
+                shadow as DeclarationNode*, span);
+            body_block.add_statement(shadow_stmt as StatementNode*);
+        }
+
+        // Append the original lambda body's statements (or the body itself
+        // if it is not a block).  The body has already been sema-walked
+        // inside `resolve_lambda` so every node carries its resolved_type.
+        if (lambda.body != null) {
+            if (lambda.body.kind == NodeKind::BlockStatement) {
+                const orig_blk: BlockStmtNode* = lambda.body as BlockStmtNode*;
+                for (mut bi: i64 = 0; bi < orig_blk.statements.length; bi++) {
+                    body_block.add_statement(orig_blk.statements[bi]);
+                }
+            } else {
+                body_block.add_statement(lambda.body);
+            }
+        }
+        call_fn.set_body(body_block);
+
+        // 5. MethodNode + attach to struct.
+        mut method: MethodNode* = new MethodNode(call_fn, span);
+        method.set_visibility(Visibility::Public);
+        method.set_static(false);
+        method.set_sink(false);
+        struct_decl.add_method(method);
+
+        // 6. Populate StructType.methods so sema's `resolve_method_overload`
+        //    can find `__call__` by name when the call dispatch kicks in.
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut method_param_types: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < call_fn.parameters.length; pi++) {
+                const pp: VarDeclNode* = call_fn.parameters[pi];
+                if (pp != null && pp.resolved_type.is_valid()) {
+                    method_param_types.push(pp.resolved_type);
+                }
+            }
+            const call_fn_ty: TypeRef = arena_ptr.get_function(
+                lambda.return_type, method_param_types, false);
+            const minfo: MethodInfo = MethodInfo {
+                name:          call_name,
+                function_type: call_fn_ty,
+                is_public:     true,
+                is_protected:  false,
+                is_static:     false,
+                is_virtual:    false,
+                is_override:   false,
+                param_types:   method_param_types,
+                ast_node:      method as void*,
+            };
+            st.add_method(minfo);
+        }
+
+        // 7. DeclarationIndex registration so cross-pass lookups work.
+        ctx_ptr.decl_index.register_type_with_module(qual_name, struct_ref, module_sym);
+        mut method_arr: MethodNode*[] = [method];
+        ctx_ptr.decl_index.register_methods_with_module(
+            qual_name, method_arr, module_sym, intern_ptr, arena_ptr);
+
+        // 8. Inject into the ProgramNode so subsequent passes walk it.
+        //    Sema's `visit(ProgramNode)` re-reads `statements.length` each
+        //    iteration, so the appended StructDecl gets type-checked in
+        //    the same pass; MoveCheck / DropInsertion / Codegen pick it
+        //    up naturally afterwards.
+        if (ctx_ptr.artifacts.ast.root != null) {
+            ctx_ptr.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+        }
+
+        return struct_ref;
+    }
+
+    /// True when `ty` is a struct that carries a `__call__` method - the
+    /// signature of a synthesised closure type.  Used by the closure-call
+    /// rewrite to decide whether `f(args)` should be reinterpreted as
+    /// `f.__call__(args)`.
+    is_closure_struct_type(mut &this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::Struct) { return false; }
+        const st: StructType* = t as StructType*;
+        const call_sym: SymbolStr = this.intern.intern("__call__");
+        return st.get_method(call_sym) != null;
+    }
+
+    /// If `call.callee` is an identifier whose resolved local type is a
+    /// closure struct, rewrite the call to dispatch through `__call__`.
+    /// In-place mutation of `call.callee`; safe because the caller has
+    /// not yet inspected the callee kind for this resolve pass.
+    maybe_rewrite_closure_call(mut &this, call: CallExprNode*) -> void {
+        if (call == null || call.callee == null) { return; }
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn.kind != NodeKind::Identifier) { return; }
+        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+        const local_ty: TypeRef = this.lookup_local(ident.name);
+        if (!this.is_closure_struct_type(local_ty)) { return; }
+
+        // Stamp the identifier with its resolved closure-struct type so
+        // resolve_member_access has the receiver-type info it needs (it
+        // would otherwise re-run resolve_identifier through the capture
+        // fallback - harmless in isolation but extra work).
+        ident.set_resolved_type(local_ty);
+
+        const call_sym: SymbolStr = this.intern.intern("__call__");
+        mut access: MemberAccessNode* = new MemberAccessNode(
+            call.callee, call_sym, ident.span, ident.span);
+        call.callee = access as ExpressionNode*;
     }
 
 
@@ -3699,6 +3956,14 @@ public:
     }
 
     resolve_call(mut &this, call: CallExprNode*) -> TypeRef {
+        // Closure-call rewrite: `f(args)` where `f` is a value of a
+        // synthesised closure-struct type (carries a `__call__` method)
+        // becomes `f.__call__(args)`.  Sema's normal method-dispatch path
+        // takes over from there; codegen sees a regular method call.
+        // Skipped for non-closure identifiers so plain function calls
+        // still take the existing direct-call fast path.
+        this.maybe_rewrite_closure_call(call);
+
         // Most args resolve without an expected type; integer literal
         // widths, etc., are resolved from their own literal form.  BUT
         // empty array literals (`[]`) need the param type to pick up an
