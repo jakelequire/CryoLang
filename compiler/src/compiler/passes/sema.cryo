@@ -127,6 +127,28 @@ public:
     // this to flag only `&<body-local>` returns.
     param_ids: u32[];
 
+    // Closure-capture detection state, mutated only by `resolve_lambda`
+    // and consulted by `resolve_identifier`.
+    //
+    // `in_lambda_depth` is the nesting level: 0 outside any lambda body,
+    // 1 inside the outermost lambda, deeper for nested lambdas.  It gates
+    // the capture-fallback path in `resolve_identifier` (so calls outside
+    // lambdas never pay).
+    //
+    // `lambda_outer_locals` holds names visible from *outside* the lambda
+    // currently being type-checked - the union of the enclosing function's
+    // locals and any further-out lambda's already-captured names.  When
+    // `resolve_identifier` misses the per-lambda `locals` map and we're
+    // inside a lambda, it consults this map: a hit means "this is a
+    // free variable, record it as a capture on `current_lambda`."
+    //
+    // `current_lambda` is the LambdaExprNode whose body we're currently
+    // walking - the destination for `add_capture` calls.  Null outside
+    // any lambda body.
+    in_lambda_depth:     i32;
+    lambda_outer_locals: HashMap<u32, TypeRef>;
+    current_lambda:      LambdaExprNode*;
+
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
                      ctx: CompilationContext*) : BaseASTVisitor() {
@@ -153,6 +175,9 @@ public:
         this.expected_type  = TypeRef::invalid();
         this.payload_binding_ids = [];
         this.param_ids = [];
+        this.in_lambda_depth     = 0;
+        this.lambda_outer_locals = HashMap<u32, TypeRef>::new();
+        this.current_lambda      = null;
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -1017,6 +1042,12 @@ public:
         this.this_is_mut = false;
         this.payload_binding_ids = [];
         this.param_ids = [];
+        // Defensive reset: lambda state is normally save/restored by
+        // resolve_lambda, but reseating it at every function entry
+        // guarantees nested-pass re-entry can never observe stale state.
+        this.in_lambda_depth     = 0;
+        this.lambda_outer_locals = HashMap<u32, TypeRef>::new();
+        this.current_lambda      = null;
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
@@ -1600,6 +1631,34 @@ public:
 
         const var_node: VarDeclNode* = decl as VarDeclNode*;
 
+        // Enforce the lambda-only inference rule (the parser deliberately
+        // allows `const name = expr;` without a `:T` annotation; sema is
+        // the gate).  An untyped binding is legal only when the
+        // initializer is a lambda expression - any other shape would be
+        // implicit variable typing, which Cryo doesn't offer.  Missing
+        // initializer too is rejected: a fully-empty `const name;` has
+        // no shape to infer from.
+        if (var_node.type_annotation == null) {
+            const init: ExpressionNode* = var_node.initializer;
+            const init_is_lambda: boolean = init != null
+                && (init as ASTNode*).kind == NodeKind::LambdaExpression;
+            if (!init_is_lambda) {
+                const var_name: string = this.intern.resolve(var_node.name);
+                const msg: string = if (init == null) {
+                    format("variable `%s` needs a type annotation: write `: T` or initialise with a lambda expression",
+                           var_name)
+                } else {
+                    format("variable `%s` needs a type annotation; type inference is only available for lambda initializers (`(params) -> Ret { ... }`)",
+                           var_name)
+                };
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0104_EXPECTED_TYPE, msg);
+                diag = diag.at_with_label(var_node.span,
+                    "missing `:` and type annotation");
+                this.ctx.emit_diagnostic(diag);
+            }
+        }
+
         // Lazy-resolve the type annotation if earlier passes missed it, e.g.
         // VarDecls living inside a match-expression arm body (like
         // `const te: TypeofExprNode* = ...` in resolve_expr's Typeof arm).
@@ -1641,6 +1700,18 @@ public:
                     init_type.is_valid() as i32,
                     var_node.resolved_type.id,
                     init_type.id);
+            }
+            // Untyped lambda-binding form: `const f = (x:i32) -> i32 { ... };`.
+            // The user elided the redundant `: (i32) -> i32` annotation; we
+            // back-fill `resolved_type` from the lambda's own signature so
+            // codegen sees a normally-typed binding (the alloca slot needs
+            // this).  Only fires for the elided form - explicitly-typed
+            // bindings keep their declared type and let the assignment
+            // check below catch mismatches.
+            if (!var_node.has_resolved_type() && init_type.is_valid()
+                    && var_node.initializer != null
+                    && (var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression) {
+                var_node.resolved_type = init_type;
             }
             if (var_node.has_resolved_type() && init_type.is_valid()) {
                 // Declared type exists; check that the initializer is compatible
@@ -2247,6 +2318,26 @@ public:
                 // Parser produces a raw VarDeclNode (not wrapped in DeclStmtNode)
                 // for C-style for-loop initializers: for (mut i: int = 0; ...)
                 const var_node: VarDeclNode* = node.init as VarDeclNode*;
+                // Same lambda-only inference rule as `visit(DeclStmtNode)`:
+                // a for-loop init `for (mut i = 0; ...)` is missing its
+                // type annotation and isn't a lambda - it must spell out
+                // `: T`.
+                if (var_node.type_annotation == null) {
+                    const init_e: ExpressionNode* = var_node.initializer;
+                    const init_is_lambda: boolean = init_e != null
+                        && (init_e as ASTNode*).kind == NodeKind::LambdaExpression;
+                    if (!init_is_lambda) {
+                        const var_name: string = this.intern.resolve(var_node.name);
+                        const msg: string = format(
+                            "for-loop initializer `%s` needs a type annotation; type inference is only available for lambda initializers",
+                            var_name);
+                        mut diag: Diagnostic = Diagnostic::error(
+                            ErrorCode::E0104_EXPECTED_TYPE, msg);
+                        diag = diag.at_with_label(var_node.span,
+                            "missing `:` and type annotation");
+                        this.ctx.emit_diagnostic(diag);
+                    }
+                }
                 if (var_node.has_initializer()) {
                     this.resolve_expr(var_node.initializer);
                 }
@@ -2708,18 +2799,20 @@ public:
         return result;
     }
 
-    /// Type-check a lambda expression and give it a function-pointer type.
+    /// Type-check a lambda expression.
     ///
-    /// A lambda is a self-contained, NON-capturing function: its body is
-    /// type-checked in a fresh per-function scope holding only the lambda's
-    /// own parameters, so it can reference globals and other functions but not
-    /// the enclosing function's locals. (A reference to an outer local
-    /// surfaces as an ordinary "not found" error rather than miscompiling into
-    /// a broken capture - closures with environments are not implemented.)
+    /// The body is walked in a per-lambda locals scope holding only the
+    /// lambda's own parameters.  Free variables (references to outer-scope
+    /// locals) are detected by `resolve_identifier`'s fallback path, which
+    /// consults `lambda_outer_locals` - the union of every enclosing scope
+    /// (function locals + any further-out lambda's already-captured names).
+    /// A hit becomes a capture: the type is required to be Copy (E0457 if
+    /// not), the binding is registered as a local in the lambda body, and
+    /// the capture is recorded on the node's `captured_*` parallel arrays.
     ///
-    /// Without this pass, lambda bodies were never type-checked: body
-    /// expressions had no `resolved_type`, so codegen produced a function with
-    /// no `ret` (an `unreachable`), and calling it crashed at runtime.
+    /// The lambda's value type is still the function-pointer signature
+    /// at the end of Phase 1; later phases switch capturing lambdas to
+    /// emit a synthesised closure struct.
     resolve_lambda(mut &this, node: LambdaExprNode*) -> TypeRef {
         mut res_ctx: ResolutionContext = ResolutionContext::new(
             this.ctx.source_file, "");
@@ -2768,6 +2861,41 @@ public:
         const saved_expected:  TypeRef                  = this.expected_type;
         const saved_loop:      i32                      = this.loop_depth;
         const saved_switch:    i32                      = this.switch_depth;
+        // Lambda-capture state save.  `saved_outer` aliases the *enclosing*
+        // lambda's outer-locals snapshot (empty when entering a top-level
+        // lambda) - it's restored verbatim on exit; the new map we build
+        // below is what the body sees.
+        const saved_outer_locals: HashMap<u32, TypeRef> = this.lambda_outer_locals;
+        const saved_lambda_depth: i32                   = this.in_lambda_depth;
+        const saved_current_lam:  LambdaExprNode*       = this.current_lambda;
+
+        // Compose the body's view of out-of-scope bindings: every name
+        // visible from immediately outside this lambda, transitively.
+        //   union = (further-out captures, via saved_outer_locals)
+        //         ∪ (immediate enclosing scope, via saved_locals)
+        // saved_locals shadows saved_outer_locals (insert overwrites): an
+        // immediate-enclosing binding that happens to share a name with a
+        // further-out one is the closer match - it's what resolve_identifier
+        // would have picked before lambda nesting added a level.
+        mut new_outer_locals: HashMap<u32, TypeRef> = HashMap<u32, TypeRef>::new();
+        mut outer_it: HashMapIter<u32, TypeRef> = saved_outer_locals.iter();
+        loop {
+            match (outer_it.next()) {
+                Option::Some(pair) => {
+                    new_outer_locals.insert(pair.first, pair.second);
+                }
+                Option::None => { break; }
+            }
+        }
+        mut local_it: HashMapIter<u32, TypeRef> = saved_locals.iter();
+        loop {
+            match (local_it.next()) {
+                Option::Some(pair) => {
+                    new_outer_locals.insert(pair.first, pair.second);
+                }
+                Option::None => { break; }
+            }
+        }
 
         this.locals         = HashMap<u32, TypeRef>::new();
         this.local_muts     = HashMap<u32, boolean>::new();
@@ -2785,6 +2913,9 @@ public:
         this.expected_type   = TypeRef::invalid();
         this.loop_depth      = 0;
         this.switch_depth    = 0;
+        this.lambda_outer_locals = new_outer_locals;
+        this.in_lambda_depth     = saved_lambda_depth + 1;
+        this.current_lambda      = node;
 
         for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
             const p: VarDeclNode* = node.parameters[pi];
@@ -2814,9 +2945,55 @@ public:
         this.expected_type   = saved_expected;
         this.loop_depth      = saved_loop;
         this.switch_depth    = saved_switch;
+        this.lambda_outer_locals = saved_outer_locals;
+        this.in_lambda_depth     = saved_lambda_depth;
+        this.current_lambda      = saved_current_lam;
 
         // The lambda's value type is its function-pointer signature.
+        // (Capturing lambdas reuse this; later phases switch them to a
+        // synthesised closure-struct type.)
         return this.arena.get_function(ret_ty, param_types, false);
+    }
+
+    /// Helper for `resolve_identifier`: a name inside a lambda body
+    /// resolved to an outer-scope binding `outer_ty`.  Validates the
+    /// capture mode (only `Copy` types are capturable in the v1 MVP),
+    /// records the capture on the surrounding `current_lambda`, and
+    /// shadows the binding into the lambda's own locals so subsequent
+    /// uses resolve through `lookup_local` without re-running this path.
+    /// Returns the captured type so the calling identifier resolves.
+    record_lambda_capture(mut &this, ident: IdentifierNode*,
+                          outer_ty: TypeRef) -> TypeRef {
+        // Non-Copy captures need Drop-glue plumbing on the closure struct
+        // that isn't in place for the v1 MVP.  Reject with a clear error
+        // that points at the use site; the lambda's locals still get
+        // shadowed so the rest of the body type-checks without cascading
+        // "not found" noise.
+        const is_copy: boolean = OwnershipQuery::is_copy(this.arena,
+            this.ctx.get_generic_registry(), this.intern, outer_ty);
+        if (!is_copy) {
+            const name_str: string = this.intern.resolve(ident.name);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0457_NON_COPY_CAPTURE,
+                format("closure captures non-Copy value `%s`", name_str));
+            diag = diag.at_with_label(ident.span,
+                "this closure would have to move the value into its environment");
+            diag = diag.with_note(
+                "v1.0 supports only by-value `Copy` captures (i32, u64, bool, char, references); non-Copy types must be passed as arguments or boxed manually");
+            this.ctx.emit_diagnostic(diag);
+        }
+
+        // Shadow the binding as a per-lambda local: subsequent references
+        // resolve via lookup_local, and the codegen path (Phase 3+) will
+        // bind it to the closure-struct field.  Captures are by-value, so
+        // the shadow is non-mut regardless of the original binding's
+        // mutability.
+        this.register_local(ident.name, outer_ty);
+
+        if (this.current_lambda != null) {
+            this.current_lambda.add_capture(ident.name, outer_ty, ident.span);
+        }
+        return outer_ty;
     }
 
 
@@ -2898,7 +3075,7 @@ public:
         return this.arena.get_f64();
     }
 
-    resolve_identifier(&this, ident: IdentifierNode*) -> TypeRef {
+    resolve_identifier(mut &this, ident: IdentifierNode*) -> TypeRef {
         if (ident.name.equals(this.this_sym) && this.this_type.is_valid()) {
             return this.this_type;
         }
@@ -2907,6 +3084,21 @@ public:
         // visit(DeclStmtNode*)).
         const local: TypeRef = this.lookup_local(ident.name);
         if (local.is_valid()) { return local; }
+
+        // Lambda-capture fallback: inside a lambda body, the per-lambda
+        // `locals` map only carries the lambda's own params, so a reference
+        // to an enclosing-scope binding misses above.  Before falling
+        // through to globals/functions/typo-diagnostic, check the outer
+        // snapshot stitched together by `resolve_lambda`; a hit becomes a
+        // capture on the surrounding lambda.
+        if (this.in_lambda_depth > 0 && this.current_lambda != null) {
+            match (this.lambda_outer_locals.get(&ident.name.id)) {
+                Option::Some(outer_ty) => {
+                    return this.record_lambda_capture(ident, outer_ty);
+                }
+                Option::None => { /* fall through */ }
+            }
+        }
 
         // Global variables are stored in the DeclarationIndex (single source
         // of truth for declaration-level type lookups).
