@@ -42,9 +42,16 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   the `![link]` directive for extern symbols.
 - **Operators:** `?` error propagation, `|>` pipeline, `??` null-coalescing,
   `T?` optional-type sugar (desugars to `Option<T>`).
-- **Lambdas:** `(params) -> Ret { body }` non-capturing function literals,
-  assignable to function-pointer types. Generic type-parameter inference
-  from function-typed arguments (`opt.map(lambda)` infers `U`).
+- **Lambdas and closures:** `(params) -> Ret { body }` function literals.
+  Non-capturing lambdas compile to anonymous function pointers; capturing
+  lambdas over `Copy` bindings (i32/u64/bool/char/references and any
+  `![derive(Copy)]` type) compile to a synthesised anonymous closure
+  struct with a `__call__` method. Both forms call directly with zero
+  overhead. Closures bound to a `(Args) -> Ret`-typed parameter are
+  delivered via per-call-site receiver specialisation, so the body
+  dispatches through `__call__` without an indirect call. Generic
+  type-parameter inference from function-typed arguments
+  (`opt.map(lambda)` infers `U`).
 - **Modules:** `_module.cryo` aggregators, `public`/`private`/`protected`
   visibility, import cycle detection.
 
@@ -109,11 +116,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 
 ### Examples
 
-Twelve worked examples under `examples/`, covering hello-world,
+Thirteen worked examples under `examples/`, covering hello-world,
 fizzbuzz, recursion, structs and methods, `Array<T>` ownership, file
 I/O and `HashMap`, traits with `where` bounds, 2D simulation,
-`std::json` parsing, recursive-descent parsing, an HTTP server, and
-stdin-driven interactive I/O.
+`std::json` parsing, recursive-descent parsing, an HTTP server,
+stdin-driven interactive I/O, and capturing closures.
 
 ### Known limitations (deferred to post-1.0)
 
@@ -122,7 +129,6 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- Capturing closures (lambdas are non-capturing).
 - `for x in iter` iteration and iterator combinators (`.map`, `.filter`,
   `.collect`, `.take`, `.zip`, `.chain`, `.enumerate`). The `Iterator`
   trait ships with `next`/`count`/`fold`/`for_each` only.
