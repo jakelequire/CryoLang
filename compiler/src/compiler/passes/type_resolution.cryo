@@ -2334,23 +2334,35 @@ type struct TypeResolutionPasses {
                         }
                         const fn_ty: TypeRef = arena.get_function(
                             fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
-                        const minfo: MethodInfo = MethodInfo {
-                            name:          fn_node.name,
-                            function_type: fn_ty,
-                            is_public:     mnode.visibility == Visibility::Public,
-                            is_protected:  mnode.visibility == Visibility::Protected,
-                            is_static:     mnode.is_static,
-                            is_virtual:    mnode.is_virtual,
-                            is_override:   mnode.is_override,
-                            param_types:   ptypes,
-                            ast_node:      mnode as void*,
-                        };
-                        if (tgt_t.kind == TypeKind::Struct) {
-                            mut tst: StructType* = tgt_t as StructType*;
-                            tst.add_method(minfo);
-                        } else if (tgt_t.kind == TypeKind::Class) {
-                            mut tct: ClassType* = tgt_t as ClassType*;
-                            tct.add_method(minfo);
+                        // Build the MethodInfo only on the paths that consume
+                        // it.  MethodInfo has no Drop impl (its owned
+                        // param_types array is freed by field drop-glue at
+                        // scope exit, not via an explicit `.drop()`), so it
+                        // can't be released on a dead path; instead `ptypes`
+                        // is moved into minfo on exactly the struct/class
+                        // branches and dropped directly otherwise.
+                        if (tgt_t.kind == TypeKind::Struct
+                                || tgt_t.kind == TypeKind::Class) {
+                            const minfo: MethodInfo = MethodInfo {
+                                name:          fn_node.name,
+                                function_type: fn_ty,
+                                is_public:     mnode.visibility == Visibility::Public,
+                                is_protected:  mnode.visibility == Visibility::Protected,
+                                is_static:     mnode.is_static,
+                                is_virtual:    mnode.is_virtual,
+                                is_override:   mnode.is_override,
+                                param_types:   ptypes,
+                                ast_node:      mnode as void*,
+                            };
+                            if (tgt_t.kind == TypeKind::Struct) {
+                                mut tst: StructType* = tgt_t as StructType*;
+                                tst.add_method(minfo);
+                            } else {
+                                mut tct: ClassType* = tgt_t as ClassType*;
+                                tct.add_method(minfo);
+                            }
+                        } else {
+                            ptypes.drop();
                         }
                     }
                 }

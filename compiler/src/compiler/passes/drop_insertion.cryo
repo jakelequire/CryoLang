@@ -1083,16 +1083,35 @@ type struct DropInserter {
             return;
         }
         if (live_then && !live_else) {
-            // Only the then-branch falls through.  Its moves apply
-            // unconditionally past the if-stmt; there's no other
-            // surviving path to compare against.
+            // Only the then-branch falls through past the if.  Two shapes
+            // land here, distinguished by has_else:
             //
-            // NOTE: a then-only move with no else (`if (c) { consume(x); }`)
-            // is really conditional - `x` survives the false path and the
-            // fail-safe under-drop suppresses its drop there, a (memory-safe)
-            // leak.  Flagging it precisely needs reassignment-aware flow (so
-            // benign `x = f(x)` rebinds don't false-positive) and ideally
-            // drop flags; until then it stays silent rather than noisy.
+            //  - No explicit else (`if (c) { consume(x); }`): the implicit
+            //    fall-through else moves nothing, so a then-only move of an
+            //    outer-scope binding is genuinely *conditional* - `x` is moved
+            //    on the true path but survives the false path, where the
+            //    fail-safe under-drop below suppresses its drop: a
+            //    memory-safe leak.  Warn (E0456) for each such binding.
+            //
+            //  - Diverging else (`if (c) { consume(x); } else { return; }`):
+            //    the else path never reaches post-if, so the then-branch is
+            //    the only surviving path and its move is *unconditional* -
+            //    not a leak.  Don't warn.
+            //
+            // Reassignment (`x = f(x)`) never reaches here as a live move:
+            // read_binary unmarks the lhs after the rhs move, tombstoning it
+            // (id 0) out of then_keys; binding_in_outer_scope rejects id 0 and
+            // any branch-local binding, so neither false-positives.
+            if (!has_else) {
+                for (mut i: i64 = 0; i < then_keys.length; i++) {
+                    if (this.binding_in_outer_scope(then_keys[i])) {
+                        this.emit_conditional_move_by_id(then_keys[i], then_lines[i]);
+                    }
+                }
+            }
+            // The surviving (then) path's moves carry past the if.  With a
+            // diverging else this is exact; with no else it's the fail-safe
+            // under-drop on the false path - the leak just warned about.
             this.set_moves_tail(snap, then_keys, then_lines);
             return;
         }
@@ -1479,6 +1498,20 @@ type struct DropInserter {
             // restrict the move semantics to plain `=`.
             if (b.op.kind == TokenType::Equal) {
                 this.walk_expr_move(b.right);
+                // Plain `=` to a bare identifier reinitializes that
+                // binding: it now owns the rhs result and must be dropped
+                // at scope exit.  Clear any stale moved state for the lhs
+                // so (a) `x = f(x)` doesn't leave `x` marked moved (which
+                // would suppress its scope-exit drop -> leak, and surface
+                // as a spurious E0456 conditional-move at branch joins),
+                // and (b) `consume(x); x = make();` revives `x`.  Mirrors
+                // move_check::read_binary.  unmark_moved here is
+                // length-preserving (tombstones in place), so the
+                // moves_since_keys/set_moves_tail branch-join checkpoints
+                // stay valid.
+                if (b.left != null && b.left.kind == NodeKind::Identifier) {
+                    this.unmark_moved((b.left as IdentifierNode*).name);
+                }
             } else {
                 this.walk_expr_read(b.right);
             }
