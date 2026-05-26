@@ -1,0 +1,214 @@
+// Drop-flag regression: a non-Copy binding conditionally moved by an
+// `if` branch is correctly dropped on the path where the move didn't
+// happen, and NOT double-dropped on the path where it did.  Before
+// drop flags landed, the conditionally-moved binding was added to the
+// moved-set at the join and its scope-exit drop was silently
+// suppressed - which for an allocating type meant the not-moved path
+// leaked.
+![config(testing)]
+namespace CryoTests::Tests::Lang::ConditionalMoveDrop;
+
+import std::test;
+import std::core::result;
+
+
+// CMDProbe type with explicit drop bookkeeping.  Two file-scope counters
+// track how many times the type was constructed vs. dropped so each
+// test can assert exact accounting (not just absence of crashes).
+
+mut cmd_probe_alive: i32 = 0;
+mut cmd_probe_drops: i32 = 0;
+
+function cmd_probe_reset() -> void {
+    cmd_probe_alive = 0;
+    cmd_probe_drops = 0;
+}
+
+type struct CMDProbe {
+    tag: i32;
+}
+
+implement struct CMDProbe {
+    static new(tag: i32) -> CMDProbe {
+        cmd_probe_alive = cmd_probe_alive + 1;
+        return CMDProbe { tag: tag };
+    }
+}
+
+implement trait Drop for struct CMDProbe {
+    drop(mut &this) -> void {
+        cmd_probe_alive = cmd_probe_alive - 1;
+        cmd_probe_drops = cmd_probe_drops + 1;
+    }
+}
+
+function consume(p: CMDProbe) -> void {
+    // by-value: callee owns and drops on return.
+}
+
+
+// --- if-then with no else: classic conditional move shape -----------
+
+![test]
+function then_only_move_drops_on_false_path() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(1);
+        if (false) {
+            consume(p);   // moved on the true path only
+        }
+        // Drop flag should fire here on the false path: p was never moved.
+    }
+    // Exactly one construct, exactly one drop.
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+![test]
+function then_only_move_drops_via_consume_on_true_path() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(2);
+        if (true) {
+            consume(p);   // consume drops p inside the callee
+        }
+        // Drop flag should suppress the scope-exit drop here on the true
+        // path: p has already been dropped by consume.
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Single drop, from consume's by-value param going out of scope.
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+
+// --- if-else: symmetric difference (then moves, else doesn't) -------
+
+![test]
+function then_branch_moves_else_doesnt_drops_on_else_path() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(3);
+        if (false) {
+            consume(p);
+        } else {
+            // borrow only - no move
+            const _t: i32 = p.tag;
+        }
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+![test]
+function else_branch_moves_then_doesnt_drops_on_then_path() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(4);
+        if (true) {
+            const _t: i32 = p.tag;
+        } else {
+            consume(p);
+        }
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+
+// --- baseline: unconditional move (no flag needed) ------------------
+
+![test]
+function unconditional_move_drops_exactly_once() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(5);
+        consume(p);   // straight-line move; no branching
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+
+// --- match arms: one arm consumes the binding, another borrows ----
+
+type enum Choice {
+    Yes;
+    No;
+}
+
+![test]
+function match_consume_in_some_arms_drops_on_borrow_arm() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(7);
+        mut c: Choice = Choice::No;
+        match (c) {
+            Choice::Yes => { consume(p); }   // moves p
+            Choice::No  => { const _t: i32 = p.tag; }  // borrow
+        }
+        // On the No path, p must be dropped at scope exit; on the Yes
+        // path the flag suppresses the duplicate drop.
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+![test]
+function match_consume_in_all_arms_no_double_drop() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(8);
+        mut c: Choice = Choice::Yes;
+        match (c) {
+            Choice::Yes => { consume(p); }
+            Choice::No  => { consume(p); }
+        }
+        // Both arms moved p (intersection => unconditional move).
+        // No flag needed; scope exit must NOT drop.
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Exactly one drop, from consume.
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}
+
+
+// --- no move on either branch: scope drop, no flag ------------------
+
+![test]
+function neither_branch_moves_normal_scope_drop() -> Result<(), TestError> {
+    cmd_probe_reset();
+    {
+        mut p: CMDProbe = CMDProbe::new(6);
+        if (true) {
+            const _t: i32 = p.tag;
+        } else {
+            const _t: i32 = p.tag;
+        }
+    }
+    match (expect_eq(cmd_probe_alive, 0 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmd_probe_drops, 1 as i32);
+}

@@ -7,8 +7,11 @@
 ///! are walked sequentially without state-merge (snapshot/restore), which
 ///! keeps the analysis conservative - it only fires on a use that is
 ///! reachable from the move on a straight-line path, so it under-reports
-///! rather than over-reports. Because every diagnostic it does emit is an
-///! unambiguous double free, use-after-move is a hard error (fatal).
+///! rather than over-reports. Because every diagnostic it does emit is
+///! an unambiguous double free, both within-iteration and loop-carried
+///! use-after-move are hard errors (fatal) - the pass is
+///! fatal_on_failure, so the pipeline aborts before codegen and the
+///! unsound binary is never emitted.
 
 namespace Compiler::Passes::MoveCheck;
 
@@ -262,14 +265,6 @@ type struct MoveChecker {
         }
     }
 
-    emit_warn(mut &this, code: ErrorCode, message: string,
-              span: SourceSpan) -> void {
-        mut diag: Diagnostic = Diagnostic::warning(code, message);
-        diag = diag.at(span);
-        this.ctx.emit_diagnostic(diag);
-        this.fired += 1;
-    }
-
     /// Emit a use-after-move error with a primary label at the use
     /// site and a secondary label at the original move site. Renderer
     /// combines them into a single rustc-style snippet with `...`
@@ -296,11 +291,11 @@ type struct MoveChecker {
     /// A value declared outside a loop, moved inside it via a storage-
     /// duplicating move, and read again on the next iteration: the move
     /// re-runs every pass over the same storage, so an owning value is
-    /// dropped (freed) more than once - a double free.  Unlike the
-    /// within-iteration use-after-move (warn-only, imprecise), this is an
-    /// unambiguous true positive, so it is a hard error: it increments
-    /// `fatal`, failing the pass and aborting the pipeline before codegen
-    /// so the double-freeing binary is never emitted.
+    /// dropped (freed) more than once - a double free.  Both this and the
+    /// within-iteration use-after-move path (`emit_use_after_move` above)
+    /// are hard errors that increment `fatal`, failing the pass and
+    /// aborting the pipeline before codegen so the double-freeing binary
+    /// is never emitted.
     emit_loop_carried(mut &this, name: SymbolStr, use_span: SourceSpan) -> void {
         const headline: string = format(
             "value '%s' moved inside a loop is used again on the next iteration",

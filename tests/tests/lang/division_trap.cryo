@@ -1,0 +1,104 @@
+// Runtime traps for integer divide-by-zero and signed-overflow
+// (INT_MIN / -1).  Both are LLVM UB on the underlying `sdiv`/`udiv`
+// instructions; the compiler now guards them with an explicit
+// `icmp ... ; br ... ; abort()` triplet so the binary aborts with
+// SIGABRT instead of silently producing a poison value or crashing
+// unpredictably.
+//
+// Float division is total under IEEE-754 (`x/0 -> +/-inf`,
+// `0/0 -> NaN`); it is NOT guarded and is exercised separately
+// to make sure the guard wasn't accidentally extended to fdiv.
+![config(testing)]
+namespace CryoTests::Tests::Lang::DivisionTrap;
+
+import std::test;
+import std::core::result;
+import std::collections::str;
+
+
+// --- traps ----------------------------------------------------------
+
+![test]
+![should_panic]
+function signed_div_by_zero_aborts() -> Result<(), TestError> {
+    mut a: i32 = 7;
+    mut b: i32 = 0;
+    const _q: i32 = a / b;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function unsigned_div_by_zero_aborts() -> Result<(), TestError> {
+    mut a: u32 = 7;
+    mut b: u32 = 0;
+    const _q: u32 = a / b;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function signed_rem_by_zero_aborts() -> Result<(), TestError> {
+    mut a: i64 = 7;
+    mut b: i64 = 0;
+    const _r: i64 = a % b;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function unsigned_rem_by_zero_aborts() -> Result<(), TestError> {
+    mut a: u64 = 7;
+    mut b: u64 = 0;
+    const _r: u64 = a % b;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function signed_intmin_div_minus_one_aborts() -> Result<(), TestError> {
+    // INT_MIN / -1 overflows the i32 result range (its true value is
+    // INT_MAX + 1) and is LLVM UB.
+    mut a: i32 = -2147483648;
+    mut b: i32 = -1;
+    const _q: i32 = a / b;
+    return Result::Ok(());
+}
+
+
+// --- non-traps: guard MUST NOT fire on safe inputs ------------------
+
+![test]
+function signed_div_normal() -> Result<(), TestError> {
+    mut a: i32 = 10;
+    mut b: i32 = 3;
+    const q: i32 = a / b;
+    return expect_eq(q, 3 as i32);
+}
+
+![test]
+function unsigned_div_normal() -> Result<(), TestError> {
+    mut a: u32 = 100;
+    mut b: u32 = 7;
+    const q: u32 = a / b;
+    return expect_eq(q, 14 as u32);
+}
+
+![test]
+function signed_intmin_div_other_ok() -> Result<(), TestError> {
+    // Only the -1 divisor triggers the overflow arm; any other
+    // divisor must still divide cleanly.
+    mut a: i32 = -2147483648;
+    mut b: i32 = 2;
+    const q: i32 = a / b;
+    return expect_eq(q, -1073741824 as i32);
+}
+
+![test]
+function float_div_by_zero_is_inf() -> Result<(), TestError> {
+    // IEEE-754: 1.0 / 0.0 = +inf.  No guard, no trap.
+    mut a: f64 = 1.0;
+    mut b: f64 = 0.0;
+    const q: f64 = a / b;
+    return expect_true(q > 1.0e300, Str::new("1.0 / 0.0 should be +inf"));
+}

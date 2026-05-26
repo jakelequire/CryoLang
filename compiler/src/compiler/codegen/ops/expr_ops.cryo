@@ -1380,6 +1380,13 @@ type struct ExprOps {
                 };
             }
             TokenType::Slash => {
+                // Guard before the divide.  IEEE-754 fdiv is total
+                // (x/0 -> +/-inf, 0/0 -> NaN) so float skips the guard;
+                // integer sdiv/udiv on a zero divisor (and signed
+                // INT_MIN / -1) are LLVM UB and must trap explicitly.
+                if (!is_float) {
+                    this.emit_int_div_guard(lhs, rhs, is_signed);
+                }
                 out_value = if (is_float) {
                     this.builder.build_fdiv(lhs, rhs, "divtmp")
                 } else { if (is_signed) {
@@ -1389,6 +1396,9 @@ type struct ExprOps {
                 } };
             }
             TokenType::Percent => {
+                if (!is_float) {
+                    this.emit_int_div_guard(lhs, rhs, is_signed);
+                }
                 out_value = if (is_float) {
                     this.builder.build_frem(lhs, rhs, "remtmp")
                 } else { if (is_signed) {
@@ -1551,6 +1561,90 @@ type struct ExprOps {
             _ => { out = LValue::null(); }
         }
         return out;
+    }
+
+    /// Emit a runtime trap before an integer divide/modulo.  LLVM treats
+    /// `sdiv`/`udiv`/`srem`/`urem` as having undefined behavior when the
+    /// divisor is zero (and for signed, additionally when computing
+    /// `INT_MIN / -1` since the mathematical result overflows the result
+    /// width).  Both cases lower to SIGFPE on x86 today, but UB lets the
+    /// optimizer assume they can't happen and silently delete surrounding
+    /// code, so guarding here keeps the language honest about its
+    /// "no hidden control flow" promise.
+    ///
+    /// IR shape (signed case; unsigned omits the INT_MIN/-1 arm):
+    ///
+    ///   %iszero = icmp eq %rhs, 0
+    ///   %neg1   = icmp eq %rhs, -1          ; signed only
+    ///   %imin   = icmp eq %lhs, INT_MIN     ; signed only
+    ///   %ovf    = and  %neg1, %imin         ; signed only
+    ///   %trap   = or   %iszero, %ovf        ; signed only
+    ///   br i1 %trap, label %div.trap, label %div.ok
+    /// div.trap:
+    ///   call void @abort()
+    ///   unreachable
+    /// div.ok:
+    ///   <caller continues with the div/rem here>
+    ///
+    /// Leaves the builder positioned at the ok block.  For non-zero
+    /// constant divisors LLVM's optimizer folds the branch away in O2
+    /// builds (default), so the guard has no steady-state runtime cost
+    /// when the compiler can prove safety statically.
+    emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean) -> void {
+        const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
+        if (rhs_ty_raw == null) { return; }
+        const rhs_ty: LType = LType { raw: rhs_ty_raw };
+        const zero: LValue = LType::const_int(rhs_ty, 0 as u64, false);
+        const is_zero: LValue = this.builder.build_icmp(
+            LIntPredicate::EQ, rhs, zero, "div.iszero");
+
+        mut trap_cond: LValue = is_zero;
+        if (is_signed) {
+            const lhs_ty_raw: void* = llvm::LLVMTypeOf(lhs.raw);
+            const lhs_ty: LType = LType { raw: lhs_ty_raw };
+            const width: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty_raw);
+            // -1 is all-ones in two's complement at any width; const_int
+            // with sign_extend=true sign-extends the i64 value to the
+            // target width, giving the canonical -1 bit pattern.
+            const minus_one: LValue = LType::const_int(
+                rhs_ty, 0xFFFFFFFFFFFFFFFF as u64, true);
+            // INT_MIN = 1 << (width - 1) for the lhs width.  LLVMConstInt
+            // truncates the u64 to the target width, so 0x8000... lands
+            // as the right bit pattern at any width <= 64.
+            const shift: u64 = (width as u64) - (1 as u64);
+            const imin_val: u64 = (1 as u64) << shift;
+            const int_min: LValue = LType::const_int(lhs_ty, imin_val, false);
+            const rhs_is_neg1: LValue = this.builder.build_icmp(
+                LIntPredicate::EQ, rhs, minus_one, "div.rhsneg1");
+            const lhs_is_intmin: LValue = this.builder.build_icmp(
+                LIntPredicate::EQ, lhs, int_min, "div.lhsmin");
+            const overflow: LValue = this.builder.build_and(
+                rhs_is_neg1, lhs_is_intmin, "div.ovf");
+            trap_cond = this.builder.build_or(is_zero, overflow, "div.trap");
+        }
+
+        const cur_bb: LBasicBlock = this.builder.get_insert_block();
+        if (!cur_bb.is_valid()) { return; }
+        const fn: LValue = cur_bb.get_parent();
+        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "div.trap");
+        const ok_bb: LBasicBlock = LBasicBlock::append(fn, "div.ok");
+
+        this.builder.build_cond_br(trap_cond, trap_bb, ok_bb);
+
+        // Trap arm: call @abort(); unreachable.  Same pattern as the
+        // match-no-default block in ir_generator: a bare `unreachable`
+        // lowers to no instruction on x86, which silently slides into
+        // adjacent code at runtime.  abort + unreachable guarantees a
+        // clean SIGABRT.
+        this.builder.position_at_end(trap_bb);
+        const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
+        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+        mut a_args: Pair<LValue, TypeRef>[] = [];
+        this.codegen_call(abort_fn, abort_ty, a_args, "");
+        this.builder.build_unreachable();
+
+        // OK arm: caller continues with the div/rem here.
+        this.builder.position_at_end(ok_bb);
     }
 
     /// Generate IR for a unary expression.
