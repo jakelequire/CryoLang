@@ -233,10 +233,7 @@ This is how `Option::map`, `Result::and_then`, and the iterator combinators take
 
 A function value can be a named function or a **lambda expression**:
 `(params) -> Ret { body }`, or `(params) -> Ret expr` for a single-expression
-body. Each parameter and the return type are written out explicitly. Lambdas
-are non-capturing — the body may reference globals, other functions, and its
-own parameters, but not locals of the enclosing function (a reference to one is
-a "cannot find value" error, not a silent capture).
+body. Each parameter and the return type are written out explicitly.
 
 ```cryo
 const inc: (int) -> int       = (n: int) -> int { return n + 1; };
@@ -244,6 +241,37 @@ const add: (int, int) -> int  = (a: int, b: int) -> int { return a + b; };
 
 apply(inc, 41);                                   // 42 (named-as-value)
 apply((n: int) -> int { return n * 2; }, 21);     // 42 (inline)
+```
+
+A lambda that references a binding from the enclosing scope **captures** it
+by value, becoming a closure. The capture must be a `Copy` value (i32, u64,
+bool, char, references, and any `![derive(Copy)]` type); non-Copy captures
+are rejected (E0457) because moving an owning value into a closure would
+need drop-glue plumbing the v1.0 release intentionally defers. The compiler
+synthesises an anonymous struct holding the captured fields plus a
+`__call__` method whose body is the lambda body; the closure value is the
+struct instance and the call site dispatches directly through `__call__`.
+Stack-allocated; no heap allocation.
+
+```cryo
+const bias: i32 = 10;
+const add_bias = (x: i32) -> i32 { return x + bias; };  // captures `bias`
+add_bias(32);                                            // 42
+```
+
+A closure can also be passed to a `(Args) -> Ret`-typed parameter; the
+compiler specialises the receiver function per concrete closure type so
+the body still issues a direct call, never an indirect one. Named
+functions and non-capturing lambdas continue to bind to the same
+parameter as bare function pointers, with no overhead change:
+
+```cryo
+function apply(f: (i32) -> i32, x: i32) -> i32 { return f(x); }
+
+const bias: i32 = 10;
+apply((x: i32) -> i32 { return x + bias; }, 32);  // 42 — capturing closure
+apply((x: i32) -> i32 { return x * 2; }, 21);     // 42 — non-capturing lambda
+apply(tentimes, 4);                               // 40 — named function pointer
 ```
 
 A combinator that infers a *new* type parameter from the callback's return

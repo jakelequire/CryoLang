@@ -158,6 +158,15 @@ public:
     // for every lambda) so the namespaces don't have to coordinate.
     closure_counter: u64;
 
+    // Phase 5 cache: dedup closure-arg specialisations of free-function
+    // calls.  Key is `<orig_name_id>|<idx>:<closure_ty_id>...`; value is
+    // the SymbolStr.id of the spec's mangled LLVM symbol, which goes on
+    // `call.resolved_callee` so codegen routes through the spec'd clone.
+    // A second call site that passes the same closure-struct type to
+    // the same parameter position of the same callee collapses onto the
+    // first spec'd clone instead of producing a duplicate.
+    closure_spec_map: HashMap<string, u32>;
+
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
                      ctx: CompilationContext*) : BaseASTVisitor() {
@@ -188,6 +197,7 @@ public:
         this.lambda_outer_locals = HashMap<u32, TypeRef>::new();
         this.current_lambda      = null;
         this.closure_counter     = 0;
+        this.closure_spec_map    = HashMap<string, u32>::new();
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -3253,6 +3263,239 @@ public:
         call.callee = access as ExpressionNode*;
     }
 
+    /// Phase 5 entry point.  When a call passes one or more capturing
+    /// closures as arguments to fn-typed (`(Args) -> Ret`) parameters of
+    /// a non-generic free function, synthesise a specialised clone of
+    /// the callee whose corresponding parameters are typed as the
+    /// concrete closure-struct instead of the fn-pointer, inject the
+    /// clone into ProgramNode, and pin `call.resolved_callee` to its
+    /// mangled LLVM symbol.  Inside the spec'd body the parameter resolves
+    /// to a closure-struct local, so `f(args)` lowers through the same
+    /// `maybe_rewrite_closure_call` path as a direct-bound closure -
+    /// codegen sees a regular method call on `__call__`, zero-cost.
+    ///
+    /// MVP scope:
+    ///   - Identifier callees (free functions); method / scope calls
+    ///     are out of scope (no callable-arg method-call test exists yet).
+    ///   - Non-generic receiver - the existing monomorphizer covers the
+    ///     `applymap<U>(f: (i32) -> U, ...)` case for non-capturing
+    ///     lambdas, and capturing closures inside a generic receiver
+    ///     would need spec-of-spec composition.
+    ///   - Non-variadic, arity matches the call.
+    ///   - Only `TypeKind::Function` params get substituted; everything
+    ///     else passes through unchanged.
+    ///
+    /// Cross-call dedup: a string key built from the original name id and
+    /// every `(idx, closure_ty.id)` pair maps to the prior spec's mangled
+    /// symbol, so a second call site with the same shape reuses the clone.
+    try_specialize_for_closure_args(mut &this,
+                                    call: CallExprNode*,
+                                    ident: IdentifierNode*) -> void {
+        if (call == null || ident == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (call.generic_args.length > 0) { return; }
+
+        // Resolve the callee's FunctionType so we can see param shapes.
+        // Try the bare name first (call as written), then the
+        // current-module-qualified form in case DI keyed it that way.
+        mut callee_fn_ref: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
+        if (!callee_fn_ref.is_valid()) {
+            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            if (!qual.equals(ident.name)) {
+                callee_fn_ref = this.ctx.decl_index.lookup_func_type(qual);
+            }
+        }
+        if (!callee_fn_ref.is_valid()) { return; }
+
+        const ft_raw: Type* = this.arena.lookup(callee_fn_ref.id);
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
+        const ft: FunctionType* = ft_raw as FunctionType*;
+        if (ft.is_variadic) { return; }
+        if (ft.param_types.length != call.arguments.length) { return; }
+
+        // Scan arg/param pairs for "closure-struct value passed to
+        // fn-typed slot" mismatches.  No mismatches -> no spec needed.
+        mut sub_indices: i64[] = [];
+        mut sub_types:   TypeRef[] = [];
+        for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+            const p_ty: TypeRef = ft.param_types[i];
+            const p_t: Type* = this.arena.lookup(p_ty.id);
+            if (p_t == null || p_t.kind != TypeKind::Function) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (!this.is_closure_struct_type(arg.resolved_type)) { continue; }
+            sub_indices.push(i);
+            sub_types.push(arg.resolved_type);
+        }
+        if (sub_indices.length == 0) { return; }
+
+        // Cache key: orig_name id + each (idx, closure_ty.id) pair.
+        // Identical re-calls collapse onto a single specialisation.
+        mut key: string = format("%u", ident.name.id);
+        for (mut ki: i64 = 0; ki < sub_indices.length; ki++) {
+            key = format("%s|%lld:%llu", key,
+                sub_indices[ki], sub_types[ki].id);
+        }
+
+        match (this.closure_spec_map.get(&key)) {
+            Option::Some(prior) => {
+                call.set_resolved_callee(SymbolStr::from_id(prior));
+                return;
+            }
+            Option::None => { /* fall through */ }
+        }
+
+        // Locate the original FunctionDeclNode at top level so we can
+        // clone it.  Bare name first, then qualified.
+        mut orig_func: FunctionDeclNode* = this.find_top_level_function(ident.name);
+        if (orig_func == null) {
+            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            if (!qual.equals(ident.name)) {
+                orig_func = this.find_top_level_function(qual);
+            }
+        }
+        if (orig_func == null) { return; }
+        if (orig_func.is_generic()) { return; }
+        if (orig_func.body == null) { return; }
+
+        // Clone the function decl.  ASTCloner clears resolved types on
+        // every cloned expression / declaration node (its docstring
+        // says the type substituter normally fills them); for our use
+        // case sema's re-walk of the injected function fills them in.
+        mut cloner: ASTCloner = ASTCloner();
+        const cloned_node: ASTNode* = cloner.clone_node(orig_func as ASTNode*);
+        if (cloned_node == null) { return; }
+        if (cloned_node.kind != NodeKind::FunctionDeclaration) { return; }
+        mut spec_func: FunctionDeclNode* = cloned_node as FunctionDeclNode*;
+
+        // Stamp every parameter's resolved_type explicitly: substituted
+        // positions get the closure-struct type, non-substituted
+        // positions get the original's resolved_type.  enter_function
+        // reads `param.resolved_type` directly when valid, so this is
+        // what registers the right locals for the body's re-walk.
+        for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
+            mut p: VarDeclNode* = spec_func.parameters[i];
+            if (p == null) { continue; }
+            mut sub_ty: TypeRef = TypeRef::invalid();
+            for (mut si: i64 = 0; si < sub_indices.length; si++) {
+                if (sub_indices[si] == i) { sub_ty = sub_types[si]; break; }
+            }
+            if (sub_ty.is_valid()) {
+                p.set_resolved_type(sub_ty);
+            } else if (i < orig_func.parameters.length
+                    && orig_func.parameters[i] != null
+                    && orig_func.parameters[i].resolved_type.is_valid()) {
+                p.set_resolved_type(orig_func.parameters[i].resolved_type);
+            }
+        }
+
+        // Carry the original's resolved return type onto the clone so
+        // enter_function picks it up without needing the annotation to
+        // be re-resolved.
+        spec_func.set_resolved_return_type(orig_func.resolved_return_type);
+
+        // Mint a unique spec name and rename the clone.  The same key
+        // produces the same name, so dedup via the closure_spec_map is
+        // strictly an early-exit; cross-pass uniqueness is enforced by
+        // the cache, not by the name.
+        const spec_name: SymbolStr = this.mint_closure_spec_name(orig_func.name, sub_types);
+        spec_func.set_name(spec_name);
+
+        // Inject into ProgramNode so the spec'd function rides through
+        // sema (this pass, via the visit(ProgramNode) length-reread
+        // loop), then move-check, drop-insertion, and finally codegen,
+        // which registers it in DI + the LLVM module under its qualified
+        // spec name during the declare_functions phase.
+        if (this.ctx.artifacts.ast.root != null) {
+            this.ctx.artifacts.ast.root.add_statement(spec_func as ASTNode*);
+        }
+
+        // Compute the mangled LLVM symbol the codegen pass will use for
+        // the spec'd function and pin it on the call.  declare_function
+        // computes the same symbol from the same args (qualified name +
+        // param types + return type), so the call resolves to the
+        // freshly declared spec at codegen.
+        const qualified_spec: SymbolStr = this.ctx.qualify_symbol_sym(spec_name);
+        mut spec_param_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
+            spec_param_types.push(spec_func.parameters[i].resolved_type);
+        }
+        const mangled: MangledName = MangledName::for_free_function(
+            this.intern, this.arena,
+            QualifiedName::from_symbol(qualified_spec),
+            spec_param_types, spec_func.resolved_return_type, false);
+        call.set_resolved_callee(mangled.value);
+        this.closure_spec_map.insert(key, mangled.value.id);
+    }
+
+    /// Linear scan over `ProgramNode.statements` to find a top-level
+    /// FunctionDeclNode whose `name` matches `name`.  Called only on
+    /// the rare closure-arg specialisation path, so the O(n) cost is
+    /// acceptable; the alternative of indexing every free function
+    /// AST in the DeclarationIndex is not worth the bookkeeping.
+    find_top_level_function(&this, name: SymbolStr) -> FunctionDeclNode* {
+        if (this.ctx.artifacts.ast.root == null) { return null; }
+        const stmts: ASTNode*[] = this.ctx.artifacts.ast.root.statements;
+        for (mut i: i64 = 0; i < stmts.length; i++) {
+            const s: ASTNode* = stmts[i];
+            if (s == null) { continue; }
+            if (s.kind != NodeKind::FunctionDeclaration) { continue; }
+            const fn: FunctionDeclNode* = s as FunctionDeclNode*;
+            if (fn.name.id == name.id) { return fn; }
+        }
+        return null;
+    }
+
+    /// Mint a stable spec name for a closure-arg specialisation:
+    /// `<orig>__cl_<ty1>_<ty2>_...`.  Cross-module uniqueness comes
+    /// from later qualification at the call to MangledName::for_free_function;
+    /// per-(orig, substitution-set) uniqueness comes from including
+    /// every substituted closure-struct's arena TypeRef id, which is a
+    /// fresh integer per synthesised closure struct.
+    mint_closure_spec_name(mut &this,
+                           orig: SymbolStr,
+                           closure_tys: TypeRef[]) -> SymbolStr {
+        mut s: string = this.intern.resolve(orig);
+        s = format("%s__cl", s);
+        for (mut i: i64 = 0; i < closure_tys.length; i++) {
+            s = format("%s_%llu", s, closure_tys[i].id);
+        }
+        return this.intern.intern(s);
+    }
+
+    /// Scope-guard for Phase 5: closures are only delivered through
+    /// free-function `(Args) -> Ret` parameter slots in v1.0.  When a
+    /// method-call or scope-resolution call carries a closure-struct
+    /// argument, the per-call-site specialisation path is bypassed and
+    /// codegen would silently lower the struct value as if it were a
+    /// fn-pointer (or, for generic receivers, leave the call unspec'd
+    /// and crash at runtime when the dispatcher loads the struct's
+    /// first word as a code pointer).  Emit one diagnostic per
+    /// closure-struct argument so the user sees an explicit v1.0
+    /// limitation note instead of an LLVM error or UB.  `context_msg`
+    /// is interpolated into the label so the diagnostic localises to
+    /// the kind of call site (method / scope-resolution).
+    reject_closure_struct_args_in_non_free_call(mut &this,
+                                                call: CallExprNode*,
+                                                context_msg: string) -> void {
+        if (call == null) { return; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (!this.is_closure_struct_type(arg.resolved_type)) { continue; }
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
+                format("%s is not yet supported", context_msg));
+            diag = diag.at_with_label(arg.span,
+                "this is a capturing closure (anonymous struct value)");
+            diag = diag.with_note(
+                "v1.0 routes capturing closures through free-function `(Args) -> Ret` parameters only; method-call and scope-resolution-call closure parameters are deferred");
+            diag = diag.with_note(
+                "workaround: pull the call out into a free function, or pre-extract the closure into a fn-pointer if the capture set is empty");
+            this.ctx.emit_diagnostic(diag);
+        }
+    }
+
 
     // Individual Expression Resolvers
 
@@ -4072,6 +4315,18 @@ public:
 
         if (callee_node.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = callee as IdentifierNode*;
+            // Phase 5: when one or more args are capturing closures bound
+            // to fn-typed parameter slots, synthesise a specialised clone
+            // of the callee with the affected parameters re-typed as the
+            // concrete closure-struct types, and pin `resolved_callee` to
+            // its mangled symbol.  The early-return below then short-
+            // circuits past the original-template arity / overload checks
+            // (which would otherwise reject the closure-struct args as
+            // not matching the fn-pointer param types).  Untouched calls
+            // - including every existing fn-pointer call site - fall
+            // through unchanged.
+            this.try_specialize_for_closure_args(call, ident);
+
             // If mono pre-pinned a specialized callee (inferred-arg generic
             // free-function calls inside a spec'd body, e.g.
             // `alloc_entry(this, h, k, v)` after HashMap<K,V,A>::insert is
@@ -4132,6 +4387,17 @@ public:
             return this.resolve_direct_call(ident);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
+            // Phase 5 scope-guard: capturing closures are only delivered
+            // through free-function `(Args) -> Ret` parameters in v1.0,
+            // via `try_specialize_for_closure_args` above.  A closure
+            // passed to a method's fn-typed param (`some.map(closure)`)
+            // would silently miscompile because the per-call-site spec
+            // path is only wired for Identifier callees.  Reject here
+            // with an explicit diagnostic so users see a clear v1.0
+            // limitation note instead of an LLVM verification failure
+            // (or, worse, runtime UB) downstream.
+            this.reject_closure_struct_args_in_non_free_call(call,
+                "passing a capturing closure as a method-call argument");
             // Run overload resolution first: tags `call.resolved_method`
             // with the specific method declaration whose parameter types
             // match the call args.  Codegen trusts this tag to pick the
@@ -4142,6 +4408,11 @@ public:
             return this.resolve_method_call(callee as MemberAccessNode*);
         }
         if (callee_node.kind == NodeKind::ScopeResolution) {
+            // Phase 5 scope-guard, mirroring the MemberAccess branch:
+            // `Type::method(closure)` and `Module::func(closure)` are
+            // not yet routed through closure-arg specialisation.
+            this.reject_closure_struct_args_in_non_free_call(call,
+                "passing a capturing closure to a scope-resolution call");
             const scope_ret: TypeRef = this.resolve_scope_call(
                 callee as ScopeResolutionNode*, call);
             if (scope_ret.is_valid()) {

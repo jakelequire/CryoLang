@@ -114,6 +114,88 @@ function lambda_capture_nested() -> Result<(), TestError> {
     return expect_eq(make_adder(5), 42);
 }
 
+// Phase 5: pass a capturing closure to a `(Args) -> Ret`-typed parameter.
+// Sema synthesises a specialised clone of the receiver function whose
+// fn-typed parameter is re-typed as the closure-struct, so the body's
+// `f(x)` dispatches through `__call__` instead of an indirect fn-pointer
+// call.  Zero-cost direct method dispatch; the LLVM optimiser folds
+// through it.
+![test]
+function lambda_closure_passed_as_fn_arg() -> Result<(), TestError> {
+    const bias: i32 = 10;
+    return expect_eq(apply((x: i32) -> i32 { return x + bias; }, 32), 42);
+}
+
+// Same `apply` accepts a named function too: the closure-arg
+// specialisation only fires when the arg actually IS a closure-struct,
+// so this call site falls through to the unchanged fn-pointer path.
+![test]
+function lambda_named_fn_still_works_after_closure_spec() -> Result<(), TestError> {
+    return expect_eq(apply(tentimes, 4), 40);
+}
+
+// Closure with two captures passed to a fn-typed parameter.  The
+// specialisation substitutes the lone fn-typed param with the
+// closure-struct's TypeRef and routes through __call__, which sees
+// both captures via `this`.
+![test]
+function lambda_multi_capture_closure_as_fn_arg() -> Result<(), TestError> {
+    const a: i32 = 7;
+    const b: i32 = 5;
+    return expect_eq(apply((x: i32) -> i32 { return x + a + b; }, 30), 42);
+}
+
+// Two call sites of the same receiver with closures of DIFFERENT
+// closure-struct types: each gets its own spec'd clone (different
+// captures = different closure structs = different specialisations).
+![test]
+function lambda_two_distinct_closures_through_same_fn() -> Result<(), TestError> {
+    const base: i32 = 30;
+    const r1: i32 = apply((x: i32) -> i32 { return x + base; }, 2);
+    const step: i32 = 5;
+    const r2: i32 = apply((x: i32) -> i32 { return x * step; }, 2);
+    return expect_eq(r1 + r2, 42);
+}
+
+// Multi-parameter fn-typed slot: substitute the (i32, i32) -> i32 slot
+// with a capturing closure-struct.  Exercises the multi-arg arity of
+// the cloned param's `__call__` method.
+![test]
+function lambda_multi_arg_closure_as_fn_arg() -> Result<(), TestError> {
+    const bias: i32 = 2;
+    return expect_eq(apply2((p: i32, q: i32) -> i32 { return p + q + bias; }, 20, 20), 42);
+}
+
+// Phase 6: closure construction inside a conditional branch.  Each
+// branch produces its OWN closure-struct value (different __Closure_N
+// types because the bodies differ), so move-check / drop-insertion must
+// see them as separate Copy values without synthesising spurious drops.
+![test]
+function lambda_closure_in_if_branches() -> Result<(), TestError> {
+    const offset: i32 = 10;
+    const use_add: boolean = true;
+    mut r: i32 = 0;
+    if (use_add) {
+        const f = (x: i32) -> i32 { return x + offset; };
+        r = f(32);
+    } else {
+        const f = (x: i32) -> i32 { return x - offset; };
+        r = f(52);
+    }
+    return expect_eq(r, 42);
+}
+
+// Phase 6: closure constructed inline and immediately consumed by a
+// fn-arg call - no named binding, no scope-exit drop needed.  Two
+// inline closures back-to-back, both captures from the same outer.
+![test]
+function lambda_inline_closure_consumed_by_call() -> Result<(), TestError> {
+    const k: i32 = 6;
+    const a: i32 = apply((x: i32) -> i32 { return x * k; }, 4);
+    const b: i32 = apply((x: i32) -> i32 { return x + k; }, 12);
+    return expect_eq(a + b, 42);
+}
+
 
 ![test]
 function lambda_inline_argument() -> Result<(), TestError> {

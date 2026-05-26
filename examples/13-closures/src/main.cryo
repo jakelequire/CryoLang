@@ -1,0 +1,102 @@
+///! Capturing closures — lambdas that capture `Copy` bindings from
+///! the enclosing scope, then can be called directly or passed to a
+///! `(Args) -> Ret`-typed parameter.
+///!
+///! Cryo lowers a capturing lambda to an anonymous closure struct
+///! holding the captured values, with a synthesised `__call__` method
+///! whose body is the lambda body.  Closures bound to a fn-typed
+///! parameter are delivered via per-call-site receiver specialisation,
+///! so the call stays a direct call even when the callee is a generic-
+///! looking `(Args) -> Ret` slot.  No heap allocation, no indirect
+///! call overhead.
+///!
+///! Run with:  cryo run
+///!
+///! v1.0 scope: captures must be `Copy` (i32 / u64 / bool / char /
+///! references / any `![derive(Copy)]` type); the closure is called
+///! through a free-function parameter slot.  Passing a capturing
+///! closure to a generic-method's fn-typed parameter (`some.map(...)`)
+///! is deferred.
+
+namespace Main;
+
+import std::core::intrinsics;
+
+/// Higher-order helper: takes any `(i32) -> i32` callable and applies
+/// it to `x`.  Named functions, non-capturing lambdas, and capturing
+/// closures all bind to this parameter shape.
+function apply(f: (i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+/// Compose two `(i32) -> i32` callables: apply `g` then `f`.
+function compose(f: (i32) -> i32, g: (i32) -> i32, x: i32) -> i32 {
+    return f(g(x));
+}
+
+/// Apply `f` `n` times.  Demonstrates a closure being called repeatedly
+/// inside the same receiver-spec instance.
+function repeat(f: (i32) -> i32, n: i32, x: i32) -> i32 {
+    mut v: i32 = x;
+    mut i: i32 = 0;
+    while (i < n) {
+        v = f(v);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Named function used to show that the same `apply` signature still
+/// accepts ordinary function pointers — closures are additive, not a
+/// replacement.
+function tentimes(n: i32) -> i32 { return n * 10; }
+
+function main() -> int {
+    // Capture two locals into a closure.  The body references `scale`
+    // and `bias`, so the compiler synthesises an anonymous struct
+    // holding both and a `__call__` method whose body is the lambda
+    // body.  The closure value is the struct instance.
+    const scale: i32 = 3;
+    const bias:  i32 = 4;
+    const linear = (x: i32) -> i32 { return x * scale + bias; };
+
+    // Direct call through the local binding.
+    intrinsics::printf("linear(10) = %d (expected 34)\n", linear(10));
+    intrinsics::printf("linear(20) = %d (expected 64)\n", linear(20));
+
+    // Pass the closure to a `(i32) -> i32`-typed parameter.  The
+    // compiler specialises `apply` for this concrete closure type, so
+    // the call inside the spec still dispatches directly through
+    // `__call__`.  No indirection.
+    intrinsics::printf("apply(linear, 5) = %d (expected 19)\n",
+        apply(linear, 5));
+
+    // An inline capturing closure works the same way.
+    const offset: i32 = 100;
+    intrinsics::printf("apply(inline +offset, 7) = %d (expected 107)\n",
+        apply((n: i32) -> i32 { return n + offset; }, 7));
+
+    // Same `apply` accepts a named function pointer — closures and
+    // function pointers coexist on the same parameter shape.
+    intrinsics::printf("apply(tentimes, 6) = %d (expected 60)\n",
+        apply(tentimes, 6));
+
+    // Multiple closures composed.  Each closure captures its own
+    // copies of the outer locals; `compose` is specialised once per
+    // (f-type, g-type) pair.
+    const inc: i32 = 1;
+    const r: i32 = compose(
+        (a: i32) -> i32 { return a * scale; },
+        (a: i32) -> i32 { return a + inc; },
+        10);
+    intrinsics::printf("compose(*scale, +inc)(10) = %d (expected 33)\n", r);
+
+    // The closure is called repeatedly inside `repeat`.  Each call
+    // re-reads `bias` from the closure struct — captures live for the
+    // closure's lifetime, not just the first call.
+    const step: i32 = 2;
+    intrinsics::printf("repeat(+step, 5, 32) = %d (expected 42)\n",
+        repeat((x: i32) -> i32 { return x + step; }, 5, 32));
+
+    return 0;
+}
