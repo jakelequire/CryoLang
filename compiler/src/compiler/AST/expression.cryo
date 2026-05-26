@@ -465,6 +465,15 @@ public:
     return_type:     TypeRef;
     return_type_ann: TypeAnnotation*;
     body:            StatementNode*;
+    // Free variables referenced by the body that resolve to outer-function
+    // locals - parallel arrays populated by Sema::resolve_lambda when the
+    // body references an enclosing-scope binding.  Empty for non-capturing
+    // lambdas; the codegen path branches on `captured_names.length == 0`.
+    // Spans point at the *use* site that first triggered the capture (for
+    // future diagnostics, e.g. non-Copy capture rejection).
+    captured_names:  SymbolStr[];
+    captured_types:  TypeRef[];
+    captured_spans:  SourceSpan[];
 
     LambdaExprNode(span: SourceSpan)
         : ExpressionNode(NodeKind::LambdaExpression, span) {
@@ -472,6 +481,9 @@ public:
         this.return_type     = TypeRef::invalid();
         this.return_type_ann = null;
         this.body            = null;
+        this.captured_names  = [];
+        this.captured_types  = [];
+        this.captured_spans  = [];
     }
 
     add_parameter(param: VarDeclNode*) -> void {
@@ -488,6 +500,22 @@ public:
 
     set_body(b: StatementNode*) -> void {
         this.body = b;
+    }
+
+    /// Record a free-variable use of an outer-scope binding.  Idempotent:
+    /// a name already in `captured_names` is not re-added (the body may
+    /// reference the same outer local multiple times).
+    add_capture(name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
+        for (mut i: i64 = 0; i < this.captured_names.length; i++) {
+            if (this.captured_names[i].id == name.id) { return; }
+        }
+        this.captured_names.push(name);
+        this.captured_types.push(ty);
+        this.captured_spans.push(span);
+    }
+
+    is_capturing() -> boolean {
+        return this.captured_names.length > 0;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
