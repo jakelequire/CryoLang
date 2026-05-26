@@ -773,34 +773,82 @@ public:
         // store writes only the first few bytes of the field, leaving the
         // rest uninitialised, and downstream `provisions[k]` reads garbage.
         const t: Type* = this.cg.lookup_type_by_id(struct_type.id);
-        // Collect the field info and the GEP base offset.  Structs are
-        // 1:1 with their LLVM-struct slots; classes are flattened with
-        // an optional vtable header + every ancestor's fields preceding
-        // this class's own fields (see `map_class`).  Initializer-list
-        // syntax only writes THIS class's own fields, so the slot index
-        // for `field_names[i]` is `base_offset + local_idx`.
+        // Collect the field info and a parallel slot-index map.  Structs are
+        // 1:1 with their LLVM-struct slots (slot = fidx).  Classes are
+        // flattened by `map_class`: slot 0 holds a vtable pointer if any
+        // class in the chain has virtual methods, then every ancestor's
+        // fields precede this class's own fields in root -> derived order.
+        // To support literals that name INHERITED fields (e.g. a `Derived`
+        // literal that writes a field declared on `Base`), we must walk the
+        // chain here, build a unified field list in the SAME order as
+        // `map_class`, and look up each named field across the whole chain.
+        // Without this walk, leaf-only `cls.fields` misses inherited names
+        // and the literal silently drops their initializer stores.
         mut fields: FieldInfo[] = [];
-        mut base_offset: i64 = 0;
+        mut field_slot: i64[] = [];  // parallel slot index per fields[i]
+        mut any_virtual: boolean = false;
+        mut leaf_cls: ClassType* = null;
         if (t != null && t.kind == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
-            fields = st.fields;
+            for (mut sfi: i64 = 0; sfi < st.fields.length; sfi++) {
+                fields.push(st.fields[sfi]);
+                field_slot.push(sfi);
+            }
         } else if (t != null && t.kind == TypeKind::Class) {
             const cls: ClassType* = t as ClassType*;
-            fields = cls.fields;
-            mut any_virtual: boolean = false;
+            leaf_cls = cls;
+            // Walk the base chain root-last (chain[0] = leaf, chain[N-1] = root).
+            mut chain: ClassType*[] = [];
             mut walk: ClassType* = cls;
             mut depth: i32 = 0;
             while (walk != null && depth < 16) {
+                chain.push(walk);
                 if (walk.has_virtual_methods) { any_virtual = true; }
-                if (depth > 0) { base_offset += walk.fields.length; }
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
                 const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
                 if (base_t == null || base_t.kind != TypeKind::Class) { break; }
                 walk = base_t as ClassType*;
                 depth += 1;
             }
-            if (any_virtual) { base_offset += 1; }
+            // Walk root -> derived so slot indices match `map_class:458-468`.
+            mut slot_idx: i64 = if (any_virtual) { 1 } else { 0 };
+            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+                const link: ClassType* = chain[ci];
+                for (mut li: i64 = 0; li < link.fields.length; li++) {
+                    fields.push(link.fields[li]);
+                    field_slot.push(slot_idx);
+                    slot_idx += 1;
+                }
+            }
         }
+
+        // Initialize the vtable pointer at slot 0 for any value-constructed
+        // class instance whose chain contains virtual methods.  Without this,
+        // every `const x: T = T{...}` for a virtual class leaves slot 0
+        // uninitialized; the first virtual call reads poison and segfaults.
+        // Mirrors the heap-`new` path in `new_delete_emitter.cryo:209-233`.
+        if (any_virtual && leaf_cls != null) {
+            const intern: InternTable* = this.cg.get_intern();
+            const qname: QualifiedName = QualifiedName::from_symbol(leaf_cls.qualified_name);
+            const vtbl_name: string = MangledName::for_vtable(intern, qname).resolve(intern);
+            mut vtbl_global: LValue = this.cg.llvm_module.get_named_global(vtbl_name);
+            if (!vtbl_global.is_valid()) {
+                // Cross-module reference: declare as an extern.  The
+                // placeholder type doesn't have to match the definition
+                // (opaque pointers; linker resolves by symbol name).
+                const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
+                const placeholder_ty: LType = LType::array_of(fn_ptr_ty, 1);
+                vtbl_global = this.cg.llvm_module.add_global(placeholder_ty, vtbl_name);
+            }
+            if (vtbl_global.is_valid()) {
+                const vptr_slot: LValue = this.cg.builder.build_struct_gep(
+                    ty, alloca, 0, "vptr.slot");
+                if (vptr_slot.is_valid()) {
+                    this.cg.builder.build_store(vtbl_global, vptr_slot);
+                }
+            }
+        }
+
         for (mut i: i64 = 0; i < field_names.length; i++) {
             mut fidx: i64 = -1;
             for (mut fi: i64 = 0; fi < fields.length; fi++) {
@@ -810,7 +858,7 @@ public:
                 }
             }
             if (fidx < 0) { continue; }
-            const slot: u32 = (base_offset + fidx) as u32;
+            const slot: u32 = field_slot[fidx] as u32;
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
             if (val.is_valid()) {

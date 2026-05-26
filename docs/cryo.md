@@ -232,8 +232,8 @@ function apply(f: (int) -> int, x: int) -> int {
 This is how `Option::map`, `Result::and_then`, and the iterator combinators take their callback.
 
 A function value can be a named function or a **lambda expression**:
-`(params) -> Ret { body }`, or `(params) -> Ret expr` for a single-expression
-body. Each parameter and the return type are written out explicitly.
+`(params) -> Ret { body }`. The body is always brace-delimited; each parameter
+and the return type are written out explicitly.
 
 ```cryo
 const inc: (int) -> int       = (n: int) -> int { return n + 1; };
