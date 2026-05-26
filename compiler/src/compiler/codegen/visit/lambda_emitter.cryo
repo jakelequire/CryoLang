@@ -56,12 +56,24 @@ type struct LambdaEmitter {
 
     // Lambda emission
 
-    /// Lambda expression: emit an anonymous non-capturing function and return
-    /// its function pointer via the visitor's `state.last_value`.  Only
-    /// explicit-type, non-capturing lambdas are supported: each parameter
-    /// must carry a type annotation, and the return type must be written
-    /// out (`-> T`) in the source.  Captures are not implemented yet (no
-    /// closure environment is built).
+    /// Lambda expression codegen.  Two cases:
+    ///
+    /// 1. **Non-capturing** (`node.is_capturing() == false`): emit an
+    ///    anonymous function with the lambda's signature, return its
+    ///    function pointer as the lambda's value.  Each parameter must
+    ///    carry a type annotation and the return type must be written
+    ///    out (`-> T`) - the existing semantics.
+    ///
+    /// 2. **Capturing** (`node.is_capturing() == true`): Sema has already
+    ///    synthesised the closure StructDecl + `__call__` method and
+    ///    stamped the lambda's `resolved_type` with the closure struct
+    ///    type.  Codegen materialises an instance of that struct here by
+    ///    building a transient `StructLiteralNode` whose field-init values
+    ///    are `IdentifierNode`s naming each capture, then routing it
+    ///    through the visitor's standard dispatch.  No standalone function
+    ///    is emitted for the lambda body itself - that lives on the
+    ///    synthesised `__call__` method, which goes through ordinary
+    ///    method codegen as part of the injected StructDecl.
     ///
     /// `visitor` is the parent IRGeneratorVisitor, accepted as `ASTVisitor*`
     /// so this module doesn't have to import the concrete visitor type
@@ -71,6 +83,11 @@ type struct LambdaEmitter {
         if (node == null) {
             this.state.last_value     = LValue::null();
             this.state.last_is_lvalue = false;
+            return;
+        }
+
+        if (node.is_capturing()) {
+            this.emit_capturing(visitor, node);
             return;
         }
 
@@ -245,5 +262,52 @@ type struct LambdaEmitter {
         // The value of a lambda expression is the function pointer itself.
         this.state.last_value     = fn_val;
         this.state.last_is_lvalue = false;
+    }
+
+    /// Capturing-lambda codegen: materialise a value of the closure struct
+    /// type stamped on `node.resolved_type` by Sema, with each field
+    /// initialised from the corresponding captured local in scope.  Built
+    /// as a transient `StructLiteralNode` so the normal struct-literal
+    /// codegen path handles the alloca + GEP-store sequence; we just
+    /// supply identifier-node initialisers whose lookups land on
+    /// `cg.values.get(<cap_name>)` for the outer function's allocas.
+    ///
+    /// No anonymous function is emitted from this site: the lambda's body
+    /// lives on the synthesised `<closure_struct>::__call__` method,
+    /// emitted by ordinary method codegen when the StructDecl Sema
+    /// injected reaches Phase 7's codegen sweep.
+    emit_capturing(mut &this, visitor: ASTVisitor*, node: LambdaExprNode*) -> void {
+        const closure_ty: TypeRef = node.resolved_type;
+        if (!closure_ty.is_valid()) {
+            // Sema should have set this; if not, fall back to a null value
+            // and let downstream verification catch the bug.
+            this.state.last_value     = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const arena: TypeArena* = this.cg.ctx.type_arena;
+        const struct_name: SymbolStr = arena.get_qualified_name(closure_ty);
+
+        mut lit: StructLiteralNode* = new StructLiteralNode(struct_name, node.span);
+        lit.set_resolved_type(closure_ty);
+
+        for (mut i: i64 = 0; i < node.captured_names.length; i++) {
+            const cap_name: SymbolStr = node.captured_names[i];
+            const cap_ty:   TypeRef   = node.captured_types[i];
+            mut ident: IdentifierNode* = new IdentifierNode(cap_name, node.span);
+            ident.set_resolved_type(cap_ty);
+            const init: FieldInit = FieldInit {
+                field_name: cap_name,
+                value:      ident as ExpressionNode*,
+                span:       node.span,
+            };
+            lit.add_field_init(init);
+        }
+
+        // Dispatch through the visitor so the existing StructLiteral
+        // codegen path runs (alloca, GEP-store per field, set
+        // state.last_value to the alloca address with last_is_lvalue=true).
+        lit.accept(visitor);
     }
 }
