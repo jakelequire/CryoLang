@@ -1,4 +1,4 @@
-///! Drop Insertion Pass: Phase 1 of auto-drop.
+///! Drop Insertion Pass.
 ///!
 ///! Runs after MoveCheck and before TypeLowering.  Performs flow-sensitive
 ///! ownership analysis with proper branch-join semantics:
@@ -6,11 +6,19 @@
 ///!   moved-sets, possibly-moved is the symmetric difference.  Diverging
 ///!   branches (those that always `return`/`break`/`continue`) are
 ///!   excluded from the join; their moves don't escape.
-///! - Possibly-moved bindings emit `E0456_CONDITIONAL_MOVE` and are
-///!   treated as moved going forward to keep cascade noise down.
+///! - Possibly-moved bindings get a synthesized `mut <name>__dropflag:
+///!   boolean = false;` hoisted before the branching statement.  Each
+///!   moving arm is augmented with `<flag> = true;`, and the binding's
+///!   scope-exit drop is wrapped in `if (!<flag>) { binding.drop(); }`.
+///!   This is the classic "drop flag" technique: the not-moved path
+///!   drops correctly, the moved path skips the drop, and LLVM's
+///!   default O2 pipeline folds the flag away when the move state can
+///!   be proven statically.  See `merge_branches_if` and
+///!   `synth_flag_for_match_arms`.
 ///! - Loop bodies snapshot/restore: body-internal moves don't propagate
-///!   to the post-loop state (Phase 3 will revisit with proper fixed-
-///!   point analysis).
+///!   to the post-loop state.  Loop-carried moves are detected by
+///!   MoveCheck (which is fatal_on_failure) before this pass runs, so
+///!   we don't need fixed-point dataflow inside the loop body here.
 ///!
 ///! ## Synthesis
 ///!
@@ -114,6 +122,25 @@ type struct DropInserter {
     link_payload: u32[];
     link_subject: u32[];
 
+    /// Conditional-move drop flags: a binding moved on some control-flow
+    /// paths but not others gets a synthesized `mut <name>__dropflag:
+    /// boolean = false;` hoisted before the branching statement, plus a
+    /// `<flag> = true;` appended to every moving arm.  At scope exit the
+    /// binding's drop is wrapped in `if (!<flag>) { ... }` so it runs on
+    /// the not-moved path and is skipped on the moved path - the
+    /// canonical "drop flag" technique.  Parallel arrays keyed by
+    /// SymbolStr id: `flag_binding_keys[i]` is the owning binding's name
+    /// id, `flag_flag_keys[i]` is the synthesized boolean local's name
+    /// id.  Lookup is linear; functions rarely have many conditional
+    /// moves, so the array is short.
+    flag_binding_keys: u32[];
+    flag_flag_keys:    u32[];
+
+    /// Monotonic counter for naming synthesized drop-flag locals (avoid
+    /// clashing with anything the user wrote or with other synthetic
+    /// names from this pass).
+    flag_seq: i64;
+
     fired:        i64;
     inserted:     i64;
 
@@ -139,6 +166,9 @@ type struct DropInserter {
             moved_lines:     [],
             link_payload:    [],
             link_subject:    [],
+            flag_binding_keys: [],
+            flag_flag_keys:    [],
+            flag_seq:        0,
             fired:           0,
             inserted:        0,
             discard_seq:     0,
@@ -399,6 +429,9 @@ type struct DropInserter {
         this.loop_boundary   = [];
         this.moved_keys  = [];
         this.moved_lines = [];
+        this.flag_binding_keys = [];
+        this.flag_flag_keys    = [];
+        this.flag_seq         = 0;
 
         this.push_scope();
         // A by-value owning parameter is moved in at the call (the argument is
@@ -622,7 +655,9 @@ type struct DropInserter {
                 d
             }
             NodeKind::IfStatement => {
-                const d: boolean = this.walk_if(stmt as IfStmtNode*);
+                // Pass `out` so walk_if can hoist drop-flag declarations
+                // for conditionally-moved bindings BEFORE the if-stmt.
+                const d: boolean = this.walk_if(stmt as IfStmtNode*, out);
                 out.push(stmt);
                 d
             }
@@ -663,7 +698,7 @@ type struct DropInserter {
                     this.type_needs_drop(m.subject.resolved_type)) {
                     this.hoist_match_subject(m, out);
                 }
-                const d: boolean = this.walk_match(m);
+                const d: boolean = this.walk_match(m, out);
                 out.push(stmt);
                 d
             }
@@ -704,7 +739,8 @@ type struct DropInserter {
 
     // ---- control-flow walks ---------------------------------------------
 
-    walk_if(mut &this, it: IfStmtNode*) -> boolean {
+    walk_if(mut &this, it: IfStmtNode*,
+            out: StatementNode*[]*) -> boolean {
         if (it == null) { return false; }
         if (it.condition != null) { this.walk_expr_read(it.condition); }
         const snap: i64 = this.snapshot_moves();
@@ -734,7 +770,7 @@ type struct DropInserter {
         // empty moved-set, making any then-only move conditional.
         const has_else: boolean = it.else_stmt != null;
         const both_diverge: boolean = then_diverges && has_else && else_diverges;
-        this.merge_branches(snap,
+        this.merge_branches_if(it, out, snap,
             then_keys, then_lines, then_diverges,
             else_keys, else_lines, has_else, else_diverges);
         return both_diverge;
@@ -762,10 +798,12 @@ type struct DropInserter {
         if (w.condition != null) { this.walk_expr_read(w.condition); }
         // Loops run their body 0+ times.  Any move inside the body
         // either doesn't happen (0 iterations) or may set up a
-        // use-after-move on the next iteration.  Phase 1 conservative
-        // model: snapshot/restore so the post-loop state matches the
-        // pre-loop state; a body-internal move is invisible past the
-        // loop.  Phase 3 fixes this with proper fixed-point analysis.
+        // use-after-move on the next iteration.  Snapshot/restore so
+        // the post-loop state matches the pre-loop state; a body-
+        // internal move is invisible past the loop.  Loop-carried
+        // double-frees are caught by MoveCheck (fatal_on_failure)
+        // before this pass runs, so the suppressed move can't cause
+        // unsoundness here.
         const snap: i64 = this.snapshot_moves();
         this.loop_boundary.push(this.scope_start_idx.length);
         if (w.body != null) {
@@ -824,9 +862,10 @@ type struct DropInserter {
         this.restore_moves(snap);
     }
 
-    walk_match(mut &this, m: MatchStmtNode*) -> boolean {
+    walk_match(mut &this, m: MatchStmtNode*,
+               out: StatementNode*[]*) -> boolean {
         if (m == null) { return false; }
-        return this.walk_match_arms(m.subject, m.arms, false);
+        return this.walk_match_arms(m, m.subject, m.arms, false, out);
     }
 
     /// Walk a match's subject and arms as N independent control-flow
@@ -887,8 +926,10 @@ type struct DropInserter {
         return consumed;
     }
 
-    walk_match_arms(mut &this, subject: ExpressionNode*,
-                    arms: MatchArmNode*[], is_expr: boolean) -> boolean {
+    walk_match_arms(mut &this, m: MatchStmtNode*,
+                    subject: ExpressionNode*,
+                    arms: MatchArmNode*[], is_expr: boolean,
+                    out: StatementNode*[]*) -> boolean {
         if (subject != null) { this.walk_expr_read(subject); }
 
         // Subject-consumption tracking for drop-glue suppression.  When the
@@ -930,11 +971,20 @@ type struct DropInserter {
         mut all_keys:    u32[] = [];
         mut all_lines:   i32[] = [];
         mut all_counts:  i64[] = [];
+        // Per-arm move log: flat parallel arrays + start-offset table
+        // so we can find which arms moved which keys without an array-
+        // of-arrays (codegen has known issues with `T[][]`).
+        // arm_move_starts[a] is the index in arm_move_keys where arm `a`'s
+        // moves begin; arm_move_starts[arm_count] is the total length.
+        mut arm_move_keys:   u32[] = [];
+        mut arm_move_lines:  i32[] = [];
+        mut arm_move_starts: i64[] = [];
         const arm_count: i64 = arms.length;
         mut live_arms:   i64 = 0;
         mut diverge_count: i64 = 0;
 
         for (mut a: i64 = 0; a < arm_count; a++) {
+            arm_move_starts.push(arm_move_keys.length);
             const arm: MatchArmNode* = arms[a];
             if (arm == null || arm.body == null) { continue; }
             // Register this arm's enum-payload bindings for consumption
@@ -975,6 +1025,10 @@ type struct DropInserter {
                     if (outer_names[o] == arm_keys[i]) { in_outer = true; }
                 }
                 if (!in_outer) { continue; }
+                // Record per-arm so the join can splice flag-sets into
+                // the specific arms that performed the move.
+                arm_move_keys.push(arm_keys[i]);
+                arm_move_lines.push(arm_lines[i]);
                 mut found: boolean = false;
                 for (mut j: i64 = 0; j < all_keys.length; j++) {
                     if (all_keys[j] == arm_keys[i]) {
@@ -990,6 +1044,8 @@ type struct DropInserter {
             }
             this.restore_moves(snap);
         }
+        // Closing offset so arm `arm_count - 1`'s slice has an end bound.
+        arm_move_starts.push(arm_move_keys.length);
 
         // All arms diverge -> match diverges; post-state irrelevant.
         if (live_arms == 0 && diverge_count > 0) {
@@ -1000,14 +1056,26 @@ type struct DropInserter {
         mut def_keys:  u32[] = [];
         mut def_lines: i32[] = [];
         for (mut i: i64 = 0; i < all_keys.length; i++) {
-            if (all_counts[i] >= live_arms) {
-                def_keys.push(all_keys[i]);
-                def_lines.push(all_lines[i]);
-            } else {
+            const cond_move: boolean = all_counts[i] < live_arms;
+            if (cond_move && m != null) {
+                // Flag synthesis: a binding moved on some arms but not
+                // all live arms.  Hoist a single flag before the match,
+                // splice `<flag>=true` into every arm that moved it.
+                const binding: SymbolStr = SymbolStr::from_id(all_keys[i]);
+                this.synth_flag_for_match_arms(m, out, binding,
+                    all_lines[i], arms, arm_count,
+                    arm_move_keys, arm_move_starts, all_keys[i]);
+            } else if (cond_move) {
+                // Expression-position match (out == null): no place to
+                // hoist a flag-decl, so fall back to the historical
+                // warning.  Practically unreachable today because
+                // expression-match in stdlib uses Option/Result with
+                // payload consumption (handled via link_payload), not
+                // outer-scope conditional moves.
                 this.emit_conditional_move_by_id(all_keys[i], all_lines[i]);
-                def_keys.push(all_keys[i]);
-                def_lines.push(all_lines[i]);
             }
+            def_keys.push(all_keys[i]);
+            def_lines.push(all_lines[i]);
         }
         this.set_moves_tail(snap, def_keys, def_lines);
         // A payload binding was consumed by some arm -> the owning subject is
@@ -1080,6 +1148,229 @@ type struct DropInserter {
         return false;
     }
 
+    /// `if`/`else`-specific branch join that synthesizes drop flags
+    /// (see `make_drop_flag_decl` / `make_drop_flag_set` /
+    /// `make_conditional_drop_call`) for any outer-scope binding moved
+    /// on one branch but not the other.  The flag-decl is hoisted into
+    /// `out` (the enclosing block buffer) BEFORE the if-stmt; the
+    /// flag-set is spliced at the END of the moving branch's body so
+    /// any drop synthesized at scope exit observes the flag's true
+    /// state on the moved control-flow path.  Falls back to the
+    /// original merge_branches semantics (add to def_keys, no flag) for
+    /// any binding where flag synthesis isn't applicable.
+    merge_branches_if(mut &this, it: IfStmtNode*,
+                       out: StatementNode*[]*, snap: i64,
+                       then_keys: u32[], then_lines: i32[], then_diverges: boolean,
+                       else_keys: u32[], else_lines: i32[],
+                       has_else: boolean, else_diverges: boolean) -> void {
+        const live_then: boolean = !then_diverges;
+        const live_else: boolean = has_else && !else_diverges;
+
+        if (!live_then && !live_else) {
+            this.restore_moves(snap);
+            return;
+        }
+        if (live_then && !live_else) {
+            // Then-only fall-through.  When there's no explicit else
+            // (or the else diverges), a then-only move of an
+            // outer-scope binding is conditional from the post-if
+            // viewpoint: the false path didn't move, the true path
+            // did.  Synthesize a drop flag for each such binding so
+            // the scope-exit drop fires on the false path and is
+            // suppressed on the true path.  Diverging-else case never
+            // reaches post-if on the false path, so the move is
+            // unconditional from post-if's perspective - no flag
+            // needed.
+            if (!has_else) {
+                this.synth_flags_for_then_only_moves(it, out, then_keys, then_lines);
+            }
+            // Surviving (then) path's moves carry past the if for
+            // subsequent analysis.  set_moves_tail also keeps the
+            // conservative behavior of marking these bindings moved
+            // for any code that follows the if; with the flag in
+            // place, maybe_append_drop still emits the conditional
+            // drop because get_drop_flag wins before is_moved_id.
+            this.set_moves_tail(snap, then_keys, then_lines);
+            return;
+        }
+        if (!live_then && live_else) {
+            // Symmetric: else-only fall-through.  Synthesize a flag
+            // for each else-only outer-scope move so the scope-exit
+            // drop fires on the (diverging) "then" side - except that
+            // side never reaches post-if, so the flag only matters
+            // for control-flow paths where neither branch was taken,
+            // which doesn't happen for `if`.  No flag needed here;
+            // just propagate the else-branch moves forward.
+            this.set_moves_tail(snap, else_keys, else_lines);
+            return;
+        }
+
+        // Both branches fall through: compute definitely-moved
+        // (intersection) and possibly-moved (symmetric difference).
+        // For each possibly-moved outer-scope binding, synthesize a
+        // drop flag and append `<flag>=true;` to the branch where it
+        // was moved.  Definitely-moved bindings (in both arms) need
+        // no flag - they are unconditionally moved, so the existing
+        // moved_keys path suppresses their scope-exit drop.
+        mut def_keys:  u32[] = [];
+        mut def_lines: i32[] = [];
+        for (mut i: i64 = 0; i < then_keys.length; i++) {
+            if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
+            mut in_else: boolean = false;
+            for (mut j: i64 = 0; j < else_keys.length; j++) {
+                if (then_keys[i] == else_keys[j]) { in_else = true; }
+            }
+            if (in_else) {
+                // Definitely moved on both branches.
+                def_keys.push(then_keys[i]);
+                def_lines.push(then_lines[i]);
+            } else {
+                // Then-only conditional move.  Flag + flag-set in then.
+                const binding: SymbolStr = SymbolStr::from_id(then_keys[i]);
+                this.synth_flag_for_branch(it, out, binding, then_lines[i],
+                    /*branch_is_then=*/true);
+                def_keys.push(then_keys[i]);
+                def_lines.push(then_lines[i]);
+            }
+        }
+        for (mut j: i64 = 0; j < else_keys.length; j++) {
+            if (!this.binding_in_outer_scope(else_keys[j])) { continue; }
+            mut in_then: boolean = false;
+            for (mut i: i64 = 0; i < then_keys.length; i++) {
+                if (then_keys[i] == else_keys[j]) { in_then = true; }
+            }
+            if (!in_then) {
+                // Else-only conditional move.  Flag + flag-set in else.
+                const binding: SymbolStr = SymbolStr::from_id(else_keys[j]);
+                this.synth_flag_for_branch(it, out, binding, else_lines[j],
+                    /*branch_is_then=*/false);
+                def_keys.push(else_keys[j]);
+                def_lines.push(else_lines[j]);
+            }
+        }
+        this.set_moves_tail(snap, def_keys, def_lines);
+    }
+
+    /// Helper: synthesize a drop flag for a single binding moved in
+    /// the given branch (true = then, false = else).  Hoists the
+    /// flag-decl into `out` and splices `<flag>=true;` into the
+    /// branch's body.  Records the binding -> flag mapping so
+    /// maybe_append_drop emits a conditional drop later.
+    synth_flag_for_branch(mut &this, it: IfStmtNode*,
+                            out: StatementNode*[]*,
+                            binding: SymbolStr, move_line: i32,
+                            branch_is_then: boolean) -> void {
+        // Already has a flag? Idempotent re-use - just splice the
+        // flag-set into this branch.
+        mut flag: SymbolStr = this.get_drop_flag(binding);
+        if (!flag.is_valid()) {
+            flag = this.fresh_drop_flag_name(binding);
+            // Hoist `mut <flag>: boolean = false;` before the if-stmt.
+            // The binding span is the best anchor for diagnostics on the
+            // synthesized local; fall back to it.span if unavailable.
+            const decl_span: SourceSpan = this.binding_span_for(binding, it.span);
+            out.push(this.make_drop_flag_decl(flag, decl_span));
+            // Register the synthesized binding in the type map so
+            // subsequent flag references type-resolve cleanly.
+            this.register_param_type(flag, this.arena.get_bool());
+            this.register_drop_flag(binding, flag);
+        }
+        // Splice `<flag>=true;` at the end of the moving branch.
+        const set_span: SourceSpan = this.line_only_span(move_line, it.span);
+        if (branch_is_then) {
+            it.then_stmt = this.splice_flag_set_into_branch(
+                it.then_stmt, flag, set_span);
+        } else {
+            it.else_stmt = this.splice_flag_set_into_branch(
+                it.else_stmt, flag, set_span);
+        }
+    }
+
+    /// Helper: synthesize a drop flag for a binding conditionally
+    /// moved by some - but not all - live arms of a match statement.
+    /// Hoists a single `mut <flag>: boolean = false;` before the match,
+    /// then splices `<flag>=true;` into every arm whose move log
+    /// includes `key`.  Arms that didn't move it (borrow-only arms,
+    /// diverging arms, irrelevant variants) leave the flag at `false`
+    /// so the scope-exit conditional drop fires correctly.
+    synth_flag_for_match_arms(mut &this, m: MatchStmtNode*,
+                                out: StatementNode*[]*,
+                                binding: SymbolStr, move_line: i32,
+                                arms: MatchArmNode*[], arm_count: i64,
+                                arm_move_keys: u32[],
+                                arm_move_starts: i64[],
+                                key: u32) -> void {
+        mut flag: SymbolStr = this.get_drop_flag(binding);
+        if (!flag.is_valid()) {
+            flag = this.fresh_drop_flag_name(binding);
+            const decl_span: SourceSpan = this.binding_span_for(binding, m.span);
+            out.push(this.make_drop_flag_decl(flag, decl_span));
+            this.register_param_type(flag, this.arena.get_bool());
+            this.register_drop_flag(binding, flag);
+        }
+        const set_span: SourceSpan = this.line_only_span(move_line, m.span);
+        // Walk per-arm slice [starts[a], starts[a+1]) and splice the
+        // flag-set when this arm moved `key`.
+        for (mut a: i64 = 0; a < arm_count; a++) {
+            const beg: i64 = arm_move_starts[a];
+            const end: i64 = arm_move_starts[a + 1];
+            mut moved_here: boolean = false;
+            for (mut j: i64 = beg; j < end; j++) {
+                if (arm_move_keys[j] == key) { moved_here = true; }
+            }
+            if (!moved_here) { continue; }
+            const arm: MatchArmNode* = arms[a];
+            if (arm == null || arm.body == null) { continue; }
+            arm.body = this.splice_flag_set_into_branch(arm.body, flag, set_span);
+        }
+    }
+
+    /// Helper: synthesize drop flags for every outer-scope binding moved
+    /// in the then-branch when there's no explicit else.  The implicit
+    /// else moves nothing, so every then-move is conditional.
+    synth_flags_for_then_only_moves(mut &this, it: IfStmtNode*,
+                                      out: StatementNode*[]*,
+                                      then_keys: u32[],
+                                      then_lines: i32[]) -> void {
+        for (mut i: i64 = 0; i < then_keys.length; i++) {
+            if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
+            const binding: SymbolStr = SymbolStr::from_id(then_keys[i]);
+            this.synth_flag_for_branch(it, out, binding, then_lines[i],
+                /*branch_is_then=*/true);
+        }
+    }
+
+    /// Look up a binding's declaration span for anchoring synthesized
+    /// nodes' diagnostics.  Falls back to `default_span` (typically the
+    /// branching statement's own span) if the binding was declared
+    /// outside any tracked scope.
+    binding_span_for(&this, binding: SymbolStr, default_span: SourceSpan) -> SourceSpan {
+        for (mut i: i64 = this.binding_names.length - 1; i >= 0; i--) {
+            if (this.binding_names[i] == binding.id) {
+                if (this.binding_spans[i].has_location()) {
+                    return this.binding_spans[i];
+                }
+                return default_span;
+            }
+        }
+        return default_span;
+    }
+
+    /// Build a 1-column span pinned to the given line, falling back to
+    /// `default_span` when no line is recorded (line == 0 means the move
+    /// site span was unavailable).
+    line_only_span(&this, line: i32, default_span: SourceSpan) -> SourceSpan {
+        if (line <= 0) { return default_span; }
+        return SourceSpan::new(this.ctx.source_file,
+            line as u32, 1 as u32,
+            line as u32, 1 as u32);
+    }
+
+    /// Original branch-join helper for match (and any non-if caller).
+    /// Same intersection/symmetric-difference logic that
+    /// merge_branches_if uses, but without drop-flag synthesis -
+    /// possibly-moved bindings still get E0456 here, pending the same
+    /// treatment for match arms in a follow-up.
     merge_branches(mut &this, snap: i64,
                    then_keys: u32[], then_lines: i32[], then_diverges: boolean,
                    else_keys: u32[], else_lines: i32[],
@@ -1300,9 +1591,25 @@ type struct DropInserter {
         const key:  u32       = this.binding_names[idx];
         const ty:   TypeRef   = this.binding_types[idx];
         const span: SourceSpan = this.binding_spans[idx];
-        if (this.is_moved_id(key))   { return; }
         if (!this.type_needs_drop(ty)) { return; }
         const sym: SymbolStr = SymbolStr::from_id(key);
+        // Conditional move: a drop-flag was hoisted for this binding by
+        // a branch-join in this function.  Emit `if (!flag) drop();`
+        // regardless of the moved-set state, since the flag is the
+        // ground truth.  The moved_keys tracking still serves other
+        // analyses (e.g. mark_moved short-circuit) but is overridden
+        // here for the drop decision.
+        const flag: SymbolStr = this.get_drop_flag(sym);
+        if (flag.is_valid()) {
+            const cstmt: StatementNode* = this.make_conditional_drop_call(
+                sym, ty, flag, span);
+            if (cstmt != null) {
+                out.push(cstmt);
+                this.inserted += 1;
+            }
+            return;
+        }
+        if (this.is_moved_id(key))   { return; }
         const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
         if (stmt != null) {
             out.push(stmt);
@@ -1386,6 +1693,134 @@ type struct DropInserter {
         m.subject = ident as ExpressionNode*;
     }
 
+    // ---- drop-flag synthesis --------------------------------------------
+    //
+    // A binding moved on some control-flow paths and not others gets a
+    // companion boolean local hoisted before the branching statement.
+    // Moving arms set the flag to `true`; scope-exit wraps the drop in
+    // `if (!<flag>) { binding.drop(); }`.  This is the standard "drop
+    // flag" technique and turns what would be a memory-safe leak on the
+    // not-moved path (the binding never gets dropped) into an exact
+    // conditional drop.  LLVM's O2 default folds the flag away when it
+    // can prove the move state statically.
+
+    /// Look up the drop-flag local synthesized for `binding`, or return
+    /// an invalid SymbolStr if there is none.
+    get_drop_flag(&this, binding: SymbolStr) -> SymbolStr {
+        if (!binding.is_valid()) { return SymbolStr::empty(); }
+        for (mut i: i64 = 0; i < this.flag_binding_keys.length; i++) {
+            if (this.flag_binding_keys[i] == binding.id) {
+                return SymbolStr::from_id(this.flag_flag_keys[i]);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Register a binding -> flag mapping (idempotent on the binding
+    /// key; the first flag wins).
+    register_drop_flag(mut &this, binding: SymbolStr, flag: SymbolStr) -> void {
+        if (!binding.is_valid() || !flag.is_valid()) { return; }
+        for (mut i: i64 = 0; i < this.flag_binding_keys.length; i++) {
+            if (this.flag_binding_keys[i] == binding.id) { return; }
+        }
+        this.flag_binding_keys.push(binding.id);
+        this.flag_flag_keys.push(flag.id);
+    }
+
+    /// Build `mut <flag>: boolean = false;` as a DeclStmt.  The boolean
+    /// type is looked up via the type arena's primitive bool registry.
+    make_drop_flag_decl(mut &this, flag_name: SymbolStr,
+                         span: SourceSpan) -> StatementNode* {
+        const lit: LiteralNode* = new LiteralNode("false", LiteralKind::Boolean, span);
+        lit.set_resolved_type(this.arena.get_bool());
+        const vd: VarDeclNode* = new VarDeclNode(flag_name, span);
+        vd.set_resolved_type(this.arena.get_bool());
+        vd.set_mutable(true);
+        vd.set_initializer(lit as ExpressionNode*);
+        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        return ds as StatementNode*;
+    }
+
+    /// Build `<flag> = true;` as an ExprStmt wrapping a BinaryExpr with
+    /// the bare `=` token.  Drop-flag locals are always `mut` (see
+    /// `make_drop_flag_decl`), so this is a legal assignment target.
+    make_drop_flag_set(mut &this, flag_name: SymbolStr,
+                        span: SourceSpan) -> StatementNode* {
+        const lhs: IdentifierNode* = new IdentifierNode(flag_name, span);
+        lhs.set_resolved_type(this.arena.get_bool());
+        const rhs: LiteralNode* = new LiteralNode("true", LiteralKind::Boolean, span);
+        rhs.set_resolved_type(this.arena.get_bool());
+        const eq_tok: Token = Token::new(TokenType::Equal, "=",
+            span.start_line as int, span.start_col as int);
+        const assign: BinaryExprNode* = new BinaryExprNode(
+            eq_tok, lhs as ExpressionNode*, rhs as ExpressionNode*, span);
+        assign.set_resolved_type(this.arena.get_bool());
+        const stmt: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
+        return stmt as StatementNode*;
+    }
+
+    /// Build `if (!<flag>) { <binding>.drop(); }` as an IfStmt.  The
+    /// then-branch is a 1-statement block holding the drop call;
+    /// else_stmt stays null.  Used by `maybe_append_drop` when the
+    /// binding has a registered drop flag (conditional move).
+    make_conditional_drop_call(mut &this, binding: SymbolStr, ty: TypeRef,
+                                 flag: SymbolStr,
+                                 span: SourceSpan) -> StatementNode* {
+        // Condition: `!<flag>`
+        const flag_ident: IdentifierNode* = new IdentifierNode(flag, span);
+        flag_ident.set_resolved_type(this.arena.get_bool());
+        const not_tok: Token = Token::new(TokenType::Exclaim, "!",
+            span.start_line as int, span.start_col as int);
+        const cond: UnaryExprNode* = new UnaryExprNode(
+            not_tok, flag_ident as ExpressionNode*, span);
+        cond.set_resolved_type(this.arena.get_bool());
+        // Body: `{ <binding>.drop(); }`
+        const drop_stmt: StatementNode* = this.make_drop_call(binding, ty, span);
+        if (drop_stmt == null) { return null as StatementNode*; }
+        const body: BlockStmtNode* = new BlockStmtNode(span);
+        body.statements.push(drop_stmt);
+        const if_stmt: IfStmtNode* = new IfStmtNode(
+            cond as ExpressionNode*, body as StatementNode*,
+            null as StatementNode*, span);
+        return if_stmt as StatementNode*;
+    }
+
+    /// Append `<flag>=true;` to a branch body so the scope-exit
+    /// conditional drop sees the moved state.  If the branch body is a
+    /// BlockStmt we append directly; otherwise we wrap it in a block
+    /// (the same trick `wrap_early_exit` uses).  Returns the (possibly
+    /// re-wrapped) branch body so the caller can update the if/match
+    /// node's pointer.
+    splice_flag_set_into_branch(mut &this, branch: StatementNode*,
+                                 flag_name: SymbolStr,
+                                 span: SourceSpan) -> StatementNode* {
+        if (branch == null) { return branch; }
+        const set_stmt: StatementNode* = this.make_drop_flag_set(flag_name, span);
+        if (branch.kind == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = branch as BlockStmtNode*;
+            blk.statements.push(set_stmt);
+            return branch;
+        }
+        // Non-block: wrap the original stmt and append the flag-set.
+        const blk: BlockStmtNode* = new BlockStmtNode(span);
+        blk.statements.push(branch);
+        blk.statements.push(set_stmt);
+        return blk as StatementNode*;
+    }
+
+    /// Allocate a fresh drop-flag name for `binding`.  Format
+    /// `<name>__dropflag<seq>` keeps the binding visible in IR dumps
+    /// (helpful when debugging) and the monotonic seq ensures uniqueness
+    /// even if the same binding gains multiple flags from nested
+    /// branches (which shouldn't happen with the idempotent
+    /// register_drop_flag, but is cheap insurance).
+    fresh_drop_flag_name(mut &this, binding: SymbolStr) -> SymbolStr {
+        const base: string = this.intern.resolve(binding);
+        const named: string = format("%s__dropflag%lld", base, this.flag_seq);
+        this.flag_seq = this.flag_seq + 1;
+        return this.intern.intern(named);
+    }
+
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).
     /// The synthesized nodes must carry resolved types; codegen runs
     /// after this pass and won't re-run type resolution, so an
@@ -1437,7 +1872,17 @@ type struct DropInserter {
                 // (the failure arm of a `?`) gets the cumulative drops of
                 // every live local, and yielded values are move-tracked.
                 const me: MatchExprNode* = expr as MatchExprNode*;
-                this.walk_match_arms(me.subject, me.arms, true);
+                // No hoist buffer at expression position - the
+                // enclosing statement-list isn't reachable from here.
+                // A throwaway out buffer plus a null match node tells
+                // walk_match_arms to skip flag synthesis and fall back
+                // to E0456 for conditional moves (rare in practice for
+                // match expressions: stdlib uses Option/Result here,
+                // whose payload consumption is tracked via
+                // link_payload, not outer-scope move detection).
+                mut throwaway_out: StatementNode*[] = [];
+                this.walk_match_arms(null, me.subject, me.arms, true,
+                    &throwaway_out);
             }
             NodeKind::TryExpression      => {
                 // `expr?` is lowered by sema to a `match` expression;
