@@ -427,15 +427,21 @@ type struct DeclarationEmitter {
         // source ordinal.  Skipped when the main-widening branch ran
         // (empty plan_param_plans).
         const sret_present_fn: boolean = sret_pointee.is_valid();
+        // Track the running LLVM slot index while scanning params instead of
+        // calling llvm_slot_index_of_param, which takes plan_param_plans by
+        // value - a move inside the loop that would conditionally consume the
+        // array.  `running_slot` at param `pi` equals the sret offset plus the
+        // slot count of every earlier param, exactly what the helper returns,
+        // and in O(n) rather than O(n^2).
+        mut running_slot: u32 = if (sret_present_fn) { 1 } else { 0 } as u32;
         for (mut pi: i64 = 0; pi < plan_param_plans.length; pi++) {
             const pp_fn: ParamPlan = plan_param_plans[pi];
             if (pp_fn.cls == ArgClass::Indirect
                     && pp_fn.attr == AbiAttr::ByVal
                     && pp_fn.pointee_ty.is_valid()) {
-                const llvm_idx: u32 = llvm_slot_index_of_param(
-                    plan_param_plans, sret_present_fn, pi);
-                this.abi.apply_byval_attribute(fn_val, llvm_idx, pp_fn.pointee_ty);
+                this.abi.apply_byval_attribute(fn_val, running_slot, pp_fn.pointee_ty);
             }
+            running_slot += pp_fn.llvm_slots.length as u32;
         }
 
         // Register under qualified name (module scope).
