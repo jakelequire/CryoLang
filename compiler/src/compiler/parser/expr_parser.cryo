@@ -834,16 +834,25 @@ public:
             lambda.set_return_type_ann(ret_ann);
         }
 
-        // Body: block body { ... } or expression body.
-        // parse_block_statement lives on Parser (child class), so we skip
-        // the block as opaque tokens here and store a placeholder block.
-        // The block content will be re-parsed during semantic analysis.
+        // Body: block body { ... }.  Cryo v1.0 requires a braced body for
+        // every lambda.  A brace-less, single-expression form like
+        // `(n: i32) -> i32 n * 2` used to be accepted by the parser but
+        // codegen wrapped the body in an ExprStmt rather than a return -
+        // so the lambda evaluated the expression and discarded it,
+        // leaving a void-returning function in a non-void return slot
+        // and producing a SIGSEGV at the first call.  Until the form
+        // is properly desugared to `{ return expr; }`, reject it with a
+        // clear diagnostic pointing at the braced form.
         if (this.check(TokenType::LBrace)) {
             const block_start: Token = this.current();
             const block: BlockStmtNode* = this.parse_lambda_block_body();
             lambda.set_body(block);
         } else {
-            // Expression body: wrap in block
+            this.report_error(ErrorCode::E0108_EXPECTED_BRACE,
+                "expected '{' to begin lambda body; the brace-less single-expression form is not supported in v1.0 - wrap the body in `{ return expr; }`");
+            // Consume the candidate expression so we don't cascade into a
+            // parse-recovery storm.  Wrap it as a discarded statement; the
+            // E0108 above is the user-facing error.
             const body_expr: ExpressionNode* = this.parse_expression();
             if (body_expr != null) {
                 const expr_stmt: ExprStmtNode* = new ExprStmtNode(body_expr, body_expr.span);

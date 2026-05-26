@@ -185,3 +185,67 @@ function inherited_field_visible() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// Regression for a silent miscompile (audit 2026-05-26): a class
+// literal whose field list named an INHERITED field used to silently
+// drop the corresponding store, leaving the field uninitialised.
+// Root cause: codegen_struct_literal scanned only the leaf class's
+// own fields and `continue`d on misses for ancestor field names.
+// Fix: walk the inheritance chain when building the field/slot map.
+type class LitBase {
+public:
+    a: i32;
+}
+
+type class LitDerived : LitBase {
+public:
+    b: i32;
+}
+
+function make_lit_derived() -> LitDerived {
+    return LitDerived { a: 100, b: 200 };
+}
+
+![test]
+function class_literal_inits_inherited_field() -> Result<(), TestError> {
+    const d: LitDerived = make_lit_derived();
+    match (expect_eq(d.a, 100)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(d.b, 200)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Regression for a silent miscompile (audit 2026-05-26): a value
+// instantiation of a class with virtual methods used to leave slot 0
+// (the vtable pointer) uninitialised, so the first virtual call read
+// poison and crashed.  Fix: codegen_struct_literal stores the vtable
+// global into slot 0 when the class's chain has virtual methods,
+// mirroring the heap-`new` path in new_delete_emitter.
+type class LitVBase {
+public:
+    a: i32;
+
+    LitVBase() { this.a = 0; }
+
+    virtual report(&this) -> i32 { return this.a; }
+}
+
+function make_lit_vbase() -> LitVBase {
+    return LitVBase { a: 99 };
+}
+
+![test]
+function class_literal_inits_vtable_for_value_construction() -> Result<(), TestError> {
+    const b: LitVBase = make_lit_vbase();
+    // If the vtable slot were poison this call would SIGSEGV.
+    match (expect_eq(b.report(), 99)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
