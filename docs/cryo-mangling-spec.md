@@ -16,7 +16,7 @@ character choice:
 
 LLVM's unquoted identifier grammar is `[-a-zA-Z$._][-a-zA-Z$._0-9]*`.
 That means the entire separator alphabet is drawn from
-`a-z A-Z 0-9 $ _ . -` — no angle brackets, commas, tildes, bangs,
+`a-z A-Z 0-9 $ _ . -` - no angle brackets, commas, tildes, bangs,
 ampersands, octothorpes, braces, or at-signs. Symbols appear directly
 in IR (`@C$foo$Fv$Rv`) with no `@"..."` quoting.
 
@@ -46,7 +46,7 @@ to the linker verbatim.
    prefix letter.
 3. **Length-prefixed identifiers** handle arbitrary user identifiers
    (digits, underscores, unicode) without escape rules.
-4. **Separator-per-role** — each structural token has exactly one
+4. **Separator-per-role** - each structural token has exactly one
    meaning. No multiplexing, no context-sensitive tokens.
 5. **No substitution compression.** Readability over symbol length.
    Modern linkers handle long names.
@@ -68,8 +68,8 @@ to the linker verbatim.
 | `_`   | Type-list separator (replaces `,`)           | Inside `$L ... $G` and parameter lists |
 | `$F`  | Parameter list start (replaces `~`)          | After path, before params |
 | `$R`  | Return type marker (replaces `!`)            | After parameter list |
-| `$s`  | Self receiver — immutable `&this`            | First parameter of a non-static method |
-| `$m`  | Self receiver — mutable `mut &this`          | First parameter of a mutating method |
+| `$s`  | Self receiver - immutable `&this`            | First parameter of a non-static method |
+| `$m`  | Self receiver - mutable `mut &this`          | First parameter of a mutating method |
 | `$f`  | Trait `for` separator                        | Between trait name and implementing type in `#tr` symbols |
 | `$O`  | Overload disambiguator                       | Trailing suffix followed by decimal digits |
 | `$V`  | Variadic marker (trailing)                   | After the last fixed parameter type |
@@ -78,12 +78,12 @@ Type prefixes in type position (never preceded by `$`):
 
 | Prefix | Role |
 |--------|------|
-| `P`    | Pointer — `P<T>` |
-| `R`    | Reference — `R<T>` |
-| `A`    | Array / slice — `A<T>` |
-| `N`    | Named type — `N$L<Path>$G` |
-| `F`    | (Reserved) Function type — `F$L<ParamList>$G<ReturnType>` |
-| `K`    | (Reserved) Closure type — `K$L<ParamList>$G<ReturnType>` |
+| `P`    | Pointer - `P<T>` |
+| `R`    | Reference - `R<T>` |
+| `A`    | Array / slice - `A<T>` |
+| `N`    | Named type - `N$L<Path>$G` |
+| `F`    | (Reserved) Function type - `F$L<ParamList>$G<ReturnType>` |
+| `K`    | (Reserved) Closure type - `K$L<ParamList>$G<ReturnType>` |
 
 > **Note:** `P`, `R`, `A`, `N`, `F`, `K` only ever start a type.
 > `$R` (structural return marker) is always preceded by `$` and is
@@ -156,7 +156,7 @@ Identical to v0.1. Primitive codes are single lowercase letters except
 
 > **Note on `int`:** `int` and `i32` collapse to the same code `i`.
 > The spec pins `int` to 32 bits. If `int` ever becomes
-> target-dependent, this collapse must be revisited — it is an ABI
+> target-dependent, this collapse must be revisited - it is an ABI
 > decision, not a cosmetic one.
 
 ---
@@ -170,8 +170,8 @@ Identical to v0.1. Primitive codes are single lowercase letters except
 | Array / slice `[T]`  | `A` + `<T>`                      | `Array<int>` → `AN$L5Array$Li$G$G` |
 | Named type           | `N$L` + `<Path>` + `$G`          | `Math::Vec2` → `N$L4Math.4Vec2$G` |
 | Generic instance     | Path with `$L`-`$G` on segment   | `Pair<int>` → `N$L4Pair$Li$G$G` |
-| Receiver `&this`     | `$s`                             | — |
-| Receiver `mut &this` | `$m`                             | — |
+| Receiver `&this`     | `$s`                             | - |
+| Receiver `mut &this` | `$m`                             | - |
 | Function type        | `F$L` + `<Params>` + `$G` + `<R>`| (reserved) |
 | Closure type         | `K$L` + `<Params>` + `$G` + `<R>`| (reserved) |
 
@@ -342,10 +342,10 @@ supported by the spec; at least one fixed parameter must precede `$V`.
 
 ### 8.18 Function / Closure Type in Type Position (Reserved)
 ```
-// fn(int, int) -> int — reserved encoding
+// fn(int, int) -> int - reserved encoding
 → F$Li_i$Gi
 
-// |int| -> int as a closure type — reserved encoding
+// |int| -> int as a closure type - reserved encoding
 → K$Li$Gi
 ```
 These forms are reserved. The spec guarantees that no other form
@@ -470,7 +470,7 @@ demangle(s):
         advance(s, 2)
         result.overload = read_number(s)
 
-    # Optional LLVM disambiguator suffix — consumed but preserved separately.
+    # Optional LLVM disambiguator suffix - consumed but preserved separately.
     if peek(s) == "." and rest_is_digits(s):
         advance(s, 1)
         result.llvm_suffix = read_number(s)
@@ -574,8 +574,8 @@ C$4Math.6Vector.4Vec2-3dot$F$s_N$L4Math.6Vector.4Vec2$G$Rd
 
 Use LLVM's `DIBuilder` to expose both forms:
 
-- `linkageName` — the mangled symbol (e.g., `C$4Rect-4area$F$s$Ri`)
-- `name` — the pretty-printed form (e.g., `Rect.area(&this) -> int`)
+- `linkageName` - the mangled symbol (e.g., `C$4Rect-4area$F$s$Ri`)
+- `name` - the pretty-printed form (e.g., `Rect.area(&this) -> int`)
 
 Debuggers (GDB, LLDB) and profilers (perf, VTune) will automatically
 show the human-readable form while the linker uses the mangled form.
@@ -622,7 +622,7 @@ The following characters must not appear in Cryo identifiers (enforced
 by the lexer): `.`, `-`, `$`, `_` (leading), plus anything outside the
 UTF-8 identifier set. If any of these ever becomes legal (e.g., via
 raw identifiers), the mangler must escape them via a `Q<hexlen>_<hex>_`
-wrapper. Internal `_` in identifiers is fine — length-prefixing makes
+wrapper. Internal `_` in identifiers is fine - length-prefixing makes
 it unambiguous.
 
 ### 12.5 Overload Disambiguation
@@ -779,7 +779,7 @@ Relative to v0.1, v0.2 trades a small amount of syntactic density
 (`$L`/`$G` vs. `<`/`>`, `-` vs. `::`, `$F`/`$R` vs. `~`/`!`) for the
 guarantee that no symbol ever requires LLVM to emit `@"..."` quotes.
 In exchange, every mangled name appears verbatim in IR, `objdump`,
-`nm`, stack traces, and linker errors — the readability story that
+`nm`, stack traces, and linker errors - the readability story that
 motivated v0.1 in the first place is preserved, and the
 grep/tooling story is strictly better.
 

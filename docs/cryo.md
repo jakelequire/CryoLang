@@ -76,9 +76,11 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | `for`      | `module`     |               | `override`  |          |         | `with`     |
 | `loop`     | `import`     |               | `inline`    |          |         |            |
 | `do`       | `export`     |               | `unsafe`    |          |         |            |
-| `break`    |              |               |             |          |         |            |
+| `break`    |              |               | `move`      |          |         |            |
 | `continue` |              |               |             |          |         |            |
 | `return`   |              |               |             |          |         |            |
+
+`move` marks a closure that captures its environment by move (see [§ 16.3](#163-move-checking)).
 
 Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [§ 21](#21-reserved-syntax).
 
@@ -167,7 +169,7 @@ Every value in Cryo has a known type at compile time, and the programmer must st
 | `i8` `i16` `i32` `i64` | Signed integers of fixed width. | 1 / 2 / 4 / 8 bytes |
 | `uint` | Default unsigned integer; alias for `u32`. | 4 bytes |
 | `u8` `u16` `u32` `u64` | Unsigned integers of fixed width. | 1 / 2 / 4 / 8 bytes |
-| `float` | Default float; alias for `f32`. | 4 bytes |
+| `float` | Default float; alias for `f64`. | 8 bytes |
 | `f32` `f64` | IEEE 754 floats. | 4 / 8 bytes |
 | `double` | Alias for `f64`. | 8 bytes |
 | `usize` `isize` | Pointer-width unsigned / signed integers. | 8 bytes on 64-bit |
@@ -273,13 +275,13 @@ parameter as bare function pointers, with no overhead change:
 function apply(f: (i32) -> i32, x: i32) -> i32 { return f(x); }
 
 const bias: i32 = 10;
-apply((x: i32) -> i32 { return x + bias; }, 32);  // 42 — capturing closure
-apply((x: i32) -> i32 { return x * 2; }, 21);     // 42 — non-capturing lambda
-apply(tentimes, 4);                               // 40 — named function pointer
+apply((x: i32) -> i32 { return x + bias; }, 32);  // 42 - capturing closure
+apply((x: i32) -> i32 { return x * 2; }, 21);     // 42 - non-capturing lambda
+apply(tentimes, 4);                               // 40 - named function pointer
 ```
 
 A combinator that infers a *new* type parameter from the callback's return
-type — for example `Option::map<U>` — does so automatically: `U` is bound from
+type - for example `Option::map<U>` - does so automatically: `U` is bound from
 the callback's signature, so the type argument may be omitted. This works the
 same whether the callback is a lambda or a named function:
 
@@ -348,7 +350,7 @@ const p: u8* = some_string as u8*; // pointer reinterpretation
 
 ### 2.10 Optional Types (`T?`)
 
-`T?` is shorthand for `Option<T>`. It is pure sugar — the parser rewrites `T?`
+`T?` is shorthand for `Option<T>`. It is pure sugar - the parser rewrites `T?`
 to `Option<T>`, so the two are the *same* type. A `T?` value carries all of
 `Option`'s methods (`is_some`, `is_none`, `unwrap_or`, `map`, …) and is freely
 assignable to and from `Option<T>`. The suffix works in every type position:
@@ -480,12 +482,12 @@ function sum(count: i32, args...) -> i64 {
 }
 ```
 
-`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [§ 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee — equivalently, pass the original `args` identifier.
+`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [§ 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
 
 Two limits are inherited from C varargs and no wrapper can remove them:
 
 - **Not count-safe.** Nothing records how many arguments were passed or their types; the callee must learn that out of band (a format string, a leading count, a sentinel).
-- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next<i8>()` is a compile error — read it as `i32` and narrow. Pass `i64`-typed values when reading with `next<i64>()`.
+- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next<i64>()`.
 
 ### 4.4 Extern Functions
 
@@ -514,7 +516,7 @@ intrinsic function strlen(str: string) -> u64;
 intrinsic function printf(format: string, args...) -> i32;
 ```
 
-The user-facing `print` / `println` / `eprint` / `eprintln` are *not* intrinsics — they live in `std::fmt` and forward to the variadic `printf` family. Only the raw C-shaped primitives above are intrinsics.
+The user-facing `print` / `println` / `eprint` / `eprintln` are *not* intrinsics - they live in `std::fmt` and forward to the variadic `printf` family. Only the raw C-shaped primitives above are intrinsics.
 
 The complete list of intrinsics is the file [`stdlib/core/intrinsics.cryo`](../stdlib/core/intrinsics.cryo). User code does not typically declare its own intrinsics; they are a contract between the standard library and the compiler.
 
@@ -523,7 +525,7 @@ The compiler also expands two source-location pseudo-constants at the call site:
 | Constant | Expands to |
 | --- | --- |
 | `FILE` | The current source file path (`string`). |
-| `LINE` | The current line number (`u32`). |
+| `LINE` | The current line number (`i32`). |
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
 
@@ -599,7 +601,7 @@ Only `mut` bindings can be assigned to.
 
 > **Reserved.** `?.`, `..` (in expression position), and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax).
 
-**Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** — `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead — `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
+**Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** - `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead - `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
 
 ```cryo
 const out: int = data |> parse |> validate(strict);   // validate(parse(data), strict)
@@ -620,7 +622,7 @@ function load(path: string) -> Result<Config, IoError> {
 }
 ```
 
-**Type-of (`typeof`).** `typeof(expr)` resolves to the static type of `expr` and is used **in type position** — anywhere a type annotation is expected: variable bindings, pointer/array/optional wrappers, generic arguments, and `as` cast targets. It is a compile-time construct that names a type, not a value, so it cannot appear where a value is expected. `expr` is only type-checked, never evaluated.
+**Type-of (`typeof`).** `typeof(expr)` resolves to the static type of `expr` and is used **in type position** - anywhere a type annotation is expected: variable bindings, pointer/array/optional wrappers, generic arguments, and `as` cast targets. It is a compile-time construct that names a type, not a value, so it cannot appear where a value is expected. `expr` is only type-checked, never evaluated.
 
 ```cryo
 const x: i32 = read_count();
@@ -696,9 +698,11 @@ A C-style `for` with three components: declare-initialiser, condition, post-upda
 
 ```cryo
 for (mut i: int = 0; i < 10; i++) {
-    println("%d", i);
+    printf("%d\n", i);
 }
 ```
+
+`for (x in xs)` iteration is reserved syntax and not yet wired to `Iterator`; see [§ 21](#21-reserved-syntax).
 
 ### 6.4 Loop
 
@@ -708,7 +712,7 @@ for (mut i: int = 0; i < 10; i++) {
 mut count: int = 0;
 loop {
     if (count >= 5) { break; }
-    println("%d", count);
+    printf("%d\n", count);
     count = count + 1;
 }
 ```
@@ -763,7 +767,7 @@ const name: string = match (n) {
 
 ### 6.9 Switch / Case
 
-A traditional `switch` is also available for **integer, `char`, `bool`, and fieldless enum** values — anything compared by value. There is no implicit fallthrough; each case is independent.
+A traditional `switch` is also available for **integer, `char`, `bool`, and fieldless enum** values - anything compared by value. There is no implicit fallthrough; each case is independent.
 
 ```cryo
 switch (value) {
@@ -797,7 +801,7 @@ function add(a: int, b: int) -> int {
 
 ### 6.12 Unsafe Blocks
 
-`unsafe { ... }` marks a region in which the compiler relaxes certain safety checks, primarily around raw pointer arithmetic and certain low-level FFI patterns. It does not turn off the type checker; it permits operations that would otherwise be rejected by the language's safety analysis.
+`unsafe { ... }` is recognised at parse time and lowers identically to a plain block. It serves as a **documentation marker**: a visible signal that the enclosed code performs raw pointer arithmetic, calls `extern` functions, or otherwise sits at the edge of the language's safety story. The compiler does not currently impose any extra restriction outside an `unsafe` block, and does not relax any check inside one - every operation Cryo permits today is permitted everywhere.
 
 ```cryo
 unsafe {
@@ -806,7 +810,7 @@ unsafe {
 }
 ```
 
-The intent is to confine dangerous operations to clearly marked regions so the rest of the codebase keeps stronger guarantees.
+Future versions may gate raw pointer dereference, raw-to-pointer `as`-casts, and `extern` calls behind an `unsafe` block. Code that already wraps such operations in `unsafe { ... }` will continue to compile when that lands; code that does not will need to.
 
 ---
 
@@ -1425,7 +1429,7 @@ const b: Pair<string> = Pair<string>::new("x", "y");
 
 it generates two independent types and two specialised function bodies, one for each instantiation. There is no shared dispatch; every call is a direct call to a fully-typed function. The trade-off is binary size: each instantiation produces its own code.
 
-The pipeline phase that drives this lives in [`compiler/src/compiler/passes/specialization.cryo`](../compiler/src/compiler/passes/specialization.cryo) and runs over every module in the program before semantic analysis.
+The pipeline driver lives in [`compiler/src/compiler/types/monomorphizer.cryo`](../compiler/src/compiler/types/monomorphizer.cryo) (Phase 6a in `instance.cryo`), invoked after type resolution and trait-bound validation but before function-body type checking. The follow-on [`compiler/src/compiler/passes/specialization.cryo`](../compiler/src/compiler/passes/specialization.cryo) walks already-typed bodies and rewrites generic call sites to point at the monomorphised callees.
 
 ---
 
@@ -1531,14 +1535,15 @@ When code imports `std::collections`, only the modules declared `public` in the 
 ### 14.3 Imports
 
 ```cryo
-import Math::Vector;                            // import the module
-import Math::Vector::Vec2, Math::Vector::Vec3;  // import specific items
-import Math::Vector::*;                         // wildcard: everything public
-import Math::Vector as V;                       // aliased
-import Math::Vector::{ Vec2, Vec3 };            // selective destructuring
+import Math::Vector;                  // import the module
+import Math::Vector::*;               // wildcard: everything public
+import Math::Vector as V;             // aliased
+import Math::Vector::{ Vec2, Vec3 };  // selective import (brace list)
 ```
 
-Wildcard imports are convenient but can cause name collisions; prefer specific imports or using the module name directly.
+Each `import` declaration imports from a single path. To bring two items from the same module into scope, use the selective brace form (`import M::{A, B};`) or write two separate `import` statements.
+
+Wildcard imports are convenient but can cause name collisions; prefer the brace form or using the module name directly.
 
 ### 14.4 Visibility
 
@@ -1591,7 +1596,7 @@ delete p;
 const arr: int* = new int[100];
 ```
 
-`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** and no constructors run — it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
+`new T[n]` allocates room for `n` contiguous `T` and yields a `T*`. The memory is **uninitialized** and no constructors run - it is the typed equivalent of `malloc(n * sizeof(T))`. Free it with `free(arr as void*)`. For constructed, growable, bounds-checked storage prefer `Array<T>`.
 
 **Higher level (`Box<T>` and the collections).** Prefer `Box<T>` over raw `malloc` for owning a single heap value, and prefer `Array<T>` / `String` / `HashMap<K, V>` over manual allocation for collections. They handle reservation, growth, and cleanup, and they implement `Drop`.
 
@@ -1648,9 +1653,9 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings — the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`). Manual `binding.drop()` remains valid and idiomatic: the analyzer treats the call as a move, the synthesizer skips bindings already consumed, and a **second** `binding.drop()` (or any other use of the binding after `.drop()`) is rejected as use-after-move (`E0452`).
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`). Manual `binding.drop()` remains valid and idiomatic: the analyzer treats the call as a move, the synthesizer skips bindings already consumed, and a **second** `binding.drop()` (or any other use of the binding after `.drop()`) is rejected as use-after-move (`E0452`).
 
-Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access — explicit `.drop()` is still required in those positions.
+Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access - explicit `.drop()` is still required in those positions.
 
 ### 16.3 Move Checking
 
@@ -1672,8 +1677,8 @@ use(a);                // error E0452: use of moved value 'a'
 
 Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
 
-- **Loop-carried move** (`E0452`) — a value moved inside a loop and re-read on the next iteration would be freed twice.
-- **Returning the address of a local** (`E0455`) — `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine — those are caller-backed.)
+- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.
+- **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 
 Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 1.4](#14-types-and-type-safety) and [§ 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
 
@@ -1805,7 +1810,7 @@ type struct Pid {
 
 - The type must have exactly one field whose size is non-zero.
 - The wrapper has the same size, alignment, and ABI as that inner field.
-- A `Pid` and an `i32` are interchangeable at the ABI level — passing `Pid` to an `extern "C"` function is identical to passing `i32`.
+- A `Pid` and an `i32` are interchangeable at the ABI level - passing `Pid` to an `extern "C"` function is identical to passing `i32`.
 
 This is the recommended idiom for type-safe wrappers around primitive FFI types (file descriptors, error codes, opaque handles) where the wrapper exists purely for type discipline at the source level.
 
@@ -1844,7 +1849,7 @@ An ADT enum (variants with payloads) is laid out as a tag (`i32`) followed by a 
 
 #### 17.3.7 Inspecting Layout: `sizeof(T)` and `alignof(T)`
 
-`sizeof(T)` and `alignof(T)` return compile-time `u64` constants reflecting the type's chosen layout — including any `![repr]` or `![align]` directives applied to it. They are the recommended way to verify FFI struct layout against a C header in a test:
+`sizeof(T)` and `alignof(T)` return compile-time `u64` constants reflecting the type's chosen layout - including any `![repr]` or `![align]` directives applied to it. They are the recommended way to verify FFI struct layout against a C header in a test:
 
 ```cryo
 ![test]
@@ -1885,8 +1890,8 @@ For larger C libraries, transcribing every signature by hand is error-prone. Cry
 
 ```cryo
 c := extern "C" {
-    #include <stdio.h>
-    #include <stdlib.h>
+    #include "stdio.h"
+    #include "stdlib.h"
     #include "./my_header.h"
 }
 
@@ -1898,11 +1903,13 @@ function main() -> int {
 }
 ```
 
-The identifier before `:=` (`c` here) introduces a namespace into which the imported declarations are placed. Access them with `::`. This prevents collisions between C names and Cryo names.
+Each `#include` takes a quoted path string. Angle-bracket form (`#include <stdio.h>`) is not currently accepted; quote system headers by name and let `clang`'s include search path resolve them. The identifier before `:=` (`c` here) introduces a namespace into which the imported declarations are placed; access them with `::` to prevent collisions between C and Cryo names.
 
 ### 18.3 Calling Cryo from C
 
-Cryo functions emitted with `![export]`-style C symbols (or marked `extern "C"`-equivalent through a directive) can be called from C with their declared name. For day-to-day FFI consumption, write a thin Cryo wrapper that takes raw types (`*u8`, `i32`, …) and call it from C using its mangled-or-exported symbol. The [mangling specification](cryo-mangling-spec.md) describes the symbol scheme.
+Cryo emits each declaration under its [mangled symbol name](cryo-mangling-spec.md). To call a Cryo function from C, write a thin wrapper inside an `extern "C"` block on the Cryo side that forwards to the real function, and declare the wrapper in your C header using the wrapper's mangled symbol.
+
+A `![no_mangle]` / `![export]` directive that suppresses mangling for a single Cryo function is on the post-1.0 roadmap; until then, the wrapper-plus-mangled-symbol approach is the supported path.
 
 ---
 
@@ -1916,7 +1923,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 | Module | What it brings in |
 | --- | --- |
-| `core::panic` | `panic(message, file, line) -> never` |
+| `core::panic` | `panic(message: string, file: string, line: u32) -> void` (does not return; aborts the process) |
 | `core::option` | `Option<T>` (`Some` / `None`) and its methods |
 | `core::result` | `Result<T, E>` (`Ok` / `Err`) and its methods |
 | `core::primitives` | Methods on built-in types (`i32::max_value`, `char::is_digit`, …) |
@@ -1924,24 +1931,26 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>` |
 | `alloc::box` | `Box<T>` |
 
-The prelude is deliberately small. Anything else is an explicit `import`.
+The prelude is deliberately small. Anything else is an explicit `import` - notably, the `print` / `println` / `eprint` / `eprintln` family lives in `std::fmt` and is **not** auto-imported. Examples in this document that use `println` assume `import std::fmt;` is in scope.
 
 ### 19.2 Module Map
 
 | Module | Highlights |
 | --- | --- |
 | **`core`** | The language foundations. `Option<T>`, `Result<T, E>`, `Slice<T>`, `NonNull<T>`, `Range<T>`, `RangeInclusive<T>`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `IntoIterator`, `From`/`Into`/`TryFrom`/`TryInto`, `Step`. Memory utilities (`copy`, `zero`, `swap`, `transmute`, `align_up`/`align_down`). Hashing (`Hasher`, `DefaultHasher`, an FNV-1a implementation). |
-| **`alloc`** | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting). |
-| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view), `String<A>` (owned UTF-8), `HashMap<K, V, A>` (separate-chaining), `HashSet<T, A>`. All allocator-generic with `GlobalAlloc` default. |
+| **`alloc`** | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting), `Arc<T>` (atomic reference counting for cross-thread sharing). |
+| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view), `String<A>` (owned UTF-8), `HashMap<K, V, A>` (separate-chaining), `HashSet<T, A>`, `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAlloc` default. |
 | **`io`** | `Read` / `Write` traits with rich defaults (`read_byte`, `read_until`, `read_to_end`, `read_to_string`, `write_all`, `write_str`, `write_line`). `Stdin`, `Stdout`, `Stderr` handles with `is_tty()`/`as_fd()`. `BufWriter<W>` / `LineWriter<W>` / `BufReader<R>`. POSIX flag constants and an `IoError` / `IoErrorKind` mapping `errno`. |
 | **`fmt`** | `Display` and `Debug` traits, `Formatter<W>` borrowing its sink, `FmtWrite`, `print` / `println` / `eprint` / `eprintln`, `format_to_string`, `format_debug_to_string`. Heap-free integer and float writers (`write_u64_decimal`, `write_f64`). |
 | **`json`** | RFC 8259 parser and serialiser. `JsonValue`, `JsonNumber`, `JsonObject` (insertion-ordered). `parse`, `stringify`, `stringify_pretty`. |
 | **`fs`** | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` and `write(path, bytes)`. `O_*` and `SEEK_*` constants. |
 | **`ffi`** | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures. |
-| **`env`** | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code) -> never`. |
+| **`env`** | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`. |
 | **`math`** | Thin libm wrappers: `square_root`, `sine`, `cosine`, `power`, `natural_log`, `exponential`, `floor`, `ceil`, `round`, `trunc`, `absolute`, plus `PI`, `TAU`, `E`. |
 | **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. TLS, UDP, HTTP/2, and WebSocket are out of scope for 1.0 and are tracked on the post-1.0 roadmap. |
 | **`process`** | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported. |
+| **`sync`** | Atomics (`AtomicU8`/`U32`/`U64`/`I32`/`I64`/`Bool`, `MemoryOrder`, `fence`, `compiler_fence`), `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement. |
+| **`thread`** | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `JoinHandle` / `Builder` and `mpsc` channels are post-1.0; the primitives under `sync` and `Arc<T>` already ship. |
 | **`test`** | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing). |
 
 ### 19.3 Naming Conventions in the Standard Library
@@ -2051,7 +2060,9 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
 | `![pure]` | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics). |
 | `![const]` | Reserved. Will mark a function as evaluable at compile time. |
-| `![noreturn]` | Reserved. Will declare a function that never returns normally (a stronger form of `-> never`). |
+| `![noreturn]` | Reserved. Will declare a function that never returns normally. |
+| `![export]` / `![no_mangle]` | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [§ 18.3](#183-calling-cryo-from-c). |
+| `for x in iter` | The `for-in` syntax is not yet implemented. Iterate with a counted `for` loop or a `while` over an explicit `Iterator::next()`. |
 | `![section("name")]` | Reserved. Will place the symbol in a specific object-file section. |
 | `![weak]` | Reserved. Will declare weak linkage. |
 | `![constructor]` / `![destructor]` | Reserved. Will register functions that run before `main` / after `main` returns. |

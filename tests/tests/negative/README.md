@@ -1,7 +1,7 @@
 # Compile-fail tests
 
 Each `.cryo` file here is a **negative test**: a complete program that the
-compiler must *reject*. They are driven natively by `cryo test` — no scripts,
+compiler must *reject*. They are driven natively by `cryo test` - no scripts,
 no separate command.
 
 ```cryo
@@ -32,7 +32,7 @@ Results appear in the normal `cryo test` output under `compile-fail result:`.
 
 A case **fails the suite** (honestly, as a red test) if the file compiles
 cleanly or emits a different code. Some files here intentionally fail today
-because they pin a diagnostic the compiler *should* emit but doesn't yet —
+because they pin a diagnostic the compiler *should* emit but doesn't yet -
 that red is the signal, not something to paper over.
 
 Keep `![config(testing)]` too (every test file carries it). Use collision-proof

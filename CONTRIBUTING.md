@@ -28,11 +28,11 @@ To run the resulting compiler from anywhere on your `PATH`, run
 ### Pinned binary (`bin/cryo`)
 
 `bin/cryo` is a known-good self-hosted compiler committed to the repo. Every
-build target — `make cryo`, `make selfhost-check`, `make test` — drives off
+build target - `make cryo`, `make selfhost-check`, `make test` - drives off
 this pin. There is no longer a path back to a C++ bootstrap: the compiler
 is the pin, and the pin is the compiler.
 
-The pin is **stale** by design — it understands the dialect of `compiler/src/`
+The pin is **stale** by design - it understands the dialect of `compiler/src/`
 at the moment it was committed, nothing more. When `compiler/src/` adopts new
 parser syntax or codegen behaviour that the pinned binary can't represent,
 `make cryo` errors out and you'll need to refresh the pin (or roll back).
@@ -47,7 +47,7 @@ git commit -m "build: refresh pinned cryo binary"
 ```
 
 Refresh **only** when `compiler/src/` has actually adopted something the
-existing pin can't handle. Do not refresh just because a new build exists —
+existing pin can't handle. Do not refresh just because a new build exists -
 the pin is for compatibility, not freshness.
 
 ## Filing issues
@@ -61,8 +61,8 @@ Use the GitHub issue tracker. The bug-report template asks for:
 ## Submitting changes
 
 1. Fork the repo and branch off `main`.
-2. Make your change. **Don't touch `legacy/bootstrap/`** — it's retired.
-3. Run `make selfhost-check` locally — your change must preserve the
+2. Make your change. **Don't touch `legacy/bootstrap/`** - it's retired.
+3. Run `make selfhost-check` locally - your change must preserve the
    stage-3 / stage-4 byte-identical fixed point.
 4. Open a PR using the provided template; explain *why* in the description.
 
@@ -77,7 +77,7 @@ A few conventions worth knowing:
   `compiler/` or `stdlib/` until you can refresh the pin from the
   fixed compiler in a follow-up.
 - New compiler-side helpers belong in `CodegenContext` /
-  `DeclarationIndex` / `InternTable` — not as inline string manipulation
+  `DeclarationIndex` / `InternTable` - not as inline string manipulation
   inside codegen.
 
 ## Known limitations

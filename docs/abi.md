@@ -1,4 +1,4 @@
-# ABI Lowering — As-Built
+# ABI Lowering - As-Built
 
 This document describes how Cryo lowers function signatures and call sites
 to LLVM IR for the SysV x86-64 ABI. It is the as-built companion to
@@ -75,12 +75,12 @@ are always Direct.
 
 | Source kind         | Size      | Plan                                                                          |
 |---------------------|-----------|-------------------------------------------------------------------------------|
-| `void` / `Unit`     | —         | `Ignore` (LLVM `void`, no slot)                                               |
-| Scalar / primitive  | —         | `Direct` (one LLVM slot = source type)                                        |
+| `void` / `Unit`     | -         | `Ignore` (LLVM `void`, no slot)                                               |
+| Scalar / primitive  | -         | `Direct` (one LLVM slot = source type)                                        |
 | Aggregate           | 0 / inv.  | falls back to `Direct` (whatever `map_type` says)                             |
-| Aggregate           | 1–8       | `Direct` with coercion — one register-sized slot (slot type per the eightbyte rules below) |
-| Aggregate           | 9–16      | `DirectPair` — two register-sized slots, wrapped in `{lo, hi}` literal struct |
-| Aggregate           | > 16      | `Indirect` with `SRet` — hidden first `ptr sret(%T)` parameter, LLVM returns `void` |
+| Aggregate           | 1–8       | `Direct` with coercion - one register-sized slot (slot type per the eightbyte rules below) |
+| Aggregate           | 9–16      | `DirectPair` - two register-sized slots, wrapped in `{lo, hi}` literal struct |
+| Aggregate           | > 16      | `Indirect` with `SRet` - hidden first `ptr sret(%T)` parameter, LLVM returns `void` |
 
 ### Parameters
 
@@ -93,10 +93,10 @@ to the unified classifiers.
 
 | Source kind         | Size      | Plan                                                                          |
 |---------------------|-----------|-------------------------------------------------------------------------------|
-| Scalar / primitive  | —         | `Direct` (one LLVM slot = source type)                                        |
-| Aggregate           | 1–8       | `Direct` with coercion — one register-sized slot (slot type per the eightbyte rules below) |
-| Aggregate           | 9–16      | `DirectPair` — two register-sized slots                                       |
-| Aggregate           | > 16      | `Indirect` with `ByVal` — single `ptr byval(%T)` slot                         |
+| Scalar / primitive  | -         | `Direct` (one LLVM slot = source type)                                        |
+| Aggregate           | 1–8       | `Direct` with coercion - one register-sized slot (slot type per the eightbyte rules below) |
+| Aggregate           | 9–16      | `DirectPair` - two register-sized slots                                       |
+| Aggregate           | > 16      | `Indirect` with `ByVal` - single `ptr byval(%T)` slot                         |
 
 The prologue (`codegen_function_prologue` and `codegen_method_prologue`)
 and `declare_method`'s LLVM slot assembly consume these plans
@@ -109,7 +109,7 @@ Because a source parameter can now contribute more than one LLVM slot,
 per-parameter attribute attachment (`byval(%T)`) computes the parameter's
 starting LLVM slot via `llvm_slot_index_of_param` (which accounts for the
 hidden sret slot and earlier DirectPair expansions) rather than the raw
-source ordinal — attaching at the ordinal would land the attribute on an
+source ordinal - attaching at the ordinal would land the attribute on an
 incompatible slot once any earlier parameter is a DirectPair.
 
 The call site recovers a coerced aggregate's size from the **lowered LLVM
@@ -129,17 +129,17 @@ the slot:
 
 1. Walk the struct/class fields whose offset falls in `[start, end)`.
 2. **One float-class field that fully covers the bucket**: emit `double`
-   (for F64) or `float` (for F32) — SSE class.
+   (for F64) or `float` (for F32) - SSE class.
 3. **Two F32 fields packing into one 8-byte eightbyte**: emit
-   `<2 x float>` via `LLVMVectorType` — multi-float SSE.
+   `<2 x float>` via `LLVMVectorType` - multi-float SSE.
 4. **Anything else** (mixed int/ptr, multiple non-float fields, F32+F64
    sharing a bucket, …): emit the smallest power-of-two integer
-   container ≥ `bucket_size` (`i8` / `i16` / `i32` / `i64`) — INTEGER
+   container ≥ `bucket_size` (`i8` / `i16` / `i32` / `i64`) - INTEGER
    class.
 
 This matches what clang emits for the same source layouts. The
 multi-float SSE branch in particular is required for C interop with
-functions returning `{float, float}` — the SysV ABI rides those in a
+functions returning `{float, float}` - the SysV ABI rides those in a
 single XMM register packed as `<2 x float>`, not in two scalar slots
 or `i64`.
 
@@ -149,11 +149,11 @@ or `i64`.
 made opaque pointers mandatory. `AbiClassifier` caches the named-attribute
 kind IDs (`LLVMGetEnumAttributeKindForName`) once per process and exposes:
 
-- `apply_sret_attribute(fn_val, pointee_ty)` — attach to LLVM param slot 0
-- `apply_sret_call_attribute(call_val, pointee_ty)` — call-site mirror
-- `apply_byval_attribute(fn_val, llvm_idx, pointee_ty)` — attach to a param slot
-- `apply_byval_call_attribute(call_val, llvm_idx, pointee_ty)` — call-site mirror
-- `apply_call_site_attrs_from_plan(call_val, plan*)` — bulk apply from a `SignaturePlan`, for function-pointer call sites where attribute queries don't work
+- `apply_sret_attribute(fn_val, pointee_ty)` - attach to LLVM param slot 0
+- `apply_sret_call_attribute(call_val, pointee_ty)` - call-site mirror
+- `apply_byval_attribute(fn_val, llvm_idx, pointee_ty)` - attach to a param slot
+- `apply_byval_call_attribute(call_val, llvm_idx, pointee_ty)` - call-site mirror
+- `apply_call_site_attrs_from_plan(call_val, plan*)` - bulk apply from a `SignaturePlan`, for function-pointer call sites where attribute queries don't work
 
 Function-side and call-site attributes are **independent in LLVM** and
 must both be set for the verifier and optimizer to treat the slot
@@ -186,12 +186,12 @@ mismatches in the equal-kinds case.
 the LLVM-actual and LLVM-expected types disagree:
 
 - `Integer | Float | Double | Vector` expected, `Struct` actual:
-  ≤ 8 byte aggregate param — spill struct, reload as scalar/vector.
+  ≤ 8 byte aggregate param - spill struct, reload as scalar/vector.
 - `Integer | Float | Double | Vector` expected, `Pointer` actual where
   the arg is an ≤ 8 byte aggregate by *address* (an lvalue, or a `T*` /
   `&T` to the aggregate, detected via `agg_register_size`): load the
   register through the pointer. This takes priority over the generic
-  `Integer ← Pointer` `ptrtoint` below — `ptrtoint`-ing the address
+  `Integer ← Pointer` `ptrtoint` below - `ptrtoint`-ing the address
   would pass the pointer where the callee expects the aggregate's bytes
   (e.g. an 8-byte `LBuilder` reached through `this.builder: LBuilder*`).
 - `Struct` expected, `Integer | Float | Double | Vector` actual:
@@ -206,8 +206,8 @@ the LLVM-actual and LLVM-expected types disagree:
 DirectPair param expansion (a single source aggregate expanding into two
 LLVM register slots) is handled by `codegen_call_direct_dp_expand`,
 dispatched from `codegen_call_direct` when `expected_count > n`. It
-handles all three argument shapes — struct value (spill to temp), lvalue
-address, and pointer/reference to the aggregate — loading `lo` at +0 and
+handles all three argument shapes - struct value (spill to temp), lvalue
+address, and pointer/reference to the aggregate - loading `lo` at +0 and
 `hi` at +8, with a slot-budget fallback for sources that carry no struct
 size (e.g. a `string` literal coerced to a `Str` parameter).
 
@@ -249,5 +249,5 @@ x86-64 rules. When a second target lands (most likely AArch64 first):
 5. Re-pin the compiler on the new target before changing default behavior.
 
 Nothing in `DeclarationEmitter`, `ExprOps`, `SymbolResolver`, or the
-visit-side emitters needs to know about the target — they all already
+visit-side emitters needs to know about the target - they all already
 go through `this.abi.X` for every ABI-shaped decision.

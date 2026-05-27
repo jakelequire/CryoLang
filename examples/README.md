@@ -1,12 +1,12 @@
 # Cryo Examples
 
 A curated tour of the Cryo language and standard library. Each
-example is a self-contained project — `cryo run` from its directory
+example is a self-contained project - `cryo run` from its directory
 builds and executes it.
 
 | #  | Example                                | What it covers                                                                |
 | -- | -------------------------------------- | ----------------------------------------------------------------------------- |
-| 01 | [01-hello](01-hello/)                  | Hello world — minimal project layout, `printf`.                               |
+| 01 | [01-hello](01-hello/)                  | Hello world - minimal project layout, `printf`.                               |
 | 02 | [02-fizzbuzz](02-fizzbuzz/)            | Control flow + enums + `match`.                                               |
 | 03 | [03-fibonacci](03-fibonacci/)          | Recursion and iteration; reading CLI args via `env::args()`.                  |
 | 04 | [04-calculator](04-calculator/)        | Structs, methods, enum-typed errors, RPN expression evaluation.               |

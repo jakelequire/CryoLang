@@ -89,11 +89,14 @@ public module core;
 /// Sub-modules:
 ///   - `layout`     : `Layout { size, align }`; `new<T>()`, `array<T>(n)`
 ///   - `allocator`  : `Allocator` trait; `AllocError`; `AllocErrorKind`
-///                    (`OutOfMemory`, `Exhausted`, `InvalidLayout`); `GlobalAlloc`
+///                    (`OutOfMemory`, `ZeroSized`, `Exhausted`, `InvalidLayout`);
+///                    `GlobalAlloc`
 ///   - `box`        : `Box<T>` unique heap ownership
 ///   - `arena`      : bump allocator (64 KiB chunks, `reset`, `drop`)
 ///   - `pool`       : fixed-slot slab allocator; layout mismatch -> `InvalidLayout`
 ///   - `rc`         : `Rc<T>` single-threaded reference-counted pointer
+///   - `arc`        : `Arc<T>` atomically reference-counted pointer for
+///                    cross-thread sharing
 public module alloc;
 
 /// Growable containers built on `alloc`. Every container owns heap
@@ -105,7 +108,8 @@ public module alloc;
 ///   - `array`      : `Array<T, A>` contiguous growable sequence;
 ///                    `push`, `pop`, `push_slice`, `try_push_slice`, ...
 ///   - `str`        : `Str` borrowed length-typed UTF-8 slice;
-///                    `to_ascii_lowercase`, `equals`, `starts_with`, ...;
+///                    `length`, `is_empty`, `byte_at`, `sub_bytes`,
+///                    `equals`, `to_ascii_lowercase`;
 ///                    implements `Eq + Hash`
 ///   - `string`     : `String` owned growable UTF-8; implements `Eq + Hash`
 ///   - `hashmap`    : `HashMap<K, V, A>` separate-chaining hash table;
@@ -149,7 +153,7 @@ public module io;
 ///   - `float`    : `write_f64` decimal + scientific-notation writer
 ///   - `display`  : `Display` and `Debug` traits; `Formatter<W>` borrowing
 ///                  its sink; `print`, `println`, `eprint`, `eprintln`
-///                  (single-syscall on values up to 256 bytes);
+///                  (printf-style variadics over libc `vprintf`/`vfprintf`);
 ///                  `format_to_string`, `format_debug_to_string`
 public module fmt;
 
@@ -171,7 +175,8 @@ public module json;
 ///
 /// Sub-modules:
 ///   - `path`  : `Path` (borrowed), `PathBuf` (owned);
-///              `extension`, `file_name`, `parent`, `join`, `is_absolute`
+///              `file_name`, `parent`, `is_absolute`; `PathBuf::push`,
+///              `PathBuf::pop`. (`extension` and `join` are post-1.0.)
 ///   - `file`  : `OpenOptions` builder; `File` (`Read + Write`);
 ///              convenience `read(path)` and `write(path, bytes)`;
 ///              `O_CREAT/EXCL/TRUNC/APPEND`; `SEEK_SET/CUR/END`
@@ -203,7 +208,8 @@ public module ffi;
 
 /// Process environment and argument access.
 /// `args() -> Array<Str>`, `var(name) -> Option<Str>`,
-/// `set_var(name, value)`, `exit(code) -> !`.
+/// `set_var(name, value)`, `remove_var(name)`,
+/// `process_exit(code: i32) -> void`.
 public module env;
 
 /// Thin wrappers over libm. Inherits platform behavior (rounding mode,
@@ -248,7 +254,7 @@ public module net;
 ///                `Output { status, stdout, stderr }`
 public module process;
 
-/// Thread spawning and per-thread storage.  POSIX-only (pthread).
+/// Per-thread storage.  POSIX-only (pthread).
 ///
 /// Sub-modules:
 ///   - `local` : `ThreadLocal<T>` lazy per-thread storage backed by
@@ -256,24 +262,32 @@ public module process;
 ///               Explicit `clear()` for cleanup; v1 has no automatic
 ///               destructor (see module docs).
 ///
-/// `spawn`, `JoinHandle<T>`, and `Builder` land alongside the
-/// closure-`move` carve-out.
+/// `thread::spawn`, `JoinHandle<T>`, and `Builder` are post-1.0.
+/// `Arc<T>` (in `alloc::arc`) and the primitives under `std::sync`
+/// already ship at 1.0; what's missing is the way to start a second
+/// thread from Cryo source.
 public module thread;
 
-/// Synchronization primitives for concurrent code.
+/// Synchronization primitives for concurrent code.  POSIX-only (pthread).
 ///
 /// Sub-modules:
-///   - `atomic` : `MemoryOrder` enum (`Relaxed`, `Acquire`, `Release`,
-///                `AcqRel`, `SeqCst`); per-type `AtomicU8`, `AtomicU32`,
-///                `AtomicU64`, `AtomicI32`, `AtomicI64`, `AtomicBool`
-///                with `load`, `store`, `fetch_add/sub/and/or/xor`,
-///                `swap`, `compare_exchange`; `fence(order)` and
-///                `compiler_fence(order)` free functions.  Named
-///                `MemoryOrder` to avoid clashing with the existing
-///                `std::core::cmp::Ordering` (Less/Equal/Greater).
-///
-/// Lock primitives (`Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`,
-/// `Barrier`) and `Arc<T>` land alongside `std::thread`.
+///   - `atomic`  : `MemoryOrder` enum (`Relaxed`, `Acquire`, `Release`,
+///                 `AcqRel`, `SeqCst`); per-type `AtomicU8`, `AtomicU32`,
+///                 `AtomicU64`, `AtomicI32`, `AtomicI64`, `AtomicBool`
+///                 with `load`, `store`, `fetch_add/sub/and/or/xor`,
+///                 `swap`, `compare_exchange`; `fence(order)` and
+///                 `compiler_fence(order)` free functions.  Named
+///                 `MemoryOrder` to avoid clashing with the existing
+///                 `std::core::cmp::Ordering` (Less/Equal/Greater).
+///   - `mutex`   : `Mutex<T, A>` exclusive lock; `lock` / `try_lock`;
+///                 RAII `MutexGuard` (`!Send`).
+///   - `rwlock`  : `RwLock<T, A>` multi-reader / single-writer lock;
+///                 RAII `RwLockReadGuard` / `RwLockWriteGuard` (`!Send`).
+///   - `condvar` : `CondVar` condition variable; `wait`, `notify_one`,
+///                 `notify_all`.
+///   - `once`    : `Once` one-shot initializer; `call_once(init)`.
+///   - `barrier` : `Barrier` N-thread rendezvous.
+///   - `error`   : `SyncError`, `SyncErrorKind`.
 public module sync;
 
 /// Cryo's built-in unit-test framework. Tests live in `<project>/tests/`
