@@ -1,0 +1,98 @@
+///! Barrier: thread rendezvous point.
+///!
+///! A `Barrier` synchronizes a fixed group of threads at a common
+///! point: every thread that calls `wait()` blocks until exactly
+///! `count` threads have arrived, then they all proceed.  Exactly
+///! one of the arriving threads receives `is_leader == true` in its
+///! `BarrierWaitResult`; the others get `false`.  The leader flag is
+///! useful for "one thread does the cleanup after every worker has
+///! finished a phase" patterns.
+///!
+///! Backed by POSIX `pthread_barrier_t` (32 bytes on Linux x86_64).
+///!
+///! `Barrier` is `Send + Sync` unconditionally.
+
+namespace std::sync::barrier;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import ffi::libc;
+
+
+type struct BarrierInner {
+    pthread_buf: u8[32];
+}
+
+
+/// Result of `Barrier::wait()`.  Exactly one of the threads at each
+/// barrier cycle observes `is_leader == true`; this is the standard
+/// way to designate one thread to do per-phase cleanup work.
+public type struct BarrierWaitResult {
+    is_leader: boolean;
+
+    is_leader(&this) -> boolean {
+        return this.is_leader;
+    }
+}
+
+
+public type struct Barrier {
+    inner: BarrierInner*;
+
+    /// Construct a barrier that requires `count` threads before
+    /// releasing them.  Panics on allocation failure or pthread init
+    /// failure (a non-zero count is the only requirement).
+    static new(count: u32) -> Barrier {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<BarrierInner>();
+        match (alloc.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<BarrierInner> = raw.cast<BarrierInner>();
+                const inner_ptr: BarrierInner* = typed.as_ptr();
+                const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+                const rc: i32 = pthread_barrier_init(buf_ptr, null, count);
+                if (rc != 0) {
+                    intrinsics::panic("Barrier::new: pthread_barrier_init failed", FILE, LINE);
+                }
+                return Barrier { inner: inner_ptr };
+            }
+            Result::Err(_) => {
+                intrinsics::panic("Barrier::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Block the current thread until every thread participating in
+    /// the barrier has called `wait()`.  Returns a `BarrierWaitResult`
+    /// whose `is_leader` flag is true on exactly one of the awakening
+    /// threads.  The barrier is automatically reset for the next
+    /// cycle once all waiters resume.
+    wait(&this) -> BarrierWaitResult {
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const rc: i32 = pthread_barrier_wait(buf_ptr);
+        // POSIX returns PTHREAD_BARRIER_SERIAL_THREAD (-1, but a
+        // positive sentinel on glibc) for the leader; 0 for the
+        // others; an errno on failure.  glibc's value is constant
+        // -1 cast through unsigned, observable as -1 == 0xFFFFFFFF.
+        // We test for non-zero non-errno.
+        const is_leader: boolean = (rc != 0 && rc != 11 && rc != 22);
+        return BarrierWaitResult { is_leader: is_leader };
+    }
+}
+
+implement trait Drop for struct Barrier {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner_ptr: BarrierInner* = this.inner;
+        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        pthread_barrier_destroy(buf_ptr);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<BarrierInner>();
+        alloc.deallocate(NonNull::new(this.inner as u8*), header);
+        this.inner = null;
+    }
+}

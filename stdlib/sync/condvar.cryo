@@ -1,0 +1,126 @@
+///! CondVar: condition variable for blocking until a predicate holds.
+///!
+///! A `CondVar` is the synchronization primitive that lets a thread
+///! atomically release a `Mutex<T>` and sleep until another thread
+///! signals.  It is the standard producer/consumer primitive.
+///!
+///! Usage pattern:
+///! ```cryo
+///! // shared: Arc<Mutex<Queue>>, cond: Arc<CondVar>
+///! mut guard: MutexGuard<Queue, GlobalAlloc> = shared.lock();
+///! while (guard.as_ptr().is_empty()) {
+///!     cond.wait(&shared, &mut guard);
+///! }
+///! // ... act on the queue ...
+///! ```
+///!
+///! `wait()` atomically releases the lock, sleeps until another
+///! thread calls `notify_one()` or `notify_all()`, then reacquires
+///! the lock before returning.  The guard remains "locked" from the
+///! caller's perspective — pthread does the unlock/relock internally.
+///!
+///! Cryo's lack of borrow-checker means the caller must take care
+///! not to use the guarded value while inside `wait()`; doing so
+///! reads through the guard while another thread holds the lock.
+///!
+///! `CondVar` is `Send + Sync` unconditionally (pthread condition
+///! variables are designed for cross-thread use).
+
+namespace std::sync::condvar;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import ffi::libc;
+import sync::mutex;
+
+
+// 48-byte opaque pthread_cond_t buffer, heap-pinned for address
+// stability (pthread cond variables, like mutexes, must not move
+// after init).
+type struct CondVarInner {
+    pthread_buf: u8[48];
+}
+
+
+public type struct CondVar {
+    inner: CondVarInner*;
+
+    /// Construct a fresh condition variable with default attributes.
+    /// Panics on allocation failure or pthread init failure.
+    static new() -> CondVar {
+        match (CondVar::try_new()) {
+            Result::Ok(c)  => { return c; }
+            Result::Err(_) => {
+                intrinsics::panic("CondVar::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    static try_new() -> Result<CondVar, AllocError> {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<CondVarInner>();
+        match (alloc.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<CondVarInner> = raw.cast<CondVarInner>();
+                const inner_ptr: CondVarInner* = typed.as_ptr();
+                const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+                pthread_cond_init(buf_ptr, null);
+                return Result::Ok(CondVar { inner: inner_ptr });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Block the current thread until another thread signals this
+    /// condition variable.  Atomically releases `mutex`, waits, and
+    /// reacquires `mutex` before returning.  `guard` is not invalidated
+    /// — its address still refers to the same `MutexInner` — but
+    /// inspect the guarded value only after `wait` returns.
+    ///
+    /// The `guard` argument is taken by `mut &` to model the
+    /// "borrow continues across the call" semantics; the guard is
+    /// unchanged at the Cryo level (pthread internally unlocks /
+    /// relocks the underlying buffer).
+    wait<T, A>(&this, mutex: &Mutex<T, A>, guard: mut &MutexGuard<T, A>) -> void {
+        const cond_buf:  u8* = &this.inner.pthread_buf[0];
+        const mutex_buf: u8* = mutex.raw_pthread_buf();
+        const rc: i32 = pthread_cond_wait(cond_buf, mutex_buf);
+        if (rc != 0) {
+            intrinsics::panic("CondVar::wait: pthread_cond_wait failed", FILE, LINE);
+        }
+    }
+
+    /// Wake up one thread waiting on this condition variable.  If no
+    /// thread is currently waiting, the signal is lost (this is the
+    /// standard pthread semantics; the producer should arrange for
+    /// the consumer to check the predicate before sleeping).
+    notify_one(&this) -> void {
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        pthread_cond_signal(buf_ptr);
+    }
+
+    /// Wake up every thread currently waiting on this condition
+    /// variable.  Spurious wake-ups are possible regardless; the
+    /// consumer must re-check the predicate after waking.
+    notify_all(&this) -> void {
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        pthread_cond_broadcast(buf_ptr);
+    }
+}
+
+implement trait Drop for struct CondVar {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner_ptr: CondVarInner* = this.inner;
+        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        pthread_cond_destroy(buf_ptr);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<CondVarInner>();
+        alloc.deallocate(NonNull::new(this.inner as u8*), header);
+        this.inner = null;
+    }
+}

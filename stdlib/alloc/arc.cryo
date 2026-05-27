@@ -1,0 +1,175 @@
+///! Arc<T, A>: atomic reference counting.
+///!
+///! `Arc<T, A>` is the thread-safe sibling of `Rc<T, A>`: it shares
+///! ownership of a heap-allocated value among many holders, but the
+///! reference count is an `AtomicU64`, so multiple threads can clone
+///! and drop `Arc` handles concurrently without a data race.  `A`
+///! defaults to `GlobalAlloc`, matching `Rc`.
+///!
+///! `Arc<T, A>` itself is structurally `Send + Sync` iff both `T` and
+///! `A` are `Send + Sync` — the compiler's auto-derive (see
+///! `OwnershipQuery::is_send` / `is_sync`) determines this without any
+///! explicit `implement` block.  `Rc` is rejected by an explicit
+///! deny-list keyed on its leaf name; `Arc` is not.
+///!
+///! The memory-ordering pattern below — `fetch_add(Relaxed)` for clone,
+///! `fetch_sub(Release)` + `fence(Acquire)` on the last-decrement path
+///! — is the canonical Boost / Rust implementation.  Relaxed is correct
+///! for the clone bump because the new reference is observed only by
+///! callers who already share the count with the cloning thread; the
+///! existing happens-before edge is sufficient.  The release/acquire
+///! pair on drop synchronizes the final `T::drop()` with every prior
+///! mutation made by any thread that has already dropped its own
+///! handle.
+///!
+///! Like `Rc`, `Arc` does **not** support weak references.  Cycles
+///! through `Arc` pointers leak; callers must break them manually.
+
+namespace std::alloc::arc;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import sync::atomic;
+
+/// Heap-resident header shared by every `Arc<T, A>` clone.  The
+/// allocator instance lives here, not in the handle, so all clones
+/// agree on who frees the inner when the last refcount drops.  The
+/// `count` field is an `AtomicU64` for thread-safe increments and
+/// decrements.
+type struct ArcInner<T, A> {
+    count: AtomicU64;
+    value: T;
+    alloc: A;
+}
+
+type struct Arc<T, A = GlobalAlloc> {
+    // Raw (nullable) so each handle's `drop` can null it and stay
+    // idempotent.  Non-null while the handle is live; only a post-drop
+    // husk holds null.
+    inner: ArcInner<T, A>*;
+
+    /// Allocate a new `Arc` backed by `GlobalAlloc` with an initial
+    /// count of 1.  Panics on allocation failure; use `try_new`.
+    static new(value: T) -> Arc<T, GlobalAlloc> {
+        match (Arc::try_new(value)) {
+            Result::Ok(r) => { return r; }
+            Result::Err(_) => {
+                intrinsics::panic("Arc::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Allocate with a caller-supplied allocator.  Panics on failure.
+    static new_in(value: T, alloc: A) -> Arc<T, A> {
+        match (Arc::try_new_in(value, alloc)) {
+            Result::Ok(r) => { return r; }
+            Result::Err(_) => {
+                intrinsics::panic("Arc::new_in: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible constructor backed by `GlobalAlloc`.  Returns
+    /// `Err(AllocError)` if the allocator refuses the request.
+    static try_new(value: T) -> Result<Arc<T, GlobalAlloc>, AllocError> {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<ArcInner<T, GlobalAlloc>>();
+        match (alloc.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<ArcInner<T, GlobalAlloc>> = raw.cast<ArcInner<T, GlobalAlloc>>();
+                const inner_ptr: ArcInner<T, GlobalAlloc>* = typed.as_ptr();
+                inner_ptr.count = AtomicU64::new(1u64);
+                inner_ptr.value = value;
+                inner_ptr.alloc = alloc;
+                return Result::Ok(Arc<T, GlobalAlloc> { inner: inner_ptr });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Fallible constructor with a caller-supplied allocator.  The
+    /// allocator instance is stored in the inner header and is used
+    /// to free the inner when the last refcount drops.
+    static try_new_in(value: T, alloc: A) -> Result<Arc<T, A>, AllocError> {
+        mut a: A = alloc;
+        const header: Layout = Layout::of<ArcInner<T, A>>();
+        match (a.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<ArcInner<T, A>> = raw.cast<ArcInner<T, A>>();
+                const inner_ptr: ArcInner<T, A>* = typed.as_ptr();
+                inner_ptr.count = AtomicU64::new(1u64);
+                inner_ptr.value = value;
+                inner_ptr.alloc = a;
+                return Result::Ok(Arc<T, A> { inner: inner_ptr });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Produce another `Arc` pointing at the same value.  The two
+    /// handles are interchangeable; the refcount is incremented
+    /// atomically with `Relaxed` ordering — the canonical Boost/Rust
+    /// pattern: the new owner already shares a happens-before with
+    /// the cloning thread, so no further synchronization is needed at
+    /// clone time.
+    clone(&this) -> Arc<T, A> {
+        const inner_ptr: ArcInner<T, A>* = this.inner;
+        inner_ptr.count.fetch_add(1u64, MemoryOrder::Relaxed);
+        return Arc<T, A> { inner: this.inner };
+    }
+
+    /// Current strong-reference count.  Reads the atomic with
+    /// `SeqCst`; treat this as advisory — by the time the caller
+    /// uses the value another thread may have changed it.
+    strong_count(&this) -> u64 {
+        return this.inner.count.load(MemoryOrder::SeqCst);
+    }
+
+    /// Raw pointer to the shared value.  Valid for as long as *any*
+    /// clone of this `Arc` is still alive; dereferencing after the
+    /// last `drop` is undefined.
+    as_ptr(&this) -> T* {
+        return &this.inner.value;
+    }
+}
+
+/// Decrement the refcount atomically; when the count reaches zero,
+/// call `T::drop()` on the shared value and free the underlying
+/// storage.  The `Release` ordering on `fetch_sub` plus the
+/// `Acquire` fence on the last-decrement path establishes a
+/// happens-before edge that synchronizes the final destructor with
+/// every prior write made by any thread that has already dropped its
+/// own handle.
+///
+/// As with `Rc`, the allocator instance lives in the inner header,
+/// so it must be moved out to a stack local *before* `deallocate`;
+/// otherwise the deallocate would free memory still being used by
+/// the allocator's own state.
+///
+/// Ownership obligation: every `Arc` handle must have `drop` called
+/// exactly once before going out of scope.
+implement<T, A> trait Drop for struct Arc<T, A>
+where T: Drop, A: Allocator {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner_ptr: ArcInner<T, A>* = this.inner;
+        // `fetch_sub` returns the value BEFORE the decrement, so the
+        // last owner is the one that observes `1` here.
+        const prev: u64 = inner_ptr.count.fetch_sub(1u64, MemoryOrder::Release);
+        if (prev == 1u64) {
+            // We are the last owner.  Acquire-fence to pair with the
+            // Release decrements of every prior thread, then run
+            // the destructor and free the inner.
+            atomic::fence(MemoryOrder::Acquire);
+            inner_ptr.value.drop();
+            mut alloc: A = inner_ptr.alloc;
+            const header: Layout = Layout::of<ArcInner<T, A>>();
+            alloc.deallocate(NonNull::new(this.inner as u8*), header);
+        }
+        this.inner = null;
+    }
+}
