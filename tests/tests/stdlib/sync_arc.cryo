@@ -1,0 +1,172 @@
+///! Arc<T> — atomic reference counting (single-threaded coverage).
+///!
+///! Cross-thread Arc semantics depend on std::thread (Step 9, in flight);
+///! these tests pin down the refcount mechanics, drop-at-zero, and clone
+///! sharing on a single thread.  Cross-thread cases will go in a
+///! sibling test file once spawn lands.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SyncArc;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::collections::array;
+import std::alloc::arc;
+import std::test::error;
+import std::test::assert;
+
+mut arc_payload_drops: i32 = 0;
+
+type struct Counted {
+    tag: i32;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        arc_payload_drops = arc_payload_drops + 1;
+    }
+}
+
+![test]
+function arc_new_starts_at_strong_count_one() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 1 });
+    const sc: u64 = a.strong_count();
+    a.drop();
+    match (expect_eq(sc as i32, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(arc_payload_drops, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function arc_clone_bumps_strong_count() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 2 });
+    mut b: Arc<Counted> = a.clone();
+    mut c: Arc<Counted> = a.clone();
+    const sc_a: u64 = a.strong_count();
+    const sc_b: u64 = b.strong_count();
+    const sc_c: u64 = c.strong_count();
+    a.drop();
+    b.drop();
+    c.drop();
+    // All three handles see refcount == 3 (Relaxed ordering on a single
+    // thread is sequentially consistent for the issuing thread).
+    match (expect_eq(sc_a as i32, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sc_b as i32, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sc_c as i32, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Only the *last* drop runs Counted::drop.
+    match (expect_eq(arc_payload_drops, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function arc_intermediate_drops_do_not_free_value() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 3 });
+    mut b: Arc<Counted> = a.clone();
+    a.drop();
+    // After a's drop, b still owns the value; the payload's drop must NOT
+    // have run yet (would be a use-after-free risk for b).
+    const after_first: i32 = arc_payload_drops;
+    const sc_b: u64 = b.strong_count();
+    b.drop();
+    match (expect_eq(after_first, 0)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sc_b as i32, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(arc_payload_drops, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function arc_as_ptr_reads_shared_value() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 77 });
+    mut b: Arc<Counted> = a.clone();
+    const pa: Counted* = a.as_ptr();
+    const pb: Counted* = b.as_ptr();
+    // Both pointers must observe the same value AND the same address.
+    const tag_a: i32 = pa.tag;
+    const tag_b: i32 = pb.tag;
+    const same_ptr: boolean = (pa as void*) == (pb as void*);
+    a.drop();
+    b.drop();
+    match (expect_eq(tag_a, 77)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(tag_b, 77)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    if (!same_ptr) {
+        return Result::Err(TestError::failed(Str::new(
+            "Arc clones must share the same payload address")));
+    }
+    return Result::Ok(());
+}
+
+![test]
+function arc_clones_round_trip_through_loop() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 1 });
+    mut clones: Array<Arc<Counted>> = Array<Arc<Counted>>::new();
+    mut i: i32 = 0;
+    while (i < 5) {
+        clones.push(a.clone());
+        i = i + 1;
+    }
+    const after_clones: u64 = a.strong_count();
+    // Drop each clone individually.
+    mut j: i32 = 0;
+    while (j < 5) {
+        match (clones.pop()) {
+            Option::Some(arc) => { mut local: Arc<Counted> = arc; local.drop(); }
+            Option::None      => { }
+        }
+        j = j + 1;
+    }
+    clones.drop();
+    const after_drops: u64 = a.strong_count();
+    a.drop();
+    match (expect_eq(after_clones as i32, 6)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_drops as i32, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(arc_payload_drops, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

@@ -554,7 +554,40 @@ type struct MoveChecker {
                 const te: TryExprNode* = expr as TryExprNode*;
                 if (te.desugared != null) { this.walk_expr_read(te.desugared); }
             }
+            NodeKind::LambdaExpression   => { this.read_lambda(expr as LambdaExprNode*);     }
             _ => {}
+        }
+    }
+
+    /// A move-flagged lambda consumes each non-Copy captured outer binding
+    /// at its construction site - the surrounding scope can no longer name
+    /// those bindings, and a loop-carried construction double-frees the
+    /// captured value.  Walk each capture as a real move so subsequent uses
+    /// surface as E0452 and loop-carried captures fail the pass.
+    ///
+    /// Sema flips `is_move` on any lambda that captures a non-Copy outer
+    /// binding (whether the source wrote `move` or not); a Copy-only
+    /// lambda has `is_move == false` and the loop body is a no-op.
+    /// Bodies aren't walked here: sema synthesises a closure struct +
+    /// `__call__` method for capturing lambdas and injects them into the
+    /// program, so MoveCheck visits the body when it walks the
+    /// synthesised method.  Non-capturing lambdas have no outer-state
+    /// effect at the construction site.
+    read_lambda(mut &this, lam: LambdaExprNode*) -> void {
+        if (lam == null) { return; }
+        if (!lam.is_move) { return; }
+        for (mut i: i64 = 0; i < lam.captured_names.length; i++) {
+            const cap_name: SymbolStr = lam.captured_names[i];
+            const cap_ty:   TypeRef   = lam.captured_types[i];
+            if (!cap_ty.is_valid()) { continue; }
+            if (this.is_copy(cap_ty)) { continue; }
+            // Synthesize an IdentifierNode at the capture's recorded span so
+            // handle_ident's existing use-after-move and loop-carried logic
+            // applies uniformly with any other move site.
+            mut id: IdentifierNode* = new IdentifierNode(cap_name,
+                lam.captured_spans[i]);
+            id.set_resolved_type(cap_ty);
+            this.handle_ident(id, true, true);
         }
     }
 

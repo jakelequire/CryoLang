@@ -1,0 +1,121 @@
+///! ThreadLocal<T> — single-threaded coverage.  Multi-threaded behavior
+///! (each thread sees its own slot) requires std::thread::spawn, which
+///! is still in flight.  These tests verify the init-on-first-access
+///! semantics, get-returns-stable-pointer, and clear-then-reinit cycle.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ThreadLocalT;
+
+import std::core::result;
+import std::core::drop;
+import std::thread::local;
+import std::test::error;
+import std::test::assert;
+
+mut init_calls: i32 = 0;
+
+function make_42() -> i32 {
+    init_calls = init_calls + 1;
+    return 42;
+}
+
+function make_seq() -> i32 {
+    init_calls = init_calls + 1;
+    return init_calls * 10;
+}
+
+![test]
+function tls_init_lazy_on_first_get() -> Result<(), TestError> {
+    init_calls = 0;
+    mut tl: ThreadLocal<i32> = ThreadLocal<i32>::new(make_42);
+    const before: i32 = init_calls;
+    const p: i32* = tl.get();
+    const v: i32 = *p;
+    const after_get: i32 = init_calls;
+    tl.clear();
+    tl.drop();
+    match (expect_eq(before, 0)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(v, 42)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_get, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function tls_subsequent_get_does_not_reinit() -> Result<(), TestError> {
+    init_calls = 0;
+    mut tl: ThreadLocal<i32> = ThreadLocal<i32>::new(make_42);
+    const _p1: i32* = tl.get();
+    const _p2: i32* = tl.get();
+    const _p3: i32* = tl.get();
+    tl.clear();
+    tl.drop();
+    match (expect_eq(init_calls, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function tls_returns_stable_pointer_across_calls() -> Result<(), TestError> {
+    init_calls = 0;
+    mut tl: ThreadLocal<i32> = ThreadLocal<i32>::new(make_42);
+    const p1: i32* = tl.get();
+    const p2: i32* = tl.get();
+    const same: boolean = (p1 as void*) == (p2 as void*);
+    tl.clear();
+    tl.drop();
+    if (!same) {
+        return Result::Err(TestError::failed(Str::new(
+            "ThreadLocal::get must return a stable pointer on the same thread")));
+    }
+    return Result::Ok(());
+}
+
+![test]
+function tls_clear_then_get_reinitializes() -> Result<(), TestError> {
+    init_calls = 0;
+    mut tl: ThreadLocal<i32> = ThreadLocal<i32>::new(make_seq);
+    const _p1: i32* = tl.get();
+    const after_first: i32 = init_calls;
+    tl.clear();
+    const _p2: i32* = tl.get();
+    const after_reinit: i32 = init_calls;
+    tl.clear();
+    tl.drop();
+    match (expect_eq(after_first, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_reinit, 2)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function tls_write_through_pointer_persists() -> Result<(), TestError> {
+    init_calls = 0;
+    mut tl: ThreadLocal<i32> = ThreadLocal<i32>::new(make_42);
+    const p1: i32* = tl.get();
+    *p1 = 999;
+    const p2: i32* = tl.get();
+    const v: i32 = *p2;
+    tl.clear();
+    tl.drop();
+    match (expect_eq(v, 999)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

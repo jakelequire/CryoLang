@@ -1,0 +1,406 @@
+///! Capture-by-move tests for closures.
+///!
+///! Cryo captures Copy types by value-copy and non-Copy types by move
+///! (the outer binding is consumed at the lambda construction site, the
+///! closure-struct takes ownership of the value, and the synthesized
+///! Drop releases it at scope exit).  The `move` keyword stays valid
+///! as an explicit signal but is no longer required: sema flips
+///! `is_move` on any lambda that captures a non-Copy outer binding.
+![config(testing)]
+namespace CryoTests::Tests::Lang::MoveLambda;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::alloc::box;
+import std::test::error;
+import std::test::assert;
+
+mut drop_counter: i32 = 0;
+
+type struct Probe {
+    payload: i32;
+}
+
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { drop_counter = drop_counter + 1; }
+}
+
+![test]
+function implicit_move_accepts_noncopy_capture() -> Result<(), TestError> {
+    // No `move` keyword - sema upgrades the lambda to move semantics
+    // automatically because `p` is non-Copy (Probe has a Drop impl).
+    const p: Probe = Probe { payload: 7 };
+    const f = () -> i32 { return p.payload; };
+    match (expect_eq(f(), 7)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function explicit_move_keyword_still_works() -> Result<(), TestError> {
+    // `move` is still a valid prefix - useful for documentation and for
+    // thread::spawn where the consumption should be visible at the
+    // construction site.  Behavior is identical to the implicit form.
+    const p: Probe = Probe { payload: 11 };
+    const f = move () -> i32 { return p.payload; };
+    match (expect_eq(f(), 11)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function captured_field_drops_exactly_once_at_scope_exit() -> Result<(), TestError> {
+    drop_counter = 0;
+    {
+        const p: Probe = Probe { payload: 1 };
+        const f = () -> i32 { return p.payload; };
+        const _v: i32 = f();
+        // `f` (and therefore the captured `p`) goes out of scope at the end
+        // of this block.  The Probe::drop above bumps drop_counter exactly
+        // once if and only if the captured field is actually dropped.
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function call_does_not_consume_capture() -> Result<(), TestError> {
+    // Calling the closure multiple times must NOT drop the captured field
+    // on each call - the closure-struct's Drop owns the release.  If the
+    // __call__ shadow's value-copy weren't suppressed via is_capture_alias,
+    // each `f()` would drop the captured field (use-after-free in any
+    // subsequent call) and the closure-struct Drop would double-free.
+    drop_counter = 0;
+    {
+        const p: Probe = Probe { payload: 4 };
+        const f = () -> i32 { return p.payload; };
+        const a: i32 = f();
+        const b: i32 = f();
+        const c: i32 = f();
+        match (expect_eq(a + b + c, 12)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function multi_field_capture_all_drop_once() -> Result<(), TestError> {
+    // A lambda capturing several non-Copy bindings must drop each exactly
+    // once on closure scope exit.  Two Probes here -> expect drop_counter
+    // == 2 after the block.
+    drop_counter = 0;
+    {
+        const p1: Probe = Probe { payload: 10 };
+        const p2: Probe = Probe { payload: 20 };
+        const sum_two = () -> i32 { return p1.payload + p2.payload; };
+        match (expect_eq(sum_two(), 30)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    match (expect_eq(drop_counter, 2)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function mixed_copy_and_noncopy_capture() -> Result<(), TestError> {
+    // Copy bindings (i32) capture by value-copy; non-Copy (Probe)
+    // capture by move.  Both kinds in one closure: closure-struct gets a
+    // synthesized Drop that drops only the non-Copy field.  Copy field
+    // contributes nothing to drop_counter.
+    drop_counter = 0;
+    {
+        const k: i32  = 3;
+        const p: Probe = Probe { payload: 4 };
+        const compute = () -> i32 { return k * p.payload; };
+        match (expect_eq(compute(), 12)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function copy_only_capture_drops_nothing() -> Result<(), TestError> {
+    // A lambda with ONLY Copy captures must NOT get an inherent Drop on
+    // its closure-struct (would pessimize a Copy-only closure into a
+    // non-Copy type).  drop_counter stays at zero through scope exit.
+    drop_counter = 0;
+    {
+        const a: i32 = 5;
+        const b: i32 = 6;
+        const f = () -> i32 { return a + b; };
+        match (expect_eq(f(), 11)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    match (expect_eq(drop_counter, 0)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function noncapturing_lambda_drops_nothing() -> Result<(), TestError> {
+    // A lambda that captures nothing stays on the function-pointer path -
+    // no closure struct, no Drop synthesis, no drop_counter activity.
+    drop_counter = 0;
+    {
+        const f = (x: i32) -> i32 { return x * 2; };
+        match (expect_eq(f(7), 14)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    match (expect_eq(drop_counter, 0)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function captured_value_visible_inside_body() -> Result<(), TestError> {
+    // Concrete check that the synthesized __call__'s `this.cap` access
+    // reads the captured value (not stale stack memory).  Build a small
+    // sequence of closures, each capturing a distinct Probe, and verify
+    // each reports its own payload.
+    drop_counter = 0;
+    mut sum: i32 = 0;
+    {
+        const p1: Probe = Probe { payload: 100 };
+        const f1 = () -> i32 { return p1.payload; };
+        sum = sum + f1();
+    }
+    {
+        const p2: Probe = Probe { payload: 200 };
+        const f2 = () -> i32 { return p2.payload; };
+        sum = sum + f2();
+    }
+    {
+        const p3: Probe = Probe { payload: 300 };
+        const f3 = () -> i32 { return p3.payload; };
+        sum = sum + f3();
+    }
+    match (expect_eq(sum, 600)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Three closures, three Probe drops at the end of each block.
+    match (expect_eq(drop_counter, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function move_lambda_returning_capture_value() -> Result<(), TestError> {
+    // Verify the body can read multiple fields of the captured value.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const p: Probe = Probe { payload: 999 };
+        const f = () -> i32 {
+            const local: i32 = p.payload + 1;
+            return local * 2;
+        };
+        got = f();
+    }
+    match (expect_eq(got, 2000)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_with_parameters_and_capture() -> Result<(), TestError> {
+    // Closure that takes a parameter AND captures.  Verifies parameter
+    // and capture mechanisms compose: arg threads through the
+    // synthesized __call__'s declared params while `bias` resolves to
+    // the captured shadow.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const bias: i32  = 10;
+        const probe: Probe = Probe { payload: 7 };
+        const scale = (x: i32) -> i32 { return (x + bias) * probe.payload; };
+        got = scale(3);
+    }
+    match (expect_eq(got, 91)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Receiver function for the closure-as-argument test below.  The fn
+// pointer parameter accepts both bare function pointers and synthesized
+// closure structs via the per-call-site receiver-spec path.
+function apply_closure(f: (i32) -> i32, x: i32) -> i32 {
+    return f(x) + f(x);
+}
+
+![test]
+function closure_passed_as_function_argument() -> Result<(), TestError> {
+    // Exercises the closure-arg spec path: the call site specializes
+    // apply_closure for the concrete closure-struct so the body issues
+    // a direct __call__ rather than an indirect call.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const probe: Probe = Probe { payload: 5 };
+        const f = (x: i32) -> i32 { return x * probe.payload; };
+        got = apply_closure(f, 3);
+    }
+    match (expect_eq(got, 30)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_body_with_local_bindings() -> Result<(), TestError> {
+    // Lambda body using local `const` and `mut` decls plus a chained
+    // expression that mixes captures, parameters, and locals.  Confirms
+    // the simplified lambda-block parser handles decl-then-expr-then-
+    // return sequencing alongside a non-Copy capture.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const probe: Probe = Probe { payload: 6 };
+        const f = (x: i32) -> i32 {
+            const base: i32 = probe.payload;
+            mut acc: i32 = base;
+            acc = acc + x;
+            acc = acc * 2;
+            return acc;
+        };
+        got = f(4);
+    }
+    // (6 + 4) * 2 == 20
+    match (expect_eq(got, 20)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function closure_invoked_repeatedly_in_loop() -> Result<(), TestError> {
+    // Hammering a capturing closure inside a loop: the closure's
+    // captured field must remain valid across every call.  Adjacent
+    // calls in a tight loop are the simplest way to spot a per-call
+    // double-drop or use-after-free.
+    drop_counter = 0;
+    mut total: i32 = 0;
+    {
+        const factor: Probe = Probe { payload: 3 };
+        const mul = (x: i32) -> i32 { return x * factor.payload; };
+        mut i: i32 = 0;
+        while (i < 100) {
+            total = total + mul(1);
+            i = i + 1;
+        }
+    }
+    match (expect_eq(total, 300)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Probe drops exactly once when the closure goes out of scope,
+    // regardless of how many times mul() was invoked.
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function box_capture_drops_heap_allocation() -> Result<(), TestError> {
+    // Capture a Box<i32> (a heap allocation owned by the closure).
+    // The closure's synthesized Drop must call Box::drop, which frees
+    // the heap storage - if it didn't, this would leak per iteration
+    // when run repeatedly (the test suite runs each test once but a
+    // leak detector would catch it).  Also confirms Box's `as_ptr` read
+    // works through the closure's captured shadow.
+    mut got: i32 = 0;
+    {
+        mut b: Box<i32> = Box::new(123);
+        const read_box = () -> i32 { return *b.as_ptr(); };
+        got = read_box();
+    }
+    match (expect_eq(got, 123)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function nested_lambdas_inner_captures_outer_local() -> Result<(), TestError> {
+    // Build an outer lambda that, when called, returns the value of an
+    // inner lambda capturing a Copy local declared inside outer's body.
+    // Cryo resolves the inner's capture against the outer's per-call
+    // locals; this exercises the capture path without touching the
+    // (still-fragile) nested non-Copy propagation case.
+    mut got: i32 = 0;
+    {
+        const seed: i32 = 4;
+        const outer = () -> i32 {
+            const local_in_outer: i32 = seed * 2;
+            const inner = () -> i32 {
+                return local_in_outer + 1;
+            };
+            return inner();
+        };
+        got = outer();
+    }
+    match (expect_eq(got, 9)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

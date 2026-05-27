@@ -2846,9 +2846,11 @@ public:
     /// locals) are detected by `resolve_identifier`'s fallback path, which
     /// consults `lambda_outer_locals` - the union of every enclosing scope
     /// (function locals + any further-out lambda's already-captured names).
-    /// A hit becomes a capture: the type is required to be Copy (E0457 if
-    /// not), the binding is registered as a local in the lambda body, and
-    /// the capture is recorded on the node's `captured_*` parallel arrays.
+    /// A hit becomes a capture: Copy types are captured by value-copy,
+    /// non-Copy types implicitly become move-captures (flipping the
+    /// lambda's `is_move` flag), the binding is registered as a local
+    /// in the lambda body, and the capture is recorded on the node's
+    /// `captured_*` parallel arrays.
     ///
     /// The lambda's value type is still the function-pointer signature
     /// at the end of Phase 1; later phases switch capturing lambdas to
@@ -3001,13 +3003,25 @@ public:
         if (node.is_capturing()
                 && saved_current_lam != null
                 && saved_lambda_depth > 0) {
+            const prop_registry: GenericRegistry* = this.ctx.get_generic_registry();
             for (mut ci: i64 = 0; ci < node.captured_names.length; ci++) {
                 const cap_name: SymbolStr = node.captured_names[ci];
                 if (!this.lookup_local(cap_name).is_valid()) {
+                    const cap_ty: TypeRef = node.captured_types[ci];
                     saved_current_lam.add_capture(
                         cap_name,
-                        node.captured_types[ci],
+                        cap_ty,
                         node.captured_spans[ci]);
+                    // Mirror record_lambda_capture's implicit-move rule:
+                    // propagating a non-Copy capture upward means the
+                    // outer lambda's __call__ also owns the value, so it
+                    // needs the same is_move plumbing (capture_alias on
+                    // its shadow, Drop on its closure struct).  Without
+                    // this, nested non-Copy captures would double-drop.
+                    if (!OwnershipQuery::is_copy(this.arena, prop_registry,
+                            this.intern, cap_ty)) {
+                        saved_current_lam.is_move = true;
+                    }
                 }
             }
         }
@@ -3031,23 +3045,23 @@ public:
     /// Returns the captured type so the calling identifier resolves.
     record_lambda_capture(mut &this, ident: IdentifierNode*,
                           outer_ty: TypeRef) -> TypeRef {
-        // Non-Copy captures need Drop-glue plumbing on the closure struct
-        // that isn't in place for the v1 MVP.  Reject with a clear error
-        // that points at the use site; the lambda's locals still get
-        // shadowed so the rest of the body type-checks without cascading
-        // "not found" noise.
+        // Cryo's capture policy: Copy types are captured by value-copy,
+        // non-Copy types are captured by move (the outer binding is
+        // consumed at the lambda's construction site, the closure-struct
+        // takes ownership of the value, and its synthesized Drop releases
+        // it at scope exit).  The `move` keyword stays valid as an
+        // explicit signal (no-op when the captures are all Copy; useful
+        // for documentation and forward-compat with thread::spawn where
+        // explicit `move` makes the consumption visible at the call site)
+        // - any non-Copy capture flips `is_move` to true regardless of
+        // whether the source actually spelled it.  MoveCheck and
+        // drop_insertion both read is_move when walking the LambdaExpr
+        // node, so they see the same move-set whether the keyword was
+        // present or implied.
         const is_copy: boolean = OwnershipQuery::is_copy(this.arena,
             this.ctx.get_generic_registry(), this.intern, outer_ty);
-        if (!is_copy) {
-            const name_str: string = this.intern.resolve(ident.name);
-            mut diag: Diagnostic = Diagnostic::error(
-                ErrorCode::E0457_NON_COPY_CAPTURE,
-                format("closure captures non-Copy value `%s`", name_str));
-            diag = diag.at_with_label(ident.span,
-                "this closure would have to move the value into its environment");
-            diag = diag.with_note(
-                "v1.0 supports only by-value `Copy` captures (i32, u64, bool, char, references); non-Copy types must be passed as arguments or boxed manually");
-            this.ctx.emit_diagnostic(diag);
+        if (!is_copy && this.current_lambda != null) {
+            this.current_lambda.is_move = true;
         }
 
         // Shadow the binding as a per-lambda local: subsequent references
@@ -3149,8 +3163,16 @@ public:
         }
 
         // 4. __call__ body: `{ const cap_i: T_i = this.cap_i; <lambda body> }`.
+        //    For a `move` lambda's non-Copy captures, the shadow is marked
+        //    is_capture_alias=true so drop_insertion skips its scope-exit
+        //    drop - the closure-struct's synthesized Drop (below) owns the
+        //    field's release.  Without the alias flag the shadow's
+        //    value-copy would drop the captured value on every __call__
+        //    return, double-freeing against the closure-struct drop and
+        //    triple-freeing if the outer `p` is also still tracked.
         mut body_block: BlockStmtNode* = new BlockStmtNode(span);
         const this_ident_sym: SymbolStr = this.this_sym;
+        const cap_registry: GenericRegistry* = this.ctx.get_generic_registry();
         for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
             const cap_name: SymbolStr = lambda.captured_names[i];
             const cap_ty:   TypeRef   = lambda.captured_types[i];
@@ -3169,6 +3191,10 @@ public:
             shadow.set_mutable(false);
             shadow.set_resolved_type(cap_ty);
             shadow.set_initializer(access as ExpressionNode*);
+            if (lambda.is_move && !OwnershipQuery::is_copy(arena_ptr,
+                    cap_registry, intern_ptr, cap_ty)) {
+                shadow.set_capture_alias(true);
+            }
 
             const shadow_stmt: DeclStmtNode* = new DeclStmtNode(
                 shadow as DeclarationNode*, span);
@@ -3197,8 +3223,77 @@ public:
         method.set_sink(false);
         struct_decl.add_method(method);
 
+        // 5b. If any capture is non-Copy, synthesize a `drop` method that
+        //     calls `.drop()` on each non-Copy field.  Without this, the
+        //     closure struct gets `is_copy == false` (a non-Copy field
+        //     makes the whole aggregate non-Copy) so drop_insertion
+        //     synthesizes `closure.drop()` at scope exit, but codegen
+        //     resolves to nothing on a struct with no inherent drop and
+        //     drop-glue does NOT recurse into closure-struct fields - so
+        //     the captured value silently leaks.  An inherent `drop`
+        //     method whose body explicitly drops each non-Copy field
+        //     gives both passes a concrete callee to dispatch through
+        //     and ensures the field's own Drop runs exactly once.
+        //     Copy-only closures need no Drop and stay Copy themselves.
+        mut drop_method: MethodNode* = null;
+        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
+        mut has_noncopy_capture: boolean = false;
+        for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
+            if (!OwnershipQuery::is_copy(arena_ptr, registry_ptr,
+                    intern_ptr, lambda.captured_types[di])) {
+                has_noncopy_capture = true;
+                break;
+            }
+        }
+        if (has_noncopy_capture) {
+            const drop_name: SymbolStr = intern_ptr.intern("drop");
+            mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
+            drop_fn.set_resolved_return_type(arena_ptr.get_void());
+
+            mut drop_body: BlockStmtNode* = new BlockStmtNode(span);
+            for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
+                const cap_name: SymbolStr = lambda.captured_names[di];
+                const cap_ty:   TypeRef   = lambda.captured_types[di];
+                if (OwnershipQuery::is_copy(arena_ptr, registry_ptr,
+                        intern_ptr, cap_ty)) {
+                    continue;
+                }
+
+                // `this`
+                mut this_id: IdentifierNode* = new IdentifierNode(
+                    this_ident_sym, span);
+                this_id.set_resolved_type(struct_ref);
+
+                // `this.cap_i`
+                mut field_acc: MemberAccessNode* = new MemberAccessNode(
+                    this_id as ExpressionNode*, cap_name, span, span);
+                field_acc.set_resolved_type(cap_ty);
+
+                // `this.cap_i.drop`
+                mut drop_acc: MemberAccessNode* = new MemberAccessNode(
+                    field_acc as ExpressionNode*, drop_name, span, span);
+
+                // `this.cap_i.drop()`
+                mut drop_call: CallExprNode* = new CallExprNode(
+                    drop_acc as ExpressionNode*, span);
+
+                // `this.cap_i.drop();`
+                const drop_stmt: ExprStmtNode* = new ExprStmtNode(
+                    drop_call as ExpressionNode*, span);
+                drop_body.add_statement(drop_stmt as StatementNode*);
+            }
+            drop_fn.set_body(drop_body);
+
+            drop_method = new MethodNode(drop_fn, span);
+            drop_method.set_visibility(Visibility::Public);
+            drop_method.set_static(false);
+            drop_method.set_sink(false);
+            struct_decl.add_method(drop_method);
+        }
+
         // 6. Populate StructType.methods so sema's `resolve_method_overload`
-        //    can find `__call__` by name when the call dispatch kicks in.
+        //    can find `__call__` (and `drop`, when synthesized) by name
+        //    when the call dispatch kicks in.
         if (struct_t != null && struct_t.kind == TypeKind::Struct) {
             const st: StructType* = struct_t as StructType*;
             mut method_param_types: TypeRef[] = [];
@@ -3222,11 +3317,30 @@ public:
                 ast_node:      method as void*,
             };
             st.add_method(minfo);
+
+            if (drop_method != null) {
+                mut drop_param_types: TypeRef[] = [];
+                const drop_fn_ty: TypeRef = arena_ptr.get_function(
+                    arena_ptr.get_void(), drop_param_types, false);
+                const drop_minfo: MethodInfo = MethodInfo {
+                    name:          intern_ptr.intern("drop"),
+                    function_type: drop_fn_ty,
+                    is_public:     true,
+                    is_protected:  false,
+                    is_static:     false,
+                    is_virtual:    false,
+                    is_override:   false,
+                    param_types:   drop_param_types,
+                    ast_node:      drop_method as void*,
+                };
+                st.add_method(drop_minfo);
+            }
         }
 
         // 7. DeclarationIndex registration so cross-pass lookups work.
         ctx_ptr.decl_index.register_type_with_module(qual_name, struct_ref, module_sym);
         mut method_arr: MethodNode*[] = [method];
+        if (drop_method != null) { method_arr.push(drop_method); }
         ctx_ptr.decl_index.register_methods_with_module(
             qual_name, method_arr, module_sym, intern_ptr, arena_ptr);
 

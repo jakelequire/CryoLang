@@ -716,6 +716,12 @@ type struct DropInserter {
         if (vd.initializer != null) {
             this.walk_expr_move(vd.initializer);
         }
+        // A capture-alias binding (synthesized shadow inside a `move`
+        // lambda's __call__) doesn't own its value - the closure struct's
+        // Drop releases the underlying field.  Skip register_binding so
+        // no scope-exit drop is emitted; without this gate, every
+        // `__call__` invocation would drop the captured value on return.
+        if (vd.is_capture_alias) { return; }
         if (!vd.is_global) {
             this.register_binding(vd.name, vd.resolved_type, vd.span);
         }
@@ -1892,7 +1898,28 @@ type struct DropInserter {
                 const te: TryExprNode* = expr as TryExprNode*;
                 if (te.desugared != null) { this.walk_expr_read(te.desugared); }
             }
+            NodeKind::LambdaExpression   => { this.read_lambda(expr as LambdaExprNode*); }
             _ => {}
+        }
+    }
+
+    /// A `move` lambda consumes each non-Copy captured outer binding at
+    /// its construction site - mirrors MoveCheck::read_lambda so both
+    /// passes agree on the move-set and the outer scope's auto-drop is
+    /// suppressed for the consumed binding.  Non-`move` lambdas don't
+    /// trigger this path (Copy captures don't drop anyway).
+    read_lambda(mut &this, lam: LambdaExprNode*) -> void {
+        if (lam == null) { return; }
+        if (!lam.is_move) { return; }
+        for (mut i: i64 = 0; i < lam.captured_names.length; i++) {
+            const cap_name: SymbolStr = lam.captured_names[i];
+            const cap_ty:   TypeRef   = lam.captured_types[i];
+            if (!cap_ty.is_valid()) { continue; }
+            if (this.is_copy(cap_ty)) { continue; }
+            mut id: IdentifierNode* = new IdentifierNode(cap_name,
+                lam.captured_spans[i]);
+            id.set_resolved_type(cap_ty);
+            this.handle_ident(id, true);
         }
     }
 
