@@ -34,6 +34,7 @@ import core::slice;
 import core::drop;
 import collections::str;
 import collections::string;
+import env;
 import io::error;
 import io::stdio;
 import fmt::display;
@@ -48,6 +49,40 @@ import test::error;
 const RULE_HEAVY: string = "================================================================================";
 const RULE_THIN:  string = "--------------------------------------------------------------------------------";
 
+// ANSI SGR escape sequences. Only emitted when `color_active(opts)` is true;
+// otherwise the bare `[PASS]` / `[FAIL]` / `[skip]` chips ship without codes.
+const ANSI_GREEN:  string = "\x1B[32m";
+const ANSI_RED:    string = "\x1B[31m";
+const ANSI_YELLOW: string = "\x1B[33m";
+const ANSI_DIM:    string = "\x1B[2m";
+const ANSI_BOLD:   string = "\x1B[1m";
+const ANSI_RESET:  string = "\x1B[0m";
+
+// TestFormat: how per-test results are laid out on stdout
+//
+//   * Plain   — current behaviour: one `test NAME ... ok` line per test.
+//               No color. Default for end-user projects; CI-friendly.
+//   * Pretty  — one block per `::`-prefixed namespace, indented leaves
+//               with `[PASS]` / `[FAIL]` / `[skip]` chips. Colored on TTY.
+//   * Compact — one line per namespace; results stream as `.` (pass),
+//               `F` (fail), `s` (skip), `P` (did-not-panic). Failure
+//               details printed after the streams, before the summary.
+
+type enum TestFormat {
+    Plain;
+    Pretty;
+    Compact;
+}
+
+// ColorMode: when to emit ANSI escapes. `Auto` checks stdout-is-TTY
+// and honors `NO_COLOR` per https://no-color.org/.
+
+type enum ColorMode {
+    Auto;
+    Always;
+    Never;
+}
+
 // RunOptions: parsed CLI args
 
 type struct RunOptions {
@@ -57,6 +92,16 @@ type struct RunOptions {
     include_ignored: boolean;
     list_only:     boolean;
     quiet:         boolean;
+    format:        TestFormat;
+    /// True iff the user explicitly passed `--format=...`. Used to
+    /// decide whether env-var or cryoconfig defaults can override.
+    format_explicit: boolean;
+    color:         ColorMode;
+    color_explicit: boolean;
+    /// Resolved once at the start of `run_all`: did `color` plus the
+    /// TTY check land on "emit escapes". Reporters consult this flag
+    /// rather than re-evaluating the policy on each test.
+    color_active:  boolean;
 
     static default() -> RunOptions {
         return RunOptions {
@@ -65,6 +110,11 @@ type struct RunOptions {
             include_ignored: false,
             list_only:       false,
             quiet:           false,
+            format:          TestFormat::Plain,
+            format_explicit: false,
+            color:           ColorMode::Auto,
+            color_explicit:  false,
+            color_active:    false,
         };
     }
 
@@ -115,6 +165,7 @@ type struct Counters {
 function parse_options(argc: i32, argv: u8**) -> RunOptions {
     mut opts: RunOptions = RunOptions::default();
     if (argv == null) {
+        apply_env_defaults(&opts);
         return opts;
     }
     mut i: i32 = 1;
@@ -131,6 +182,16 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
         } else if (arg.equals(&Str::new("-q"))
                 || arg.equals(&Str::new("--quiet"))) {
             opts.quiet = true;
+        } else if (arg_starts_with(arg, "--format=")) {
+            const v: Str = arg.sub_bytes(9, arg.length());
+            if (apply_format(&opts, v)) {
+                opts.format_explicit = true;
+            }
+        } else if (arg_starts_with(arg, "--color=")) {
+            const v: Str = arg.sub_bytes(8, arg.length());
+            if (apply_color(&opts, v)) {
+                opts.color_explicit = true;
+            }
         } else if (arg.length() >= 1 && arg.as_ptr()[0] == 0x2D) { // '-'
             // Unknown flag: warn but keep going.
             intrinsics::printf("warning: unknown flag: %.*s\n",
@@ -146,12 +207,189 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
         }
         i++;
     }
+    apply_env_defaults(&opts);
     return opts;
+}
+
+/// True iff `arg` begins with `prefix` (byte-wise). Used for matching
+/// `--format=...` and `--color=...` argv slots without allocating.
+function arg_starts_with(arg: Str, prefix: string) -> boolean {
+    const p: Str = Str::new(prefix);
+    if (arg.length() < p.length()) { return false; }
+    return arg.sub_bytes(0, p.length()).equals(&p);
+}
+
+/// Parse a TestFormat name and store it. Returns false on an unknown
+/// value (caller decides whether to mark the option as explicit).
+function apply_format(opts: mut &RunOptions, value: Str) -> boolean {
+    if (value.equals(&Str::new("plain"))) {
+        opts.format = TestFormat::Plain;
+        return true;
+    }
+    if (value.equals(&Str::new("pretty"))) {
+        opts.format = TestFormat::Pretty;
+        return true;
+    }
+    if (value.equals(&Str::new("compact"))) {
+        opts.format = TestFormat::Compact;
+        return true;
+    }
+    intrinsics::printf("warning: unknown --format value: %.*s (expected plain|pretty|compact)\n",
+        value.length() as i32, value.as_ptr());
+    return false;
+}
+
+/// Parse a ColorMode name and store it. Returns false on an unknown
+/// value.
+function apply_color(opts: mut &RunOptions, value: Str) -> boolean {
+    if (value.equals(&Str::new("auto"))) {
+        opts.color = ColorMode::Auto;
+        return true;
+    }
+    if (value.equals(&Str::new("always"))) {
+        opts.color = ColorMode::Always;
+        return true;
+    }
+    if (value.equals(&Str::new("never"))) {
+        opts.color = ColorMode::Never;
+        return true;
+    }
+    intrinsics::printf("warning: unknown --color value: %.*s (expected auto|always|never)\n",
+        value.length() as i32, value.as_ptr());
+    return false;
+}
+
+/// Fill in any field the user didn't pass on the CLI from environment
+/// variables. CLI > env > cryoconfig (via env, set by `cryo test`) > default.
+///
+///   CRYO_TEST_FORMAT = plain|pretty|compact
+///   CRYO_TEST_COLOR  = auto|always|never
+///   NO_COLOR         = (any value) -> force ColorMode::Never
+function apply_env_defaults(opts: mut &RunOptions) -> void {
+    if (!opts.format_explicit) {
+        const fmt_opt: Option<String> = env::var(Str::new("CRYO_TEST_FORMAT"));
+        match (fmt_opt) {
+            Option::Some(mut s) => {
+                apply_format(opts, s.as_str());
+                s.drop();
+            }
+            Option::None => { }
+        }
+    }
+    if (!opts.color_explicit) {
+        const col_opt: Option<String> = env::var(Str::new("CRYO_TEST_COLOR"));
+        match (col_opt) {
+            Option::Some(mut s) => {
+                apply_color(opts, s.as_str());
+                s.drop();
+            }
+            Option::None => { }
+        }
+        // NO_COLOR convention: presence (even empty) forces colors off.
+        // It wins over CRYO_TEST_COLOR=always when both are set in env,
+        // but a CLI `--color=always` still overrides because the
+        // explicit-flag short-circuits this whole block.
+        const no_color: Option<String> = env::var(Str::new("NO_COLOR"));
+        match (no_color) {
+            Option::Some(mut s) => {
+                opts.color = ColorMode::Never;
+                s.drop();
+            }
+            Option::None => { }
+        }
+    }
 }
 
 /// View a NUL-terminated `u8*` as a `Str` without allocation.
 function cstr_to_str(raw: u8*) -> Str {
     return Str::from_raw(raw, libc::strlen(raw));
+}
+
+// Color resolution + ANSI emission
+
+/// Resolve `opts.color` into a concrete on/off decision for this run.
+/// `Auto` -> on iff stdout is a TTY (already gated by NO_COLOR at
+/// parse time). Caller stores the result on `opts.color_active`.
+function resolve_color_active(opts: &RunOptions) -> boolean {
+    match (opts.color) {
+        ColorMode::Always => { return true;  }
+        ColorMode::Never  => { return false; }
+        ColorMode::Auto   => { return is_tty(1); }
+    }
+    return false;
+}
+
+/// Print an ANSI escape iff color is active for this run. No-op
+/// otherwise; the callers stay branch-free.
+function emit_ansi(active: boolean, code: string) -> void {
+    if (active) {
+        intrinsics::printf("%s", code);
+    }
+}
+
+// Verdict chips (rendered colored on TTY, plain otherwise).
+//
+//   chip_pass  -> "[PASS]"  green
+//   chip_fail  -> "[FAIL]"  red
+//   chip_skip  -> "[skip]"  yellow
+//
+// These print the chip text only; the caller writes whatever spacing /
+// trailing detail (panic reason, exit code) it wants.
+
+function chip_pass(active: boolean) -> void {
+    emit_ansi(active, ANSI_GREEN);
+    intrinsics::printf("[PASS]");
+    emit_ansi(active, ANSI_RESET);
+}
+
+function chip_fail(active: boolean) -> void {
+    emit_ansi(active, ANSI_RED);
+    intrinsics::printf("[FAIL]");
+    emit_ansi(active, ANSI_RESET);
+}
+
+function chip_skip(active: boolean) -> void {
+    emit_ansi(active, ANSI_YELLOW);
+    intrinsics::printf("[skip]");
+    emit_ansi(active, ANSI_RESET);
+}
+
+// Name splitting (for Pretty / Compact grouping)
+
+/// Group prefix + leaf name extracted from a `::`-delimited test name.
+///
+///   "CryoTests::Lang::SendSyncAutoDerive::sync_accepts_primitives"
+///         -> group = "CryoTests::Lang::SendSyncAutoDerive"
+///            leaf  = "sync_accepts_primitives"
+///
+/// Tests with no `::` (rare in practice; the test runner-synthesized
+/// names always carry the namespace) come back with an empty group
+/// and the full name as the leaf.
+type struct SplitName {
+    group: Str;
+    leaf:  Str;
+}
+
+function split_test_name(full: Str) -> SplitName {
+    const len: u64 = full.length();
+    if (len < 3) {
+        return SplitName { group: Str::new(""), leaf: full };
+    }
+    const ptr: u8* = full.as_ptr();
+    // Scan backwards for "::". The first match from the right is the
+    // separator between group and leaf.
+    mut i: u64 = len - 1;
+    while (i >= 1) {
+        if (ptr[i - 1] == 0x3A && ptr[i] == 0x3A) {
+            return SplitName {
+                group: full.sub_bytes(0, i - 1),
+                leaf:  full.sub_bytes(i + 1, len),
+            };
+        }
+        if (i == 1) { break; }
+        i = i - 1;
+    }
+    return SplitName { group: Str::new(""), leaf: full };
 }
 
 // Filter matching
@@ -339,6 +577,272 @@ function is_failure(outcome: TestOutcome) -> boolean {
     }
 }
 
+// Reporter state + format-aware dispatch
+//
+// `ReporterState` carries the "what group are we currently in" plus
+// (in Compact mode only) the in-flight per-group dot stream and tally.
+// The buffers are reused across groups via `String::clear()` so the
+// per-group flush doesn't churn the allocator.
+
+type struct ReporterState {
+    /// True once we've printed at least one group header (Pretty) or
+    /// started accumulating dots for one (Compact).
+    has_group: boolean;
+    /// Owned copy of the currently-active group name. `String::clear()`
+    /// resets length without freeing capacity between groups.
+    cur_group: String;
+    /// Compact-only: per-group dot stream (`.` pass, `F` fail, `s`
+    /// skip, `P` did-not-panic, `E` runner-error). Flushed and cleared
+    /// when the group changes or the run ends.
+    cur_dots: String;
+    cur_ok:   u64;
+    cur_fail: u64;
+    cur_skip: u64;
+
+    static new() -> ReporterState {
+        return ReporterState {
+            has_group: false,
+            cur_group: String::new(),
+            cur_dots:  String::new(),
+            cur_ok:    0,
+            cur_fail:  0,
+            cur_skip:  0,
+        };
+    }
+}
+
+implement trait Drop for struct ReporterState {
+    drop(mut &this) -> void {
+        this.cur_group.drop();
+        this.cur_dots.drop();
+    }
+}
+
+// ---- Plain reporter (cargo-style, byte-identical to pre-1.0 output) ----
+
+/// `test FULL::QUALIFIED::NAME ... ` — the original prefix line. The
+/// trailing space lets the outcome word land on the same line.
+function plain_begin_test(name: Str) -> void {
+    intrinsics::printf("test %.*s ... ", name.length() as i32, name.as_ptr());
+}
+
+/// Outcome word + newline. Mirrors `print_outcome` but lives next to
+/// the other Plain helpers so the three formats are siblings.
+function plain_end_test(outcome: TestOutcome, was_should_panic: boolean) -> void {
+    print_outcome(outcome, was_should_panic);
+}
+
+/// Ignored-test entry (one line, `... ignored`).
+function plain_skipped(name: Str) -> void {
+    plain_begin_test(name);
+    plain_end_test(TestOutcome::Skipped, false);
+}
+
+// ---- Pretty reporter (grouped + indented + colored chips) ----
+
+/// Emit the group header line iff the group changed (or this is the
+/// first group). A blank line separates adjacent groups.
+function pretty_enter_group(state: mut &ReporterState, group: Str) -> void {
+    if (state.has_group) {
+        const cur: Str = state.cur_group.as_str();
+        if (cur.equals(&group)) {
+            return;
+        }
+        intrinsics::printf("\n");
+    }
+    // Empty group name (no `::` in the test name) -> render as `<root>`
+    // so it's still visually distinct.
+    if (group.length() == 0) {
+        intrinsics::printf("<root>\n");
+    } else {
+        intrinsics::printf("%.*s\n", group.length() as i32, group.as_ptr());
+    }
+    state.cur_group.clear();
+    state.cur_group.push_str(group);
+    state.has_group = true;
+}
+
+/// `  leaf_name ... ` — indented in-flight prefix. Flushed before the
+/// fork so a hang at least shows which test was in flight.
+function pretty_begin_test(state: mut &ReporterState, name: Str) -> void {
+    const sn: SplitName = split_test_name(name);
+    pretty_enter_group(state, sn.group);
+    intrinsics::printf("  %.*s ... ", sn.leaf.length() as i32, sn.leaf.as_ptr());
+}
+
+/// Verdict chip + trailing detail. Color-active state read from opts.
+function pretty_end_test(opts: &RunOptions, outcome: TestOutcome,
+                          was_should_panic: boolean) -> void {
+    match (outcome) {
+        TestOutcome::Pass => {
+            chip_pass(opts.color_active);
+            if (was_should_panic) {
+                intrinsics::printf("  (panicked as expected)");
+            }
+            intrinsics::printf("\n");
+        }
+        TestOutcome::Fail(code, signal, signaled) => {
+            chip_fail(opts.color_active);
+            if (signaled) {
+                intrinsics::printf("  (panicked, signal %d)\n", signal);
+            } else {
+                intrinsics::printf("  (exit %d)\n", code);
+            }
+        }
+        TestOutcome::Skipped => {
+            chip_skip(opts.color_active);
+            intrinsics::printf("\n");
+        }
+        TestOutcome::DidNotPanic => {
+            chip_fail(opts.color_active);
+            intrinsics::printf("  (test did not panic as expected)\n");
+        }
+        TestOutcome::RunnerError(code) => {
+            chip_fail(opts.color_active);
+            intrinsics::printf("  (runner error: errno=%d)\n", code);
+        }
+    }
+}
+
+/// Indented `  leaf_name ... [skip]` for `![ignore]` without execution.
+function pretty_skipped(state: mut &ReporterState, opts: &RunOptions, name: Str) -> void {
+    pretty_begin_test(state, name);
+    pretty_end_test(opts, TestOutcome::Skipped, false);
+}
+
+// ---- Compact reporter (one line per group, dot stream) ----
+
+/// Flush the in-flight group: pad group name to a column, then the
+/// dot stream, then a `N ok[, M fail[, K skip]]` summary.
+function compact_flush_group(state: mut &ReporterState) -> void {
+    if (!state.has_group) { return; }
+    const gview: Str = state.cur_group.as_str();
+    const glen:  u64 = gview.length();
+    if (glen == 0) {
+        intrinsics::printf("<root>");
+    } else {
+        intrinsics::printf("%.*s", glen as i32, gview.as_ptr());
+    }
+    // Pad to roughly column 50 so the dot streams align across groups.
+    // For overlong group names, fall back to two spaces.
+    const target: u64 = 50;
+    const display: u64 = if (glen == 0) { 6 } else { glen };
+    mut pad: u64 = if (display < target) { target - display } else { 2 };
+    mut k: u64 = 0;
+    while (k < pad) {
+        intrinsics::printf(" ");
+        k = k + 1;
+    }
+    const dview: Str = state.cur_dots.as_str();
+    intrinsics::printf("%.*s", dview.length() as i32, dview.as_ptr());
+    // Space + per-group summary.
+    intrinsics::printf("   %llu ok", state.cur_ok);
+    if (state.cur_fail > 0) { intrinsics::printf(", %llu fail", state.cur_fail); }
+    if (state.cur_skip > 0) { intrinsics::printf(", %llu skip", state.cur_skip); }
+    intrinsics::printf("\n");
+    intrinsics::fflush(null);
+    // Reset for next group.
+    state.cur_group.clear();
+    state.cur_dots.clear();
+    state.cur_ok = 0;
+    state.cur_fail = 0;
+    state.cur_skip = 0;
+    state.has_group = false;
+}
+
+/// Switch into `group`, flushing the previous one if any.
+function compact_enter_group(state: mut &ReporterState, group: Str) -> void {
+    if (state.has_group) {
+        const cur: Str = state.cur_group.as_str();
+        if (cur.equals(&group)) { return; }
+        compact_flush_group(state);
+    }
+    state.cur_group.push_str(group);
+    state.has_group = true;
+}
+
+/// Setup before a test runs: ensure the group header is current.
+/// Compact doesn't print anything per-test up front; the dot lands at
+/// end_test time.
+function compact_begin_test(state: mut &ReporterState, name: Str) -> void {
+    const sn: SplitName = split_test_name(name);
+    compact_enter_group(state, sn.group);
+}
+
+/// Append a dot/letter for this outcome and bump the per-group tally.
+function compact_end_test(state: mut &ReporterState, outcome: TestOutcome) -> void {
+    match (outcome) {
+        TestOutcome::Pass => {
+            state.cur_dots.push_byte(0x2E as u8); // '.'
+            state.cur_ok = state.cur_ok + 1;
+        }
+        TestOutcome::Fail(_, _, _) => {
+            state.cur_dots.push_byte(0x46 as u8); // 'F'
+            state.cur_fail = state.cur_fail + 1;
+        }
+        TestOutcome::Skipped => {
+            state.cur_dots.push_byte(0x73 as u8); // 's'
+            state.cur_skip = state.cur_skip + 1;
+        }
+        TestOutcome::DidNotPanic => {
+            state.cur_dots.push_byte(0x50 as u8); // 'P'
+            state.cur_fail = state.cur_fail + 1;
+        }
+        TestOutcome::RunnerError(_) => {
+            state.cur_dots.push_byte(0x45 as u8); // 'E'
+            state.cur_fail = state.cur_fail + 1;
+        }
+    }
+}
+
+/// Ignored tests under Compact mode: enter the group, emit `s`, bump
+/// the skip tally. No fork.
+function compact_skipped(state: mut &ReporterState, name: Str) -> void {
+    compact_begin_test(state, name);
+    state.cur_dots.push_byte(0x73 as u8);
+    state.cur_skip = state.cur_skip + 1;
+}
+
+// ---- Format-dispatched reporter façade ----
+
+function reporter_begin_test(opts: &RunOptions, state: mut &ReporterState,
+                              name: Str) -> void {
+    match (opts.format) {
+        TestFormat::Plain   => { plain_begin_test(name); }
+        TestFormat::Pretty  => { pretty_begin_test(state, name); }
+        TestFormat::Compact => { compact_begin_test(state, name); }
+    }
+    intrinsics::fflush(null);
+}
+
+function reporter_end_test(opts: &RunOptions, state: mut &ReporterState,
+                            outcome: TestOutcome, was_should_panic: boolean) -> void {
+    match (opts.format) {
+        TestFormat::Plain   => { plain_end_test(outcome, was_should_panic); }
+        TestFormat::Pretty  => { pretty_end_test(opts, outcome, was_should_panic); }
+        TestFormat::Compact => { compact_end_test(state, outcome); }
+    }
+}
+
+function reporter_skipped(opts: &RunOptions, state: mut &ReporterState,
+                           name: Str) -> void {
+    match (opts.format) {
+        TestFormat::Plain   => { plain_skipped(name); }
+        TestFormat::Pretty  => { pretty_skipped(state, opts, name); }
+        TestFormat::Compact => { compact_skipped(state, name); }
+    }
+}
+
+/// Called once after the loop completes: Compact mode needs to flush
+/// the last group's buffered line; Plain/Pretty are no-ops.
+function reporter_finalize(opts: &RunOptions, state: mut &ReporterState) -> void {
+    match (opts.format) {
+        TestFormat::Plain   => { }
+        TestFormat::Pretty  => { }
+        TestFormat::Compact => { compact_flush_group(state); }
+    }
+}
+
 // Entry point: called by the compiler-synthesized test main
 
 /// Run every test in `descriptors` that matches `argc/argv` filtering,
@@ -351,6 +855,8 @@ function is_failure(outcome: TestOutcome) -> boolean {
 function run_all(argc: i32, argv: u8**,
                  descriptors: TestDescriptor*, count: u64) -> i32 {
     mut opts: RunOptions = parse_options(argc, argv);
+    // Pin color decision now so reporters don't re-evaluate per test.
+    opts.color_active = resolve_color_active(&opts);
 
     // Pre-pass: count how many descriptors actually match the filter so
     // the `running N tests` header is honest.
@@ -396,6 +902,7 @@ function run_all(argc: i32, argv: u8**,
     intrinsics::printf("%s\n\n", RULE_HEAVY);
 
     mut counts: Counters = Counters::new();
+    mut rstate: ReporterState = ReporterState::new();
     i = 0;
     while (i < count) {
         const d: TestDescriptor = descriptors[i];
@@ -408,20 +915,19 @@ function run_all(argc: i32, argv: u8**,
 
         if (d.ignored && !opts.include_ignored) {
             if (!opts.quiet) {
-                print_test_prefix(d.name);
-                print_outcome(TestOutcome::Skipped, false);
+                reporter_skipped(&opts, &rstate, d.name);
             }
             counts.ignored = counts.ignored + 1;
             i = i + 1;
             continue;
         }
 
-        // Always print the prefix for runs we actually execute so the
+        // Always emit a prefix for runs we actually execute so the
         // user can see which test is in flight (helps debug a hang).
-        print_test_prefix(d.name);
+        reporter_begin_test(&opts, &rstate, d.name);
         const outcome: TestOutcome = run_one(d);
         const failed: boolean = is_failure(outcome);
-        print_outcome(outcome, d.should_panic);
+        reporter_end_test(&opts, &rstate, outcome, d.should_panic);
 
         if (failed) {
             counts.failed = counts.failed + 1;
@@ -430,6 +936,9 @@ function run_all(argc: i32, argv: u8**,
         }
         i = i + 1;
     }
+    // Compact mode: flush the last in-flight group line. Plain/Pretty
+    // are no-ops here.
+    reporter_finalize(&opts, &rstate);
 
     // Trailing summary: a framed block so it stands clear of the
     // per-test stream above it.
@@ -442,9 +951,16 @@ function run_all(argc: i32, argv: u8**,
     intrinsics::printf("    %-9s%6llu\n", "ignored",  counts.ignored);
     intrinsics::printf("    %-9s%6llu\n", "filtered", counts.filtered);
     intrinsics::printf("%s\n", RULE_THIN);
-    intrinsics::printf("    result   %s\n", verdict);
+    if (opts.color_active && counts.failed == 0) {
+        intrinsics::printf("    result   %s%s%s\n", ANSI_GREEN, verdict, ANSI_RESET);
+    } else if (opts.color_active && counts.failed > 0) {
+        intrinsics::printf("    result   %s%s%s\n", ANSI_RED, verdict, ANSI_RESET);
+    } else {
+        intrinsics::printf("    result   %s\n", verdict);
+    }
     intrinsics::printf("%s\n", RULE_HEAVY);
 
+    rstate.drop();
     const exit_code: i32 = if (counts.failed == 0) { 0 } else { 1 };
     return exit_code;
 }

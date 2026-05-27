@@ -2001,7 +2001,37 @@ cryo test                          # run every discoverable test
 cryo test some_filter              # run tests whose name contains "some_filter"
 cryo test --list                   # discover only; print and exit
 cryo test --ignored                # also run ![ignore]-marked tests
+cryo test --exact                  # treat the filter as an exact match
+cryo test -q, --quiet              # suppress per-test ok / ignored lines
 ```
+
+### Output format
+
+The runner ships three output formats; `--format=<mode>` picks per-run:
+
+| Format    | Layout                                                         |
+| --------- | -------------------------------------------------------------- |
+| `plain`   | Cargo-style `test NAME ... ok` lines; CI-friendly. **Default.** |
+| `pretty`  | Tests grouped under their namespace, indented leaves, `[PASS]` / `[FAIL]` / `[skip]` chips. Colored on a TTY. |
+| `compact` | One line per namespace with a dot-stream of results (`.` pass, `F` fail, `s` skip, `P` did-not-panic, `E` runner error) and a trailing per-group tally. |
+
+Color follows `--color=<auto|always|never>`. `auto` (default) emits ANSI escapes only when stdout is a terminal; the `NO_COLOR` environment variable forces it off per <https://no-color.org/>.
+
+Configuration precedence is **CLI flag > environment variable > `cryoconfig` > built-in default**:
+
+```bash
+cryo test --format=pretty --color=always
+CRYO_TEST_FORMAT=compact CRYO_TEST_COLOR=never cryo test
+```
+
+```ini
+# cryoconfig
+[test]
+format = "pretty"   # one of: plain | pretty | compact
+color  = "auto"     # one of: auto  | always | never
+```
+
+`cryo test` forwards `[test] format = "..."` to the spawned test binary as `--format=...`, so the cryoconfig defaults travel without needing exported environment variables.
 
 ---
 
