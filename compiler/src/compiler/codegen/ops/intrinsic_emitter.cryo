@@ -205,6 +205,70 @@ type struct IntrinsicEmitter {
     }
 
 
+    // Atomic op helpers
+    //
+    // The `order` argument of every atomic intrinsic MUST be a
+    // compile-time constant Ordering enum value: LLVM's atomic ordering
+    // is part of the instruction itself, not a runtime operand.  We
+    // verify with LLVMIsConstant and extract the value with
+    // LLVMConstIntGetZExtValue; a non-constant falls back to SeqCst
+    // (the safest ordering), which should be unreachable in practice
+    // because std::sync::atomic only passes Ordering enum constants.
+
+    extract_ordering_arg(mut &this, order_val: LValue) -> i32 {
+        if (llvm::LLVMIsConstant(order_val.raw) == 0) {
+            return 7;  // SequentiallyConsistent fallback
+        }
+        return llvm::LLVMConstIntGetZExtValue(order_val.raw) as i32;
+    }
+
+    /// Emit `load atomic Ty, Ptr ordering, align Bytes`.
+    emit_atomic_load(mut &this, width_ty: LType, align_bytes: u32,
+                     ptr: LValue, order_val: LValue) -> LValue {
+        const order: i32 = this.extract_ordering_arg(order_val);
+        return this.builder.build_atomic_load(width_ty, ptr, order, align_bytes, "atom.load");
+    }
+
+    /// Emit `store atomic Val, Ptr ordering, align Bytes`.  Returns a
+    /// null LValue since stores are void.
+    emit_atomic_store(mut &this, align_bytes: u32,
+                      ptr: LValue, val: LValue, order_val: LValue) -> LValue {
+        const order: i32 = this.extract_ordering_arg(order_val);
+        this.builder.build_atomic_store(val, ptr, order, align_bytes);
+        return LValue::null();
+    }
+
+    /// Emit `atomicrmw Op Ptr, Val ordering`.  `op_code` is an
+    /// LLVMAtomicRMWBinOp value (Xchg=0, Add=1, Sub=2, And=3, Nand=4,
+    /// Or=5, Xor=6, Max=7, Min=8, UMax=9, UMin=10).  Returns the
+    /// pre-modification value of `*ptr`.
+    emit_atomic_rmw(mut &this, op_code: i32,
+                    ptr: LValue, val: LValue, order_val: LValue) -> LValue {
+        const order: i32 = this.extract_ordering_arg(order_val);
+        return this.builder.build_atomic_rmw(op_code, ptr, val, order);
+    }
+
+    /// Emit a single `cmpxchg`, extract both halves of its `{T, i1}`
+    /// aggregate result, zext the success flag to Cryo's i8 boolean,
+    /// store it through `out_ok`, and return the loaded value as the
+    /// intrinsic's result.  One instruction in IR; no duplication.
+    emit_atomic_cmpxchg(mut &this,
+                        ptr: LValue, cmp: LValue, new_val: LValue,
+                        succ_val: LValue, fail_val: LValue,
+                        out_ok: LValue) -> LValue {
+        const succ: i32 = this.extract_ordering_arg(succ_val);
+        const fail: i32 = this.extract_ordering_arg(fail_val);
+        const agg: LValue = this.builder.build_atomic_cmpxchg(
+            ptr, cmp, new_val, succ, fail
+        );
+        const old_val: LValue = this.builder.build_extract_value(agg, 0, "cx.val");
+        const ok_i1:   LValue = this.builder.build_extract_value(agg, 1, "cx.ok");
+        const ok_i8:   LValue = this.builder.build_zext(ok_i1, LType::i8(), "cx.ok.i8");
+        this.builder.build_store(ok_i8, out_ok);
+        return old_val;
+    }
+
+
     // Dispatcher
 
     /// Inline-lower a bare-name function call to LLVM IR.  Returns
@@ -227,6 +291,36 @@ type struct IntrinsicEmitter {
             IntrinsicKind::Rotr64       => { 2 }
             // panic(message: string, file: string, line: u32)
             IntrinsicKind::Panic        => { 3 }
+            // Atomic loads: (ptr, order) — 2 args.
+            IntrinsicKind::AtomicLoadU8    => { 2 }
+            IntrinsicKind::AtomicLoadU32   => { 2 }
+            IntrinsicKind::AtomicLoadU64   => { 2 }
+            // Atomic stores and RMW ops: (ptr, value, order) — 3 args.
+            IntrinsicKind::AtomicStoreU8   => { 3 }
+            IntrinsicKind::AtomicStoreU32  => { 3 }
+            IntrinsicKind::AtomicStoreU64  => { 3 }
+            IntrinsicKind::AtomicAddU8     => { 3 }
+            IntrinsicKind::AtomicAddU32    => { 3 }
+            IntrinsicKind::AtomicAddU64    => { 3 }
+            IntrinsicKind::AtomicSubU8     => { 3 }
+            IntrinsicKind::AtomicSubU32    => { 3 }
+            IntrinsicKind::AtomicSubU64    => { 3 }
+            IntrinsicKind::AtomicAndU8     => { 3 }
+            IntrinsicKind::AtomicAndU32    => { 3 }
+            IntrinsicKind::AtomicAndU64    => { 3 }
+            IntrinsicKind::AtomicOrU8      => { 3 }
+            IntrinsicKind::AtomicOrU32     => { 3 }
+            IntrinsicKind::AtomicOrU64     => { 3 }
+            IntrinsicKind::AtomicXorU8     => { 3 }
+            IntrinsicKind::AtomicXorU32    => { 3 }
+            IntrinsicKind::AtomicXorU64    => { 3 }
+            IntrinsicKind::AtomicSwapU8    => { 3 }
+            IntrinsicKind::AtomicSwapU32   => { 3 }
+            IntrinsicKind::AtomicSwapU64   => { 3 }
+            // cmpxchg: (ptr, cmp, new, succ_order, fail_order, out_ok)
+            IntrinsicKind::AtomicCmpxchgU8  => { 6 }
+            IntrinsicKind::AtomicCmpxchgU32 => { 6 }
+            IntrinsicKind::AtomicCmpxchgU64 => { 6 }
             // atomic_fence(order: i32): single arg.  isfinite, dirent_*
             // also single arg, so they fall through to the default below.
             _                           => { 1 }
@@ -392,6 +486,53 @@ type struct IntrinsicEmitter {
             IntrinsicKind::VaArgF64    => { this.builder.build_va_arg(args[0], LType::f64(), "va.arg") }
             IntrinsicKind::VaArgPtr    => { this.builder.build_va_arg(args[0], LType::pointer_to(LType::i8()), "va.arg") }
             IntrinsicKind::VaArgString => { this.builder.build_va_arg(args[0], LType::pointer_to(LType::i8()), "va.arg") }
+
+            // -- Atomic load: (ptr, order). Width fixed by suffix; alignment
+            //    matches the operand's natural alignment (REQUIRED by LLVM
+            //    for atomic loads/stores). --
+            IntrinsicKind::AtomicLoadU8  => { this.emit_atomic_load(LType::i8(),  1, args[0], args[1]) }
+            IntrinsicKind::AtomicLoadU32 => { this.emit_atomic_load(LType::i32(), 4, args[0], args[1]) }
+            IntrinsicKind::AtomicLoadU64 => { this.emit_atomic_load(LType::i64(), 8, args[0], args[1]) }
+
+            // -- Atomic store: (ptr, value, order). --
+            IntrinsicKind::AtomicStoreU8  => { this.emit_atomic_store(1, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicStoreU32 => { this.emit_atomic_store(4, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicStoreU64 => { this.emit_atomic_store(8, args[0], args[1], args[2]) }
+
+            // -- Atomic RMW: (ptr, value, order); op_code is the
+            //    LLVMAtomicRMWBinOp value (Xchg=0 / Add=1 / Sub=2 / And=3 /
+            //    Or=5 / Xor=6).  No Nand exposed at the stdlib boundary. --
+            IntrinsicKind::AtomicAddU8  => { this.emit_atomic_rmw(1, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicAddU32 => { this.emit_atomic_rmw(1, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicAddU64 => { this.emit_atomic_rmw(1, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicSubU8  => { this.emit_atomic_rmw(2, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicSubU32 => { this.emit_atomic_rmw(2, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicSubU64 => { this.emit_atomic_rmw(2, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicAndU8  => { this.emit_atomic_rmw(3, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicAndU32 => { this.emit_atomic_rmw(3, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicAndU64 => { this.emit_atomic_rmw(3, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicOrU8   => { this.emit_atomic_rmw(5, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicOrU32  => { this.emit_atomic_rmw(5, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicOrU64  => { this.emit_atomic_rmw(5, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicXorU8  => { this.emit_atomic_rmw(6, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicXorU32 => { this.emit_atomic_rmw(6, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicXorU64 => { this.emit_atomic_rmw(6, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicSwapU8 => { this.emit_atomic_rmw(0, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicSwapU32 => { this.emit_atomic_rmw(0, args[0], args[1], args[2]) }
+            IntrinsicKind::AtomicSwapU64 => { this.emit_atomic_rmw(0, args[0], args[1], args[2]) }
+
+            // -- Compare-and-swap: (ptr, cmp, new, succ_order, fail_order,
+            //    out_ok). Emits one cmpxchg, extracts both halves, writes
+            //    the ok flag through out_ok, returns the loaded value. --
+            IntrinsicKind::AtomicCmpxchgU8 => {
+                this.emit_atomic_cmpxchg(args[0], args[1], args[2], args[3], args[4], args[5])
+            }
+            IntrinsicKind::AtomicCmpxchgU32 => {
+                this.emit_atomic_cmpxchg(args[0], args[1], args[2], args[3], args[4], args[5])
+            }
+            IntrinsicKind::AtomicCmpxchgU64 => {
+                this.emit_atomic_cmpxchg(args[0], args[1], args[2], args[3], args[4], args[5])
+            }
         };
 
         return Option::Some(out_value);
