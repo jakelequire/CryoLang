@@ -46,10 +46,23 @@ def git(*args: str) -> str:
         return "unknown"
 
 
+# Files that pin-cryo itself writes during a refresh.  Excluded from the
+# dirty check below so the pin doesn't record itself as dirty just by
+# running.
+_PIN_OUTPUTS = (
+    ":!bin/cryo",
+    ":!bin/cryo.pin.txt",
+    ":!bin/cryo.exe",
+    ":!bin/cryo.exe.pin.txt",
+)
+
+
 def worktree_dirty() -> bool:
+    """True iff anything outside the pin outputs differs from HEAD."""
     try:
         r = subprocess.run(
-            ["git", "-C", str(ROOT), "diff-index", "--quiet", "HEAD", "--"],
+            ["git", "-C", str(ROOT), "diff-index", "--quiet", "HEAD", "--",
+             *_PIN_OUTPUTS],
             capture_output=True,
         )
         return r.returncode != 0
@@ -81,9 +94,14 @@ def write_sidecar(pin: Path, source: Path, stripped: bool) -> Path:
     commit = git("rev-parse", "HEAD")
     short = git("rev-parse", "--short", "HEAD")
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
-    describe = git("describe", "--always", "--dirty", "--tags")
+    # Compose the dirty suffix ourselves: `git describe --dirty` checks the
+    # whole worktree, but we want to ignore the pin outputs that this run
+    # is itself producing.  `worktree_dirty()` excludes those paths.
+    is_dirty = worktree_dirty()
+    describe_base = git("describe", "--always", "--tags")
+    describe = f"{describe_base}-dirty" if is_dirty else describe_base
     user = git("config", "user.name")
-    dirty = "dirty" if worktree_dirty() else "clean"
+    dirty = "dirty" if is_dirty else "clean"
 
     host = f"{platform.system()} {platform.release()} {platform.machine()}"
 
