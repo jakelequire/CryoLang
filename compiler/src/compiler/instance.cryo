@@ -32,6 +32,7 @@ import Compiler::AST::Node;
 import Compiler::AST::Dumper;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::MangledName;
 import Utils;
 import Utils::File;
 import Utils::Logger;
@@ -502,6 +503,7 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
+        MangledName::set_lsp_safe(true);
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, source);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(&ctx, &pipeline, "");
@@ -509,6 +511,7 @@ type struct CompilerInstance {
 
     /// Compile for LSP from in-memory content (no file on disk).
     compile_for_lsp_content(&this, virtual_path: string, content: string) -> CompilationResult {
+        MangledName::set_lsp_safe(true);
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, virtual_path);
         ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
@@ -518,12 +521,14 @@ type struct CompilerInstance {
     /// Compile for LSP into a caller-owned context.
     /// Single-file mode: parses + type-checks just the one file the
     /// editor is showing, with no project context.  Cross-file
-    /// references resolve to invalid TypeRefs, which makes the
-    /// mangler `panic`; so this path skips post-NameResolution
-    /// passes.  Used as a fallback when we can't find a cryoconfig.
+    /// references resolve to invalid TypeRefs; in LSP-safe mode the
+    /// mangler emits a poison sentinel instead of panicking, so this
+    /// path can run post-NameResolution passes without crashing the
+    /// daemon.  Used as a fallback when we can't find a cryoconfig.
     /// For real diagnostics, route through `compile_for_lsp_project_into`.
     compile_for_lsp_content_into(&this, ctx: CompilationContext*,
                                  virtual_path: string, content: string) -> CompilationResult {
+        MangledName::set_lsp_safe(true);
         // Same risk as the multi-target build path: TypeArena.next_id
         // resets every compile, so without clearing the (TypeRef.id ->
         // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
@@ -549,6 +554,7 @@ type struct CompilerInstance {
                                  config_path: string,
                                  override_path: string,
                                  override_content: string) -> CompilationResult {
+        MangledName::set_lsp_safe(true);
         ctx.lsp_override_path    = override_path;
         ctx.lsp_override_content = override_content;
         mut config: ProjectConfig = ProjectConfig::parse(config_path);
@@ -1019,7 +1025,7 @@ type struct CompilerInstance {
             if (!pipeline.run_all(ctx)) {
                 intrinsics::fprintf(g_stderr,
                     "error: frontend pipeline failed for module %u\n", i);
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             cdebug("[Compiler] Phase 2: Module %u succeeded\n", i);
             // Save the parsed AST using local buffer
@@ -1049,7 +1055,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::AST);
             ctx.provisions.mark(Provision::ASTValidated);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             // Save the resolver's scope to local buffer
             if (ctx.resolver != null && ctx.active_module_index >= 0) {
@@ -1086,7 +1092,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::ModuleOrder);
             ctx.provisions.mark(Provision::NamesResolved);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             pipeline.reset();
         }
@@ -1141,7 +1147,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::NamesResolved);
             ctx.provisions.mark(Provision::TypeDeclarations);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             pipeline.reset();
         }
@@ -1177,7 +1183,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TypeDeclarations);
             ctx.provisions.mark(Provision::TemplatesRegistered);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             pipeline.reset();
         }
@@ -1205,7 +1211,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::FunctionSignatures);
             ctx.provisions.mark(Provision::TemplatesRegistered);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             pipeline.reset();
         }
@@ -1251,7 +1257,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::TypesResolved);
             ctx.provisions.mark(Provision::StructFieldsSynced);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             pipeline.reset();
         }
@@ -1286,7 +1292,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::StructFieldsSynced);
             ctx.provisions.mark(Provision::DirectivesProcessed);
             if (!pipeline.run_all(ctx)) {
-                return this.project_failure(ctx);
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             pipeline.reset();
         }
@@ -1313,7 +1319,7 @@ type struct CompilerInstance {
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("monomorphizer worklist not drained between Phase 6a and 6b (%d pending)",
                     remaining)));
-            return this.project_failure(ctx);
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
         // Phase 6b: Validation + Semantic Analysis + Codegen Preparation.
@@ -1578,7 +1584,23 @@ type struct CompilerInstance {
         }
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
         ok_result.stdlib_root = ctx.stdlib_root;
+        intrinsics::free(ast_buf);
+        intrinsics::free(scope_buf);
         return ok_result;
+    }
+
+    /// Release the per-module AST / scope buffers allocated by
+    /// `compile_project_with_ctx` and forward to `project_failure`.
+    /// Used at every failure return inside the orchestrator so the
+    /// LSP daemon (which calls back into `compile_project_with_ctx`
+    /// once per project change) does not leak ~16 bytes per module
+    /// per recompile.
+    project_failure_release(&this, ctx: CompilationContext*,
+                            ast_buf: void*, scope_buf: void*)
+            -> CompilationResult {
+        intrinsics::free(ast_buf);
+        intrinsics::free(scope_buf);
+        return this.project_failure(ctx);
     }
 
     /// Helper: build a failure result from context diagnostics.

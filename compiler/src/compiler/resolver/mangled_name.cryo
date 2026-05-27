@@ -35,6 +35,57 @@ import Compiler::Types::UserDefined;
 import Compiler::Types::Generic;
 import Compiler::Types::Arena;
 import Compiler::Types;
+import core::intrinsics;
+import utils;
+
+
+// Mangler internal-compiler-error gate.
+//
+// The mangler panics on impossible inputs (invalid TypeRef, null Type*,
+// unhandled TypeKind) because in a CLI build those states are silent-
+// miscompile hazards: falling back to "v" would produce a symbol that
+// collides with a real void-typed declaration.  Loud panic = the
+// regression is impossible to miss.
+//
+// The LSP daemon, however, is a long-running process that compiles
+// repeatedly on each keystroke and routinely sees incomplete pipelines
+// (single-file LSP mode, in-progress edits with cross-file gaps).  A
+// panic in that context kills the editor's language server with no
+// recovery path.
+//
+// `set_lsp_safe(true)` switches the four panic sites to a softer mode:
+// they write the offending message to stderr and return a poisoned
+// sentinel symbol (`MANGLER_POISON`) instead of aborting.  The LSP
+// entry points in `Compiler::Instance` flip this on right after they
+// create their `CompileMode::Lsp` context.  CLI builds never set it,
+// so the loud-fail property is preserved for normal `cryo build`.
+mut g_mangler_lsp_safe: boolean = false;
+
+/// Sentinel symbol returned by the mangler in LSP-safe mode when it
+/// would otherwise panic.  Deliberately unmistakable in nm output and
+/// linker errors so the recovered diagnostic is the obvious thing to
+/// search for.
+const MANGLER_POISON: string = "N$L18__MANGLER_POISON__$G";
+
+/// Switch the mangler between CLI-loud and LSP-safe error handling.
+/// Idempotent.  See `g_mangler_lsp_safe` for the rationale.
+public function set_lsp_safe(enabled: boolean) -> void {
+    g_mangler_lsp_safe = enabled;
+}
+
+/// Internal: report an unrecoverable mangler state.  In CLI mode this
+/// calls `intrinsics::panic` (which aborts).  In LSP-safe mode it
+/// writes a diagnostic to stderr and returns the poison sentinel so
+/// the daemon survives.
+function mangler_ice(msg: string) -> string {
+    if (g_mangler_lsp_safe) {
+        intrinsics::fprintf(g_stderr,
+            "warning: mangler internal error in LSP mode: %s\n", msg);
+        return MANGLER_POISON;
+    }
+    intrinsics::panic(msg, FILE, LINE);
+    return MANGLER_POISON;
+}
 
 
 // ReceiverKind: first-parameter receiver shape for non-static methods
@@ -562,15 +613,15 @@ function encode_params(table: InternTable*, arena: TypeArena*,
 function encode_type_ref(table: InternTable*, arena: TypeArena*,
                          ty: TypeRef, caller: string) -> string {
     if (!ty.is_valid()) {
-        intrinsics::panic(format(
+        return mangler_ice(format(
             "encode_type_ref: invalid TypeRef (id=0) at %s; upstream resolution gap",
-            caller), FILE, LINE);
+            caller));
     }
     const t: Type* = arena.lookup(ty.id);
     if (t == null) {
-        intrinsics::panic(format(
+        return mangler_ice(format(
             "encode_type_ref: arena lookup returned null for TypeRef id=%llu at %s",
-            ty.id, caller), FILE, LINE);
+            ty.id, caller));
     }
     return encode_type(table, arena, t);
 }
@@ -578,8 +629,7 @@ function encode_type_ref(table: InternTable*, arena: TypeArena*,
 /// Encode a Type* directly.  Compound types recurse via encode_type_ref.
 function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> string {
     if (ty == null) {
-        intrinsics::panic("encode_type: null Type* (internal compiler error, caller passed null)",
-              FILE, LINE);
+        return mangler_ice("encode_type: null Type* (internal compiler error, caller passed null)");
     }
 
     if (ty.kind == TypeKind::Void)   { return "v"; }
@@ -687,8 +737,8 @@ function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> strin
     // Either way, falling back to "v" silently produces a symbol that
     // collides with genuine void-typed declarations; panic so the
     // offending site is loud rather than silently miscompiled.
-    intrinsics::panic(format("encode_type: unhandled type kind %s; extend the mangler or close the upstream resolution gap",
-                 ty.kind.to_string()), FILE, LINE);
+    return mangler_ice(format("encode_type: unhandled type kind %s; extend the mangler or close the upstream resolution gap",
+                 ty.kind.to_string()));
 }
 
 /// Encode the qualified path of a named type for use INSIDE `N$L...$G`.
