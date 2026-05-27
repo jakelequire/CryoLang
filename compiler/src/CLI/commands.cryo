@@ -16,6 +16,19 @@ import Utils::Logger;
 const TEST_RULE_HEAVY: string = "================================================================================";
 const TEST_RULE_THIN:  string = "--------------------------------------------------------------------------------";
 
+// ANSI SGR escape sequences for the compile-fail suite's chip output.
+// Mirrors stdlib/test/runner.cryo so the two suites paint identically.
+const NEG_ANSI_GREEN: string = "\x1B[32m";
+const NEG_ANSI_RED:   string = "\x1B[31m";
+const NEG_ANSI_RESET: string = "\x1B[0m";
+
+/// Tally returned by the compile-fail suite so `cmd_test`'s unified
+/// OVERALL footer can quote it alongside the unit-suite outcome.
+type struct NegSuiteResult {
+    ran:      i32;
+    failures: i32;
+}
+
 type enum CommandKind {
     Help;
     Version;
@@ -881,9 +894,9 @@ type struct Executor {
         if (args.has_flag("quiet"))   { cmd = format("%s --quiet",   cmd); }
         if (args.has_flag("q"))       { cmd = format("%s -q",        cmd); }
 
-        // Forward --format and --color. CLI wins; otherwise pull from the
-        // cryoconfig's `[test]` section (re-parsed here because the
-        // CompilationResult doesn't expose ProjectConfig directly).
+        // Resolve --format and --color once. CLI wins over cryoconfig; the
+        // resolved values are forwarded to the unit-test binary AND drive the
+        // compile-fail suite's framing below so the two halves look identical.
         mut fmt_choice: string = "";
         mut col_choice: string = "";
         if (args.has_arg("format")) {
@@ -948,16 +961,50 @@ type struct Executor {
         // Compile-fail suite: run each tests/negative/*.cryo file through
         // `cryo check` and assert it fails with its declared error code.
         // Skipped under --list (which only enumerates the runtime tests).
+        mut neg_ran: i32 = 0;
+        mut neg_failures: i32 = 0;
         if (!args.has_flag("list")) {
             const proj_root: string = Executor::dir_of(config_path);
             const neg_dir: string = format("%s/tests/negative", proj_root);
             mut pattern: string = "";
             if (args.positional_count() > 0) { pattern = args.input_file(); }
-            const neg_failures: i32 =
-                Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir, pattern);
+            const neg_res: NegSuiteResult =
+                Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir,
+                                             pattern, fmt_choice, col_choice);
+            neg_ran      = neg_res.ran;
+            neg_failures = neg_res.failures;
             if (neg_failures > 0 && exit_code == 0) {
                 exit_code = 1;
             }
+        }
+
+        // Unified OVERALL footer: a single verdict line that quotes both
+        // suites at once, sitting beneath the per-suite summary blocks the
+        // unit runner and `run_negative_suite` already printed. Skipped
+        // under --list (no real run happened).
+        if (!args.has_flag("list")) {
+            const overall_pass: boolean = unit_ok && (neg_failures == 0);
+            const overall_active: boolean = Executor::neg_color_active(col_choice);
+            printf("\n%s\n", TEST_RULE_HEAVY);
+            if (overall_active && overall_pass) {
+                printf("  OVERALL  %sPASS%s", NEG_ANSI_GREEN, NEG_ANSI_RESET);
+            } else if (overall_active) {
+                printf("  OVERALL  %sFAIL%s", NEG_ANSI_RED, NEG_ANSI_RESET);
+            } else {
+                printf("  OVERALL  %s", if (overall_pass) { "PASS" } else { "FAIL" });
+            }
+            const unit_label: string = if (unit_ok) { "ok" } else { "failed" };
+            if (neg_ran > 0) {
+                printf("  (unit: %s; compile-fail: %d passed",
+                    unit_label, neg_ran - neg_failures);
+                if (neg_failures > 0) {
+                    printf(", %d failed", neg_failures);
+                }
+                printf(")\n");
+            } else {
+                printf("  (unit: %s)\n", unit_label);
+            }
+            printf("%s\n", TEST_RULE_HEAVY);
         }
         return exit_code;
     }
@@ -1028,20 +1075,99 @@ type struct Executor {
         return format("%s", &buf[0] as string);
     }
 
+    /// Resolve `col_choice` ("auto"/"always"/"never"/"") into an
+    /// on/off decision for ANSI color emission. Auto checks `NO_COLOR`
+    /// (presence forces off, per https://no-color.org/) and `isatty(1)`.
+    /// Mirrors `resolve_color_active` in `stdlib/test/runner.cryo`.
+    static neg_color_active(col_choice: string) -> boolean {
+        if (strcmp(col_choice, "always") == 0) { return true;  }
+        if (strcmp(col_choice, "never")  == 0) { return false; }
+        // "auto" or "" (default): NO_COLOR > isatty.
+        const nc: i8* = getenv("NO_COLOR") as i8*;
+        if (nc != null) { return false; }
+        return isatty(1) == 1;
+    }
+
+    /// Emit a green `[PASS]` chip when color is active, plain otherwise.
+    static neg_chip_pass(active: boolean) -> void {
+        if (active) {
+            printf("%s[PASS]%s", NEG_ANSI_GREEN, NEG_ANSI_RESET);
+        } else {
+            printf("[PASS]");
+        }
+    }
+
+    /// Emit a red `[FAIL]` chip when color is active, plain otherwise.
+    static neg_chip_fail(active: boolean) -> void {
+        if (active) {
+            printf("%s[FAIL]%s", NEG_ANSI_RED, NEG_ANSI_RESET);
+        } else {
+            printf("[FAIL]");
+        }
+    }
+
     /// Run every compile-fail case under `neg_dir`. Each file is compiled
     /// on its own with `cryo check`; it must fail AND emit the code named by
     /// its `![config(negative, <code>)]` directive. A case that compiles
     /// cleanly, or emits a different code, is a real failure. `pattern`,
     /// when non-empty, filters by filename substring (mirrors the runtime
-    /// runner's positional filter). Returns the number that misbehaved.
+    /// runner's positional filter). `fmt_choice` / `col_choice` mirror the
+    /// unit runner's `--format=` / `--color=` surface so the two halves of
+    /// `cryo test` paint identically.
     static run_negative_suite(self_exe: string, stdlib_abs: string,
-                              neg_dir: string, pattern: string) -> i32 {
+                              neg_dir: string, pattern: string,
+                              fmt_choice: string, col_choice: string)
+            -> NegSuiteResult {
+        // Pre-pass: count how many entries actually survive the filter.
+        // Suppresses the entire compile-fail section (header + body + summary)
+        // when a `cryo test <pattern>` invocation matches nothing here, so
+        // unit-only runs don't leave an empty stub block behind. We close
+        // and reopen the dir between passes because there's no `rewinddir`
+        // intrinsic in core::intrinsics.
+        const pre_dp: void* = opendir(neg_dir);
+        if (pre_dp == null) {
+            // No tests/negative -> nothing to do.
+            return NegSuiteResult { ran: 0, failures: 0 };
+        }
+        mut to_run: i32 = 0;
+        mut pre_entry: void* = readdir(pre_dp);
+        while (pre_entry != null) {
+            const pn: string = dirent_name(pre_entry);
+            const pnl: u64 = strlen(pn);
+            if (dirent_type(pre_entry) == 0
+                && strcmp(pn, ".") != 0 && strcmp(pn, "..") != 0
+                && pnl > 5
+                && strcmp(ptr_add(pn as void*, (pnl - 5) as u64) as string, ".cryo") == 0
+                && (strlen(pattern) == 0 || strstr(pn, pattern) != null)) {
+                to_run += 1;
+            }
+            pre_entry = readdir(pre_dp);
+        }
+        closedir(pre_dp);
+        if (to_run == 0) {
+            return NegSuiteResult { ran: 0, failures: 0 };
+        }
         const dp: void* = opendir(neg_dir);
-        if (dp == null) { return 0; }            // no tests/negative -> nothing to do
+        if (dp == null) {
+            return NegSuiteResult { ran: 0, failures: 0 };
+        }
+
+        const is_pretty:  boolean = strcmp(fmt_choice, "pretty")  == 0;
+        const is_compact: boolean = strcmp(fmt_choice, "compact") == 0;
+        const color_on:   boolean = Executor::neg_color_active(col_choice);
 
         printf("\n%s\n", TEST_RULE_HEAVY);
         printf("  CRYO TESTS  /  compile-fail\n");
         printf("%s\n\n", TEST_RULE_HEAVY);
+
+        // Pretty: print the group header once; each test is an indented
+        // line with a `[PASS]` / `[FAIL]` chip. Compact: stream a dot per
+        // test under a single padded group label; flushed at end.
+        if (is_pretty) {
+            printf("compile-fail\n");
+        } else if (is_compact) {
+            printf("compile-fail                                      ");
+        }
 
         const tmp: string = format("/tmp/cryo_negtest_%d.out", getpid());
         mut failures: i32 = 0;
@@ -1064,9 +1190,26 @@ type struct Executor {
             const full: string = format("%s/%s", neg_dir, name);
             const content: string = Executor::read_file_or_empty(full);
             const expected: string = Executor::neg_code_from(content);
-            printf("test (negative) %s ... ", name);
+
+            // Per-test prefix: Plain emits `test (negative) NAME ... ` up
+            // front so a hang is visible; Pretty emits `  NAME ... ` with
+            // the same intent; Compact stays silent until the result lands.
+            if (is_pretty) {
+                printf("  %s ... ", name);
+            } else if (!is_compact) {
+                printf("test (negative) %s ... ", name);
+            }
+            fflush(null);
+
             if (strlen(expected) == 0) {
-                printf("FAILED (no ![config(negative, <code>)] directive)\n");
+                if (is_compact) {
+                    printf("F");
+                } else if (is_pretty) {
+                    Executor::neg_chip_fail(color_on);
+                    printf("  (no ![config(negative, <code>)] directive)\n");
+                } else {
+                    printf("FAILED (no ![config(negative, <code>)] directive)\n");
+                }
                 failures += 1; ran += 1; entry = readdir(dp); continue;
             }
 
@@ -1081,10 +1224,25 @@ type struct Executor {
             system(runcmd);
             const out: string = Executor::read_file_or_empty(tmp);
             const want: string = format("error[%s]", expected);
-            if (strstr(out, want) != null) {
-                printf("ok\n");
+            const passed: boolean = strstr(out, want) != null;
+            if (passed) {
+                if (is_compact) {
+                    printf(".");
+                } else if (is_pretty) {
+                    Executor::neg_chip_pass(color_on);
+                    printf("\n");
+                } else {
+                    printf("ok\n");
+                }
             } else {
-                printf("FAILED (expected %s)\n", expected);
+                if (is_compact) {
+                    printf("F");
+                } else if (is_pretty) {
+                    Executor::neg_chip_fail(color_on);
+                    printf("  (expected %s)\n", expected);
+                } else {
+                    printf("FAILED (expected %s)\n", expected);
+                }
                 failures += 1;
             }
             ran += 1;
@@ -1092,6 +1250,13 @@ type struct Executor {
         }
         closedir(dp);
         unlink(tmp);
+
+        // Compact: close out the single in-flight line with the tally.
+        if (is_compact && ran > 0) {
+            printf("   %d ok", ran - failures);
+            if (failures > 0) { printf(", %d fail", failures); }
+            printf("\n");
+        }
 
         if (ran > 0) {
             const verdict: string = if (failures == 0) { "PASS" } else { "FAIL" };
@@ -1101,10 +1266,16 @@ type struct Executor {
             printf("    %-9s%6d\n", "passed", ran - failures);
             printf("    %-9s%6d\n", "failed", failures);
             printf("%s\n", TEST_RULE_THIN);
-            printf("    result   %s\n", verdict);
+            if (color_on && failures == 0) {
+                printf("    result   %s%s%s\n", NEG_ANSI_GREEN, verdict, NEG_ANSI_RESET);
+            } else if (color_on) {
+                printf("    result   %s%s%s\n", NEG_ANSI_RED,   verdict, NEG_ANSI_RESET);
+            } else {
+                printf("    result   %s\n", verdict);
+            }
             printf("%s\n", TEST_RULE_HEAVY);
         }
-        return failures;
+        return NegSuiteResult { ran: ran, failures: failures };
     }
 
     /// `cryo check <file>`: frontend + semantic analysis, no codegen.
