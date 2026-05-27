@@ -105,12 +105,12 @@ type struct Mutex<T, A = GlobalAlloc> {
     }
 
     /// Fallible constructor.  Initializes the pthread mutex with
-    /// default attributes (`PTHREAD_MUTEX_NORMAL`); a failure to
-    /// allocate the inner buffer surfaces as `AllocError`.  A failure
-    /// of `pthread_mutex_init` itself is converted to a
-    /// SyncError-shaped `AllocError::OutOfResources` so the caller
-    /// gets a single fallible path; for v1 we don't expose
-    /// pthread-init errors separately.
+    /// default attributes (`PTHREAD_MUTEX_NORMAL`).  Returns
+    /// `Err(AllocError)` either when the inner buffer cannot be
+    /// allocated or when `pthread_mutex_init` itself fails (ENOMEM
+    /// or EAGAIN under resource pressure); in the latter case the
+    /// just-allocated buffer is released before returning so the
+    /// caller never leaks on the error path.
     static try_new(value: T) -> Result<Mutex<T, GlobalAlloc>, AllocError> {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const header: Layout = Layout::of<MutexInner<T, GlobalAlloc>>();
@@ -120,7 +120,11 @@ type struct Mutex<T, A = GlobalAlloc> {
                     raw.cast<MutexInner<T, GlobalAlloc>>();
                 const inner_ptr: MutexInner<T, GlobalAlloc>* = typed.as_ptr();
                 const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-                pthread_mutex_init(buf_ptr, null);
+                const rc: i32 = pthread_mutex_init(buf_ptr, null);
+                if (rc != 0) {
+                    alloc.deallocate(raw, header);
+                    return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
+                }
                 inner_ptr.value = value;
                 inner_ptr.alloc = alloc;
                 return Result::Ok(Mutex<T, GlobalAlloc> { inner: inner_ptr });
@@ -137,7 +141,11 @@ type struct Mutex<T, A = GlobalAlloc> {
                 const typed: NonNull<MutexInner<T, A>> = raw.cast<MutexInner<T, A>>();
                 const inner_ptr: MutexInner<T, A>* = typed.as_ptr();
                 const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-                pthread_mutex_init(buf_ptr, null);
+                const rc: i32 = pthread_mutex_init(buf_ptr, null);
+                if (rc != 0) {
+                    a.deallocate(raw, header);
+                    return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
+                }
                 inner_ptr.value = value;
                 inner_ptr.alloc = a;
                 return Result::Ok(Mutex<T, A> { inner: inner_ptr });
