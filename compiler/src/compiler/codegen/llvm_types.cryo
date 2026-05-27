@@ -510,6 +510,78 @@ type struct LBuilder {
         return LValue { raw: llvm::LLVMBuildGlobalStringPtr(this.raw, str, name) };
     }
 
+    // ----- Atomic Operations -----
+    //
+    // Memory ordering integers mirror LLVMAtomicOrdering in llvm-c/Core.h:
+    //   0 = NotAtomic, 1 = Unordered, 2 = Monotonic (Relaxed),
+    //   4 = Acquire, 5 = Release, 6 = AcquireRelease,
+    //   7 = SequentiallyConsistent
+    //
+    // The single-thread flag is always 0 here (multi-threaded ops).  The
+    // stdlib's `std::sync::atomic::Ordering` enum is what the user sees;
+    // these wrappers take the post-translation integer so the cost of the
+    // translation stays in the codegen dispatcher.
+    //
+    // Atomic loads and stores REQUIRE an explicit alignment (LLVM rejects
+    // the verifier check otherwise); pass the natural alignment of the
+    // pointee in bytes (1, 2, 4, or 8).
+
+    /// Emits an LLVM `fence` instruction with the given memory ordering.
+    /// `Name` is unused at the IR level; passes the empty string.
+    build_fence(&this, order: i32) -> LValue {
+        return LValue { raw: llvm::LLVMBuildFence(this.raw, order, 0, "") };
+    }
+
+    /// Emits `load atomic Ty, Ptr ordering, align Bytes`.  Used by the
+    /// per-type `atomic_load_*` intrinsics; not a substitute for
+    /// `build_load`, which is non-atomic.
+    build_atomic_load(&this, ty: LType, ptr: LValue, order: i32, align_bytes: u32, name: string) -> LValue {
+        if (ty.raw == null || ptr.raw == null) { return LValue::null(); }
+        const inst: void* = llvm::LLVMBuildLoad2(this.raw, ty.raw, ptr.raw, name);
+        if (inst == null) { return LValue::null(); }
+        llvm::LLVMSetOrdering(inst, order);
+        llvm::LLVMSetAlignment(inst, align_bytes);
+        return LValue { raw: inst };
+    }
+
+    /// Emits `store atomic Val, Ptr ordering, align Bytes`.
+    build_atomic_store(&this, val: LValue, ptr: LValue, order: i32, align_bytes: u32) -> LValue {
+        if (val.raw == null || ptr.raw == null) { return LValue::null(); }
+        const inst: void* = llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw);
+        if (inst == null) { return LValue::null(); }
+        llvm::LLVMSetOrdering(inst, order);
+        llvm::LLVMSetAlignment(inst, align_bytes);
+        return LValue { raw: inst };
+    }
+
+    /// Emits `atomicrmw Op Ptr, Val ordering`.  `op` is an
+    /// LLVMAtomicRMWBinOp value (Xchg=0 / Add=1 / Sub=2 / And=3 / Nand=4 /
+    /// Or=5 / Xor=6 / Max=7 / Min=8 / UMax=9 / UMin=10).  Returns the
+    /// pre-modification value of `*Ptr`.
+    build_atomic_rmw(&this, op: i32, ptr: LValue, val: LValue, order: i32) -> LValue {
+        if (ptr.raw == null || val.raw == null) { return LValue::null(); }
+        return LValue { raw: llvm::LLVMBuildAtomicRMW(this.raw, op, ptr.raw, val.raw, order, 0) };
+    }
+
+    /// Emits `cmpxchg Ptr, Cmp, New SuccessOrdering FailureOrdering`.
+    /// Returns the LLVM `{T, i1}` aggregate; caller uses
+    /// `build_extract_value` to pull index 0 (loaded value) and index 1
+    /// (success flag).  Higher-level wrappers in
+    /// `Ops::IntrinsicEmitter::try_emit` reshape the aggregate into a
+    /// Cryo `Pair<T, boolean>`.
+    build_atomic_cmpxchg(&this, ptr: LValue, cmp: LValue, new_val: LValue,
+                         succ_order: i32, fail_order: i32) -> LValue {
+        if (ptr.raw == null || cmp.raw == null || new_val.raw == null) {
+            return LValue::null();
+        }
+        return LValue {
+            raw: llvm::LLVMBuildAtomicCmpXchg(
+                this.raw, ptr.raw, cmp.raw, new_val.raw,
+                succ_order, fail_order, 0
+            )
+        };
+    }
+
     // ----- Casts -----
 
     build_trunc(&this, val: LValue, dest_ty: LType, name: string) -> LValue {

@@ -188,6 +188,7 @@ LLVMValueRef LLVMConstReal(LLVMTypeRef RealTy, double N);
 LLVMValueRef LLVMConstNull(LLVMTypeRef Ty);
 LLVMBool LLVMIsNull(LLVMValueRef Val);
 LLVMBool LLVMIsConstant(LLVMValueRef Val);
+unsigned long long LLVMConstIntGetZExtValue(LLVMValueRef ConstantVal);
 LLVMValueRef LLVMConstAllOnes(LLVMTypeRef Ty);
 LLVMValueRef LLVMGetUndef(LLVMTypeRef Ty);
 LLVMValueRef LLVMConstPointerNull(LLVMTypeRef Ty);
@@ -279,9 +280,50 @@ void         LLVMAddCase(LLVMValueRef Switch, LLVMValueRef OnVal,
                          LLVMBasicBlockRef Dest);
 LLVMValueRef LLVMBuildUnreachable(LLVMBuilderRef B);
 
+/* ===================================================================
+ * Builder — Atomic Operations
+ *
+ * Memory ordering values (LLVMAtomicOrdering, llvm-c/Core.h):
+ *   0 = NotAtomic, 1 = Unordered, 2 = Monotonic (Relaxed),
+ *   4 = Acquire, 5 = Release, 6 = AcquireRelease,
+ *   7 = SequentiallyConsistent
+ *
+ * AtomicRMW binary-op values (LLVMAtomicRMWBinOp):
+ *   0 = Xchg, 1 = Add, 2 = Sub, 3 = And, 4 = Nand,
+ *   5 = Or, 6 = Xor, 7 = Max, 8 = Min, 9 = UMax, 10 = UMin
+ *   (additional FP and inc/dec variants exist past 10; bind as int)
+ *
+ * Pass `int SingleThread = 0` for a normal multi-thread op (the only
+ * thing the stdlib currently uses).  Per LLVM rules, atomic loads
+ * and stores REQUIRE an explicit alignment — callers must invoke
+ * LLVMSetAlignment after LLVMBuildLoad2/LLVMBuildStore for atomics.
+ * =================================================================== */
+
 /* Atomic fence — used by IntrinsicsCodegen to lower atomic_fence(order). */
 LLVMValueRef LLVMBuildFence(LLVMBuilderRef B, int Ordering, int SingleThread,
                             const char *Name);
+
+/* Atomic read-modify-write.  No Name parameter in LLVM-C. */
+LLVMValueRef LLVMBuildAtomicRMW(LLVMBuilderRef B, int Op,
+                                LLVMValueRef Ptr, LLVMValueRef Val,
+                                int Ordering, int SingleThread);
+
+/* Atomic compare-and-swap.  Returns the LLVM `{ T, i1 }` aggregate;
+ * caller extracts index 0 (loaded value) and index 1 (success flag)
+ * via LLVMBuildExtractValue.  No Name parameter in LLVM-C. */
+LLVMValueRef LLVMBuildAtomicCmpXchg(LLVMBuilderRef B, LLVMValueRef Ptr,
+                                    LLVMValueRef Cmp, LLVMValueRef New,
+                                    int SuccessOrdering,
+                                    int FailureOrdering,
+                                    int SingleThread);
+
+/* Set ordering on an existing load/store instruction.  Used to turn a
+ * plain LLVMBuildLoad2 / LLVMBuildStore into an atomic load/store. */
+void LLVMSetOrdering(LLVMValueRef MemoryAccessInst, int Ordering);
+
+/* Set explicit alignment (in bytes) on a load/store/alloca/global.
+ * Required for atomic loads and stores. */
+void LLVMSetAlignment(LLVMValueRef V, unsigned Bytes);
 
 
 /* ===================================================================

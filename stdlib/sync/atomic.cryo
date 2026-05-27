@@ -1,0 +1,461 @@
+///! Atomic primitives for concurrent code.
+///!
+///! Each `Atomic<T>` type wraps a single cell of integer-typed storage
+///! and exposes load, store, fetch_add/sub/and/or/xor, swap, and
+///! compare_exchange — all driven by the compiler's atomic intrinsics,
+///! which lower directly to LLVM's `atomicrmw` / `cmpxchg` / atomic
+///! `load` / `store` instructions.  No libc, no spin loops, no calls.
+///!
+///! Available types: `AtomicU8`, `AtomicU32`, `AtomicU64`, `AtomicI32`,
+///! `AtomicI64`, `AtomicBool`.  The signed variants and `AtomicBool`
+///! lower onto the same LLVM ops as their unsigned counterparts (LLVM
+///! doesn't distinguish signed/unsigned for atomic integer memory
+///! ops); the wrappers add a bitcast at the source level.
+///!
+///! Every operation takes an `MemoryOrder` describing the memory-model
+///! constraints around it.  When in doubt, `SeqCst` is the always-safe
+///! choice; `Relaxed` is correct for counters where only the final
+///! value matters; `Acquire` / `Release` pair to form the standard
+///! happens-before edge.  See the per-method docs for which orderings
+///! are permitted (e.g., a load cannot use `Release`).
+///!
+///! Atomic types are intentionally **not** `Copy`: mutation through a
+///! shared pointer must be controlled, and bitwise-copying an atomic
+///! would silently break that invariant.  Wrap in `Arc<Atomic*>` to
+///! share across threads.
+
+namespace std::sync::atomic;
+
+import core::intrinsics;
+import core::result;
+
+/// Memory-ordering for an atomic operation.
+///
+/// Values mirror LLVM's `AtomicMemoryOrder` enum exactly (Relaxed=2,
+/// Acquire=4, Release=5, AcqRel=6, SeqCst=7), so the conversion to
+/// the compiler intrinsic's `u32` argument is a direct mapping.
+///
+/// - `Relaxed`: no ordering constraints, only atomicity. Cheapest;
+///   correct for hit counters and similar usage where the observed
+///   sequence of values doesn't matter.
+/// - `Acquire`: on loads/RMW, prevents reordering of *later* memory
+///   accesses across this op.  Pairs with `Release` on the producer
+///   side to form a happens-before edge.
+/// - `Release`: on stores/RMW, prevents reordering of *earlier*
+///   memory accesses across this op.  Pairs with `Acquire`.
+/// - `AcqRel`: combined `Acquire + Release`; for RMW ops only.
+/// - `SeqCst`: full sequential-consistency.  All threads observe
+///   the same global order of `SeqCst` ops on every cell.
+type enum MemoryOrder : u32 {
+    Relaxed = 2;
+    Acquire = 4;
+    Release = 5;
+    AcqRel  = 6;
+    SeqCst  = 7;
+}
+
+/// Translate an `MemoryOrder` to the `u32` value the compiler intrinsic
+/// expects (which itself matches LLVM's int representation).  A `match`
+/// rather than an `as u32` cast keeps the conversion explicit and
+/// portable in case the enum lowering changes.
+function memory_order_as_u32(order: MemoryOrder) -> u32 {
+    return match (order) {
+        MemoryOrder::Relaxed => { 2u32 }
+        MemoryOrder::Acquire => { 4u32 }
+        MemoryOrder::Release => { 5u32 }
+        MemoryOrder::AcqRel  => { 6u32 }
+        MemoryOrder::SeqCst  => { 7u32 }
+    };
+}
+
+/// Insert a memory fence with the given ordering.  Equivalent to
+/// `atomicrmw xchg` on a dummy location with no actual ops, but
+/// generated as a real LLVM `fence` instruction.
+///
+/// Note: the current emitter lowers every fence as `SeqCst`
+/// regardless of the requested ordering, matching what the v1
+/// `atomic_fence` intrinsic was designed to do.  Higher-precision
+/// fences land alongside the rest of std::sync::atomic's surface.
+public function fence(order: MemoryOrder) -> void {
+    atomic_fence(memory_order_as_u32(order));
+}
+
+/// Like `fence`, but only constrains the compiler's reordering, not
+/// the CPU's.  Today this lowers to the same SeqCst LLVM fence as
+/// `fence` (the conservative path); the distinction is preserved for
+/// future refinement.  Use this when communicating with code inside
+/// the same thread (e.g., signal handlers, longjmp paths).
+public function compiler_fence(order: MemoryOrder) -> void {
+    atomic_fence(memory_order_as_u32(order));
+}
+
+
+/// 8-bit unsigned atomic cell.
+public type struct AtomicU8 {
+    value: u8;
+
+    /// Construct an `AtomicU8` initialized to `initial`.  Stack-allocated;
+    /// callers wishing to share between threads should wrap in
+    /// `Arc<AtomicU8>` (when `Arc` lands) or place inside a heap-pinned
+    /// container.
+    static new(initial: u8) -> AtomicU8 {
+        return AtomicU8 { value: initial };
+    }
+
+    load(&this, order: MemoryOrder) -> u8 {
+        return atomic_load_u8(&this.value, memory_order_as_u32(order));
+    }
+
+    store(mut &this, val: u8, order: MemoryOrder) -> void {
+        atomic_store_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_add(mut &this, val: u8, order: MemoryOrder) -> u8 {
+        return atomic_add_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_sub(mut &this, val: u8, order: MemoryOrder) -> u8 {
+        return atomic_sub_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_and(mut &this, val: u8, order: MemoryOrder) -> u8 {
+        return atomic_and_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_or(mut &this, val: u8, order: MemoryOrder) -> u8 {
+        return atomic_or_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_xor(mut &this, val: u8, order: MemoryOrder) -> u8 {
+        return atomic_xor_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    /// Atomically replace the cell's value with `val` and return the
+    /// previous value.
+    swap(mut &this, val: u8, order: MemoryOrder) -> u8 {
+        return atomic_swap_u8(&this.value, val, memory_order_as_u32(order));
+    }
+
+    /// Atomic compare-and-swap.  Returns `Ok(prev)` with `prev == current`
+    /// when the swap happens; `Err(actual)` with the observed value
+    /// when the comparison fails.
+    compare_exchange(mut &this, current: u8, next: u8, succ: MemoryOrder, fail: MemoryOrder) -> Result<u8, u8> {
+        mut ok: boolean = false;
+        const loaded: u8 = atomic_cmpxchg_u8(
+            &this.value, current, next,
+            memory_order_as_u32(succ), memory_order_as_u32(fail), &ok
+        );
+        if (ok) { return Result::Ok(loaded); }
+        return Result::Err(loaded);
+    }
+}
+
+/// Empty `Drop` makes `AtomicU8` non-`Copy`; mutation through a shared
+/// pointer must remain explicit, never silent.
+implement trait Drop for struct AtomicU8 {
+    drop(mut &this) -> void { }
+}
+
+
+/// 32-bit unsigned atomic cell.
+public type struct AtomicU32 {
+    value: u32;
+
+    static new(initial: u32) -> AtomicU32 {
+        return AtomicU32 { value: initial };
+    }
+
+    load(&this, order: MemoryOrder) -> u32 {
+        return atomic_load_u32(&this.value, memory_order_as_u32(order));
+    }
+
+    store(mut &this, val: u32, order: MemoryOrder) -> void {
+        atomic_store_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_add(mut &this, val: u32, order: MemoryOrder) -> u32 {
+        return atomic_add_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_sub(mut &this, val: u32, order: MemoryOrder) -> u32 {
+        return atomic_sub_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_and(mut &this, val: u32, order: MemoryOrder) -> u32 {
+        return atomic_and_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_or(mut &this, val: u32, order: MemoryOrder) -> u32 {
+        return atomic_or_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_xor(mut &this, val: u32, order: MemoryOrder) -> u32 {
+        return atomic_xor_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    swap(mut &this, val: u32, order: MemoryOrder) -> u32 {
+        return atomic_swap_u32(&this.value, val, memory_order_as_u32(order));
+    }
+
+    compare_exchange(mut &this, current: u32, next: u32, succ: MemoryOrder, fail: MemoryOrder) -> Result<u32, u32> {
+        mut ok: boolean = false;
+        const loaded: u32 = atomic_cmpxchg_u32(
+            &this.value, current, next,
+            memory_order_as_u32(succ), memory_order_as_u32(fail), &ok
+        );
+        if (ok) { return Result::Ok(loaded); }
+        return Result::Err(loaded);
+    }
+}
+
+implement trait Drop for struct AtomicU32 {
+    drop(mut &this) -> void { }
+}
+
+
+/// 64-bit unsigned atomic cell.  The building block for `Arc`'s
+/// reference count.
+public type struct AtomicU64 {
+    value: u64;
+
+    static new(initial: u64) -> AtomicU64 {
+        return AtomicU64 { value: initial };
+    }
+
+    load(&this, order: MemoryOrder) -> u64 {
+        return atomic_load_u64(&this.value, memory_order_as_u32(order));
+    }
+
+    store(mut &this, val: u64, order: MemoryOrder) -> void {
+        atomic_store_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_add(mut &this, val: u64, order: MemoryOrder) -> u64 {
+        return atomic_add_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_sub(mut &this, val: u64, order: MemoryOrder) -> u64 {
+        return atomic_sub_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_and(mut &this, val: u64, order: MemoryOrder) -> u64 {
+        return atomic_and_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_or(mut &this, val: u64, order: MemoryOrder) -> u64 {
+        return atomic_or_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    fetch_xor(mut &this, val: u64, order: MemoryOrder) -> u64 {
+        return atomic_xor_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    swap(mut &this, val: u64, order: MemoryOrder) -> u64 {
+        return atomic_swap_u64(&this.value, val, memory_order_as_u32(order));
+    }
+
+    compare_exchange(mut &this, current: u64, next: u64, succ: MemoryOrder, fail: MemoryOrder) -> Result<u64, u64> {
+        mut ok: boolean = false;
+        const loaded: u64 = atomic_cmpxchg_u64(
+            &this.value, current, next,
+            memory_order_as_u32(succ), memory_order_as_u32(fail), &ok
+        );
+        if (ok) { return Result::Ok(loaded); }
+        return Result::Err(loaded);
+    }
+}
+
+implement trait Drop for struct AtomicU64 {
+    drop(mut &this) -> void { }
+}
+
+
+/// 32-bit signed atomic cell.  Same bit-level operations as `AtomicU32`;
+/// the wrapper exists so user code keeps signed semantics at the source
+/// level.
+public type struct AtomicI32 {
+    value: i32;
+
+    static new(initial: i32) -> AtomicI32 {
+        return AtomicI32 { value: initial };
+    }
+
+    load(&this, order: MemoryOrder) -> i32 {
+        const raw: u32 = atomic_load_u32(&this.value as u32*, memory_order_as_u32(order));
+        return raw as i32;
+    }
+
+    store(mut &this, val: i32, order: MemoryOrder) -> void {
+        atomic_store_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+    }
+
+    fetch_add(mut &this, val: i32, order: MemoryOrder) -> i32 {
+        const prev: u32 = atomic_add_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+        return prev as i32;
+    }
+
+    fetch_sub(mut &this, val: i32, order: MemoryOrder) -> i32 {
+        const prev: u32 = atomic_sub_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+        return prev as i32;
+    }
+
+    fetch_and(mut &this, val: i32, order: MemoryOrder) -> i32 {
+        const prev: u32 = atomic_and_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+        return prev as i32;
+    }
+
+    fetch_or(mut &this, val: i32, order: MemoryOrder) -> i32 {
+        const prev: u32 = atomic_or_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+        return prev as i32;
+    }
+
+    fetch_xor(mut &this, val: i32, order: MemoryOrder) -> i32 {
+        const prev: u32 = atomic_xor_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+        return prev as i32;
+    }
+
+    swap(mut &this, val: i32, order: MemoryOrder) -> i32 {
+        const prev: u32 = atomic_swap_u32(&this.value as u32*, val as u32, memory_order_as_u32(order));
+        return prev as i32;
+    }
+
+    compare_exchange(mut &this, current: i32, next: i32, succ: MemoryOrder, fail: MemoryOrder) -> Result<i32, i32> {
+        mut ok: boolean = false;
+        const loaded: u32 = atomic_cmpxchg_u32(
+            &this.value as u32*, current as u32, next as u32,
+            memory_order_as_u32(succ), memory_order_as_u32(fail), &ok
+        );
+        if (ok) { return Result::Ok(loaded as i32); }
+        return Result::Err(loaded as i32);
+    }
+}
+
+implement trait Drop for struct AtomicI32 {
+    drop(mut &this) -> void { }
+}
+
+
+/// 64-bit signed atomic cell.
+public type struct AtomicI64 {
+    value: i64;
+
+    static new(initial: i64) -> AtomicI64 {
+        return AtomicI64 { value: initial };
+    }
+
+    load(&this, order: MemoryOrder) -> i64 {
+        const raw: u64 = atomic_load_u64(&this.value as u64*, memory_order_as_u32(order));
+        return raw as i64;
+    }
+
+    store(mut &this, val: i64, order: MemoryOrder) -> void {
+        atomic_store_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+    }
+
+    fetch_add(mut &this, val: i64, order: MemoryOrder) -> i64 {
+        const prev: u64 = atomic_add_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+        return prev as i64;
+    }
+
+    fetch_sub(mut &this, val: i64, order: MemoryOrder) -> i64 {
+        const prev: u64 = atomic_sub_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+        return prev as i64;
+    }
+
+    fetch_and(mut &this, val: i64, order: MemoryOrder) -> i64 {
+        const prev: u64 = atomic_and_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+        return prev as i64;
+    }
+
+    fetch_or(mut &this, val: i64, order: MemoryOrder) -> i64 {
+        const prev: u64 = atomic_or_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+        return prev as i64;
+    }
+
+    fetch_xor(mut &this, val: i64, order: MemoryOrder) -> i64 {
+        const prev: u64 = atomic_xor_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+        return prev as i64;
+    }
+
+    swap(mut &this, val: i64, order: MemoryOrder) -> i64 {
+        const prev: u64 = atomic_swap_u64(&this.value as u64*, val as u64, memory_order_as_u32(order));
+        return prev as i64;
+    }
+
+    compare_exchange(mut &this, current: i64, next: i64, succ: MemoryOrder, fail: MemoryOrder) -> Result<i64, i64> {
+        mut ok: boolean = false;
+        const loaded: u64 = atomic_cmpxchg_u64(
+            &this.value as u64*, current as u64, next as u64,
+            memory_order_as_u32(succ), memory_order_as_u32(fail), &ok
+        );
+        if (ok) { return Result::Ok(loaded as i64); }
+        return Result::Err(loaded as i64);
+    }
+}
+
+implement trait Drop for struct AtomicI64 {
+    drop(mut &this) -> void { }
+}
+
+
+/// Atomic boolean cell.  Backed by `u8` atomics: `false = 0`, `true = 1`.
+public type struct AtomicBool {
+    value: boolean;
+
+    static new(initial: boolean) -> AtomicBool {
+        return AtomicBool { value: initial };
+    }
+
+    load(&this, order: MemoryOrder) -> boolean {
+        const raw: u8 = atomic_load_u8(&this.value as u8*, memory_order_as_u32(order));
+        return raw != 0u8;
+    }
+
+    store(mut &this, val: boolean, order: MemoryOrder) -> void {
+        const b: u8 = if (val) { 1u8 } else { 0u8 };
+        atomic_store_u8(&this.value as u8*, b, memory_order_as_u32(order));
+    }
+
+    /// AND the boolean cell with `val`.  Returns the previous value.
+    fetch_and(mut &this, val: boolean, order: MemoryOrder) -> boolean {
+        const b: u8 = if (val) { 1u8 } else { 0u8 };
+        const prev: u8 = atomic_and_u8(&this.value as u8*, b, memory_order_as_u32(order));
+        return prev != 0u8;
+    }
+
+    /// OR the boolean cell with `val`.  Returns the previous value.
+    fetch_or(mut &this, val: boolean, order: MemoryOrder) -> boolean {
+        const b: u8 = if (val) { 1u8 } else { 0u8 };
+        const prev: u8 = atomic_or_u8(&this.value as u8*, b, memory_order_as_u32(order));
+        return prev != 0u8;
+    }
+
+    /// XOR the boolean cell with `val`.  Returns the previous value.
+    fetch_xor(mut &this, val: boolean, order: MemoryOrder) -> boolean {
+        const b: u8 = if (val) { 1u8 } else { 0u8 };
+        const prev: u8 = atomic_xor_u8(&this.value as u8*, b, memory_order_as_u32(order));
+        return prev != 0u8;
+    }
+
+    swap(mut &this, val: boolean, order: MemoryOrder) -> boolean {
+        const b: u8 = if (val) { 1u8 } else { 0u8 };
+        const prev: u8 = atomic_swap_u8(&this.value as u8*, b, memory_order_as_u32(order));
+        return prev != 0u8;
+    }
+
+    compare_exchange(mut &this, current: boolean, next: boolean, succ: MemoryOrder, fail: MemoryOrder) -> Result<boolean, boolean> {
+        const cur_b: u8  = if (current) { 1u8 } else { 0u8 };
+        const next_b: u8 = if (next)    { 1u8 } else { 0u8 };
+        mut ok: boolean = false;
+        const loaded: u8 = atomic_cmpxchg_u8(
+            &this.value as u8*, cur_b, next_b,
+            memory_order_as_u32(succ), memory_order_as_u32(fail), &ok
+        );
+        if (ok) { return Result::Ok(loaded != 0u8); }
+        return Result::Err(loaded != 0u8);
+    }
+}
+
+implement trait Drop for struct AtomicBool {
+    drop(mut &this) -> void { }
+}
