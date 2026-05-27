@@ -1,0 +1,97 @@
+///! Mutex<T> — single-threaded coverage of lock/unlock/try_lock and
+///! guard drop releasing the lock.  Cross-thread tests require std::thread.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SyncMutex;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::sync::mutex;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function mutex_lock_returns_guard_and_releases_on_drop() -> Result<(), TestError> {
+    mut m: Mutex<i32> = Mutex::new(0);
+    mut g1: MutexGuard<i32, GlobalAlloc> = m.lock();
+    *g1.as_ptr() = 42;
+    g1.drop();
+    // Re-lock after the first guard dropped — would deadlock if the
+    // first lock leaked.
+    mut g2: MutexGuard<i32, GlobalAlloc> = m.lock();
+    const v: i32 = *g2.as_ptr();
+    g2.drop();
+    m.drop();
+    match (expect_eq(v, 42)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function mutex_guarded_writes_persist() -> Result<(), TestError> {
+    mut m: Mutex<i32> = Mutex::new(10);
+    mut g1: MutexGuard<i32, GlobalAlloc> = m.lock();
+    const p: i32* = g1.as_ptr();
+    *p = *p + 5;
+    g1.drop();
+    mut g2: MutexGuard<i32, GlobalAlloc> = m.lock();
+    const v: i32 = *g2.as_ptr();
+    g2.drop();
+    m.drop();
+    match (expect_eq(v, 15)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function mutex_try_lock_when_unlocked_returns_some() -> Result<(), TestError> {
+    mut m: Mutex<i32> = Mutex::new(99);
+    mut got_lock: boolean = false;
+    mut value: i32 = 0;
+    match (m.try_lock()) {
+        Option::Some(g) => {
+            mut guard: MutexGuard<i32, GlobalAlloc> = g;
+            got_lock = true;
+            value = *guard.as_ptr();
+            guard.drop();
+        }
+        Option::None => { }
+    }
+    m.drop();
+    if (!got_lock) {
+        return Result::Err(TestError::failed(Str::new(
+            "try_lock on unlocked Mutex must return Some")));
+    }
+    match (expect_eq(value, 99)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function mutex_multiple_sequential_lockings() -> Result<(), TestError> {
+    mut m: Mutex<i32> = Mutex::new(0);
+    mut i: i32 = 0;
+    while (i < 5) {
+        mut g: MutexGuard<i32, GlobalAlloc> = m.lock();
+        const p: i32* = g.as_ptr();
+        *p = *p + 1;
+        g.drop();
+        i = i + 1;
+    }
+    mut g_final: MutexGuard<i32, GlobalAlloc> = m.lock();
+    const final: i32 = *g_final.as_ptr();
+    g_final.drop();
+    m.drop();
+    match (expect_eq(final, 5)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

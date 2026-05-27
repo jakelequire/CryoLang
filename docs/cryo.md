@@ -243,15 +243,19 @@ apply(inc, 41);                                   // 42 (named-as-value)
 apply((n: int) -> int { return n * 2; }, 21);     // 42 (inline)
 ```
 
-A lambda that references a binding from the enclosing scope **captures** it
-by value, becoming a closure. The capture must be a `Copy` value (i32, u64,
-bool, char, references, and any `![derive(Copy)]` type); non-Copy captures
-are rejected (E0457) because moving an owning value into a closure would
-need drop-glue plumbing the v1.0 release intentionally defers. The compiler
-synthesises an anonymous struct holding the captured fields plus a
-`__call__` method whose body is the lambda body; the closure value is the
-struct instance and the call site dispatches directly through `__call__`.
-Stack-allocated; no heap allocation.
+A lambda that references a binding from the enclosing scope **captures** it,
+becoming a closure. Copy types (i32, u64, bool, char, references, and any
+`![derive(Copy)]` type) are captured by value-copy; non-Copy types are
+captured by move - the outer binding is consumed at the lambda's
+construction site (subsequent use is E0452) and the closure-struct's
+synthesized Drop releases the captured value at scope exit. The `move`
+keyword stays valid as an explicit prefix (`move (params) -> T { body }`)
+but is no longer required for non-Copy captures: any non-Copy capture
+implicitly flips the lambda to move semantics. The compiler synthesises an
+anonymous struct holding the captured fields plus a `__call__` method whose
+body is the lambda body; the closure value is the struct instance and the
+call site dispatches directly through `__call__`. Stack-allocated; no heap
+allocation.
 
 ```cryo
 const bias: i32 = 10;
