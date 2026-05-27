@@ -23,6 +23,7 @@ import core::mem;
 import core::ptr;
 import core::drop;
 import core::clone;
+import core::cmp;
 import alloc::layout;
 import alloc::allocator;
 
@@ -220,6 +221,39 @@ type struct Array<T, A = GlobalAlloc> {
         this.length = 0;
     }
 
+    /// Sort the array in place, ascending, by `T::compare`.
+    ///
+    /// Hybrid in-place quicksort: median-of-three pivot above a cutoff,
+    /// insertion sort below.  O(n log n) average; O(n^2) adversarial
+    /// worst case (pure quicksort, no introsort fallback in v1.0).
+    /// **Not stable** — equal elements may be reordered.  No allocation.
+    ///
+    /// The bound is `T: Ord`; primitives, `String`, and any user type
+    /// that implements `Ord` are accepted.  Owning `T`s are moved
+    /// in place via `mem::swap` so the array's drop obligation stays
+    /// intact (every initialised slot still gets dropped exactly once).
+    sort(mut &this) -> void where T: Ord {
+        if (this.length < 2) { return; }
+        sort_range<T>(this.ptr, 0, this.length);
+    }
+
+    /// Sort in place using a user-supplied "less-than" predicate.
+    /// Returns no value; mutates the array.  Same complexity and
+    /// stability as `sort()`.  The predicate must impose a strict
+    /// weak ordering (irreflexive, transitive, with the implied
+    /// equivalence being transitive) or the result is unspecified.
+    ///
+    /// `less` is a function pointer; non-capturing lambdas convert
+    /// implicitly.  Capturing closures passed in method position are
+    /// rejected (E0458) in v1.0 — capture by indirection if you need
+    /// state (`mut state: State*; (a, b) -> boolean { ... state.x ... }`)
+    /// or pull the sort into a free function and use the free-function
+    /// closure-arg path.
+    sort_by(mut &this, less: (&T, &T) -> boolean) -> void {
+        if (this.length < 2) { return; }
+        sort_range_by<T>(this.ptr, 0, this.length, less);
+    }
+
     /// Append every element of `source` to the end of this array.
     /// Panics on allocation failure; use `try_push_slice` to recover.
     push_slice(mut &this, source: Slice<T>) -> void {
@@ -362,6 +396,163 @@ where T: Drop, A: Allocator {
         this.ptr = null;
         this.length = 0;
         this.capacity = 0;
+    }
+}
+
+// Sort helpers ----------------------------------------------------------------
+//
+// Free functions rather than methods so they're reachable from both
+// `sort()` and `sort_by()` without re-stating the where bound at every
+// call site, and so recursive quicksort doesn't have to thread `mut &this`
+// through the recursion.  Operate on a raw `T*` + `[lo, hi)` half-open
+// range; the caller (`sort` / `sort_by`) is responsible for validating
+// the range against the array's length before the first call.
+
+/// Length cutoff for switching from quicksort to insertion sort. 16 is
+/// the canonical value; small enough that insertion sort's O(n^2) is
+/// faster than quicksort's per-element overhead, large enough to avoid
+/// recursing all the way down.
+const SORT_INSERTION_CUTOFF: u64 = 16;
+
+function sort_range<T>(ptr: T*, lo: u64, hi: u64) -> void where T: Ord {
+    if (hi - lo < SORT_INSERTION_CUTOFF) {
+        sort_insertion<T>(ptr, lo, hi);
+        return;
+    }
+    const pivot_idx: u64 = sort_partition<T>(ptr, lo, hi);
+    sort_range<T>(ptr, lo, pivot_idx);
+    sort_range<T>(ptr, pivot_idx + 1, hi);
+}
+
+function sort_insertion<T>(ptr: T*, lo: u64, hi: u64) -> void where T: Ord {
+    mut i: u64 = lo + 1;
+    while (i < hi) {
+        mut j: u64 = i;
+        // Walk j backwards while ptr[j-1] > ptr[j].  Stop at lo.
+        while (j > lo) {
+            const ord: Ordering = ptr[j - 1].compare(&ptr[j]);
+            match (ord) {
+                Ordering::Greater => {
+                    mem::swap<T>(mem::offset(ptr, (j - 1) as i64),
+                                 mem::offset(ptr,  j      as i64));
+                    j = j - 1;
+                }
+                Ordering::Less    => { break; }
+                Ordering::Equal   => { break; }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// Median-of-three pivot: pick the median of `ptr[lo]`, `ptr[mid]`,
+/// `ptr[hi-1]` as the pivot, move it to `ptr[hi-1]`, then partition
+/// `[lo, hi-1)` around its value.  Returns the final pivot index.
+function sort_partition<T>(ptr: T*, lo: u64, hi: u64) -> u64 where T: Ord {
+    const mid: u64 = lo + (hi - lo) / 2;
+    sort_order_pair<T>(ptr, lo,     mid);
+    sort_order_pair<T>(ptr, lo,     hi - 1);
+    sort_order_pair<T>(ptr, mid,    hi - 1);
+    // After the three pair-orderings, ptr[lo] <= ptr[mid] <= ptr[hi-1].
+    // Stash the median (ptr[mid]) at hi-1 as the pivot.
+    mem::swap<T>(mem::offset(ptr, mid       as i64),
+                 mem::offset(ptr, (hi - 1)  as i64));
+    // Lomuto partition over [lo, hi-1) with pivot at ptr[hi-1].
+    mut store: u64 = lo;
+    mut k:     u64 = lo;
+    while (k < hi - 1) {
+        const ord: Ordering = ptr[k].compare(&ptr[hi - 1]);
+        match (ord) {
+            Ordering::Less    => {
+                mem::swap<T>(mem::offset(ptr, store as i64),
+                             mem::offset(ptr, k     as i64));
+                store = store + 1;
+            }
+            Ordering::Equal   => { }
+            Ordering::Greater => { }
+        }
+        k = k + 1;
+    }
+    mem::swap<T>(mem::offset(ptr, store    as i64),
+                 mem::offset(ptr, (hi - 1) as i64));
+    return store;
+}
+
+function sort_order_pair<T>(ptr: T*, i: u64, j: u64) -> void where T: Ord {
+    const ord: Ordering = ptr[i].compare(&ptr[j]);
+    match (ord) {
+        Ordering::Greater => {
+            mem::swap<T>(mem::offset(ptr, i as i64),
+                         mem::offset(ptr, j as i64));
+        }
+        Ordering::Less  => { }
+        Ordering::Equal => { }
+    }
+}
+
+// `sort_by` helpers — identical shape to the Ord versions but route
+// comparisons through a caller-supplied `less` predicate.  Duplicated
+// rather than parameterised because Cryo's free-function generics can
+// take a fn-typed parameter directly, and the duplication keeps the
+// hot inner loops monomorphic and obvious.
+
+function sort_range_by<T>(ptr: T*, lo: u64, hi: u64,
+                          less: (&T, &T) -> boolean) -> void {
+    if (hi - lo < SORT_INSERTION_CUTOFF) {
+        sort_insertion_by<T>(ptr, lo, hi, less);
+        return;
+    }
+    const pivot_idx: u64 = sort_partition_by<T>(ptr, lo, hi, less);
+    sort_range_by<T>(ptr, lo, pivot_idx,    less);
+    sort_range_by<T>(ptr, pivot_idx + 1, hi, less);
+}
+
+function sort_insertion_by<T>(ptr: T*, lo: u64, hi: u64,
+                              less: (&T, &T) -> boolean) -> void {
+    mut i: u64 = lo + 1;
+    while (i < hi) {
+        mut j: u64 = i;
+        while (j > lo) {
+            if (less(&ptr[j], &ptr[j - 1])) {
+                mem::swap<T>(mem::offset(ptr, (j - 1) as i64),
+                             mem::offset(ptr,  j      as i64));
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+function sort_partition_by<T>(ptr: T*, lo: u64, hi: u64,
+                              less: (&T, &T) -> boolean) -> u64 {
+    const mid: u64 = lo + (hi - lo) / 2;
+    sort_order_pair_by<T>(ptr, lo,  mid,     less);
+    sort_order_pair_by<T>(ptr, lo,  hi - 1,  less);
+    sort_order_pair_by<T>(ptr, mid, hi - 1,  less);
+    mem::swap<T>(mem::offset(ptr, mid       as i64),
+                 mem::offset(ptr, (hi - 1)  as i64));
+    mut store: u64 = lo;
+    mut k:     u64 = lo;
+    while (k < hi - 1) {
+        if (less(&ptr[k], &ptr[hi - 1])) {
+            mem::swap<T>(mem::offset(ptr, store as i64),
+                         mem::offset(ptr, k     as i64));
+            store = store + 1;
+        }
+        k = k + 1;
+    }
+    mem::swap<T>(mem::offset(ptr, store    as i64),
+                 mem::offset(ptr, (hi - 1) as i64));
+    return store;
+}
+
+function sort_order_pair_by<T>(ptr: T*, i: u64, j: u64,
+                               less: (&T, &T) -> boolean) -> void {
+    if (less(&ptr[j], &ptr[i])) {
+        mem::swap<T>(mem::offset(ptr, i as i64),
+                     mem::offset(ptr, j as i64));
     }
 }
 

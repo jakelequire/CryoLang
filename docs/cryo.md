@@ -1644,28 +1644,34 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings — the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`). Manual `binding.drop()` remains valid and idiomatic: the analyzer detects it as a move and the synthesizer skips bindings that are already consumed.
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings — the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`). Manual `binding.drop()` remains valid and idiomatic: the analyzer treats the call as a move, the synthesizer skips bindings already consumed, and a **second** `binding.drop()` (or any other use of the binding after `.drop()`) is rejected as use-after-move (`E0452`).
 
 Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access — explicit `.drop()` is still required in those positions.
 
 ### 16.3 Move Checking
 
-Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_check.cryo`](../compiler/src/compiler/passes/move_check.cryo)). A *storage-duplicating* move — binding a non-`Copy` value to a new name, assigning it, or placing it in an aggregate literal — transfers ownership; using the original afterward is reported. Passing a value to a function is a *borrow* (arguments are passed by hidden reference, and the callee does not drop them), **not** a move, so a value stays usable after a call. Reassigning re-initialises the binding.
+Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_check.cryo`](../compiler/src/compiler/passes/move_check.cryo)). A *storage-duplicating* move transfers ownership; using the original afterward is a hard error (`E0452`). Move sites are:
+
+- binding a non-`Copy` value to a new name (`const b: T = a;`),
+- assigning a non-`Copy` value into a slot (`x = a;`),
+- placing a non-`Copy` value into an aggregate literal,
+- passing a non-`Copy` value to a function or method parameter that is **not** a reference type (`fn f(t: T)` moves; `fn f(t: &T)` borrows), and
+- calling `binding.drop()` or any method whose receiver consumes (`mut this` or `![sink]`).
+
+References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment.
 
 ```cryo
 const a: Buffer = make_buffer(1024);
-const b: Buffer = a;   // moves a -> b (storage-duplicating)
-use(a);                // ⚠ use of moved value 'a' (warning)
+const b: Buffer = a;   // moves a -> b
+use(a);                // error E0452: use of moved value 'a'
 ```
 
-Ordinary use-after-move stays a **warning**: drop-insertion already skips dropping a moved-from source, so the original still names live memory until the destination is dropped — the read is logically wrong but not, on its own, a memory error. (Whether a *second* `.drop()` is a double free depends on the type — `Rc`/`Box` make it idempotent, a naive `free`-in-`drop` does not — so the compiler cannot decide it in general and leaves it to the warning.)
-
-Two move/ownership hazards that *are* unambiguous memory errors, independent of any type's `drop` body, are **hard errors**:
+Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
 
 - **Loop-carried move** (`E0452`) — a value moved inside a loop and re-read on the next iteration would be freed twice.
 - **Returning the address of a local** (`E0455`) — `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine — those are caller-backed.)
 
-Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 1.4](#14-types-and-type-safety) and [§ 15](#15-pointers-and-memory)). Move tracking is a best-effort aid, not a soundness boundary.
+Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 1.4](#14-types-and-type-safety) and [§ 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
 
 ---
 

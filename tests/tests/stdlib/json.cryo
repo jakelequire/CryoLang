@@ -285,3 +285,57 @@ function round_trip_object() -> Result<(), TestError> {
         }
     }
 }
+
+// ============================================================================
+// Serializer hardening: non-finite floats must NOT emit raw NaN/inf
+// literals (which are not valid JSON per RFC 8259) - serialize as null.
+// ============================================================================
+
+![test]
+function serialize_nan_emits_null() -> Result<(), TestError> {
+    // 0.0 / 0.0 is the cheapest portable NaN; multiplying side-steps
+    // any constant-folding warning.
+    const zero: f64 = 0.0;
+    const nan: f64 = zero / zero;
+    mut v: JsonValue = JsonValue::Number(JsonNumber::Float(nan));
+    mut out: String = serializer::stringify(&v);
+    v.drop();
+    const same: boolean = out.as_str().equals(&Str::new("null"));
+    out.drop();
+    return expect(same, s("NaN must serialize as null", 26));
+}
+
+![test]
+function serialize_positive_infinity_emits_null() -> Result<(), TestError> {
+    const huge: f64 = 1.0e308;
+    const inf: f64 = huge * huge;  // overflow -> +inf
+    mut v: JsonValue = JsonValue::Number(JsonNumber::Float(inf));
+    mut out: String = serializer::stringify(&v);
+    v.drop();
+    const same: boolean = out.as_str().equals(&Str::new("null"));
+    out.drop();
+    return expect(same, s("+Inf must serialize as null", 27));
+}
+
+![test]
+function serialize_negative_infinity_emits_null() -> Result<(), TestError> {
+    const huge: f64 = 1.0e308;
+    const ninf: f64 = -(huge * huge);
+    mut v: JsonValue = JsonValue::Number(JsonNumber::Float(ninf));
+    mut out: String = serializer::stringify(&v);
+    v.drop();
+    const same: boolean = out.as_str().equals(&Str::new("null"));
+    out.drop();
+    return expect(same, s("-Inf must serialize as null", 27));
+}
+
+![test]
+function serialize_finite_float_unchanged() -> Result<(), TestError> {
+    // Sanity: finite floats still go through the normal writer path.
+    mut v: JsonValue = JsonValue::Number(JsonNumber::Float(3.5));
+    mut out: String = serializer::stringify(&v);
+    v.drop();
+    const got_null: boolean = out.as_str().equals(&Str::new("null"));
+    out.drop();
+    return expect(!got_null, s("finite floats must not become null", 34));
+}

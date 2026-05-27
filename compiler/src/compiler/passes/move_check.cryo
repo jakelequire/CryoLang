@@ -560,6 +560,33 @@ type struct MoveChecker {
 
     read_call(mut &this, c: CallExprNode*) -> void {
         if (c == null) { return; }
+        // Special case: `<ident>.drop()` is the user's "release this
+        // binding now" mark.  `Drop::drop` is signed `drop(mut &this)`,
+        // so `method_consumes_receiver` says false (a reference
+        // receiver isn't a by-value consume), and without this arm
+        // the move-checker would treat `x.drop()` as a borrow.  But
+        // drop_insertion already treats `.drop()` as a move so it
+        // doesn't synthesise a second drop at scope exit
+        // (drop_insertion.cryo:1899-1924), and the two passes must
+        // agree on the move-set.  Mirror that classification here so
+        // `x.drop(); x.drop();` (or `x.drop(); use(x);`) surfaces as
+        // E0452 at compile time instead of a silent double-free at
+        // runtime.  Identifier-only receivers and zero arguments keep
+        // the special case syntactic (no false positives on method
+        // chains or .drop()-with-args overloads).
+        if (c.callee != null && c.arguments.length == 0 &&
+            c.callee.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+            if (this.intern != null &&
+                ma.member.id == this.intern.intern("drop").id &&
+                ma.object != null && ma.object.kind == NodeKind::Identifier) {
+                // walk_expr_move's Copy guard short-circuits for
+                // primitives and POD types, so this is a no-op for
+                // bindings that don't actually own anything.
+                this.walk_expr_move(ma.object, true);
+                return;
+            }
+        }
         // Method call to a consuming method: treat the receiver
         // (`x` in `x.method(...)`) as moved.  Without this, a method
         // declared `mut this` or marked `![sink]` would still

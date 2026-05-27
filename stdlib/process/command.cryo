@@ -32,6 +32,7 @@ import collections::string;
 import alloc::allocator;
 import ffi::cstr;
 import ffi::libc;
+import ffi::libc;
 import process::child;
 
 // ArgvBuf: owned grow-on-push buffer of `u8*` for execvp's argv.
@@ -602,52 +603,96 @@ function clone_command(cmd: &Command) -> Command {
 }
 
 /// Drain a `Child`'s captured stdout/stderr into buffers, then
-/// `wait()` for it. Used by `Command::output()`. Reads both streams
-/// in sequence, good enough for small outputs; processes that
-/// produce a lot of stderr while stdout is slow to drain could
-/// deadlock. A real async-capable `select` would fix that, but
-/// that's a separate module.
+/// `wait()` for it. Used by `Command::output()`.
+///
+/// Reads both pipes interleaved via `poll(2)` over non-blocking fds.
+/// The previous serial "drain stdout fully, then stderr" implementation
+/// deadlocked any child that filled the 64-KiB stderr pipe buffer
+/// before its stdout was fully consumed (kernel blocks the child's
+/// write, child never exits, parent never finishes reading stdout,
+/// parent never reaches the stderr read).
 function collect_output(c: mut &Child) -> Result<Output, IoError> {
     mut stdout_buffer: Array<u8> = Array::new();
     mut stderr_buffer: Array<u8> = Array::new();
     mut chunk: u8[4096];
 
+    // Extract raw fds (i32 is Copy, so reading `h.fd` through the match
+    // arm doesn't consume the handle). Put each handle back into its
+    // slot so the existing Drop impls close the fds when `c` drops.
+    mut so_fd:   i32 = -1;
+    mut so_open: boolean = false;
     match (c.stdout) {
-        Option::Some(mut handle) => {
-            loop {
-                match (handle.read(&chunk[0], 4096)) {
-                    Result::Ok(n) => {
-                        if (n == 0) { break; }
-                        mut i: u64 = 0;
-                        while (i < n) { stdout_buffer.push(chunk[i]); i++; }
-                    }
-                    Result::Err(err) => {
-                        return Result::Err(err);
-                    }
-                }
-            }
-            c.stdout = Option::None;
+        Option::Some(mut h) => {
+            so_fd   = h.fd;
+            so_open = true;
+            set_nonblock(so_fd);
+            c.stdout = Option::Some(h);
+        }
+        Option::None => { }
+    }
+    mut se_fd:   i32 = -1;
+    mut se_open: boolean = false;
+    match (c.stderr) {
+        Option::Some(mut h) => {
+            se_fd   = h.fd;
+            se_open = true;
+            set_nonblock(se_fd);
+            c.stderr = Option::Some(h);
         }
         Option::None => { }
     }
 
-    match (c.stderr) {
-        Option::Some(mut handle) => {
-            loop {
-                match (handle.read(&chunk[0], 4096)) {
-                    Result::Ok(n) => {
-                        if (n == 0) { break; }
-                        mut i: u64 = 0;
-                        while (i < n) { stderr_buffer.push(chunk[i]); i++; }
-                    }
-                    Result::Err(err) => {
-                        return Result::Err(err);
-                    }
+    mut polls: libc::pollfd[2];
+    while (so_open || se_open) {
+        mut nfds:   u64 = 0;
+        mut so_idx: i64 = -1;
+        mut se_idx: i64 = -1;
+        if (so_open) {
+            polls[nfds].fd      = so_fd;
+            polls[nfds].events  = libc::POLLIN;
+            polls[nfds].revents = 0 as i16;
+            so_idx = nfds as i64;
+            nfds = nfds + 1;
+        }
+        if (se_open) {
+            polls[nfds].fd      = se_fd;
+            polls[nfds].events  = libc::POLLIN;
+            polls[nfds].revents = 0 as i16;
+            se_idx = nfds as i64;
+            nfds = nfds + 1;
+        }
+
+        const pr: i32 = libc::poll(&polls[0], nfds, -1);
+        if (pr < 0) {
+            const err: IoError = IoError::from_errno(libc::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { continue; }
+                _ => { return Result::Err(err); }
+            }
+        }
+
+        if (so_idx >= 0) {
+            const ev: i16 = polls[so_idx as u64].revents;
+            const ready: i16 = ev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR);
+            if (ready != 0) {
+                match (drain_nonblock(so_fd, &chunk[0], 4096, &stdout_buffer)) {
+                    DrainOutcome::Eof       => { so_open = false; }
+                    DrainOutcome::Again     => { }
+                    DrainOutcome::Failed(e) => { return Result::Err(e); }
                 }
             }
-            c.stderr = Option::None;
         }
-        Option::None => { }
+        if (se_idx >= 0) {
+            const ev: i16 = polls[se_idx as u64].revents;
+            const ready: i16 = ev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR);
+            if (ready != 0) {
+                match (drain_nonblock(se_fd, &chunk[0], 4096, &stderr_buffer)) {
+                    DrainOutcome::Eof       => { se_open = false; }
+                    DrainOutcome::Again     => { }
+                    DrainOutcome::Failed(e) => { return Result::Err(e); }
+                }
+            }
+        }
     }
 
     match (c.wait()) {
@@ -660,6 +705,44 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
         }
         Result::Err(err) => {
             return Result::Err(err);
+        }
+    }
+}
+
+/// Best-effort: switch `fd` to non-blocking by OR'ing `O_NONBLOCK`
+/// into its file-status flags. Failure is ignored — if the kernel
+/// won't take the flag we fall back to whatever poll(2) decides.
+function set_nonblock(fd: i32) -> void {
+    const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
+    if (cur < 0) { return; }
+    libc::fcntl(fd, libc::F_SETFL, (cur | libc::O_NONBLOCK) as i64);
+}
+
+/// Outcome of one non-blocking drain cycle. `Eof` means the writer
+/// has closed its end; `Again` means EAGAIN/EWOULDBLOCK — there are
+/// no bytes available right now, wait on poll again.
+type enum DrainOutcome {
+    Eof;
+    Again;
+    Failed(IoError);
+}
+
+/// Read every available byte from `fd` into `buf`, returning the
+/// stopping reason. `fd` must already be in non-blocking mode.
+function drain_nonblock(fd: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) -> DrainOutcome {
+    loop {
+        const n: i64 = libc::read(fd, chunk, chunk_len);
+        if (n > 0) {
+            mut i: u64 = 0;
+            while (i < n as u64) { buf.push(chunk[i]); i = i + 1; }
+            continue;
+        }
+        if (n == 0) { return DrainOutcome::Eof; }
+        const err: IoError = IoError::from_errno(libc::errno());
+        match (err.kind) {
+            IoErrorKind::Interrupted => { continue; }
+            IoErrorKind::WouldBlock  => { return DrainOutcome::Again; }
+            _ => { return DrainOutcome::Failed(err); }
         }
     }
 }
