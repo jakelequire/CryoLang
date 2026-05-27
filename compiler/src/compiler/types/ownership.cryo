@@ -218,6 +218,215 @@ type struct OwnershipQuery {
         return true;
     }
 
+    // Send / Sync: structural thread-safety markers.
+    //
+    // Mirrors the `is_copy` shape but with thread-safety rules:
+    //   - Primitives, references, function pointers, raw pointers:
+    //     Send + Sync.  Raw pointers being Send+Sync is the
+    //     "weaker-than-Rust" stance Cryo adopts elsewhere (no borrow
+    //     checker, refs unchecked): a struct that hides a `T*` field
+    //     and reasons about it correctly (Box, Arc, Array, HashMap,
+    //     String, ...) doesn't have to fight the type system.  Types
+    //     that genuinely aren't thread-safe (Rc, MutexGuard) go on
+    //     the explicit deny-list below, keyed by their leaf name.
+    //   - Arrays / Optional / Tuple: Send/Sync iff every component is.
+    //   - Struct / Class / Enum aggregates: Send/Sync iff every field
+    //     (or every variant payload, for enums) is, AND the type isn't
+    //     on the deny-list.
+    //   - InstantiatedType: deny-list check on the template's leaf name
+    //     comes first; otherwise delegate to the resolved type.
+    //   - Generic params and unresolved positions: conservative false.
+    //
+    // Send and Sync currently share the same structural rule.  They are
+    // exposed as separate predicates so future divergence (e.g. Rust's
+    // `&T: Send iff T: Sync` distinction) can land without an API change.
+
+    /// True when a value of `ty` may safely transfer between threads.
+    static is_send(arena: TypeArena*, registry: GenericRegistry*,
+                   intern: InternTable*, ty: TypeRef) -> boolean {
+        return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern, ty, 0);
+    }
+
+    /// True when a value of `ty` may safely be shared by reference
+    /// between threads.
+    static is_sync(arena: TypeArena*, registry: GenericRegistry*,
+                   intern: InternTable*, ty: TypeRef) -> boolean {
+        return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern, ty, 0);
+    }
+
+    /// Worker shared by `is_send` and `is_sync`.  Tracks recursion
+    /// depth to bail out of pathological arena chains the same way
+    /// `is_copy_at_depth` does.  Returns `false` for any unresolved /
+    /// out-of-budget input — false negatives only forbid extra
+    /// thread-crossings, never enable an unsound one.
+    static is_thread_safe_at_depth(arena: TypeArena*, registry: GenericRegistry*,
+                                    intern: InternTable*, ty: TypeRef,
+                                    depth: i32) -> boolean {
+        if (depth >= 32) { return false; }
+        if (arena == null) { return false; }
+        const t: Type* = arena.lookup(ty.id);
+        if (t == null) { return false; }
+        const k: TypeKind = t.kind;
+
+        // Primitives are bitwise-portable and don't carry hidden state.
+        if (k == TypeKind::Void   || k == TypeKind::Unit  ||
+            k == TypeKind::Bool   || k == TypeKind::Int   ||
+            k == TypeKind::Float  || k == TypeKind::Char  ||
+            k == TypeKind::String || k == TypeKind::Never) {
+            return true;
+        }
+
+        // References, function pointers, and raw pointers: all Send +
+        // Sync.  Cryo lacks borrow-checked lifetimes, so references are
+        // unchecked address handles like raw pointers; treating them
+        // identically keeps the rule simple.  Stdlib container types
+        // (Box, Arc, Array, HashMap, String, ...) all hide a raw pointer
+        // and depend on this rule to inherit Send/Sync from their
+        // generic args.  Genuinely-unsafe types go on the deny-list.
+        if (k == TypeKind::Pointer   || k == TypeKind::Reference ||
+            k == TypeKind::Function) {
+            return true;
+        }
+
+        // Compound aggregates: thread-safe iff every component is.
+        if (k == TypeKind::Array) {
+            const at: ArrayType* = t as ArrayType*;
+            if (at.is_dynamic()) {
+                // A dynamic-array type alone isn't a value position;
+                // Array<T> is a Struct and walks the field rule below.
+                return false;
+            }
+            return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                            at.element, depth + 1);
+        }
+        if (k == TypeKind::Optional) {
+            const ot: OptionalType* = t as OptionalType*;
+            return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                            ot.wrapped, depth + 1);
+        }
+        if (k == TypeKind::Tuple) {
+            const tt: TupleType* = t as TupleType*;
+            return OwnershipQuery::all_thread_safe(arena, registry, intern,
+                                                    tt.elements, depth + 1);
+        }
+
+        // User aggregates: deny-list first (Rc and friends), then
+        // structural field walk.
+        if (k == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            const sbare: SymbolStr = OwnershipQuery::leaf_segment(intern, st.qualified_name);
+            if (OwnershipQuery::is_thread_safety_denied(intern, sbare)) {
+                return false;
+            }
+            return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
+                                                           st.fields, depth + 1);
+        }
+        if (k == TypeKind::Class) {
+            const ct: ClassType* = t as ClassType*;
+            const cbare: SymbolStr = OwnershipQuery::leaf_segment(intern, ct.qualified_name);
+            if (OwnershipQuery::is_thread_safety_denied(intern, cbare)) {
+                return false;
+            }
+            return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
+                                                           ct.fields, depth + 1);
+        }
+        if (k == TypeKind::Enum) {
+            const et: EnumType* = t as EnumType*;
+            const ebare: SymbolStr = OwnershipQuery::leaf_segment(intern, et.qualified_name);
+            if (OwnershipQuery::is_thread_safety_denied(intern, ebare)) {
+                return false;
+            }
+            return OwnershipQuery::all_variants_thread_safe(arena, registry, intern,
+                                                             et.variants, depth + 1);
+        }
+
+        if (k == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = t as TypeAliasType*;
+            if (!al.target.is_valid()) { return false; }
+            return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                            al.target, depth + 1);
+        }
+
+        if (k == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            // Deny-list check on the template's bare name catches
+            // `Rc<T>` even when its type_args[0] is itself thread-safe.
+            const template_bare: SymbolStr =
+                OwnershipQuery::registry_name_of(arena, intern, ty);
+            if (OwnershipQuery::is_thread_safety_denied(intern, template_bare)) {
+                return false;
+            }
+            if (inst.has_resolved_type()) {
+                return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                                inst.resolved_type, depth + 1);
+            }
+            return false;
+        }
+
+        // Generic params, traits, function templates: not concrete
+        // value positions for the marker query.  Conservative false.
+        return false;
+    }
+
+    /// True when every element type in `tys` is Send/Sync.
+    static all_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
+                            intern: InternTable*, tys: TypeRef[],
+                            depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < tys.length; i++) {
+            if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                          tys[i], depth)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// True when every field's type is Send/Sync.
+    static all_fields_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
+                                    intern: InternTable*, fields: FieldInfo[],
+                                    depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                          fields[i].field_type, depth)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// True when every variant payload list is all-Send/Sync.
+    static all_variants_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
+                                      intern: InternTable*, variants: EnumVariantInfo[],
+                                      depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < variants.length; i++) {
+            if (!OwnershipQuery::all_thread_safe(arena, registry, intern,
+                                                   variants[i].payload_types, depth)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// True when `leaf` names a stdlib type that is inherently
+    /// !Send + !Sync regardless of its component types:
+    ///   - `Rc` : single-threaded reference counting.
+    ///   - `MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard` :
+    ///     pthread mutex/rwlock primitives require unlock from the
+    ///     same thread that acquired the lock, so a guard cannot
+    ///     cross threads.
+    static is_thread_safety_denied(intern: InternTable*, leaf: SymbolStr) -> boolean {
+        if (intern == null || !leaf.is_valid()) { return false; }
+        const rc_name: SymbolStr = intern.intern("Rc");
+        if (rc_name.is_valid() && leaf.equals(rc_name)) { return true; }
+        const mg_name: SymbolStr = intern.intern("MutexGuard");
+        if (mg_name.is_valid() && leaf.equals(mg_name)) { return true; }
+        const rrg_name: SymbolStr = intern.intern("RwLockReadGuard");
+        if (rrg_name.is_valid() && leaf.equals(rrg_name)) { return true; }
+        const rwg_name: SymbolStr = intern.intern("RwLockWriteGuard");
+        if (rwg_name.is_valid() && leaf.equals(rwg_name)) { return true; }
+        return false;
+    }
+
     // needs_drop: does scope-exit drop glue have to run for `ty`?
     //
     // True when a value of `ty` owns a resource that must be released at

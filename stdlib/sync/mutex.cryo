@@ -1,0 +1,200 @@
+///! Mutex<T>: mutual-exclusion lock around a value.
+///!
+///! `Mutex<T, A>` wraps a value `T` in a POSIX mutex so that at most
+///! one thread at a time can read or mutate it.  The mutex's backing
+///! storage (a 40-byte opaque pthread buffer, per the Linux x86_64
+///! ABI) lives in a heap-allocated `MutexInner` so its address stays
+///! stable while concurrent threads hold or wait on the lock — moving
+///! a pthread mutex after `pthread_mutex_init` is undefined behavior.
+///! The `Mutex<T>` handle itself is an 8-byte pointer to the inner,
+///! so the handle is freely movable.
+///!
+///! Calling `lock()` returns a `MutexGuard<T, A>` that
+///!   1. dereferences via `as_ptr()` to a `T*` pointing at the
+///!      guarded value, valid for the lifetime of the guard,
+///!   2. releases the lock automatically when its `drop()` runs.
+///!
+///! `MutexGuard<T, A>` is **not** `Send`: a POSIX mutex must be
+///! unlocked from the same thread that locked it.  The compiler
+///! enforces this via a deny-list keyed on the type name.
+///!
+///! `Mutex<T, A>` itself is `Send + Sync` iff `T: Send` and `A: Send`.
+///! The structural rule does the right thing automatically — there is
+///! no `unsafe impl` on this side.
+///!
+///! ## Lock poisoning
+///!
+///! Cryo's runtime has no cross-thread panic-catch story, so this
+///! implementation does **not** mark a Mutex as "poisoned" when a
+///! thread holding it panics.  In practice, panicking while holding
+///! a mutex leaves the lock held forever (subsequent `lock()` calls
+///! block indefinitely).  Code that needs to recover should use
+///! `try_lock()` with a timeout rather than `lock()`.
+
+namespace std::sync::mutex;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import ffi::libc;
+import sync::error;
+
+
+// Heap-pinned mutex backing: holds the pthread buffer plus the
+// guarded value plus the allocator the handle uses to free us.
+// `pthread_buf` must occupy 40 bytes on Linux x86_64; updating the
+// constant in `ffi::libc` requires updating this array size too.
+type struct MutexInner<T, A> {
+    pthread_buf: u8[40];
+    value:       T;
+    alloc:       A;
+}
+
+
+/// RAII guard returned by `Mutex::lock`.  Carries a raw pointer to
+/// the inner so it can release the lock on drop.  Deref via
+/// `as_ptr()` to read or mutate the guarded value.
+public type struct MutexGuard<T, A> {
+    inner: MutexInner<T, A>*;
+
+    /// Pointer to the guarded value.  Valid for the lifetime of
+    /// this guard; never `null`.
+    as_ptr(&this) -> T* {
+        return &this.inner.value;
+    }
+}
+
+/// Releasing the lock on guard-drop is what makes `Mutex` an RAII
+/// primitive.  The `inner` pointer is nulled after unlock so a
+/// double-drop is a no-op rather than double-unlock.
+implement<T, A> trait Drop for struct MutexGuard<T, A> {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        pthread_mutex_unlock(buf_ptr);
+        this.inner = null;
+    }
+}
+
+
+public type struct Mutex<T, A = GlobalAlloc> {
+    inner: MutexInner<T, A>*;
+
+    /// Construct a `Mutex<T>` initialized to hold `value`, using
+    /// `GlobalAlloc` for the inner allocation.  Panics on
+    /// allocation failure; use `try_new` to handle the error.
+    static new(value: T) -> Mutex<T, GlobalAlloc> {
+        match (Mutex::try_new(value)) {
+            Result::Ok(m)  => { return m; }
+            Result::Err(_) => {
+                intrinsics::panic("Mutex::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    static new_in(value: T, alloc: A) -> Mutex<T, A> {
+        match (Mutex::try_new_in(value, alloc)) {
+            Result::Ok(m)  => { return m; }
+            Result::Err(_) => {
+                intrinsics::panic("Mutex::new_in: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible constructor.  Initializes the pthread mutex with
+    /// default attributes (`PTHREAD_MUTEX_NORMAL`); a failure to
+    /// allocate the inner buffer surfaces as `AllocError`.  A failure
+    /// of `pthread_mutex_init` itself is converted to a
+    /// SyncError-shaped `AllocError::OutOfResources` so the caller
+    /// gets a single fallible path; for v1 we don't expose
+    /// pthread-init errors separately.
+    static try_new(value: T) -> Result<Mutex<T, GlobalAlloc>, AllocError> {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<MutexInner<T, GlobalAlloc>>();
+        match (alloc.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<MutexInner<T, GlobalAlloc>> =
+                    raw.cast<MutexInner<T, GlobalAlloc>>();
+                const inner_ptr: MutexInner<T, GlobalAlloc>* = typed.as_ptr();
+                const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+                pthread_mutex_init(buf_ptr, null);
+                inner_ptr.value = value;
+                inner_ptr.alloc = alloc;
+                return Result::Ok(Mutex<T, GlobalAlloc> { inner: inner_ptr });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    static try_new_in(value: T, alloc: A) -> Result<Mutex<T, A>, AllocError> {
+        mut a: A = alloc;
+        const header: Layout = Layout::of<MutexInner<T, A>>();
+        match (a.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<MutexInner<T, A>> = raw.cast<MutexInner<T, A>>();
+                const inner_ptr: MutexInner<T, A>* = typed.as_ptr();
+                const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+                pthread_mutex_init(buf_ptr, null);
+                inner_ptr.value = value;
+                inner_ptr.alloc = a;
+                return Result::Ok(Mutex<T, A> { inner: inner_ptr });
+            }
+            Result::Err(err) => { return Result::Err(err); }
+        }
+    }
+
+    /// Acquire the lock, blocking the current thread until it is
+    /// available.  Returns a guard whose `drop()` will release the
+    /// lock.  Panics only on a programming error reported by
+    /// `pthread_mutex_lock` (`EINVAL` from a recursively-locked
+    /// non-recursive mutex or a destroyed mutex).
+    lock(&this) -> MutexGuard<T, A> {
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const rc: i32 = pthread_mutex_lock(buf_ptr);
+        if (rc != 0) {
+            intrinsics::panic("Mutex::lock: pthread_mutex_lock failed", FILE, LINE);
+        }
+        return MutexGuard<T, A> { inner: this.inner };
+    }
+
+    /// Non-blocking lock attempt.  Returns `Some(guard)` when the
+    /// lock was acquired; `None` when the lock was already held by
+    /// another thread.
+    try_lock(&this) -> Option<MutexGuard<T, A>> {
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        const rc: i32 = pthread_mutex_trylock(buf_ptr);
+        if (rc == 0) {
+            return Option::Some(MutexGuard<T, A> { inner: this.inner });
+        }
+        return Option::None;
+    }
+
+    /// Raw pointer to the inner pthread buffer.  Used by `CondVar`
+    /// to pair the mutex with a condition variable in
+    /// `pthread_cond_wait`; not a stable public API.
+    raw_pthread_buf(&this) -> u8* {
+        return &this.inner.pthread_buf[0];
+    }
+}
+
+/// Tears down the pthread mutex and frees the inner buffer.  Caller
+/// is responsible for ensuring no outstanding `MutexGuard` exists
+/// when this fires — a guard that outlives its mutex will unlock a
+/// destroyed pthread buffer, which is undefined behavior.
+implement<T, A> trait Drop for struct Mutex<T, A>
+where T: Drop, A: Allocator {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner_ptr: MutexInner<T, A>* = this.inner;
+        const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
+        pthread_mutex_destroy(buf_ptr);
+        inner_ptr.value.drop();
+        mut alloc: A = inner_ptr.alloc;
+        const header: Layout = Layout::of<MutexInner<T, A>>();
+        alloc.deallocate(NonNull::new(this.inner as u8*), header);
+        this.inner = null;
+    }
+}

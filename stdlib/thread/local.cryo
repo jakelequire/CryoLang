@@ -1,0 +1,114 @@
+///! ThreadLocal<T>: per-thread storage backed by `pthread_key`.
+///!
+///! Each thread that touches a `ThreadLocal<T>` lazily gets its own
+///! heap-allocated `T` on first access; subsequent accesses by the
+///! same thread return a pointer to the same slot.  Threads never
+///! see each other's values.
+///!
+///! ## Implementation
+///!
+///! Built on POSIX `pthread_key_create` + `pthread_setspecific` /
+///! `pthread_getspecific`.  The per-thread value is heap-boxed and
+///! the `void*` slot in pthread's TLS table holds the box's raw
+///! pointer.  First access on a thread allocates and runs the
+///! `init: () -> T` function pointer supplied at construction.
+///!
+///! ## Cleanup discipline (v1 limitation)
+///!
+///! `pthread_key_create` accepts a destructor that pthread runs when
+///! a thread exits.  v1 passes **null** for that destructor, meaning
+///! per-thread allocations are NOT automatically freed when a thread
+///! exits.  Callers must invoke `clear()` from each thread before
+///! the thread terminates, or accept the leak.
+///!
+///! A future revision can wire a per-T monomorphized `extern "C"`
+///! destructor through the compiler's generic-monomorphization
+///! pipeline, eliminating the leak.  Until then, daemon-style
+///! threads (process-lifetime) make this limitation immaterial,
+///! and short-lived worker threads should call `clear()` at exit.
+///!
+///! ## Constraints
+///!
+///! - `init: () -> T` must be a function pointer (non-capturing
+///!   lambda or named function).  Capturing closures can't be passed
+///!   through a `() -> T` slot.
+///! - `T` must not depend on per-allocation alignment beyond what
+///!   `GlobalAlloc::allocate` provides for `Layout::of<T>()`.
+
+namespace std::thread::local;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import ffi::libc;
+
+
+public type struct ThreadLocal<T> {
+    key:  u32;
+    init: () -> T;
+
+    /// Construct a `ThreadLocal<T>` whose per-thread value is produced
+    /// by calling `init` on first access from each thread.  Panics on
+    /// pthread key-creation failure (typically OOM in the kernel-side
+    /// key table; rare).
+    static new(init: () -> T) -> ThreadLocal<T> {
+        mut key: u32 = 0u32;
+        // Null destructor: see the leak note in the module doc.
+        const rc: i32 = pthread_key_create(&key, null);
+        if (rc != 0) {
+            intrinsics::panic("ThreadLocal::new: pthread_key_create failed",
+                              FILE, LINE);
+        }
+        return ThreadLocal<T> { key: key, init: init };
+    }
+
+    /// Get a raw pointer to the current thread's value, initializing
+    /// it via `init` on first access.  The pointer is stable for the
+    /// lifetime of the thread (or until `clear()` is called by the
+    /// same thread).
+    get(&this) -> T* {
+        const raw: u8* = pthread_getspecific(this.key);
+        if (raw != null) {
+            return raw as T*;
+        }
+        // First access on this thread: allocate and initialize.
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const layout: Layout = Layout::of<T>();
+        match (alloc.allocate(layout)) {
+            Result::Ok(buf) => {
+                const tp: T* = buf.cast<T>().as_ptr();
+                *tp = (this.init)();
+                pthread_setspecific(this.key, tp as u8*);
+                return tp;
+            }
+            Result::Err(_) => {
+                intrinsics::panic("ThreadLocal::get: allocation failed",
+                                  FILE, LINE);
+            }
+        }
+    }
+
+    /// Free the current thread's value if it has been initialized.
+    /// Subsequent `get()` from this thread will re-run `init`.  Other
+    /// threads' values are untouched.
+    clear(&this) -> void {
+        const raw: u8* = pthread_getspecific(this.key);
+        if (raw == null) { return; }
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const layout: Layout = Layout::of<T>();
+        alloc.deallocate(NonNull::new(raw), layout);
+        pthread_setspecific(this.key, null);
+    }
+}
+
+/// Releases the pthread TLS key.  Does NOT free per-thread values
+/// other threads may still hold — callers must coordinate cleanup
+/// via `clear()` from each thread before dropping the ThreadLocal.
+implement<T> trait Drop for struct ThreadLocal<T> {
+    drop(mut &this) -> void {
+        pthread_key_delete(this.key);
+    }
+}

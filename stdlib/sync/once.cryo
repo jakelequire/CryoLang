@@ -1,0 +1,85 @@
+///! Once: one-shot initialization synchronization.
+///!
+///! A `Once` runs an initialization function exactly once across all
+///! threads — every thread that calls `call_once()` either runs the
+///! initializer (the first one to enter) or blocks until the
+///! initializer has finished (every subsequent caller).  After the
+///! initializer returns, every `call_once()` returns immediately.
+///!
+///! Backed by POSIX `pthread_once_t` (4 bytes on Linux x86_64).  The
+///! initial state is all-zero, so a `pthread_once_t` zeroed buffer
+///! IS the `PTHREAD_ONCE_INIT` constant: no separate `pthread_*_init`
+///! call is needed.
+///!
+///! The initializer is a `() -> void` function pointer.  Cryo lambdas
+///! without captures are valid function pointers, so the typical call
+///! site reads:
+///!   ```cryo
+///!   static ONCE: Once = Once::new();
+///!   ONCE.call_once(() -> void { setup_global_table(); });
+///!   ```
+///!
+///! `Once` is `Send + Sync` unconditionally.
+
+namespace std::sync::once;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import ffi::libc;
+
+
+type struct OnceInner {
+    pthread_buf: u8[4];
+}
+
+
+public type struct Once {
+    inner: OnceInner*;
+
+    /// Construct a fresh `Once` in the not-yet-run state.  Panics on
+    /// allocation failure (`Once` has no fallible constructor — the
+    /// expected use is in a module-level constant, where allocation
+    /// happens once and panic-on-failure is the right default).
+    static new() -> Once {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<OnceInner>();
+        match (alloc.allocate(header)) {
+            Result::Ok(raw) => {
+                const typed: NonNull<OnceInner> = raw.cast<OnceInner>();
+                const inner_ptr: OnceInner* = typed.as_ptr();
+                // PTHREAD_ONCE_INIT is an all-zero buffer; explicit
+                // memset to keep the initial state portable in case
+                // the allocator hands back uninitialized bytes.
+                intrinsics::memset(inner_ptr as void*, 0i32, header.size());
+                return Once { inner: inner_ptr };
+            }
+            Result::Err(_) => {
+                intrinsics::panic("Once::new: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Run `init` exactly once across all threads that call
+    /// `call_once` on this `Once`.  Threads calling concurrently
+    /// block until the initializer completes.
+    call_once(&this, init: () -> void) -> void {
+        const buf_ptr: u8* = &this.inner.pthread_buf[0];
+        pthread_once(buf_ptr, init as void*);
+    }
+}
+
+implement trait Drop for struct Once {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        // pthread_once_t has no _destroy entry-point; the buffer is
+        // just data.  Free the inner and we're done.
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        const header: Layout = Layout::of<OnceInner>();
+        alloc.deallocate(NonNull::new(this.inner as u8*), header);
+        this.inner = null;
+    }
+}
