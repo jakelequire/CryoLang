@@ -64,7 +64,7 @@ ExternDecl         ::= "extern" "function" Ident
 ExternFn           ::= "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
 
-(*  C-header import — a named-namespace form of `extern "C"` that
+(*  C-header import - a named-namespace form of `extern "C"` that
     asks the compiler to invoke clang on the listed headers and pull
     the resulting declarations into the named namespace.            *)
 CHeaderImport      ::= Ident ":=" "extern" StringLit
@@ -81,8 +81,11 @@ ParamList          ::= Param ("," Param)* ("," VariadicParam)?
 Param              ::= Ident ":" Type | "&this" | "mut" "&this"
 VariadicParam      ::= Ident ":" Type "..."
 
-WhereClause        ::= Ident ":" Ident ("+" Ident)*
-                       ("," Ident ":" Ident ("+" Ident)*)*
+WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*
+                       ("," Ident ":" TraitBound ("+" TraitBound)*)*
+                       (* TraitBound is a possibly-qualified trait name with
+                          optional generic arguments - same shape as
+                          super-trait references on a `type trait` decl. *)
 Visibility         ::= "public" | "private" | "protected"
 
 
@@ -101,6 +104,9 @@ AggregateKind      ::= "struct" | "class"
 
 Member             ::= Visibility? "static"?
                        (Field | Method | Constructor | Destructor)
+                     | VisibilityBlock          (* `public:` / `private:` / `protected:`
+                                                   labels a run of subsequent members. *)
+VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor)*
 
 Field              ::= Ident ":" Type ("=" Expr)? ";"
 Method             ::= ("virtual" | "override")? Ident Generics?
@@ -208,8 +214,12 @@ Primary            ::= Literal
                      | Lambda
                      | "(" Expr ")"
 
-Lambda             ::= "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Type
-                       (Block | Expr)            (* non-capturing function literal *)
+Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Type
+                       Block                     (* function literal; captures
+                                                    its environment by value-copy
+                                                    for Copy types and by move
+                                                    otherwise.  `move` makes the
+                                                    move-capture explicit. *)
 LambdaParam        ::= Ident (":" Type)?
 
 StructLit          ::= Ident GenericArgs?
@@ -243,14 +253,17 @@ CaseClause         ::= ("case" Expr | "default") ":" Statement*
 
 (*  Patterns =================================================== *)
 
-(* Or-patterns are written at the arm level (see MatchArm) — a
+(* Or-patterns are written at the arm level (see MatchArm) - a
    single Pattern node never contains `|` itself.                  *)
 
 Pattern            ::= "_"
                      | Literal
                      | Ident                              (* binding *)
                      | QualName ("(" PatElem ("," PatElem)* ")")?  (* enum *)
-                     | Literal ".." Literal               (* range  *)
+                     | RangeBound ".." RangeBound         (* range, both bounds
+                                                             same kind: char or
+                                                             integer literal *)
+RangeBound         ::= CharLit | "-"? IntLit
 PatElem            ::= "_" | Ident | Literal | "mut" Ident
 
 
@@ -313,7 +326,7 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*                                                                  *)
 (*  These names are reserved by the lexer and may not be used as    *)
 (*  identifiers.  Some (e.g. `from`, `async`, `await`, `yield`)     *)
-(*  are lexed but not yet wired into the parser — see § 21 of       *)
+(*  are lexed but not yet wired into the parser - see § 21 of       *)
 (*  `cryo.md` for the reserved-syntax table.                        *)
 (*                                                                  *)
 (*  alignof    any        as        async     auto       await     *)
@@ -323,10 +336,10 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  float      for        from      function  generic    i8        *)
 (*  i16        i32        i64       i128      if         implement *)
 (*  import     in         inline    int       intrinsic  loop      *)
-(*  match      module     mut       mutable   namespace  new       *)
-(*  null       optional   override  private   protected  public    *)
-(*  return     sizeof     static    string    struct     switch    *)
-(*  this       This       trait     true      tuple      type      *)
-(*  typeof     u8         u16       u32       u64        u128      *)
-(*  uint       unsafe     unsigned  virtual   void       where     *)
-(*  while      with       yield                                    *)
+(*  match      module     move      mut       mutable    namespace *)
+(*  new        null       optional  override  private    protected *)
+(*  public     return     sizeof    static    string     struct    *)
+(*  switch     this       This      trait     true       tuple     *)
+(*  type       typeof     u8        u16       u32        u64       *)
+(*  u128       uint       unsafe    unsigned  virtual    void      *)
+(*  where      while      with      yield                          *)

@@ -14,7 +14,7 @@
 namespace Hello;
 
 function main() -> int {
-    printf("Hello, world!");
+    printf("Hello, world!\n");
     return 0;
 }
 ```
@@ -46,7 +46,7 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
 
 ## Installing
 
-The repo ships a committed self-hosted compiler binary at `bin/cryo` and a stdlib at `stdlib/`. The installer symlinks them into your `$PATH`. **No build step is required.**
+The repo ships a committed self-hosted compiler binary at `bin/cryo` and a stdlib at `stdlib/`. The installer symlinks them into your `$PATH` and builds the stdlib archive (`stdlib/.bin/libcryo.a`, ~1 s on first install). The pinned `bin/cryo` itself does not need to be rebuilt.
 
 ```bash
 git clone https://github.com/jakelequire/CryoLang.git
@@ -95,7 +95,7 @@ cryo init hello
 cd hello
 ```
 
-`cryo init` is interactive — pressing Enter accepts every default. When invoked as `cryo init <dir>` the directory becomes the default project name; piping empty lines (`yes "" | cryo init hello`) accepts every prompt non-interactively.
+`cryo init` is interactive - pressing Enter accepts every default. When invoked as `cryo init <dir>` the directory becomes the default project name; piping empty lines (`yes "" | cryo init hello`) accepts every prompt non-interactively.
 
 This produces:
 
@@ -144,11 +144,11 @@ Type annotations are required. Mutability is opt-in.
 ### Control flow
 
 ```cryo
-if (x > 0) { println("positive"); }
-else if (x < 0) { println("negative"); }
-else { println("zero"); }
+if (x > 0) { printf("positive\n"); }
+else if (x < 0) { printf("negative\n"); }
+else { printf("zero\n"); }
 
-for (mut i: int = 0; i < 10; i++) { println("%d", i); }
+for (mut i: int = 0; i < 10; i++) { printf("%d\n", i); }
 
 loop {
     if (done) { break; }
@@ -196,7 +196,7 @@ public:
 type class Dog : Animal {
 public:
     Dog() : Animal("Dog") {}
-    override speak(&this) -> void { println("%s: Woof!", this.name); }
+    override speak(&this) -> void { printf("%s: Woof!\n", this.name); }
 }
 
 function make_speak(a: Animal*) -> void {
@@ -215,9 +215,9 @@ type enum Shape {
 
 function describe(s: Shape) -> void {
     match (s) {
-        Shape::Circle(r)        => { println("Circle r=%f", r); }
-        Shape::Rectangle(w, h)  => { println("Rect %f x %f", w, h); }
-        Shape::Point            => { println("A point"); }
+        Shape::Circle(r)        => { printf("Circle r=%f\n", r); }
+        Shape::Rectangle(w, h)  => { printf("Rect %f x %f\n", w, h); }
+        Shape::Point            => { printf("A point\n"); }
     }
 }
 ```
@@ -379,7 +379,7 @@ entry_point = "src/tool/main.cryo"
 | Module | What you'll find |
 | --- | --- |
 | `core` | Language foundations: `Option`, `Result`, `Slice`, `NonNull`, `Range`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `From`/`Into`/`TryFrom`, `Step`. Memory utilities. FNV-1a hasher. |
-| `alloc` | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump), `Pool` (slab), `Rc<T>`. |
+| `alloc` | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump), `Pool` (slab), `Rc<T>`, `Arc<T>`. |
 | `collections` | `Array<T, A>`, `Str` (borrowed UTF-8), `String<A>` (owned UTF-8), `HashMap<K, V, A>`, `HashSet<T, A>`. Allocator-generic with `GlobalAlloc` default. |
 | `io` | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping. |
 | `fmt` | `Display`, `Debug`, `Formatter<W>`, `FmtWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`. |
@@ -390,6 +390,8 @@ entry_point = "src/tool/main.cryo"
 | `math` | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`. |
 | `net` | TCP sockets and an HTTP/1.1 layer: `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, connection-per-request `serve(addr, handler)`, `Client::get`/`post`. |
 | `process` | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`. |
+| `sync` | Atomics (`AtomicU8` / `U32` / `U64` / `I32` / `I64` / `Bool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
+| `thread` | `ThreadLocal<T>` via POSIX TLS. (`thread::spawn` / `JoinHandle` are post-1.0; see Roadmap below.) |
 | `test` | The built-in unit-test framework. |
 
 The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `collections::array`, and `alloc::box`.
@@ -412,7 +414,7 @@ make clean             # remove compiler + stdlib build outputs
 
 Day-to-day flow: `make cryo`. Pre-tag / pre-merge gate: `make selfhost-check`.
 
-The pinned binary at `bin/cryo` is required — every build target drives off it. If the pin is missing, check out a revision that has it committed.
+The pinned binary at `bin/cryo` is required - every build target drives off it. If the pin is missing, check out a revision that has it committed.
 
 ---
 
@@ -486,8 +488,11 @@ for the full 1.0 release notes.
 - Trait system with `where`-bound generics, monomorphisation, and trait impls on primitives.
 - Single-inheritance classes with virtual dispatch and destructors.
 - Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, exclusive range, or-patterns).
+- Lambdas and capturing closures (let-bound, inline, multi-capture, nested, closure-as-fn-arg).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
-- Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`.
+- Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`, `Arc`.
+- Synchronization primitives: atomics (`AtomicU{8,32,64}`, `AtomicI{32,64}`, `AtomicBool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with call-site enforcement.
+- `ThreadLocal<T>` via POSIX TLS.
 - I/O over `Read` / `Write` traits with buffered wrappers.
 - HTTP/1.1 server (keep-alive, read timeouts), client, router. JSON parser and serializer.
 - POSIX subprocess spawning with `fork + execve`.
@@ -497,14 +502,14 @@ for the full 1.0 release notes.
 
 **Beyond 1.0 (post-stable):**
 
+- `thread::spawn` / `JoinHandle` / `Builder` (the `sync` primitives ship in 1.0; what's missing is the way to start a second thread from Cryo source). `mpsc` channels.
 - Async / await / coroutines (currently parser-only).
-- Range expressions (`a..b`, `a..=b`) in expression position.
-- Inclusive range patterns (`1..=10`) and pattern guard clauses (`x if cond =>`).
+- Range expressions (`a..b`, `a..=b`) in expression position. Pattern guard clauses (`x if cond =>`).
 - Iterator adapters (`.map`, `.filter`, `.collect`, …) and `for x in iter` loops.
-- Capturing closures.
 - TLS, UDP, HTTP/2, and WebSocket for `net::http`.
-- Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, …).
-- Cross-compilation.
+- Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, `metadata`, …).
+- `time` (`Instant`, `Duration`, `sleep`) and `random` modules.
+- Cross-compilation; Windows / macOS targets.
 
 A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax).
 
@@ -514,4 +519,4 @@ A precise list of features the grammar reserves but the compiler does not yet lo
 
 Licensed under the [Apache License 2.0](LICENSE).
 
-Copyright 2025 Jacob LeQuire.
+Copyright 2025–2026 Jacob LeQuire.

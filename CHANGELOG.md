@@ -58,7 +58,7 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 ### Standard library
 
 - **`alloc`:** `Allocator` trait, `GlobalAlloc`, `Arena`, `Pool`, `Box<T>`,
-  `Rc<T>` (all allocator-generic).
+  `Rc<T>`, `Arc<T>` (all allocator-generic).
 - **`collections`:** `Array<T>`, `String`, `HashMap<K,V>`, `HashSet<T>`,
   `Pair<A,B>`, `Slice<T>`, `Str`.
 - **`core`:** `Copy`/`Drop`/`Clone`/`Eq`/`Ord`/`Hash`/`Default`/`From`/`Into`/
@@ -76,12 +76,18 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`process`:** `Command`/`Child`/`ExitStatus` via `fork + execve`;
   `spawn`/`status`/`output`/`wait`/`try_wait`/`kill`/`send_signal`.
 - **`env`:** `args()`, `var`, `set_var`, `remove_var`, `process_exit`.
+- **`sync`:** atomics (`AtomicU8`/`U32`/`U64`/`I32`/`I64`/`Bool`,
+  `MemoryOrder`, `fence`, `compiler_fence`), `Mutex<T>`, `RwLock<T>`,
+  `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with
+  call-site enforcement.
+- **`thread`:** `ThreadLocal<T>` via `pthread_key`. (`thread::spawn`,
+  `JoinHandle`, `Builder` are post-1.0.)
 - **`math`:** `sqrt`, `pow`, `sin`/`cos`/`tan`, `ln`/`log2`/`log10`/`exp`,
   `abs_i32`/`abs_i64`/`abs_f64`, `is_nan`/`is_inf`/`is_finite`, `hypot`.
 - **`fmt`:** `Display`/`Debug`/`FmtWrite` traits, `Formatter<W>`,
   `print`/`println`/`eprint`/`eprintln`, `format_to_string`,
   `format_debug_to_string`, floating-point formatting.
-- **`test`:** the `cryo test` framework — `![test]`, `![ignore]`,
+- **`test`:** the `cryo test` framework - `![test]`, `![ignore]`,
   `![should_panic]`, `expect_*` assertion helpers.
 - **`ffi`:** `CStr`/`CString`/`NulError`; `libc` bindings (~2k LoC);
   syscall layer (~2k LoC).
@@ -124,7 +130,7 @@ stdin-driven interactive I/O, and capturing closures.
 
 ### Known limitations (deferred to post-1.0)
 
-These are not bugs against 1.0 — the language deliberately ships
+These are not bugs against 1.0 - the language deliberately ships
 without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
@@ -140,7 +146,10 @@ authoritative list.
   (`Option`/`Result`/`Array`/`HashMap` print via field access, not via
   `println("{}", x)`).
 - Async / await / coroutines.
-- Threading, atomics, channels.
+- `thread::spawn` / `JoinHandle` / `Builder` and `mpsc` channels. (The
+  primitives under `std::sync` and `Arc<T>` ship in 1.0; what's missing
+  is the way to start a second thread from Cryo source.)
+- `time::Instant` / `Duration` / `sleep`; `random` module.
 - Filesystem operations beyond read/write/open (`remove_file`,
   `create_dir`, `read_dir`, `metadata`, `rename`, `exists`, `copy`).
 - TLS, UDP, HTTP/2, WebSocket in `net`.
