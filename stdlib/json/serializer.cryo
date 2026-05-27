@@ -165,14 +165,33 @@ function write_number(out: mut &String, n: &JsonNumber) -> void {
             }
         }
         JsonNumber::Float(v) => {
-            // Defer to the stdlib float writer. It produces a shape
-            // round-trip-able through strtod; that's all we promise.
-            mut buf: u8[32];
-            const written: u64 = v.to_buf(&buf[0]);
-            mut i: u64 = 0;
-            while (i < written) {
-                out.push_byte(buf[i]);
-                i++;
+            // JSON (RFC 8259 §6) has no representation for NaN or
+            // infinity. The stdlib float writer formats those as the
+            // literal text "NaN" / "inf" / "-inf" (a legitimate choice
+            // for debug output) but emitting those bytes into a JSON
+            // stream produces a document that no compliant parser will
+            // accept. Map every non-finite value to JSON's `null` so
+            // round-tripping through external systems stays valid.
+            //
+            // The finite check is inline: for any finite `v`, `v - v`
+            // is `0.0`; for both NaN and ±Inf, `v - v` is NaN, and
+            // `NaN == 0.0` is false. One arithmetic op, no imports.
+            const finite: boolean = (v - v) == 0.0;
+            if (!finite) {
+                out.push_byte(110); // 'n'
+                out.push_byte(117); // 'u'
+                out.push_byte(108); // 'l'
+                out.push_byte(108); // 'l'
+            } else {
+                // Defer to the stdlib float writer. It produces a shape
+                // round-trip-able through strtod; that's all we promise.
+                mut buf: u8[32];
+                const written: u64 = v.to_buf(&buf[0]);
+                mut i: u64 = 0;
+                while (i < written) {
+                    out.push_byte(buf[i]);
+                    i++;
+                }
             }
         }
     }

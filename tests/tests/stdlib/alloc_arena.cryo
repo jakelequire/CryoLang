@@ -138,12 +138,13 @@ function overflow_allocates_additional_chunk() -> Result<(), TestError> {
 }
 
 ![test]
-function reset_releases_and_arena_reusable() -> Result<(), TestError> {
+function reset_reuses_chunks_and_arena_reusable() -> Result<(), TestError> {
     mut a: Arena = Arena::with_chunk_size(256);
     match (a.allocate(Layout::new(16, 8))) {
         Result::Ok(_)  => { }
         Result::Err(_) => { a.drop(); return bail(Str::new("pre-reset allocate failed")); }
     }
+    const cap_before_reset: u64 = a.capacity();
     a.reset();
     const cap_after_reset: u64 = a.capacity();
     const used_after_reset: u64 = a.used();
@@ -154,13 +155,45 @@ function reset_releases_and_arena_reusable() -> Result<(), TestError> {
         Result::Err(_) => { }
     }
     a.drop();
-    match (expect_eq(cap_after_reset, 0)) {     // reset released every chunk
+    // Reset reuses the chunks (does NOT free them back to the system).
+    match (expect_eq(cap_after_reset, cap_before_reset)) {
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
     }
-    match (expect_eq(used_after_reset, 0)) {
+    match (expect_eq(used_after_reset, 0)) {     // high-water mark is zeroed
         Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
     }
     return expect(reusable, Str::new("arena must be reusable after reset"));
+}
+
+![test]
+function reset_does_not_round_trip_through_system_allocator() -> Result<(), TestError> {
+    // Repeated reset+allocate must reuse the underlying chunk — the
+    // capacity stays constant, no churn.  This is the amortizing
+    // property of an arena (the bug was that reset==drop, so each
+    // reset+allocate cycle round-tripped through malloc/free).
+    mut a: Arena = Arena::with_chunk_size(1024);
+    match (a.allocate(Layout::new(64, 8))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("first allocate failed")); }
+    }
+    const cap1: u64 = a.capacity();
+    a.reset();
+    match (a.allocate(Layout::new(64, 8))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("post-reset allocate failed")); }
+    }
+    const cap2: u64 = a.capacity();
+    a.reset();
+    match (a.allocate(Layout::new(64, 8))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { a.drop(); return bail(Str::new("post-second-reset allocate failed")); }
+    }
+    const cap3: u64 = a.capacity();
+    a.drop();
+    match (expect_eq(cap1, cap2)) {
+        Result::Ok(_)  => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cap2, cap3);
 }
 
 // with_chunk_size(0) is a caller bug and panics; the forked runner counts

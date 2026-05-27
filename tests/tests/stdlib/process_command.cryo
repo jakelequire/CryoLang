@@ -1,6 +1,8 @@
 ///! Command / Child — spawn known binaries, check exit status, capture
-///! stdout.  Uses tiny outputs only (the H3 stderr-drain deadlock means
-///! large captures are unsafe).
+///! stdout and stderr.  As of 2026-05-26 the H3 stderr-drain deadlock
+///! is fixed (poll(2) over non-blocking pipes), so large captures are
+///! safe; the `output_with_large_stderr_does_not_deadlock` test
+///! exercises a >64-KiB stderr load specifically as a regression.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::ProcessCommand;
@@ -157,4 +159,55 @@ function output_captures_stdout() -> Result<(), TestError> {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
     return expect(content_ok, Str::new("output().stdout should be \"foo bar\\n\""));
+}
+
+// Regression for the H3 stderr-drain deadlock (audit 2026-05-26).
+// Pre-fix: collect_output() read stdout fully, then stderr.  A child
+// that filled its 64-KiB stderr pipe buffer before its stdout was
+// drained would block on `write(stderr, ...)`, the parent would block
+// on `read(stdout, ...)` waiting for the terminator the child hadn't
+// yet produced, and the whole thing would deadlock forever.
+//
+// Post-fix: poll(2) over both pipes interleaved.  This test forces
+// roughly 100 KiB onto stderr (well past the kernel's pipe buffer)
+// before the child writes any stdout, and confirms output() returns
+// in bounded time with both streams captured.
+![test]
+function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
+    mut cmd: Command = Command::new(Str::new("/bin/sh"));
+    cmd.arg(Str::new("-c"));
+    // Print ~100 KiB to stderr first (`yes` repeats "y\n" forever;
+    // `head -c` caps to 100000 bytes), then one terminator line to
+    // stdout.  Under the old serial-drain code this hangs forever.
+    cmd.arg(Str::new("yes | head -c 100000 >&2; echo done"));
+    mut deadlocked: boolean = true;
+    mut success:    boolean = false;
+    mut got_stdout: boolean = false;
+    mut got_stderr: boolean = false;
+    match (cmd.output()) {
+        Result::Ok(out) => {
+            mut o: Output = out;
+            deadlocked = false;
+            success    = o.status.success();
+            got_stdout = o.stdout.length() >= 4;     // "done\n"
+            got_stderr = o.stderr.length() >= 100000;
+            o.drop();
+        }
+        Result::Err(_) => {
+            // /bin/sh missing on this host - skip rather than fail.
+            cmd.drop();
+            return Result::Ok(());
+        }
+    }
+    cmd.drop();
+    match (expect(!deadlocked, Str::new("output() must return; old serial drain deadlocked"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(success, Str::new("child should exit with status 0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(got_stdout, Str::new("stdout 'done' terminator must be captured"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(got_stderr, Str::new("stderr must capture ~100 KiB"));
 }

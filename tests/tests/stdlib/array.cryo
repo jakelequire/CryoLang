@@ -288,3 +288,161 @@ function get_ptr_borrows_owning_elements_no_double_free() -> Result<(), TestErro
         Str::new("get_ptr should borrow 'beta' from the array in place"));
 }
 
+// Sort ------------------------------------------------------------------------
+
+function arr_eq_i32_seq(arr: &Array<i32>, expected: &Array<i32>) -> boolean {
+    if (arr.length() != expected.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < arr.length()) {
+        match (arr.get(i)) {
+            Option::Some(av) => {
+                match (expected.get(i)) {
+                    Option::Some(ev) => { if (av != ev) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+![test]
+function sort_empty_array_is_noop() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    a.sort();
+    const ok: boolean = a.length() == 0;
+    a.drop();
+    return expect(ok, Str::new("sort on empty array must not crash or grow it"));
+}
+
+![test]
+function sort_single_element_is_noop() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    a.push(42);
+    a.sort();
+    mut ok: boolean = a.length() == 1;
+    match (a.get(0)) {
+        Option::Some(v) => { if (v != 42) { ok = false; } }
+        Option::None    => { ok = false; }
+    }
+    a.drop();
+    return expect(ok, Str::new("sort on single-element array preserves it"));
+}
+
+![test]
+function sort_already_sorted_unchanged() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    mut i: i32 = 0;
+    while (i < 32) { a.push(i); i = i + 1; }
+    a.sort();
+    mut want: Array<i32> = Array<i32>::new();
+    mut j: i32 = 0;
+    while (j < 32) { want.push(j); j = j + 1; }
+    const ok: boolean = arr_eq_i32_seq(&a, &want);
+    a.drop();
+    want.drop();
+    return expect(ok, Str::new("already-sorted input must round-trip identical"));
+}
+
+![test]
+function sort_reverse_sorted_ascends() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    mut i: i32 = 31;
+    while (i >= 0) { a.push(i); i = i - 1; }
+    a.sort();
+    mut want: Array<i32> = Array<i32>::new();
+    mut j: i32 = 0;
+    while (j < 32) { want.push(j); j = j + 1; }
+    const ok: boolean = arr_eq_i32_seq(&a, &want);
+    a.drop();
+    want.drop();
+    return expect(ok, Str::new("reverse-sorted input must end up ascending 0..32"));
+}
+
+![test]
+function sort_random_small_below_cutoff() -> Result<(), TestError> {
+    // Below SORT_INSERTION_CUTOFF (16): exercises the insertion-sort path.
+    mut a: Array<i32> = Array<i32>::new();
+    a.push(7);  a.push(2);  a.push(9);  a.push(1);
+    a.push(5);  a.push(3);  a.push(8);  a.push(4);
+    a.push(6);  a.push(0);  // 10 elements
+    a.sort();
+    mut want: Array<i32> = Array<i32>::new();
+    mut j: i32 = 0;
+    while (j < 10) { want.push(j); j = j + 1; }
+    const ok: boolean = arr_eq_i32_seq(&a, &want);
+    a.drop();
+    want.drop();
+    return expect(ok, Str::new("small-input insertion-sort path must sort correctly"));
+}
+
+![test]
+function sort_random_above_cutoff() -> Result<(), TestError> {
+    // Above SORT_INSERTION_CUTOFF: exercises the quicksort path.
+    // 64 elements; deterministic shuffle (i * 37 % 64) so the
+    // test is reproducible.
+    mut a: Array<i32> = Array<i32>::new();
+    mut i: i32 = 0;
+    while (i < 64) {
+        const k: i32 = (i * 37) % 64;
+        a.push(k);
+        i = i + 1;
+    }
+    a.sort();
+    // Verify the sequence is non-decreasing.
+    mut ok: boolean = true;
+    mut prev: i32 = -2147483648;
+    mut j: u64 = 0;
+    while (j < a.length()) {
+        match (a.get(j)) {
+            Option::Some(v) => {
+                if (v < prev) { ok = false; }
+                prev = v;
+            }
+            Option::None => { ok = false; }
+        }
+        j = j + 1;
+    }
+    a.drop();
+    return expect(ok, Str::new("quicksort path must produce a non-decreasing sequence"));
+}
+
+![test]
+function sort_with_duplicates() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    a.push(3); a.push(1); a.push(3); a.push(2);
+    a.push(1); a.push(3); a.push(2); a.push(1);
+    a.sort();
+    // Expected: [1,1,1,2,2,3,3,3]
+    mut want: Array<i32> = Array<i32>::new();
+    want.push(1); want.push(1); want.push(1);
+    want.push(2); want.push(2);
+    want.push(3); want.push(3); want.push(3);
+    const ok: boolean = arr_eq_i32_seq(&a, &want);
+    a.drop();
+    want.drop();
+    return expect(ok, Str::new("sort with duplicates must group equal elements"));
+}
+
+// sort_by ---------------------------------------------------------------------
+
+function desc_i32(a: &i32, b: &i32) -> boolean {
+    // "less than" for descending sort: a comes before b iff a > b.
+    return *a > *b;
+}
+
+![test]
+function sort_by_descending_predicate() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    a.push(2); a.push(5); a.push(1); a.push(4); a.push(3);
+    a.sort_by(desc_i32);
+    mut want: Array<i32> = Array<i32>::new();
+    want.push(5); want.push(4); want.push(3); want.push(2); want.push(1);
+    const ok: boolean = arr_eq_i32_seq(&a, &want);
+    a.drop();
+    want.drop();
+    return expect(ok, Str::new("sort_by with desc predicate must sort descending"));
+}
+
