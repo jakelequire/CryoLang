@@ -301,8 +301,8 @@ function closure_passed_as_function_argument() -> Result<(), TestError> {
 function lambda_body_with_local_bindings() -> Result<(), TestError> {
     // Lambda body using local `const` and `mut` decls plus a chained
     // expression that mixes captures, parameters, and locals.  Confirms
-    // the simplified lambda-block parser handles decl-then-expr-then-
-    // return sequencing alongside a non-Copy capture.
+    // the lambda-block parser handles decl-then-expr-then-return
+    // sequencing alongside a non-Copy capture.
     drop_counter = 0;
     mut got: i32 = 0;
     {
@@ -318,6 +318,161 @@ function lambda_body_with_local_bindings() -> Result<(), TestError> {
     }
     // (6 + 4) * 2 == 20
     match (expect_eq(got, 20)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_body_with_if_while() -> Result<(), TestError> {
+    // Lambda body containing `if`, `while`, and a local `mut` variable.
+    // Lambdas use the full statement parser via parse_inner_block, so
+    // any statement legal in a function body is legal here too.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const limit: Probe = Probe { payload: 5 };
+        const sum_up_to = (n: i32) -> i32 {
+            mut acc: i32 = 0;
+            mut i: i32   = 0;
+            while (i < n) {
+                if (i < limit.payload) {
+                    acc = acc + i;
+                }
+                i = i + 1;
+            }
+            return acc;
+        };
+        got = sum_up_to(10);
+    }
+    // Sums 0+1+2+3+4 = 10 (i values < limit.payload=5).
+    match (expect_eq(got, 10)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_body_with_for_and_break() -> Result<(), TestError> {
+    // `for` loop + `break` inside a lambda body.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const cap: Probe = Probe { payload: 7 };
+        const find_first_ge = (target: i32) -> i32 {
+            mut result: i32 = -1;
+            for (mut i: i32 = 0; i < cap.payload; i++) {
+                if (i >= target) {
+                    result = i;
+                    break;
+                }
+            }
+            return result;
+        };
+        got = find_first_ge(3);
+    }
+    match (expect_eq(got, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_body_with_match_on_option() -> Result<(), TestError> {
+    // `match` statement inside a lambda body.  Confirms pattern
+    // matching is available in lambda bodies via the full statement
+    // path, including payload extraction.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const base: Probe = Probe { payload: 100 };
+        const unwrap_or_default = (opt: Option<i32>) -> i32 {
+            match (opt) {
+                Option::Some(v) => { return v + base.payload; }
+                Option::None    => { return base.payload; }
+            }
+        };
+        got = unwrap_or_default(Option::Some(5));
+        got = got + unwrap_or_default(Option::None);
+    }
+    // (100 + 5) + 100 == 205
+    match (expect_eq(got, 205)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(drop_counter, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_body_with_nested_if_else_chain() -> Result<(), TestError> {
+    // if/else-if/else chain in a lambda body.
+    mut got: i32 = 0;
+    {
+        const classify = (x: i32) -> i32 {
+            if (x < 0) {
+                return -1;
+            } else if (x == 0) {
+                return 0;
+            } else if (x < 10) {
+                return 1;
+            } else {
+                return 2;
+            }
+        };
+        got = classify(-5) + classify(0) + classify(7) + classify(42);
+    }
+    // -1 + 0 + 1 + 2 == 2
+    match (expect_eq(got, 2)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function lambda_body_with_loop_and_continue() -> Result<(), TestError> {
+    // `loop { ... break; }` + `continue` inside a lambda body.
+    drop_counter = 0;
+    mut got: i32 = 0;
+    {
+        const stop_at: Probe = Probe { payload: 5 };
+        const count_odds_below = () -> i32 {
+            mut count: i32 = 0;
+            mut i: i32     = 0;
+            loop {
+                if (i >= stop_at.payload) { break; }
+                if ((i % 2) == 0) {
+                    i = i + 1;
+                    continue;
+                }
+                count = count + 1;
+                i = i + 1;
+            }
+            return count;
+        };
+        got = count_odds_below();
+    }
+    // Odd numbers in [0..5): 1, 3 -> count == 2
+    match (expect_eq(got, 2)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }
