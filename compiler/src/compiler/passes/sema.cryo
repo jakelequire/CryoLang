@@ -8392,6 +8392,24 @@ public:
         return TypeRef::invalid();
     }
 
+    /// True when the current `expected_type` resolves (through any
+    /// InstantiatedType wrapper) to a DYNAMIC array `E[]` (`{ptr, len, cap}`
+    /// fat pointer), as opposed to a fixed `[E; N]`. Used by fill-form array
+    /// literals to keep `mut c: E[] = [v; N]` dynamic while letting a fixed
+    /// target adopt a fixed shape.
+    expected_is_dynamic_array(&this) -> boolean {
+        if (!this.expected_type.is_valid()) { return false; }
+        mut exp_t: Type* = this.arena.lookup(this.expected_type.id);
+        if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = exp_t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                exp_t = this.arena.lookup(inst.resolved_type.id);
+            }
+        }
+        if (exp_t == null || exp_t.kind != TypeKind::Array) { return false; }
+        return !(exp_t as ArrayType*).is_fixed();
+    }
+
     resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
         // Bidirectional inference: if the surrounding context expects an
         // `Array<E>` / `[E; N]`, push `E` as the expected_type while
@@ -8464,7 +8482,20 @@ public:
             if (arr.repeat_count > 0) {
                 size = arr.repeat_count;
             } else if (arr.repeat_count_expr != null) {
-                size = -1;  // dynamic size
+                // Fill form `[value; count]` (the parser always records the
+                // count as `repeat_count_expr`, even a literal). A compile-
+                // time-constant count yields a FIXED `[E; count]` so it
+                // matches a fixed `[E; N]` slot and fills the `[N x E]`
+                // alloca directly - leaving it dynamic produced a `{ptr,len,
+                // cap}` fat pointer whose store into the `[N x E]` local was
+                // silently dropped, so the array read back uninitialized
+                // garbage. A non-constant (runtime) count, or a context that
+                // explicitly expects a dynamic `E[]`, stays dynamic (-1).
+                size = -1;
+                if (!this.expected_is_dynamic_array()) {
+                    const fill_count: i64 = sema_const_int_index(arr.repeat_count_expr);
+                    if (fill_count >= 0) { size = fill_count; }
+                }
             }
             // Propagate a dynamic-array expected type: when the surrounding
             // context expects `T[]` (e.g. `return [a, b]` in a function

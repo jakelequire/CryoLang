@@ -2808,10 +2808,16 @@ type struct Monomorphizer {
             // param has been bound.  This is what lets `mem::offset(this.ptr,
             // 1)` resolve: T pins from arg[0] (`T*` <-> `Point*`), arg[1] (`1`)
             // is unresolvable but inconsequential since it has no generics.
+            // PASS A - bind generic params from NON-literal arguments only.
+            // Integer/float literals are polymorphic (see
+            // arg_is_polymorphic_literal): they must not pin `T` to their i32
+            // default, or a wider sibling argument / return-type context gets
+            // silently narrowed. Literals are filled in Pass C below.
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const param: VarDeclNode* = tmpl_func.parameters[i];
                 if (param == null || !param.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
+                if (this.arg_is_polymorphic_literal(arg)) { continue; }
                 mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
                 if (!actual.is_valid()) { continue; }
                 if (subst != null) {
@@ -2821,38 +2827,42 @@ type struct Monomorphizer {
                 this.infer_conflict_to   = TypeRef::invalid();
                 this.unify_for_inference(param.resolved_type, actual);
                 // A generic param bound by an earlier argument now meets a
-                // structurally different actual in this position. If the two
-                // are a hard category mismatch (e.g. `i32` then `string`) the
-                // call is ill-typed: there is no single `T`. Reject precisely
-                // instead of silently pinning the first binding and
-                // reinterpreting the later argument's bits (a miscompile).
-                // Coercible pairs (numeric widen/narrow/sign) and any pair
-                // still carrying a generic param are left to the existing
-                // pin-first behavior, so literal flexibility and generic
-                // forwarding are unaffected.
+                // structurally different actual in this position. Both are
+                // NON-literal concrete types (literals were skipped), so there
+                // is genuinely no single `T`: reject precisely - whether the
+                // pair is a hard category mismatch (`i32`/`string`) or merely a
+                // coercible numeric pair (`i32`/`i64`). The old code let
+                // coercible pairs through "pin-first", which silently narrowed
+                // the second argument to the first's width - a miscompile. Any
+                // pair still carrying a generic param keeps pin-first so
+                // generic forwarding (`T` <- `U`) is unaffected.
                 if (this.infer_conflict_from.is_valid()
                         && this.infer_conflict_to.is_valid()
                         && this.infer_type_is_concrete(this.infer_conflict_from)
                         && this.infer_type_is_concrete(this.infer_conflict_to)) {
-                    mut tc: TypeChecker = TypeChecker::new(this.arena);
-                    if (tc.check_compatibility(this.infer_conflict_to,
-                            this.infer_conflict_from)
-                            == TypeCompatibility::Incompatible) {
-                        this.emit_infer_conflict(call, callee_name, arg,
-                            this.infer_conflict_from, this.infer_conflict_to);
-                        return;
-                    }
+                    this.emit_infer_conflict(call, callee_name, arg,
+                        this.infer_conflict_from, this.infer_conflict_to);
+                    return;
                 }
             }
         }
 
-        // Return-type-driven inference for `![implicit]` callees: any generic
-        // param still unbound after arg unification is recovered by unifying
-        // the template's declared return type against the call's expected type
-        // (the type of the `const x: T = ...` this call initializes).  Bare
-        // `T` return types bind directly; compound return types (`Option<T>`,
-        // `T*`) bind structurally via the same unifier.
-        if (tmpl_func.is_implicit && this.current_expected_type.is_valid()
+        // PASS B - return-type-driven inference. Any generic param still
+        // unbound after non-literal args is recovered by unifying the
+        // template's declared return type against the call's expected type
+        // (the `const x: T = ...` this call initializes). Bare `T` return
+        // types bind directly; compound return types (`Option<T>`, `T*`,
+        // `Box<T>`) bind structurally via the same unifier.
+        //
+        // This now runs for ALL callees (not just `![implicit]`): with Pass A
+        // no longer letting a polymorphic literal pin `T`, a call like
+        // `mut b: Box<i64> = Box::new(99)` must recover `T = i64` from the
+        // expected `Box<i64>` rather than defaulting the literal to i32 and
+        // monomorphizing `Box<i32>` (the silent-truncation miscompile). It is
+        // fill-only (guarded by `any_unbound`) and never overrides a param a
+        // real argument already pinned, so calls that fully infer from their
+        // arguments are unaffected.
+        if (this.current_expected_type.is_valid()
                 && tmpl_func.resolved_return_type.is_valid()) {
             mut any_unbound: boolean = false;
             for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
@@ -2861,6 +2871,47 @@ type struct Monomorphizer {
             if (any_unbound) {
                 this.unify_for_inference(
                     tmpl_func.resolved_return_type, this.current_expected_type);
+            }
+        }
+
+        // PASS C - literal fallback. A polymorphic literal argument whose
+        // generic param is STILL unbound (no non-literal arg and no usable
+        // return-type context pinned it) fills the param with its default
+        // type (i32 / f64). A literal whose param another source already
+        // bound is left alone - codegen coerces the literal to that width, so
+        // `Box<i64>::new(99)` stores a full i64. This keeps `Box::new(99)` and
+        // `id(0)` inferring as before when no wider context exists.
+        if (explicit_args.length == 0) {
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = tmpl_func.parameters[i];
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (!this.arg_is_polymorphic_literal(arg)) { continue; }
+                mut lit_actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+                if (!lit_actual.is_valid()) { continue; }
+                if (subst != null) {
+                    lit_actual = subst.apply(lit_actual, this.arena);
+                }
+                const bound: TypeRef = this.bound_type_for_formal(param.resolved_type);
+                if (bound.is_valid()) {
+                    // The param was already pinned (by a non-literal arg or the
+                    // return type). The literal adopts that type IF it can
+                    // coerce to it - any numeric width. A non-numeric binding
+                    // (e.g. `second(5, "hello")` pins `T = string` from the
+                    // string arg) means the literal genuinely has no shared
+                    // `T`: reject, mirroring the two-concrete case in Pass A.
+                    // Without this, reordering literals to a later pass would
+                    // let `second(5, "hello")` slip through unflagged.
+                    mut tc: TypeChecker = TypeChecker::new(this.arena);
+                    if (tc.check_compatibility(lit_actual, bound)
+                            == TypeCompatibility::Incompatible) {
+                        this.emit_infer_conflict(call, callee_name, arg, bound, lit_actual);
+                        return;
+                    }
+                    continue;  // numeric: codegen coerces the literal to `bound`
+                }
+                // Param still unbound: fill it with the literal's default type.
+                this.unify_for_inference(param.resolved_type, lit_actual);
             }
         }
 
@@ -3052,6 +3103,60 @@ type struct Monomorphizer {
         return true;
     }
 
+    /// True when `expr` is a bare (or simply negated) integer / float
+    /// literal whose type has not yet been pinned by an earlier phase.
+    /// Such literals are POLYMORPHIC during generic-argument inference: a
+    /// literal must adopt whatever concrete type the generic param is bound
+    /// to by a non-literal argument or the expected return type, defaulting
+    /// to i32 / f64 only when nothing else constrains it. Letting a literal
+    /// pin `T` to its i32 default (the old behavior) silently truncated wider
+    /// values - e.g. `Box<i64>::new(1234567890123)` monomorphized `Box<i32>`
+    /// and stored 4 bytes. Mono runs before sema, so the literal carries no
+    /// resolved_type here; that is exactly why the default must not pin T.
+    arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        if (expr.resolved_type.is_valid()) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            return lit.literal_kind == LiteralKind::Integer
+                || lit.literal_kind == LiteralKind::Float;
+        }
+        // `-5` parses as Unary('-', <literal>); treat it as polymorphic too.
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            if (u.op.lexeme == "-" && u.operand != null) {
+                const on: ASTNode* = u.operand as ASTNode*;
+                if (on.kind == NodeKind::Literal) {
+                    const lit2: LiteralNode* = u.operand as LiteralNode*;
+                    return lit2.literal_kind == LiteralKind::Integer
+                        || lit2.literal_kind == LiteralKind::Float;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// When `formal` is a bare open generic param of the call being inferred
+    /// that already has a binding, return that bound concrete type; otherwise
+    /// return invalid. Used by the literal-fallback pass to decide whether a
+    /// polymorphic literal can adopt the param's already-pinned type (any
+    /// numeric width) or genuinely conflicts with it (e.g. a `string`).
+    bound_type_for_formal(&this, formal: TypeRef) -> TypeRef {
+        if (!formal.is_valid()) { return TypeRef::invalid(); }
+        const ft: Type* = this.arena.lookup(formal.id);
+        if (ft == null) { return TypeRef::invalid(); }
+        if (ft.kind != TypeKind::GenericParam && ft.kind != TypeKind::BoundedParam) {
+            return TypeRef::invalid();
+        }
+        for (mut i: i64 = 0; i < this.inference_param_ids.length; i++) {
+            if (this.inference_param_ids[i] == formal.id) {
+                return this.inference_bindings[i];
+            }
+        }
+        return TypeRef::invalid();
+    }
+
     /// A single generic parameter was inferred to two incompatible concrete
     /// types across argument positions (`f<T>(a: T, b: T)` called
     /// `f(5, "hello")`). Report at the offending argument so the user sees
@@ -3172,16 +3277,71 @@ type struct Monomorphizer {
         }
         if (explicit_params.length != call.arguments.length) { return false; }
 
+        // Three-pass inference, identical in spirit to the free-function
+        // path in `discover_inferred_calls_in_expr` (see the Pass A/B/C
+        // comments there). The target params here are the OWNER'S generic
+        // params (`T` in `Box<T>`), not method-level params.
+        //
+        // PASS A - bind the owner's params from NON-literal args. An integer/
+        // float literal is polymorphic and must NOT pin `T` to its i32
+        // default: `Box::new(1234567890123)` for `mut b: Box<i64>` would
+        // monomorphize `Box<i32>` and truncate the literal to 1912276171.
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             const param: VarDeclNode* = explicit_params[i];
             if (param == null || !param.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
+            if (this.arg_is_polymorphic_literal(arg)) { continue; }
             mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
             if (!actual.is_valid()) { continue; }
             if (subst != null) {
                 actual = subst.apply(actual, this.arena);
             }
             this.unify_for_inference(param.resolved_type, actual);
+        }
+
+        // PASS B - recover any still-unbound owner param from the expected
+        // type by unifying the method's declared return type against it. For
+        // a constructor `Box::new -> Box<T>` initialising `mut b: Box<i64>`,
+        // this binds `T = i64` (the only way a wide literal `Box::new(...)`
+        // gets the right owner instantiation). Fill-only; never overrides a
+        // param a real argument already pinned.
+        if (this.current_expected_type.is_valid()
+                && method_func.resolved_return_type.is_valid()) {
+            mut any_unbound_b: boolean = false;
+            for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+                if (!this.inference_bindings[i].is_valid()) { any_unbound_b = true; break; }
+            }
+            if (any_unbound_b) {
+                this.unify_for_inference(
+                    method_func.resolved_return_type, this.current_expected_type);
+            }
+        }
+
+        // PASS C - literal fallback. A literal whose owner param is still
+        // unbound fills it with the literal's default (i32/f64); a literal
+        // whose param another source pinned adopts that type if numeric
+        // (codegen coerces), or is rejected if the binding is non-numeric.
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = explicit_params[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (!this.arg_is_polymorphic_literal(arg)) { continue; }
+            mut lit_actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+            if (!lit_actual.is_valid()) { continue; }
+            if (subst != null) {
+                lit_actual = subst.apply(lit_actual, this.arena);
+            }
+            const bound: TypeRef = this.bound_type_for_formal(param.resolved_type);
+            if (bound.is_valid()) {
+                mut tc_c: TypeChecker = TypeChecker::new(this.arena);
+                if (tc_c.check_compatibility(lit_actual, bound)
+                        == TypeCompatibility::Incompatible) {
+                    this.emit_infer_conflict(call, member_name, arg, bound, lit_actual);
+                    return true;
+                }
+                continue;
+            }
+            this.unify_for_inference(param.resolved_type, lit_actual);
         }
 
         // Apply default type args (e.g. `CString<A = GlobalAlloc>`,
