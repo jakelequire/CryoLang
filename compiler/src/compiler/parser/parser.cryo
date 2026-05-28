@@ -1927,16 +1927,42 @@ public:
                 }
                 this.advance(); // consume 'include'
 
-                // Parse include path string
-                if (!this.check(TokenType::StringLiteral)) {
+                // Parse the include path. Two C-style forms:
+                //   #include "foo.h"   quoted  -> local include, resolved
+                //                                 relative to this file's dir
+                //   #include <stdio.h> angle   -> system include, resolved
+                //                                 by the C preprocessor's
+                //                                 system search path
+                if (this.check(TokenType::StringLiteral)) {
+                    const path: string = this.current().lexeme;
+                    this.advance(); // consume string literal
+                    node.add_include_path(path);
+                } else if (this.check(TokenType::LAngle)) {
+                    this.advance(); // consume '<'
+                    // Reconstruct the bracketed path from its component
+                    // tokens (`stdio` `.` `h` -> "stdio.h"). Header paths
+                    // contain no whitespace, so concatenating the lexemes
+                    // is faithful to the source.
+                    mut sys_path: string = "";
+                    while (!this.check(TokenType::RAngle)
+                            && !this.check(TokenType::RBrace)
+                            && !this.is_at_end()) {
+                        sys_path = format("%s%s", sys_path, this.current().lexeme);
+                        this.advance();
+                    }
+                    if (!this.check(TokenType::RAngle)) {
+                        this.report_error(ErrorCode::E0100_EXPECTED_TOKEN,
+                            "expected '>' to close a system '#include <...>' path");
+                        continue;
+                    }
+                    this.advance(); // consume '>'
+                    node.add_system_include_path(sys_path);
+                } else {
                     this.report_error(ErrorCode::E0100_EXPECTED_TOKEN,
-                        "expected string path after #include");
+                        "expected a quoted \"path\" or <path> after #include");
                     this.advance();
                     continue;
                 }
-                const path: string = this.current().lexeme;
-                this.advance(); // consume string literal
-                node.add_include_path(path);
             } else {
                 this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
                     "expected '#include' directive in extern C import block");
