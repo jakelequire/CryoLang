@@ -2492,20 +2492,39 @@ public:
         const start: Token = this.advance(); // consume 'for'
         this.consume(TokenType::LParen, "'('");
 
-        // Check for for-in syntax: for (name in expr)
+        // For-in syntax: `for (x in iter) body` desugars at parse time into
+        //
+        //     {
+        //         mut __cryo_for_iter_N = <collection>;
+        //         loop {
+        //             match (__cryo_for_iter_N.next()) {
+        //                 Option::Some(x) => { <body> }
+        //                 Option::None    => { break; }
+        //             }
+        //         }
+        //     }
+        //
+        // The collection expression is evaluated exactly once (it becomes
+        // the initializer of `__cryo_for_iter_N`).  Type inference for the
+        // iterator binding piggybacks on the `is_auto` carve-out in sema
+        // (same path lambda bindings use); the binding's type is taken
+        // from the initializer once the latter is resolved.  Drop of the
+        // iterator is handled by the existing scope-exit drop synthesis
+        // on the outer block.
         if (this.check(TokenType::Identifier) && this.peek_at(1).kind == TokenType::KwIn) {
-            // For-in loop: parse as for(; ; ) with special init
-            const iter_tok: Token = this.advance(); // consume iterator name
-            this.advance(); // consume 'in'
+            const iter_tok: Token = this.advance();             // bound name (`x`)
+            this.advance();                                     // consume 'in'
             const collection: ExpressionNode* = this.parse_expression();
+            if (collection == null) {
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    "expected an iterator expression after `in`");
+                this.consume(TokenType::RParen, "')'");
+                return this.parse_statement_or_block();
+            }
             this.consume(TokenType::RParen, "')'");
             const body: StatementNode* = this.parse_statement_or_block();
-
-            // Create a desugared for loop
-            // For now, create a for loop with the collection as condition
-            const iter_name: SymbolStr = this.intern_lexeme(iter_tok);
-            mut iter_var: VarDeclNode* = new VarDeclNode(iter_name, this.span_from_token(iter_tok));
-            return new ForStmtNode(iter_var, collection, null, body, this.span_from(start));
+            const full_span: SourceSpan = this.span_from(start);
+            return this.build_for_in_desugar(iter_tok, collection, body, full_span);
         }
 
         // C-style for: for (init; cond; update) body
@@ -2536,6 +2555,105 @@ public:
 
         const body: StatementNode* = this.parse_statement_or_block();
         return new ForStmtNode(init, condition, update, body, this.span_from(start));
+    }
+
+    /// Synthesise the desugaring of `for (x in collection) body` into:
+    ///
+    ///     {
+    ///         mut __cryo_for_iter_N = collection;
+    ///         loop {
+    ///             match (__cryo_for_iter_N.next()) {
+    ///                 Option::Some(x) => { body }
+    ///                 Option::None    => { break; }
+    ///             }
+    ///         }
+    ///     }
+    ///
+    /// Each for-in gets a fresh `N` so nested / sibling loops never alias.
+    /// The iterator binding carries `is_auto = true`; sema's existing
+    /// initializer-type back-fill (same path used for lambda-bound `const`
+    /// vars) supplies its type.  The user's loop variable is bound by the
+    /// `Some(x)` arm pattern, which already means `break` / `continue` /
+    /// `return` inside the body behave like an ordinary `loop`.
+    build_for_in_desugar(iter_tok: Token, collection: ExpressionNode*,
+                         body: StatementNode*, full_span: SourceSpan) -> StatementNode* {
+        const iter_span: SourceSpan = this.span_from_token(iter_tok);
+        const user_name: SymbolStr  = this.intern_lexeme(iter_tok);
+
+        // Fresh synthetic name `__cryo_for_iter_N`.
+        g_for_in_counter += 1;
+        const iter_str:  string    = format("__cryo_for_iter_%u", g_for_in_counter);
+        const iter_name: SymbolStr = this.ctx.intern(iter_str);
+
+        // `mut __cryo_for_iter_N = collection;`
+        mut iter_decl: VarDeclNode* = new VarDeclNode(iter_name, full_span);
+        iter_decl.set_mutable(true);
+        iter_decl.set_auto(true);                      // type from initializer
+        iter_decl.set_initializer(collection);
+        const iter_decl_stmt: DeclStmtNode* = new DeclStmtNode(
+            iter_decl as DeclarationNode*, full_span);
+
+        // `__cryo_for_iter_N.next()` — match scrutinee.
+        const iter_ident:  IdentifierNode*    = new IdentifierNode(iter_name, full_span);
+        const next_name:   SymbolStr          = this.ctx.intern("next");
+        const next_member: MemberAccessNode*  = new MemberAccessNode(
+            iter_ident as ExpressionNode*, next_name, full_span, full_span);
+        const next_call:   CallExprNode*      = new CallExprNode(
+            next_member as ExpressionNode*, full_span);
+
+        // `Option::Some(x) => { body }`
+        const opt_name:  SymbolStr = this.ctx.intern("Option");
+        const some_name: SymbolStr = this.ctx.intern("Some");
+        const none_name: SymbolStr = this.ctx.intern("None");
+
+        mut some_pat: EnumPatternNode* = new EnumPatternNode(iter_span);
+        some_pat.set_enum_name(opt_name);
+        some_pat.set_variant_name(some_name);
+        const pb: PatternBinding* = new PatternBinding { name: user_name, span: iter_span };
+        some_pat.add_element(PatternElement::Binding(pb));
+
+        mut some_arm: MatchArmNode* = new MatchArmNode(full_span);
+        some_arm.add_pattern(some_pat as PatternNode*);
+        // The user's body block becomes the arm body verbatim.  If the
+        // body parsed as a non-block statement, wrap it so the arm body
+        // is always a block (matches the rest of the parser's invariant).
+        mut some_body: BlockStmtNode* = null;
+        if (body != null && (body as ASTNode*).kind == NodeKind::BlockStatement) {
+            some_body = body as BlockStmtNode*;
+        } else {
+            some_body = new BlockStmtNode(if (body != null) { body.span } else { full_span });
+            if (body != null) { some_body.add_statement(body); }
+        }
+        some_arm.set_body(some_body as StatementNode*);
+
+        // `Option::None => { break; }`
+        mut none_pat: EnumPatternNode* = new EnumPatternNode(full_span);
+        none_pat.set_enum_name(opt_name);
+        none_pat.set_variant_name(none_name);
+
+        mut none_arm: MatchArmNode* = new MatchArmNode(full_span);
+        none_arm.add_pattern(none_pat as PatternNode*);
+        mut none_body: BlockStmtNode* = new BlockStmtNode(full_span);
+        none_body.add_statement(new BreakStmtNode(full_span) as StatementNode*);
+        none_arm.set_body(none_body as StatementNode*);
+
+        // `match (__cryo_for_iter_N.next()) { Some(x)=>..., None=>... }`
+        mut match_stmt: MatchStmtNode* = new MatchStmtNode(
+            next_call as ExpressionNode*, full_span);
+        match_stmt.add_arm(some_arm);
+        match_stmt.add_arm(none_arm);
+
+        // `loop { <match> }`
+        mut loop_body: BlockStmtNode* = new BlockStmtNode(full_span);
+        loop_body.add_statement(match_stmt as StatementNode*);
+        const loop_stmt: LoopStmtNode* = new LoopStmtNode(
+            loop_body as StatementNode*, full_span);
+
+        // `{ <iter_decl_stmt>; <loop_stmt>; }`
+        mut outer: BlockStmtNode* = new BlockStmtNode(full_span);
+        outer.add_statement(iter_decl_stmt as StatementNode*);
+        outer.add_statement(loop_stmt as StatementNode*);
+        return outer as StatementNode*;
     }
 
     /// Parse a match statement: match (expr) { arms }

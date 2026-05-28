@@ -1822,7 +1822,16 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.resolve_var_types_in_statement(method.func.body as ASTNode*, &runner.res_ctx);
+                                // Method-level generics (`Layout::array<T>(n)`)
+                                // must be in scope when the walker reaches a
+                                // `mut x: T = ...` body annotation; without
+                                // the binding, the resolver returns invalid
+                                // and `emit_undefined_type` fires E0203 on a
+                                // perfectly legal generic param.
+                                mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                    method.func.generic_params, &runner.res_ctx);
+                                runner.resolve_var_types_in_statement(
+                                    method.func.body as ASTNode*, &m_ctx);
                                 body_count++;
                             }
                         }
@@ -1834,7 +1843,10 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.resolve_var_types_in_statement(method.func.body as ASTNode*, &runner.res_ctx);
+                                mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                    method.func.generic_params, &runner.res_ctx);
+                                runner.resolve_var_types_in_statement(
+                                    method.func.body as ASTNode*, &m_ctx);
                                 body_count++;
                             }
                         }
@@ -1846,7 +1858,10 @@ type struct TypeResolutionPasses {
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const func: FunctionDeclNode* = node.methods[j];
                             if (func != null && func.body != null) {
-                                runner.resolve_var_types_in_statement(func.body as ASTNode*, &runner.res_ctx);
+                                mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                    func.generic_params, &runner.res_ctx);
+                                runner.resolve_var_types_in_statement(
+                                    func.body as ASTNode*, &m_ctx);
                                 body_count++;
                             }
                         }
@@ -1855,10 +1870,27 @@ type struct TypeResolutionPasses {
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
                     if (!node.is_generic()) {
+                        // Build the per-impl context that mirrors what
+                        // FunctionSignature uses: the impl's own `<T, ...>`
+                        // plus the trait's outer params bound to the
+                        // impl's trait args (so the trait's `Item`
+                        // resolves to the impl's concrete `T`).
+                        // `synthesize_default_trait_methods` may have
+                        // cloned default methods (e.g. `fold<Acc>` from
+                        // `Iterator<Item>`); their bodies reference both
+                        // the trait's `Item` and the method's own `Acc`,
+                        // so all three layers must be pushed before the
+                        // body walk to avoid spurious E0203.
+                        mut impl_ctx: ResolutionContext = runner.make_generic_context(
+                            node.generic_params, &runner.res_ctx);
+                        runner.bind_trait_args_for_impl(node, &impl_ctx);
                         for (mut j: i64 = 0; j < node.methods.length; j++) {
                             const method: MethodNode* = node.methods[j];
                             if (method != null && method.func != null && method.func.body != null) {
-                                runner.resolve_var_types_in_statement(method.func.body as ASTNode*, &runner.res_ctx);
+                                mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                    method.func.generic_params, &impl_ctx);
+                                runner.resolve_var_types_in_statement(
+                                    method.func.body as ASTNode*, &m_ctx);
                                 body_count++;
                             }
                         }

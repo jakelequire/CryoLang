@@ -1,0 +1,220 @@
+///! for-in loops - desugar correctness over `Iterator::next`.
+///!
+///! The parser lowers `for (x in iter) body` into
+///!
+///!     {
+///!         mut __cryo_for_iter_N = iter;
+///!         loop {
+///!             match (__cryo_for_iter_N.next()) {
+///!                 Option::Some(x) => { body }
+///!                 Option::None    => { break; }
+///!             }
+///!         }
+///!     }
+///!
+///! Pin the user-observable behavior of that lowering: bound name, body
+///! evaluation count, control-flow keywords (`break` / `continue` /
+///! `return`) inside the body, nested loops, and a custom `Iterator`
+///! impl on a user type.  Range types are covered exhaustively in
+///! `iter.cryo`; we only need to confirm the sugar drives the same
+///! iterator surface.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ForIn;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::core::ops;
+import std::test::error;
+import std::test::assert;
+
+
+// ============================================================================
+// Range - half-open
+// ============================================================================
+
+![test]
+function for_in_range_visits_each_element_in_order() -> Result<(), TestError> {
+    mut sum: i32 = 0;
+    mut count: i32 = 0;
+    for (i in Range::new(0, 5)) {
+        sum = sum + i;
+        count = count + 1;
+    }
+    // 0+1+2+3+4 = 10; five iterations.
+    match (expect_eq(sum, 10)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count, 5);
+}
+
+![test]
+function for_in_empty_range_runs_zero_times() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    for (i in Range::new(5, 5)) {
+        count = count + 1;
+    }
+    return expect_eq(count, 0);
+}
+
+![test]
+function for_in_descending_range_runs_zero_times() -> Result<(), TestError> {
+    // [10, 5) is empty because start >= end.  Same contract as iter.cryo's
+    // `range_with_start_geq_end_is_empty`, just over the sugar.
+    mut count: i32 = 0;
+    for (i in Range::new(10, 5)) {
+        count = count + 1;
+    }
+    return expect_eq(count, 0);
+}
+
+// ============================================================================
+// RangeInclusive - closed
+// ============================================================================
+
+![test]
+function for_in_range_inclusive_visits_both_endpoints() -> Result<(), TestError> {
+    mut sum: i32 = 0;
+    mut count: i32 = 0;
+    for (i in RangeInclusive::new(1, 4)) {
+        sum = sum + i;
+        count = count + 1;
+    }
+    // 1+2+3+4 = 10; four iterations.
+    match (expect_eq(sum, 10)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count, 4);
+}
+
+
+// ============================================================================
+// Control flow inside the body
+// ============================================================================
+
+![test]
+function for_in_break_exits_loop() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    for (i in Range::new(0, 10)) {
+        if (i == 3) { break; }
+        count = count + 1;
+    }
+    // Should run for i = 0, 1, 2 (three times), then break before
+    // incrementing on i = 3.
+    return expect_eq(count, 3);
+}
+
+![test]
+function for_in_continue_skips_iteration() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    for (i in Range::new(0, 5)) {
+        if (i == 2) { continue; }
+        count = count + 1;
+    }
+    // 5 iterations, skip 1 -> 4.
+    return expect_eq(count, 4);
+}
+
+function early_return_helper() -> i32 {
+    mut acc: i32 = 0;
+    for (i in Range::new(0, 100)) {
+        if (i == 7) { return acc; }
+        acc = acc + 1;
+    }
+    return -1;
+}
+
+![test]
+function for_in_return_unwinds_through_loop_and_match() -> Result<(), TestError> {
+    // `return` from inside a for-in body must escape both the desugared
+    // `loop` and the inner `match`; the function returns the accumulator
+    // at the moment of the return.
+    return expect_eq(early_return_helper(), 7);
+}
+
+
+// ============================================================================
+// Nested for-in - each level gets its own synthesized iter binding,
+// and the inner `break` only exits the inner loop.
+// ============================================================================
+
+![test]
+function for_in_nested_loops_independent() -> Result<(), TestError> {
+    mut pairs: i32 = 0;
+    for (i in Range::new(0, 3)) {
+        for (j in Range::new(0, 4)) {
+            pairs = pairs + 1;
+        }
+    }
+    // 3 * 4 = 12.
+    return expect_eq(pairs, 12);
+}
+
+![test]
+function for_in_inner_break_only_breaks_inner() -> Result<(), TestError> {
+    mut outer_count: i32 = 0;
+    mut inner_count: i32 = 0;
+    for (i in Range::new(0, 3)) {
+        outer_count = outer_count + 1;
+        for (j in Range::new(0, 10)) {
+            if (j == 2) { break; }
+            inner_count = inner_count + 1;
+        }
+    }
+    match (expect_eq(outer_count, 3)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // Inner runs for j = 0, 1 each outer iteration -> 2 * 3 = 6.
+    return expect_eq(inner_count, 6);
+}
+
+
+// ============================================================================
+// Custom Iterator - confirm the sugar drives ANY type that implements
+// the trait, not just stdlib Range.  Inheriting the trait's default
+// `count` / `fold<Acc>` / `for_each` here also doubles as coverage that
+// `synthesize_default_trait_methods` keeps method-level generic params
+// in scope through Phase 3's body walk.
+// ============================================================================
+
+type struct CountDown {
+    value: i32;
+
+    static new(start: i32) -> CountDown {
+        return CountDown { value: start };
+    }
+}
+
+implement trait Iterator<i32> for struct CountDown {
+    next(mut &this) -> Option<i32> {
+        if (this.value <= 0) { return Option::None; }
+        const v: i32 = this.value;
+        this.value = this.value - 1;
+        return Option::Some(v);
+    }
+}
+
+![test]
+function for_in_drives_user_iterator() -> Result<(), TestError> {
+    mut sum: i32 = 0;
+    mut count: i32 = 0;
+    for (v in CountDown::new(4)) {
+        sum = sum + v;
+        count = count + 1;
+    }
+    // Yields 4, 3, 2, 1 then None.  Sum = 10, count = 4.
+    match (expect_eq(sum, 10)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count, 4);
+}
+
+![test]
+function for_in_user_iterator_can_be_empty() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    for (v in CountDown::new(0)) {
+        count = count + 1;
+    }
+    return expect_eq(count, 0);
+}

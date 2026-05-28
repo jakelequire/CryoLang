@@ -1677,8 +1677,14 @@ public:
         // already carries a resolved type (synthesised declarations -
         // closure-struct __call__ shadows, drop-insertion's flag
         // locals - bypass parser-level annotation but always have
-        // their resolved_type stamped at construction time).
-        if (var_node.type_annotation == null && !var_node.has_resolved_type()) {
+        // their resolved_type stamped at construction time).  Also
+        // skip for `is_auto` bindings: those are compiler-synthesised
+        // vars (today: the `__cryo_for_iter_N` iterator binding emitted
+        // by the for-in desugar) whose type is taken from their
+        // initializer once it's been resolved, mirroring the lambda
+        // back-fill below.
+        if (var_node.type_annotation == null && !var_node.has_resolved_type()
+                && !var_node.is_auto) {
             const init: ExpressionNode* = var_node.initializer;
             const init_is_lambda: boolean = init != null
                 && (init as ASTNode*).kind == NodeKind::LambdaExpression;
@@ -1748,9 +1754,16 @@ public:
             // this).  Only fires for the elided form - explicitly-typed
             // bindings keep their declared type and let the assignment
             // check below catch mismatches.
+            //
+            // Same back-fill is used by `is_auto` bindings, which today
+            // are the `__cryo_for_iter_N` locals the for-in desugar emits.
+            // The initializer's resolved_type IS the iterator type; we
+            // copy it onto the binding so downstream calls to `.next()`
+            // and the scope-exit drop see a normally-typed local.
             if (!var_node.has_resolved_type() && init_type.is_valid()
                     && var_node.initializer != null
-                    && (var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression) {
+                    && ((var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression
+                        || var_node.is_auto)) {
                 var_node.resolved_type = init_type;
             }
             if (var_node.has_resolved_type() && init_type.is_valid()) {
