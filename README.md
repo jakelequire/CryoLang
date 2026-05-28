@@ -504,8 +504,8 @@ for the full 1.0 release notes.
 
 - `thread::spawn` / `JoinHandle` / `Builder` (the `sync` primitives ship in 1.0; what's missing is the way to start a second thread from Cryo source). `mpsc` channels.
 - Async / await / coroutines (currently parser-only).
-- Range expressions (`a..b`, `a..=b`) in expression position. Pattern guard clauses (`x if cond =>`).
-- Iterator adapters (`.map`, `.filter`, `.collect`, …) and `for x in iter` loops.
+- Pattern guard clauses (`x if cond =>`).
+- Iterator adapters (`.map`, `.filter`, `.collect`, …). (`for (x in iter)` itself — over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator` — ships in 1.0, as do range expressions `a..b` / `a..=b`.)
 - TLS, UDP, HTTP/2, and WebSocket for `net::http`.
 - Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, `metadata`, …).
 - `time` (`Instant`, `Duration`, `sleep`) and `random` modules.

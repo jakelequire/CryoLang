@@ -642,21 +642,24 @@ From **lowest** to **highest**:
 | 2 | `??` (null-coalescing) | Right |
 | 3 | `\|>` `<\|` (pipeline) | Left |
 | 4 | `? :` (ternary) | Right |
-| 5 | `\|\|` | Left |
-| 6 | `&&` | Left |
-| 7 | `\|` | Left |
-| 8 | `^` | Left |
-| 9 | `&` | Left |
-| 10 | `==` `!=` | Left |
-| 11 | `<` `>` `<=` `>=` `<=>` | Left |
-| 12 | `<<` `>>` | Left |
-| 13 | `+` `-` | Left |
-| 14 | `*` `/` `%` | Left |
-| 15 | `as` | Left |
-| 16 | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right |
-| 17 | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix) | Left |
+| 5 | `..` `..=` (range) | Left |
+| 6 | `\|\|` | Left |
+| 7 | `&&` | Left |
+| 8 | `\|` | Left |
+| 9 | `^` | Left |
+| 10 | `&` | Left |
+| 11 | `==` `!=` | Left |
+| 12 | `<` `>` `<=` `>=` `<=>` | Left |
+| 13 | `<<` `>>` | Left |
+| 14 | `+` `-` | Left |
+| 15 | `*` `/` `%` | Left |
+| 16 | `as` | Left |
+| 17 | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right |
+| 18 | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix) | Left |
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
+
+The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [§ 6.3](#63-for-loops)).
 
 ---
 
@@ -702,7 +705,29 @@ for (mut i: int = 0; i < 10; i++) {
 }
 ```
 
-`for (x in xs)` iteration is reserved syntax and not yet wired to `Iterator`; see [§ 21](#21-reserved-syntax).
+`for (x in <expr>)` iterates a sequence. The expression is evaluated exactly once and bound to a hidden mutable local; the parser lowers the loop to a `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`. `break`, `continue`, and `return` inside the body bind to the synthesised loop, and the iterator binding is dropped at the end of the enclosing block.
+
+The scrutinee may be:
+
+- An **`Iterator`** directly — anything exposing `next(mut &this) -> Option<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>` and any type that `implement trait Iterator<T>`.
+- A **range literal** `a..b` (half-open) or `a..=b` (inclusive). These are sugar for `Range::new(a, b)` / `RangeInclusive::new(a, b)`; see the precedence table in [§ 5.7](#57-operator-precedence).
+- An **iterable** that exposes `iter()` returning an iterator — `Array<T>` and `Slice<T>` (their `iter()` is gated `where T: Copy`). The lowering inserts the `.iter()` call.
+- A **fixed-size array** `T[N]`. The lowering views it as a `Slice<T>` over its `N` elements.
+
+```cryo
+mut sum: i32 = 0;
+for (i in 0..5) {            // range literal; 0,1,2,3,4
+    sum = sum + i;
+}
+// sum == 10
+
+const xs: i32[3] = [7, 8, 9];
+for (x in xs) {              // fixed-size array
+    sum = sum + x;
+}
+```
+
+Range literals are ordinary expressions and may appear anywhere, not only in a `for` header: `const r: Range<i32> = 2..7;`. `..` binds looser than the arithmetic operators, so `a..b + 1` parses as `a..(b + 1)`.
 
 ### 6.4 Loop
 
@@ -2053,7 +2078,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
 | `yield` | Parser accepts a `yield` expression; no generator semantics exist. |
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
-| Range expressions `a..b` / `a..=b` | The `..` token is recognised but reserved in expression position; `..=` is not tokenised at all. Construct ranges with the `Range<T>` / `RangeInclusive<T>` types directly (e.g. `RangeInclusive::new(a, b)`). |
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
@@ -2062,7 +2086,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `![const]` | Reserved. Will mark a function as evaluable at compile time. |
 | `![noreturn]` | Reserved. Will declare a function that never returns normally. |
 | `![export]` / `![no_mangle]` | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [§ 18.3](#183-calling-cryo-from-c). |
-| `for x in iter` | The `for-in` syntax is not yet implemented. Iterate with a counted `for` loop or a `while` over an explicit `Iterator::next()`. |
 | `![section("name")]` | Reserved. Will place the symbol in a specific object-file section. |
 | `![weak]` | Reserved. Will declare weak linkage. |
 | `![constructor]` / `![destructor]` | Reserved. Will register functions that run before `main` / after `main` returns. |
