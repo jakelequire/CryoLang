@@ -146,10 +146,12 @@ authoritative list.
 
 - Iterator combinators (`.map`, `.filter`, `.collect`, `.take`, `.zip`,
   `.chain`, `.enumerate`). The `Iterator` trait ships with
-  `next`/`count`/`fold`/`for_each` only; `for (x in iter)` iteration
-  works against any of these.
-- Range expressions in expression position (`a..b`, `a..=b`).
-- Inclusive range patterns (`1..=10`).
+  `next`/`count`/`fold`/`for_each` only; `for (x in iter)` iteration and
+  range *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0
+  and work against any of these.
+- Inclusive range *patterns* (`1..=10` in a `match` arm). Range
+  expressions ship; the inclusive form is not yet accepted in pattern
+  position (`a..b` patterns are, and are always inclusive).
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - `Display`/`Debug` impls for container and ADT types
@@ -166,5 +168,11 @@ authoritative list.
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.
 - Cross-module trait-impl coherence checks (same-file only in 1.0).
+  Relatedly, two distinct user types that share the same *leaf* name in
+  different modules (e.g. `ModA::Widget` and `ModB::Widget`) are
+  disambiguated correctly as types, but trait-method dispatch on them
+  resolves through the bare leaf name and can bind to the
+  first-registered type's impl. Give such types distinct names until
+  fully-qualified trait dispatch lands post-1.0.
 
 [1.0.0]: https://github.com/jakelequire/CryoLang/releases/tag/v1.0.0

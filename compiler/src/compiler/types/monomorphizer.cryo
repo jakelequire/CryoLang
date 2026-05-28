@@ -30,6 +30,7 @@ import Compiler::AST::Specializer;
 import Compiler::AST::Pattern;
 import Compiler::Types::Substitution;
 import Compiler::Types::Inference;
+import Compiler::Types::Checker;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Ownership;
@@ -139,6 +140,15 @@ type struct Monomorphizer {
     // own generic param IDs from create_generic_param).
     inference_param_ids: u64[];
 
+    // Transient: the (existing, new) actuals from the most recent open-param
+    // unification conflict, surfaced by `unify_for_inference` from the
+    // InferCtx. `try_infer_function_call` resets these before each per-arg
+    // unify and, on a conflict, decides via `check_compatibility` whether the
+    // two are a genuine "no single T" type error (reject) or a coercible
+    // mismatch (keep the pin-first behavior). Both are Copy.
+    infer_conflict_from: TypeRef;
+    infer_conflict_to:   TypeRef;
+
     // Expected type of the expression currently being walked, when it sits in
     // an expected-type position (a typed `const/mut x: T = <expr>` initializer).
     // Drives return-type inference for `![implicit]` callees: an omitted
@@ -204,6 +214,8 @@ type struct Monomorphizer {
             nested_visited:        [],
             inference_bindings:    [],
             inference_param_ids:   [],
+            infer_conflict_from:   TypeRef::invalid(),
+            infer_conflict_to:     TypeRef::invalid(),
             current_expected_type: TypeRef::invalid(),
             current_spec_inst_id:  0,
             current_spec_struct:   null,
@@ -2805,7 +2817,32 @@ type struct Monomorphizer {
                 if (subst != null) {
                     actual = subst.apply(actual, this.arena);
                 }
+                this.infer_conflict_from = TypeRef::invalid();
+                this.infer_conflict_to   = TypeRef::invalid();
                 this.unify_for_inference(param.resolved_type, actual);
+                // A generic param bound by an earlier argument now meets a
+                // structurally different actual in this position. If the two
+                // are a hard category mismatch (e.g. `i32` then `string`) the
+                // call is ill-typed: there is no single `T`. Reject precisely
+                // instead of silently pinning the first binding and
+                // reinterpreting the later argument's bits (a miscompile).
+                // Coercible pairs (numeric widen/narrow/sign) and any pair
+                // still carrying a generic param are left to the existing
+                // pin-first behavior, so literal flexibility and generic
+                // forwarding are unaffected.
+                if (this.infer_conflict_from.is_valid()
+                        && this.infer_conflict_to.is_valid()
+                        && this.infer_type_is_concrete(this.infer_conflict_from)
+                        && this.infer_type_is_concrete(this.infer_conflict_to)) {
+                    mut tc: TypeChecker = TypeChecker::new(this.arena);
+                    if (tc.check_compatibility(this.infer_conflict_to,
+                            this.infer_conflict_from)
+                            == TypeCompatibility::Incompatible) {
+                        this.emit_infer_conflict(call, callee_name, arg,
+                            this.infer_conflict_from, this.infer_conflict_to);
+                        return;
+                    }
+                }
             }
         }
 
@@ -2968,6 +3005,76 @@ type struct Monomorphizer {
             "`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
         diag = diag.help(format(
             "write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
+        this.diagnostics.emit(diag);
+    }
+
+    /// True when `t` contains no open generic/bounded param and bottoms out at
+    /// a concrete representation. Mirrors sema's `arg_type_is_concrete` so the
+    /// inference-conflict check applies the same conservatism: `()`/`void` and
+    /// any param-carrying type are treated as non-concrete and never flagged.
+    infer_type_is_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::GenericParam)     { return false; }
+        if (ty.kind == TypeKind::BoundedParam)     { return false; }
+        if (ty.kind == TypeKind::FunctionTemplate) { return false; }
+        if (ty.kind == TypeKind::Function)         { return false; }
+        if (ty.kind == TypeKind::Unit)             { return false; }
+        if (ty.kind == TypeKind::Void)             { return false; }
+        if (ty.kind == TypeKind::Pointer) {
+            const pt: PointerType* = ty as PointerType*;
+            return this.infer_type_is_concrete(pt.pointee);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = ty as ReferenceType*;
+            return this.infer_type_is_concrete(rt.referent);
+        }
+        if (ty.kind == TypeKind::Array) {
+            const at: ArrayType* = ty as ArrayType*;
+            return this.infer_type_is_concrete(at.element);
+        }
+        if (ty.kind == TypeKind::Optional) {
+            const ot: OptionalType* = ty as OptionalType*;
+            return this.infer_type_is_concrete(ot.wrapped);
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const tt: TupleType* = ty as TupleType*;
+            for (mut i: i64 = 0; i < tt.elements.length; i++) {
+                if (!this.infer_type_is_concrete(tt.elements[i])) { return false; }
+            }
+            return true;
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return false; }
+        }
+        return true;
+    }
+
+    /// A single generic parameter was inferred to two incompatible concrete
+    /// types across argument positions (`f<T>(a: T, b: T)` called
+    /// `f(5, "hello")`). Report at the offending argument so the user sees
+    /// exactly which value disagrees with the earlier-pinned type.
+    emit_infer_conflict(mut &this, call: CallExprNode*, fn_name: SymbolStr,
+                        arg: ExpressionNode*, bound: TypeRef, got: TypeRef) -> void {
+        const fn_str:    string = this.intern_table.resolve(fn_name);
+        const bound_str: string = this.arena.resolve_display_name_short(bound.id);
+        const got_str:   string = this.arena.resolve_display_name_short(got.id);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0214_ARGUMENT_MISMATCH,
+            format("conflicting types for the type parameter of `%s`", fn_str));
+        const anchor: SourceSpan = if (arg != null && arg.span.has_location()) {
+            arg.span
+        } else {
+            call.span
+        };
+        diag = diag.at_with_label(anchor,
+            format("expected `%s` (inferred from an earlier argument), found `%s`",
+                   bound_str, got_str));
+        diag = diag.with_note(format(
+            "a single type parameter cannot be both `%s` and `%s`",
+            bound_str, got_str));
         this.diagnostics.emit(diag);
     }
 
@@ -3962,6 +4069,10 @@ type struct Monomorphizer {
         mut solved: TypeRef[] = [];
         for (mut i: i64 = 0; i < ctx.bindings.length; i++) { solved.push(ctx.bindings[i]); }
         this.inference_bindings = solved;
+        // Surface any open-param binding conflict the unifier recorded so the
+        // caller can judge whether it is a real type error or a coercible one.
+        this.infer_conflict_from = ctx.conflict_from;
+        this.infer_conflict_to   = ctx.conflict_to;
         return ok;
     }
 
