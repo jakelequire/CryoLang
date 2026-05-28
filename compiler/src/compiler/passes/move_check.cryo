@@ -6,12 +6,19 @@
 ///! unsound binary is never emitted.
 ///!
 ///! Scope: bare-identifier moves at let initializers and at function-call
-///! arguments. Branches are walked sequentially without state-merge
-///! (snapshot/restore), so the analysis is conservative: it only fires
-///! on a use reachable from the move on a straight-line path, and
-///! under-reports rather than over-reports. Every diagnostic it does
-///! emit is an unambiguous double-free; both within-iteration and
-///! loop-carried use-after-move are hard errors.
+///! arguments. `if`/`else` and `match` branches ARE merged at their join
+///! (`merge_branches`): a binding moved on any branch that can fall through
+///! to the join is possibly-moved afterwards and - because Cryo has no
+///! partial-move tracking - is conservatively treated as Moved, so a reuse
+///! past the join is reported. Branches that diverge (`return`/`break`/
+///! `continue`, or all sub-branches diverge) never reach the join, so their
+///! moves are dropped - that is what keeps the `if (c) { consume(x); return; }
+///! use(x);` guard pattern false-positive-free. `switch` cases are NOT yet
+///! merged (a case reaches the join via `break`, a different divergence rule);
+///! moves inside switch cases are still walked straight-line but not joined.
+///! Every diagnostic is an unambiguous (or, across a branch join, a possible)
+///! double-free; within-iteration, across-branch, and loop-carried
+///! use-after-move are all hard errors.
 
 namespace Compiler::Passes::MoveCheck;
 
@@ -265,6 +272,124 @@ type struct MoveChecker {
         }
     }
 
+    /// Conservative "does every path through `stmt` leave via return / break /
+    /// continue" check, used by merge_branches to decide whether a branch's
+    /// moves reach the post-branch join. A diverging branch never falls
+    /// through, so its moves must NOT propagate past the enclosing `if`/
+    /// `match` - that is exactly what keeps the `if (c) { consume(x); return; }
+    /// use(x);` guard pattern sound and false-positive-free. `break`/`continue`
+    /// count as divergence here because, for an `if`/`match`, they jump to
+    /// (or past) the enclosing loop, bypassing the code that follows the
+    /// join. (This rule does NOT hold for `switch`, whose cases reach the
+    /// join via `break`; switch is intentionally not merged.)
+    always_diverges(&this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        match (stmt.kind) {
+            NodeKind::ReturnStatement   => { return true; }
+            NodeKind::BreakStatement    => { return true; }
+            NodeKind::ContinueStatement => { return true; }
+            NodeKind::BlockStatement => {
+                // A block diverges if any straight-line statement diverges
+                // (everything after that statement is unreachable).
+                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    if (this.always_diverges(b.statements[i])) { return true; }
+                }
+                return false;
+            }
+            NodeKind::IfStatement => {
+                // Diverges only if it has an else AND both branches diverge.
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                if (it.else_stmt == null) { return false; }
+                return this.always_diverges(it.then_stmt) &&
+                       this.always_diverges(it.else_stmt);
+            }
+            NodeKind::MatchStatement => {
+                // Exhaustive (sema-guaranteed): diverges iff every arm does.
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                if (m.arms.length == 0) { return false; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null || !this.always_diverges(arm.body)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => { return false; }
+        }
+    }
+
+    /// Walk a set of mutually-exclusive branches (the two arms of an `if`,
+    /// or the arms of a `match`) and merge their move-sets at the join.
+    ///
+    /// Each branch is walked from the SAME pre-branch move state (restored
+    /// between branches), so a within-branch use-after-move still fires and
+    /// no branch sees another's moves. After all branches, a binding moved
+    /// by ANY branch that can fall through to the join (i.e. does not
+    /// `always_diverges`) is marked Moved: Cryo has no partial-move tracking,
+    /// so a value possibly-moved on some path is unsafe to reuse past the
+    /// join (a potential double free) and is treated as moved. Diverging
+    /// branches' moves are dropped - their path never reaches the join.
+    /// A null body (e.g. a missing `else`) is the implicit live no-move
+    /// branch: it is skipped, contributing nothing to the union, which
+    /// leaves a one-sided move correctly *possibly*-moved.
+    merge_branches(mut &this, bodies: StatementNode*[]) -> void {
+        const snap: i64 = this.snapshot_moves();
+        // Branches are separate scopes. A binding DECLARED inside a branch
+        // (e.g. `Ok(handle) => { mut f = handle; ... }`) is dead at the join,
+        // so its move must NOT propagate - otherwise a sibling arm that
+        // re-declares the same name would falsely read it as moved. We
+        // record each branch's declarations (forcing `capture_decls` on for
+        // the walk) and exclude branch-locals from the union, mirroring how
+        // walk_loop_body excludes body-locals from the carried set.
+        const prev_capture: boolean = this.capture_decls;
+        mut u_keys:  u32[]        = [];
+        mut u_spans: SourceSpan[] = [];
+        mut u_real:  boolean[]    = [];
+        for (mut i: i64 = 0; i < bodies.length; i++) {
+            const body: StatementNode* = bodies[i];
+            if (body == null) { continue; }
+            const branch_cap_start: i64 = this.captured_decl_keys.length;
+            this.capture_decls = true;
+            this.walk_stmt(body);
+            this.capture_decls = prev_capture;
+            // Only branches that can fall through contribute moves to the join.
+            if (!this.always_diverges(body)) {
+                for (mut j: i64 = snap; j < this.moved_keys.length; j++) {
+                    const k:    u32     = this.moved_keys[j];
+                    // Declared in this branch -> dead at the join, skip.
+                    if (this.is_body_local(k, branch_cap_start)) { continue; }
+                    const real: boolean = this.moved_real[j];
+                    mut found: boolean = false;
+                    for (mut u: i64 = 0; u < u_keys.length; u++) {
+                        if (u_keys[u] == k) {
+                            // A storage-duplicating move on any path wins.
+                            if (real) { u_real[u] = true; }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        u_keys.push(k);
+                        u_spans.push(this.moved_spans[j]);
+                        u_real.push(real);
+                    }
+                }
+            }
+            this.restore_moves(snap);
+            // Outside a loop-discovery walk, the captured branch-locals are
+            // only needed for the exclusion above - drop them so the stack
+            // doesn't grow. Inside one (prev_capture true), leave them: they
+            // are genuinely loop-body-local and the enclosing loop needs them.
+            if (!prev_capture) { this.truncate_captured(branch_cap_start); }
+        }
+        // Apply the merged moves as the post-join state.
+        for (mut i: i64 = 0; i < u_keys.length; i++) {
+            this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
+        }
+    }
+
     /// Emit a use-after-move error with a primary label at the use
     /// site and a secondary label at the original move site. Renderer
     /// combines them into a single rustc-style snippet with `...`
@@ -398,17 +523,32 @@ type struct MoveChecker {
             NodeKind::IfStatement => {
                 const it: IfStmtNode* = stmt as IfStmtNode*;
                 if (it.condition != null) { this.walk_expr_read(it.condition); }
-                // Snapshot state, walk both branches, restore. Phase 1
-                // doesn't propagate moves out of branches. This sacrifices
-                // a class of true positives (moves common to every path)
-                // for zero false positives on early-return / early-break
-                // patterns.
-                const snap: i64 = this.snapshot_moves();
-                if (it.then_stmt != null) { this.walk_stmt(it.then_stmt); }
-                this.restore_moves(snap);
-                const snap2: i64 = this.snapshot_moves();
-                if (it.else_stmt != null) { this.walk_stmt(it.else_stmt); }
-                this.restore_moves(snap2);
+                // Walk both branches from the same pre-branch state and merge
+                // their moves at the join. A binding moved in a non-diverging
+                // branch stays moved afterwards (possibly-moved -> Moved,
+                // since Cryo has no partial-move tracking), so a reuse past
+                // the `if` is reported. A null `else` is the implicit live
+                // fall-through that moves nothing - it just leaves a then-only
+                // move *possibly* (not definitely) moved, which the union
+                // models correctly. See merge_branches.
+                mut if_branches: StatementNode*[] = [it.then_stmt, it.else_stmt];
+                this.merge_branches(if_branches);
+            }
+            NodeKind::MatchStatement => {
+                // Previously unhandled: moves inside match arms were invisible,
+                // so a double-move within one arm (or a move in an arm reused
+                // after the match) silently double-freed at runtime. Read the
+                // subject once, then merge the arm bodies like if/else
+                // branches. Sema guarantees exhaustiveness, so there is no
+                // implicit live fall-through arm.
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                if (m.subject != null) { this.walk_expr_read(m.subject); }
+                mut arm_bodies: StatementNode*[] = [];
+                for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
+                    const arm: MatchArmNode* = m.arms[ai];
+                    if (arm != null) { arm_bodies.push(arm.body); }
+                }
+                this.merge_branches(arm_bodies);
             }
             NodeKind::WhileStatement => {
                 const w: WhileStmtNode* = stmt as WhileStmtNode*;
@@ -547,6 +687,7 @@ type struct MoveChecker {
             NodeKind::ArrayLiteral       => { this.read_array_lit(expr as ArrayLiteralNode*);        }
             NodeKind::TernaryExpression  => { this.read_ternary(expr as TernaryExprNode*);           }
             NodeKind::IfExpression       => { this.read_if_expr(expr as IfExprNode*);                }
+            NodeKind::MatchExpression    => { this.read_match(expr as MatchExprNode*);               }
             NodeKind::NewExpression      => { this.read_new(expr as NewExprNode*);                   }
             NodeKind::TryExpression      => {
                 // `expr?` is lowered to a `match` by sema; walk the desugar
@@ -772,6 +913,22 @@ type struct MoveChecker {
         if (ie.condition != null) { this.walk_expr_read(ie.condition); }
         if (ie.then_expr != null) { this.walk_expr_read(ie.then_expr); }
         if (ie.else_expr != null) { this.walk_expr_read(ie.else_expr); }
+        return;
+    }
+
+    /// A `match` in expression position (also the desugaring of `expr?`).
+    /// Read the subject once, then merge the arm bodies exactly like the
+    /// statement form so a double-move within an arm, or a move in an arm
+    /// reused after the match, is caught.
+    read_match(mut &this, m: MatchExprNode*) -> void {
+        if (m == null) { return; }
+        if (m.subject != null) { this.walk_expr_read(m.subject); }
+        mut arm_bodies: StatementNode*[] = [];
+        for (mut i: i64 = 0; i < m.arms.length; i++) {
+            const arm: MatchArmNode* = m.arms[i];
+            if (arm != null) { arm_bodies.push(arm.body); }
+        }
+        this.merge_branches(arm_bodies);
         return;
     }
 

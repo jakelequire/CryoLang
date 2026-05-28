@@ -1,0 +1,32 @@
+// E0452: a non-Copy value moved twice inside a single `match` arm.
+//
+// Regression for the audit finding that the move checker never walked
+// `match` arms at all (walk_stmt/walk_expr had no MatchStatement/
+// MatchExpression case), so a double-move inside an arm passed `check`
+// clean and then double-freed at runtime ("free(): double free
+// detected"). The arm body is now walked straight-line, so the second
+// `consume(h)` is a hard-error use-after-move and no binary is emitted.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::MatchArmDoubleMove;
+
+type struct Heap {
+    p: void*;
+}
+
+implement trait Drop for struct Heap {
+    drop(mut &this) -> void { free(this.p); }
+}
+
+function consume(h: Heap) -> void {
+    // by-value owning parameter: drops `h` at function exit.
+}
+
+function main() -> int {
+    mut h: Heap = Heap { p: malloc(16) };
+    match (1) {
+        1 => { consume(h); consume(h); }   // second use is after move -> double free
+        _ => {}
+    }
+    return 0;
+}
