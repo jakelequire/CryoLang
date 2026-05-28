@@ -106,6 +106,55 @@ function function_calls_stripped(cg: CodegenContext*, fn_val: void*) -> boolean 
     return false;
 }
 
+/// Create the per-module DWARF scaffolding when `ctx.emit_debug_info` is
+/// set: a DIBuilder, a DIFile for the module's source path, a
+/// DICompileUnit, and the module-level `Debug Info Version` / `Dwarf
+/// Version` flags (without which the backend drops all debug metadata).
+/// The handles are stashed on `ctx` for the function prologue to attach
+/// per-function DISubprograms; `LLVMDIBuilderFinalize` must be called
+/// before verification. No-op when debug info is off.
+function setup_debug_info(ctx: CompilationContext*, module_raw: void*) -> void {
+    if (!ctx.emit_debug_info) { return; }
+
+    const dib: void* = llvm::LLVMCreateDIBuilder(module_raw);
+    ctx.di_builder = dib;
+
+    // DIFile: use the module's source path as the file name and "." as the
+    // directory; debuggers join the two.
+    const src: string = ctx.source_file;
+    const file: void* = llvm::LLVMDIBuilderCreateFile(
+        dib, src, intrinsics::strlen(src), ".", 1);
+    ctx.di_file = file;
+
+    // DICompileUnit: Lang = C (1), EmissionKind = Full (1); other flags off.
+    const producer: string = "Cryo compiler";
+    const cu: void* = llvm::LLVMDIBuilderCreateCompileUnit(
+        dib, 1, file,
+        producer, intrinsics::strlen(producer),
+        0,            // isOptimized
+        "", 0,        // Flags
+        0,            // RuntimeVer
+        "", 0,        // SplitName
+        1,            // EmissionKind = Full
+        0,            // DWOId
+        0,            // SplitDebugInlining
+        0,            // DebugInfoForProfiling
+        "", 0,        // SysRoot
+        "", 0);       // SDK
+    ctx.di_cu = cu;
+
+    // Module flags (behavior Warning = 1). "Debug Info Version" must be 3
+    // (DEBUG_METADATA_VERSION) or LLVM silently strips the debug info.
+    const ver_key: string = "Debug Info Version";
+    const dver: void* = llvm::LLVMValueAsMetadata(
+        llvm::LLVMConstInt(llvm::LLVMInt32Type(), 3, 0));
+    llvm::LLVMAddModuleFlag(module_raw, 1, ver_key, intrinsics::strlen(ver_key), dver);
+    const dwarf_key: string = "Dwarf Version";
+    const dwarf: void* = llvm::LLVMValueAsMetadata(
+        llvm::LLVMConstInt(llvm::LLVMInt32Type(), 4, 0));
+    llvm::LLVMAddModuleFlag(module_raw, 1, dwarf_key, intrinsics::strlen(dwarf_key), dwarf);
+}
+
 /// Iterate the module's functions until no more cascade-strips happen.
 /// For each function with a body that calls a stripped sibling, strip it
 /// (which adds it to the stripped set, potentially triggering more
@@ -207,6 +256,11 @@ type struct CodegenPasses {
         }
         cdebug("[Codegen] Step 9: Target machine ready\n");
 
+        // DWARF debug-info scaffolding (no-op unless `-g`/--debug-info).
+        // Must run before function-body emission so each prologue can
+        // attach a DISubprogram + source location to its function.
+        setup_debug_info(ctx, cg.llvm_module.raw);
+
         // Cross-module externs are declared lazily by `resolve_function` /
         // `resolve_function_with_arity` / `resolve_global` on first reference
         // from this module, avoiding the O(modules x funcs x overloads) bulk
@@ -262,6 +316,13 @@ type struct CodegenPasses {
         // strip set only contains symbols whose body was attempted in
         // this module.
         cascade_strip_dependents(cg);
+
+        // Finalize debug info: wires every DISubprogram into the compile
+        // unit and resolves temporary metadata. Must run before
+        // LLVMVerifyModule, which checks debug-info well-formedness.
+        if (ctx.di_builder != null) {
+            llvm::LLVMDIBuilderFinalize(ctx.di_builder);
+        }
 
         // Pre-verify: scan all functions for corrupt types before calling
         // LLVMVerifyModule (which crashes on null function types).

@@ -165,7 +165,9 @@ type struct ProjectConfig {
     entry_point:  string;      // relative path from project root (executables)
     source_dir:   string;      // root source directory (libraries/stdlib)
     debug:        boolean;
-    optimize:     boolean;
+    // LLVM optimization level 0..3, from `[compiler] optimize` in C-style
+    // (`O0`/`O1`/`O2`/`O3`). Defaults to 2. See `parse_opt_level`.
+    opt_level:    u32;
     no_std:       boolean;
     emit_llvm:    boolean;
     project_root: string;      // directory containing cryoconfig
@@ -230,11 +232,11 @@ type struct ProjectConfig {
             entry_point:  "main.cryo",
             source_dir:   ".",
             debug:        false,
-            // Optimized by default (O2). A project opts into an
-            // unoptimized, debuggable build with `[compiler] optimize =
-            // false` (=> O0) or `cryo build --opt-level=0`. Leaving this
-            // unset must preserve the historical always-O2 behavior.
-            optimize:     true,
+            // Optimized by default (O2). A project picks a level with
+            // `[compiler] optimize = O0|O1|O2|O3` (or `cryo build
+            // --opt-level=N`). Leaving it unset preserves the historical
+            // always-O2 behavior.
+            opt_level:    2,
             no_std:       false,
             emit_llvm:    false,
             project_root: ".",
@@ -386,9 +388,9 @@ type struct ProjectConfig {
                 }
                 "compiler" => {
                     match (key) {
-                        "debug"    => { config.debug    = parse_bool(val); }
-                        "optimize" => { config.optimize = parse_bool(val); }
-                        "no_std"   => { config.no_std   = parse_bool(val); }
+                        "debug"    => { config.debug     = parse_bool(val); }
+                        "optimize" => { config.opt_level = parse_opt_level(val); }
+                        "no_std"   => { config.no_std    = parse_bool(val); }
                         "args" => {
                             // Check if the args array contains --emit-llvm
                             if (intrinsics::strstr(raw_val, "--emit-llvm") != null) {
@@ -523,6 +525,22 @@ function parse_bool(s: string) -> boolean {
     if (intrinsics::strcmp(s, "yes") == 0)   { return true;  }
     if (intrinsics::strcmp(s, "1") == 0)     { return true;  }
     return false;
+}
+
+/// Parse a `[compiler] optimize` value into an LLVM optimization level
+/// 0..3. Accepts C-style `O0`/`O1`/`O2`/`O3` (case-insensitive), a bare
+/// `0`..`3`, and the legacy booleans (`true`/`yes` => O2, `false`/`no` =>
+/// O0). Anything unrecognized falls back to O2 (the default level).
+function parse_opt_level(s: string) -> u32 {
+    // Legacy boolean spellings (pre-C-style configs).
+    if (intrinsics::strcmp(s, "true")  == 0 || intrinsics::strcmp(s, "yes") == 0) { return 2; }
+    if (intrinsics::strcmp(s, "false") == 0 || intrinsics::strcmp(s, "no")  == 0) { return 0; }
+    // C-style `O0`..`O3` (either case) or a bare digit.
+    if (intrinsics::strcmp(s, "O0") == 0 || intrinsics::strcmp(s, "o0") == 0 || intrinsics::strcmp(s, "0") == 0) { return 0; }
+    if (intrinsics::strcmp(s, "O1") == 0 || intrinsics::strcmp(s, "o1") == 0 || intrinsics::strcmp(s, "1") == 0) { return 1; }
+    if (intrinsics::strcmp(s, "O2") == 0 || intrinsics::strcmp(s, "o2") == 0 || intrinsics::strcmp(s, "2") == 0) { return 2; }
+    if (intrinsics::strcmp(s, "O3") == 0 || intrinsics::strcmp(s, "o3") == 0 || intrinsics::strcmp(s, "3") == 0) { return 3; }
+    return 2;
 }
 
 /// Parse a TOML-like string array value: `["a", "b", "c"]` -> ["a","b","c"].

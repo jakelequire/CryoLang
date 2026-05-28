@@ -326,6 +326,8 @@ Run with `cryo test`. See [`docs/cryo.md` § 20](./docs/cryo.md#20-testing).
 | --- | --- |
 | `cryo init [dir]` | Scaffold a new project (`cryoconfig` + `src/main.cryo`). |
 | `cryo build` | Build the project in the current directory. |
+| `cryo build --opt-level=N` | Override the optimization level (`0`–`3`) for this build. |
+| `cryo build -g` | Emit DWARF debug info (source file/line) for gdb/lldb backtraces. |
 | `cryo run` | Build and execute. |
 | `cryo test [filter]` | Discover, build, and run every `![test]` function. |
 | `cryo test --list` | Print discovered tests without running. |
@@ -354,7 +356,7 @@ entry_point  = "src/main.cryo"
 
 [compiler]
 debug     = false
-optimize  = true
+optimize  = O2                         # O0 (debuggable) .. O3; default O2
 link_libs = ["sqlite3"]
 
 [dependencies]

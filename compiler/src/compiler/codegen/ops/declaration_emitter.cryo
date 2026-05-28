@@ -1362,6 +1362,47 @@ type struct DeclarationEmitter {
     /// 4. Push scope, bind parameter names
     /// 5. The visitor will visit the body (BlockStmtNode)
     /// 6. Handle implicit return for void functions
+    /// Attach a DWARF DISubprogram to `fn_val` and set the builder's
+    /// current debug location to the function's declaration line, scoped
+    /// to that subprogram. Called from the prologue once the builder is at
+    /// the entry block; every instruction emitted afterward inherits the
+    /// location. No-op unless `-g` populated `ctx.di_builder`. The
+    /// subroutine type carries no parameter list (sufficient for
+    /// function-level file:line backtraces; per-argument types and
+    /// per-statement line granularity are follow-ups).
+    emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
+        const ctx_ptr: CompilationContext* = this.ctx;
+        if (!ctx_ptr.emit_debug_info || ctx_ptr.di_builder == null) { return; }
+        if (!fn_val.is_valid()) { return; }
+
+        const dib:  void* = ctx_ptr.di_builder;
+        const file: void* = ctx_ptr.di_file;
+
+        const subroutine_ty: void* = llvm::LLVMDIBuilderCreateSubroutineType(
+            dib, file, null, 0, 0);
+
+        const name: string = this.resolve(node.name);
+        const name_len: u64 = intrinsics::strlen(name);
+        mut line: u32 = node.span.start_line;
+        if (line == 0) { line = 1; }
+
+        const sp: void* = llvm::LLVMDIBuilderCreateFunction(
+            dib, file, name, name_len, name, name_len, file, line,
+            subroutine_ty,
+            0,        // IsLocalToUnit
+            1,        // IsDefinition
+            line,     // ScopeLine
+            0,        // Flags
+            0);       // IsOptimized
+        llvm::LLVMSetSubprogram(fn_val.raw, sp);
+
+        mut col: u32 = node.span.start_col;
+        if (col == 0) { col = 1; }
+        const loc: void* = llvm::LLVMDIBuilderCreateDebugLocation(
+            llvm::LLVMGetGlobalContext(), line, col, sp, null);
+        llvm::LLVMSetCurrentDebugLocation2(this.builder.raw, loc);
+    }
+
     codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
@@ -1416,6 +1457,13 @@ type struct DeclarationEmitter {
 
         const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
         this.builder.position_at_end(entry_bb);
+
+        // DWARF: attach a DISubprogram + set the entry debug location
+        // BEFORE any body instructions, so the prologue allocas and the
+        // whole body inherit a !dbg location (the verifier requires one on
+        // inlinable calls in a function that carries debug info). No-op
+        // unless `-g`.
+        this.emit_debug_subprogram(fn_val, node);
 
         // Create allocas for each parameter and store the incoming value.
         this.values.push_scope();
