@@ -35,6 +35,8 @@ typedef void *LLVMPassManagerRef;
 typedef void *LLVMPassBuilderOptionsRef;
 typedef void *LLVMMemoryBufferRef;
 typedef void *LLVMAttributeRef;
+typedef void *LLVMMetadataRef;
+typedef void *LLVMDIBuilderRef;
 
 typedef int LLVMBool;
 
@@ -582,6 +584,62 @@ int   LLVMRunPasses(LLVMModuleRef M, const char *Passes,
  * =================================================================== */
 
 void LLVMDisposeMessage(char *Message);
+
+
+/* ===================================================================
+ * Debug Info (DWARF via DIBuilder)
+ *
+ * Enum-typed parameters (LLVMDWARFSourceLanguage, LLVMDWARFEmissionKind,
+ * LLVMDWARFTypeEncoding, LLVMDIFlags, LLVMModuleFlagBehavior) are declared
+ * here as plain `unsigned`/`int`. The real LLVM-C headers use enums, but
+ * those are ABI-compatible with int, and declaring them as integers lets
+ * the Cryo C-header extractor map them to u32/i32 (an unknown enum typedef
+ * would otherwise map to an opaque pointer and break the call ABI).
+ * All parameters are named so the extractor never sees an unnamed pointer.
+ * =================================================================== */
+
+LLVMDIBuilderRef LLVMCreateDIBuilder(LLVMModuleRef M);
+void LLVMDIBuilderFinalize(LLVMDIBuilderRef Builder);
+
+LLVMMetadataRef LLVMDIBuilderCreateFile(LLVMDIBuilderRef Builder,
+    const char *Filename, size_t FilenameLen,
+    const char *Directory, size_t DirectoryLen);
+
+LLVMMetadataRef LLVMDIBuilderCreateCompileUnit(LLVMDIBuilderRef Builder,
+    unsigned Lang, LLVMMetadataRef FileRef,
+    const char *Producer, size_t ProducerLen,
+    LLVMBool isOptimized, const char *Flags, size_t FlagsLen,
+    unsigned RuntimeVer, const char *SplitName, size_t SplitNameLen,
+    unsigned Kind, unsigned DWOId, LLVMBool SplitDebugInlining,
+    LLVMBool DebugInfoForProfiling, const char *SysRoot, size_t SysRootLen,
+    const char *SDK, size_t SDKLen);
+
+LLVMMetadataRef LLVMDIBuilderCreateSubroutineType(LLVMDIBuilderRef Builder,
+    LLVMMetadataRef File, LLVMMetadataRef *ParameterTypes,
+    unsigned NumParameterTypes, int Flags);
+
+LLVMMetadataRef LLVMDIBuilderCreateBasicType(LLVMDIBuilderRef Builder,
+    const char *Name, size_t NameLen, uint64_t SizeInBits,
+    unsigned Encoding, int Flags);
+
+LLVMMetadataRef LLVMDIBuilderCreateFunction(LLVMDIBuilderRef Builder,
+    LLVMMetadataRef Scope, const char *Name, size_t NameLen,
+    const char *LinkageName, size_t LinkageNameLen, LLVMMetadataRef File,
+    unsigned LineNo, LLVMMetadataRef Ty, LLVMBool IsLocalToUnit,
+    LLVMBool IsDefinition, unsigned ScopeLine, int Flags, LLVMBool IsOptimized);
+
+void LLVMSetSubprogram(LLVMValueRef Func, LLVMMetadataRef SP);
+
+LLVMMetadataRef LLVMDIBuilderCreateDebugLocation(LLVMContextRef Ctx,
+    unsigned Line, unsigned Column, LLVMMetadataRef Scope,
+    LLVMMetadataRef InlinedAt);
+
+void LLVMSetCurrentDebugLocation2(LLVMBuilderRef Builder, LLVMMetadataRef Loc);
+
+LLVMMetadataRef LLVMValueAsMetadata(LLVMValueRef Val);
+
+void LLVMAddModuleFlag(LLVMModuleRef M, unsigned Behavior,
+    const char *Key, size_t KeyLen, LLVMMetadataRef Val);
 
 
 #ifdef __cplusplus
