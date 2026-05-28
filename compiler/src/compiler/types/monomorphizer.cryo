@@ -156,6 +156,16 @@ type struct Monomorphizer {
     current_spec_inst_id: u64;
     current_spec_struct:  StructDeclNode*;
 
+    // Transient: most recent constructor-shaped static-method instantiation
+    // discovered by `try_infer_static_method_on_generic_template`.  Set
+    // when value-arg inference promotes a call like `Range::new(0, 5)`
+    // from the template `Range<T>` to the spec'd `Range<i32>`.  Read
+    // (and cleared) by the `is_auto` VarDecl back-propagation in
+    // `discover_inferred_calls_in_stmt` so the synthesized for-in
+    // iterator local picks up the spec'd type without ever mutating
+    // `call.resolved_type` (which other passes treat as load-bearing).
+    last_static_inst_ref: TypeRef;
+
     // Per-walker scope stack for match-arm bindings.  Populated by
     // `push_arm_bindings_to_scope` before walking an arm body and torn
     // down by `pop_scope_bindings` afterwards.  `lookup_local_type` and
@@ -197,6 +207,7 @@ type struct Monomorphizer {
             current_expected_type: TypeRef::invalid(),
             current_spec_inst_id:  0,
             current_spec_struct:   null,
+            last_static_inst_ref:  TypeRef::invalid(),
             scope_names:           [],
             scope_types:           [],
         };
@@ -1741,7 +1752,7 @@ type struct Monomorphizer {
                 if (inner != null) {
                     const inner_node: ASTNode* = inner as ASTNode*;
                     if (inner_node.kind == NodeKind::VariableDeclaration) {
-                        const vd: VarDeclNode* = inner as VarDeclNode*;
+                        mut vd: VarDeclNode* = inner as VarDeclNode*;
                         if (vd.initializer != null) {
                             // Push the declared type as the expected type so an
                             // `![implicit]` initializer (`const v: T = make()`)
@@ -1756,8 +1767,31 @@ type struct Monomorphizer {
                                 exp = subst.apply(exp, this.arena);
                             }
                             this.current_expected_type = exp;
+                            const saved_inst: TypeRef = this.last_static_inst_ref;
+                            this.last_static_inst_ref = TypeRef::invalid();
                             this.discover_inferred_calls_in_expr(vd.initializer, res_ctx, subst, names, types);
+                            const inst_from_init: TypeRef = this.last_static_inst_ref;
+                            this.last_static_inst_ref = saved_inst;
                             this.current_expected_type = saved_exp;
+
+                            // `is_auto` bindings are compiler-synthesised
+                            // (today: the `__cryo_for_iter_N` iterator local
+                            // emitted by the for-in desugar) and have no
+                            // user-written type annotation.  Sema typed the
+                            // binding from the initializer's call return,
+                            // which for a generic constructor call is the
+                            // template (`Range<T>`).  Value-arg inference
+                            // ran above and pinned the concrete owner type
+                            // for any constructor-shaped static; lift it
+                            // here so codegen's method lookup on the
+                            // binding sees `Range<i32>` (etc.) instead of
+                            // the template.  We deliberately do NOT touch
+                            // `call.resolved_type`; other passes treat the
+                            // call's typing as load-bearing and rewriting
+                            // it from this side channel destabilises them.
+                            if (vd.is_auto && inst_from_init.is_valid()) {
+                                vd.resolved_type = inst_from_init;
+                            }
                         }
                     }
                 }
@@ -3044,6 +3078,19 @@ type struct Monomorphizer {
         if (!inst_ref.is_valid()) { return false; }
         this.enqueue_from_type_ref(inst_ref);
 
+        // Constructor-shaped static methods (`Range::new -> Range<T>`,
+        // `Array::with_capacity -> Array<T, A>`) return the owner's own
+        // instantiation, and value-arg inference has just pinned the
+        // type arguments concretely.  Stash the spec'd owner so the
+        // `is_auto` VarDecl back-propagation downstream
+        // (`discover_inferred_calls_in_stmt`) can lift the for-in
+        // iterator local from the template `Range<T>` to `Range<i32>`.
+        // Not all statics return their owner template; the matches gate
+        // keeps the stash off for `Layout::array<T>(n) -> Layout` (etc.).
+        if (this.return_type_matches_owner_template(method_func, entry)) {
+            this.last_static_inst_ref = inst_ref;
+        }
+
         // Build the spec'd qualified-owner name and the combined-key
         // callee symbol.  Mirror what `ASTSpecializer::specialize` does:
         //   spec_name      = MangledName::specialized_identifier(<bare>, args)
@@ -3066,6 +3113,42 @@ type struct Monomorphizer {
         const combined_sym: SymbolStr = this.intern_table.intern(combined_str);
         call.set_resolved_callee(combined_sym);
         return true;
+    }
+
+    /// True when the syntactic name of the method's declared return type
+    /// matches the owner template's bare name.  Used by
+    /// `try_infer_static_method_on_generic_template` to detect
+    /// constructor-shaped statics (`Range::new -> Range<T>`,
+    /// `Array::with_capacity -> Array<T, A>`) so the call's resolved_type
+    /// can be updated to the spec'd owner instantiation.
+    return_type_matches_owner_template(mut &this, method_func: FunctionDeclNode*,
+                                       entry: TemplateEntry*) -> boolean {
+        if (method_func == null || entry == null) { return false; }
+        if (method_func.return_type_annotation == null) { return false; }
+        if (!entry.name.is_valid()) { return false; }
+        const ret_name: SymbolStr = this.type_annotation_base_name(
+            method_func.return_type_annotation);
+        if (!ret_name.is_valid()) { return false; }
+        // Compare against the un-qualified template name (`Range`, `Array`)
+        // since the return-type annotation is written in the owner's own
+        // scope and never carries the full module path.
+        return ret_name.equals(entry.name);
+    }
+
+    /// Extract the syntactic base name from a type annotation:
+    ///   `Named(Range)`           -> "Range"
+    ///   `Generic(Named(Range))`  -> "Range"   (peeled once)
+    /// Returns an empty SymbolStr for unnameable shapes (tuples, function
+    /// pointers, etc.) so the caller short-circuits safely.
+    type_annotation_base_name(mut &this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(na)   => { na.name }
+            TypeAnnotation::Generic(ga) => {
+                this.type_annotation_base_name(ga.base)
+            }
+            _                            => { SymbolStr::empty() }
+        };
     }
 
     /// Walk every spec'd impl block looking for one whose target is the
