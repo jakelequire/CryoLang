@@ -26,6 +26,8 @@ import std::core::result;
 import std::core::option;
 import std::core::iter;
 import std::core::ops;
+import std::core::slice;
+import std::collections::array;
 import std::test::error;
 import std::test::assert;
 
@@ -217,4 +219,137 @@ function for_in_user_iterator_can_be_empty() -> Result<(), TestError> {
         count = count + 1;
     }
     return expect_eq(count, 0);
+}
+
+
+// ============================================================================
+// Range-literal sugar - `a..b` desugars to `Range::new(a, b)` and `a..=b`
+// to `RangeInclusive::new(a, b)` at parse time, in any expression position.
+// ============================================================================
+
+![test]
+function for_in_range_literal_exclusive() -> Result<(), TestError> {
+    mut sum: i32 = 0;
+    for (i in 0..5) {
+        sum = sum + i;
+    }
+    // 0+1+2+3+4 = 10.
+    return expect_eq(sum, 10);
+}
+
+![test]
+function for_in_range_literal_inclusive() -> Result<(), TestError> {
+    mut sum: i32 = 0;
+    for (i in 1..=4) {
+        sum = sum + i;
+    }
+    // 1+2+3+4 = 10.
+    return expect_eq(sum, 10);
+}
+
+![test]
+function for_in_range_literal_with_expression_bounds() -> Result<(), TestError> {
+    // `..` binds looser than `+`, so this is `1..(4+1)` = [1, 5).
+    const lo: i32 = 1;
+    const hi: i32 = 4;
+    mut sum: i32 = 0;
+    for (i in lo..hi + 1) {
+        sum = sum + i;
+    }
+    // 1+2+3+4 = 10.
+    return expect_eq(sum, 10);
+}
+
+![test]
+function for_in_range_literal_is_a_value() -> Result<(), TestError> {
+    // The sugar produces an ordinary `Range<T>` value usable outside a loop.
+    const r: Range<i32> = 2..7;
+    match (expect_eq(r.start, 2)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(r.end, 7);
+}
+
+
+// ============================================================================
+// Iterables - the scrutinee need not be an Iterator itself; if it exposes
+// `iter()` the lowering inserts the call.  Covers `Array<T>` and `Slice<T>`.
+// ============================================================================
+
+![test]
+function for_in_array_visits_each_element() -> Result<(), TestError> {
+    mut arr: Array<i32> = Array<i32>::new();
+    arr.push(5);
+    arr.push(10);
+    arr.push(15);
+    mut sum: i32 = 0;
+    mut count: i32 = 0;
+    for (x in arr) {
+        sum = sum + x;
+        count = count + 1;
+    }
+    match (expect_eq(sum, 30)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count, 3);
+}
+
+![test]
+function for_in_empty_array_runs_zero_times() -> Result<(), TestError> {
+    const arr: Array<i32> = Array<i32>::new();
+    mut count: i32 = 0;
+    for (x in arr) {
+        count = count + 1;
+    }
+    return expect_eq(count, 0);
+}
+
+![test]
+function for_in_slice_visits_each_element() -> Result<(), TestError> {
+    mut arr: Array<i32> = Array<i32>::new();
+    arr.push(1);
+    arr.push(2);
+    arr.push(3);
+    arr.push(4);
+    const s: Slice<i32> = arr.as_slice();
+    mut sum: i32 = 0;
+    for (x in s) {
+        sum = sum + x;
+    }
+    // 1+2+3+4 = 10.
+    return expect_eq(sum, 10);
+}
+
+
+// ============================================================================
+// Fixed-size arrays `T[N]` - sema lowers the scrutinee to
+// `Slice<T>::from_raw(&arr[0], N)` and the monomorphizer seeds the
+// `Slice<T>` / `SliceIter<T>` specs.
+// ============================================================================
+
+![test]
+function for_in_fixed_array_visits_each_element() -> Result<(), TestError> {
+    const arr: i32[4] = [10, 20, 30, 40];
+    mut sum: i32 = 0;
+    mut count: i32 = 0;
+    for (x in arr) {
+        sum = sum + x;
+        count = count + 1;
+    }
+    match (expect_eq(sum, 100)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count, 4);
+}
+
+![test]
+function for_in_fixed_array_break_works() -> Result<(), TestError> {
+    const arr: i32[5] = [1, 2, 3, 4, 5];
+    mut sum: i32 = 0;
+    for (x in arr) {
+        if (x == 4) { break; }
+        sum = sum + x;
+    }
+    // 1+2+3 = 6.
+    return expect_eq(sum, 6);
 }

@@ -1736,8 +1736,123 @@ public:
             if (var_node.has_resolved_type()) {
                 this.expected_type = var_node.resolved_type;
             }
-            const init_type: TypeRef = this.resolve_expr(var_node.initializer);
+            mut init_type: TypeRef = this.resolve_expr(var_node.initializer);
             this.expected_type = saved_expected;
+            // for-in scrutinee back-fill: if this binding was synthesized
+            // by the for-in desugar (`is_auto`) and the collection's type
+            // doesn't expose `next()` but does expose `iter()`, wrap the
+            // initializer with `.iter()` and re-resolve.  Lets `for (x in
+            // arr)` work against `Array<T>` / `Slice<T>` / `SliceIter<T>`
+            // — anything iterable — while leaving direct-iterator
+            // scrutinees (`Range`, user types that `implement trait
+            // Iterator`) alone.
+            if (var_node.is_auto && init_type.is_valid()
+                    && var_node.initializer != null) {
+                // Step 1: T[N] fixed-size arrays don't have methods; lower
+                // to `Slice::from_raw(&<arr>[0], N)` so the iter()-wrap
+                // below can dispatch through Slice<T>.
+                const arr_t: Type* = this.arena.lookup(init_type.id);
+                if (arr_t != null && arr_t.kind == TypeKind::Array) {
+                    const at: ArrayType* = arr_t as ArrayType*;
+                    if (at.is_fixed()) {
+                        const orig_init: ExpressionNode* = var_node.initializer;
+                        const sp: SourceSpan = orig_init.span;
+                        // &<orig_init>[0]
+                        const zero_lit: LiteralNode* = new LiteralNode(
+                            "0", LiteralKind::Integer, sp);
+                        const idx: ArrayAccessNode* = new ArrayAccessNode(
+                            orig_init, zero_lit as ExpressionNode*, sp);
+                        const amp_tok: Token = Token::new(
+                            TokenType::Amp, "&",
+                            sp.start_line as int, sp.start_col as int);
+                        mut amp: UnaryExprNode* = new UnaryExprNode(
+                            amp_tok, idx as ExpressionNode*, sp);
+                        amp.is_synthetic = true;
+                        // N (size)
+                        const n_str: string = format("%ld", at.size);
+                        const n_lit: LiteralNode* = new LiteralNode(
+                            n_str, LiteralKind::Integer, sp);
+                        // Slice<T>::from_raw(&arr[0], N).  Slice is in the
+                        // prelude so this resolves without any explicit
+                        // import in the user's file.  We carry T as an
+                        // explicit scope-level generic arg using
+                        // `pre_resolved` (sema runs after mono, so the
+                        // mono's value-arg→type-arg inference engine
+                        // never sees this synthesized call; passing T
+                        // explicitly is the cheap path).
+                        const slice_sym: SymbolStr = this.intern.intern("Slice");
+                        const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
+                        mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
+                            slice_sym, from_raw_sym, sp);
+                        mut elt_named: NamedAnnotation* =
+                            new NamedAnnotation {
+                                name:         SymbolStr::empty(),
+                                span:         sp,
+                                pre_resolved: at.element,
+                            };
+                        const elt_ann: TypeAnnotation* =
+                            new TypeAnnotation::Named(elt_named);
+                        mut gen_args: TypeAnnotation*[] = [];
+                        gen_args.push(elt_ann);
+                        sr.set_scope_generic_args(gen_args);
+                        mut call: CallExprNode* = new CallExprNode(
+                            sr as ExpressionNode*, sp);
+                        call.add_argument(amp as ExpressionNode*);
+                        call.add_argument(n_lit as ExpressionNode*);
+                        var_node.set_initializer(call as ExpressionNode*);
+                        init_type = this.resolve_expr(var_node.initializer);
+                    }
+                }
+                // Step 2: nominal scrutinee that's iterable-but-not-iterator.
+                // If type doesn't expose `next()` but does expose `iter()`,
+                // wrap with `.iter()` and re-resolve.  Covers Array<T>,
+                // Slice<T>, and (after step 1) the lowered T[N] case.
+                mut lookup_ref: TypeRef = init_type;
+                mut t: Type* = this.arena.lookup(init_type.id);
+                mut depth: i32 = 0;
+                while (t != null && depth < 5) {
+                    if (t.kind == TypeKind::Pointer) {
+                        const pt: PointerType* = t as PointerType*;
+                        lookup_ref = pt.pointee;
+                        t = this.arena.lookup(lookup_ref.id);
+                    } else if (t.kind == TypeKind::Reference) {
+                        const rt: ReferenceType* = t as ReferenceType*;
+                        lookup_ref = rt.referent;
+                        t = this.arena.lookup(lookup_ref.id);
+                    } else if (t.kind == TypeKind::InstantiatedType) {
+                        const inst: InstantiatedType* = t as InstantiatedType*;
+                        if (!inst.has_resolved_type()) { break; }
+                        lookup_ref = inst.resolved_type;
+                        t = this.arena.lookup(lookup_ref.id);
+                    } else {
+                        break;
+                    }
+                    depth += 1;
+                }
+                const type_sym: SymbolStr = this.lookup_type_sym(lookup_ref);
+                if (type_sym.is_valid()) {
+                    const next_sym: SymbolStr = this.intern.intern("next");
+                    const next_ret: TypeRef = this.lookup_method_return(
+                        type_sym, next_sym);
+                    if (!next_ret.is_valid()) {
+                        const iter_sym: SymbolStr = this.intern.intern("iter");
+                        const iter_ret: TypeRef = this.lookup_method_return(
+                            type_sym, iter_sym);
+                        if (iter_ret.is_valid()) {
+                            const orig_init: ExpressionNode* = var_node.initializer;
+                            const wrap_span: SourceSpan = orig_init.span;
+                            mut iter_member: MemberAccessNode* =
+                                new MemberAccessNode(orig_init, iter_sym,
+                                                     wrap_span, wrap_span);
+                            mut iter_call: CallExprNode* =
+                                new CallExprNode(iter_member as ExpressionNode*,
+                                                 wrap_span);
+                            var_node.set_initializer(iter_call as ExpressionNode*);
+                            init_type = this.resolve_expr(var_node.initializer);
+                        }
+                    }
+                }
+            }
             if (this.ctx.debug_mode) {
                 const _dbg_name: string = this.intern.resolve(var_node.name);
                 cdebug("[Sema:DeclStmt] var '%s' has_resolved=%d init_valid=%d resolved_id=%llu init_id=%llu\n",

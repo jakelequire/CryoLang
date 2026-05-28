@@ -41,7 +41,16 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **FFI:** `extern "C"` functions, variadic functions via `VaArgs::new(...)`,
   the `![link]` directive for extern symbols.
 - **Operators:** `?` error propagation, `|>` pipeline, `??` null-coalescing,
-  `T?` optional-type sugar (desugars to `Option<T>`).
+  `T?` optional-type sugar (desugars to `Option<T>`), `a..b` / `a..=b`
+  range expressions (desugar to `Range::new` / `RangeInclusive::new`;
+  valid in any expression position, looser than arithmetic).
+- **`for (x in iter)` iteration:** the parser desugars to
+  `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`,
+  evaluating the scrutinee exactly once. The scrutinee may be any
+  `Iterator` (stdlib `Range<T>` / `RangeInclusive<T>` or any
+  `implement trait Iterator<T>`), a range literal (`for (i in 0..n)`),
+  an iterable exposing `iter()` (`Array<T>`, `Slice<T>`), or a
+  fixed-size array `T[N]` (viewed as a `Slice<T>`).
 - **Lambdas and closures:** `(params) -> Ret { body }` function literals.
   Non-capturing lambdas compile to anonymous function pointers; capturing
   lambdas over `Copy` bindings (i32/u64/bool/char/references and any
@@ -135,9 +144,10 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- `for x in iter` iteration and iterator combinators (`.map`, `.filter`,
-  `.collect`, `.take`, `.zip`, `.chain`, `.enumerate`). The `Iterator`
-  trait ships with `next`/`count`/`fold`/`for_each` only.
+- Iterator combinators (`.map`, `.filter`, `.collect`, `.take`, `.zip`,
+  `.chain`, `.enumerate`). The `Iterator` trait ships with
+  `next`/`count`/`fold`/`for_each` only; `for (x in iter)` iteration
+  works against any of these.
 - Range expressions in expression position (`a..b`, `a..=b`).
 - Inclusive range patterns (`1..=10`).
 - Pattern guard clauses (`x if cond =>`).

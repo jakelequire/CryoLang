@@ -1792,6 +1792,30 @@ type struct Monomorphizer {
                             if (vd.is_auto && inst_from_init.is_valid()) {
                                 vd.resolved_type = inst_from_init;
                             }
+
+                            // for-in over a fixed-size array `T[N]`: sema
+                            // (which runs AFTER mono) lowers the scrutinee
+                            // to `Slice<T>::from_raw(...).iter()`, but mono
+                            // never sees that synthesized call and so never
+                            // instantiates `Slice<T>` / `SliceIter<T>`.
+                            // Seed them here, keyed off the binding's
+                            // fixed-array element type, so the specs exist
+                            // by codegen time.
+                            if (vd.is_auto) {
+                                const it_ty: TypeRef =
+                                    this.resolve_arg_type_for_inference(
+                                        vd.initializer, names, types);
+                                if (it_ty.is_valid()) {
+                                    mut it_t: Type* = this.arena.lookup(it_ty.id);
+                                    if (it_t != null
+                                            && it_t.kind == TypeKind::Array) {
+                                        const fa: ArrayType* = it_t as ArrayType*;
+                                        if (fa.is_fixed() && fa.element.is_valid()) {
+                                            this.seed_fixed_array_iter_specs(fa.element);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2067,6 +2091,34 @@ type struct Monomorphizer {
     /// (free-fn or method calls, complex expressions); inference simply
     /// skips those args, and the post-loop "all bindings filled" check
     /// catches the case where no other arg pinned the missing binding.
+    /// Instantiate `Slice<elt>` and `SliceIter<elt>` (and enqueue them on
+    /// the worklist) so the for-in-over-`T[N]` lowering sema emits later
+    /// (`Slice<elt>::from_raw(...).iter()`) has concrete specs at codegen
+    /// time.  Both templates take a single type param.  Idempotent: a
+    /// cache hit just re-enqueues, which `enqueue_from_type_ref` no-ops.
+    seed_fixed_array_iter_specs(mut &this, elt: TypeRef) -> void {
+        if (this.generic_registry == null || !elt.is_valid()) { return; }
+        const elt_t: Type* = this.arena.lookup(elt.id);
+        if (elt_t == null) { return; }
+        if (elt_t.kind == TypeKind::GenericParam
+                || elt_t.kind == TypeKind::BoundedParam) { return; }
+        const names2: SymbolStr[] = [
+            this.intern_table.intern("std::core::slice::Slice"),
+            this.intern_table.intern("std::core::slice::SliceIter"),
+        ];
+        for (mut i: i64 = 0; i < names2.length; i++) {
+            const entry: TemplateEntry* =
+                this.generic_registry.get_template(names2[i]);
+            if (entry == null) { continue; }
+            mut args: TypeRef[] = [];
+            args.push(elt);
+            const inst_ref: TypeRef =
+                this.generic_registry.instantiate_for_module(
+                    entry.base_type, args, this.current_module);
+            this.enqueue_from_type_ref(inst_ref);
+        }
+    }
+
     resolve_arg_type_for_inference(&this, expr: ExpressionNode*,
                                    names: SymbolStr[], types: TypeRef[]) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
