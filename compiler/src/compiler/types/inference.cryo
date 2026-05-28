@@ -52,6 +52,13 @@ type struct InferCtx {
     arena:     TypeArena*;
     param_ids: u64[];
     bindings:  TypeRef[];
+    // When `unify` rejects an open generic param because it was already
+    // bound to a structurally different actual, it records that (existing,
+    // new) pair here (first conflict only). The monomorphizer reads this to
+    // tell a genuine "no single T" type error (`i32` then `string`) apart
+    // from a benign coercible mismatch (`i32` then `i64`). Both are Copy.
+    conflict_from: TypeRef;
+    conflict_to:   TypeRef;
 
     /// Empty context for a template: one unbound slot per open param.
     static for_template(arena: TypeArena*, param_ids: u64[]) -> InferCtx {
@@ -59,7 +66,10 @@ type struct InferCtx {
         for (mut i: i64 = 0; i < param_ids.length; i++) {
             binds.push(TypeRef::invalid());
         }
-        return InferCtx { arena: arena, param_ids: param_ids, bindings: binds };
+        return InferCtx {
+            arena: arena, param_ids: param_ids, bindings: binds,
+            conflict_from: TypeRef::invalid(), conflict_to: TypeRef::invalid(),
+        };
     }
 
     /// Adopt a caller-owned side-table (param ids + in-progress bindings).
@@ -77,7 +87,10 @@ type struct InferCtx {
         for (mut i: i64 = 0; i < param_ids.length; i++) { pid.push(param_ids[i]); }
         mut bnd: TypeRef[] = [];
         for (mut i: i64 = 0; i < bindings.length; i++) { bnd.push(bindings[i]); }
-        return InferCtx { arena: arena, param_ids: pid, bindings: bnd };
+        return InferCtx {
+            arena: arena, param_ids: pid, bindings: bnd,
+            conflict_from: TypeRef::invalid(), conflict_to: TypeRef::invalid(),
+        };
     }
 
     /// Index of `id` in the open-param list, or -1 if `id` is not a param
@@ -117,7 +130,16 @@ type struct InferCtx {
             if (idx < 0) { return false; }
             const existing: TypeRef = this.bindings[idx];
             if (existing.is_valid()) {
-                return existing.id == actual.id;
+                if (existing.id == actual.id) { return true; }
+                // Same open param met two structurally different actuals.
+                // Record the first such pair so the caller can decide whether
+                // it is a real type error or a coercible mismatch; the bool
+                // return is unchanged (still a unification failure).
+                if (!this.conflict_from.is_valid()) {
+                    this.conflict_from = existing;
+                    this.conflict_to   = actual;
+                }
+                return false;
             }
             this.bindings[idx] = actual;
             return true;
