@@ -298,15 +298,24 @@ when the type parameter appears *nowhere* the call can infer it from.
 
 ### 2.6 Tuple Types
 
-A tuple groups a fixed number of heterogeneous values into one compound. **Tuple types and tuple literals use square brackets.** Round parentheses are reserved for grouping and the unit type.
+> **Status: partially reserved — see [§21](#21-reserved-syntax).** The
+> bracketed tuple *type* (`[int, string]`) is accepted in type position, but
+> tuple *literals* and `.N` element access are **not yet lowered**: a
+> `[a, b]` literal currently parses as an array, so constructing or reading a
+> tuple value does not compile (it reports `E0200`). The design below is a
+> roadmap, not a usable 1.0 feature.
+
+A tuple groups a fixed number of heterogeneous values into one compound. **Tuple types and tuple literals are planned to use square brackets.** Round parentheses are reserved for grouping and the unit type.
 
 ```cryo
+// Planned syntax. The type aliases below compile today; the literal and
+// the `.0` / `.1` element access do NOT yet (see the status note above).
 type Pair        = [int, string];
 type Triple      = [int, int, int];
 
-const p: [int, string] = [42, "answer"];
-const x: int    = p.0;
-const s: string = p.1;
+const p: [int, string] = [42, "answer"];   // not yet: parses as an array
+const x: int    = p.0;                      // not yet
+const s: string = p.1;                      // not yet
 ```
 
 `(int, string)` is **not** a tuple type. The parser will reject it and direct you to the bracketed form.
@@ -922,13 +931,23 @@ public:
 
 Visibility may also be declared per-field with a leading `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes.
 
-Fields may have **default values** that are used when the field is omitted from a struct literal:
+Fields may declare **default values** with `= <expr>`.
+
+> **Status: reserved — see [§21](#21-reserved-syntax).** The default-value
+> syntax parses, but defaults are **not yet applied** at construction: a
+> struct literal must still supply every field, and omitting a field that
+> has a default is an error (`E0355`). The syntax below is accepted by the
+> parser today purely so the eventual feature is forward-compatible.
 
 ```cryo
 type struct Config {
-    debug:   boolean = false;
+    debug:   boolean = false;   // default parsed, but NOT yet applied
     verbose: boolean = false;
 }
+
+// Today this is an error (E0355: missing fields `debug`, `verbose`);
+// when defaults are implemented it will construct Config { false, false }.
+const c: Config = Config {};
 ```
 
 ### 8.3 Methods
@@ -1915,9 +1934,9 @@ For larger C libraries, transcribing every signature by hand is error-prone. Cry
 
 ```cryo
 c := extern "C" {
-    #include "stdio.h"
-    #include "stdlib.h"
-    #include "./my_header.h"
+    #include <stdio.h>       // angle: system include search path
+    #include <stdlib.h>
+    #include "./my_header.h" // quoted: relative to this source file
 }
 
 function main() -> int {
@@ -1928,7 +1947,9 @@ function main() -> int {
 }
 ```
 
-Each `#include` takes a quoted path string. Angle-bracket form (`#include <stdio.h>`) is not currently accepted; quote system headers by name and let `clang`'s include search path resolve them. The identifier before `:=` (`c` here) introduces a namespace into which the imported declarations are placed; access them with `::` to prevent collisions between C and Cryo names.
+Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) — exactly as in C. The identifier before `:=` (`c` here) introduces a namespace into which the imported declarations are placed; access them with `::` to prevent collisions between C and Cryo names.
+
+An aliased import block holds **only** `#include` directives, never Cryo declarations; conversely, a plain `extern "C"` block (§18.1) holds **only** hand-written Cryo signatures, never `#include`. Don't also hand-declare a symbol that an imported header already defines (e.g. `puts` from `<stdio.h>`) — reach it through the alias (`c::puts`) instead.
 
 ### 18.3 Calling Cryo from C
 
@@ -2081,6 +2102,8 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
+| Tuple literals `[a, b]` + `.N` access | The tuple *type* `[T, U]` is accepted in type position, but a `[a, b]` literal parses as an array and `.N` element access is not lowered, so constructing or reading a tuple value does not compile (`E0200`). See [§ 2.6](#26-tuple-types). |
+| Struct field defaults (`field: T = expr`) | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
 | `![pure]` | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics). |
 | `![const]` | Reserved. Will mark a function as evaluable at compile time. |

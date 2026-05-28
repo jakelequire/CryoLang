@@ -53,8 +53,22 @@ function run(ctx: CompilationContext*) -> PassResult {
 
         for (mut j: int = 0; j < extern_node.include_paths.length; j++) {
             const include_path: string = extern_node.include_paths[j];
-            const resolved: string = resolve_include_path(source_dir, include_path);
+            const is_system: boolean =
+                (j < extern_node.include_is_system.length)
+                && extern_node.include_is_system[j];
 
+            if (is_system) {
+                // `#include <stdio.h>`: let the C preprocessor resolve it
+                // against its system search path. There is no local file
+                // to stat first.
+                const count: i32 =
+                    process_c_system_header(include_path, extern_node, ctx);
+                total_imported += count;
+                continue;
+            }
+
+            // `#include "foo.h"`: resolve relative to the importing file.
+            const resolved: string = resolve_include_path(source_dir, include_path);
             if (resolved == "") {
                 cdebug("[CHeaderImport] WARNING: header not found: '%s' (relative to '%s')\n",
                        include_path, source_dir);
@@ -137,40 +151,76 @@ function pick_c_preprocessor() -> string {
     return "clang-20";
 }
 
-/// Run the C preprocessor on a header file and parse the output.
-/// Returns the number of function declarations extracted.  Emits a
-/// proper diagnostic when the preprocessor fails (missing binary,
-/// non-zero exit, or empty output for a non-empty header); silent
-/// stderr redirects swallowed every previous failure mode and produced
-/// confusing "no functions imported" results.
+/// Preprocess a local header *file* (quoted include `#include "foo.h"`)
+/// and parse the output. Returns the number of function declarations
+/// extracted.
 function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
                           ctx: CompilationContext*) -> i32 {
     const cc: string = pick_c_preprocessor();
-    const cc_len: u64 = intrinsics::strlen(cc);
-    const path_len: u64 = intrinsics::strlen(resolved_path);
-    const flags: string = " -E -P \"";
-    const tail:  string = "\"";
-    const flags_len: u64 = intrinsics::strlen(flags);
-    const tail_len:  u64 = intrinsics::strlen(tail);
-    const cmd_len: u64 = cc_len + flags_len + path_len + tail_len + 1;
-    const cmd: i8* = intrinsics::malloc(cmd_len) as i8*;
-    intrinsics::memcpy(cmd as void*, cc as void*, cc_len);
-    intrinsics::memcpy((cmd + cc_len) as void*, flags as void*, flags_len);
-    intrinsics::memcpy((cmd + cc_len + flags_len) as void*, resolved_path as void*, path_len);
-    intrinsics::memcpy((cmd + cc_len + flags_len + path_len) as void*, tail as void*, tail_len);
-    cmd[cc_len + flags_len + path_len + tail_len] = 0;
+    // cc -E -P "<resolved_path>"
+    const cmd: string = format("%s -E -P \"%s\"", cc, resolved_path);
+    return run_preproc_pipe(cmd, resolved_path, extern_node, ctx);
+}
 
+/// Preprocess an angle-bracket *system* header (`#include <stdio.h>`).
+/// The header is not a local file, so rather than stat a path we feed a
+/// one-line `#include <...>` to the preprocessor on stdin and let it
+/// resolve the header against its own system search path. The header
+/// name is validated to path-safe characters first so it can be embedded
+/// in the single-quoted shell argument without injection risk.
+function process_c_system_header(header: string, extern_node: ExternBlockNode*,
+                                 ctx: CompilationContext*) -> i32 {
+    if (!is_safe_header_name(header)) {
+        ctx.diagnostics.emit(Diagnostic::error(
+            ErrorCode::E0806_HEADER_PREPROC_FAILED,
+            format("invalid system header name '<%s>': only letters, digits, and '. _ / + -' are allowed",
+                header)));
+        return 0;
+    }
+    const cc: string = pick_c_preprocessor();
+    // printf '#include <hdr>\n' | cc -E -P -x c -
+    // The single quotes keep '<', '>', and '#' literal; is_safe_header_name
+    // has already excluded the only single-quote breakout character.
+    const cmd: string = format("printf '#include <%s>\\n' | %s -E -P -x c -",
+        header, cc);
+    return run_preproc_pipe(cmd, header, extern_node, ctx);
+}
+
+/// True when `name` contains only characters valid in a C header path:
+/// ASCII letters, digits, and '. _ / + -'. Excludes shell metacharacters
+/// (notably the single quote) so the name is safe to embed in the
+/// single-quoted printf argument of the system-header preprocess command.
+function is_safe_header_name(name: string) -> boolean {
+    const len: u64 = intrinsics::strlen(name);
+    if (len == 0) { return false; }
+    for (mut i: u64 = 0; i < len; i++) {
+        const c: i8 = name[i];
+        const ok: boolean = is_c_ident_char(c)
+            || c == '.' || c == '/' || c == '+' || c == '-';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+/// popen `cmd`, slurp its stdout, and extract C function prototypes into
+/// `extern_node`. `label` names the header for diagnostics. Returns the
+/// number of functions extracted. Emits a proper diagnostic when the
+/// preprocessor can't launch, exits non-zero, or yields nothing; silent
+/// failures previously surfaced as confusing "no extern decls visible"
+/// errors at the next pass with no clue why. Does not free `cmd`.
+function run_preproc_pipe(cmd: string, label: string,
+                          extern_node: ExternBlockNode*,
+                          ctx: CompilationContext*) -> i32 {
     if (ctx.debug_mode) {
         cdebug("[CHeaderImport] Running preprocessor: %s\n", cmd);
     }
 
-    const pipe: void* = intrinsics::popen(cmd as string, "r");
+    const pipe: void* = intrinsics::popen(cmd, "r");
     if (pipe == null) {
         ctx.diagnostics.emit(Diagnostic::error(
             ErrorCode::E0806_HEADER_PREPROC_FAILED,
-            format("failed to launch C preprocessor '%s' for header '%s' (popen returned null)",
-                cc, resolved_path)));
-        intrinsics::free(cmd as void*);
+            format("failed to launch C preprocessor for header '%s' (popen returned null)",
+                label)));
         return 0;
     }
 
@@ -203,13 +253,11 @@ function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
     if (exit_code != 0) {
         ctx.diagnostics.emit(Diagnostic::error(
             ErrorCode::E0806_HEADER_PREPROC_FAILED,
-            format("C preprocessor '%s' failed for header '%s' (exit status %d); set $CRYO_CC if your clang binary is named differently",
-                cc, resolved_path, exit_code)));
-        intrinsics::free(cmd as void*);
+            format("C preprocessor failed for header '%s' (exit status %d); set $CRYO_CC if your clang binary is named differently",
+                label, exit_code)));
         intrinsics::free(output_buf as void*);
         return 0;
     }
-    intrinsics::free(cmd as void*);
 
     if (output_len == 0) {
         intrinsics::free(output_buf as void*);
@@ -369,9 +417,29 @@ function try_parse_c_func(source: string, source_len: i64, start: i64,
                 pos += 1;
             }
 
+            // Unnamed pointer parameter (`FILE *`, `void *`): the scan above
+            // treats the type's trailing identifier as a parameter name, but
+            // a `*` after it means the parameter is unnamed and the `*`
+            // belongs to the type. Critically, for `void *` this otherwise
+            // truncates the type to bare `void` (the `*` sits past
+            // param_type_end), which is not a first-class LLVM type and fails
+            // module verification. Detect the trailing `*` and fold the whole
+            // span into the type.
+            mut unnamed_ptr: boolean = false;
+            if (param_name_end >= 0) {
+                mut k: i64 = param_name_end;
+                while (k < pos) {
+                    if (source[k] == '*') { unnamed_ptr = true; break; }
+                    k += 1;
+                }
+            }
+
             // Determine parameter name vs type keyword
             mut pname: string = "";
-            if (param_name_start >= 0) {
+            if (unnamed_ptr) {
+                // No name; the full span (including the `*`) is the type.
+                param_type_end = pos;
+            } else if (param_name_start >= 0) {
                 pname = extract_trimmed(source, param_name_start, param_name_end);
                 if (is_c_type_keyword(pname)) {
                     param_type_end = param_name_end;
@@ -387,6 +455,14 @@ function try_parse_c_func(source: string, source_len: i64, start: i64,
             }
 
             const param_type_str: string = extract_trimmed(source, param_start, param_type_end);
+            // A bare `void` parameter type is not a first-class LLVM type and
+            // would fail module verification. This shouldn't survive the
+            // unnamed-pointer handling above for valid C, but system headers
+            // are adversarial; skip the whole declaration rather than emit
+            // invalid IR for one unparseable signature.
+            if (str_eq(param_type_str, "void")) {
+                return fail;
+            }
             const param_sym: SymbolStr = ctx.intern_table.intern(pname);
             const param_type_ann: TypeAnnotation* = c_type_to_annotation(param_type_str, ctx);
             const span: SourceSpan = SourceSpan::none();

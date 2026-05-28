@@ -398,18 +398,32 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Optimization for module: %s\n", ctx.artifacts.ir.module_name);
+            cdebug("[Codegen] Optimization for module: %s (O%u)\n",
+                ctx.artifacts.ir.module_name, ctx.opt_level);
+        }
+
+        // O0: skip the IR optimization pipeline entirely. This leaves the
+        // generated allocas / loads / stores intact (no mem2reg, no
+        // inlining, no folding) so an O0 build stays debuggable and maps
+        // cleanly back to source. The backend TargetMachine level below
+        // still governs instruction selection / register allocation.
+        if (ctx.opt_level == 0) {
+            if (ctx.debug_mode) {
+                cdebug("[Codegen] O0: skipping IR optimization pipeline\n");
+            }
+            return PassResult::ok();
         }
 
         const opt_triple: string = resolve_effective_triple(ctx.target_triple);
-        mut tm: LTargetMachine = create_target_machine_for_triple(opt_triple);
+        mut tm: LTargetMachine = create_target_machine_with_opt(
+            opt_triple, ctx.opt_level as i32);
         if (!tm.is_valid()) {
             return PassResult::ok();
         }
 
-        // Run default O2 optimization pipeline.
+        // Run the default optimization pipeline at the configured level.
         const opts: void* = llvm::LLVMCreatePassBuilderOptions();
-        const passes: string = "default<O2>";
+        const passes: string = format("default<O%u>", ctx.opt_level);
         const result: i32 = llvm::LLVMRunPasses(
             ctx.artifacts.ir.llvm_module, passes, tm.raw, opts);
         llvm::LLVMDisposePassBuilderOptions(opts);
@@ -489,7 +503,8 @@ type struct CodegenPasses {
         // a stale host machine here would silently undo the cross-
         // compile we set up in IR generation.
         const obj_triple: string = resolve_effective_triple(ctx.target_triple);
-        mut tm: LTargetMachine = create_target_machine_for_triple(obj_triple);
+        mut tm: LTargetMachine = create_target_machine_with_opt(
+            obj_triple, ctx.opt_level as i32);
         if (!tm.is_valid()) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 "failed to create target machine for object emission");

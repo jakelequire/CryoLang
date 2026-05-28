@@ -75,6 +75,12 @@ type struct CompilerConfig {
     /// emit-to-file mode in codegen (Asm/Object) or trigger the
     /// IR-text dump / `cc` link flow (IRText/Exe).
     output_kind:         OutputKind;
+    /// CLI override for the LLVM optimization level (`--opt-level=N`,
+    /// 0..3). `-1` means "unset" => fall back to cryoconfig `[compiler]
+    /// optimize`. Takes priority over the cryoconfig value so a single
+    /// project can be built optimized or debuggable without editing the
+    /// file. Read in `compile_project_with_ctx`.
+    opt_level_override:  i32;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -88,6 +94,7 @@ type struct CompilerConfig {
             target_triple_override: "",
             output_path_override: "",
             output_kind:         OutputKind::None,
+            opt_level_override:  -1,
         };
     }
 
@@ -103,6 +110,7 @@ type struct CompilerConfig {
             target_triple_override: "",
             output_path_override: "",
             output_kind:         OutputKind::None,
+            opt_level_override:  -1,
         };
     }
 }
@@ -440,6 +448,13 @@ type struct CompilerInstance {
 
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
         ctx.debug_mode = this.config.debug;
+        // Single-file has no cryoconfig; honor a `--opt-level=N` override
+        // when present, otherwise keep the default O2 (ctx.opt_level == 2).
+        if (this.config.opt_level_override >= 0) {
+            mut lvl: i32 = this.config.opt_level_override;
+            if (lvl > 3) { lvl = 3; }
+            ctx.opt_level = lvl as u32;
+        }
         ctx.target_triple = this.config.target_triple_override;
         ctx.output_path_override = this.config.output_path_override;
         ctx.output_kind          = this.config.output_kind;
@@ -798,6 +813,14 @@ type struct CompilerInstance {
 
         const root_path: string = config.discovery_root_path();
         ctx.debug_mode = this.config.debug;
+        // Optimization level: cryoconfig `[compiler] optimize` (true=>O2,
+        // false=>O0), overridden by `--opt-level=N` when the CLI set it.
+        ctx.opt_level = if (config.optimize) { 2 } else { 0 };
+        if (this.config.opt_level_override >= 0) {
+            mut lvl: i32 = this.config.opt_level_override;
+            if (lvl > 3) { lvl = 3; }
+            ctx.opt_level = lvl as u32;
+        }
         ctx.project_no_std = config.no_std;
         ctx.target_triple = config.target_triple;
 

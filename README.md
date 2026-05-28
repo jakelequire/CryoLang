@@ -281,23 +281,26 @@ Items are private by default; `public` exports them.
 ### FFI
 
 ```cryo
+// Declare individual C functions by hand:
 extern "C" {
-    function puts(s: string) -> int;
+    function strlen(s: string) -> u64;
 }
 
+// …or import a whole C header under an alias. Quoted includes resolve
+// relative to the source file; angle-bracket includes use the system
+// search path, exactly as in C.
 c := extern "C" {
     #include <stdio.h>
-    #include <stdlib.h>
 }
 
 function main() -> int {
-    puts("via libc");
-    c::printf("printf(%d)\n", 42);
+    const n: u64 = strlen("hello");
+    c::printf("strlen = %lu\n", n);
     return 0;
 }
 ```
 
-The `c := extern "C" { #include … }` form imports a real C header. The compiler invokes `clang` to preprocess it and synthesises bindings under the named alias.
+The `c := extern "C" { #include … }` form imports a real C header. The compiler invokes `clang` to preprocess it and synthesises bindings under the named alias. Don't also hand-declare a symbol that the imported header defines (e.g. `puts` from `<stdio.h>`) — call it through the alias (`c::puts`) instead.
 
 ### Tests
 
