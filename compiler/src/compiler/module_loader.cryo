@@ -10,6 +10,8 @@ namespace Compiler::ModuleLoader;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Diag::Sink;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::EditDistance;
 import Compiler::Resolver::InternTable;
 import Compiler::ModuleGraph;
 import Compiler::Diag;
@@ -305,6 +307,29 @@ type struct ModuleLoader {
     }
 
 
+    /// Best-effort "did you mean" for an unresolved import. Scans the
+    /// pre-built namespace map — every discoverable module's declared
+    /// namespace — for the closest name by Damerau-Levenshtein distance.
+    /// Catches the common case mismatch (`utils` -> `Utils`) and small
+    /// typos (`Compiler::Reslover` -> `Compiler::Resolver`). Returns ""
+    /// when nothing is close enough or the map is empty.
+    suggest_module(&this, import_path: string) -> string {
+        mut candidates: string[] = [];
+        const count: u64 = this.ns_map.bucket_count();
+        mut b: u64 = 0;
+        while (b < count) {
+            mut node: hashmap::Entry<string, string>* = this.ns_map.get_bucket(b);
+            loop {
+                if (node == null) { break; }
+                candidates.push(node.key);
+                node = node.next;
+            }
+            b += 1;
+        }
+        return find_best_candidate(import_path, candidates);
+    }
+
+
     // Internal: Recursive Discovery
 
     /// Recursively discover a module and its imports.
@@ -408,9 +433,32 @@ type struct ModuleLoader {
                             import_path, resolved);
                     }
                 } else {
-                    const msg: string = format("module '%s' not found (imported from '%s')",
-                        import_path, file_path);
-                    sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
+                    // Unresolved import. Anchor the diagnostic at the
+                    // offending path, and — when a near-match exists in the
+                    // discovered namespace map — suggest it. The lockstep
+                    // import_spans array carries no file (scan_tokens has
+                    // none), so rebuild the span with this file's path.
+                    mut span: SourceSpan = SourceSpan::none();
+                    if (i < scan.import_spans.length) {
+                        const raw: SourceSpan = scan.import_spans[i];
+                        span = SourceSpan::new(file_path,
+                            raw.start_line, raw.start_col,
+                            raw.end_line, raw.end_col);
+                    }
+                    const suggestion: string = this.suggest_module(import_path);
+                    mut diag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0500_MODULE_NOT_FOUND,
+                        format("cannot find module `%s`", import_path));
+                    if (span.has_location()) {
+                        diag = diag.at_with_label(span,
+                            format("no module named `%s` is in scope", import_path));
+                    }
+                    if (strlen(suggestion) > 0) {
+                        diag = diag.with_note(format("did you mean `%s`?", suggestion));
+                    }
+                    diag = diag.help(
+                        "imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive");
+                    sink.emit(diag);
                     success = false;
                     continue;
                 }
@@ -544,6 +592,7 @@ type struct ModuleLoader {
 type struct ModuleScanResult {
     namespace_name:  string;
     import_paths:    string[];    // real `import` statements (create dependency edges)
+    import_spans:    SourceSpan[]; // span of each import path, parallel to import_paths (file unset; caller fills)
     import_count:    i64;
     submodule_paths: string[];    // `public module` declarations (discover only, no dep edge)
     submodule_count: i64;
@@ -556,6 +605,7 @@ type struct ModuleScanResult {
 function scan_tokens(tokens: Token[]) -> ModuleScanResult {
     mut ns: string = "";
     mut imports: string[] = [];
+    mut import_spans: SourceSpan[] = [];
     mut submodules: string[] = [];
     const len: i64 = tokens.length;
     mut i: i64 = 0;
@@ -579,10 +629,33 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
 
         // import Foo::Bar;
         if (tok.kind == TokenType::KwImport) {
+            // The path's first segment sits just past the `import`
+            // keyword; record its position so an unresolved import can
+            // point a caret at the path rather than emitting a
+            // context-free message.
+            mut path_line: int = tok.line;
+            mut path_col:  int = tok.column + 7;  // length of "import "
             i += 1;
+            if (i < len) {
+                path_line = tokens[i].line;
+                path_col  = tokens[i].column;
+            }
             const path: string = collect_qualified_name(tokens, &i, len);
             if (strlen(path) > 0) {
                 imports.push(path);
+                // Underline through the last consumed name token. The
+                // file is left empty here (scan_tokens has no path); the
+                // caller rebuilds the span with the real source path.
+                mut end_line: int = path_line;
+                mut end_col:  int = path_col + (strlen(path) as int);
+                if (i >= 1 && (i - 1) < len) {
+                    const last: Token = tokens[i - 1];
+                    end_line = last.line;
+                    end_col  = last.column + last.source_length;
+                }
+                import_spans.push(SourceSpan::new("",
+                    path_line as u32, path_col as u32,
+                    end_line as u32, end_col as u32));
             }
             // Skip semicolon if present
             if (i < len) {
@@ -631,6 +704,7 @@ function scan_tokens(tokens: Token[]) -> ModuleScanResult {
     return ModuleScanResult {
         namespace_name:  ns,
         import_paths:    imports,
+        import_spans:    import_spans,
         import_count:    import_count_val,
         submodule_paths: submodules,
         submodule_count: submodule_count_val,
