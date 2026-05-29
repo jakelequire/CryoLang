@@ -145,21 +145,23 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- Iterator combinators are partial. `.take(n)` ships as a lazy
-  `Iterator` default returning a `TakeIter` adapter. It works when the
-  adapter is consumed by `.count()` or `for (x in ...)`, across all of these
-  receiver shapes: a named local (`r.take(n).count()`), a call-expression
-  receiver (`Range<i32>::new(0,100).take(n).count()`), and an explicitly-typed
-  local bound to the adapter (`mut t: TakeIter<Range<i32>> = r.take(n);
-  t.count()`). Not yet supported: consuming the adapter with `.fold(...)` (or
-  any default whose signature names the element type - the adapter carries
-  the element type only in a where-clause, which the lazy specializer can't
-  yet bind there), chaining adapters (`r.take(a).take(b)`), and
-  `.map`/`.filter`/`.zip`/`.chain`/`.enumerate`/`.collect` (not yet
-  implemented); these surface a type-mismatch diagnostic. The `Iterator`
-  trait otherwise ships with `next`/`count`/`fold`/`for_each` on direct
-  iterators; `for (x in iter)` iteration and range *expressions* (`a..b` /
-  `a..=b`, see Compiler above) ship in 1.0 and work against any of these.
+- Iterator combinators are partial. `.take(n)`, `.map(f)` and `.filter(pred)`
+  ship as lazy `Iterator` defaults returning adapters (`TakeIter`, `MapIter`,
+  `FilterIter`); `f`/`pred` must be non-capturing functions. They work when
+  applied **directly to an iterator** (a named local, an explicitly-typed
+  local bound to the adapter, or a call-expression receiver such as
+  `Range<i32>::new(0,100)`) and consumed by `.count()`, `.fold(...)` or
+  `for (x in ...)` - e.g. `r.take(n).count()`, `r.map(f).fold(..)`,
+  `r.filter(p).count()`, `for (x in r.filter(p))`. `take` additionally
+  chains with itself (`r.take(a).take(b)`) and composes with a following
+  `.map`/`.filter` (`r.map(f).filter(p)`). Not yet supported: an
+  **own-generic combinator following another combinator** - `.map` applied to
+  another adapter's result (`r.take(n).map(f)`, `r.map(f).map(g)`) - which
+  surfaces a type-mismatch diagnostic; and `.zip`/`.chain`/`.enumerate`/
+  `.collect` (not yet implemented). The `Iterator` trait otherwise ships with
+  `next`/`count`/`fold`/`for_each`; `for (x in iter)` iteration and range
+  *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0 and work
+  against any of these.
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - `Display`/`Debug` impls for container and ADT types

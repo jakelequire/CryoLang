@@ -208,6 +208,10 @@ function count_on_empty_range_is_zero() -> Result<(), TestError> {
 
 function iter_add_i32(acc: i32, x: i32) -> i32 { return acc + x; }
 function iter_add_u64(acc: u64, x: u64) -> u64 { return acc + x; }
+function iter_double_i32(x: i32) -> i32 { return x * 2; }
+function iter_widen_i64(x: i32) -> i64 { return (x as i64) * 10; }
+function iter_add_i64(acc: i64, x: i64) -> i64 { return acc + x; }
+function iter_is_even(x: i32) -> boolean { return x % 2 == 0; }
 
 mut g_for_each_sum: i32 = 0;
 function iter_accumulate(x: i32) -> void { g_for_each_sum = g_for_each_sum + x; }
@@ -292,10 +296,17 @@ function range_char_walks_ascii_letters() -> Result<(), TestError> {
 // arrives as an InstantiatedType wrapper in one and a concrete struct in
 // the other dedupes, instead of producing two structs that compare unequal.
 //
-// Not yet supported (tracked in CHANGELOG known-limitations): chaining
-// adapters (`it.take(a).take(b)`), a call-expression receiver
-// (`make_range().take(n)`), or consuming the adapter with an own-generic
-// default whose signature mentions the element type (`fold`).
+// Consuming the adapter with `fold` (an own-generic default whose signature
+// names the element type via `(Acc, Item) -> Acc`) also works: the adapter's
+// element type comes from the impl's where-clause (`I: Iterator<A>`), and the
+// lazy method-specializer recovers it from the spec'd impl's already-resolved
+// signature when re-resolution of the cloned annotation can't bind it.
+//
+// Chaining adapters (`it.take(a).take(b)`) works too: the nested
+// `TakeIter<TakeIter<..>>` monomorphizes recursively (its where-clause `A` is
+// derived through the inner adapter's own Iterator impl), and its by-value
+// `this` receiver - now larger than 8 bytes - is reconstructed from its two
+// DirectPair LLVM slots in the method prologue.
 
 ![test]
 function take_caps_count_at_n() -> Result<(), TestError> {
@@ -378,4 +389,130 @@ function take_on_call_expression_receiver_caps_at_source() -> Result<(), TestErr
     // range capped at 100 counts 4, exercising the on-demand-resolved receiver's
     // inner iterator end to end.
     return expect_eq(Range<i32>::new(5, 9).take(100).count(), 4 as u64);
+}
+
+![test]
+function take_typed_local_folds() -> Result<(), TestError> {
+    // `fold` on a typed-local adapter, n > len, non-zero start: 5+6+7+8 = 26.
+    // The adapter's element type (`A` from `where I: Iterator<A>`) is recovered
+    // for fold's `(Acc, Item) -> Acc` signature from the spec'd impl.
+    mut r: Range<i32> = Range::new(5, 9);
+    mut t: TakeIter<Range<i32>> = r.take(100);
+    return expect_eq(t.fold(0, iter_add_i32), 26);
+}
+
+![test]
+function take_inline_chain_folds() -> Result<(), TestError> {
+    // `fold` directly on `r.take(n)` (named-local inline): first 4 of 1.. ->
+    // 1+2+3+4 = 10.
+    mut r: Range<i32> = Range::new(1, 100);
+    return expect_eq(r.take(4).fold(0, iter_add_i32), 10);
+}
+
+![test]
+function take_on_call_expression_receiver_folds() -> Result<(), TestError> {
+    // `fold` on a call-expression receiver: 10+11+12 = 33.
+    return expect_eq(Range<i32>::new(10, 100).take(3).fold(0, iter_add_i32), 33);
+}
+
+![test]
+function take_chain_caps_at_inner_min() -> Result<(), TestError> {
+    // `r.take(10).take(3)`: the outer cap (3) wins -> count 3, not 10.
+    // Requires the nested `TakeIter<TakeIter<Range<i32>>>` to monomorphize and
+    // its >8-byte by-value `this` receiver to round-trip through both
+    // DirectPair slots (a single-slot prologue dropped the upper half and
+    // miscounted).
+    mut r: Range<i32> = Range::new(0, 100);
+    return expect_eq(r.take(10).take(3).count(), 3 as u64);
+}
+
+![test]
+function take_chain_caps_at_outer_min() -> Result<(), TestError> {
+    // `r.take(3).take(10)`: the inner cap (3) wins -> count 3.
+    mut r: Range<i32> = Range::new(0, 100);
+    return expect_eq(r.take(3).take(10).count(), 3 as u64);
+}
+
+![test]
+function take_call_expr_receiver_drives_for_in_twice() -> Result<(), TestError> {
+    // Two for-in loops, each over a `Range::new(..).take(n)` call-expression
+    // receiver in the same function.  Regression: the second loop's iterator
+    // binding was mistyped as the inner `Range<i32>` (the constructor's owner,
+    // captured by the static-constructor side channel) instead of the
+    // `TakeIter` chain result, only when more than one such loop appeared.
+    mut s1: i32 = 0;
+    for (x in Range<i32>::new(0, 100).take(5)) { s1 = s1 + x; }   // 0+1+2+3+4
+    mut s2: i32 = 0;
+    for (x in Range<i32>::new(7, 9).take(100)) { s2 = s2 + x; }   // 7+8
+    return expect_eq(s1 + s2, 25);
+}
+
+![test]
+function take_chain_drives_for_in_with_values() -> Result<(), TestError> {
+    // for-in over a chained adapter yields real element VALUES: first 4 of
+    // 5.. (capped first at 100) -> 5+6+7+8 = 26.  Proves the nested receiver's
+    // `inner` survives the DirectPair reconstruction end to end.
+    mut r: Range<i32> = Range::new(5, 50);
+    mut sum: i32 = 0;
+    for (x in r.take(100).take(4)) { sum = sum + x; }
+    return expect_eq(sum, 26);
+}
+
+// ============================================================================
+// MapIter / FilterIter adapters - `map` / `filter` combinators
+// ============================================================================
+//
+// `map<B>` is an own-generic self-returning default; `filter` is a
+// zero-own-generic one.  Both store a non-capturing function in a field, so
+// the element type(s) are struct parameters (`MapIter<I, A, B>`,
+// `FilterIter<I, A>`) rather than where-clause-only generics.  These pin
+// map/filter applied directly to an iterator and `map().filter()`.
+//
+// NOT YET covered (tracked in CHANGELOG known-limitations): an own-generic
+// combinator FOLLOWING another combinator (`r.take(n).map(f)`,
+// `r.map(f).map(g)`) - the intermediate adapter isn't monomorphized when the
+// outer `map` specializes against it.
+
+![test]
+function map_counts_preserve_length() -> Result<(), TestError> {
+    mut r: Range<i32> = Range::new(0, 5);
+    return expect_eq(r.map(iter_double_i32).count(), 5 as u64);
+}
+
+![test]
+function map_folds_transformed_values() -> Result<(), TestError> {
+    // sum of doubles of 0..5 = 2*(0+1+2+3+4) = 20.  `fold` (own-generic) on a
+    // `map` (own-generic) result exercises chained own-generic specialization.
+    mut r: Range<i32> = Range::new(0, 5);
+    return expect_eq(r.map(iter_double_i32).fold(0, iter_add_i32), 20);
+}
+
+![test]
+function map_can_change_element_type() -> Result<(), TestError> {
+    // map i32 -> i64 (output type differs from input): sum 10*(0+1+2) = 30.
+    mut r: Range<i32> = Range::new(0, 3);
+    return expect_eq(r.map(iter_widen_i64).fold(0 as i64, iter_add_i64), 30 as i64);
+}
+
+![test]
+function filter_counts_matching() -> Result<(), TestError> {
+    // evens in 0..10 -> 0,2,4,6,8 -> 5.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.filter(iter_is_even).count(), 5 as u64);
+}
+
+![test]
+function filter_drives_for_in_with_values() -> Result<(), TestError> {
+    // sum of evens in 0..10 = 0+2+4+6+8 = 20.
+    mut r: Range<i32> = Range::new(0, 10);
+    mut sum: i32 = 0;
+    for (x in r.filter(iter_is_even)) { sum = sum + x; }
+    return expect_eq(sum, 20);
+}
+
+![test]
+function map_then_filter_composes() -> Result<(), TestError> {
+    // map doubles every element (all even), filter keeps evens -> all 10 kept.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.map(iter_double_i32).filter(iter_is_even).count(), 10 as u64);
 }
