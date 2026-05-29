@@ -2413,6 +2413,14 @@ type struct Monomorphizer {
             const ce_call: CallExprNode* = expr as CallExprNode*;
             if (ce_call.callee == null) { return TypeRef::invalid(); }
             const callee_node: ASTNode* = ce_call.callee as ASTNode*;
+            // NOTE: a ScopeResolution (static-call) receiver is deliberately
+            // NOT resolved here.  Feeding static-call return types into the
+            // general inference path mis-specializes ordinary generic methods
+            // on call-expression receivers (e.g. `Box::new(..).clone()`),
+            // producing caller/callee mangle mismatches.  The one place that
+            // genuinely needs it - a self-returning combinator on a static-call
+            // receiver (`Range<i32>::new(..).take(n)`) - resolves it explicitly
+            // in `try_infer_method_call`, gated on the combinator check.
             if (callee_node.kind != NodeKind::MemberAccess) {
                 return TypeRef::invalid();
             }
@@ -2700,6 +2708,74 @@ type struct Monomorphizer {
                 ret = method_subst.apply(ret, this.arena);
             }
             return ret;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Compute the return type of a static-method call expression
+    /// (`Type<args>::method(...)`) for inference.  Resolves the scope to a
+    /// struct/class template, binds the template's generic params from the
+    /// scope's `<args>`, finds the (non-own-generic) static method by name,
+    /// and substitutes its declared return type.  For `Range<i32>::new(0,100)`
+    /// this yields `Range<i32>` - the concrete receiver type the chained
+    /// `.take(4)` then specializes against.  Own-generic static methods are
+    /// skipped (they route through `try_infer_function_call`, which redoes
+    /// inference); any unresolved scope/arg/method returns invalid so the
+    /// caller falls back cleanly.
+    resolve_static_call_return_type(mut &this, call: CallExprNode*) -> TypeRef {
+        if (call == null || call.callee == null) { return TypeRef::invalid(); }
+        if (this.decl_index == null || this.type_resolver == null) {
+            return TypeRef::invalid();
+        }
+        const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+
+        // Resolve the scope name to a generic struct/class template.  Try the
+        // name as written, then its qualified form.
+        mut base: TypeRef = this.decl_index.lookup_type(sr.scope_name);
+        if (!base.is_valid()) {
+            base = this.decl_index.lookup_type(
+                this.decl_index.resolve_qualified(sr.scope_name));
+        }
+        if (!base.is_valid()) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(base.id);
+        if (tmpl == null) { return TypeRef::invalid(); }
+        if (tmpl.node_kind != NodeKind::StructDeclaration &&
+            tmpl.node_kind != NodeKind::ClassDeclaration) {
+            return TypeRef::invalid();
+        }
+        const struct_ast: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+        if (struct_ast == null) { return TypeRef::invalid(); }
+
+        // Bind the scope's generic args (`<i32>`) to the template's params.
+        mut method_subst: TypeSubstitution = TypeSubstitution::empty();
+        mut ctx: ResolutionContext = ResolutionContext::new("", "");
+        const nargs: i64 = if (tmpl.param_type_ids.length < sr.scope_generic_args.length) {
+            tmpl.param_type_ids.length
+        } else {
+            sr.scope_generic_args.length
+        };
+        for (mut i: i64 = 0; i < nargs; i++) {
+            const a: TypeRef = this.type_resolver.resolve(sr.scope_generic_args[i], &ctx);
+            if (!a.is_valid()) { return TypeRef::invalid(); }
+            method_subst.add(tmpl.param_type_ids[i], a);
+        }
+
+        for (mut i: i64 = 0; i < struct_ast.methods.length; i++) {
+            const m: MethodNode* = struct_ast.methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(sr.member_name)) { continue; }
+            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            mut ret: TypeRef = m.func.resolved_return_type;
+            if (!ret.is_valid()) { return TypeRef::invalid(); }
+            if (!method_subst.is_empty()) {
+                ret = method_subst.apply(ret, this.arena);
+            }
+            // `apply` builds a fresh InstantiatedType (e.g. `Range<i32>` from
+            // `Range<T>`); link it to the already-monomorphized concrete type
+            // when one exists so a chained `.take(n)` specializes against a
+            // resolved receiver.
+            return this.arena.canonical_resolved(ret);
         }
         return TypeRef::invalid();
     }
@@ -3351,6 +3427,63 @@ type struct Monomorphizer {
     /// On success, instantiates the spec'd owner type (e.g. `Slice<u8>`)
     /// and pins a `Owner_<args>::method`-shaped resolved_callee on the
     /// call.  Returns true when inference succeeds and the call is pinned.
+    /// Force an InstantiatedType receiver to be monomorphized *now* so an
+    /// adapter built over it specializes against a resolved struct, not an
+    /// unresolved placeholder.  The named-local combinator path (`r.take(n)`)
+    /// works because the local's annotation was monomorphized in `process_all`
+    /// before inference runs; a call-expression receiver
+    /// (`Range<i32>::new(..).take(n)`) produces its instantiation during this
+    /// same inference walk, so its concrete struct doesn't exist yet.  Resolving
+    /// the `This` in the adapter's `TakeIter<This>` return against an unresolved
+    /// receiver yields an invalid type and crashes the mangler; specializing the
+    /// receiver here closes that gap.  Returns the resolved concrete type when
+    /// it could be produced, else `ty` unchanged.
+    ensure_receiver_inst_resolved(mut &this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return ty; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (inst.has_resolved_type()) { return inst.resolved_type; }
+        if (this.generic_registry == null) { return ty; }
+        // An equivalent instantiation may already be resolved under a different
+        // arg representation; reuse it before doing any work.
+        const existing: TypeRef = this.arena.canonical_resolved(ty);
+        if (!existing.equals(ty)) { return existing; }
+        const key: string = this.make_key_for(inst.generic_base, inst.type_args);
+        // Already specialized elsewhere: the canonical-resolved lookup above
+        // would have found it unless its raw-id propagation didn't reach this
+        // inst; force the link, then return the concrete type.
+        if (this.is_cached(key)) {
+            const req_c: MonomorphRequest = MonomorphRequest {
+                generic_type: ty,            type_args: inst.type_args,
+                base_type:    inst.generic_base, span:   SourceSpan::none(),
+            };
+            this.propagate_cached_resolution(key, req_c);
+            return this.arena.canonical_resolved(ty);
+        }
+        // Mid-specialization of this very type (we're walking its own body):
+        // don't re-enter, or the cycle guard fires.  Leave it unresolved.
+        if (this.is_in_progress(key)) { return ty; }
+        // Specialize JUST this receiver instantiation now - not the whole
+        // worklist, which would error on items legitimately in-progress higher
+        // up the specialization stack.  Mirror the worklist loop's in-progress
+        // bracketing; nested instantiations the spec discovers are enqueued for
+        // the post-walk drain, not processed here.
+        const reg: TypeRef = this.generic_registry.instantiate_for_module(
+            inst.generic_base, inst.type_args, this.current_module);
+        const reg_t: Type* = this.arena.lookup(reg.id);
+        if (reg_t == null || reg_t.kind != TypeKind::InstantiatedType) { return ty; }
+        const reg_inst: InstantiatedType* = reg_t as InstantiatedType*;
+        const request: MonomorphRequest = MonomorphRequest {
+            generic_type: reg,                  type_args: reg_inst.type_args,
+            base_type:    reg_inst.generic_base, span:      SourceSpan::none(),
+        };
+        this.in_progress.insert(key, true);
+        this.specialize_request(request, key);
+        this.remove_in_progress(key);
+        this.generic_registry.mark_monomorphized(reg_inst.generic_base, reg_inst.type_args);
+        return this.arena.canonical_resolved(ty);
+    }
+
     try_infer_static_method_on_generic_template(mut &this,
             call: CallExprNode*, qualified_scope: SymbolStr,
             bare_scope: SymbolStr, member_name: SymbolStr,
@@ -3877,14 +4010,33 @@ type struct Monomorphizer {
     /// like `map<B>`, which retain their generic and infer it from args.
     try_instantiate_self_returning_default(mut &this, call: CallExprNode*,
                                            ma: MemberAccessNode*,
-                                           recv_type: TypeRef) -> boolean {
+                                           recv_type_in: TypeRef) -> boolean {
+        mut recv_type: TypeRef = recv_type_in;
         mut impl_node: ImplBlockNode* = null;
-        const orig: MethodNode* = this.find_self_returning_default(
+        mut orig: MethodNode* = this.find_self_returning_default(
             recv_type, ma.member, &impl_node);
         if (orig == null || orig.func == null || impl_node == null) { return false; }
         // Own-generic combinators (`map<B>`) keep their generic; the
         // inference path handles them.
         if (orig.func.generic_params.length > 0) { return false; }
+        // Confirmed: a zero-own-generic self-returning combinator.  If the
+        // receiver is an instantiation that hasn't been monomorphized yet (a
+        // call-expression receiver such as `Range<i32>::new(..)`, produced
+        // during this very inference walk), specialize it now so we resolve
+        // `TakeIter<This>` against a concrete struct - an unresolved receiver
+        // yields an invalid return type and crashes the mangler.  Gated behind
+        // the combinator check so ordinary method calls (e.g. `clone`) keep
+        // their existing specialization timing untouched.
+        const resolved_recv: TypeRef = this.ensure_receiver_inst_resolved(recv_type);
+        if (!resolved_recv.equals(recv_type)) {
+            recv_type = resolved_recv;
+            // Re-find against the now-concrete receiver so the spec method
+            // lands on the receiver spec's own impl block, not the template's.
+            impl_node = null;
+            orig = this.find_self_returning_default(recv_type, ma.member, &impl_node);
+            if (orig == null || orig.func == null || impl_node == null) { return false; }
+            if (orig.func.generic_params.length > 0) { return false; }
+        }
         // Reuse an already-instantiated sibling (a prior call on the same
         // concrete receiver type) rather than minting a duplicate symbol.
         for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
@@ -3946,6 +4098,30 @@ type struct Monomorphizer {
         // Recover the receiver's TypeRef from the param/local table; bail
         // when the receiver is anything but a name we can look up.
         mut recv_type: TypeRef = this.resolve_arg_type_for_inference(ma.object, names, types);
+        // A static-call receiver (`Range<i32>::new(..).take(n)`) is left
+        // unresolved by the general path (resolving it there perturbs ordinary
+        // generic inference - see resolve_arg_type_for_inference).  Resolve it
+        // here ONLY when the call is a self-returning combinator, so the
+        // adapter has a concrete receiver to specialize against.
+        if (!recv_type.is_valid() && ma.object != null) {
+            const obj_node: ASTNode* = ma.object as ASTNode*;
+            if (obj_node.kind == NodeKind::CallExpression) {
+                const obj_call: CallExprNode* = ma.object as CallExprNode*;
+                if (obj_call.callee != null &&
+                    (obj_call.callee as ASTNode*).kind == NodeKind::ScopeResolution) {
+                    const cand: TypeRef = this.resolve_static_call_return_type(obj_call);
+                    if (cand.is_valid()) {
+                        mut probe_impl: ImplBlockNode* = null;
+                        const srd: MethodNode* = this.find_self_returning_default(
+                            cand, ma.member, &probe_impl);
+                        if (srd != null && srd.func != null &&
+                            srd.func.generic_params.length == 0) {
+                            recv_type = cand;
+                        }
+                    }
+                }
+            }
+        }
         if (!recv_type.is_valid()) { return; }
         if (subst != null) {
             recv_type = subst.apply(recv_type, this.arena);
@@ -4403,7 +4579,71 @@ type struct Monomorphizer {
                 }
             }
         }
+        // Refuse to hand back a spec whose signature didn't fully resolve.
+        // The mangler treats an invalid TypeRef in a registered method as an
+        // internal error and aborts; that fires for own-generic defaults whose
+        // signature mentions an element type the receiver can't bind here -
+        // e.g. `fold<Acc>(f: (Acc, Item) -> Acc)` on a where-clause-generic
+        // adapter (`TakeIter`), where `Item` is unbound.  Failing here instead
+        // leaves `resolved_method` unset so the call surfaces a clean
+        // "method not found" diagnostic rather than crashing the compiler.
+        if (this.type_has_unresolved(spec_method.func.resolved_return_type, 0)) {
+            return null;
+        }
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const p: VarDeclNode* = spec_method.func.parameters[i];
+            if (p != null && this.type_has_unresolved(p.resolved_type, 0)) {
+                return null;
+            }
+        }
         return spec_method;
+    }
+
+    /// True when `ty` is invalid or *contains* an invalid TypeRef at any depth
+    /// (through Function params/return, Pointer, Reference, Array, Optional,
+    /// Tuple, or InstantiatedType args).  A shallow `is_valid()` check misses
+    /// an unbound element type buried in a function-typed parameter such as
+    /// `(Acc, Item) -> Acc`, which the mangler would then abort on.
+    type_has_unresolved(&this, ty: TypeRef, depth: i32) -> boolean {
+        if (!ty.is_valid()) { return true; }
+        if (depth > 16) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return true; }
+        if (t.kind == TypeKind::Function) {
+            const f: FunctionType* = t as FunctionType*;
+            if (this.type_has_unresolved(f.return_type, depth + 1)) { return true; }
+            for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                if (this.type_has_unresolved(f.param_types[i], depth + 1)) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.type_has_unresolved((t as PointerType*).pointee, depth + 1);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.type_has_unresolved((t as ReferenceType*).referent, depth + 1);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.type_has_unresolved((t as ArrayType*).element, depth + 1);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.type_has_unresolved((t as OptionalType*).wrapped, depth + 1);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.type_has_unresolved(tup.elements[i], depth + 1)) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.type_has_unresolved(inst.type_args[i], depth + 1)) { return true; }
+            }
+            return false;
+        }
+        return false;
     }
 
     /// Register a freshly created spec method in the DeclarationIndex.
@@ -5195,11 +5435,32 @@ type struct Monomorphizer {
         this.pending.push(request);
     }
 
-    /// Build a cache key from a request.
-    /// Delegates to GenericRegistry's make_cache_key to guarantee format
-    /// consistency between the instantiation cache and monomorphization cache.
+    /// Build a cache key from a request, used to dedup specializations in
+    /// `spec_index`.  Mirrors GenericRegistry's `make_cache_key` format
+    /// (`base<arg,arg>`) but canonicalizes each argument id through
+    /// `canon_type_id`: an arg that arrives as an InstantiatedType wrapper
+    /// (e.g. the inner `Range<i32>` of a Phase-5 annotation `TakeIter<Range<i32>>`)
+    /// collapses to the same concrete id the monomorphizer used when it built
+    /// the spec from the concrete struct.  Without this, two equivalent
+    /// instantiations key differently and produce two distinct concrete
+    /// structs for one type, which then compare unequal (spurious E0200 on
+    /// `mut t: TakeIter<Range<i32>> = r.take(n)`).  When no argument needs
+    /// canonicalizing the key is byte-identical to the raw form, so existing
+    /// behavior is unchanged.
     make_key(&this, request: MonomorphRequest) -> string {
-        return this.generic_registry.make_cache_key(request.base_type, request.type_args);
+        return this.make_key_for(request.base_type, request.type_args);
+    }
+
+    /// `make_key` over a raw `(base, args)` pair.  Canonicalizes each arg id
+    /// (see `canon_type_id`) so equivalent instantiations dedup to one spec.
+    make_key_for(&this, base: TypeRef, type_args: TypeRef[]) -> string {
+        mut key: string = format("%llu<", base.id);
+        for (mut i: i64 = 0; i < type_args.length; i++) {
+            if (i > 0) { key += ","; }
+            key += format("%llu", this.arena.canon_type_id(type_args[i]));
+        }
+        key += ">";
+        return key;
     }
 
     /// Check if a key is already in the specialization cache.

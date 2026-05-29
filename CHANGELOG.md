@@ -146,17 +146,20 @@ without them and the grammar reserves the relevant syntax. See
 authoritative list.
 
 - Iterator combinators are partial. `.take(n)` ships as a lazy
-  `Iterator` default returning a `TakeIter` adapter, and works when the
-  iterator is a named local consumed directly - e.g. `r.take(n).count()`,
-  `r.take(n).fold(...)`, or `for (x in r.take(n)) { ... }`. Not yet
-  supported: binding the adapter to an explicitly-typed local
-  (`mut t: TakeIter<..> = r.take(n)`), a call-expression receiver
-  (`make_range().take(n)`), and chaining adapters (`r.take(a).take(b)` and,
-  by extension, `.map`/`.filter`/`.zip`/`.chain`/`.enumerate`/`.collect`,
-  which are not yet implemented). The `Iterator` trait otherwise ships with
-  `next`/`count`/`fold`/`for_each`; `for (x in iter)` iteration and range
-  *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0 and work
-  against any of these.
+  `Iterator` default returning a `TakeIter` adapter. It works when the
+  adapter is consumed by `.count()` or `for (x in ...)`, across all of these
+  receiver shapes: a named local (`r.take(n).count()`), a call-expression
+  receiver (`Range<i32>::new(0,100).take(n).count()`), and an explicitly-typed
+  local bound to the adapter (`mut t: TakeIter<Range<i32>> = r.take(n);
+  t.count()`). Not yet supported: consuming the adapter with `.fold(...)` (or
+  any default whose signature names the element type - the adapter carries
+  the element type only in a where-clause, which the lazy specializer can't
+  yet bind there), chaining adapters (`r.take(a).take(b)`), and
+  `.map`/`.filter`/`.zip`/`.chain`/`.enumerate`/`.collect` (not yet
+  implemented); these surface a type-mismatch diagnostic. The `Iterator`
+  trait otherwise ships with `next`/`count`/`fold`/`for_each` on direct
+  iterators; `for (x in iter)` iteration and range *expressions* (`a..b` /
+  `a..=b`, see Compiler above) ship in 1.0 and work against any of these.
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - `Display`/`Debug` impls for container and ADT types
