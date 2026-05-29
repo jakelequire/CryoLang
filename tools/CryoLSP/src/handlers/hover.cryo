@@ -1075,12 +1075,45 @@ function format_annotation(ann: TypeAnnotation*, intern: InternTable*) -> string
 /// For globals with a literal initializer, the value is appended:
 /// `const ENOENT: i32 = 2` - useful for errno-style constant tables
 /// where the value is the relevant fact about the binding.
+/// Reconstruct a closure's signature `(P0, P1, ...) -> Ret` from the
+/// LambdaExprNode.  A capturing lambda's `resolved_type` is the synthesized
+/// `__Closure_<N>` struct, so displaying that type name gives an opaque
+/// `__Closure_0` in hovers; the signature is the useful information and it's
+/// fully recoverable from the lambda's parameters + return type.
+function format_lambda_signature(lam: LambdaExprNode*, arena: TypeArena*) -> string {
+    mut s: string = "(";
+    for (mut i: i64 = 0; i < lam.parameters.length; i++) {
+        if (i > 0) { s = s + ", "; }
+        const p: VarDeclNode* = lam.parameters[i];
+        if (p.has_resolved_type()) {
+            s = s + arena.resolve_display_name_short(p.resolved_type.id);
+        } else if (p.type_annotation != null) {
+            s = s + format_annotation(p.type_annotation, arena.intern_table);
+        } else {
+            s = s + "?";
+        }
+    }
+    s = s + ") -> ";
+    if (lam.return_type.is_valid()) {
+        s = s + arena.resolve_display_name_short(lam.return_type.id);
+    } else if (lam.return_type_ann != null) {
+        s = s + format_annotation(lam.return_type_ann, arena.intern_table);
+    } else {
+        s = s + "void";
+    }
+    return s;
+}
+
 function format_variable_decl(v: VarDeclNode*, arena: TypeArena*) -> string {
     if (v == null) { return ""; }
     mut sig: string = if (v.is_mutable) { "mut " } else { "const " };
     sig = sig + arena.intern_table.resolve(v.name);
     sig = sig + ": ";
-    sig = sig + arena.resolve_display_name_short(v.resolved_type.id);
+    if (v.initializer != null && v.initializer.kind == NodeKind::LambdaExpression) {
+        sig = sig + format_lambda_signature(v.initializer as LambdaExprNode*, arena);
+    } else {
+        sig = sig + arena.resolve_display_name_short(v.resolved_type.id);
+    }
     if (v.is_global && v.initializer != null) {
         const init: string = literal_text(v.initializer);
         if (init != "") { sig = sig + " = " + init; }
