@@ -14,6 +14,7 @@ import { getConfig, resolveServerPath } from './config';
 import { createStatusBar, updateStatus, disposeStatusBar } from './statusBar';
 import { registerCommands } from './commands';
 import { registerDiagnosticView } from './diagnosticView';
+import { extendMarkdownIt, initHighlighter } from './markdownPreview';
 
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
@@ -24,7 +25,9 @@ const RESTART_WINDOW_MS = 60_000; // 1 minute
 let restartTimestamps: number[] = [];
 let restartInProgress = false;
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+export async function activate(
+    context: vscode.ExtensionContext
+): Promise<{ extendMarkdownIt: typeof extendMarkdownIt }> {
     outputChannel = vscode.window.createOutputChannel('CryoLSP');
     context.subscriptions.push(outputChannel);
 
@@ -54,8 +57,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // restarts without a re-registration step.
     registerDiagnosticView(context, () => client, outputChannel);
 
+    // Build the Shiki highlighter for the Markdown preview before returning, so
+    // it's ready when VS Code renders. Non-fatal: on failure the markdown-it
+    // hook falls back to VS Code's default highlighting.
+    try {
+        await initHighlighter();
+    } catch (err) {
+        outputChannel.appendLine(`Markdown preview highlighter unavailable: ${err}`);
+    }
+
     // Start the language server
     await startClient(context);
+
+    // Expose the Markdown-preview highlighter. VS Code calls extendMarkdownIt
+    // on the preview's markdown-it instance (gated by the
+    // `markdown.markdownItPlugins` contribution in package.json).
+    return { extendMarkdownIt };
 }
 
 async function startClient(context: vscode.ExtensionContext): Promise<void> {

@@ -417,8 +417,38 @@ function walk_method_decl(m: MethodNode*, tokens: mut &Array<SemanticToken>) -> 
     st_walk_node(f.body as ASTNode*, tokens);
 }
 
+/// True when `name` resolves to a compiler-synthesized closure struct
+/// (`<ns>::__Closure_<N>`, minted by Sema::synthesize_closure_struct).  Sema
+/// appends these to the ProgramNode so later passes see them, but they are NOT
+/// user source: every synthesized node (the capture fields and the `__call__`
+/// method whose body holds `this.<capture>` accesses + the inlined lambda body)
+/// carries the originating lambda's span.  Walking them emits semantic tokens
+/// across the whole `move (...) -> ... { ... }` expression, and dedup_overlapping
+/// then drops the real narrow tokens in favour of that wide one - flooding the
+/// line with a single colour.  Skip the subtree entirely.
+function is_synthesized_closure_name(name: SymbolStr) -> boolean {
+    if (g_intern == null || !name.is_valid()) { return false; }
+    const hay: string = g_intern.resolve(name);
+    if (hay == null) { return false; }
+    const needle: string = "__Closure";
+    const nlen: u64 = strlen(needle);
+    const hlen: u64 = strlen(hay);
+    if (hlen < nlen) { return false; }
+    mut i: u64 = 0;
+    while (i + nlen <= hlen) {
+        mut j: u64 = 0;
+        while (j < nlen && hay[(i + j) as i64] == needle[j as i64]) { j = j + 1; }
+        if (j == nlen) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
 function walk_struct_decl(s: StructDeclNode*, tokens: mut &Array<SemanticToken>) -> void {
     if (s == null) { return; }
+    // Compiler-synthesized closure structs aren't user source; their nodes
+    // carry the lambda's span and would flood the line (see helper above).
+    if (is_synthesized_closure_name(s.name)) { return; }
     if (s.has_name_span()) {
         emit_span(s.name_span, Lsp::Protocol::SemanticTokens::TYPE_STRUCT,
                   Lsp::Protocol::SemanticTokens::MOD_DECLARATION, tokens);
@@ -833,13 +863,14 @@ function walk_scope_resolution(s: ScopeResolutionNode*, is_callee: boolean,
                       Lsp::Protocol::SemanticTokens::MOD_NONE, tokens);
         }
 
-        // Member emit: only when there are no generic-arg lists that
-        // would push the member name away from the span's end.  With
-        // `Foo<T>::bar` or `Foo::bar<U>`, the parser's reported
-        // span.end_col may sit past `bar` (covering `<U>` too), and we
-        // can't reliably back up `member_len` bytes to find `bar`.
-        const has_generics: boolean = s.scope_generic_args.length > 0
-                                    || s.generic_args.length > 0;
+        // Member emit: skip only when generic args sit AFTER the member
+        // (`Foo::bar<U>`), where the parser's reported span.end_col can cover
+        // the `<U>` too and we can't reliably back up `member_len` bytes to
+        // find `bar`.  Generics on the SCOPE (`Foo<T>::bar`) are consumed
+        // before the member and don't move span.end_col off the member name,
+        // so they must NOT block the member token (this is what gives `new`
+        // the function color in `Foo<int>::new()`).
+        const has_generics: boolean = s.generic_args.length > 0;
         const member_str: string = g_intern.resolve(s.member_name);
         const member_len: u32 = strlen(member_str) as u32;
         if (!has_generics && member_len > 0 as u32 && !s.member_name.is_empty()
