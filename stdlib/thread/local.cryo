@@ -94,9 +94,16 @@ type struct ThreadLocal<T> {
     /// Free the current thread's value if it has been initialized.
     /// Subsequent `get()` from this thread will re-run `init`.  Other
     /// threads' values are untouched.
-    clear(&this) -> void {
+    clear(&this) -> void
+    where T: Drop {
         const raw: u8* = pthread_getspecific(this.key);
         if (raw == null) { return; }
+        // Run T's destructor on the stored value before reclaiming its
+        // storage, so owning fields (String, Box, ...) inside T are released
+        // rather than leaked. Primitives' Drop impls are no-ops, so this is
+        // free for POD thread-locals.
+        const tp: T* = raw as T*;
+        (*tp).drop();
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const layout: Layout = Layout::of<T>();
         alloc.deallocate(NonNull::new(raw), layout);

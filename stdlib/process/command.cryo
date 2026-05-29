@@ -467,10 +467,17 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
     // -------- parent --------
     // Close the ends of each pipe that belong to the child.
+    // For `Stdio::Fd`, ownership of the fd transferred to the spawn: the
+    // child duped it into place (`child_remap`) before exec, so the parent
+    // must close its own copy here. Without it the caller's fd leaks on
+    // every `Fd`-configured spawn (the doc on `Stdio::Fd` promised this).
     match (cmd.stdin_cfg) {
         Stdio::Piped => {
             if (stdin_pipe.read_end >= 0) { fd::close_fd(stdin_pipe.read_end); }
             stdin_pipe.read_end = -1;
+        }
+        Stdio::Fd(raw) => {
+            if (raw >= 0) { fd::close_fd(raw); }
         }
         _ => { }
     }
@@ -479,12 +486,18 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
             if (stdout_pipe.write_end >= 0) { fd::close_fd(stdout_pipe.write_end); }
             stdout_pipe.write_end = -1;
         }
+        Stdio::Fd(raw) => {
+            if (raw >= 0) { fd::close_fd(raw); }
+        }
         _ => { }
     }
     match (cmd.stderr_cfg) {
         Stdio::Piped => {
             if (stderr_pipe.write_end >= 0) { fd::close_fd(stderr_pipe.write_end); }
             stderr_pipe.write_end = -1;
+        }
+        Stdio::Fd(raw) => {
+            if (raw >= 0) { fd::close_fd(raw); }
         }
         _ => { }
     }

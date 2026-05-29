@@ -381,6 +381,22 @@ private:
         }
 
         if (this.at_end() || this.peek() != '\'') {
+            // Distinguish a genuinely unterminated literal from a multi-
+            // character one like 'AB'. Scan the rest of the line for a
+            // closing quote: if one exists, the user wrote too many
+            // characters (not an unterminated literal), and the
+            // close-the-literal autofix would be actively harmful - it would
+            // turn 'AB' into 'A'B'. Consume through the closing quote so the
+            // error doesn't cascade into a second diagnostic on the tail.
+            mut found_close: boolean = false;
+            while (!this.at_end() && this.peek() != '\n') {
+                if (this.peek() == '\'') { found_close = true; break; }
+                this.advance();
+            }
+            if (found_close) {
+                this.advance(); // consume the closing quote (recovery)
+                return this.emit_error_multi_char_literal();
+            }
             LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated character literal at line %d", this.current_location.line);
             return this.emit_error_close_literal(
                 ErrorCode::E0003_UNTERMINATED_CHAR,
@@ -733,6 +749,34 @@ private:
         return Token::new(
             TokenType::Unknown,
             message,
+            this.current_location.line,
+            this.current_location.column
+        );
+    }
+
+    /// Report a multi-character character literal (`'AB'`).  Unlike the
+    /// unterminated case this attaches NO insert-quote autofix (that would
+    /// produce `'A'B'`); instead it points the user at a string literal.
+    emit_error_multi_char_literal(&this) -> Token {
+        const msg: string = "character literal may only contain one codepoint";
+        if (this.sink != null) {
+            const span: SourceSpan = SourceSpan::new(
+                this.file.path(),
+                this.current_location.line as u32,
+                this.current_location.column as u32,
+                this.current_location.line as u32,
+                this.current_location.column as u32 + 1
+            );
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0003_UNTERMINATED_CHAR, msg);
+            diag = diag.at(span);
+            diag = diag.with_note(
+                "a `'...'` literal holds a single character; use double quotes for a string");
+            this.sink.emit(diag);
+        }
+        return Token::new(
+            TokenType::Unknown,
+            msg,
             this.current_location.line,
             this.current_location.column
         );
