@@ -888,13 +888,13 @@ If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
 
 ### 7.3 Range Patterns
 
-Range patterns match values within an inclusive range. They are most useful for character classification.
+Range patterns match values within an inclusive range. They are most useful for character classification. Both spellings — `a..b` and the explicit `a..=b` — are **inclusive** in pattern position (note this differs from a range *expression*, where `a..b` is half-open). Bounds must be integer or char literals of the same kind.
 
 ```cryo
 match (ch) {
-    '0'..'9'                 => { println("digit"); }
-    'a'..'z' | 'A'..'Z' | '_' => { println("ident-start"); }
-    _                        => { println("other"); }
+    '0'..='9'                   => { println("digit"); }
+    'a'..'z' | 'A'..'Z' | '_'   => { println("ident-start"); }
+    _                           => { println("other"); }
 }
 ```
 
