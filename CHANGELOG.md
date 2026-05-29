@@ -26,7 +26,8 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   base type (`type enum X : u8 { … }`), exhaustive match enforcement on
   enum subjects.
 - **Pattern matching:** literal, identifier, wildcard, enum-destructure,
-  exclusive range (`a..b`), and or-patterns (`a | b | c`).
+  range patterns (`a..b` and the explicit `a..=b`; both are inclusive in
+  pattern position), and or-patterns (`a | b | c`).
 - **Ownership:**
   - `Copy` and `Drop` traits with automatic recursive drop glue through
     struct fields, enum payloads, and container elements.
@@ -149,9 +150,6 @@ authoritative list.
   `next`/`count`/`fold`/`for_each` only; `for (x in iter)` iteration and
   range *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0
   and work against any of these.
-- Inclusive range *patterns* (`1..=10` in a `match` arm). Range
-  expressions ship; the inclusive form is not yet accepted in pattern
-  position (`a..b` patterns are, and are always inclusive).
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - `Display`/`Debug` impls for container and ADT types
