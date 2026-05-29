@@ -519,6 +519,71 @@ type struct TypeArena {
         return count;
     }
 
+    /// The canonical identity of a type argument: an `InstantiatedType` that
+    /// already carries a `resolved_type` collapses to that concrete type's id.
+    /// Two textual occurrences of the same generic instantiation can otherwise
+    /// disagree on a nested arg's representation - e.g. an annotation
+    /// `TakeIter<Range<i32>>` holds the inner `Range<i32>` as an
+    /// InstantiatedType wrapper, while the monomorphizer built its spec from
+    /// the concrete `Range_i32` StructType.  Both denote the same type, so
+    /// canonicalizing through `resolved_type` lets them compare equal.
+    canon_type_id(&this, r: TypeRef) -> u64 {
+        const t: Type* = this.lookup(r.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                return inst.resolved_type.id;
+            }
+        }
+        return r.id;
+    }
+
+    /// Find an already-monomorphized concrete type for `(base, args)`, matching
+    /// the argument list *canonically* (see `canon_type_id`).  Recovers the
+    /// concrete type the monomorphizer built when an equivalent instantiation
+    /// is reconstructed later under a differently-represented but equivalent
+    /// arg list - e.g. a fresh `Range<i32>` produced by substituting a static
+    /// method's `Range<T>` return holds its `i32` directly, while the spec was
+    /// keyed off the same.  Returns the concrete `resolved_type`, or invalid.
+    find_resolved_instantiation(&this, base: TypeRef, args: TypeRef[]) -> TypeRef {
+        for (mut i: i64 = 0; i < this.types.length; i++) {
+            const t: Type* = this.types[i];
+            if (t == null) { continue; }
+            if (t.kind != TypeKind::InstantiatedType) { continue; }
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { continue; }
+            if (inst.generic_base.id != base.id) { continue; }
+            if (inst.type_args.length != args.length) { continue; }
+            mut matches: boolean = true;
+            for (mut j: i64 = 0; j < args.length; j++) {
+                if (this.canon_type_id(inst.type_args[j]) != this.canon_type_id(args[j])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                return inst.resolved_type;
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve `ty` to its concrete type when it is an InstantiatedType: its
+    /// own `resolved_type` if set, otherwise the concrete type of an equivalent
+    /// instantiation already monomorphized (matched canonically by base + args).
+    /// Returns `ty` unchanged for non-instantiations or when no concrete type
+    /// exists yet.
+    canonical_resolved(&this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return ty; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (inst.has_resolved_type()) { return inst.resolved_type; }
+        const concrete: TypeRef = this.find_resolved_instantiation(
+            inst.generic_base, inst.type_args);
+        if (concrete.is_valid()) { return concrete; }
+        return ty;
+    }
+
     /// Create an error type for type resolution failures.
     create_error(mut &this, reason: string, span: SourceSpan) -> TypeRef {
         return this.alloc_type(new ErrorType(this.next_id, reason, span));

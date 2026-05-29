@@ -281,12 +281,21 @@ function range_char_walks_ascii_letters() -> Result<(), TestError> {
 // when checking/deriving the impl's bounds; without it the impl was dropped
 // and `count`/`next` never registered for the spec.  These pin the
 // consumption paths that work today: a named-iterator receiver consumed
-// inline by a terminal default (`count`) or driven by `for`-in.
+// inline by a terminal default (`count`) or driven by `for`-in, plus
+// binding the adapter to an explicit-typed local
+// (`mut t: TakeIter<..> = it.take(n)`) and consuming THAT with `count` /
+// `for`-in.  The typed-local binding requires the two textual
+// occurrences of `TakeIter<Range<i32>>` (the annotation, resolved before
+// monomorphization, and the `take(n)` return, resolved during it) to
+// monomorphize to ONE concrete struct; the monomorphizer's spec cache key
+// canonicalizes its argument ids (`canon_type_id`) so a nested arg that
+// arrives as an InstantiatedType wrapper in one and a concrete struct in
+// the other dedupes, instead of producing two structs that compare unequal.
 //
-// Not yet supported (tracked in CHANGELOG known-limitations): binding the
-// adapter to an explicit-typed local (`mut t: TakeIter<..> = it.take(n)`),
-// chaining adapters (`it.take(a).take(b)`), or a call-expression receiver
-// (`make_range().take(n)`).
+// Not yet supported (tracked in CHANGELOG known-limitations): chaining
+// adapters (`it.take(a).take(b)`), a call-expression receiver
+// (`make_range().take(n)`), or consuming the adapter with an own-generic
+// default whose signature mentions the element type (`fold`).
 
 ![test]
 function take_caps_count_at_n() -> Result<(), TestError> {
@@ -317,4 +326,56 @@ function take_drives_for_in_loop() -> Result<(), TestError> {
     mut sum: i32 = 0;
     for (x in r.take(5)) { sum = sum + x; }
     return expect_eq(sum, 10);
+}
+
+![test]
+function take_bound_to_typed_local_counts() -> Result<(), TestError> {
+    // Bind the adapter to an explicit `TakeIter<Range<i32>>` local, then
+    // count it.  The annotation and the `take(3)` return must denote ONE
+    // concrete type; before the spec-key canonicalization they monomorphized
+    // to two distinct structs and this failed type-checking (`expected
+    // TakeIter<Range<i32>>, found TakeIter<Range<i32>>`).
+    mut r: Range<i32> = Range::new(0, 10);
+    mut t: TakeIter<Range<i32>> = r.take(3);
+    return expect_eq(t.count(), 3 as u64);
+}
+
+![test]
+function take_typed_local_caps_when_n_exceeds_len() -> Result<(), TestError> {
+    // n > len through a typed binding: a 4-element non-zero-start range
+    // capped at 100 still counts 4.  This exercises the inner iterator end
+    // to end (a broken `inner` would not stop at the source's true length).
+    mut r: Range<i32> = Range::new(5, 9);
+    mut t: TakeIter<Range<i32>> = r.take(100);
+    return expect_eq(t.count(), 4 as u64);
+}
+
+![test]
+function take_typed_local_drives_for_in() -> Result<(), TestError> {
+    // for-in over a typed-local adapter sums real element VALUES (not just
+    // a count), proving the bound local carries a correct `inner`: the first
+    // 4 of 2.. -> 2+3+4+5 = 14.
+    mut r: Range<i32> = Range::new(2, 100);
+    mut t: TakeIter<Range<i32>> = r.take(4);
+    mut sum: i32 = 0;
+    for (x in t) { sum = sum + x; }
+    return expect_eq(sum, 14);
+}
+
+![test]
+function take_on_call_expression_receiver_counts() -> Result<(), TestError> {
+    // `.take(n)` directly on a call-expression receiver, with no intermediate
+    // binding.  The receiver `Range<i32>::new(..)` produces its instantiation
+    // during the same inference walk that specializes `take`, so it must be
+    // monomorphized on demand; otherwise `take` resolves to the unspecialized
+    // `TakeIter<This>` template (E0636) or crashes the mangler.
+    return expect_eq(Range<i32>::new(0, 100).take(4).count(), 4 as u64);
+}
+
+![test]
+function take_on_call_expression_receiver_caps_at_source() -> Result<(), TestError> {
+    // Same call-expression-receiver shape, n > len, non-zero start: a 4-element
+    // range capped at 100 counts 4, exercising the on-demand-resolved receiver's
+    // inner iterator end to end.
+    return expect_eq(Range<i32>::new(5, 9).take(100).count(), 4 as u64);
 }
