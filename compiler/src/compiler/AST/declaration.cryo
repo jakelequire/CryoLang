@@ -214,6 +214,15 @@ public:
     /// trait-impl fallback - hand-written trait methods reach that point
     /// through their own route and must not be re-specialized there.
     is_synth_default:       boolean;
+    /// Set on a synthesized trait-default clone whose return type mentions
+    /// `This` (e.g. the iterator combinators `map`/`filter`/`take` returning
+    /// `MapIter<This, ...>`).  Such methods are self-referential: synthesized
+    /// into an adapter's own impl they would instantiate `Adapter<Adapter<…>>`
+    /// ad infinitum.  They must therefore be instantiated lazily (only when
+    /// actually called), like generic methods - never eagerly per impl.  The
+    /// monomorphizer skips them in `resolve_methods` and drives them through
+    /// the call-site inference path instead.
+    is_self_returning_default: boolean;
     /// `![link("name")]` linker-symbol override for an extern function.
     /// When `has_link_name` is set, codegen names the LLVM declaration
     /// `link_name` instead of the Cryo source name, so the symbol resolved
@@ -237,6 +246,7 @@ public:
         this.is_variadic            = false;
         this.is_implicit            = false;
         this.is_synth_default       = false;
+        this.is_self_returning_default = false;
         this.link_name              = "";
         this.has_link_name          = false;
         this.return_type_annotation = null;
@@ -267,6 +277,7 @@ public:
     set_variadic(v: boolean) -> void                        { this.is_variadic = v; }
     set_implicit(v: boolean) -> void                        { this.is_implicit = v; }
     set_synth_default(v: boolean) -> void                   { this.is_synth_default = v; }
+    set_self_returning_default(v: boolean) -> void          { this.is_self_returning_default = v; }
     set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
     set_resolved_return_type(t: TypeRef) -> void             { this.resolved_return_type = t; }
 
@@ -730,6 +741,13 @@ public:
     /// registration used for the template.  Empty until stamped.
     qualified_target_name: SymbolStr;
     generic_params: GenericParamNode*[];
+    /// The target type's own type arguments as written after `for`
+    /// (the `<T>` in `implement<T> trait Iterator<T> for Range<T>`).
+    /// Captured so `This` in a cloned default method's signature can be
+    /// rewritten to the full Self type `Range<T>` rather than the bare
+    /// `Range`, which would drop the args and mis-resolve.  Empty for
+    /// non-generic targets and inherent impls.
+    target_args:    TypeAnnotation*[];
     methods:        MethodNode*[];
     /// The trait being implemented. Null = inherent impl (existing form).
     /// Non-null = `implement [<T>] trait <Path>[<args>] for <Target>` form.
@@ -750,6 +768,7 @@ public:
         this.target_type           = target_type;
         this.qualified_target_name = SymbolStr::empty();
         this.generic_params        = [];
+        this.target_args           = [];
         this.methods               = [];
         this.trait_annotation      = null;
         this.where_bounds          = [];
@@ -770,6 +789,10 @@ public:
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
+    }
+
+    set_target_args(mut &this, args: TypeAnnotation*[]) -> void {
+        this.target_args = args;
     }
 
     set_trait_annotation(mut &this, ann: TypeAnnotation*) -> void {

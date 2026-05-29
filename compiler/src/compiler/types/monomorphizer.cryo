@@ -964,6 +964,13 @@ type struct Monomorphizer {
                 // the resulting FunctionType has an invalid TypeRef
                 // in its param list, which the mangler later encodes
                 // as `v`, pinning a junk symbol.
+                //
+                // First derive any impl-introduced generic the Self type
+                // doesn't determine (e.g. `A` in `implement<I, A> Iterator<A>
+                // for TakeN<I> where I: Iterator<A>`) from the where-bounds,
+                // so both the trait-arg binding below and the method
+                // signatures resolve it concretely.
+                this.derive_impl_where_generics(decl, subst, &res_ctx);
                 this.bind_trait_args_for_spec_impl(decl, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
@@ -982,6 +989,14 @@ type struct Monomorphizer {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
+            // Self-returning trait defaults (combinators like `map`/`take`
+            // returning an adapter over `This`) are instantiated lazily at
+            // call sites, never eagerly: synthesized into an adapter's own
+            // impl, eager resolution would request `Adapter<Adapter<…>>`
+            // without bound, recursing forever.  Skip here; the call-site
+            // inference path (`try_infer_method_call`) specializes the ones
+            // that are actually invoked.
+            if (method.func.is_self_returning_default) { continue; }
             // Per-method where-bounds were already verified by
             // `filter_bounds_violating_methods` /
             // `filter_bounds_violating_impls` in `specialize_with_entry`;
@@ -1085,6 +1100,107 @@ type struct Monomorphizer {
             const arg_ty: TypeRef = this.type_resolver.resolve(trait_args[i], res_ctx);
             if (!arg_ty.is_valid()) { continue; }
             res_ctx.add_binding(gp.name, arg_ty);
+        }
+    }
+
+    /// Given a concrete type `subject` (e.g. `Range<i32>`) and a bare trait
+    /// leaf name (e.g. `Iterator`), return the concrete trait args of
+    /// `subject`'s impl of that trait (e.g. `[i32]`).  Empty on any failure.
+    ///
+    /// Works from the template impl plus `subject`'s own type args, so it
+    /// doesn't depend on `subject` having been monomorphized yet: bind the
+    /// subject impl's params (`T` in `implement<T> Iterator<T> for Range<T>`)
+    /// to `subject`'s concrete args (`i32`), then resolve the impl's
+    /// `trait_annotation` args under that binding.
+    concrete_trait_args_for(mut &this, subject: TypeRef,
+                            trait_leaf: SymbolStr) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (this.generic_registry == null || this.type_resolver == null) { return out; }
+        const base_name: SymbolStr = this.bare_name_of(subject);
+        if (!base_name.is_valid()) { return out; }
+        const impl_node: ImplBlockNode* =
+            this.generic_registry.lookup_trait_impl(trait_leaf, base_name);
+        if (impl_node == null) { return out; }
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return out; }
+
+        mut ctx: ResolutionContext = ResolutionContext::new("", "");
+        const st: Type* = this.arena.lookup(subject.id);
+        if (st != null && st.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = st as InstantiatedType*;
+            const n: i64 = if (impl_node.generic_params.length < inst.type_args.length) {
+                impl_node.generic_params.length
+            } else {
+                inst.type_args.length
+            };
+            for (mut i: i64 = 0; i < n; i++) {
+                const gp: GenericParamNode* = impl_node.generic_params[i];
+                if (gp == null) { continue; }
+                ctx.add_binding(gp.name, inst.type_args[i]);
+            }
+        }
+
+        match (*trait_ann) {
+            TypeAnnotation::Generic(g) => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    out.push(this.type_resolver.resolve(g.args[i], &ctx));
+                }
+            }
+            _ => {}
+        }
+        return out;
+    }
+
+    /// Bind impl-introduced generic params that the Self type doesn't
+    /// determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
+    /// where I: Iterator<A>`) into `res_ctx`, by resolving each where-bound
+    /// against the concrete subject.  Here `I` is bound by the struct subst
+    /// to `Range<i32>`; the bound `I: Iterator<A>` then pins `A` to
+    /// `Range<i32>`'s Iterator element (`i32`).  Without this the cloned
+    /// method bodies re-resolve `A` through an empty context, leaving an
+    /// invalid TypeRef in the signature that aborts the mangler.  Run before
+    /// `bind_trait_args_for_spec_impl` so the trait-arg binding can also see
+    /// the derived param.
+    derive_impl_where_generics(mut &this, impl_node: ImplBlockNode*,
+                               subst: TypeSubstitution*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || subst == null) { return; }
+        if (impl_node.where_bounds.length == 0) { return; }
+        for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
+            const bound: TraitBound = impl_node.where_bounds[bi];
+            // The subject (e.g. `I`) must be determined by the instantiation;
+            // otherwise the bound can't be resolved to a concrete type here.
+            const subject: TypeRef = this.lookup_subst_for_param(
+                bound.type_parameter, subst);
+            if (!subject.is_valid()) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: TraitRef = bound.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const concrete_args: TypeRef[] =
+                    this.concrete_trait_args_for(subject, trait_leaf);
+                if (concrete_args.length != tr.type_args.length) { continue; }
+                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                    const ta: TypeAnnotation* = tr.type_args[ai];
+                    if (ta == null) { continue; }
+                    match (*ta) {
+                        TypeAnnotation::Named(n) => {
+                            // Bind a bare where-bound param (e.g. `A`) that the
+                            // Self-type substitution doesn't already fix and
+                            // that isn't already bound.  The spec'd impl clone
+                            // has its `generic_params` cleared, so we can't
+                            // gate on membership there; the subst/res_ctx
+                            // checks keep this from rebinding a concrete param.
+                            if (this.lookup_subst_for_param(n.name, subst).is_invalid()
+                                    && res_ctx.lookup_binding(n.name).is_invalid()
+                                    && concrete_args[ai].is_valid()) {
+                                res_ctx.add_binding(n.name, concrete_args[ai]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -3667,6 +3783,116 @@ type struct Monomorphizer {
     /// `call.resolved_method`.  Codegen Strategy 0 then computes the
     /// fully-mangled call-target symbol from the method's now-concrete
     /// param types, and the impl-block injection pass declares it.
+    /// Find a self-returning trait default (combinator) named `method_name`
+    /// on `recv_type`'s impl, regardless of its own-generic count.  Searches
+    /// the receiver's specialized impl blocks first, then the bare-name
+    /// trait-impl registry (non-generic receivers).  Writes the owning impl
+    /// through `out_impl`.
+    find_self_returning_default(&this, recv_type: TypeRef,
+                                method_name: SymbolStr,
+                                out_impl: ImplBlockNode**) -> MethodNode* {
+        for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
+            const entry: SpecializationEntry = this.spec_entries[i];
+            if (entry.specialized_type.id != recv_type.id) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                if (impl_node == null) { continue; }
+                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                    const m: MethodNode* = impl_node.methods[k];
+                    if (m == null || m.func == null) { continue; }
+                    if (!m.func.name.equals(method_name)) { continue; }
+                    if (!m.func.is_self_returning_default) { continue; }
+                    *out_impl = impl_node;
+                    return m;
+                }
+            }
+        }
+        if (this.generic_registry == null) { return null; }
+        const bare: SymbolStr = this.bare_name_of(recv_type);
+        if (!bare.is_valid()) { return null; }
+        for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            if (!impl_node.target_type.equals(bare)) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (!m.func.is_self_returning_default) { continue; }
+                *out_impl = impl_node;
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /// Lazily instantiate a zero-own-generic self-returning trait default
+    /// (e.g. `take`/`filter`) at a call site, for the concrete receiver.
+    /// These are skipped by eager `resolve_methods` (they would self-apply
+    /// forever); here we clone + resolve the one actually called, push the
+    /// concrete sibling onto the receiver's impl, register it, and walk its
+    /// body so its own nested calls (`TakeIter::new`, the returned adapter)
+    /// get monomorphized.  Returns true when handled; false (so the caller
+    /// continues to the generic-inference path) for own-generic defaults
+    /// like `map<B>`, which retain their generic and infer it from args.
+    try_instantiate_self_returning_default(mut &this, call: CallExprNode*,
+                                           ma: MemberAccessNode*,
+                                           recv_type: TypeRef) -> boolean {
+        mut impl_node: ImplBlockNode* = null;
+        const orig: MethodNode* = this.find_self_returning_default(
+            recv_type, ma.member, &impl_node);
+        if (orig == null || orig.func == null || impl_node == null) { return false; }
+        // Own-generic combinators (`map<B>`) keep their generic; the
+        // inference path handles them.
+        if (orig.func.generic_params.length > 0) { return false; }
+        // Reuse an already-instantiated sibling (a prior call on the same
+        // concrete receiver type) rather than minting a duplicate symbol.
+        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+            const m: MethodNode* = impl_node.methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (m == orig) { continue; }
+            if (m.func.name.equals(ma.member)
+                    && !m.func.is_self_returning_default
+                    && m.func.generic_params.length == 0) {
+                call.set_resolved_method(m as ASTNode*);
+                return true;
+            }
+        }
+        mut empty_names: SymbolStr[] = [];
+        mut empty_args: TypeRef[] = [];
+        const spec_method: MethodNode* = this.specialize_method(
+            orig, empty_names, empty_args, recv_type);
+        if (spec_method == null || spec_method.func == null) { return false; }
+        // The clone is concrete now, not a deferred template.
+        spec_method.func.set_self_returning_default(false);
+        impl_node.methods.push(spec_method);
+        call.set_resolved_method(spec_method as ASTNode*);
+        this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+        // Walk the spec'd body so the returned adapter and `Adapter::new`
+        // get monomorphized.  The adapter's own self-returning defaults stay
+        // skipped, so this terminates.
+        if (spec_method.func.body != null) {
+            mut spec_local_names: SymbolStr[] = [];
+            mut spec_local_types: TypeRef[] = [];
+            if (recv_type.is_valid()) {
+                spec_local_names.push(this.intern_table.intern("this"));
+                spec_local_types.push(recv_type);
+            }
+            for (mut pi: i64 = 0; pi < spec_method.func.parameters.length; pi++) {
+                const p: VarDeclNode* = spec_method.func.parameters[pi];
+                if (p == null || !p.resolved_type.is_valid()) { continue; }
+                spec_local_names.push(p.name);
+                spec_local_types.push(p.resolved_type);
+            }
+            this.collect_locals_in_block(spec_method.func.body,
+                                         &spec_local_names, &spec_local_types);
+            mut spec_ctx: ResolutionContext = ResolutionContext::new("", "");
+            this.discover_inferred_calls_in_block(spec_method.func.body,
+                &spec_ctx, null, spec_local_names, spec_local_types);
+        }
+        return true;
+    }
+
     try_infer_method_call(mut &this, call: CallExprNode*,
                           subst: TypeSubstitution*,
                           names: SymbolStr[], types: TypeRef[]) -> void {
@@ -3731,6 +3957,16 @@ type struct Monomorphizer {
         // path handles these directly via `generic_base`.
         const is_unresolved_inst: boolean = tk == TypeKind::InstantiatedType;
         if (!is_user_kind && !is_primitive_kind && !is_unresolved_inst) { return; }
+
+        // Self-returning trait defaults (combinators returning an adapter
+        // over `This`) are skipped by eager `resolve_methods`; instantiate
+        // the one being called here, for this concrete receiver.  The
+        // zero-own-generic ones (`take`/`filter`/...) are fully handled in
+        // the helper; own-generic ones (`map<B>`) return false and fall
+        // through to the generic-inference path below.
+        if (this.try_instantiate_self_returning_default(call, ma, recv_type)) {
+            return;
+        }
 
         // Find the impl method.  Three lookup paths:
         //   1. spec_entries: generic types whose spec'd impl blocks
