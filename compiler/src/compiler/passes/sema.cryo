@@ -6933,6 +6933,19 @@ public:
             found = m;
             break;
         }
+        // Trait-impl methods (incl. synthesized default methods like
+        // `Iterator::fold<Acc>` / `Wrapper::wrap<B>`) live on the impl block,
+        // not the owner type's struct/class `methods[]`.  When the owner-side
+        // search misses, look through the trait impls registered for this
+        // owner; their generic params drive the owner-level bindings instead.
+        mut impl_block: ImplBlockNode* = null;
+        if (found == null) {
+            found = this.find_method_in_trait_impls(
+                owner_ref, member.member, member.generic_args.length, &impl_block);
+            if (found != null && impl_block != null) {
+                owner_params = impl_block.generic_params;
+            }
+        }
         if (found == null) { return fallback; }
         const ret_ann: TypeAnnotation* = found.func.return_type_annotation;
         if (ret_ann == null) { return fallback; }
@@ -6970,6 +6983,41 @@ public:
         const refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &res_ctx);
         if (!refined.is_valid()) { return fallback; }
         return refined;
+    }
+
+    /// Search the trait impls registered for `owner_ref` for a method named
+    /// `method_name` whose own generic-param count matches `n_generic_args`.
+    /// Synthesized default trait methods (and hand-written generic trait
+    /// methods) live on the impl block rather than the owner's struct/class
+    /// `methods[]`, so the owner-side lookup in
+    /// `resolve_method_return_with_explicit_args` misses them.  On a match,
+    /// writes the owning impl block through `out_impl` so the caller can use
+    /// its generic params for the owner-level bindings.  First match wins.
+    find_method_in_trait_impls(&this, owner_ref: TypeRef,
+                               method_name: SymbolStr, n_generic_args: i64,
+                               out_impl: ImplBlockNode**) -> MethodNode* {
+        if (this.ctx.generic_registry == null) { return null; }
+        const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
+        const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* =
+                this.ctx.generic_registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            const matches_target: boolean =
+                impl_node.target_type.equals(bare)
+                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
+                || (qname.is_valid() && impl_node.target_type.equals(qname));
+            if (!matches_target) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length != n_generic_args) { continue; }
+                *out_impl = impl_node;
+                return m;
+            }
+        }
+        return null;
     }
 
     /// Dispatch: resolve `Scope::Member(args)` as one of three constructs:

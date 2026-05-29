@@ -1217,6 +1217,113 @@ type struct TypeResolutionPasses {
         }
     }
 
+    /// Rewrite every reference to a trait's generic parameter (by name) in
+    /// `ann` (in-place) to the impl's corresponding trait-argument
+    /// annotation.  Companion to `rewrite_this_type_annotation`, run after
+    /// cloning a trait default method into an impl block.  The trait body's
+    /// signature names the trait's own params - e.g. `Item` in
+    /// `Iterator<Item>::fold<Acc>(... f: (Acc, Item) -> Acc ...)` - but the
+    /// clone lives in `implement<T> Iterator<T> for Range<T>`, where the
+    /// trait arg standing in for `Item` is `T`.  Without this rewrite the
+    /// cloned annotation keeps the literal name `Item`, which the
+    /// impl-specialization substituter (keyed on the impl's own params, e.g.
+    /// `T`) never touches; the leftover generic surfaces as an invalid
+    /// TypeRef and crashes the mangler when the method is later specialized
+    /// for a concrete instantiation.  `param_names[i]` maps to `arg_anns[i]`;
+    /// complex args (e.g. `Pair<u64, A>`) are deep-cloned into the slot.
+    static rewrite_trait_params_annotation(ann: TypeAnnotation*,
+                                            param_names: SymbolStr[],
+                                            arg_anns: TypeAnnotation*[]) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                // Pre-resolved leaves already map to a concrete TypeRef and
+                // can't be a trait param awaiting substitution.
+                if (n.pre_resolved.is_valid()) { return; }
+                for (mut i: i64 = 0; i < param_names.length; i++) {
+                    if (n.name.equals(param_names[i])) {
+                        const cloned: TypeAnnotation* =
+                            TypeAnnotation::clone_ptr(arg_anns[i]);
+                        if (cloned != null) {
+                            intrinsics::memcpy(ann, cloned, sizeof(TypeAnnotation));
+                        }
+                        return;
+                    }
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    r.inner, param_names, arg_anns);
+            }
+            TypeAnnotation::Pointer(p) => {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    p.inner, param_names, arg_anns);
+            }
+            TypeAnnotation::Optional(o) => {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    o.inner, param_names, arg_anns);
+            }
+            TypeAnnotation::Array(a) => {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    a.element, param_names, arg_anns);
+            }
+            TypeAnnotation::Generic(g) => {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    g.base, param_names, arg_anns);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    TypeResolutionPasses::rewrite_trait_params_annotation(
+                        g.args[i], param_names, arg_anns);
+                }
+            }
+            TypeAnnotation::Tuple(tu) => {
+                for (mut i: i64 = 0; i < tu.elements.length; i++) {
+                    TypeResolutionPasses::rewrite_trait_params_annotation(
+                        tu.elements[i], param_names, arg_anns);
+                }
+            }
+            TypeAnnotation::Function(f) => {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    f.return_type, param_names, arg_anns);
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    TypeResolutionPasses::rewrite_trait_params_annotation(
+                        f.parameters[i], param_names, arg_anns);
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Apply both clone-time rewrites to a freshly cloned trait default
+    /// method's signature: `This` -> the impl target, and each trait generic
+    /// param -> the impl's corresponding trait arg.  Consolidated into one
+    /// entry point so the caller makes a single call; the return type is
+    /// handled before the param loop so the loop is the trailing statement.
+    static rewrite_default_method_signature(cloned: FunctionDeclNode*,
+                                            target: SymbolStr,
+                                            param_names: SymbolStr[],
+                                            arg_anns: TypeAnnotation*[]) -> void {
+        if (cloned == null) { return; }
+        const ret_ann: TypeAnnotation* = cloned.return_type_annotation;
+        if (ret_ann != null) {
+            TypeResolutionPasses::rewrite_this_type_annotation(ret_ann, target);
+            if (param_names.length > 0) {
+                TypeResolutionPasses::rewrite_trait_params_annotation(
+                    ret_ann, param_names, arg_anns);
+            }
+        }
+        for (mut p: i64 = 0; p < cloned.parameters.length; p++) {
+            const param: VarDeclNode* = cloned.parameters[p];
+            if (param != null && param.type_annotation != null) {
+                TypeResolutionPasses::rewrite_this_type_annotation(
+                    param.type_annotation, target);
+                if (param_names.length > 0) {
+                    TypeResolutionPasses::rewrite_trait_params_annotation(
+                        param.type_annotation, param_names, arg_anns);
+                }
+            }
+        }
+    }
+
     /// Walk a trait_annotation to its leaf identifier: the bare trait name.
     /// Mirrors `Specialization::extract_root_name` but is duplicated here
     /// to keep type_resolution.cryo self-contained.
@@ -1294,6 +1401,25 @@ type struct TypeResolutionPasses {
         }
         if (!needs_synthesis) { return 0; }
 
+        // Map the trait's own generic params onto this impl's trait args so
+        // cloned signatures referencing `Item` (etc.) become the concrete
+        // arg (`T`, `i32`, `Pair<u64, A>`, ...).  Only meaningful when the
+        // arities line up; an arity mismatch is a user error reported
+        // elsewhere, so we skip the rewrite and let that path fire.
+        const trait_arg_anns: TypeAnnotation*[] =
+            TypeResolutionPasses::extract_trait_args(impl_node.trait_annotation);
+        mut trait_param_names: SymbolStr[] = [];
+        if (trait_arg_anns.length == trait_decl.generic_params.length) {
+            for (mut gi: i64 = 0; gi < trait_decl.generic_params.length; gi++) {
+                const gp: GenericParamNode* = trait_decl.generic_params[gi];
+                if (gp == null) {
+                    trait_param_names = [];
+                    break;
+                }
+                trait_param_names.push(gp.name);
+            }
+        }
+
         // Clone each not-overridden default method into the impl block.
         // The clones go through the rest of FunctionSignature/TypeResolution/
         // Sema in the same loop, picking up the impl's `this_type` so any
@@ -1318,23 +1444,15 @@ type struct TypeResolutionPasses {
 
             const cloned: FunctionDeclNode* = cloner.clone_func_decl(tfunc);
             if (cloned == null) { continue; }
+            cloned.set_synth_default(true);
             // Rewrite `&This` / `-> This` annotations on the cloned signature
             // to the impl's target. The trait body keeps `ThisType` for
             // generic resolution at trait-sig time; the impl body needs a
             // concrete name so resolution doesn't depend on `ctx.this_type`
             // being set (it isn't for generic impl targets whose decl_index
             // lookup misses).
-            for (mut p: i64 = 0; p < cloned.parameters.length; p++) {
-                const param: VarDeclNode* = cloned.parameters[p];
-                if (param != null && param.type_annotation != null) {
-                    TypeResolutionPasses::rewrite_this_type_annotation(
-                        param.type_annotation, impl_node.target_type);
-                }
-            }
-            if (cloned.return_type_annotation != null) {
-                TypeResolutionPasses::rewrite_this_type_annotation(
-                    cloned.return_type_annotation, impl_node.target_type);
-            }
+            TypeResolutionPasses::rewrite_default_method_signature(
+                cloned, impl_node.target_type, trait_param_names, trait_arg_anns);
             mut method: MethodNode* = new MethodNode(cloned, cloned.span);
             method.set_static(cloned.is_static);
             impl_node.add_method(method);
