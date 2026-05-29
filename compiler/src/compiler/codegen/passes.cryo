@@ -211,6 +211,18 @@ type struct CodegenPasses {
     /// IRGeneration pass.  Creates an LLVM module, walks the AST, and
     /// produces LLVM IR.  Stores result in ctx.artifacts.ir.
     static run_ir_generation(ctx: CompilationContext*) -> PassResult {
+        // If an earlier pass (name resolution, sema, move-check, ...) already
+        // reported an error, the program is ill-typed and any IR we produce is
+        // unsound - e.g. a wrong-arity call lowers to an LLVM `call` with the
+        // wrong operand count and trips the verifier, surfacing a confusing
+        // internal-compiler-error (E0900) on top of the real source diagnostic.
+        // Skip codegen entirely so the user sees only the genuine error. The
+        // overall compile still fails (the pipeline's final gate is
+        // `!diagnostics.has_errors()`), so no unsound binary is emitted.
+        if (ctx.diagnostics.has_errors()) {
+            cdebug("[Codegen] Skipping IR generation: earlier passes reported errors\n");
+            return PassResult::ok();
+        }
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         // Resolve module name.

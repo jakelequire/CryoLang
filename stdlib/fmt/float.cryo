@@ -115,6 +115,34 @@ implement f64 {
         }
         return cursor + write_fixed(buffer + cursor, absolute, decimals);
     }
+
+    /// Write `this` as the SHORTEST decimal string that re-parses (via
+    /// `strtod`) to the identical f64 bit value - i.e. a round-trippable
+    /// representation. Tries 15, then 16, then 17 significant digits (every
+    /// finite double round-trips at 17) and returns the first that reparses
+    /// exactly, so typical values stay compact (`0.1`, not the noisy
+    /// `0.10000000000000001`). Returns bytes written (excluding the NUL).
+    ///
+    /// This exists because `to_buf`'s fixed-6-decimal form silently TRUNCATES
+    /// precision - `3.141592653589793` became `3.141593` - which made JSON
+    /// serialization lossy despite advertising strtod round-tripping. JSON
+    /// (and any caller that must preserve f64 values) should use this.
+    /// `buffer` must hold at least 32 bytes. Non-finite inputs (NaN/Inf) have
+    /// no round-trippable form; callers handle them first, but as a guard we
+    /// fall back to the debug spelling.
+    to_buf_roundtrip(&this, buffer: u8*) -> u64 {
+        const value: f64 = this;
+        if (libc::__isnan(value) != 0 || libc::__isinf(value) != 0) {
+            return this.to_buf_with(buffer, DEFAULT_DECIMALS);
+        }
+        mut n: i32 = libc::snprintf(buffer, 32, "%.15g" as u8*, value);
+        if (n > 0 && libc::strtod(buffer, null) == value) { return n as u64; }
+        n = libc::snprintf(buffer, 32, "%.16g" as u8*, value);
+        if (n > 0 && libc::strtod(buffer, null) == value) { return n as u64; }
+        n = libc::snprintf(buffer, 32, "%.17g" as u8*, value);
+        if (n < 0) { return 0; }
+        return n as u64;
+    }
 }
 
 // Private helpers
