@@ -1021,16 +1021,23 @@ type struct DeclarationEmitter {
                     pointee_ty: LType::null(),
                 });
             } else if (is_val_this) {
-                mut s_val: LType[] = [];
-                s_val.push(target_mapped);
-                total_user_slots += 1;
-                user_plans.push(ParamPlan {
-                    cryo_type:  param.resolved_type,
-                    cls:      ArgClass::Direct,
-                    llvm_slots: s_val,
-                    attr:       AbiAttr::None,
-                    pointee_ty: LType::null(),
-                });
+                // By-value `this` (consuming self) must use the SAME ABI
+                // classification as an ordinary by-value parameter, so the
+                // definition's receiver slot matches the caller's extern
+                // declaration.  The caller classify_param-coerces an
+                // <=8-byte struct receiver to a register scalar (e.g.
+                // `%Range` -> `i64`); pushing the raw struct type here made
+                // the definition's signature disagree with the call site
+                // (define `%Range %0` vs call `i64`), so the receiver bytes
+                // were mis-passed and every field the body read back was
+                // garbage.  The prologue stores the (coerced) param into the
+                // `this` alloca; opaque-pointer stores reinterpret it back to
+                // the struct, exactly as the normal value-param path does.
+                mut recv_tref_v: TypeRef = di.lookup_type(target_type);
+                if (!recv_tref_v.is_valid()) { recv_tref_v = param.resolved_type; }
+                const pplan_v: ParamPlan = this.abi.classify_param(recv_tref_v);
+                total_user_slots += pplan_v.llvm_slots.length as u32;
+                user_plans.push(pplan_v);
             } else {
                 const pplan_n: ParamPlan = this.abi.classify_param(param.resolved_type);
                 total_user_slots += pplan_n.llvm_slots.length as u32;

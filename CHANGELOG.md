@@ -145,11 +145,18 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- Iterator combinators (`.map`, `.filter`, `.collect`, `.take`, `.zip`,
-  `.chain`, `.enumerate`). The `Iterator` trait ships with
-  `next`/`count`/`fold`/`for_each` only; `for (x in iter)` iteration and
-  range *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0
-  and work against any of these.
+- Iterator combinators are partial. `.take(n)` ships as a lazy
+  `Iterator` default returning a `TakeIter` adapter, and works when the
+  iterator is a named local consumed directly - e.g. `r.take(n).count()`,
+  `r.take(n).fold(...)`, or `for (x in r.take(n)) { ... }`. Not yet
+  supported: binding the adapter to an explicitly-typed local
+  (`mut t: TakeIter<..> = r.take(n)`), a call-expression receiver
+  (`make_range().take(n)`), and chaining adapters (`r.take(a).take(b)` and,
+  by extension, `.map`/`.filter`/`.zip`/`.chain`/`.enumerate`/`.collect`,
+  which are not yet implemented). The `Iterator` trait otherwise ships with
+  `next`/`count`/`fold`/`for_each`; `for (x in iter)` iteration and range
+  *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0 and work
+  against any of these.
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - `Display`/`Debug` impls for container and ADT types
