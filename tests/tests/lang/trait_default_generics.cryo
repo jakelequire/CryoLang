@@ -1,0 +1,81 @@
+///! Trait default methods that carry their own generic params + fn-typed
+///! params.
+///!
+///! A default like `wrap<B>(&this, f: (Item) -> B) -> Option<B>` is cloned
+///! into each impl during default-method materialization. For the clone to
+///! behave like a hand-written method, two substitutions must happen:
+///!
+///!   * the trait's own generic (`Item`) is rewritten to the impl's trait
+///!     arg at clone time, so the cloned signature carries no dangling trait
+///!     generic into monomorphization; and
+///!   * the method's own generic (`B`) is substituted into the return type
+///!     at the call site - for both explicit (`wrap<i32>`) and inferred
+///!     args, on generic and non-generic receivers alike.
+///!
+///! Before this worked the generic-receiver path aborted the compiler in
+///! the name mangler, and the non-generic path mis-typed the return as
+///! `Option<B>` (a spurious E0200). Pin both directions here.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::TraitDefaultGenerics;
+
+import std::core::result;
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+function tdg_dbl(x: i32) -> i32 { return x * 2; }
+function tdg_inc(x: i32) -> i32 { return x + 1; }
+
+type trait TdgWrapper<Item> {
+    get(&this) -> Item;
+    wrap<B>(&this, f: (Item) -> B) -> Option<B> {
+        return Option::Some(f(this.get()));
+    }
+}
+
+// Non-generic receiver: the trait arg `Item` resolves to a concrete `i32`.
+type struct TdgCell {
+    v: i32;
+    static new(v: i32) -> TdgCell { return TdgCell { v: v }; }
+}
+implement trait TdgWrapper<i32> for TdgCell {
+    get(&this) -> i32 { return this.v; }
+}
+
+// Generic receiver: the trait arg `Item` resolves to the impl's own `T`.
+type struct TdgHolder<T> {
+    val: T;
+    static new(v: T) -> TdgHolder<T> { return TdgHolder<T> { val: v }; }
+}
+implement<T> trait TdgWrapper<T> for TdgHolder<T> {
+    get(&this) -> T { return this.val; }
+}
+
+![test]
+function default_own_generic_explicit_arg_nongeneric_receiver() -> Result<(), TestError> {
+    const c: TdgCell = TdgCell::new(21);
+    match (c.wrap<i32>(tdg_dbl)) {
+        Option::Some(x) => { return expect_eq(x, 42); }
+        Option::None    => { return bail(Str::new("wrap<i32> returned None")); }
+    }
+}
+
+![test]
+function default_own_generic_inferred_arg_nongeneric_receiver() -> Result<(), TestError> {
+    // No explicit `<i32>`; `B` is inferred from `tdg_inc`'s return type.
+    const c: TdgCell = TdgCell::new(5);
+    match (c.wrap(tdg_inc)) {
+        Option::Some(x) => { return expect_eq(x, 6); }
+        Option::None    => { return bail(Str::new("wrap (inferred) returned None")); }
+    }
+}
+
+![test]
+function default_own_generic_generic_receiver() -> Result<(), TestError> {
+    const h: TdgHolder<i32> = TdgHolder<i32>::new(20);
+    match (h.wrap<i32>(tdg_dbl)) {
+        Option::Some(x) => { return expect_eq(x, 40); }
+        Option::None    => { return bail(Str::new("TdgHolder.wrap<i32> returned None")); }
+    }
+}
