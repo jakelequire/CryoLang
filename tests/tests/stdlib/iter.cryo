@@ -266,3 +266,55 @@ function range_char_walks_ascii_letters() -> Result<(), TestError> {
     const want: u32 = 294;
     return expect_eq(byte_sum, want);
 }
+
+// ============================================================================
+// TakeIter adapter - lazy `take(n)` combinator
+// ============================================================================
+//
+// `take(this, n)` is a self-returning trait default: it consumes the
+// iterator by value and returns a `TakeIter<Self>` yielding at most `n`
+// elements.  It's instantiated lazily at the call site (eager
+// materialization would self-apply `TakeIter::take` forever).  Keeping the
+// where-clause-generic `Iterator` impl on `TakeIter` (its `next` introduces
+// the element type `A` only via `where I: Iterator<A>`) requires the
+// monomorphizer to recover a concrete spec arg's InstantiatedType wrapper
+// when checking/deriving the impl's bounds; without it the impl was dropped
+// and `count`/`next` never registered for the spec.  These pin the
+// consumption paths that work today: a named-iterator receiver consumed
+// inline by a terminal default (`count`) or driven by `for`-in.
+//
+// Not yet supported (tracked in CHANGELOG known-limitations): binding the
+// adapter to an explicit-typed local (`mut t: TakeIter<..> = it.take(n)`),
+// chaining adapters (`it.take(a).take(b)`), or a call-expression receiver
+// (`make_range().take(n)`).
+
+![test]
+function take_caps_count_at_n() -> Result<(), TestError> {
+    // 100-element source, take 4: count reports 4, not 100.
+    mut r: Range<i32> = Range::new(0, 100);
+    return expect_eq(r.take(4).count(), 4 as u64);
+}
+
+![test]
+function take_yields_whole_source_when_shorter_than_n() -> Result<(), TestError> {
+    // Asking for more than the source holds yields the whole source: a
+    // 3-element range capped at 10 still counts 3 (inner exhausts first).
+    mut r: Range<i32> = Range::new(0, 3);
+    return expect_eq(r.take(10).count(), 3 as u64);
+}
+
+![test]
+function take_zero_yields_nothing() -> Result<(), TestError> {
+    mut r: Range<i32> = Range::new(0, 100);
+    return expect_eq(r.take(0).count(), 0 as u64);
+}
+
+![test]
+function take_drives_for_in_loop() -> Result<(), TestError> {
+    // for-in consumes the adapter in place: sum the first 5 of 0.. ->
+    // 0+1+2+3+4 = 10, proving `next` stops after `n` and yields real values.
+    mut r: Range<i32> = Range::new(0, 100);
+    mut sum: i32 = 0;
+    for (x in r.take(5)) { sum = sum + x; }
+    return expect_eq(sum, 10);
+}
