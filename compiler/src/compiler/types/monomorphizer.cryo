@@ -1112,10 +1112,28 @@ type struct Monomorphizer {
     /// subject impl's params (`T` in `implement<T> Iterator<T> for Range<T>`)
     /// to `subject`'s concrete args (`i32`), then resolve the impl's
     /// `trait_annotation` args under that binding.
-    concrete_trait_args_for(mut &this, subject: TypeRef,
+    concrete_trait_args_for(mut &this, subject_in: TypeRef,
                             trait_leaf: SymbolStr) -> TypeRef[] {
         mut out: TypeRef[] = [];
         if (this.generic_registry == null || this.type_resolver == null) { return out; }
+        // The monomorphizer often binds a where-clause param straight to the
+        // concrete spec'd Struct/Class/Enum (e.g. `I := Range<i32>` struct)
+        // rather than its InstantiatedType wrapper. A concrete spec's bare
+        // name is its MANGLED spec name (`5Range$Li$G`), so the trait-impl
+        // lookup below — keyed on the template's bare name (`Range`) — would
+        // miss, and the wrapper's type args (needed to bind the trait's
+        // generic, e.g. deriving `A := i32` from `Range<i32>: Iterator<i32>`)
+        // would be unavailable. Recover the wrapper first. Mirrors the same
+        // recovery in `type_implements_trait`.
+        mut subject: TypeRef = subject_in;
+        const subj_t: Type* = this.arena.lookup(subject_in.id);
+        if (subj_t != null
+                && (subj_t.kind == TypeKind::Struct
+                    || subj_t.kind == TypeKind::Class
+                    || subj_t.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, subject_in);
+            if (wrapper.is_valid()) { subject = wrapper; }
+        }
         const base_name: SymbolStr = this.bare_name_of(subject);
         if (!base_name.is_valid()) { return out; }
         const impl_node: ImplBlockNode* =
@@ -1442,7 +1460,29 @@ type struct Monomorphizer {
             }
         }
 
-        const target_name: SymbolStr = this.bare_name_of(ty);
+        // Normalize the subject to its InstantiatedType wrapper when we
+        // were handed the concrete spec'd Struct/Class/Enum directly. The
+        // monomorphizer substitutes a where-clause param straight to the
+        // concrete spec (e.g. checking `I: Iterator<A>` for `TakeIter<I>`,
+        // where `I` was bound to the concrete `Range<i32>` struct rather
+        // than its wrapper). A concrete spec struct's bare name is its
+        // MANGLED spec name (`5Range$Li$G`), so the trait-impl registry
+        // lookup below — keyed on the template's bare name (`Range`) —
+        // would miss, and the impl would be wrongly dropped. The wrapper
+        // both bare-names back to the template AND carries the type args
+        // needed to verify the matched impl's own where-bounds
+        // (`Range<T> where T: Step`). Mirrors diagnose_method_bounds_failure.
+        mut subject: TypeRef = ty;
+        const subj_t0: Type* = this.arena.lookup(ty.id);
+        if (subj_t0 != null
+                && (subj_t0.kind == TypeKind::Struct
+                    || subj_t0.kind == TypeKind::Class
+                    || subj_t0.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, ty);
+            if (wrapper.is_valid()) { subject = wrapper; }
+        }
+
+        const target_name: SymbolStr = this.bare_name_of(subject);
         if (!target_name.is_valid()) { return false; }
         const impl_block: ImplBlockNode* =
             this.generic_registry.lookup_trait_impl(trait_name, target_name);
@@ -1470,7 +1510,7 @@ type struct Monomorphizer {
         // the concrete type's args. For `implement<T> trait Eq for Option<T>`
         // and `ty = Option<X>`, the impl's `T` maps to the InstantiatedType's
         // `type_args[0]`.
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(subject.id);
         if (t == null) { return false; }
         if (t.kind != TypeKind::InstantiatedType) {
             // No outer args to substitute through; bounds reference impl
