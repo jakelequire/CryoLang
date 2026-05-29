@@ -24,6 +24,20 @@ function make_seq() -> i32 {
     return init_calls * 10;
 }
 
+mut owning_drops: i32 = 0;
+
+type struct OwningTls {
+    tag: i32;
+}
+
+implement trait Drop for struct OwningTls {
+    drop(mut &this) -> void { owning_drops = owning_drops + 1; }
+}
+
+function make_owning() -> OwningTls {
+    return OwningTls { tag: 7 };
+}
+
 ![test]
 function tls_init_lazy_on_first_get() -> Result<(), TestError> {
     init_calls = 0;
@@ -114,6 +128,30 @@ function tls_write_through_pointer_persists() -> Result<(), TestError> {
     tl.clear();
     tl.drop();
     match (expect_eq(v, 999)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Regression: `clear()` must run `T::drop` on the stored value before
+// reclaiming its storage (it used to free the bytes without dropping,
+// leaking any owning fields). The drop must run exactly once - clearing
+// then dropping the ThreadLocal must not double-drop.
+![test]
+function tls_clear_runs_value_drop() -> Result<(), TestError> {
+    owning_drops = 0;
+    mut tl: ThreadLocal<OwningTls> = ThreadLocal<OwningTls>::new(make_owning);
+    const _p: OwningTls* = tl.get();
+    tl.clear();
+    const after_clear: i32 = owning_drops;
+    tl.drop();
+    const after_tldrop: i32 = owning_drops;
+    match (expect_eq(after_clear, 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_tldrop, 1)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }

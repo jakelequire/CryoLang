@@ -5029,6 +5029,17 @@ public:
         return uniq;
     }
 
+    /// Whether the `FunctionType` behind a `MethodInfo.function_type` is
+    /// variadic.  Variadic methods accept a variable argument tail, so the
+    /// strict arity check must skip them (mirrors `check_call_arity`'s
+    /// `if (ft.is_variadic) return;` for free functions).
+    method_type_is_variadic(&this, fn_type: TypeRef) -> boolean {
+        if (!fn_type.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(fn_type.id);
+        if (t == null || t.kind != TypeKind::Function) { return false; }
+        return (t as FunctionType*).is_variadic;
+    }
+
     check_method_call_arg_types(mut &this, call: CallExprNode*,
                                 member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = member.object.resolved_type;
@@ -5059,6 +5070,12 @@ public:
         const argc: i64 = call.arguments.length;
         mut found:     boolean   = false;
         mut ambiguous: boolean   = false;
+        // A same-named variadic candidate accepts this call's arity (a fixed
+        // prefix plus a variable tail). Mirrors the free-function path
+        // (`check_call_arity`), which bails on `is_variadic`; without it a
+        // variadic method was rejected as if its declared parameter count
+        // were exact.
+        mut variadic_ok: boolean = false;
         mut chosen:    TypeRef[] = [];
         // Arity tracking: how many same-named candidates exist (any arity),
         // and their unique non-receiver param count (-1 none, -2 conflicting).
@@ -5087,6 +5104,10 @@ public:
             for (mut mi: i64 = 0; mi < cur.length; mi++) {
                 const m: MethodInfo = cur[mi];
                 if (!m.name.equals(member.member)) { continue; }
+                if (this.method_type_is_variadic(m.function_type)) {
+                    variadic_ok = true;
+                    continue;
+                }
                 name_seen  += 1;
                 uniq_arity  = this.note_arity(uniq_arity, m.param_types.length);
                 if (m.param_types.length != argc) { continue; }
@@ -5143,6 +5164,10 @@ public:
                         if (mn == null || mn.func == null) { continue; }
                         const fn_node: FunctionDeclNode* = mn.func;
                         if (!fn_node.name.equals(member.member)) { continue; }
+                        if (fn_node.is_variadic) {
+                            variadic_ok = true;
+                            continue;
+                        }
                         mut tparams: TypeRef[] = [];
                         for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
                             const pp: VarDeclNode* = fn_node.parameters[pi];
@@ -5180,6 +5205,9 @@ public:
             this.check_args_against_params(call, chosen.as_slice());
             return;
         }
+        // A variadic overload accepts this arity: skip the strict arity
+        // diagnostic, consistent with the free-function path.
+        if (variadic_ok) { return; }
         // The method name resolved but no overload has the call's arity:
         // report it here (E0215/E0216) instead of letting codegen emit a
         // call with the wrong operand count and fail LLVM verification.
@@ -5346,6 +5374,10 @@ public:
         const argc: i64 = call.arguments.length;
         mut found:     boolean   = false;
         mut ambiguous: boolean   = false;
+        // See `check_method_call_arg_types`: a variadic static overload
+        // accepts a variable argument tail and must skip the strict arity
+        // check, mirroring the free-function path.
+        mut variadic_ok: boolean = false;
         mut chosen:    TypeRef[] = [];
         mut name_seen:  i64 = 0;
         mut uniq_arity: i64 = -1;
@@ -5353,6 +5385,10 @@ public:
             const m: MethodInfo = methods[mi];
             if (!m.is_static) { continue; }
             if (!m.name.equals(scope.member_name)) { continue; }
+            if (this.method_type_is_variadic(m.function_type)) {
+                variadic_ok = true;
+                continue;
+            }
             name_seen  += 1;
             uniq_arity  = this.note_arity(uniq_arity, m.param_types.length);
             if (m.param_types.length != argc) { continue; }
@@ -5374,6 +5410,7 @@ public:
             this.check_args_against_params(call, chosen.as_slice());
             return;
         }
+        if (variadic_ok) { return; }
         // Static method name resolved but no overload has the call's arity.
         if (name_seen > 0) {
             this.emit_method_arity_error(call, scope.member_name,
@@ -8567,6 +8604,25 @@ public:
             }
             const t: TypeRef = this.resolve_expr(arr.elements[i]);
             this.expected_type = saved_expected;
+            // Every element must be assignable to the array's element type:
+            // the context-declared element type when the surrounding context
+            // fixes it (`i32[] = [...]`), otherwise the first element's type
+            // (the literal itself establishes the homogeneous element type).
+            // Without this, a mismatched element (`i32[] = [1, "x"]`) was
+            // silently accepted and reinterpreted at codegen -> type confusion.
+            mut target: TypeRef = elem_expected;
+            if (!target.is_valid()) { target = elem_type; }
+            if (target.is_valid() && t.is_valid()
+                && !this.checker.can_assign(t, target)) {
+                this.emit_type_mismatch_with_value(
+                    ErrorCode::E0200_TYPE_MISMATCH,
+                    arr.elements[i].span,
+                    target,
+                    t,
+                    "array elements must all have the same type",
+                    SourceSpan::none(),
+                    arr.elements[i]);
+            }
             if (!elem_type.is_valid() && t.is_valid()) {
                 elem_type = t;
             }
