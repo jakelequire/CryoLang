@@ -1146,16 +1146,33 @@ type struct Monomorphizer {
         const st: Type* = this.arena.lookup(subject.id);
         if (st != null && st.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = st as InstantiatedType*;
-            const n: i64 = if (impl_node.generic_params.length < inst.type_args.length) {
-                impl_node.generic_params.length
-            } else {
-                inst.type_args.length
-            };
-            for (mut i: i64 = 0; i < n; i++) {
-                const gp: GenericParamNode* = impl_node.generic_params[i];
-                if (gp == null) { continue; }
-                ctx.add_binding(gp.name, inst.type_args[i]);
+            // Bind the struct's OWN params from the TARGET args (`I` in
+            // `for TakeIter<I>`), not the full generic-param list - a
+            // where-clause can introduce extra generics (`A`) the struct
+            // doesn't carry.
+            mut subst: TypeSubstitution = TypeSubstitution::empty();
+            if (impl_node.target_args.length == inst.type_args.length) {
+                for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
+                    const ta: TypeAnnotation* = impl_node.target_args[i];
+                    if (ta == null) { continue; }
+                    match (*ta) {
+                        TypeAnnotation::Named(n) => {
+                            ctx.add_binding(n.name, inst.type_args[i]);
+                            const gp_ref: TypeRef =
+                                this.arena.create_generic_param(n.name, i as u64);
+                            subst.add(gp_ref.id, inst.type_args[i]);
+                        }
+                        _ => {}
+                    }
+                }
             }
+            // Derive any where-clause-introduced generic the struct args don't
+            // determine (e.g. `A` in `implement<I,A> Iterator<A> for TakeIter<I>
+            // where I: Iterator<A>`).  Without this, an adapter subject's trait
+            // arg (`A`) stays an unbound `Named("A")` and the trait-arg list
+            // below carries an invalid TypeRef - which surfaces when the trait
+            // arg is itself another adapter's element type (chaining).
+            this.derive_impl_where_generics(impl_node, &subst, &ctx);
         }
 
         match (*trait_ann) {
@@ -1520,21 +1537,33 @@ type struct Monomorphizer {
             return false;
         }
         const inst: InstantiatedType* = t as InstantiatedType*;
-        if (impl_block.generic_params.length != inst.type_args.length) {
+        // Map the impl's TARGET type args - the names the struct itself is
+        // parameterized by (`I` in `for TakeIter<I>`) - to the concrete
+        // instantiation's args.  This is NOT the same as the impl's full
+        // generic-param list: a where-clause can introduce extra generics the
+        // struct doesn't carry (`A` in `implement<I, A> Iterator<A> for
+        // TakeIter<I> where I: Iterator<A>`), so keying off `generic_params`
+        // and requiring it to equal `type_args.length` wrongly rejected every
+        // such impl (e.g. the nested `TakeIter<TakeIter<Range<i32>>>` while
+        // chaining).  The where-bound check below only needs the target params
+        // bound; it looks up bound subjects by name.
+        if (impl_block.target_args.length != inst.type_args.length) {
             return false;
         }
         mut nested: TypeSubstitution = TypeSubstitution::empty();
-        for (mut gi: i64 = 0; gi < impl_block.generic_params.length; gi++) {
-            const gp_node: GenericParamNode* = impl_block.generic_params[gi];
-            if (gp_node == null) { continue; }
-            // The impl's generic param names live on the AST as SymbolStr;
-            // we need an arena TypeRef to bridge into TypeSubstitution.
-            // bounds_satisfied's `lookup_subst_for_param` keys by the
-            // GenericParam's `param_name` (a SymbolStr), so create a
-            // GenericParam type just for this one lookup. The created
-            // TypeRef goes into `nested.param_ids`.
-            const gp_ref: TypeRef = this.arena.create_generic_param(gp_node.name, gi as u64);
-            nested.add(gp_ref.id, inst.type_args[gi]);
+        for (mut gi: i64 = 0; gi < impl_block.target_args.length; gi++) {
+            const ta: TypeAnnotation* = impl_block.target_args[gi];
+            if (ta == null) { continue; }
+            match (*ta) {
+                TypeAnnotation::Named(n) => {
+                    // `lookup_subst_for_param` keys by the GenericParam's
+                    // name, so the index here only has to make a GenericParam
+                    // TypeRef; the name is what matters.
+                    const gp_ref: TypeRef = this.arena.create_generic_param(n.name, gi as u64);
+                    nested.add(gp_ref.id, inst.type_args[gi]);
+                }
+                _ => {}
+            }
         }
         return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
     }
@@ -1957,7 +1986,30 @@ type struct Monomorphizer {
                             // `call.resolved_type`; other passes treat the
                             // call's typing as load-bearing and rewriting
                             // it from this side channel destabilises them.
-                            if (vd.is_auto && inst_from_init.is_valid()) {
+                            // Only lift from the static-constructor side channel
+                            // when the initializer IS directly that constructor
+                            // call (`for (x in Range::new(0,10))`).  When it's a
+                            // method chain on one (`Range::new(..).take(n)`),
+                            // `last_static_inst_ref` holds the INNER constructor's
+                            // owner (`Range<i32>`), not the chain's result
+                            // (`TakeIter<Range<i32>>`); overwriting with it
+                            // mistypes the iterator binding.  Sema types the
+                            // method-chain binding from the call's resolved_method
+                            // instead, so leave it alone here.
+                            mut init_is_direct_static: boolean = false;
+                            if (vd.initializer != null) {
+                                const init_n: ASTNode* = vd.initializer as ASTNode*;
+                                if (init_n.kind == NodeKind::CallExpression) {
+                                    const init_call: CallExprNode* = vd.initializer as CallExprNode*;
+                                    if (init_call.callee != null
+                                            && (init_call.callee as ASTNode*).kind
+                                               == NodeKind::ScopeResolution) {
+                                        init_is_direct_static = true;
+                                    }
+                                }
+                            }
+                            if (vd.is_auto && inst_from_init.is_valid()
+                                    && init_is_direct_static) {
                                 vd.resolved_type = inst_from_init;
                             }
 
@@ -2402,6 +2454,24 @@ type struct Monomorphizer {
             if (expr.resolved_type.is_valid()) {
                 return expr.resolved_type;
             }
+            const ce_call: CallExprNode* = expr as CallExprNode*;
+            // A combinator call earlier in this same inference walk
+            // (`r.map(f)` as the receiver of `.fold(..)`) has had its
+            // `resolved_method` pinned to the concrete spec, but not its
+            // `resolved_type` (sema runs later).  `lookup_method_return` below
+            // can't recover the spec's return for an own-generic combinator
+            // (it can't fill `B`), so consult the pinned spec method's already-
+            // concrete return type first.
+            if (ce_call.resolved_method != null) {
+                const rm: ASTNode* = ce_call.resolved_method;
+                if (rm.kind == NodeKind::MethodDeclaration) {
+                    const rmm: MethodNode* = ce_call.resolved_method as MethodNode*;
+                    if (rmm.func != null
+                            && rmm.func.resolved_return_type.is_valid()) {
+                        return rmm.func.resolved_return_type;
+                    }
+                }
+            }
             // For calls inside a generic-method body that sema skipped, we
             // still need a best-effort return type so downstream match
             // subjects can be typed.  The receiver-driven path: when the
@@ -2410,7 +2480,6 @@ type struct Monomorphizer {
             // Restricted to method calls because free-function generics
             // would yield unsubstituted GenericParams here, which break
             // bound-checking elsewhere.
-            const ce_call: CallExprNode* = expr as CallExprNode*;
             if (ce_call.callee == null) { return TypeRef::invalid(); }
             const callee_node: ASTNode* = ce_call.callee as ASTNode*;
             // NOTE: a ScopeResolution (static-call) receiver is deliberately
@@ -4126,6 +4195,19 @@ type struct Monomorphizer {
         if (subst != null) {
             recv_type = subst.apply(recv_type, this.arena);
         }
+        // An adapter receiver produced earlier in this same inference walk
+        // (`r.map(f)` as the receiver of `.fold(..)`) may not be monomorphized
+        // yet, so its spec'd impl - and the inherited default we're about to
+        // specialize on it - doesn't exist in `spec_entries` until the
+        // post-walk drain.  Force it now so `find_spec_impl_method` sees it.
+        // No-op when the receiver is already resolved or isn't an instantiation.
+        // An adapter receiver produced earlier in this same inference walk
+        // (`r.map(f)` as the receiver of `.fold(..)`) may not be monomorphized
+        // yet, so its spec'd impl - and the inherited default we're about to
+        // specialize on it - doesn't exist in `spec_entries` until forced.
+        // Force it now so `find_spec_impl_method` sees it.  No-op when the
+        // receiver is already resolved or isn't an instantiation.
+        recv_type = this.ensure_receiver_inst_resolved(recv_type);
         // Unwrap Reference/Pointer/InstantiatedType to land on a concrete
         // Struct/Class/Enum (which is what spec_entries.specialized_type
         // points at).
@@ -4388,6 +4470,13 @@ type struct Monomorphizer {
         const spec_method: MethodNode* = this.specialize_method(
             orig_method, method_param_names, this.inference_bindings, recv_type);
         if (spec_method == null) { return; }
+        // The clone is a concrete specialization, not a deferred template - even
+        // when the original was a self-returning combinator default (`map<B>`).
+        // Clearing the flag (mirroring `try_instantiate_self_returning_default`)
+        // makes sema treat the spec's resolved return type as load-bearing
+        // instead of skipping it as a template, so a chained consumer
+        // (`r.map(f).count()`) sees the concrete adapter type.
+        spec_method.func.set_self_returning_default(false);
         if (inherent_owner_ast != null) {
             // Push onto the inherent owner's own methods[] array so
             // `declare_struct_methods` / `declare_class_methods` picks
@@ -4579,14 +4668,46 @@ type struct Monomorphizer {
                 }
             }
         }
+        // Fallback for a signature the annotation re-resolution couldn't fully
+        // concretize.  An own-generic default inherited into a where-clause-
+        // generic impl (`fold<Acc>` on `implement<I,A> Iterator<A> for
+        // TakeIter<I> where I: Iterator<A>`) keeps the impl param `A` as a bare
+        // `Named("A")` in its cloned annotation (`f: (Acc, A) -> Acc`); `A`
+        // isn't a Self-type arg, so re-resolving the annotation in this context
+        // leaves it unbound.  But `original` is the spec'd impl's copy, whose
+        // *resolved* signature already had `A` bound to the concrete element
+        // type during impl specialization.  So when re-resolution fails for a
+        // slot, substitute the method's own generics onto `original`'s resolved
+        // type for that slot - which carries the concrete `A` - instead.
+        if (this.type_has_unresolved(spec_method.func.resolved_return_type, 0)
+                && original.func.resolved_return_type.is_valid()) {
+            const cand: TypeRef = subst_ptr.apply(
+                original.func.resolved_return_type, this.arena);
+            if (!this.type_has_unresolved(cand, 0)) {
+                spec_method.func.set_resolved_return_type(cand);
+            }
+        }
+        const n_clone_params: i64 = spec_method.func.parameters.length;
+        const n_orig_params: i64 = original.func.parameters.length;
+        if (n_clone_params == n_orig_params) {
+            for (mut i: i64 = 0; i < n_clone_params; i++) {
+                const p: VarDeclNode* = spec_method.func.parameters[i];
+                const op: VarDeclNode* = original.func.parameters[i];
+                if (p == null || op == null) { continue; }
+                if (!this.type_has_unresolved(p.resolved_type, 0)) { continue; }
+                if (!op.resolved_type.is_valid()) { continue; }
+                const cand: TypeRef = subst_ptr.apply(op.resolved_type, this.arena);
+                if (!this.type_has_unresolved(cand, 0)) {
+                    p.set_resolved_type(cand);
+                }
+            }
+        }
+
         // Refuse to hand back a spec whose signature didn't fully resolve.
         // The mangler treats an invalid TypeRef in a registered method as an
-        // internal error and aborts; that fires for own-generic defaults whose
-        // signature mentions an element type the receiver can't bind here -
-        // e.g. `fold<Acc>(f: (Acc, Item) -> Acc)` on a where-clause-generic
-        // adapter (`TakeIter`), where `Item` is unbound.  Failing here instead
-        // leaves `resolved_method` unset so the call surfaces a clean
-        // "method not found" diagnostic rather than crashing the compiler.
+        // internal error and aborts.  Failing here instead leaves
+        // `resolved_method` unset so the call surfaces a clean "method not
+        // found"/type-mismatch diagnostic rather than crashing the compiler.
         if (this.type_has_unresolved(spec_method.func.resolved_return_type, 0)) {
             return null;
         }
