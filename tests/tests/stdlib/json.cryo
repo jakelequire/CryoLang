@@ -286,6 +286,40 @@ function round_trip_object() -> Result<(), TestError> {
     }
 }
 
+// Regression: serializing an f64 must preserve its full precision through a
+// stringify -> parse round-trip. The serializer previously used the fixed
+// 6-decimal `to_buf`, so `3.141592653589793` came back as `3.141593` - silent
+// data loss despite the API advertising strtod round-tripping. It now emits
+// the shortest representation that re-parses to the identical f64.
+![test]
+function round_trip_float_precision() -> Result<(), TestError> {
+    const original: f64 = 3.141592653589793;
+    mut v: JsonValue = JsonValue::Number(JsonNumber::Float(original));
+    mut text: String = serializer::stringify(&v);
+    v.drop();
+    match (parser::parse(text.as_str())) {
+        Result::Ok(parsed) => {
+            mut owned: JsonValue = parsed;
+            match (owned.as_f64()) {
+                Option::Some(got) => {
+                    owned.drop();
+                    text.drop();
+                    return expect(got == original, s("float precision lost", 20));
+                }
+                Option::None => {
+                    owned.drop();
+                    text.drop();
+                    return bail(s("not a float", 11));
+                }
+            }
+        }
+        Result::Err(e) => {
+            mut err: JsonError = e; err.drop(); text.drop();
+            return bail(s("reparse failed", 14));
+        }
+    }
+}
+
 // ============================================================================
 // Serializer hardening: non-finite floats must NOT emit raw NaN/inf
 // literals (which are not valid JSON per RFC 8259) - serialize as null.

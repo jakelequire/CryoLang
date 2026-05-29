@@ -4978,6 +4978,57 @@ public:
     /// distinct signature - is skipped, since picking the target then
     /// needs the resolver's full matching.  Each argument is checked
     /// against its non-receiver parameter via `check_args_against_params`.
+    /// Emit an arity diagnostic for a method / static-method call whose name
+    /// resolved but whose argument count matched no overload. `expected` is
+    /// the unique non-receiver parameter count of the same-named candidates,
+    /// or < 0 when they disagree (overloaded by arity) - in which case a
+    /// generic "no overload takes M arguments" is reported. Mirrors
+    /// `check_call_arity`'s E0215/E0216 so methods and static methods get the
+    /// same arity diagnostics free functions do, instead of silently reaching
+    /// codegen and failing LLVM verification (a `cryo check`-clean ICE).
+    emit_method_arity_error(mut &this, call: CallExprNode*, name: SymbolStr,
+                            kind: string, expected: i64, got: i64) -> void {
+        const nm: string = this.intern.resolve(name);
+        if (expected < 0) {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0215_TOO_MANY_ARGS,
+                format("no overload of %s `%s` takes %lld argument(s)",
+                       kind, nm, got));
+            d = d.at_with_label(call.span,
+                "no matching overload for this argument count");
+            this.ctx.diagnostics.emit(d);
+            return;
+        }
+        if (got < expected) {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0216_TOO_FEW_ARGS,
+                format("%s `%s` takes %lld argument(s) but %lld were supplied",
+                       kind, nm, expected, got));
+            d = d.at_with_label(call.span,
+                format("missing %lld argument%s", expected - got,
+                    if (expected - got == 1) { "" } else { "s" }));
+            this.ctx.diagnostics.emit(d);
+            return;
+        }
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0215_TOO_MANY_ARGS,
+            format("%s `%s` takes %lld argument(s) but %lld were supplied",
+                   kind, nm, expected, got));
+        d = d.at_with_label(call.span,
+            format("unexpected argument%s",
+                if (got - expected == 1) { "" } else { "s" }));
+        this.ctx.diagnostics.emit(d);
+    }
+
+    /// Fold a same-named candidate's parameter count into the running
+    /// unique-arity tally used for arity diagnostics. `uniq` starts at -1
+    /// (none seen yet) and becomes -2 once two candidates disagree on arity.
+    note_arity(&this, uniq: i64, param_count: i64) -> i64 {
+        if (uniq == -1)          { return param_count; }
+        if (uniq != param_count) { return -2; }
+        return uniq;
+    }
+
     check_method_call_arg_types(mut &this, call: CallExprNode*,
                                 member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = member.object.resolved_type;
@@ -5009,6 +5060,11 @@ public:
         mut found:     boolean   = false;
         mut ambiguous: boolean   = false;
         mut chosen:    TypeRef[] = [];
+        // Arity tracking: how many same-named candidates exist (any arity),
+        // and their unique non-receiver param count (-1 none, -2 conflicting).
+        // Drives the arity diagnostic when no candidate matches `argc`.
+        mut name_seen:     i64 = 0;
+        mut uniq_arity:    i64 = -1;
 
         // -- Inherent methods (class base chain / struct / enum) --
         // Primitives have no inherent methods; their trait impls are
@@ -5031,6 +5087,8 @@ public:
             for (mut mi: i64 = 0; mi < cur.length; mi++) {
                 const m: MethodInfo = cur[mi];
                 if (!m.name.equals(member.member)) { continue; }
+                name_seen  += 1;
+                uniq_arity  = this.note_arity(uniq_arity, m.param_types.length);
                 if (m.param_types.length != argc) { continue; }
                 if (!found) {
                     found = true;
@@ -5093,6 +5151,8 @@ public:
                             if (pp.name.equals(this_val)) { continue; }
                             tparams.push(pp.resolved_type);
                         }
+                        name_seen  += 1;
+                        uniq_arity  = this.note_arity(uniq_arity, tparams.length);
                         if (tparams.length != argc) { tparams.drop(); continue; }
                         if (!found) {
                             found = true;
@@ -5115,8 +5175,18 @@ public:
             }
         }
 
-        if (!found || ambiguous) { return; }
-        this.check_args_against_params(call, chosen.as_slice());
+        if (ambiguous) { return; }
+        if (found) {
+            this.check_args_against_params(call, chosen.as_slice());
+            return;
+        }
+        // The method name resolved but no overload has the call's arity:
+        // report it here (E0215/E0216) instead of letting codegen emit a
+        // call with the wrong operand count and fail LLVM verification.
+        if (name_seen > 0) {
+            this.emit_method_arity_error(call, member.member, "method",
+                uniq_arity, argc);
+        }
     }
 
     /// True when one side is an enum and the other an integer.  A Cryo
@@ -5220,12 +5290,17 @@ public:
             const ot: Type* = this.arena.lookup(overloads[0].id);
             if (ot != null && ot.kind == TypeKind::Function) {
                 const ft: FunctionType* = ot as FunctionType*;
-                // Arity is not (yet) reported for scope calls; only
-                // type-check when the counts already line up so we don't
-                // misalign the comparison.
-                if (!ft.is_variadic
-                    && ft.param_types.length == call.arguments.length) {
-                    this.check_args_against_params(call, ft.param_types.as_slice());
+                if (!ft.is_variadic) {
+                    if (ft.param_types.length == call.arguments.length) {
+                        this.check_args_against_params(call, ft.param_types.as_slice());
+                    } else {
+                        // Wrong arity for the single resolved overload: report
+                        // it instead of letting codegen build a mis-arity call
+                        // and fail LLVM verification.
+                        this.emit_method_arity_error(call, scope.member_name,
+                            "function", ft.param_types.length,
+                            call.arguments.length);
+                    }
                 }
             }
             return;
@@ -5272,10 +5347,14 @@ public:
         mut found:     boolean   = false;
         mut ambiguous: boolean   = false;
         mut chosen:    TypeRef[] = [];
+        mut name_seen:  i64 = 0;
+        mut uniq_arity: i64 = -1;
         for (mut mi: i64 = 0; mi < methods.length; mi++) {
             const m: MethodInfo = methods[mi];
             if (!m.is_static) { continue; }
             if (!m.name.equals(scope.member_name)) { continue; }
+            name_seen  += 1;
+            uniq_arity  = this.note_arity(uniq_arity, m.param_types.length);
             if (m.param_types.length != argc) { continue; }
             if (!found) {
                 found = true;
@@ -5290,8 +5369,16 @@ public:
                 ambiguous = true;
             }
         }
-        if (!found || ambiguous) { return; }
-        this.check_args_against_params(call, chosen.as_slice());
+        if (ambiguous) { return; }
+        if (found) {
+            this.check_args_against_params(call, chosen.as_slice());
+            return;
+        }
+        // Static method name resolved but no overload has the call's arity.
+        if (name_seen > 0) {
+            this.emit_method_arity_error(call, scope.member_name,
+                "static method", uniq_arity, argc);
+        }
     }
 
     /// One level of pointer/reference indirection peeled off `t`, or an
@@ -8340,9 +8427,45 @@ public:
         return struct_ref;
     }
 
-    resolve_scope_resolution(&this, scope: ScopeResolutionNode*) -> TypeRef {
+    /// Reject `Enum::member` where `member` is neither a variant nor a
+    /// static method of the enum. Resolving the scope to a valid enum type
+    /// is not enough - the member has to exist, or a typo silently compiles
+    /// (E0640 with a did-you-mean over the real variant names).
+    validate_enum_scope_member(mut &this, scope_ty: TypeRef,
+                               scope: ScopeResolutionNode*) -> void {
+        const t: Type* = this.arena.lookup(scope_ty.id);
+        if (t == null || t.kind != TypeKind::Enum) { return; }
+        const et: EnumType* = t as EnumType*;
+        if (et.get_variant(scope.member_name) != null) { return; }
+        for (mut i: i64 = 0; i < et.methods.length; i++) {
+            if (et.methods[i].name.equals(scope.member_name)) { return; }
+        }
+        const enum_name: string = this.intern.resolve(scope.scope_name);
+        const member:    string = this.intern.resolve(scope.member_name);
+        mut cands: string[] = [];
+        for (mut i: i64 = 0; i < et.variants.length; i++) {
+            cands.push(this.intern.resolve(et.variants[i].name));
+        }
+        const best: string = find_best_candidate(member, cands);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
+            format("enum `%s` has no variant `%s`", enum_name, member));
+        d = d.at_with_label(scope.span, "unknown variant");
+        if (strlen(best) > 0) {
+            d = d.help(format("did you mean `%s::%s`?", enum_name, best));
+        }
+        this.ctx.diagnostics.emit(d);
+    }
+
+    resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
         const found: TypeRef = this.lookup_type_by_sym(scope.scope_name);
         if (found.is_valid()) {
+            // When the scope is an enum, the member must be a real variant
+            // (or a static method). A typo like `Color::Bogus` previously
+            // resolved straight to the enum type with the member ignored, so
+            // it compiled and ran as a match arm that could never fire / a
+            // garbage discriminant - a silent miscompile.
+            this.validate_enum_scope_member(found, scope);
             return this.promote_to_expected_instantiation(found);
         }
         // Module-qualified globals: `libc::O_APPEND` where `libc` is a
