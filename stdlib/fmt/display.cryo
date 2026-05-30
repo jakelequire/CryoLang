@@ -22,6 +22,8 @@ import io::traits;
 import io::stdio;
 import collections::str;
 import collections::string;
+import collections::array;
+import collections::hashmap;
 import alloc::allocator;
 import core::primitives;
 import fmt::float;
@@ -480,6 +482,270 @@ where W: FmtWrite {
         Result::Err(err) => { return Result::Err(err); }
     }
     return f.write_byte(0x7D); // '}'
+}
+
+// Composite Display / Debug impls: Option, Result
+//
+// These recurse into the wrapped value's own `fmt`.  The recursion is
+// trait-correct: inside `Display::fmt` a nested `.fmt()` dispatches to the
+// element's `Display`; inside `Debug::fmt` it dispatches to `Debug` (the
+// compiler's bound-directed dispatch threads the enclosing trait).  Each
+// write short-circuits on error via an explicit match (the `?` operator is
+// not used in this module).
+
+implement<T> trait Display for enum Option<T>
+where T: Display {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (&this) {
+            Option::Some(value) => {
+                match (f.write_str(Str::new("Some("))) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+                match (value.fmt(f)) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+                return f.write_str(Str::new(")"));
+            }
+            Option::None => {
+                return f.write_str(Str::new("None"));
+            }
+        }
+    }
+}
+
+implement<T> trait Debug for enum Option<T>
+where T: Debug {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (&this) {
+            Option::Some(value) => {
+                match (f.write_str(Str::new("Some("))) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+                match (value.fmt(f)) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+                return f.write_str(Str::new(")"));
+            }
+            Option::None => {
+                return f.write_str(Str::new("None"));
+            }
+        }
+    }
+}
+
+/// Construct a `Result<(), FmtError>` error.  Defined OUTSIDE the
+/// `implement ... for Result` blocks below because inside them the bare
+/// `Result::Err` constructor binds to the Self enum (`Result<T, E>`)
+/// rather than `Result<(), FmtError>`, producing a type mismatch.  As a
+/// free function the name resolves unambiguously.
+private function fmt_err(e: FmtError) -> Result<(), FmtError> {
+    return Result::Err(e);
+}
+
+implement<T, E> trait Display for enum Result<T, E>
+where T: Display, E: Display {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (&this) {
+            Result::Ok(value) => {
+                match (f.write_str(Str::new("Ok("))) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                match (value.fmt(f)) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                return f.write_str(Str::new(")"));
+            }
+            Result::Err(err) => {
+                match (f.write_str(Str::new("Err("))) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                match (err.fmt(f)) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                return f.write_str(Str::new(")"));
+            }
+        }
+    }
+}
+
+implement<T, E> trait Debug for enum Result<T, E>
+where T: Debug, E: Debug {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (&this) {
+            Result::Ok(value) => {
+                match (f.write_str(Str::new("Ok("))) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                match (value.fmt(f)) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                return f.write_str(Str::new(")"));
+            }
+            Result::Err(err) => {
+                match (f.write_str(Str::new("Err("))) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                match (err.fmt(f)) {
+                    Result::Ok(_) => { }
+                    Result::Err(e) => { return fmt_err(e); }
+                }
+                return f.write_str(Str::new(")"));
+            }
+        }
+    }
+}
+
+// Composite Display / Debug impls: Array, HashMap
+//
+// `Array<T>` renders as `[a, b, c]`; `HashMap<K, V>` as `{k: v, k2: v2}`.
+// Elements are borrowed in place (Array via `get_ptr`, HashMap via the
+// public bucket walk) so these work for owning element types.  The nested
+// `.fmt()` dispatches to the element's Display inside `Display::fmt` and to
+// its Debug inside `Debug::fmt` (bound-directed dispatch).
+
+implement<T, A> trait Display for struct Array<T, A>
+where T: Display, A: Allocator {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (f.write_str(Str::new("["))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        const n: u64 = this.length();
+        mut i: u64 = 0;
+        while (i < n) {
+            if (i > 0) {
+                match (f.write_str(Str::new(", "))) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+            }
+            match (this.get_ptr(i)) {
+                Option::Some(p) => {
+                    match (p.fmt(f)) {
+                        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+                Option::None => { }
+            }
+            i = i + 1;
+        }
+        return f.write_str(Str::new("]"));
+    }
+}
+
+implement<T, A> trait Debug for struct Array<T, A>
+where T: Debug, A: Allocator {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (f.write_str(Str::new("["))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        const n: u64 = this.length();
+        mut i: u64 = 0;
+        while (i < n) {
+            if (i > 0) {
+                match (f.write_str(Str::new(", "))) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+            }
+            match (this.get_ptr(i)) {
+                Option::Some(p) => {
+                    match (p.fmt(f)) {
+                        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+                Option::None => { }
+            }
+            i = i + 1;
+        }
+        return f.write_str(Str::new("]"));
+    }
+}
+
+implement<K, V, A> trait Display for struct HashMap<K, V, A>
+where K: Display, V: Display, A: Allocator {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (f.write_str(Str::new("{"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        const nb: u64 = this.bucket_count();
+        mut bi: u64 = 0;
+        mut first: boolean = true;
+        while (bi < nb) {
+            mut node: Entry<K, V>* = this.get_bucket(bi);
+            while (node != null) {
+                if (!first) {
+                    match (f.write_str(Str::new(", "))) {
+                        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+                first = false;
+                match (node.key.fmt(f)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (f.write_str(Str::new(": "))) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (node.value.fmt(f)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                node = node.next;
+            }
+            bi = bi + 1;
+        }
+        return f.write_str(Str::new("}"));
+    }
+}
+
+implement<K, V, A> trait Debug for struct HashMap<K, V, A>
+where K: Debug, V: Debug, A: Allocator {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        match (f.write_str(Str::new("{"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        const nb: u64 = this.bucket_count();
+        mut bi: u64 = 0;
+        mut first: boolean = true;
+        while (bi < nb) {
+            mut node: Entry<K, V>* = this.get_bucket(bi);
+            while (node != null) {
+                if (!first) {
+                    match (f.write_str(Str::new(", "))) {
+                        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                    }
+                }
+                first = false;
+                match (node.key.fmt(f)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (f.write_str(Str::new(": "))) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (node.value.fmt(f)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                node = node.next;
+            }
+            bi = bi + 1;
+        }
+        return f.write_str(Str::new("}"));
+    }
 }
 
 // LineBuf: internal stack-buffered sink

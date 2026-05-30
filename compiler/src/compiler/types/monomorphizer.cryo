@@ -417,6 +417,279 @@ type struct Monomorphizer {
     }
 
 
+    // Bound-directed dispatch annotation (Bug C)
+
+    /// Annotate method calls with a disambiguating trait so the
+    /// monomorphizer's trait-impl method lookups pick the right impl when a
+    /// type implements two traits that declare a same-named method (the
+    /// canonical case: `Display::fmt` vs `Debug::fmt`).  The information
+    /// that disambiguates them - a `where T: Debug` bound, or the enclosing
+    /// trait-impl's trait - is only available PRE-monomorphization (once a
+    /// generic is substituted to a concrete type the bound is gone), so this
+    /// runs over EVERY decl (generic templates included) before mono clones
+    /// anything; the cloner copies `resolved_trait` onto every spec.
+    ///
+    /// Two rules:
+    ///   1. Param receiver: `recv.m()` where `recv` is a parameter whose
+    ///      annotation head is a generic param bounded by exactly ONE trait
+    ///      -> that trait.  (Fixes e.g. `format_debug_to_string`'s own
+    ///      `value.fmt()` where `value: &T, T: Debug`.)
+    ///   2. Trait-impl recursion: a call to the enclosing method's own name
+    ///      inside a trait-impl method -> the impl's trait.  (Fixes container
+    ///      recursion: `element.fmt()` inside `Array::Debug::fmt` -> Debug,
+    ///      regardless of how `element` was bound - match arm, get_ptr, etc.)
+    annotate_bound_dispatch_in_module(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        mut no_bounds: TraitBound[] = [];
+        const no_trait: SymbolStr = SymbolStr::empty();
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    this.annotate_dispatch_in_func(f, f.trait_bounds, no_trait);
+                }
+                NodeKind::StructDeclaration => {
+                    const sn: StructDeclNode* = stmt as StructDeclNode*;
+                    this.annotate_dispatch_in_methods(sn.methods, no_bounds, no_trait);
+                }
+                NodeKind::ClassDeclaration => {
+                    const cn: ClassDeclNode* = stmt as ClassDeclNode*;
+                    this.annotate_dispatch_in_methods(cn.methods, no_bounds, no_trait);
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    mut trait_leaf: SymbolStr = SymbolStr::empty();
+                    if (ib.is_trait_impl()) {
+                        trait_leaf = this.trait_leaf_of_ann(ib.trait_annotation);
+                    }
+                    this.annotate_dispatch_in_methods(ib.methods, ib.where_bounds, trait_leaf);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    annotate_dispatch_in_methods(mut &this, methods: MethodNode*[],
+                                 impl_bounds: TraitBound[],
+                                 trait_leaf: SymbolStr) -> void {
+        for (mut k: i64 = 0; k < methods.length; k++) {
+            const m: MethodNode* = methods[k];
+            if (m == null || m.func == null) { continue; }
+            // Rule 1 needs the param's bound, which may be impl-level
+            // (`implement<T> ... where T: Debug`) or method-level; merge both.
+            mut bounds: TraitBound[] = [];
+            for (mut a: i64 = 0; a < impl_bounds.length; a++) {
+                bounds.push(impl_bounds[a]);
+            }
+            for (mut b: i64 = 0; b < m.func.trait_bounds.length; b++) {
+                bounds.push(m.func.trait_bounds[b]);
+            }
+            this.annotate_dispatch_in_func(m.func, bounds, trait_leaf);
+        }
+    }
+
+    annotate_dispatch_in_func(mut &this, func: FunctionDeclNode*,
+                              bounds: TraitBound[],
+                              enclosing_trait: SymbolStr) -> void {
+        if (func == null || func.body == null) { return; }
+        this.annotate_dispatch_stmt(func.body as StatementNode*, func, bounds,
+                                    enclosing_trait);
+    }
+
+    /// Apply the two annotation rules to a single method-call's MemberAccess.
+    annotate_dispatch_member(mut &this, ma: MemberAccessNode*,
+                             func: FunctionDeclNode*, bounds: TraitBound[],
+                             enclosing_trait: SymbolStr) -> void {
+        if (ma == null) { return; }
+        if (ma.resolved_trait.is_valid()) { return; }
+        // Rule 1: receiver is a parameter typed as a single-bounded generic.
+        const obj_node: ASTNode* = ma.object as ASTNode*;
+        if (obj_node != null && obj_node.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = ma.object as IdentifierNode*;
+            for (mut p: i64 = 0; p < func.parameters.length; p++) {
+                const param: VarDeclNode* = func.parameters[p];
+                if (param == null) { continue; }
+                if (!param.name.equals(id.name)) { continue; }
+                const head: SymbolStr = this.trait_leaf_of_ann(param.type_annotation);
+                if (head.is_valid()) {
+                    const tr: SymbolStr = this.single_bound_trait_for(head, bounds);
+                    if (tr.is_valid()) {
+                        ma.set_resolved_trait(tr);
+                        return;
+                    }
+                }
+                break;
+            }
+        }
+        // Rule 2: recursive same-named call inside a trait-impl method.
+        if (enclosing_trait.is_valid() && ma.member.equals(func.name)) {
+            ma.set_resolved_trait(enclosing_trait);
+        }
+    }
+
+    /// Return the single trait bounding `param_name`, or empty when the
+    /// param has zero or more-than-one bound trait (ambiguous - leave the
+    /// dispatch to its default).
+    single_bound_trait_for(&this, param_name: SymbolStr,
+                           bounds: TraitBound[]) -> SymbolStr {
+        mut found: SymbolStr = SymbolStr::empty();
+        mut count: i64 = 0;
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            const b: TraitBound = bounds[i];
+            if (!b.type_parameter.equals(param_name)) { continue; }
+            for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
+                const tr: TraitRef = b.trait_refs[j];
+                if (tr.path.length == 0) { continue; }
+                found = tr.path[tr.path.length - 1];
+                count += 1;
+            }
+        }
+        if (count == 1) { return found; }
+        return SymbolStr::empty();
+    }
+
+    annotate_dispatch_stmt(mut &this, stmt: StatementNode*,
+                           func: FunctionDeclNode*, bounds: TraitBound[],
+                           enclosing_trait: SymbolStr) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        match (node.kind) {
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.annotate_dispatch_expr(es.expression, func, bounds, enclosing_trait);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                const inner: DeclarationNode* = ds.declaration;
+                if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = inner as VarDeclNode*;
+                    if (vd.initializer != null) {
+                        this.annotate_dispatch_expr(vd.initializer, func, bounds, enclosing_trait);
+                    }
+                }
+            }
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                if (rs.expression != null) {
+                    this.annotate_dispatch_expr(rs.expression, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::BlockStatement => {
+                const bs: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < bs.statements.length; i++) {
+                    this.annotate_dispatch_stmt(bs.statements[i], func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                this.annotate_dispatch_expr(ifs.condition, func, bounds, enclosing_trait);
+                if (ifs.then_stmt != null) {
+                    this.annotate_dispatch_stmt(ifs.then_stmt, func, bounds, enclosing_trait);
+                }
+                if (ifs.has_else() && ifs.else_stmt != null) {
+                    this.annotate_dispatch_stmt(ifs.else_stmt, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.annotate_dispatch_expr(ws.condition, func, bounds, enclosing_trait);
+                if (ws.body != null) {
+                    this.annotate_dispatch_stmt(ws.body, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                if (fs.condition != null) {
+                    this.annotate_dispatch_expr(fs.condition, func, bounds, enclosing_trait);
+                }
+                if (fs.body != null) {
+                    this.annotate_dispatch_stmt(fs.body, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (ls.body != null) {
+                    this.annotate_dispatch_stmt(ls.body, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.annotate_dispatch_expr(ms.subject, func, bounds, enclosing_trait);
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm == null || arm.body == null) { continue; }
+                    this.annotate_dispatch_stmt(arm.body, func, bounds, enclosing_trait);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    annotate_dispatch_expr(mut &this, expr: ExpressionNode*,
+                           func: FunctionDeclNode*, bounds: TraitBound[],
+                           enclosing_trait: SymbolStr) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        match (node.kind) {
+            NodeKind::CallExpression => {
+                const call: CallExprNode* = expr as CallExprNode*;
+                if (call.callee != null
+                        && (call.callee as ASTNode*).kind == NodeKind::MemberAccess) {
+                    this.annotate_dispatch_member(
+                        call.callee as MemberAccessNode*, func, bounds, enclosing_trait);
+                }
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.annotate_dispatch_expr(call.arguments[i], func, bounds, enclosing_trait);
+                }
+                if (call.callee != null) {
+                    this.annotate_dispatch_expr(call.callee, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                this.annotate_dispatch_expr(ma.object, func, bounds, enclosing_trait);
+            }
+            NodeKind::BinaryExpression => {
+                const be: BinaryExprNode* = expr as BinaryExprNode*;
+                this.annotate_dispatch_expr(be.left, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(be.right, func, bounds, enclosing_trait);
+            }
+            NodeKind::UnaryExpression => {
+                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                this.annotate_dispatch_expr(ue.operand, func, bounds, enclosing_trait);
+            }
+            NodeKind::TryExpression => {
+                const te: TryExprNode* = expr as TryExprNode*;
+                this.annotate_dispatch_expr(te.operand, func, bounds, enclosing_trait);
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                this.annotate_dispatch_expr(aa.array, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(aa.index, func, bounds, enclosing_trait);
+            }
+            NodeKind::CastExpression => {
+                const ce: CastExprNode* = expr as CastExprNode*;
+                this.annotate_dispatch_expr(ce.expression, func, bounds, enclosing_trait);
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = expr as StructLiteralNode*;
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    this.annotate_dispatch_expr(sl.field_inits[i].value, func, bounds, enclosing_trait);
+                }
+            }
+            NodeKind::ArrayLiteral => {
+                const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
+                for (mut i: i64 = 0; i < al.elements.length; i++) {
+                    this.annotate_dispatch_expr(al.elements[i], func, bounds, enclosing_trait);
+                }
+            }
+            _ => {}
+        }
+    }
+
+
     // Module-wide inferred-call discovery
 
     /// Walk every non-generic top-level declaration in the given module
@@ -3828,6 +4101,23 @@ type struct Monomorphizer {
         };
     }
 
+    /// `&this` twin of `type_annotation_base_name`, peeling
+    /// Generic/Reference/Pointer/Optional to the head Named name.  Used by
+    /// the trait-impl method lookups (which are `&this`) to read an impl
+    /// block's trait leaf and a param annotation's head type for
+    /// bound-directed dispatch (Display vs Debug `fmt`).
+    trait_leaf_of_ann(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(na)     => { na.name }
+            TypeAnnotation::Generic(ga)   => { this.trait_leaf_of_ann(ga.base) }
+            TypeAnnotation::Reference(ra) => { this.trait_leaf_of_ann(ra.inner) }
+            TypeAnnotation::Pointer(pa)   => { this.trait_leaf_of_ann(pa.inner) }
+            TypeAnnotation::Optional(oa)  => { this.trait_leaf_of_ann(oa.inner) }
+            _                             => { SymbolStr::empty() }
+        };
+    }
+
     /// Walk every spec'd impl block looking for one whose target is the
     /// given concrete type and that has a method with the given name.
     /// Returns null if no match.  Used by method-call inference to find
@@ -3909,7 +4199,15 @@ type struct Monomorphizer {
     }
 
     find_spec_impl_method(&this, target_type: TypeRef, method_name: SymbolStr,
+                          preferred_trait: SymbolStr,
                           out_impl: ImplBlockNode**) -> MethodNode* {
+        // Bound-directed dispatch: when two traits declare a same-named
+        // method for this type (e.g. Display::fmt and Debug::fmt on
+        // String<A>), the call site records the intended trait in
+        // `preferred_trait`.  Prefer the impl of that trait; otherwise keep
+        // the historical first-match behavior.
+        mut first_m: MethodNode* = null;
+        mut first_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
             const entry: SpecializationEntry = this.spec_entries[i];
             if (entry.specialized_type.id != target_type.id) { continue; }
@@ -3921,12 +4219,20 @@ type struct Monomorphizer {
                     if (m == null || m.func == null) { continue; }
                     if (!m.func.name.equals(method_name)) { continue; }
                     if (m.func.generic_params.length == 0) { continue; }
-                    *out_impl = impl_node;
-                    return m;
+                    if (preferred_trait.is_valid() && impl_node.is_trait_impl()) {
+                        const tl: SymbolStr =
+                            this.trait_leaf_of_ann(impl_node.trait_annotation);
+                        if (tl.is_valid() && tl.equals(preferred_trait)) {
+                            *out_impl = impl_node;
+                            return m;
+                        }
+                    }
+                    if (first_m == null) { first_m = m; first_impl = impl_node; }
                 }
             }
         }
-        return null;
+        if (first_m != null) { *out_impl = first_impl; }
+        return first_m;
     }
 
     /// Walk the methods[] of a non-generic struct/class whose AST was
@@ -3996,10 +4302,16 @@ type struct Monomorphizer {
     /// codegen's direct-call path, not inference).
     find_trait_impl_method_for_target(&this, bare_target_name: SymbolStr,
                                       method_name: SymbolStr,
+                                      preferred_trait: SymbolStr,
                                       out_impl: ImplBlockNode**) -> MethodNode* {
         if (!bare_target_name.is_valid()) { return null; }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
+        // Bound-directed dispatch: prefer the impl of `preferred_trait` when
+        // the call site disambiguated a same-named method across two traits
+        // (e.g. Debug vs Display `fmt`); otherwise keep first-match.
+        mut first_m: MethodNode* = null;
+        mut first_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
             if (impl_node == null) { continue; }
@@ -4009,11 +4321,19 @@ type struct Monomorphizer {
                 if (m == null || m.func == null) { continue; }
                 if (!m.func.name.equals(method_name)) { continue; }
                 if (m.func.generic_params.length == 0) { continue; }
-                *out_impl = impl_node;
-                return m;
+                if (preferred_trait.is_valid() && impl_node.is_trait_impl()) {
+                    const tl: SymbolStr =
+                        this.trait_leaf_of_ann(impl_node.trait_annotation);
+                    if (tl.is_valid() && tl.equals(preferred_trait)) {
+                        *out_impl = impl_node;
+                        return m;
+                    }
+                }
+                if (first_m == null) { first_m = m; first_impl = impl_node; }
             }
         }
-        return null;
+        if (first_m != null) { *out_impl = first_impl; }
+        return first_m;
     }
 
     /// Attempt formal<->actual unification on a CallExprNode whose callee
@@ -4286,7 +4606,7 @@ type struct Monomorphizer {
         mut inherent_owner_ast: ASTNode* = null;
         mut orig_method: MethodNode* = null;
         if (is_user_kind || is_unresolved_inst) {
-            orig_method = this.find_spec_impl_method(recv_type, ma.member, &impl_node);
+            orig_method = this.find_spec_impl_method(recv_type, ma.member, ma.resolved_trait, &impl_node);
             if (orig_method == null) {
                 orig_method = this.find_inherent_method(
                     recv_type, ma.member, &inherent_owner_ast);
@@ -4325,7 +4645,7 @@ type struct Monomorphizer {
                 const bare: SymbolStr = this.bare_name_of(recv_type);
                 mut cand_impl: ImplBlockNode* = null;
                 const cand: MethodNode* = this.find_trait_impl_method_for_target(
-                    bare, ma.member, &cand_impl);
+                    bare, ma.member, ma.resolved_trait, &cand_impl);
                 if (cand != null && cand.func != null
                         && (cand.func.is_synth_default || cand.func.is_generic())) {
                     orig_method = cand;
@@ -4335,7 +4655,7 @@ type struct Monomorphizer {
         } else {
             const bare: SymbolStr = this.bare_name_of(recv_type);
             orig_method = this.find_trait_impl_method_for_target(
-                bare, ma.member, &impl_node);
+                bare, ma.member, ma.resolved_trait, &impl_node);
         }
         if (orig_method == null) { return; }
         if (impl_node == null && inherent_owner_ast == null) { return; }
