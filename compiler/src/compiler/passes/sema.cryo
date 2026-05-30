@@ -5836,6 +5836,47 @@ public:
             arg_types.push(arg_expr.resolved_type);
         }
 
+        // Bound-directed dispatch: when this call carries a disambiguating
+        // trait (set pre-monomorphization by the monomorphizer's
+        // `annotate_bound_dispatch_in_module` for a method two traits both
+        // declare, e.g. `Display::fmt` vs `Debug::fmt`), resolve directly
+        // against THAT trait's impl block.  Runs before the inherent /
+        // overload passes below, which pick the first name+arity match and
+        // can't distinguish the two same-signature methods.
+        // Bound-directed dispatch: when this call was annotated with a
+        // disambiguating trait (set pre-monomorphization for a method two
+        // traits both declare, e.g. `Display::fmt` vs `Debug::fmt`), the
+        // monomorphizer already specialized and pinned `resolved_method` to
+        // the INTENDED trait's spec via its bound-aware lookup.  Honor that
+        // choice directly: pin the callee from that method.  Re-running the
+        // overload passes below can't distinguish the two same-signature
+        // methods and would pick the wrong one (or fail to match the spec's
+        // monomorphized param at all, leaving codegen to fall back to the
+        // ambiguous `Type::method` symbol).  Gated on `resolved_trait` so
+        // only annotated calls take this path.
+        if (member.resolved_trait.is_valid() && base_t != null
+                && call.resolved_method != null) {
+            const rm: MethodNode* = call.resolved_method as MethodNode*;
+            if (rm != null && rm.func != null && rm.func.origin_trait.is_valid()) {
+                mut owner_str: string = "";
+                match (base_t.kind) {
+                    TypeKind::Class  => { owner_str = this.intern.resolve((base_t as ClassType*).qualified_name); }
+                    TypeKind::Struct => { owner_str = this.intern.resolve((base_t as StructType*).qualified_name); }
+                    TypeKind::Enum   => { owner_str = this.intern.resolve((base_t as EnumType*).qualified_name); }
+                    TypeKind::Int | TypeKind::Float | TypeKind::Bool
+                    | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
+                        owner_str = base_t.display_name();
+                    }
+                    _ => {}
+                }
+                if (strlen(owner_str) > 0) {
+                    this.pin_method_callee_from_qname(
+                        call, owner_str, rm, rm.is_static);
+                    return;
+                }
+            }
+        }
+
         // Two-pass overload resolution over the leaf->root chain.  Pass 1
         // picks exact arena-ID matches (the fast, unambiguous case, e.g.,
         // `visit(LiteralNode*)` called with a `LiteralNode*` arg).  Pass 2
