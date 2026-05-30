@@ -4310,17 +4310,24 @@ type struct Monomorphizer {
                 // isn't inline on the type, so the three paths above miss;
                 // the clone lives on the trait impl block keyed by the bare
                 // target name, exactly like the primitive-receiver case
-                // below.  Restricted to synthesized defaults: hand-written
-                // generic trait methods on such owners (e.g. `Str::fmt<W>`)
-                // already specialize through their own route, and matching
-                // them here would mint a bogus still-generic spec when the
-                // call site can't bind the method generic concretely.
+                // below.  Also matches HAND-WRITTEN generic trait methods
+                // (e.g. a user `Display`'s `fmt<W>`, or `Str::fmt<W>`): these
+                // do NOT specialize through any other route - without this
+                // they reach codegen as an unsubstituted `Formatter<W>`
+                // symbol (E0636).  Gated to generic methods (`is_generic()`):
+                // a non-generic trait method hits `n_method_params == 0` and
+                // returns below; a generic method whose param can't be bound
+                // is rejected by the inference early-returns (no bogus
+                // still-generic spec is minted).  The spec'd signature is
+                // fully substituted by the post-resolution subst sweep in
+                // `specialize_method`, which closes the nested-`W` gap that
+                // the AST annotation substituter leaves open.
                 const bare: SymbolStr = this.bare_name_of(recv_type);
                 mut cand_impl: ImplBlockNode* = null;
                 const cand: MethodNode* = this.find_trait_impl_method_for_target(
                     bare, ma.member, &cand_impl);
                 if (cand != null && cand.func != null
-                        && cand.func.is_synth_default) {
+                        && (cand.func.is_synth_default || cand.func.is_generic())) {
                     orig_method = cand;
                     impl_node = cand_impl;
                 }
@@ -4458,6 +4465,23 @@ type struct Monomorphizer {
                 if (orig_func.is_implicit && call.generic_args.length == 0) {
                     this.emit_cannot_infer(call, orig_func.name);
                 }
+                return;
+            }
+        }
+
+        // Defer when a binding isn't concrete.  Inference can bind a method
+        // generic to ANOTHER generic param when this call is walked inside a
+        // still-generic context - e.g. `view.fmt(f)` inside the TEMPLATE body
+        // of `String::Debug::fmt<W>` binds `Str::fmt`'s `W` to the enclosing
+        // (still-generic) `W` rather than a concrete type.  `m_all_bound`
+        // accepts it because a GenericParam is a valid TypeRef, but
+        // specializing now would mint a bogus still-generic spec (`fmt` with
+        // `Formatter<W>`) that reaches codegen as an unsubstituted symbol
+        // (E0636).  Skip; the concrete spec is minted later when the
+        // enclosing generic method is itself specialized with a concrete `W`
+        // and its body re-walked.
+        for (mut bi: i64 = 0; bi < this.inference_bindings.length; bi++) {
+            if (this.type_contains_generic_param(this.inference_bindings[bi])) {
                 return;
             }
         }
@@ -4700,6 +4724,32 @@ type struct Monomorphizer {
                 if (!this.type_has_unresolved(cand, 0)) {
                     p.set_resolved_type(cand);
                 }
+            }
+        }
+
+        // Substitution sweep over the resolved signature.  The AST
+        // annotation substituter (ASTTypeSubstituter, above) does not reach
+        // a method generic param NESTED inside an instantiated annotation
+        // (e.g. the `W` in `f: mut &Formatter<W>`), so after
+        // `resolve_func_signature` that slot resolves to
+        // `Formatter<GenericParam(W)>` - a TypeRef that `type_has_unresolved`
+        // treats as fully valid (a GenericParam is not "invalid"), so the
+        // fallbacks above leave it untouched.  It then reaches codegen as
+        // `Formatter<W>` and member calls on it (`f.write_str`) fail with
+        // E0636.  Re-apply the method-generic substitution to every resolved
+        // signature slot; `apply` recurses into Pointer/Reference/Array/
+        // Optional/Function/Tuple/InstantiatedType, replacing `W` at any
+        // depth.  It is a no-op for already-concrete slots (e.g. a top-level
+        // `hasher: H` that the AST substituter already rewrote), so the
+        // working cases are unaffected.
+        if (spec_method.func.resolved_return_type.is_valid()) {
+            spec_method.func.set_resolved_return_type(
+                subst_ptr.apply(spec_method.func.resolved_return_type, this.arena));
+        }
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const sp: VarDeclNode* = spec_method.func.parameters[i];
+            if (sp != null && sp.resolved_type.is_valid()) {
+                sp.set_resolved_type(subst_ptr.apply(sp.resolved_type, this.arena));
             }
         }
 
