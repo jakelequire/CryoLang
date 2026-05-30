@@ -552,6 +552,17 @@ These are used by `panic`, `assert`, and the testing framework to report failure
 
 Integer division truncates toward zero. The prefix forms `++x`, `--x` evaluate to the new value; the postfix forms `x++`, `x--` evaluate to the old value (C semantics).
 
+**Overflow.** Integer arithmetic **wraps** on overflow using two's-complement modular arithmetic, for both signed and unsigned types: the result is reduced modulo 2<sup>N</sup> for an N-bit type. There is no overflow trap and no automatic widening. For example, with `i32`:
+
+```cryo
+mut x: i32 = 2147483647;   // i32::MAX
+x = x + 1;                 // wraps to -2147483648 (i32::MIN), no trap
+```
+
+This is a defined deterministic result, not undefined behavior, but it is *silent*: the language does not insert checks. Code that must detect overflow has to compare against the type's bounds before the operation. (Unsigned wrap is the usual `mod 2`<sup>`N`</sup>; e.g. `0u8 - 1u8 == 255`.)
+
+**Division and modulo by zero** are *not* checked by the compiler and fault at runtime (on typical targets the CPU raises `SIGFPE`); the signed `i32::MIN / -1` / `i32::MIN % -1` cases overflow the result and fault the same way. Guard the divisor when it can be zero.
+
 ### 5.2 Comparison
 
 | Operator | Description |
@@ -1669,7 +1680,7 @@ const non_null: NonNull<u8> = NonNull::new(buf).unwrap();
 
 ## 16. Ownership, Copy, and Drop
 
-Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately weaker than Rust's**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check), and it warns rather than rejects on the current compiler.
+Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately weaker than Rust's**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check). It has no borrow checker, no lifetimes, and does not track aliasing of raw pointers — but the move check is a *hard error*, not a warning: using a value after it has been moved is rejected at compile time (`E0452`, see [§ 16.3](#163-move-checking)).
 
 ### 16.1 The `Copy` Trait
 

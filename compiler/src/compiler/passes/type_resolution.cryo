@@ -1008,6 +1008,41 @@ type struct TypeResolutionPasses {
                 if (node.source_module == "") {
                     node.set_source_module(ctx.source_file);
                 }
+                // Stamp each trait-impl method with its trait's leaf name so
+                // every mangling site can disambiguate it from a same-named
+                // method of another trait implemented for the same type.
+                // Without this, `implement trait A for T { foo() }` and
+                // `implement trait B for T { foo() }` mangle to the same
+                // symbol and collide at link time (see
+                // FunctionDeclNode.origin_trait and
+                // MangledName::for_method_or_trait_impl).  This is the single
+                // stamping chokepoint: it runs for both the type-resolution
+                // path and the specialization injected-decl path (which
+                // routes spec'd impl blocks back through register_decl_in_index).
+                if (node.is_trait_impl()) {
+                    const ot_trait_leaf: SymbolStr =
+                        TypeResolutionPasses::extract_trait_leaf(node.trait_annotation);
+                    if (ot_trait_leaf.is_valid()) {
+                        // Prefer the canonical qualified trait name so traits
+                        // sharing a leaf in different modules (e.g. a user
+                        // `Eq` vs `std::core::cmp::Eq`) don't merge.
+                        // `resolve_qualified` returns its input unchanged when
+                        // no bare->qualified mapping exists, so this is always
+                        // valid.  Stamped once per method here; every mangling
+                        // site reads the stamped value, so definition and
+                        // call-site symbols always agree regardless of which
+                        // form resolution produced.
+                        mut ot_trait: SymbolStr =
+                            ctx.decl_index.resolve_qualified(ot_trait_leaf);
+                        if (!ot_trait.is_valid()) { ot_trait = ot_trait_leaf; }
+                        for (mut omi: i64 = 0; omi < node.methods.length; omi++) {
+                            const om: MethodNode* = node.methods[omi];
+                            if (om != null && om.func != null) {
+                                om.func.set_origin_trait(ot_trait);
+                            }
+                        }
+                    }
+                }
                 // Resolve the impl's target type to its CANONICAL qualified
                 // name. Resolution order:
                 //   1. Already-qualified target: use as-is.

@@ -359,8 +359,22 @@ public:
     /// unary = ( '-' | '!' | '*' | '&' | '~' | '++' | '--' ) unary | postfix
     parse_unary() -> ExpressionNode* {
         if (this.current().kind.is_unary_prefix_op()) {
+            // Guard against unbounded recursion on pathological prefix
+            // chains like `----...x` / `!!!...x`: each operator recurses
+            // through parse_unary with no bracket token for advance() to
+            // count, so a few hundred thousand levels overflow the native
+            // stack and crash the compiler.  256 is far beyond any
+            // realistic hand-written nesting; the check sits before
+            // advance() so no token is consumed on the error path.
+            if (this.unary_depth > 256) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "expression nesting too deep (unary-operator recursion limit exceeded)");
+                return null;
+            }
             const op: Token = this.advance();
+            this.unary_depth += 1;
             const operand: ExpressionNode* = this.parse_unary();
+            this.unary_depth -= 1;
             if (operand == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     format("expected expression after unary '%s'", op.lexeme));

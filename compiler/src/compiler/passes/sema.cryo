@@ -5754,8 +5754,8 @@ public:
             fn_node, is_static, this.intern);
         const param_refs: TypeRef[] = method_non_receiver_params(
             fn_node, this.intern);
-        const mangled: MangledName = MangledName::for_method(
-            this.intern, this.arena, type_qn, fn_node.name, recv_kind,
+        const mangled: MangledName = MangledName::for_method_or_trait_impl(
+            this.intern, this.arena, type_qn, fn_node.origin_trait, fn_node.name, recv_kind,
             param_refs, fn_node.resolved_return_type, fn_node.is_variadic);
         call.set_resolved_callee(mangled.value);
     }
@@ -6236,6 +6236,93 @@ public:
         return false;
     }
 
+    /// for-in over a non-`Copy` collection.  The desugar lowers
+    /// `for (x in xs)` to `xs.iter()` followed by `iter.next()`, but
+    /// `Array<T>::iter` / `Slice<T>::iter` are gated `where T: Copy`.  For a
+    /// non-`Copy` element the `.iter()` wrap can't resolve, so the loop is
+    /// left calling `.next()` (or `.iter()`) on the bare collection and the
+    /// user sees a bare "no method named `next`" pointing at a call they
+    /// never wrote.  Detect that shape — a Copy-gated `iter` whose concrete
+    /// element argument isn't `Copy` — and report the real cause with a
+    /// by-reference workaround.  Returns true when it emitted a diagnostic.
+    try_diagnose_forin_noncopy(mut &this, obj_type: TypeRef,
+                                member: MemberAccessNode*,
+                                primary_span: SourceSpan) -> boolean {
+        // Only the for-in desugar calls `.next()` / `.iter()` against a bare
+        // collection; users don't invoke those on the container directly.
+        const is_next: boolean = member.member.equals(this.intern.intern("next"));
+        const is_iter: boolean = member.member.equals(this.intern.intern("iter"));
+        if (!is_next && !is_iter) { return false; }
+
+        const reg: GenericRegistry* = this.ctx.get_generic_registry();
+        if (reg == null || this.ctx.monomorphizer == null) { return false; }
+
+        // Peel ref/ptr to the InstantiatedType carrying the element arg.
+        mut t: Type* = this.arena.lookup(obj_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::InstantiatedType) { break; }
+            if (t.kind == TypeKind::Reference) {
+                t = this.arena.lookup((t as ReferenceType*).referent.id);
+            } else if (t.kind == TypeKind::Pointer) {
+                t = this.arena.lookup((t as PointerType*).pointee.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+
+        const tmpl: TemplateEntry* = reg.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return false; }
+        if (tmpl.param_names.length != inst.type_args.length) { return false; }
+
+        // The collection must expose an `iter` whose where-clause gates it.
+        const iter_fn: FunctionDeclNode* =
+            this.find_template_method(tmpl.ast_node, this.intern.intern("iter"));
+        if (iter_fn == null || iter_fn.trait_bounds.length == 0) { return false; }
+
+        // Find a `where <param>: Copy` bound on iter() whose concrete
+        // argument doesn't satisfy `Copy`.
+        for (mut bi: i64 = 0; bi < iter_fn.trait_bounds.length; bi++) {
+            const bound: TraitBound = iter_fn.trait_bounds[bi];
+            mut concrete: TypeRef = TypeRef::invalid();
+            for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
+                if (tmpl.param_names[pi].equals(bound.type_parameter)) {
+                    concrete = inst.type_args[pi];
+                    break;
+                }
+            }
+            if (!concrete.is_valid()) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef = bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (strcmp(this.intern.resolve(trait_name), "Copy") != 0) { continue; }
+                if (OwnershipQuery::is_copy(this.arena, reg, this.intern, concrete)) {
+                    continue;
+                }
+                // Confirmed: iter() is Copy-gated and the element isn't Copy.
+                const coll_str: string = this.type_display_name(obj_type);
+                const elem_str: string = this.type_display_name(concrete);
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                    format("cannot iterate `%s` with `for-in`: its element type `%s` is not `Copy`",
+                        coll_str, elem_str));
+                d = d.at(primary_span);
+                d = d.with_note(
+                    "`for (x in xs)` lowers to `xs.iter()`, but `iter` is gated `where T: Copy` because it yields elements by value");
+                d = d.help(format(
+                    "iterate by index and borrow each element in place instead, e.g. `for (mut i: u64 = 0; i < xs.length(); i++) { const x: %s* = ... xs.get_ptr(i); }`",
+                    elem_str));
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+        }
+        return false;
+    }
+
     resolve_method_call(mut &this, member: MemberAccessNode*) -> TypeRef {
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid -> upstream error already emitted, stay silent
@@ -6425,6 +6512,13 @@ public:
         // owns heap data.  Report the specific unmet bound (and, for `Copy`,
         // point at the borrowing alternative) instead of a bare "no method".
         if (this.try_diagnose_method_bound_failure(obj_type, member)) {
+            return TypeRef::invalid();
+        }
+
+        // for-in over a non-Copy Array/Slice: the desugar's synthesized
+        // `.next()`/`.iter()` call fails here; report the Copy-gate cause
+        // rather than a bare "no method named `next`".
+        if (this.try_diagnose_forin_noncopy(obj_type, member, primary_span)) {
             return TypeRef::invalid();
         }
 
