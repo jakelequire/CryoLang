@@ -1000,6 +1000,30 @@ type struct CompilerInstance {
             }
         }
 
+        // Force-discover the f-string runtime (std::fmt::interp), but ONLY
+        // when some discovered module (entry graph, prelude, OR a test file)
+        // actually uses an f-string.  Done after ALL discovery so the
+        // `uses_fstring` flag reflects test files too.  It is deliberately
+        // NOT in the prelude: its transitive deps (ffi::libc etc.) would
+        // otherwise be pulled into every program and their globally-visible
+        // C shims (`strstr`/`realpath`, which return `u8*`) would collide
+        // with code using the `core::intrinsics` shims (which return `i8*`) —
+        // exactly what broke the compiler's own self-build.  AutoImport
+        // injects `import std::fmt::interp` into the f-string-using modules
+        // for symbol visibility; this (gated on the same usage) puts the
+        // module in the graph so it links, since the injection happens after
+        // discovery.
+        if (ctx.mode.auto_imports_enabled() && !config.no_std
+                && intrinsics::strlen(stdlib_root) > 0
+                && ctx.module_graph.uses_fstring) {
+            const interp_path: string = stdlib_root + "/fmt/interp.cryo";
+            if (File::exists(interp_path)) {
+                loader.discover_module(
+                    ctx.intern_table, ctx.module_graph, ctx.diagnostics,
+                    interp_path, this.config.debug);
+            }
+        }
+
         cdebug("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
             ctx.module_graph.module_count(), ctx.module_graph.modules.length);
         cdebug("[Compiler] name_index.length=%u\n", ctx.module_graph.name_index.length());

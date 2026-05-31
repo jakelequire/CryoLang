@@ -11,6 +11,7 @@ import Compiler::Diag;
 import Compiler::Diag::Diagnostic;
 import Compiler::Diag::Suggestion;
 import Compiler::AST::Statement;
+import Compiler::AST::Expression;
 import Compiler::CompilationContext;
 import Compiler::Resolver::SymbolStr;
 import Utils::Logger;
@@ -22,6 +23,15 @@ public:
     /// Base implementation returns null; overridden by ExprParser (limited)
     /// and Parser (full statement support including for/if/while).
     virtual parse_inner_block() -> BlockStmtNode* {
+        return null;
+    }
+
+    /// Parse a standalone expression from a separate token stream, on a
+    /// fresh parser instance.  Used by f-string desugaring to parse each
+    /// `{...}` hole without disturbing this parser's own token stream (which
+    /// is owned — reassigning it would drop the live tokens).  Overridden by
+    /// `Parser` to spin up a real sub-`Parser`; the base returns null.
+    virtual parse_expr_from_tokens(toks: Token[]) -> ExpressionNode* {
         return null;
     }
 
@@ -75,6 +85,17 @@ public:
     // For self-referential type detection
     current_type_name: string;
 
+    // Set by `parse_fstring` when an f-string (`f"..."`) is parsed.  The
+    // top-level Parser copies it onto the ProgramNode so AutoImport can
+    // inject the f-string runtime import; see ProgramNode.uses_fstring.
+    used_fstring: boolean;
+
+    // Span of the f-string currently being desugared.  Held in a field so
+    // the `fstr_*` desugar helpers don't take it as a by-value `SourceSpan`
+    // parameter (mixing a trailing struct-by-value with several scalar args
+    // tripped a calling-convention mismatch).
+    fstr_span: SourceSpan;
+
 
     ParserBase(tokens: Token[], source_file: string, ctx: CompilationContext*) {
         this.tokens       = tokens;
@@ -96,6 +117,8 @@ public:
         this.pending_doc_comments = [];
         this.last_doc_end_line    = -1;
         this.current_type_name    = "";
+        this.used_fstring         = false;
+        this.fstr_span            = SourceSpan::none();
     }
 
 

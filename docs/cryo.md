@@ -141,6 +141,31 @@ r"C:\Users\name\file"     // raw: backslashes are literal
 
 **Escape sequences:** `\n` `\t` `\r` `\a` `\b` `\f` `\v` `\0` `\\` `\'` `\"` `\xHH` (hex byte).
 
+#### f-strings (string interpolation)
+
+An f-string, prefixed with `f`, builds an owned `String` by interpolating
+expressions written inside `{...}`:
+
+```cryo
+const x: i32 = 42;
+const opt: Option<i32> = Option::Some(7);
+const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
+```
+
+- `{expr}` formats `expr` through the `Display` trait; `{expr:?}` formats it
+  through `Debug`. Any type implementing the relevant trait works, including
+  `Option`, `Result`, and `Array<T>`.
+- The embedded expression is a full expression: `f"{a + b}"`, `f"{p.x}"`,
+  `f"{m.get(k)}"`.
+- `{{` and `}}` produce literal `{` and `}`. Standard escape sequences in the
+  literal text are processed as in a normal string.
+- The result is a heap-backed `String` the caller owns (and drops). The
+  parser desugars the whole f-string to calls into `std::fmt::interp`, which
+  is auto-imported into any module that uses one.
+
+For raw, untyped formatted output (C `printf` semantics, `%d`/`%s`
+specifiers, not type-checked), use `print` / `println` from `std::fmt`.
+
 #### Boolean and Null Literals
 
 ```cryo

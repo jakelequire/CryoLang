@@ -1,0 +1,154 @@
+///! f-string interpolation (`f"...{expr}...{expr:?}..."`).
+///!
+///! The parser desugars an f-string into a chain of `std::fmt::interp`
+///! builder calls (`fmt_new` / `fmt_append_lit` / `fmt_append_display` /
+///! `fmt_append_debug`) that produce an owned `String`.  These tests pin the
+///! end-to-end behaviour: literal text, `{}` (Display) and `{:?}` (Debug)
+///! holes, expression holes, `{{`/`}}` escapes, and container/ADT values.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FStringT;
+
+import std::core::result;
+import std::core::option;
+import std::core::primitives;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::test::error;
+import std::test::assert;
+
+/// Compare an owned `String` (typically an f-string result) to `want`,
+/// dropping it afterwards.
+function check(got: String, want: string) -> Result<(), TestError> {
+    mut s: String = got;
+    const view: Str = s.as_str();
+    const w: Str = Str::new(want);
+    const eq: boolean = view.equals(&w);
+    s.drop();
+    return expect(eq, Str::new(want));
+}
+
+// ============================================================================
+// Literal text and escapes
+// ============================================================================
+
+![test]
+function fstring_literal_only() -> Result<(), TestError> {
+    return check(f"hello world", "hello world");
+}
+
+![test]
+function fstring_empty() -> Result<(), TestError> {
+    return check(f"", "");
+}
+
+![test]
+function fstring_brace_escape() -> Result<(), TestError> {
+    return check(f"{{not a hole}}", "{not a hole}");
+}
+
+![test]
+function fstring_escape_sequences() -> Result<(), TestError> {
+    // Standard string escapes are processed in the literal chunks.
+    return check(f"a\tb", "a\tb");
+}
+
+// ============================================================================
+// Display (`{}`) holes
+// ============================================================================
+
+![test]
+function fstring_display_int() -> Result<(), TestError> {
+    const x: i32 = 42;
+    return check(f"x = {x}", "x = 42");
+}
+
+![test]
+function fstring_display_bool() -> Result<(), TestError> {
+    const b: boolean = true;
+    return check(f"{b}", "true");
+}
+
+![test]
+function fstring_display_str() -> Result<(), TestError> {
+    const name: Str = Str::new("world");
+    return check(f"hi {name}!", "hi world!");
+}
+
+![test]
+function fstring_display_negative() -> Result<(), TestError> {
+    const n: i32 = -7;
+    return check(f"n={n}", "n=-7");
+}
+
+// ============================================================================
+// Debug (`{:?}`) holes
+// ============================================================================
+
+![test]
+function fstring_debug_int() -> Result<(), TestError> {
+    const x: i32 = 7;
+    return check(f"{x:?}", "7");
+}
+
+![test]
+function fstring_debug_option_some() -> Result<(), TestError> {
+    const o: Option<i32> = Option::Some(5);
+    return check(f"{o:?}", "Some(5)");
+}
+
+![test]
+function fstring_debug_option_none() -> Result<(), TestError> {
+    const o: Option<i32> = Option::None;
+    return check(f"{o:?}", "None");
+}
+
+![test]
+function fstring_debug_result_ok() -> Result<(), TestError> {
+    const r: Result<i32, i32> = Result::Ok(99);
+    return check(f"{r:?}", "Ok(99)");
+}
+
+![test]
+function fstring_debug_array() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    a.push(1);
+    a.push(2);
+    a.push(3);
+    const out: String = f"{a:?}";
+    a.drop();
+    return check(out, "[1, 2, 3]");
+}
+
+// ============================================================================
+// Multiple holes, expression holes, mixed
+// ============================================================================
+
+![test]
+function fstring_multiple_holes() -> Result<(), TestError> {
+    const a: i32 = 1;
+    const b: i32 = 2;
+    return check(f"{a} and {b}", "1 and 2");
+}
+
+![test]
+function fstring_expression_hole() -> Result<(), TestError> {
+    const a: i32 = 10;
+    const b: i32 = 32;
+    return check(f"sum = {a + b}", "sum = 42");
+}
+
+![test]
+function fstring_mixed_display_debug() -> Result<(), TestError> {
+    const x: i32 = 3;
+    const o: Option<i32> = Option::Some(8);
+    return check(f"x={x}, o={o:?}", "x=3, o=Some(8)");
+}
+
+![test]
+function fstring_adjacent_holes() -> Result<(), TestError> {
+    const a: i32 = 4;
+    const b: i32 = 5;
+    return check(f"{a}{b}", "45");
+}

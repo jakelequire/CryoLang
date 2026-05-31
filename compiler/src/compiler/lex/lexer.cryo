@@ -108,6 +108,16 @@ private:
         const token_start: string = this.current;
         const c: char = this.advance();
 
+        // f-string prefix: `f"..."`.  Must precede the is_alpha check
+        // because `f` is alpha and would otherwise lex as the identifier
+        // `f` followed by a plain string literal.  Only the immediate
+        // `f"` digraph triggers this; a bare `f` (or `foo`) still lexes as
+        // an identifier.
+        if (c == 'f' && this.peek() == '"') {
+            this.advance(); // consume the opening quote
+            return this.lex_fstring();
+        }
+
         if (Lexer::is_alpha(c)) {
             return this.lex_identifier();
         }
@@ -318,6 +328,60 @@ private:
 
         return Token::new_with_extent(
             TokenType::StringLiteral, processed,
+            start_line, start_col, source_length);
+    }
+
+    /// Lex an f-string `f"..."`.  The dispatcher consumed both the `f`
+    /// and the opening `"`, so `current` points at the first body byte.
+    ///
+    /// Unlike `lex_string`, escape sequences are NOT processed here and the
+    /// raw template (everything up to the closing quote, braces included)
+    /// is stored verbatim in the lexeme.  The parser splits the template on
+    /// `{`/`}`, sub-parses each hole as an expression, and processes the
+    /// per-chunk escapes there.  We still skip `\X` digraphs while scanning
+    /// so an escaped quote `\"` doesn't terminate the literal early.
+    lex_fstring(&this) -> Token {
+        const start_line: int = this.current_location.line;
+        // The `f` and the `"` were both consumed by the dispatcher, so the
+        // opening `f` sits two columns back from `current`.
+        const start_col:  int = this.current_location.column - 2;
+
+        const start: string = this.current;
+
+        while (!this.at_end() && this.peek() != '"') {
+            if (this.peek() == '\\' && !this.at_end()) {
+                this.advance(); // consume backslash
+                if (!this.at_end()) {
+                    this.advance(); // consume escaped character
+                }
+            } else {
+                if (this.peek() == '\n') {
+                    this.current_location.newline();
+                }
+                this.advance();
+            }
+        }
+
+        if (this.at_end()) {
+            LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unterminated f-string literal at line %d", this.current_location.line);
+            return this.emit_error_close_literal(
+                ErrorCode::E0002_UNTERMINATED_STRING,
+                "Unterminated f-string literal",
+                "\"");
+        }
+
+        this.advance(); // consume closing quote
+
+        // Raw template without the surrounding quotes: `start` points past
+        // the opening quote, subtract 1 for the closing quote consumed above.
+        const raw_len: u64 = (this.current as i64 - start as i64 - 1) as u64;
+        const raw_text: string = substr(start, 0, raw_len);
+
+        // Source extent covers `f`, both quotes, and every body byte.
+        const source_length: int = (raw_len + 3 as u64) as int;
+
+        return Token::new_with_extent(
+            TokenType::FStringLiteral, raw_text,
             start_line, start_col, source_length);
     }
 

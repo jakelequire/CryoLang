@@ -946,6 +946,29 @@ function run_auto_import_pass(ctx: CompilationContext*) -> PassResult {
         return PassResult::ok();
     }
 
+    // Inject the f-string runtime import for any module that used an
+    // f-string (`f"..."`).  The parser desugars each into nested
+    // `fmt_new`/`fmt_append_*` calls (see std::fmt::interp); this brings
+    // those names into scope.  Done here rather than via the prelude so the
+    // formatter's transitive deps (ffi::libc etc.) don't pollute every
+    // module.  Placed before the explicit-`import std::prelude` short-circuit
+    // below so it still fires when the user imported the prelude themselves.
+    // A same-module re-import (if the user also wrote it) is silently
+    // de-duplicated during name resolution.
+    if (root.uses_fstring) {
+        const interp_import: ImportDeclNode* = new ImportDeclNode(
+            "std::fmt::interp", ImportStyle::Wildcard, SourceSpan::none());
+        mut with_interp: ASTNode*[] = [];
+        with_interp.push(interp_import as ASTNode*);
+        for (mut fi: i64 = 0; fi < root.statements.length; fi++) {
+            with_interp.push(root.statements[fi]);
+        }
+        root.statements = with_interp;
+        if (ctx.debug_mode) {
+            cdebug("[AutoImport] Injected 'import std::fmt::interp' (f-string used)\n");
+        }
+    }
+
     // Check whether the user already has an explicit `import std::prelude`.
     // If so, skip injection to avoid a duplicate import.
     const prelude_path: string = "std::prelude";

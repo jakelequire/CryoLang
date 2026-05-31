@@ -7,6 +7,7 @@
 namespace Compiler::Parser::ExprParser;
 
 import Compiler::Lex;
+import Compiler::Lex::Lexer;
 import Compiler::Diag::SourceSpan;
 import Compiler::Diag;
 import Compiler::AST;
@@ -20,6 +21,7 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::QualifiedName;
 import Compiler::Parser::ParserBase;
 import Utils::Logger;
+import Utils::File;
 
 
 // Find the first '.' in a numeric lexeme like "1.0": returns its byte
@@ -496,6 +498,10 @@ public:
             return this.parse_string_literal();
         }
 
+        if (tok.kind == TokenType::FStringLiteral) {
+            return this.parse_fstring();
+        }
+
         if (tok.kind == TokenType::CharConstant) {
             return this.parse_char_literal();
         }
@@ -656,6 +662,211 @@ public:
     parse_char_literal() -> ExpressionNode* {
         const tok: Token = this.advance();
         return new LiteralNode(tok.lexeme, LiteralKind::Char, this.span_from_token(tok));
+    }
+
+    /// Parse an f-string `f"...{expr}...{expr:?}..."` and desugar it, here
+    /// in the parser, into a chain of `fmt_*` builder calls that produce an
+    /// owned `String`.  See `std::fmt::interp` for the runtime the chain
+    /// targets and the desugar shape.
+    ///
+    /// Display vs Debug is chosen purely by the hole's format spec (`{}` ->
+    /// Display, `{:?}` -> Debug), which is fully known here at parse time,
+    /// so the entire desugar is built now and the rest of the pipeline only
+    /// ever sees ordinary calls.  Each generic `fmt_append_display`/`_debug`
+    /// call has its `T` inferred from the `&expr` argument by the
+    /// monomorphizer, exactly like a hand-written `format_to_string(&x)`;
+    /// building the chain pre-monomorphization is what makes that work.
+    ///
+    /// `{{` / `}}` are literal braces; standard escapes (`\n`, `\t`, ...) in
+    /// the literal chunks are processed via the same routine as plain
+    /// strings.  Only `{}` and `{:?}` specs are recognised for now.
+    parse_fstring() -> ExpressionNode* {
+        const tok: Token = this.advance();
+        this.used_fstring = true;
+        // Stash the span so the desugar helpers can read it from a field
+        // rather than taking it as a by-value struct parameter.
+        this.fstr_span = this.span_from_token(tok);
+        const raw: string = tok.lexeme;
+        const len: i64 = intrinsics::strlen(raw) as i64;
+
+        // acc := fmt_new()
+        mut acc: ExpressionNode* = this.fstr_call0("fmt_new");
+
+        // Literal runs are tracked as `[chunk_start, i)` index ranges into
+        // `raw` and materialised with `substr` — no manual byte buffer.  A
+        // `{{` / `}}` escape flushes the run up to and including the first
+        // brace, then skips the second, so the literal brace survives.
+        mut chunk_start: i64 = 0;
+        mut i: i64 = 0;
+        while (i < len) {
+            const c: char = *(raw + i) as char;
+
+            if (c == '{') {
+                if (i + 1 < len && (*(raw + i + 1) as char) == '{') {
+                    // `{{`: flush through the first brace, skip the second.
+                    acc = this.fstr_flush_range(acc, raw, chunk_start, i + 1);
+                    chunk_start = i + 2;
+                    i += 2;
+                    continue;
+                }
+                // Hole: flush the literal run before it.
+                acc = this.fstr_flush_range(acc, raw, chunk_start, i);
+
+                // Scan to the matching '}', tracking brace depth and
+                // skipping string/char literals so braces inside them
+                // (e.g. `foo("}")`) don't terminate the hole early.
+                mut depth: i64 = 0;
+                mut j: i64 = i + 1;
+                mut closed: boolean = false;
+                while (j < len) {
+                    const cj: char = *(raw + j) as char;
+                    if (cj == '"' || cj == '\'') {
+                        j = this.fstr_skip_quoted(raw, len, j, cj);
+                        continue;
+                    }
+                    if (cj == '{') {
+                        depth += 1;
+                    } else if (cj == '}') {
+                        if (depth == 0) { closed = true; break; }
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if (!closed) {
+                    this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                        "unterminated `{` in f-string");
+                    return acc;
+                }
+
+                const hole_len: i64 = j - (i + 1);
+                const hole_src: string = substr(raw, i + 1, hole_len);
+
+                // Split off a trailing `:?` Debug spec, if present.
+                const tl: i64 = this.fstr_rstrip_len(hole_src);
+                const is_debug: boolean = this.fstr_spec_is_debug(hole_src, tl);
+                mut expr_src: string = hole_src;
+                if (is_debug) {
+                    expr_src = substr(hole_src, 0, tl - 2);
+                }
+
+                const inner: ExpressionNode* = this.fstr_parse_hole(expr_src);
+                chunk_start = j + 1; // literal run resumes past the closing '}'
+                i = j + 1;
+                if (inner == null) {
+                    this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                        "expected an expression inside f-string `{...}`");
+                    continue;
+                }
+                // &inner: synthetic address-of, exempt from the user-facing
+                // no-address-of-a-literal check (E0223) so `f"{42}"` works.
+                const amp: Token = Token::new(TokenType::Amp, "&", tok.line, tok.column);
+                mut ref_node: UnaryExprNode* = new UnaryExprNode(amp, inner, this.fstr_span);
+                ref_node.is_synthetic = true;
+
+                const helper: string =
+                    if (is_debug) { "fmt_append_debug" } else { "fmt_append_display" };
+                acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                continue;
+            }
+
+            if (c == '}') {
+                if (i + 1 < len && (*(raw + i + 1) as char) == '}') {
+                    // `}}`: flush through the first brace, skip the second.
+                    acc = this.fstr_flush_range(acc, raw, chunk_start, i + 1);
+                    chunk_start = i + 2;
+                    i += 2;
+                    continue;
+                }
+                this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
+                    "unmatched `}` in f-string (write `}}` for a literal brace)");
+                return acc;
+            }
+
+            i += 1;
+        }
+
+        // Flush the trailing literal run.
+        acc = this.fstr_flush_range(acc, raw, chunk_start, len);
+        return acc;
+    }
+
+    /// Flush the literal run `raw[start, end)` into `acc` as a
+    /// `fmt_append_lit(acc, "<escape-processed>")` call.  No-op when empty.
+    /// Uses `this.fstr_span` for synthesized node spans.
+    fstr_flush_range(acc: ExpressionNode*, raw: string,
+                     start: i64, end: i64) -> ExpressionNode* {
+        if (end <= start) { return acc; }
+        const text_raw: string = substr(raw, start, end - start);
+        const text: string = Lexer::process_escape_sequences(text_raw);
+        const lit: LiteralNode* = new LiteralNode(text, LiteralKind::String, this.fstr_span);
+        return this.fstr_call2("fmt_append_lit", acc, lit as ExpressionNode*);
+    }
+
+    /// Build a zero-argument free-function call `name()`.
+    fstr_call0(name: string) -> ExpressionNode* {
+        const id: IdentifierNode* = new IdentifierNode(this.ctx.intern(name), this.fstr_span);
+        mut call: CallExprNode* = new CallExprNode(id as ExpressionNode*, this.fstr_span);
+        return call as ExpressionNode*;
+    }
+
+    /// Build a two-argument free-function call `name(a, b)`.
+    fstr_call2(name: string, a: ExpressionNode*, b: ExpressionNode*) -> ExpressionNode* {
+        const id: IdentifierNode* = new IdentifierNode(this.ctx.intern(name), this.fstr_span);
+        mut call: CallExprNode* = new CallExprNode(id as ExpressionNode*, this.fstr_span);
+        call.add_argument(a);
+        call.add_argument(b);
+        return call as ExpressionNode*;
+    }
+
+    /// Sub-lex and parse a hole's source text as a standalone expression.
+    /// Reuses the full expression grammar (so `f"{a + b.c()}"` parses
+    /// correctly) by lexing the hole into its own token stream and handing
+    /// it to a fresh sub-parser via `parse_expr_from_tokens` (overridden on
+    /// the concrete `Parser`).  A separate parser is used so the hole's
+    /// tokens never displace this parser's own (owned) token stream.
+    fstr_parse_hole(src: string) -> ExpressionNode* {
+        const f: File = File::from_content("<fstring>", "cryo", src);
+        mut lx: Lexer = Lexer::new(f, this.ctx.diagnostics);
+        const hole_toks: Token[] = lx.lex();
+        return this.parse_expr_from_tokens(hole_toks);
+    }
+
+    /// Length of `s` with trailing ASCII whitespace trimmed.
+    fstr_rstrip_len(s: string) -> i64 {
+        mut n: i64 = intrinsics::strlen(s) as i64;
+        while (n > 0) {
+            const ch: char = *(s + n - 1) as char;
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+                n -= 1;
+            } else {
+                break;
+            }
+        }
+        return n;
+    }
+
+    /// True if the hole text `s` (whose trimmed length is `tl`) ends with a
+    /// `:?` Debug spec.  Early-returns keep the `s + tl - 2` deref guarded by
+    /// the length check without relying on `&&` short-circuit evaluation.
+    fstr_spec_is_debug(s: string, tl: i64) -> boolean {
+        if (tl < 2) { return false; }
+        const c2: char = *(s + tl - 2) as char;
+        const c1: char = *(s + tl - 1) as char;
+        return c2 == ':' && c1 == '?';
+    }
+
+    /// Advance past a string/char literal in a hole scan.  `j` indexes the
+    /// opening quote `q`; returns the index just past the closing quote (or
+    /// end-of-template if unterminated, leaving the outer scan to fail).
+    fstr_skip_quoted(src: string, len: i64, j: i64, q: char) -> i64 {
+        mut k: i64 = j + 1;
+        while (k < len) {
+            const ck: char = *(src + k) as char;
+            if (ck == '\\') { k += 2; continue; }
+            if (ck == q) { return k + 1; }
+            k += 1;
+        }
+        return k;
     }
 
     /// Parse an identifier, handling scope resolution, generic calls, and struct literals.
