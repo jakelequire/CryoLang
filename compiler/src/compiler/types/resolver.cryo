@@ -75,6 +75,25 @@ type struct ResolutionContext {
     set_this_type(mut &this, t: TypeRef) -> void {
         this.this_type = t;
     }
+
+    /// Deep copy.  A bitwise `*ctx` copy aliases the owning
+    /// `generic_bindings` buffer between the original and the copy, so a
+    /// later `push`/realloc on either invalidates the other and end-of-scope
+    /// drop-glue frees one buffer twice (double-free).  This produces an
+    /// independent context with its own `generic_bindings` storage.  The
+    /// element type `Pair<SymbolStr, TypeRef>` is POD (interned ids), so the
+    /// per-element copies are trivial.  `import_modules` is reconstructed as
+    /// `[]` — it is never populated anywhere, matching the prior behavior.
+    clone(&this) -> ResolutionContext {
+        mut out: ResolutionContext =
+            ResolutionContext::new(this.current_module, this.source_file);
+        out.this_type = this.this_type;
+        for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
+            out.add_binding(this.generic_bindings[i].first,
+                            this.generic_bindings[i].second);
+        }
+        return out;
+    }
 }
 
 
@@ -288,7 +307,7 @@ type struct TypeResolver {
 
             // If the method itself is generic, bind its own params
             if (method.func.is_generic()) {
-                mut method_ctx: ResolutionContext = *res_ctx;
+                mut method_ctx: ResolutionContext = res_ctx.clone();
                 for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
                     const gp: GenericParamNode* = method.func.generic_params[j];
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
@@ -360,7 +379,7 @@ type struct TypeResolver {
             if (i >= params.length) { return filled; }
             const gp: GenericParamNode* = params[i];
             if (gp == null || !gp.has_default_annotation()) { return filled; }
-            mut def_ctx: ResolutionContext = *ctx;
+            mut def_ctx: ResolutionContext = ctx.clone();
             for (mut j: i64 = 0; j < filled.length; j++) {
                 def_ctx.add_binding(entry.param_names[j], filled[j]);
             }
@@ -395,7 +414,7 @@ type struct TypeResolver {
             if (func == null) { continue; }
 
             if (func.is_generic()) {
-                mut method_ctx: ResolutionContext = *res_ctx;
+                mut method_ctx: ResolutionContext = res_ctx.clone();
                 for (mut j: i64 = 0; j < func.generic_params.length; j++) {
                     const gp: GenericParamNode* = func.generic_params[j];
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
@@ -712,7 +731,7 @@ private:
             if (entry.node_kind == NodeKind::TypeAliasDeclaration) {
                 const alias_node: TypeAliasDeclNode* = entry.ast_node as TypeAliasDeclNode*;
                 if (alias_node != null && alias_node.target_annotation != null) {
-                    mut alias_ctx: ResolutionContext = *ctx;
+                    mut alias_ctx: ResolutionContext = ctx.clone();
                     for (mut i: i64 = 0; i < entry.param_count; i++) {
                         alias_ctx.add_binding(entry.param_names[i], args[i]);
                     }
