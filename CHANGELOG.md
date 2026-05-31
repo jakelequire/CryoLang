@@ -45,6 +45,15 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `T?` optional-type sugar (desugars to `Option<T>`), `a..b` / `a..=b`
   range expressions (desugar to `Range::new` / `RangeInclusive::new`;
   valid in any expression position, looser than arithmetic).
+- **f-strings (`f"...{expr}...{expr:?}..."`):** string interpolation. The
+  parser desugars each f-string into a chain of `std::fmt::interp` builder
+  calls that produce an owned `String`; `{expr}` formats the value through
+  `Display` and `{expr:?}` through `Debug` (so it works for any type that
+  implements them, including `Option`/`Result`/`Array`). Embedded
+  expressions are full expressions (`f"{a + b}"`); `{{` / `}}` are literal
+  braces. `std::fmt::interp` is auto-imported into any module that uses an
+  f-string. The printf-style `print`/`println` (C `%d`/`%s` specifiers,
+  variadic, not type-checked) remain available for raw formatted output.
 - **`for (x in iter)` iteration:** the parser desugars to
   `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`,
   evaluating the scrutinee exactly once. The scrutinee may be any
@@ -164,9 +173,6 @@ authoritative list.
   against any of these.
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
-- `Display`/`Debug` impls for container and ADT types
-  (`Option`/`Result`/`Array`/`HashMap` print via field access, not via
-  `println("{}", x)`).
 - Async / await / coroutines.
 - `thread::spawn` / `JoinHandle` / `Builder` and `mpsc` channels. (The
   primitives under `std::sync` and `Arc<T>` ship in 1.0; what's missing

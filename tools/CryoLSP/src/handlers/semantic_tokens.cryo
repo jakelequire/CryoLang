@@ -735,8 +735,34 @@ function walk_expr(e: ExpressionNode*, tokens: mut &Array<SemanticToken>) -> voi
     // v1 to mark up here.  Future work: alignof/sizeof type names.
 }
 
+/// True when `c` is a call into the f-string desugar runtime
+/// (`fmt_new` / `fmt_append_lit` / `fmt_append_display` / `fmt_append_debug`,
+/// see std::fmt::interp).  The parser lowers `f"...{expr}..."` to a chain of
+/// these at PARSE time, and every synthesized node carries the f-string
+/// token's span; the hole sub-expressions are sub-parsed with spans relative
+/// to the hole text.  Walking that subtree would paint `function` tokens
+/// across the whole f-string and mis-place hole tokens.  We detect the
+/// outermost call by callee name and skip the entire subtree, leaving the
+/// f-string to the TextMate grammar's interpolation rule (which colours the
+/// literal parts as a string and the `{...}` holes as embedded code).
+function is_fstring_runtime_call(c: CallExprNode*) -> boolean {
+    if (c == null || c.callee == null || g_intern == null) { return false; }
+    if (c.callee.kind != NodeKind::Identifier) { return false; }
+    const id: IdentifierNode* = c.callee as IdentifierNode*;
+    if (!id.name.is_valid()) { return false; }
+    const name: string = g_intern.resolve(id.name);
+    if (name == null) { return false; }
+    return strcmp(name, "fmt_new") == 0
+        || strcmp(name, "fmt_append_lit") == 0
+        || strcmp(name, "fmt_append_display") == 0
+        || strcmp(name, "fmt_append_debug") == 0;
+}
+
 function walk_call_expr(c: CallExprNode*, tokens: mut &Array<SemanticToken>) -> void {
     if (c == null) { return; }
+    // f-string desugar: skip the whole subtree (see helper above).  The
+    // TextMate grammar handles f-string colouring.
+    if (is_fstring_runtime_call(c)) { return; }
     // Override the callee's classification: it's a callable, so the
     // callee name should be `function` or `method`, not `variable` or
     // `property`.

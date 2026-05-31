@@ -1,0 +1,77 @@
+///! f-string interpolation runtime.
+///!
+///! These helpers are the desugar target for `f"...{expr}..."` string
+///! interpolation. The parser lowers an f-string into a chain of nested
+///! calls that thread an owned `String` builder left-to-right:
+///!
+///!   f"x = {x}, y = {y:?}"
+///!
+///! becomes
+///!
+///!   fmt_append_debug(
+///!       fmt_append_lit(
+///!           fmt_append_display(
+///!               fmt_append_lit(fmt_new(), "x = "),
+///!               &x),
+///!           ", y = "),
+///!       &y)
+///!
+///! Each helper takes the partial `String` by value (moving ownership in),
+///! appends to it, and returns it, so the whole expression evaluates to a
+///! single owned `String` with no intermediate temporaries to drop.
+///!
+///! The generic `fmt_append_display` / `fmt_append_debug` carry the
+///! `Display` / `Debug` bound so bound-directed dispatch resolves the
+///! nested `value.fmt(f)` to the right trait (this is exactly how
+///! `format_to_string` / `format_debug_to_string` pick Display vs Debug).
+///!
+///! This module is in the prelude so `f"..."` works without an explicit
+///! import, the same way `core::slice` / `core::ops` back the for-in and
+///! range sugar.
+
+namespace std::fmt::interp;
+
+import core::result;
+import collections::string;
+import fmt::display;
+
+/// Start a fresh interpolation buffer.  The innermost call in an
+/// f-string desugar.
+function fmt_new() -> String {
+    return String::new();
+}
+
+/// Append a literal text chunk (the text between `{...}` holes).
+function fmt_append_lit(out: String, text: string) -> String {
+    mut s: String = out;
+    s.push_cstr(text);
+    return s;
+}
+
+/// Append a `{expr}` hole via `Display`.  In-memory `String` sinks never
+/// fail to write, so a formatting error (which can only originate from a
+/// user `Display` impl returning `Err`) is swallowed here rather than
+/// propagated — an f-string evaluates to a plain `String`, not a `Result`.
+function fmt_append_display<T>(out: String, value: &T) -> String
+where T: Display {
+    mut s: String = out;
+    mut f: Formatter<String> = Formatter::new(&s);
+    match (value.fmt(&f)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    return s;
+}
+
+/// Append a `{expr:?}` hole via `Debug`.  Same error handling as
+/// `fmt_append_display`.
+function fmt_append_debug<T>(out: String, value: &T) -> String
+where T: Debug {
+    mut s: String = out;
+    mut f: Formatter<String> = Formatter::new(&s);
+    match (value.fmt(&f)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { }
+    }
+    return s;
+}
