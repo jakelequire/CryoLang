@@ -139,6 +139,15 @@ implement trait Allocator for struct Pool {
 /// Allocate a new backing block and thread its slots onto the free list.
 function grow(pool: mut &Pool) -> Result<(), AllocError> {
     const stride: u64 = pool.slot.padded_size();
+    // Guard `stride * slots_per_block` against u64 overflow: a wrapped product
+    // would aligned_alloc a too-small block, after which threading
+    // `slots_per_block` FreeNodes across `data + i*stride` writes far past the
+    // allocation. slots_per_block is caller-supplied (with_block_size), so a
+    // pathological value must fail cleanly rather than corrupt the heap.
+    const pool_u64_max: u64 = (0 as u64) - (1 as u64);
+    if (stride != 0 && pool.slots_per_block > pool_u64_max / stride) {
+        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+    }
     const bytes: u64 = stride * pool.slots_per_block;
 
     const header: void* = intrinsics::malloc(sizeof(Block));
