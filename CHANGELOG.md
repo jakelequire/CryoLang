@@ -101,8 +101,10 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   call-site enforcement.
 - **`thread`:** `ThreadLocal<T>` via `pthread_key`. (`thread::spawn`,
   `JoinHandle`, `Builder` are post-1.0.)
-- **`math`:** `sqrt`, `pow`, `sin`/`cos`/`tan`, `ln`/`log2`/`log10`/`exp`,
-  `abs_i32`/`abs_i64`/`abs_f64`, `is_nan`/`is_inf`/`is_finite`, `hypot`.
+- **`math`:** `square_root`, `cube_root`, `power`, `sine`/`cosine`/`tangent`,
+  `natural_log`/`log_base2`/`log_base10`/`exponential`, `absolute` (f64)
+  /`absolute_f32`, `abs_i32`/`abs_i64`, `is_nan`/`is_infinite`/`is_finite`,
+  `hypot`.
 - **`fmt`:** `Display`/`Debug`/`FmtWrite` traits, `Formatter<W>`,
   `print`/`println`/`eprint`/`eprintln`, `format_to_string`,
   `format_debug_to_string`, floating-point formatting.

@@ -352,6 +352,19 @@ public:
     override visit(node: VarDeclNode*) -> void {
         // Local variable declarations (globals handled in forward_declare)
         if (!node.is_global) {
+            // Reject a same-scope redeclaration of a value binding (E0205).
+            // `const x = 1; const x = 2;` in one block previously kept only
+            // one of the two: Scope::insert dropped the duplicate from the
+            // index with nothing but a debug log, so the second binding was
+            // silently accepted. Shadowing in a nested block is a distinct
+            // child scope and remains allowed.
+            if (this.resolver.current_scope_has(node.name)) {
+                this.ctx.emit_error_at(
+                    ErrorCode::E0205_REDEFINED_SYMBOL,
+                    format("the name `%s` is already declared in this scope",
+                        this.resolver.intern_table.resolve(node.name)),
+                    node.span);
+            }
             const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable);
             // Record the declaration span so downstream passes (TypeResolution,
             // Sema) can map VarDeclNode.span -> SymbolID for type write-back.

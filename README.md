@@ -393,7 +393,7 @@ entry_point = "src/tool/main.cryo"
 | `ffi` | The C ABI boundary. `libc` houses every `extern "C"` the stdlib needs. `cstr` for `CStr` / `CString`. |
 | `env` | `args()`, `var()`, `set_var()`, `process_exit()`. |
 | `math` | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`. |
-| `net` | TCP sockets and an HTTP/1.1 layer: `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, connection-per-request `serve(addr, handler)`, `Client::get`/`post`. |
+| `net` | TCP sockets and an HTTP/1.1 layer: `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server (`HttpServer::with_router(addr, &router).run()`), `Client::get`/`post`. |
 | `process` | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`. |
 | `sync` | Atomics (`AtomicU8` / `U32` / `U64` / `I32` / `I64` / `Bool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
 | `thread` | `ThreadLocal<T>` via POSIX TLS. (`thread::spawn` / `JoinHandle` are post-1.0; see Roadmap below.) |

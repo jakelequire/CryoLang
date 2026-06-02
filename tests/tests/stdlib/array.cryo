@@ -10,6 +10,7 @@ import std::core::slice;
 import std::core::drop;
 import std::collections::array;
 import std::collections::string;
+import std::alloc::allocator;
 import std::test::error;
 import std::test::assert;
 
@@ -444,5 +445,26 @@ function sort_by_descending_predicate() -> Result<(), TestError> {
     a.drop();
     want.drop();
     return expect(ok, Str::new("sort_by with desc predicate must sort descending"));
+}
+
+// Growth overflow -------------------------------------------------------------
+
+![test]
+function reserve_near_u64_max_fails_cleanly() -> Result<(), TestError> {
+    // Regression: reserve_grow's capacity-doubling loop must cap at u64::MAX
+    // instead of wrapping to a tiny value (infinite loop / undersized alloc).
+    // For a 1-byte element there is no `cap * elem_size` overflow, so the
+    // request reaches the allocator and fails gracefully with an AllocError
+    // rather than hanging or corrupting memory.
+    mut a: Array<u8> = Array<u8>::new();
+    a.push(1 as u8);
+    a.push(2 as u8);
+    const r: Result<(), AllocError> = a.reserve(18446744073709551000);
+    expect_true(r.is_err(),
+        Str::new("reserve(~u64::MAX) must return Err, not loop forever"))?;
+    // The failed reservation must leave the array untouched.
+    expect_eq(a.length(), 2 as u64)?;
+    a.drop();
+    return Result::Ok(());
 }
 

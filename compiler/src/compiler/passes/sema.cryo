@@ -3898,6 +3898,14 @@ public:
         return TypeRef::invalid();
     }
 
+    /// True when the current `expected_type` hint is a concrete integer type
+    /// (so a literal/constant being resolved would already adopt it).
+    expected_type_is_int_type(&this) -> boolean {
+        if (!this.expected_type.is_valid()) { return false; }
+        const e: Type* = this.arena.lookup(this.expected_type.id);
+        return e != null && e.kind == TypeKind::Int;
+    }
+
     resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
         // Push the non-literal operand's type as the expected type while
         // resolving the literal so that shape-less literals (empty array
@@ -3979,10 +3987,37 @@ public:
                 bin.span);
         }
 
+        // A compile-time-constant numeric expression whose folded value
+        // exceeds i32, with no wider integer expected_type to adopt: push i64
+        // so every operand computes at full precision instead of truncating
+        // at the i32 default. This is the case the per-argument expected-type
+        // push can't reach - a generic constructor's parameter is still `T`
+        // at sema time, so `Box::new(1 << 40)` / `Box::new(1024*1024*1024*8)`
+        // would otherwise fold their operands in i32 and overflow to 1 / 0.
+        // Constants that fit i32 fold unchanged (force_wide stays invalid), so
+        // ordinary code is untouched.
+        mut force_wide: TypeRef = TypeRef::invalid();
+        if (!this.expected_type_is_int_type()) {
+            mut folded: i64 = 0;
+            if (try_fold_const_i64(bin as ExpressionNode*, &folded)) {
+                const mag: u64 = if (folded < 0) { (0 - folded) as u64 }
+                                 else { folded as u64 };
+                if (mag > SEMA_I32_MAX_MAG) {
+                    force_wide = this.arena.get_i64();
+                }
+            }
+        }
+        if (force_wide.is_valid()) {
+            const saved_fw: TypeRef = this.expected_type;
+            this.expected_type = force_wide;
+            lhs = this.resolve_expr(bin.left);
+            rhs = this.resolve_expr(bin.right);
+            this.expected_type = saved_fw;
+        }
         // Non-assignment binary ops: when one operand is a numeric literal
         // and the other isn't, resolve the non-literal first and use its
         // type as the expected_type for the literal.
-        if (right_is_lit && !left_is_lit) {
+        else if (right_is_lit && !left_is_lit) {
             lhs = this.resolve_expr(bin.left);
             if (lhs.is_valid()) {
                 const saved_exp: TypeRef = this.expected_type;
@@ -5063,6 +5098,31 @@ public:
         return (t as FunctionType*).is_variadic;
     }
 
+    /// The canonical trait a method came from, or empty for an inherent
+    /// (non-trait) method. Read off the back-referenced AST node's
+    /// `FunctionDeclNode.origin_trait`, which TypeResolution stamps on every
+    /// trait-impl method. Used to detect two-trait dispatch ambiguity even
+    /// when both methods sit in the receiver's inherent method table.
+    method_origin_trait(&this, m: MethodInfo) -> SymbolStr {
+        if (m.ast_node == null) { return SymbolStr::empty(); }
+        const mn: MethodNode* = m.ast_node as MethodNode*;
+        if (mn.func == null) { return SymbolStr::empty(); }
+        return this.canon_trait_name(mn.func.origin_trait);
+    }
+
+    /// Canonicalize a trait name to its fully-qualified form so two stampings
+    /// of the SAME trait don't read as distinct. TypeResolution stamps
+    /// `origin_trait` with whichever form resolution produced (bare or
+    /// qualified), so a type implementing one trait can carry both
+    /// `Allocator` and `std::alloc::allocator::Allocator`; comparing those
+    /// raw would be a false ambiguity. Mirrors the canonicalization at the
+    /// stamping site (type_resolution).
+    canon_trait_name(&this, name: SymbolStr) -> SymbolStr {
+        if (!name.is_valid()) { return name; }
+        if (this.ctx.decl_index == null) { return name; }
+        return this.ctx.decl_index.resolve_qualified(name);
+    }
+
     check_method_call_arg_types(mut &this, call: CallExprNode*,
                                 member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = member.object.resolved_type;
@@ -5093,6 +5153,17 @@ public:
         const argc: i64 = call.arguments.length;
         mut found:     boolean   = false;
         mut ambiguous: boolean   = false;
+        // Two-trait same-signature ambiguity: when the matched method is
+        // provided by more than one trait implemented for this receiver with
+        // an identical signature (e.g. `Display::fmt` and `Debug::fmt`), a
+        // bare `x.fmt(..)` can't pick one. `found_trait` records the trait of
+        // the first trait-impl match; a later same-signature match from a
+        // DIFFERENT trait sets `trait_ambiguous`. Only flagged when bound-
+        // directed dispatch hasn't already disambiguated the call site
+        // (`member.resolved_trait` unset).
+        mut trait_ambiguous: boolean = false;
+        mut found_trait: SymbolStr   = SymbolStr::empty();
+        mut other_trait: SymbolStr   = SymbolStr::empty();
         // A same-named variadic candidate accepts this call's arity (a fixed
         // prefix plus a variable tail). Mirrors the free-function path
         // (`check_call_arity`), which bails on `is_variadic`; without it a
@@ -5143,8 +5214,19 @@ public:
                     for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
                         chosen.push(m.param_types[ci]);
                     }
-                } else if (!this.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
-                    ambiguous = true;
+                    found_trait = this.method_origin_trait(m);
+                } else {
+                    const m_origin: SymbolStr = this.method_origin_trait(m);
+                    if (found_trait.is_valid() && m_origin.is_valid()
+                            && !m_origin.equals(found_trait)) {
+                        // Same name, two different traits: ambiguous regardless
+                        // of whether the parameter lists compare equal (generic
+                        // `fmt<W>` methods carry distinct `W` ids).
+                        trait_ambiguous = true;
+                        other_trait = m_origin;
+                    } else if (!this.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
+                        ambiguous = true;
+                    }
                 }
             }
             if (walk == null) { break; }
@@ -5159,7 +5241,7 @@ public:
         // -- Trait-impl methods (registered off the receiver's canonical
         // name; covers `implement trait T for U`, including primitive U).
         // Same non-receiver param construction as `match_methods_on_impl_block`.
-        if (!ambiguous && this.ctx.generic_registry != null) {
+        if (!ambiguous && !trait_ambiguous && this.ctx.generic_registry != null) {
             mut target_name: SymbolStr = SymbolStr::empty();
             match (base_t.kind) {
                 TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
@@ -5177,7 +5259,7 @@ public:
                 const traits: SymbolStr[] =
                     this.ctx.generic_registry.traits_implemented_by(target_name);
                 for (mut ti: i64 = 0; ti < traits.length; ti++) {
-                    if (ambiguous) { break; }
+                    if (ambiguous || trait_ambiguous) { break; }
                     const block: ImplBlockNode* =
                         this.ctx.generic_registry.lookup_trait_impl(
                             traits[ti], target_name);
@@ -5205,6 +5287,7 @@ public:
                         if (!found) {
                             found = true;
                             chosen = tparams;
+                            found_trait = this.canon_trait_name(traits[ti]);
                         } else {
                             // `tparams` is not moved into `chosen` on this path,
                             // so drop it after the signature comparison to keep
@@ -5213,7 +5296,20 @@ public:
                             const same: boolean =
                                 this.same_param_sig(chosen.as_slice(), tparams.as_slice());
                             tparams.drop();
-                            if (!same) {
+                            const cand_trait: SymbolStr =
+                                this.canon_trait_name(traits[ti]);
+                            if (found_trait.is_valid()
+                                    && !cand_trait.equals(found_trait)) {
+                                // A second trait provides the same-named method
+                                // at this arity: a bare call can't choose. This
+                                // holds whether or not the parameter lists are
+                                // structurally identical - two generic `fmt<W>`
+                                // methods carry distinct `W` ids yet are equally
+                                // valid targets.
+                                trait_ambiguous = true;
+                                other_trait = cand_trait;
+                                break;
+                            } else if (!same) {
                                 ambiguous = true;
                                 break;
                             }
@@ -5223,6 +5319,26 @@ public:
             }
         }
 
+        // Same-named method from two different traits with identical
+        // signatures, and no bound-directed dispatch pinned the trait: the
+        // bare call is genuinely ambiguous. (When `member.resolved_trait` is
+        // set - e.g. a `T: Display`-bounded receiver, or recursion inside a
+        // trait-impl method - mono already chose, so this stays silent.)
+        if (trait_ambiguous && !member.resolved_trait.is_valid()) {
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0154_AMBIGUOUS_CALL,
+                format("call to `%s` is ambiguous: it is provided by multiple traits implemented for this type",
+                    this.intern.resolve(member.member)));
+            diag = diag.at_with_label(member.span,
+                format("`%s` is defined by both `%s` and `%s`",
+                    this.intern.resolve(member.member),
+                    this.intern.resolve(found_trait),
+                    this.intern.resolve(other_trait)));
+            diag = diag.with_note(
+                "disambiguate by calling the trait method explicitly, e.g. `Trait::method(receiver, args)`");
+            this.ctx.emit_diagnostic(diag);
+            return;
+        }
         if (ambiguous) { return; }
         if (found) {
             this.check_args_against_params(call, chosen.as_slice());
@@ -9060,6 +9176,124 @@ function int_literal_text_is_zero(s: string) -> boolean {
 /// greater than `max_mag` (or overflows u64, which exceeds any type whose
 /// bound fits in u64). Honors `0x`/`0b`/`0o` prefixes and `_` separators.
 /// Returns false on malformed text so other passes own that diagnostic.
+/// Parse an integer-literal lexeme (decimal or `0x`/`0o`/`0b`, `_` allowed)
+/// into a u64. Returns false on a non-integer char or overflow past u64.
+/// Sibling of `int_literal_exceeds`, but yields the value.
+function parse_int_literal_u64(s: string, out: u64*) -> boolean {
+    if (s == null) { return false; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return false; }
+    mut i: i64 = 0;
+    mut radix: u64 = 10;
+    if (len >= 2 && s[0] == '0') {
+        const c1: char = s[1];
+        if (c1 == 'x' || c1 == 'X') { radix = 16; i = 2; }
+        else if (c1 == 'b' || c1 == 'B') { radix = 2; i = 2; }
+        else if (c1 == 'o' || c1 == 'O') { radix = 8; i = 2; }
+    }
+    mut acc: u64 = 0;
+    mut saw: boolean = false;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i = i + 1; continue; }
+        mut d: u64 = 0;
+        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
+        else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
+        else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
+        else { return false; }
+        if (d >= radix) { return false; }
+        saw = true;
+        if (acc > (SEMA_U64_MAX - d) / radix) { return false; }
+        acc = acc * radix + d;
+        i = i + 1;
+    }
+    if (!saw) { return false; }
+    *out = acc;
+    return true;
+}
+
+/// Fold a compile-time-constant integer expression to its i64 value, for
+/// width selection only (the actual computation is left to codegen at the
+/// chosen width). Accepts integer literals and arithmetic/bitwise/shift
+/// combinations of them - the same shapes as `is_constant_numeric_expr`.
+/// Returns false (caller leaves width unchanged) for anything non-constant
+/// or whenever a step would overflow i64 or hit a constant divide-by-zero:
+/// bailing is always safe because it just preserves the existing default
+/// width. Folds in i64; values needing u64/i128 are the bailed degenerate
+/// tail. This is what lets `Box::new(1 << 40)` / `Box::new(1024*1024*1024*8)`
+/// adopt i64 instead of truncating their operands at the i32 default when no
+/// expected type (e.g. a generic constructor's `T`) constrains them.
+function try_fold_const_i64(expr: ExpressionNode*, out: i64*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        mut v: u64 = 0;
+        if (!parse_int_literal_u64(lit.value, &v)) { return false; }
+        if (v > SEMA_I64_MAX_MAG) { return false; }   // needs > i64; bail
+        *out = v as i64;
+        return true;
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        mut a: i64 = 0;
+        if (!try_fold_const_i64(u.operand, &a)) { return false; }
+        if (u.op.lexeme == "-") { *out = 0 - a; return true; }
+        if (u.op.lexeme == "+") { *out = a; return true; }
+        if (u.op.lexeme == "~") { *out = ~a; return true; }
+        return false;
+    }
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        mut x: i64 = 0;
+        mut y: i64 = 0;
+        if (!try_fold_const_i64(b.left, &x)) { return false; }
+        if (!try_fold_const_i64(b.right, &y)) { return false; }
+        const op: string = b.op.lexeme;
+        const I64MAX: i64 = SEMA_I64_MAX_MAG as i64;
+        const I64MIN: i64 = (0 - I64MAX) - 1;
+        if (op == "+") {
+            if (y > 0 && x > I64MAX - y) { return false; }
+            if (y < 0 && x < I64MIN - y) { return false; }
+            *out = x + y; return true;
+        }
+        if (op == "-") {
+            if (y < 0 && x > I64MAX + y) { return false; }
+            if (y > 0 && x < I64MIN + y) { return false; }
+            *out = x - y; return true;
+        }
+        if (op == "*") {
+            if (x == 0 || y == 0) { *out = 0; return true; }
+            // Bail on the trap edge and on overflow (checked by re-division).
+            if (x == I64MIN || y == I64MIN) { return false; }
+            const p: i64 = x * y;
+            if (p / y != x) { return false; }
+            *out = p; return true;
+        }
+        if (op == "/" || op == "%") {
+            if (y == 0) { return false; }
+            if (x == I64MIN && y == 0 - 1) { return false; }
+            *out = if (op == "/") { x / y } else { x % y };
+            return true;
+        }
+        if (op == "<<") {
+            if (y < 0 || y >= 63 || x < 0) { return false; }
+            if (x > (I64MAX >> y)) { return false; }
+            *out = x << y; return true;
+        }
+        if (op == ">>") {
+            if (y < 0 || y >= 64) { return false; }
+            *out = x >> y; return true;
+        }
+        if (op == "&") { *out = x & y; return true; }
+        if (op == "|") { *out = x | y; return true; }
+        if (op == "^") { *out = x ^ y; return true; }
+        return false;
+    }
+    return false;
+}
+
 function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
     if (s == null) { return false; }
     const len: i64 = strlen(s) as i64;
