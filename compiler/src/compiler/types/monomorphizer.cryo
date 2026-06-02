@@ -2755,6 +2755,40 @@ type struct Monomorphizer {
             // bound-checking elsewhere.
             if (ce_call.callee == null) { return TypeRef::invalid(); }
             const callee_node: ASTNode* = ce_call.callee as ASTNode*;
+            // Free-function call (`cnt(geti(9))`) as an inferred argument:
+            // recover the callee's declared return type so a generic param that
+            // can ONLY be pinned from this argument still binds. Without it mono
+            // leaves the binding unset, never pins the OUTER call, and codegen
+            // later fails with "cannot resolve function" (E0636) on the
+            // unspecialized template - the symptom behind nesting a call inside
+            // a generic whose own return type doesn't mention the param (so the
+            // return-type pass can't recover it either). Only a single,
+            // CONCRETE-returning overload is read directly: a generic free
+            // function's return type is an unsubstituted GenericParam - the very
+            // hazard the method-only restriction below was written to avoid -
+            // which infer_type_is_concrete rejects, and an ambiguous
+            // multi-overload name can't be disambiguated without the formal.
+            if (callee_node.kind == NodeKind::Identifier && this.decl_index != null) {
+                const cid: IdentifierNode* = ce_call.callee as IdentifierNode*;
+                // Look up by the BARE name only and require a single, globally
+                // unique definition. A `resolve_qualified` attempt is context-
+                // free here and would pick an arbitrary same-named function
+                // from another module (e.g. two `classify`s with different
+                // return types), pinning T to the wrong type. Bare uniqueness
+                // is the conservative signal: collisions yield length != 1 and
+                // are skipped, falling back to the other args / the literal
+                // default just as before this fast path existed.
+                const fns: TypeRef[] = this.decl_index.lookup_func_type_overloads(cid.name);
+                if (fns.length == 1) {
+                    const fnt: Type* = this.arena.lookup(fns[0].id);
+                    if (fnt != null && fnt.kind == TypeKind::Function) {
+                        const fty: FunctionType* = fnt as FunctionType*;
+                        if (this.infer_type_is_concrete(fty.return_type)) {
+                            return fty.return_type;
+                        }
+                    }
+                }
+            }
             // NOTE: a ScopeResolution (static-call) receiver is deliberately
             // NOT resolved here.  Feeding static-call return types into the
             // general inference path mis-specializes ordinary generic methods
@@ -3696,17 +3730,33 @@ type struct Monomorphizer {
             return lit.literal_kind == LiteralKind::Integer
                 || lit.literal_kind == LiteralKind::Float;
         }
-        // `-5` parses as Unary('-', <literal>); treat it as polymorphic too.
+        // `-5`, `+n`, `~mask` parse as Unary(op, <expr>); a unary over a
+        // polymorphic numeric constant is itself polymorphic.
         if (node.kind == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
-            if (u.op.lexeme == "-" && u.operand != null) {
-                const on: ASTNode* = u.operand as ASTNode*;
-                if (on.kind == NodeKind::Literal) {
-                    const lit2: LiteralNode* = u.operand as LiteralNode*;
-                    return lit2.literal_kind == LiteralKind::Integer
-                        || lit2.literal_kind == LiteralKind::Float;
-                }
+            if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+                return this.arg_is_polymorphic_literal(u.operand);
             }
+            return false;
+        }
+        // A compile-time-constant numeric expression (`1 << 40`,
+        // `3_000_000_000 + 3_000_000_000`) is as polymorphic as the bare
+        // literals it is built from: its operands default to i32, so letting
+        // it pin `T` silently narrows a wider slot (`Box<i64>`, a `u64` param)
+        // exactly like a bare literal would. Only arithmetic/bitwise/shift ops
+        // qualify - comparisons and logical ops yield bool, not a numeric the
+        // param could adopt. The expected type recovers the real width in
+        // Pass B; codegen evaluates the operands at that width (sema pushes the
+        // slot type onto the expression - see is_constant_numeric_expr).
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            const op: string = b.op.lexeme;
+            const is_arith: boolean =
+                op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+                || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+            if (!is_arith) { return false; }
+            return this.arg_is_polymorphic_literal(b.left)
+                && this.arg_is_polymorphic_literal(b.right);
         }
         return false;
     }

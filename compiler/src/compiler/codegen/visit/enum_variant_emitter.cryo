@@ -21,6 +21,7 @@ import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
 import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
 
 
 type struct EnumVariantEmitter {
@@ -99,11 +100,26 @@ type struct EnumVariantEmitter {
                 this.cg.builder.build_store(args[0], typed_ptr);
             }
         } else {
-            // Multi-field payload: lay out sequentially.
+            // Multi-field payload: lay out sequentially using the SAME field
+            // alignment rules as compute_enum_layout (type_map) so the store
+            // offsets agree with the lowered struct layout. A naive packed
+            // running sum would place a `u64` after a `u8` at byte +1 and emit
+            // `store i64 ..., align 8` against an odd address - UB the
+            // optimizer may exploit, and a fault on strict-alignment targets.
             mut offset: u64 = 0;
             for (mut i: i64 = 0; i < args.length && i < variant.payload_types.length as i64; i++) {
                 const field_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[i]);
                 if (!field_ty.is_valid()) { continue; }
+                const ft: Type* = this.resolve_payload_type(variant.payload_types[i]);
+                if (ft != null) {
+                    // align_up the running offset to this field's alignment
+                    // before placing it (mirrors compute_enum_layout).
+                    const fa: u64 = ft.alignment();
+                    if (fa > 0) {
+                        const rem: u64 = offset % fa;
+                        if (rem != 0) { offset += (fa - rem); }
+                    }
+                }
                 const byte_offset: LValue = LType::const_int(LType::i64(), offset, false);
                 const obuf: void* = intrinsics::malloc(8);
                 const obuf_arr: void** = obuf as void**;
@@ -114,7 +130,6 @@ type struct EnumVariantEmitter {
                 const field_ptr: LValue = this.cg.builder.build_bitcast(
                     field_ptr_raw, LType::pointer_to(field_ty), "enum.field.cast");
                 this.cg.builder.build_store(args[i], field_ptr);
-                const ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[i].id);
                 if (ft != null) {
                     offset += ft.size_bytes();
                 }
@@ -122,5 +137,22 @@ type struct EnumVariantEmitter {
         }
 
         return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
+    }
+
+    /// Look up a payload field's `Type`, following an `InstantiatedType`
+    /// wrapper to its concrete spec'd struct. The wrapper reports size /
+    /// alignment 0, so a multi-field payload offset computed off the wrapper
+    /// would collapse onto its predecessor. Mirrors the same dereference in
+    /// compute_enum_layout (type_map) so the store offsets match the alloc.
+    resolve_payload_type(&this, ty: TypeRef) -> Type* {
+        mut t: Type* = this.cg.lookup_type_by_id(ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                const resolved: Type* = this.cg.lookup_type_by_id(inst.resolved_type.id);
+                if (resolved != null) { t = resolved; }
+            }
+        }
+        return t;
     }
 }
