@@ -2123,6 +2123,16 @@ public:
             while (this.check(TokenType::ColonColon)) {
                 this.advance();
                 const next: Token = this.current();
+                // The segment after `::` must be an identifier. `Foo::123` /
+                // `Foo::*` used to silently absorb the bogus token into the
+                // qualified name, producing a confusing "type `Foo::123` not
+                // found" later instead of pointing at the offending token.
+                if (next.kind != TokenType::Identifier) {
+                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                        format("expected an identifier after `::`, found '%s'",
+                            next.lexeme));
+                    break;
+                }
                 qn.push(this.ctx.get_intern_table(), next.lexeme);
                 this.advance();
             }
@@ -2215,6 +2225,14 @@ public:
                         // `0x`/`0o`/`0b` base prefixes and `_` separators that
                         // a hand-rolled decimal scan would silently drop (e.g.
                         // `T[0xFF]` must be 255, not 0).
+                        // A size that needs more than 64 bits would saturate to
+                        // a meaningless value; reject it up front rather than
+                        // build a garbage array type.
+                        if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+                            this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+                                format("array size `%s` does not fit in 64 bits",
+                                    size_tok.lexeme));
+                        }
                         size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
                         this.advance();
                     } else if (size_tok.kind == TokenType::Identifier) {

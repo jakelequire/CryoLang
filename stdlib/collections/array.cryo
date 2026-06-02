@@ -295,6 +295,15 @@ type struct Array<T, A = GlobalAlloc> {
 
     reserve_exact(mut &this, additional: u64) -> Result<(), AllocError> {
         const required: u64 = this.length + additional;
+        // A wrapped `length + additional` (sum < length) means the requested
+        // capacity can't be represented in u64. Reject it rather than
+        // under-sizing: `try_push_slice` would otherwise see `required <=
+        // capacity`, skip the realloc, and memcpy `additional` elements past
+        // the end of the buffer. Mirrors RawBuffer::reserve_exact.
+        if (required < this.length) {
+            return Result::Err(AllocError::new(
+                AllocErrorKind::OutOfMemory, Layout::array<T>(this.length)));
+        }
         if (required <= this.capacity) {
             return Result::Ok(());
         }
@@ -306,6 +315,12 @@ type struct Array<T, A = GlobalAlloc> {
     /// did before Array dropped its RawBuffer dependency.
     reserve_grow(mut &this, additional: u64) -> Result<(), AllocError> {
         const required: u64 = this.length + additional;
+        // See reserve_exact: reject a wrapped `length + additional` rather than
+        // under-allocating and overrunning the buffer in the caller's memcpy.
+        if (required < this.length) {
+            return Result::Err(AllocError::new(
+                AllocErrorKind::OutOfMemory, Layout::array<T>(this.length)));
+        }
         if (required <= this.capacity) {
             return Result::Ok(());
         }
