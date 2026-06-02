@@ -196,6 +196,43 @@ function reset_does_not_round_trip_through_system_allocator() -> Result<(), Test
     return expect_eq(cap2, cap3);
 }
 
+// Regression: reset must reuse chunks across a fill that spans MORE THAN ONE
+// chunk. The single-chunk tests above passed even when `allocate` only ever
+// probed `this.head` and prepended a fresh chunk on every miss; that bug grew
+// the arena by a chunk (or more) on each fill/reset cycle. Here each fill
+// needs several chunks, so a non-reusing arena's capacity would climb every
+// cycle. We assert it stays flat.
+![test]
+function reset_reuses_chunks_across_multiple_chunks() -> Result<(), TestError> {
+    // 64-byte chunks; allocate 8 * 16 bytes = 128 useful bytes per cycle,
+    // which (with alignment padding) forces several chunks.
+    mut a: Arena = Arena::with_chunk_size(64);
+    mut cycle: i32 = 0;
+    mut cap_first: u64 = 0;
+    mut cap_last: u64 = 0;
+    loop {
+        if (cycle >= 4) { break; }
+        mut i: i32 = 0;
+        loop {
+            if (i >= 8) { break; }
+            match (a.allocate(Layout::new(16, 8))) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { a.drop(); return bail(Str::new("multi-chunk allocate failed")); }
+            }
+            i = i + 1;
+        }
+        const cap: u64 = a.capacity();
+        if (cycle == 0) { cap_first = cap; }
+        cap_last = cap;
+        a.reset();
+        cycle = cycle + 1;
+    }
+    a.drop();
+    // Capacity after the first fill must equal capacity after the last fill:
+    // the emptied chunks are reused, not re-allocated.
+    return expect_eq(cap_first, cap_last);
+}
+
 // with_chunk_size(0) is a caller bug and panics; the forked runner counts
 // the abort as a pass.
 ![test]
