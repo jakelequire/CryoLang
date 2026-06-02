@@ -4962,21 +4962,32 @@ public:
                     SourceSpan::none(),
                     arg);
             } else if (this.checker.is_same_width_sign_reinterpret(arg_ty, param_ty)
-                       && (is_numeric_literal_expr(arg) ||
-                           is_negative_numeric_literal_expr(arg))
-                       && !this.int_literal_fits_target(arg, param_ty)) {
+                       && (
+                           // (a) A numeric LITERAL whose magnitude can't be
+                           // represented in the target (`take_u32(-1)`) - a
+                           // statically-known wrong value at any width.
+                           ((is_numeric_literal_expr(arg) ||
+                             is_negative_numeric_literal_expr(arg))
+                            && !this.int_literal_fits_target(arg, param_ty))
+                           // (b) A RUNTIME value at a sub-64-bit width
+                           // (`mut n: i32 = ...; take_u32(n)`): a likely
+                           // accidental sign flip.  Matches assignment, which
+                           // rejects this via can_assign.
+                           || (!is_numeric_literal_expr(arg)
+                               && !is_negative_numeric_literal_expr(arg)
+                               && this.checker.is_subword_sign_reinterpret(arg_ty, param_ty))
+                       )) {
                 // Same-width signedness reinterpretation (i32 <-> u32, i64 <->
                 // u64) preserves bits but flips the VALUE for any top-bit-set
                 // input: `take_u32(-1_i32)` silently arrives as 4294967295.
                 // Assignment already rejects this (E0200 via can_assign); the
                 // call-arg gate was the asymmetric hole.
                 //
-                // Targeted policy: flag only when the argument is a numeric
-                // LITERAL whose magnitude can't be represented in the target
-                // (`take_u32(-1)`) - a definite, statically-known wrong value.
-                // A literal that fits is exempt (`take_u32(5)`), and runtime
-                // i64<->u64 offset/length passing (pervasive and benign in
-                // practice) is left to the caller.
+                // Policy: flag (a) any literal whose magnitude can't be
+                // represented in the target, and (b) runtime values at widths
+                // below 64 bits.  A literal that fits is exempt
+                // (`take_u32(5)`), and runtime i64<->u64 offset/length passing
+                // (pervasive and benign in practice) stays lenient.
                 this.emit_type_mismatch_with_value(
                     ErrorCode::E0214_ARGUMENT_MISMATCH,
                     arg.span,

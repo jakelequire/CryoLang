@@ -227,6 +227,22 @@ public:
         // Declare parameters and record spans for type write-back
         for (mut i: int = 0; i < node.parameters.length; i++) {
             const param: VarDeclNode* = node.parameters[i];
+            // Reject a duplicate parameter name (E0205). `Scope::insert` drops
+            // the duplicate silently, so `function f(x: i32, x: i32)` would
+            // otherwise compile with the second `x` shadowed and unreachable.
+            // Scan only prior parameters (rather than `current_scope_has`) so a
+            // value parameter sharing a generic param's name is not falsely
+            // flagged.
+            for (mut j: int = 0; j < i; j++) {
+                if (node.parameters[j].name.id == param.name.id) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0205_REDEFINED_SYMBOL,
+                        format("the parameter `%s` is already declared in this function",
+                            this.resolver.intern_table.resolve(param.name)),
+                        param.span);
+                    break;
+                }
+            }
             const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
             this.resolver.record_resolution(param.span, param_sym);
         }
@@ -386,6 +402,18 @@ public:
         // Declare each binding's local in the current scope.
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
+            // Reject two bindings that introduce the same local name (E0205):
+            // `const {x, x} = ...` would otherwise drop the duplicate silently.
+            for (mut j: i64 = 0; j < i; j++) {
+                if (node.bindings[j].local_name.id == b.local_name.id) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0205_REDEFINED_SYMBOL,
+                        format("the name `%s` is bound more than once in this destructuring",
+                            this.resolver.intern_table.resolve(b.local_name)),
+                        b.name_span);
+                    break;
+                }
+            }
             const sym_id: SymbolID = this.resolver.declare_variable(
                 b.local_name, b.name_span, b.is_mutable);
             this.resolver.record_resolution(b.name_span, sym_id);

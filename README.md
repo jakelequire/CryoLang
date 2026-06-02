@@ -234,9 +234,9 @@ implement trait Eq for i32 {
 }
 
 function find<T>(xs: &Array<T>, target: T) -> Option<u64>
-    where T: Eq {
+    where T: Eq + Copy {
     for (mut i: u64 = 0; i < xs.length(); i++) {
-        if (xs.get(i).equals(&target)) {
+        if (xs.get(i).contains(&target)) {
             return Option::Some(i);
         }
     }

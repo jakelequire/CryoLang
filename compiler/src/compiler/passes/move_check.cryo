@@ -570,7 +570,112 @@ type struct MoveChecker {
                 const lp: LoopStmtNode* = stmt as LoopStmtNode*;
                 this.walk_loop_body(lp.body);
             }
+            NodeKind::SwitchStatement => {
+                // Previously unhandled (the `_ => {}` arm): moves inside switch
+                // case bodies were invisible, so a double-move within one case -
+                // or a move in a case reused after the switch - silently double-
+                // freed/used-after-free at runtime. Cryo's switch has no
+                // fallthrough (each case is an independent block), so cases are
+                // mutually-exclusive branches like match arms: read the subject
+                // once, then merge the case bodies. The subject is always a Copy
+                // scalar (sema restricts it to int/char/bool/fieldless-enum), so
+                // it never itself moves.
+                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
+                if (sw.expression != null) { this.walk_expr_read(sw.expression); }
+                this.merge_switch_cases(sw.cases);
+            }
             _ => {}
+        }
+    }
+
+    /// Divergence of a switch CASE body with respect to the switch's own
+    /// merge point. Unlike `always_diverges`, a `break` is NOT divergence
+    /// here: in a switch a `break` jumps to the merge (the normal way to end
+    /// a case), so the case's moves still reach the code after the switch and
+    /// must be counted at the join. Only `return` / `continue` leave the
+    /// switch entirely (to the function / an enclosing loop), so those cases'
+    /// moves do not escape to the post-switch state.
+    switch_case_diverges(mut &this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        match (stmt.kind) {
+            NodeKind::ReturnStatement   => { return true;  }
+            NodeKind::ContinueStatement => { return true;  }
+            NodeKind::BreakStatement    => { return false; }
+            NodeKind::BlockStatement => {
+                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    if (this.switch_case_diverges(b.statements[i])) { return true; }
+                }
+                return false;
+            }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                if (it.else_stmt == null) { return false; }
+                return this.switch_case_diverges(it.then_stmt) &&
+                       this.switch_case_diverges(it.else_stmt);
+            }
+            NodeKind::MatchStatement => {
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                if (m.arms.length == 0) { return false; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null || !this.switch_case_diverges(arm.body)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => { return false; }
+        }
+    }
+
+    /// Merge the move-sets of a switch's case bodies at the switch join.
+    /// Mirrors `merge_branches` (each case walked from the same pre-switch
+    /// state, intra-case use-after-move still fires, branch-local bindings
+    /// excluded from the union, possibly-moved -> Moved at the join), but uses
+    /// `switch_case_diverges` so a `break`-terminated case still contributes
+    /// its moves (it reaches the merge). A switch is not required to be
+    /// exhaustive; the implicit "no case matched" fall-through moves nothing,
+    /// which the union models correctly (a one-sided move stays *possibly*
+    /// moved and is conservatively treated as Moved).
+    merge_switch_cases(mut &this, cases: CaseStmtNode*[]) -> void {
+        const snap: i64 = this.snapshot_moves();
+        const prev_capture: boolean = this.capture_decls;
+        mut u_keys:  u32[]        = [];
+        mut u_spans: SourceSpan[] = [];
+        mut u_real:  boolean[]    = [];
+        for (mut i: i64 = 0; i < cases.length; i++) {
+            const c: CaseStmtNode* = cases[i];
+            if (c == null || c.body == null) { continue; }
+            const branch_cap_start: i64 = this.captured_decl_keys.length;
+            this.capture_decls = true;
+            this.walk_stmt(c.body as StatementNode*);
+            this.capture_decls = prev_capture;
+            if (!this.switch_case_diverges(c.body as StatementNode*)) {
+                for (mut j: i64 = snap; j < this.moved_keys.length; j++) {
+                    const k: u32 = this.moved_keys[j];
+                    if (this.is_body_local(k, branch_cap_start)) { continue; }
+                    const real: boolean = this.moved_real[j];
+                    mut found: boolean = false;
+                    for (mut u: i64 = 0; u < u_keys.length; u++) {
+                        if (u_keys[u] == k) {
+                            if (real) { u_real[u] = true; }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        u_keys.push(k);
+                        u_spans.push(this.moved_spans[j]);
+                        u_real.push(real);
+                    }
+                }
+            }
+            this.restore_moves(snap);
+            if (!prev_capture) { this.truncate_captured(branch_cap_start); }
+        }
+        for (mut i: i64 = 0; i < u_keys.length; i++) {
+            this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
         }
     }
 
@@ -934,10 +1039,26 @@ type struct MoveChecker {
 
     read_new(mut &this, n: NewExprNode*) -> void {
         if (n == null) { return; }
-        // `new T(args)` constructor parameters are autoref'd like ordinary
-        // call arguments, so treat them as borrows (read context, no move).
+        // `new T(args)` constructor arguments transfer ownership exactly like
+        // ordinary call arguments: a by-value (`T` parameter) argument is moved
+        // into the constructed object, so reusing the caller's binding
+        // afterwards is a use-after-move (and a loop-carried reuse double-frees
+        // once the object owns the storage).  Earlier this walked every
+        // argument as a borrow, which left `new Holder(t); use(t);` silently
+        // accepted even though drop_insertion::read_new already treats the same
+        // argument as a move and suppresses its scope-exit drop - the two
+        // passes disagreed on the move-set.  Mirror read_call (and
+        // drop_insertion::read_new) so they track the identical set: an
+        // autoref'd borrow stays a read, a by-value droppable argument is a
+        // real move.
         for (mut i: i64 = 0; i < n.arguments.length; i++) {
-            this.walk_expr_read(n.arguments[i]);
+            const arg: ExpressionNode* = n.arguments[i];
+            if (arg == null) { continue; }
+            if (!arg.autoref && this.type_needs_drop(arg.resolved_type)) {
+                this.walk_expr_move(arg, true);
+            } else {
+                this.walk_expr_read(arg);
+            }
         }
         return;
     }

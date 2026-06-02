@@ -37,11 +37,17 @@ type struct Chunk {
 
 type struct Arena {
     head: Chunk*;
+    // Allocation frontier: the chunk `allocate` bumps into on the fast
+    // path. Distinct from `head` (the list anchor used by reset/capacity/
+    // drop) so that, after a `reset`, allocation can march back through the
+    // already-allocated chunks and reuse them instead of prepending fresh
+    // ones every cycle. `null` until the first chunk is allocated.
+    current: Chunk*;
     chunk_size: u64;
 
     /// Create an arena whose chunks are `DEFAULT_CHUNK_SIZE` bytes each.
     static new() -> Arena {
-        return Arena { head: null, chunk_size: DEFAULT_CHUNK_SIZE };
+        return Arena { head: null, current: null, chunk_size: DEFAULT_CHUNK_SIZE };
     }
 
     /// Create an arena with a custom chunk size. Requests larger than
@@ -51,7 +57,7 @@ type struct Arena {
         if (chunk_size == 0) {
             intrinsics::panic("Arena::with_chunk_size: chunk_size must be non-zero", FILE, LINE);
         }
-        return Arena { head: null, chunk_size: chunk_size };
+        return Arena { head: null, current: null, chunk_size: chunk_size };
     }
 
     /// Reset every chunk's high-water mark to zero, making the arena's
@@ -70,6 +76,9 @@ type struct Arena {
             chunk.offset = 0;
             chunk = chunk.next;
         }
+        // Rewind the allocation frontier so the next `allocate` reuses the
+        // chunks we just emptied rather than prepending new ones.
+        this.current = this.head;
     }
 
     /// Total bytes currently held in chunks (including unused tail).
@@ -112,6 +121,7 @@ implement trait Drop for struct Arena {
             chunk = next;
         }
         this.head = null;
+        this.current = null;
     }
 }
 
@@ -121,15 +131,34 @@ implement trait Allocator for struct Arena {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, block));
         }
 
-        // Try the head chunk first.
-        if (this.head != null) {
-            const fit: u8* = try_bump(this.head, block);
+        // Fast path: bump into the current frontier chunk.
+        if (this.current != null) {
+            const fit: u8* = try_bump(this.current, block);
             if (fit != null) {
                 return Result::Ok(NonNull::new(fit));
             }
         }
 
-        // Head chunk can't satisfy us; allocate a new one. Requests
+        // Frontier is full (or unset). Before allocating a fresh chunk, walk
+        // the whole chunk list for any chunk with room — this is what reuses
+        // the chunks emptied by `reset` instead of growing the arena every
+        // fill/reset cycle. The successful chunk becomes the new frontier, so
+        // the walk only happens at chunk boundaries (amortized O(1)), not on
+        // every allocation.
+        mut scan: Chunk* = this.head;
+        loop {
+            if (scan == null) { break; }
+            if (scan != this.current) {
+                const fit: u8* = try_bump(scan, block);
+                if (fit != null) {
+                    this.current = scan;
+                    return Result::Ok(NonNull::new(fit));
+                }
+            }
+            scan = scan.next;
+        }
+
+        // No existing chunk can satisfy us; allocate a new one. Requests
         // larger than the configured chunk size get a custom-sized
         // chunk so single giant allocations don't get rejected.
         mut new_capacity: u64 = this.chunk_size;
@@ -142,6 +171,7 @@ implement trait Allocator for struct Arena {
         }
         chunk.next = this.head;
         this.head = chunk;
+        this.current = chunk;
 
         const fit: u8* = try_bump(chunk, block);
         if (fit == null) {
