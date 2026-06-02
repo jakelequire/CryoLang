@@ -4555,6 +4555,23 @@ public:
                     // rejects.  Leaving it unpushed keeps the literal signed so
                     // the same-width-sign-reinterpret arg gate below flags it.
                     push_expected = true;
+                } else if ((arg_node.kind == NodeKind::BinaryExpression
+                            || arg_node.kind == NodeKind::UnaryExpression)
+                        && is_constant_numeric_expr(arg)
+                        && !is_negative_numeric_literal_expr(arg)
+                        && is_wide_int_type(this.arena, param_types[i])) {
+                    // A compile-time-constant numeric expression (`1 << 40`,
+                    // `3_000_000_000 + 3_000_000_000`) computes its operands at
+                    // their i32 default and truncates *before* the result
+                    // widens into a 64-bit slot. Push the (wide) param type so
+                    // the operands adopt the slot width and the constant folds
+                    // at full precision (`Box<i64>::new(1 << 40)`).  Bare
+                    // literals keep their own width logic; negative bare
+                    // literals are handled by the branch above (signed-only);
+                    // narrow slots (i8..u32) stay i32-default so a genuine
+                    // narrowing is still caught by the call-arg narrowing gate
+                    // rather than wrapping silently inside the operand width.
+                    push_expected = true;
                 }
             }
             if (push_expected) {
@@ -8928,6 +8945,56 @@ function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
     const lit: LiteralNode* = expr as LiteralNode*;
     return lit.literal_kind == LiteralKind::Integer
         || lit.literal_kind == LiteralKind::Float;
+}
+
+/// True when `expr` is a compile-time-constant numeric expression: a numeric
+/// literal, or arithmetic/bitwise/shift combinations of such (`1 << 40`,
+/// `3_000_000_000 + 3_000_000_000`, `~mask`, `-(1 << 20)`). Like a bare
+/// literal these are width-polymorphic, but their operands default to i32 and
+/// the computation happens at that width *before* the result widens to the
+/// slot - so `1 << 40` shifts in i32 and yields 0/garbage unless the slot's
+/// type is pushed onto the whole expression. Comparisons / logical ops are
+/// excluded: they produce bool, not a numeric the slot could adopt.
+function is_constant_numeric_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        return lit.literal_kind == LiteralKind::Integer
+            || lit.literal_kind == LiteralKind::Float;
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+            return is_constant_numeric_expr(u.operand);
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        const op: string = b.op.lexeme;
+        const is_arith: boolean =
+            op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+            || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+        if (!is_arith) { return false; }
+        return is_constant_numeric_expr(b.left)
+            && is_constant_numeric_expr(b.right);
+    }
+    return false;
+}
+
+/// True when `ty` is a 64-bit-or-wider integer type. Used to gate pushing a
+/// param slot's type onto a constant numeric expression argument: wide slots
+/// are where a constant computed at the i32 default silently truncates, while
+/// narrow slots (i8..u32) must keep defaulting to i32 so a genuine narrowing
+/// (`take_u8(255 + 1)`) is still flagged by the call-arg narrowing gate
+/// instead of wrapping silently inside the operand width.
+function is_wide_int_type(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null || t.kind != TypeKind::Int) { return false; }
+    const it: IntType* = t as IntType*;
+    return it.int_kind.bit_width() >= 64;
 }
 
 /// True when `expr` is a negated numeric literal: a UnaryExpression with a

@@ -198,13 +198,34 @@ type struct PatternEmitter {
                 minfo.enum_llvm, minfo.subject_ptr, 1, "enum.payload.ptr");
             if (!payload_ptr.is_valid()) { continue; }
 
-            // Precompute payload field offsets (sum of earlier field sizes).
+            // Precompute payload field offsets using the SAME field alignment
+            // rules as compute_enum_layout (type_map) and the construction side
+            // (EnumVariantEmitter): align_up the running offset to each field's
+            // alignment before recording it. A naive packed running sum would
+            // bind e.g. a `u64` after a `u8` at byte +1, reading it with a
+            // false `align 8` off an odd address (UB / strict-align fault).
             const num_payload: i64 = variant.payload_types.length;
             mut offsets: u64[] = [];
             mut running: u64 = 0;
             for (mut pi: i64 = 0; pi < num_payload; pi++) {
+                mut ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[pi].id);
+                // Follow an InstantiatedType wrapper (reports size/align 0) to
+                // its concrete spec'd struct, as type_map does.
+                if (ft != null && ft.kind == TypeKind::InstantiatedType) {
+                    const inst: InstantiatedType* = ft as InstantiatedType*;
+                    if (inst.has_resolved_type()) {
+                        const r: Type* = this.cg.lookup_type_by_id(inst.resolved_type.id);
+                        if (r != null) { ft = r; }
+                    }
+                }
+                if (ft != null) {
+                    const fa: u64 = ft.alignment();
+                    if (fa > 0) {
+                        const rem: u64 = running % fa;
+                        if (rem != 0) { running += (fa - rem); }
+                    }
+                }
                 offsets.push(running);
-                const ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[pi].id);
                 if (ft != null) {
                     running += ft.size_bytes();
                 }

@@ -1,0 +1,143 @@
+///! Regression coverage for three silent-miscompile fixes (v1.0.0 audit):
+///!
+///!  1. Generic / wide-slot inference must not pin a constant numeric
+///!     EXPRESSION to its i32 operand default. `1 << 40` and
+///!     `3_000_000_000 + 3_000_000_000` flowing into an i64 slot must keep
+///!     full precision instead of truncating to 32 bits. (monomorphizer
+///!     `arg_is_polymorphic_literal` + sema constant-expr expected-type push.)
+///!
+///!  2. Fixed-array size suffixes must honour `0x`/`0o`/`0b` prefixes and `_`
+///!     separators - `i32[0xFF]` is 255 elements, not 0. (Parser used a
+///!     decimal-only digit scan; now defers to parse_numeric_lexeme_i64.)
+///!
+///!  3. ADT-enum multi-field payloads must place each field on its natural
+///!     alignment (a `u64` after a `u8` lands at offset 8, not a packed +1
+///!     with a false `align 8`). Construction and pattern-binding agree with
+///!     compute_enum_layout. (enum_variant_emitter + pattern_emitter.)
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LiteralExprAndEnumLayout;
+
+import std::core::result;
+import std::alloc::box::{Box};
+import std::test::error;
+import std::test::assert;
+
+// --- Fix #1: constant-expression width in wide slots --------------------
+
+const SHIFT_40: i64 = 1099511627776;   // 2^40
+const SUM_6E9:  i64 = 6000000000;      // 3e9 + 3e9, overflows i32
+
+function take_i64(x: i64) -> i64 { return x; }
+
+![test]
+function shift_expr_in_i64_local() -> Result<(), TestError> {
+    const x: i64 = 1 << 40;
+    expect_eq(x, SHIFT_40)?;
+    return Result::Ok(());
+}
+
+![test]
+function add_expr_overflowing_i32_in_i64_local() -> Result<(), TestError> {
+    const x: i64 = 3000000000 + 3000000000;
+    expect_eq(x, SUM_6E9)?;
+    return Result::Ok(());
+}
+
+![test]
+function shift_expr_as_call_arg() -> Result<(), TestError> {
+    // The constant expression flows into take_i64's i64 slot. The whole call
+    // is also nested directly as the first argument of expect_eq<T> (an
+    // sret-returning generic): mono must infer T from take_i64's return type,
+    // or it leaves expect_eq unspecialized and codegen fails with E0636.
+    expect_eq(take_i64(1 << 40), SHIFT_40)?;
+    expect_eq(take_i64(3000000000 + 3000000000), SUM_6E9)?;
+    return Result::Ok(());
+}
+
+// --- Free-function call as a generic argument (mono inference) ----------
+
+type struct LitBox { code: i64; lo: i64; hi: i64; }   // > 16 bytes -> sret
+function litexpr_box<T>(v: T) -> LitBox { return LitBox { code: v as i64, lo: 0, hi: 0 }; }
+
+![test]
+function generic_infers_t_from_freefn_call_arg() -> Result<(), TestError> {
+    // litexpr_box<T> returns a non-generic struct, so T can ONLY be pinned from the
+    // argument. The argument is itself a free-function call; mono must read
+    // take_i64's concrete return type to bind T (regression: E0636).
+    const b: LitBox = litexpr_box(take_i64(123456789012));
+    expect_eq(b.code, 123456789012)?;
+    return Result::Ok(());
+}
+
+![test]
+function wide_const_expr_into_generic_box() -> Result<(), TestError> {
+    // Box::new must infer Box<i64> (not Box<i32>) from the declared slot, so
+    // a constant whose operands themselves overflow i32 keeps full precision.
+    mut b: Box<i64> = Box::new(3000000000 + 3000000000);
+    const got: i64 = *b.as_ptr();
+    expect_eq(got, SUM_6E9)?;
+    return Result::Ok(());
+}
+
+// --- Fix #2: based fixed-array sizes ------------------------------------
+
+![test]
+function hex_fixed_array_size() -> Result<(), TestError> {
+    // 0xFF == 255 elements. A decimal-only scan would size this at 0, making
+    // every write below an out-of-bounds stack store.
+    mut a: i32[0xFF];
+    mut i: i64 = 0;
+    while (i < 255) { a[i] = (i as i32) * 2; i = i + 1; }
+    expect_eq(a[0], 0 as i32)?;
+    expect_eq(a[254], 508 as i32)?;
+    return Result::Ok(());
+}
+
+![test]
+function octal_and_binary_fixed_array_sizes() -> Result<(), TestError> {
+    mut o: i32[0o17];     // 15
+    mut b: i32[0b1010];   // 10
+    o[14] = 14 as i32;
+    b[9]  = 9 as i32;
+    expect_eq(o[14], 14 as i32)?;
+    expect_eq(b[9],  9 as i32)?;
+    return Result::Ok(());
+}
+
+// --- Fix #3: aligned multi-field enum payloads --------------------------
+
+type enum Mixed {
+    Pair(u8, u64);
+    Triple(u8, u16, u64);
+    None;
+}
+
+![test]
+function enum_u8_u64_payload_roundtrips() -> Result<(), TestError> {
+    mut e: Mixed = Mixed::Pair(7, 1099511627776);
+    match (e) {
+        Mixed::Pair(a, b) => {
+            expect_eq(a, 7 as u8)?;
+            expect_eq(b, 1099511627776 as u64)?;
+        }
+        Mixed::Triple(_, _, _) => { return bail(Str::new("wrong variant")); }
+        Mixed::None => { return bail(Str::new("wrong variant")); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function enum_three_field_mixed_alignment_roundtrips() -> Result<(), TestError> {
+    mut e: Mixed = Mixed::Triple(255, 4096, 9000000000);
+    match (e) {
+        Mixed::Triple(a, b, c) => {
+            expect_eq(a, 255 as u8)?;
+            expect_eq(b, 4096 as u16)?;
+            expect_eq(c, 9000000000 as u64)?;
+        }
+        Mixed::Pair(_, _) => { return bail(Str::new("wrong variant")); }
+        Mixed::None => { return bail(Str::new("wrong variant")); }
+    }
+    return Result::Ok(());
+}
