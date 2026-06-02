@@ -4779,7 +4779,16 @@ public:
         if (overloads.length == 0) {
             overloads = this.ctx.decl_index.lookup_func_type_overloads(ident.name);
         }
-        if (overloads.length != 1) { return; }
+        if (overloads.length == 0) { return; }
+        if (overloads.length > 1) {
+            // Overload set: the single-overload arity check below can't pick a
+            // target. Still catch the definite-wrong case where the call's
+            // arity matches NONE of the overloads (and none is variadic) - that
+            // used to fall through to a misleading codegen "cannot resolve
+            // function 'f'" instead of a clear arity diagnostic.
+            this.check_overloaded_free_call_arity(call, ident, overloads);
+            return;
+        }
 
         const ft_raw: Type* = this.arena.lookup(overloads[0].id);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
@@ -4893,6 +4902,67 @@ public:
         // argument against its declared parameter type.  (Auto-ref of
         // value args to `&T` params is handled once in `resolve_call`.)
         this.check_args_against_params(call, ft.param_types.as_slice());
+    }
+
+    /// Arity check for a call against an OVERLOAD SET (>1 candidate). Emits a
+    /// clear diagnostic only when the call's argument count matches NO
+    /// overload and none is variadic - the definite-wrong case that otherwise
+    /// surfaced as a misleading codegen "cannot resolve function 'f'". When
+    /// the arity matches some overload, resolution is left to codegen (which
+    /// picks by argument types), so this never rejects a valid overloaded call.
+    check_overloaded_free_call_arity(mut &this, call: CallExprNode*,
+                                     ident: IdentifierNode*,
+                                     overloads: TypeRef[]) -> void {
+        const got: i64 = call.arguments.length;
+        mut uniq_arity:  i64 = -1;
+        mut any_variadic: boolean = false;
+        mut matches:      boolean = false;
+        for (mut i: i64 = 0; i < overloads.length; i++) {
+            const t: Type* = this.arena.lookup(overloads[i].id);
+            // An unexpected non-function entry: bail rather than risk a
+            // spurious diagnostic.
+            if (t == null || t.kind != TypeKind::Function) { return; }
+            const ft: FunctionType* = t as FunctionType*;
+            if (ft.is_variadic) { any_variadic = true; continue; }
+            const ar: i64 = ft.param_types.length;
+            uniq_arity = this.note_arity(uniq_arity, ar);
+            if (ar == got) { matches = true; }
+        }
+        if (any_variadic || matches) { return; }
+        // `note_arity` yields the single shared arity (>= 0) when every
+        // overload agrees, or -2 when they differ; map the latter to -1 so
+        // `emit_method_arity_error` prints the "no overload takes N" form.
+        const expected_for_msg: i64 = if (uniq_arity >= 0) { uniq_arity } else { -1 };
+        this.emit_method_arity_error(call, ident.name, "function",
+            expected_for_msg, got);
+    }
+
+    /// Non-emitting category check: do the call's args fit `params`? Mirrors
+    /// the hard-mismatch ("Incompatible", with the same indirection / enum-int
+    /// allowances) branch of `check_args_against_params` but returns a bool.
+    /// Used to resolve which overload an ambiguous-by-arity static call
+    /// targets. Non-concrete args/params count as fitting (the monomorphizer
+    /// re-checks once they're concrete), so this never under-counts a generic.
+    args_fit_params_loosely(mut &this, call: CallExprNode*,
+                            params: Slice<TypeRef>) -> boolean {
+        const n: i64 = params.length as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i >= call.arguments.length) { break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const arg_ty:   TypeRef = arg.resolved_type;
+            const param_ty: TypeRef = params.get(i as u64).unwrap();
+            if (!this.arg_type_is_concrete(arg_ty))   { continue; }
+            if (!this.arg_type_is_concrete(param_ty)) { continue; }
+            const compat: TypeCompatibility =
+                this.checker.check_compatibility(arg_ty, param_ty);
+            if (compat == TypeCompatibility::Incompatible) {
+                if (this.indirection_compatible(arg_ty, param_ty)) { continue; }
+                if (this.enum_int_compatible(arg_ty, param_ty)) { continue; }
+                return false;
+            }
+        }
+        return true;
     }
 
     /// Per-argument type checking for a call whose argument list aligns
@@ -5555,7 +5625,35 @@ public:
                 ambiguous = true;
             }
         }
-        if (ambiguous) { return; }
+        if (ambiguous) {
+            // Same-arity static overloads with differing param types: arity
+            // alone can't pick the target, so the arg check was skipped. Try
+            // to resolve by argument types - if the args loosely fit exactly
+            // ONE candidate, that's the target, so run the precise arg check
+            // against it (surfacing narrowing / type errors the bare arity
+            // match can't). If they fit none or several, leave resolution to
+            // codegen (no false positives).
+            mut fit_count:  i64 = 0;
+            mut fit_params: TypeRef[] = [];
+            for (mut mi: i64 = 0; mi < methods.length; mi++) {
+                const m: MethodInfo = methods[mi];
+                if (!m.is_static) { continue; }
+                if (!m.name.equals(scope.member_name)) { continue; }
+                if (this.method_type_is_variadic(m.function_type)) { continue; }
+                if (m.param_types.length != argc) { continue; }
+                if (this.args_fit_params_loosely(call, m.param_types.as_slice())) {
+                    fit_count += 1;
+                    fit_params = [];
+                    for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
+                        fit_params.push(m.param_types[ci]);
+                    }
+                }
+            }
+            if (fit_count == 1) {
+                this.check_args_against_params(call, fit_params.as_slice());
+            }
+            return;
+        }
         if (found) {
             this.check_args_against_params(call, chosen.as_slice());
             return;
