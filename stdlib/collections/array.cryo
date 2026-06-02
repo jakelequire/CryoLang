@@ -32,6 +32,11 @@ import alloc::allocator;
 /// pushes.
 const INITIAL_CAPACITY: u64 = 4;
 
+/// u64 max, used as the capacity-doubling ceiling in `reserve_grow` (see
+/// `RAW_U64_MAX` in raw_buffer.cryo - Array no longer depends on RawBuffer,
+/// so the constant is mirrored here).
+const ARRAY_U64_MAX: u64 = (0 as u64) - (1 as u64);
+
 type struct Array<T, A = GlobalAlloc> {
     // Layout: { ptr, length, capacity, alloc }.  ABI-compatible with
     // the legacy `T[]` fat pointer the self-hosted compiler emits.
@@ -309,6 +314,14 @@ type struct Array<T, A = GlobalAlloc> {
             new_cap = INITIAL_CAPACITY;
         }
         while (new_cap < required) {
+            // Once doubling would overflow `u64`, geometric growth has hit
+            // the ceiling: fall back to exactly `required` (already known to
+            // fit) instead of wrapping to a small value and either looping
+            // forever or under-allocating. Mirrors RawBuffer::reserve.
+            if (new_cap > ARRAY_U64_MAX / 2) {
+                new_cap = required;
+                break;
+            }
             new_cap = new_cap * 2;
         }
         return this.resize_storage( new_cap);

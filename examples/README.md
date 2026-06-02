@@ -12,7 +12,7 @@ builds and executes it.
 | 04 | [04-calculator](04-calculator/)        | Structs, methods, enum-typed errors, RPN expression evaluation.               |
 | 05 | [05-todo-cli](05-todo-cli/)            | `Array<T>` ownership, `Drop` trait impls, `Option`-based lookup.              |
 | 06 | [06-word-count](06-word-count/)        | File I/O (`fs::file::read`), byte scanning, `HashMap` keyed top-N.            |
-| 07 | [07-shapes](07-shapes/)                | Traits, multiple impls, generics with `where` bounds, `math::sqrt`.           |
+| 07 | [07-shapes](07-shapes/)                | Traits, multiple impls, generics with `where` bounds, `math::square_root`.    |
 | 08 | [08-game-of-life](08-game-of-life/)    | 2D simulation on a torus, ANSI terminal output, `libc::usleep` for animation. |
 | 09 | [09-json-config](09-json-config/)      | `std::json` parsing, nested object/array walking, fallback defaults.          |
 | 10 | [10-expr-interpreter](10-expr-interpreter/) | Lexer + recursive-descent parser + evaluator over arithmetic.            |
