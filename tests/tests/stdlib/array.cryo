@@ -468,3 +468,26 @@ function reserve_near_u64_max_fails_cleanly() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
+![test]
+function reserve_exact_wrapping_additional_fails() -> Result<(), TestError> {
+    // Regression: `length + additional` must not silently wrap. With a
+    // non-empty array, an `additional` of u64::MAX makes the sum wrap to a
+    // small value (< length); without the guard reserve_exact would see
+    // `required <= capacity`, return Ok WITHOUT growing, and a later
+    // try_push_slice would memcpy `additional` elements past the buffer.
+    // The guard must reject the wrapped request as an AllocError. reserve_grow
+    // shares the same guard.
+    mut a: Array<u8> = Array<u8>::new();
+    a.push(1 as u8);
+    a.push(2 as u8);                                   // length 2, capacity >= 2
+    const re: Result<(), AllocError> = a.reserve_exact(18446744073709551615); // u64::MAX
+    expect_true(re.is_err(),
+        Str::new("reserve_exact with wrapping additional must return Err"))?;
+    const rg: Result<(), AllocError> = a.reserve_grow(18446744073709551615);
+    expect_true(rg.is_err(),
+        Str::new("reserve_grow with wrapping additional must return Err"))?;
+    expect_eq(a.length(), 2 as u64)?;                  // array untouched
+    a.drop();
+    return Result::Ok(());
+}
+

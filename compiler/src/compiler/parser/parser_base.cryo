@@ -397,7 +397,19 @@ public:
             base = 8;  i += 2;
         }
 
-        mut acc: i64 = 0;
+        // Accumulate in u64 with a hard overflow guard: a literal that needs
+        // more than 64 bits (e.g. `0x1_0000_0000_0000_0000` or a 25-digit
+        // decimal) used to wrap silently to an arbitrary small/negative value
+        // - dangerous for the parser-side callers (fixed-array sizes, enum
+        // discriminants, pattern literals) that have no later value-range
+        // check. Saturate to u64::MAX instead so the value is at worst
+        // obviously-too-big (a giant array size fails loudly at codegen)
+        // rather than a plausible small wrap. The array-size caller also
+        // reports E0010 up front via `numeric_lexeme_overflows_u64`.
+        const u64_max: u64 = (0 as u64) - (1 as u64);
+        const ubase: u64 = base as u64;
+        mut acc: u64 = 0;
+        mut overflowed: boolean = false;
         while (i < len) {
             const c: char = s[i];
             if (c == '_') { i += 1; continue; }
@@ -407,12 +419,58 @@ public:
             else if (c >= 'A' && c <= 'F') { digit = (c as i64) - ('A' as i64) + 10; }
             else { break; }
             if (digit >= base) { break; }
-            acc = acc * base + digit;
+            const ud: u64 = digit as u64;
+            // acc * ubase + ud overflows u64 iff acc > (u64_max - ud) / ubase.
+            if (acc > (u64_max - ud) / ubase) {
+                overflowed = true;
+                break;
+            }
+            acc = acc * ubase + ud;
             i += 1;
         }
+        if (overflowed) { acc = u64_max; }
 
-        if (negate) { return -acc; }
-        return acc;
+        if (negate) { return -(acc as i64); }
+        return acc as i64;
+    }
+
+    /// True when the integer lexeme `s` needs more than 64 bits, i.e. when
+    /// `parse_numeric_lexeme_i64` would have to saturate. Lets a caller that
+    /// cares (the fixed-array-size path) report a precise diagnostic instead
+    /// of silently using the saturated value. Honours the `0x`/`0o`/`0b`
+    /// prefixes, `_` separators, and a leading sign, mirroring the parser.
+    static numeric_lexeme_overflows_u64(s: string) -> boolean {
+        if (s == null) { return false; }
+        const len: i64 = intrinsics::strlen(s) as i64;
+        if (len == 0) { return false; }
+        mut i: i64 = 0;
+        if (s[0] == '-' || s[0] == '+') { i = 1; }
+        mut base: i64 = 10;
+        if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+            base = 16; i += 2;
+        } else if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B')) {
+            base = 2;  i += 2;
+        } else if (i + 1 < len && s[i] == '0' && (s[i + 1] == 'o' || s[i + 1] == 'O')) {
+            base = 8;  i += 2;
+        }
+        const u64_max: u64 = (0 as u64) - (1 as u64);
+        const ubase: u64 = base as u64;
+        mut acc: u64 = 0;
+        while (i < len) {
+            const c: char = s[i];
+            if (c == '_') { i += 1; continue; }
+            mut digit: i64 = -1;
+            if (c >= '0' && c <= '9')      { digit = (c as i64) - ('0' as i64); }
+            else if (c >= 'a' && c <= 'f') { digit = (c as i64) - ('a' as i64) + 10; }
+            else if (c >= 'A' && c <= 'F') { digit = (c as i64) - ('A' as i64) + 10; }
+            else { break; }
+            if (digit >= base) { break; }
+            const ud: u64 = digit as u64;
+            if (acc > (u64_max - ud) / ubase) { return true; }
+            acc = acc * ubase + ud;
+            i += 1;
+        }
+        return false;
     }
 
     /// Strip surrounding double-quote characters from a string-literal
