@@ -61,29 +61,36 @@ type struct Diagnostic {
         };
     }
 
-    /// Attach a source span and return a new diagnostic (builder pattern).
-    at(mut &this, span: SourceSpan) -> Diagnostic {
-        this.span = span;
-        // Build the new labels array via push() rather than the `arr +
-        // [elem]` concat operator.  The concat operator on an array of
-        // structs containing further arrays/strings (like SpanLabel's
-        // `message: string`) lowers to a malformed result: the resulting
-        // `Array<T>`'s length field reads as a heap pointer.  push() works
-        // because it reuses the receiver's storage and grows by a known step.
-        mut new_labels: SpanLabel[] = [];
-        for (mut i: i64 = 0; i < this.labels.length; i++) {
-            new_labels.push(this.labels[i]);
-        }
-        new_labels.push(SpanLabel::primary(span, this.message));
+    /// Deep copy.  The three owning arrays are rebuilt into independent
+    /// buffers (SpanLabel is Copy; children/suggestions are cloned), so a
+    /// clone can be returned from a builder while the receiver keeps - and
+    /// independently frees - its own arrays.  The builders below all start
+    /// from `this.clone()` and mutate the copy in place; without the clone
+    /// they shallow-aliased the receiver's arrays and double-freed them.
+    clone(&this) -> Diagnostic {
+        mut labels_c: SpanLabel[] = [];
+        mut children_c: Diagnostic[] = [];
+        mut suggestions_c: Suggestion[] = [];
+        for (mut i: i64 = 0; i < this.labels.length; i++)      { labels_c.push(this.labels[i]); }
+        for (mut i: i64 = 0; i < this.children.length; i++)    { children_c.push(this.children[i].clone()); }
+        for (mut i: i64 = 0; i < this.suggestions.length; i++) { suggestions_c.push(this.suggestions[i].clone()); }
         return Diagnostic {
             severity:    this.severity,
             code:        this.code,
             message:     this.message,
-            span:        span,
-            labels:      new_labels,
-            children:    this.children,
-            suggestions: this.suggestions,
+            span:        this.span,
+            labels:      labels_c,
+            children:    children_c,
+            suggestions: suggestions_c,
         };
+    }
+
+    /// Attach a source span and return a new diagnostic (builder pattern).
+    at(&this, span: SourceSpan) -> Diagnostic {
+        mut r: Diagnostic = this.clone();
+        r.span = span;
+        r.labels.push(SpanLabel::primary(span, r.message));
+        return r;
     }
 
     /// Like `at()`, but attaches a *short* primary caption distinct from
@@ -92,23 +99,12 @@ type struct Diagnostic {
     /// primary inline reads e.g. "value used here after move" while
     /// the headline carries the full description. Falls back to the
     /// headline if `label` is empty.
-    at_with_label(mut &this, span: SourceSpan, label: string) -> Diagnostic {
-        this.span = span;
-        mut new_labels: SpanLabel[] = [];
-        for (mut i: i64 = 0; i < this.labels.length; i++) {
-            new_labels.push(this.labels[i]);
-        }
-        const caption: string = if (label == "") { this.message } else { label };
-        new_labels.push(SpanLabel::primary(span, caption));
-        return Diagnostic {
-            severity:    this.severity,
-            code:        this.code,
-            message:     this.message,
-            span:        span,
-            labels:      new_labels,
-            children:    this.children,
-            suggestions: this.suggestions,
-        };
+    at_with_label(&this, span: SourceSpan, label: string) -> Diagnostic {
+        mut r: Diagnostic = this.clone();
+        r.span = span;
+        const caption: string = if (label == "") { r.message } else { label };
+        r.labels.push(SpanLabel::primary(span, caption));
+        return r;
     }
 
     /// Append a note child diagnostic.
@@ -122,21 +118,9 @@ type struct Diagnostic {
             children:    [],
             suggestions: [],
         };
-        // See `at()` for why we use push() instead of `arr + [elem]`.
-        mut new_children: Diagnostic[] = [];
-        for (mut i: i64 = 0; i < this.children.length; i++) {
-            new_children.push(this.children[i]);
-        }
-        new_children.push(child);
-        return Diagnostic {
-            severity:    this.severity,
-            code:        this.code,
-            message:     this.message,
-            span:        this.span,
-            labels:      this.labels,
-            children:    new_children,
-            suggestions: this.suggestions,
-        };
+        mut r: Diagnostic = this.clone();
+        r.children.push(child);
+        return r;
     }
 
     /// Append a note child diagnostic with a source location.
@@ -152,20 +136,9 @@ type struct Diagnostic {
             children:    [],
             suggestions: [],
         };
-        mut new_children: Diagnostic[] = [];
-        for (mut i: i64 = 0; i < this.children.length; i++) {
-            new_children.push(this.children[i]);
-        }
-        new_children.push(child);
-        return Diagnostic {
-            severity:    this.severity,
-            code:        this.code,
-            message:     this.message,
-            span:        this.span,
-            labels:      this.labels,
-            children:    new_children,
-            suggestions: this.suggestions,
-        };
+        mut r: Diagnostic = this.clone();
+        r.children.push(child);
+        return r;
     }
 
     /// Append a help child diagnostic.
@@ -179,60 +152,23 @@ type struct Diagnostic {
             children:    [],
             suggestions: [],
         };
-        mut new_children: Diagnostic[] = [];
-        for (mut i: i64 = 0; i < this.children.length; i++) {
-            new_children.push(this.children[i]);
-        }
-        new_children.push(child);
-        return Diagnostic {
-            severity:    this.severity,
-            code:        this.code,
-            message:     this.message,
-            span:        this.span,
-            labels:      this.labels,
-            children:    new_children,
-            suggestions: this.suggestions,
-        };
+        mut r: Diagnostic = this.clone();
+        r.children.push(child);
+        return r;
     }
 
     /// Append a secondary span label (e.g. "also defined here").
     also_at(&this, span: SourceSpan, message: string) -> Diagnostic {
-        // See `at()` above: the `arr + [elem]` concat operator
-        // produces a malformed result for SpanLabel[]; build via push().
-        mut new_labels: SpanLabel[] = [];
-        for (mut i: i64 = 0; i < this.labels.length; i++) {
-            new_labels.push(this.labels[i]);
-        }
-        new_labels.push(SpanLabel::secondary(span, message));
-        return Diagnostic {
-            severity:    this.severity,
-            code:        this.code,
-            message:     this.message,
-            span:        this.span,
-            labels:      new_labels,
-            children:    this.children,
-            suggestions: this.suggestions,
-        };
+        mut r: Diagnostic = this.clone();
+        r.labels.push(SpanLabel::secondary(span, message));
+        return r;
     }
 
     /// Append a suggestion.
     suggest(&this, suggestion: Suggestion) -> Diagnostic {
-        // See `at()`: `arr + [elem]` produces a malformed array of structs;
-        // build via push().
-        mut new_suggestions: Suggestion[] = [];
-        for (mut i: i64 = 0; i < this.suggestions.length; i++) {
-            new_suggestions.push(this.suggestions[i]);
-        }
-        new_suggestions.push(suggestion);
-        return Diagnostic {
-            severity:    this.severity,
-            code:        this.code,
-            message:     this.message,
-            span:        this.span,
-            labels:      this.labels,
-            children:    this.children,
-            suggestions: new_suggestions,
-        };
+        mut r: Diagnostic = this.clone();
+        r.suggestions.push(suggestion);
+        return r;
     }
 
     /// Format for display (simple, non-rendered format).

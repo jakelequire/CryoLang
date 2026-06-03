@@ -180,11 +180,11 @@ type struct OwnershipQuery {
 
     /// True when every TypeRef in `tys` is Copy. Empty list trivially yes.
     static all_copy(arena: TypeArena*, registry: GenericRegistry*,
-                    intern: InternTable*, tys: TypeRef[],
+                    intern: InternTable*, tys: &TypeRef[],
                     depth: i32) -> boolean {
         for (mut i: i64 = 0; i < tys.length; i++) {
             if (!OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                   tys[i], depth)) {
+                                                   (*tys)[i], depth)) {
                 return false;
             }
         }
@@ -193,11 +193,11 @@ type struct OwnershipQuery {
 
     /// True when every FieldInfo in `fields` has a Copy field type.
     static all_fields_copy(arena: TypeArena*, registry: GenericRegistry*,
-                            intern: InternTable*, fields: FieldInfo[],
+                            intern: InternTable*, fields: &FieldInfo[],
                             depth: i32) -> boolean {
         for (mut i: i64 = 0; i < fields.length; i++) {
             if (!OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                   fields[i].field_type, depth)) {
+                                                   (*fields)[i].field_type, depth)) {
                 return false;
             }
         }
@@ -370,11 +370,11 @@ type struct OwnershipQuery {
 
     /// True when every element type in `tys` is Send/Sync.
     static all_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
-                            intern: InternTable*, tys: TypeRef[],
+                            intern: InternTable*, tys: &TypeRef[],
                             depth: i32) -> boolean {
         for (mut i: i64 = 0; i < tys.length; i++) {
             if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
-                                                          tys[i], depth)) {
+                                                          (*tys)[i], depth)) {
                 return false;
             }
         }
@@ -383,11 +383,11 @@ type struct OwnershipQuery {
 
     /// True when every field's type is Send/Sync.
     static all_fields_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
-                                    intern: InternTable*, fields: FieldInfo[],
+                                    intern: InternTable*, fields: &FieldInfo[],
                                     depth: i32) -> boolean {
         for (mut i: i64 = 0; i < fields.length; i++) {
             if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
-                                                          fields[i].field_type, depth)) {
+                                                          (*fields)[i].field_type, depth)) {
                 return false;
             }
         }
@@ -396,11 +396,11 @@ type struct OwnershipQuery {
 
     /// True when every variant payload list is all-Send/Sync.
     static all_variants_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
-                                      intern: InternTable*, variants: EnumVariantInfo[],
+                                      intern: InternTable*, variants: &EnumVariantInfo[],
                                       depth: i32) -> boolean {
         for (mut i: i64 = 0; i < variants.length; i++) {
             if (!OwnershipQuery::all_thread_safe(arena, registry, intern,
-                                                   variants[i].payload_types, depth)) {
+                                                   (*variants)[i].payload_types, depth)) {
                 return false;
             }
         }
@@ -477,10 +477,18 @@ type struct OwnershipQuery {
 
         if (k == TypeKind::Array) {
             const at: ArrayType* = t as ArrayType*;
-            // Dynamic arrays own a heap buffer via the Array<T> Drop impl,
-            // caught above by has_inherent_drop; a bare fixed array drops
-            // iff its element type does.
+            // A heap-backed `T[]` owns a malloc'd buffer (and transitively
+            // its elements), so it always needs drop regardless of element
+            // type.  Its synthesized `.drop()` dispatches to the
+            // byte-compatible `Array<T>::drop` (call_emitter), which drops
+            // each element in place and then frees the buffer.
+            if (at.is_heap_dynamic()) { return true; }
+            // A fixed array whose named-const/computed size is still pending
+            // (FIXED_PENDING) owns no heap buffer; we also can't see its
+            // element count, so don't synthesize a drop (matches the prior
+            // behavior for all `size < 0` arrays).
             if (at.is_dynamic()) { return false; }
+            // A resolved fixed array `[E; N]` drops iff its element does.
             return OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
                                                        at.element, depth + 1);
         }
@@ -530,11 +538,11 @@ type struct OwnershipQuery {
 
     /// True when any element type in `tys` needs drop.
     static any_needs_drop(arena: TypeArena*, registry: GenericRegistry*,
-                          intern: InternTable*, tys: TypeRef[],
+                          intern: InternTable*, tys: &TypeRef[],
                           depth: i32) -> boolean {
         for (mut i: i64 = 0; i < tys.length; i++) {
             if (OwnershipQuery::needs_drop_at_depth(arena, registry, intern,
-                                                    tys[i], depth)) {
+                                                    (*tys)[i], depth)) {
                 return true;
             }
         }

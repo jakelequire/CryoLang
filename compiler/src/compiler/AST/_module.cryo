@@ -363,6 +363,14 @@ type struct ArrayAnnotation {
     element: TypeAnnotation*;
     size:    i64;
     span:    SourceSpan;
+
+    // Sentinel `size` values for the two `size < 0` array shapes; the
+    // resolver copies `size` verbatim into `ArrayType`, whose matching
+    // `heap_dynamic_size()` / `fixed_pending_size()` are authoritative.
+    //   heap-dynamic `T[]`  : owns a heap buffer (droppable)
+    //   fixed-pending `T[N]`: named-const / computed N, resolved later
+    static heap_dynamic_size()  -> i64 { return -1; }
+    static fixed_pending_size() -> i64 { return -2; }
 }
 
 type struct FunctionAnnotation {
@@ -426,6 +434,17 @@ type struct TraitRef {
     path:      SymbolStr[];
     type_args: TypeAnnotation*[];
     span:      SourceSpan;
+
+    /// Deep copy into independently-owned arrays (SymbolStr and the
+    /// TypeAnnotation* handles are Copy), so a clone can be stored in a
+    /// second owner without aliasing this one's buffers.
+    clone(&this) -> TraitRef {
+        mut path_c: SymbolStr[] = [];
+        mut args_c: TypeAnnotation*[] = [];
+        for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
+        for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
+        return TraitRef { path: path_c, type_args: args_c, span: this.span };
+    }
 }
 
 /// A trait bound from a where clause (e.g., `where T: Default`,
@@ -438,6 +457,20 @@ type struct TraitBound {
     type_parameter: SymbolStr;
     trait_refs:     TraitRef[];
     span:           SourceSpan;
+
+    /// Deep copy; clones each (owning) TraitRef into an independent buffer so
+    /// the result can be stored in a second owner without a double-free.
+    clone(&this) -> TraitBound {
+        mut refs_c: TraitRef[] = [];
+        for (mut i: i64 = 0; i < this.trait_refs.length; i++) {
+            refs_c.push(this.trait_refs[i].clone());
+        }
+        return TraitBound {
+            type_parameter: this.type_parameter,
+            trait_refs:     refs_c,
+            span:           this.span,
+        };
+    }
 }
 
 /// A pattern element inside an enum pattern (e.g., binding, wildcard, literal).

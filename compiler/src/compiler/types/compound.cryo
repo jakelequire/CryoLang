@@ -12,6 +12,15 @@ namespace Compiler::Types::Compound;
 import Compiler::Types::TypeRef;
 import Compiler::Types;
 
+// ArrayType.size sentinels for the two `size < 0` shapes (kept as literals
+// at their use sites - see `is_heap_dynamic` and the parser - because a
+// module-level `const` referenced from a method does not reliably resolve):
+//   -1  ARRAY_SIZE_HEAP_DYNAMIC   `T[]`, owns a malloc'd buffer, droppable
+//   -2  ARRAY_SIZE_FIXED_PENDING  `T[N]` with named-const/computed N,
+//                                 fixed (no heap buffer), size resolved later
+// Both satisfy `is_dynamic()` (size < 0) so every existing layout/codegen
+// path is unaffected; only ownership analysis distinguishes them.
+
 
 // PointerType: Raw pointer to another type
 
@@ -79,6 +88,23 @@ public:
 
     is_dynamic(&this) -> boolean { return this.size < 0; }
     is_fixed(&this) -> boolean   { return this.size >= 0; }
+
+    // The two `size < 0` shapes that `is_dynamic()` lumps together. Named
+    // via static accessors rather than a module `const`, because a const
+    // referenced from a method does not reliably resolve in the self-host
+    // (it silently reads as 0, defeating the comparison).
+    //
+    //   heap-dynamic `T[]`  : heap-backed growable fat pointer that OWNS a
+    //                         malloc'd buffer; needs a buffer-freeing drop.
+    //   fixed-pending `T[N]`: N is a named const / computed expression; a
+    //                         FIXED array awaiting size resolution, owns no
+    //                         separate heap buffer, so it must NOT be freed.
+    // Both report `is_dynamic()`, so every layout/codegen path is unchanged;
+    // only ownership analysis distinguishes them.
+    static heap_dynamic_size()  -> i64 { return -1; }
+    static fixed_pending_size() -> i64 { return -2; }
+
+    is_heap_dynamic(&this) -> boolean { return this.size == ArrayType::heap_dynamic_size(); }
 
     override display_name(&this) -> string {
         if (this.is_dynamic()) {
