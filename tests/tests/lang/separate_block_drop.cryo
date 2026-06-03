@@ -1,0 +1,72 @@
+///! Inherent `drop` declared in a SEPARATE `implement T { ... }` block (not
+///! inline in the type body, and not via `implement trait Drop for T`) must
+///! be visible to ownership classification: the type is non-Copy and its
+///! destructor is synthesized at scope exit.
+///!
+///! Before this fix, `has_inherent_drop` only walked the type-decl node's
+///! inline `methods[]` and the TemplateEntry's impl_blocks (generics only).
+///! A non-generic type whose `drop` lived in a standalone inherent impl block
+///! was silently classified Copy AND never dropped - a silent leak, and a
+///! `where T: Copy` soundness hole. Separate-block methods already resolve and
+///! codegen for ordinary calls, so the gap was purely in the drop/Copy query.
+///!
+///! Each `Probe::drop()` bumps a module counter; tests assert the exact count.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::SeparateBlockDrop;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset_drop_count() -> void { g_drop_count = 0; }
+function drop_count()       -> i32  { return g_drop_count; }
+
+// `drop` lives in a standalone inherent impl block, NOT inline and NOT a
+// trait impl. This is the construct the fix wires into ownership analysis.
+type struct Probe { tag: i32; }
+implement Probe {
+    bumped(&this) -> i32 { return this.tag + 1; }
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+// A named local of the type drops exactly once at scope exit.
+![test]
+function separate_block_drop_runs_once() -> Result<(), TestError> {
+    reset_drop_count();
+    {
+        mut p: Probe = Probe { tag: 1 };
+        // Ordinary separate-block method still resolves and runs.
+        const b: i32 = p.bumped();
+        match (expect_eq(b, 2)) {
+            Result::Ok(_) => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }                              // p drops here, exactly once
+    return expect_eq(drop_count(), 1);
+}
+
+// Two distinct locals each drop once: no missed drop, no double-free.
+![test]
+function separate_block_drop_each_local() -> Result<(), TestError> {
+    reset_drop_count();
+    {
+        mut a: Probe = Probe { tag: 1 };
+        mut b: Probe = Probe { tag: 2 };
+        match (expect_eq(a.tag + b.tag, 3)) {
+            Result::Ok(_) => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_eq(drop_count(), 2);
+}
+
+// A discarded owning temporary of the type drops at statement end (the
+// drop-synthesis path now sees the separate-block destructor).
+![test]
+function separate_block_drop_discarded_temp() -> Result<(), TestError> {
+    reset_drop_count();
+    Probe { tag: 9 };
+    return expect_eq(drop_count(), 1);
+}
