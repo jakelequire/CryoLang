@@ -125,25 +125,27 @@ type struct TypeResolutionRunner {
         // have no outer params and need no binding work.
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
         if (trait_ann == null) { return; }
-        const args: TypeAnnotation*[] = TypeResolutionPasses::extract_trait_args(trait_ann);
-        if (args.length == 0) { return; }
+        // Read the trait args in place through the node (peel_to_generic
+        // returns the owning node, not a droppable copy of its args).
+        const gen: GenericAnnotation* = TypeResolutionPasses::peel_to_generic(trait_ann);
+        if (gen == null || gen.args.length == 0) { return; }
         const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
         if (!trait_leaf.is_valid()) { return; }
         const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
         if (trait_decl == null) { return; }
         // Arity mismatch is a user-level error caught elsewhere; bail
         // silently here rather than emit a duplicate diagnostic.
-        if (trait_decl.generic_params.length != args.length) { return; }
+        if (trait_decl.generic_params.length != gen.args.length) { return; }
 
         // Resolve each arg in the impl's own resolution context (which
         // already has the impl's `<T, ...>` params bound), then map the
         // trait param's name onto it.  `Iterator<T>` impl: trait_decl's
         // param[0] is `Item` and arg[0] resolves to the impl's `T`, so
         // we add `Item -> T` to the context.
-        for (mut i: i64 = 0; i < args.length; i++) {
+        for (mut i: i64 = 0; i < gen.args.length; i++) {
             const gp: GenericParamNode* = trait_decl.generic_params[i];
             if (gp == null) { continue; }
-            const arg_ty: TypeRef = this.resolver.resolve(args[i], res_ctx);
+            const arg_ty: TypeRef = this.resolver.resolve(gen.args[i], res_ctx);
             if (!arg_ty.is_valid()) { continue; }
             res_ctx.add_binding(gp.name, arg_ty);
         }
@@ -1453,21 +1455,26 @@ type struct TypeResolutionPasses {
         };
     }
 
-    /// Walk a trait_annotation to its generic arg list.  Returns the
-    /// `args` of the innermost `Generic(base, args)` wrapper, or an empty
-    /// list when the trait isn't a generic instantiation (e.g.
-    /// `implement trait Drop for Foo`; `Drop` is just `Named("Drop")`.
-    static extract_trait_args(ann: TypeAnnotation*) -> TypeAnnotation*[] {
-        if (ann == null) { return []; }
+    /// Peel a trait annotation down to its underlying GenericAnnotation
+    /// node (through Reference/Pointer wrappers), or null when the trait is
+    /// non-generic.  Returns the NODE pointer (Copy, non-owning), NOT a copy
+    /// of its `args`: callers read `gen.args` in place (member access /
+    /// indexing through the pointer) so the node keeps SOLE ownership of the
+    /// owning array.  Returning `g.args` by value aliased the field's buffer
+    /// into a droppable local, and since `TypeAnnotation*[]` is deep-owning
+    /// over its elements, two callers each dropping that alias double-freed
+    /// the node's args buffer (and its element nodes).
+    static peel_to_generic(ann: TypeAnnotation*) -> GenericAnnotation* {
+        if (ann == null) { return null; }
         return match (*ann) {
-            TypeAnnotation::Generic(g) => { g.args }
+            TypeAnnotation::Generic(g) => { g }
             TypeAnnotation::Reference(r) => {
-                TypeResolutionPasses::extract_trait_args(r.inner)
+                TypeResolutionPasses::peel_to_generic(r.inner)
             }
             TypeAnnotation::Pointer(p) => {
-                TypeResolutionPasses::extract_trait_args(p.inner)
+                TypeResolutionPasses::peel_to_generic(p.inner)
             }
-            _ => { [] }
+            _ => { null }
         };
     }
 
@@ -1515,10 +1522,19 @@ type struct TypeResolutionPasses {
         // arg (`T`, `i32`, `Pair<u64, A>`, ...).  Only meaningful when the
         // arities line up; an arity mismatch is a user error reported
         // elsewhere, so we skip the rewrite and let that path fire.
-        const trait_arg_anns: TypeAnnotation*[] =
-            TypeResolutionPasses::extract_trait_args(impl_node.trait_annotation);
+        // Read the trait args in place through the node; never copy the
+        // owning `gen.args` array into a droppable local (double-free).
+        // The non-generic case (gen == null) borrows a local empty sentinel
+        // so the downstream `&TypeAnnotation*[]` borrow always has a valid
+        // referent (it is never iterated when param_names is empty anyway).
+        const gen: GenericAnnotation* =
+            TypeResolutionPasses::peel_to_generic(impl_node.trait_annotation);
+        const empty_args: TypeAnnotation*[] = [];
+        const arg_count: i64 = if (gen != null) { gen.args.length } else { 0 };
+        const args_ref: &TypeAnnotation*[] =
+            if (gen != null) { &gen.args } else { &empty_args };
         mut trait_param_names: SymbolStr[] = [];
-        if (trait_arg_anns.length == trait_decl.generic_params.length) {
+        if (arg_count == trait_decl.generic_params.length) {
             for (mut gi: i64 = 0; gi < trait_decl.generic_params.length; gi++) {
                 const gp: GenericParamNode* = trait_decl.generic_params[gi];
                 if (gp == null) {
@@ -1571,7 +1587,7 @@ type struct TypeResolutionPasses {
             // lookup misses).
             TypeResolutionPasses::rewrite_default_method_signature(
                 cloned, impl_node.target_type, impl_node.target_args,
-                trait_param_names, trait_arg_anns);
+                trait_param_names, args_ref);
             mut method: MethodNode* = new MethodNode(cloned, cloned.span);
             method.set_static(cloned.is_static);
             impl_node.add_method(method);
