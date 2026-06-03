@@ -1,0 +1,73 @@
+///! Regression: `new T { field: owning_local }` must MOVE an owning-array
+///! local into the heap-constructed object, not leave it to be dropped at
+///! the constructing scope's exit.
+///!
+///! drop_insertion (and move_check) walked only `NewExpr.arguments`, never
+///! `NewExpr.struct_init`, so a field initializer like `new Bag { items: xs }`
+///! never marked `xs` moved. The drop glue then freed `xs`'s buffer (and each
+///! owning element) at scope exit while the heap object still aliased it - a
+///! double free / use-after-free. The matching bare struct literal
+///! (`Bag { items: xs }`) was always handled by read_struct_lit and is kept
+///! here as a control. See passes/drop_insertion.cryo::read_new and
+///! passes/move_check.cryo::read_new.
+///!
+///! Same Probe/counter harness as drop_glue.cryo / move_field_out_ok.cryo:
+///! each drop bumps a module counter, and the tests assert the EXACT count -
+///! too many means the double free we set out to prevent.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::NewStructInitArrayMove;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Probe { tag: i32; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+// Eq so `Option<Probe>` (array machinery is `where T: Eq`) instantiates
+// cleanly in the multi-module test build.
+implement trait Eq for struct Probe {
+    equals(&this, other: &Probe) -> boolean { return this.tag == other.tag; }
+}
+
+// An owning array of droppable elements: dropping the array drops each Probe.
+type struct Bag { items: Probe[]; }
+
+// `new Bag { items: xs }` moves `xs` into the heap Bag. The heap object is a
+// raw pointer (not scope-dropped), so its Probes never drop here. Pre-fix,
+// `xs` was dropped at block exit (count would be 2) and the read below would
+// touch freed storage.
+![test]
+function new_struct_init_moves_owning_array() -> Result<(), TestError> {
+    reset();
+    mut observed_len: i32 = 0;
+    {
+        const xs: Probe[] = [Probe { tag: 1 }, Probe { tag: 2 }];
+        const bag: Bag* = new Bag { items: xs };
+        // Read through the heap object: a use-after-free on the buggy compiler.
+        observed_len = bag.items.length as i32;
+    }
+    // xs was moved into the (leaked) heap Bag -> nothing dropped at scope exit.
+    const a: Result<(), TestError> = expect_eq(count(), 0);
+    if (a.is_err()) { return a; }
+    return expect_eq(observed_len, 2);
+}
+
+// Control: the bare struct-literal form moves the local into a VALUE Bag whose
+// glue drops the two Probes exactly once each at scope exit (never twice).
+![test]
+function struct_literal_value_drops_array_once() -> Result<(), TestError> {
+    reset();
+    {
+        const xs: Probe[] = [Probe { tag: 1 }, Probe { tag: 2 }];
+        const bag: Bag = Bag { items: xs };
+    }
+    return expect_eq(count(), 2);
+}
