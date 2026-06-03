@@ -294,11 +294,15 @@ type struct TypeArena {
     }
 
     /// Get or create a function type.
-    get_function(mut &this, ret: TypeRef, params: TypeRef[], is_variadic: boolean) -> TypeRef {
+    // `params` is borrowed: get_function only reads element ids to build the
+    // cache key, so callers keep ownership (and can reuse the array for a
+    // MethodInfo or drop it).  On the cache-miss path the array is copied into
+    // the owning FunctionType (TypeRef is Copy, so this is a cheap shallow copy).
+    get_function(mut &this, ret: TypeRef, params: &TypeRef[], is_variadic: boolean) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] get_function() ret=%lu params=%lld", ret.id, params.length);
         mut key: string = format("fn_ret_%lu", ret.id);
         for (mut i: i64 = 0; i < params.length; i++) {
-            key = format("%s_%lu", key, params[i].id);
+            key = format("%s_%lu", key, (*params)[i].id);
         }
         if (is_variadic) {
             key += "_var";
@@ -308,7 +312,11 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.function_cache.get(&key);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params, is_variadic));
+        mut params_owned: TypeRef[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            params_owned.push((*params)[i]);
+        }
+        mut ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params_owned, is_variadic));
         this.function_cache.insert(key, ref);
         return ref;
     }
@@ -456,13 +464,16 @@ type struct TypeArena {
     /// InstantiatedTypes directly during template body rewrites).
     /// Sharing the arena slot means `set_resolved_type` done by the
     /// monomorphizer for one caller automatically satisfies the other.
-    create_instantiation(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
+    // `args` is borrowed (read for the cache key); on the cache-miss path it
+    // is copied into the owning InstantiatedType (TypeRef is Copy).  Callers
+    // keep ownership and can reuse the array for demand tracking.
+    create_instantiation(mut &this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
         mut key: string = format("%llu<", base.id);
         for (mut i: i64 = 0; i < args.length; i++) {
             if (i > 0) {
-                key = format("%s,%llu", key, args[i].id);
+                key = format("%s,%llu", key, (*args)[i].id);
             } else {
-                key = format("%s%llu", key, args[i].id);
+                key = format("%s%llu", key, (*args)[i].id);
             }
         }
         key = format("%s>", key);
@@ -473,7 +484,11 @@ type struct TypeArena {
             return cached.unwrap();
         }
 
-        const ref: TypeRef = this.alloc_type(new InstantiatedType(this.next_id, base, args));
+        mut args_owned: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            args_owned.push((*args)[i]);
+        }
+        const ref: TypeRef = this.alloc_type(new InstantiatedType(this.next_id, base, args_owned));
         this.instantiated_cache.insert(key, ref);
         return ref;
     }
@@ -493,7 +508,7 @@ type struct TypeArena {
     /// every other textual occurrence of `HashMap<string, u32>` stays
     /// unresolved and breaks `fallback 2` in codegen scope-call resolution.
     propagate_instantiated_resolution(mut &this, base: TypeRef,
-                                       type_args: TypeRef[],
+                                       type_args: &TypeRef[],
                                        resolved: TypeRef) -> i64 {
         mut count: i64 = 0;
         for (mut i: i64 = 0; i < this.types.length; i++) {
@@ -506,7 +521,7 @@ type struct TypeArena {
             if (inst.type_args.length != type_args.length) { continue; }
             mut matches: boolean = true;
             for (mut j: i64 = 0; j < type_args.length; j++) {
-                if (inst.type_args[j].id != type_args[j].id) {
+                if (inst.type_args[j].id != (*type_args)[j].id) {
                     matches = false;
                     break;
                 }

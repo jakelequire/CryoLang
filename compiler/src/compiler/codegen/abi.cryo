@@ -91,6 +91,23 @@ type struct ParamPlan {
     /// type so codegen can emit `byval(%T)` / `sret(%T)` correctly.
     /// `LType::null()` when not applicable.
     pointee_ty: LType;
+
+    /// Deep copy.  `llvm_slots` (the only owning field; LType is Copy) is
+    /// rebuilt into an independent buffer so a clone can be stored in a
+    /// second owner without double-freeing this plan's slots.
+    clone(&this) -> ParamPlan {
+        mut slots_c: LType[] = [];
+        for (mut i: i64 = 0; i < this.llvm_slots.length; i++) {
+            slots_c.push(this.llvm_slots[i]);
+        }
+        return ParamPlan {
+            cryo_type:  this.cryo_type,
+            cls:        this.cls,
+            llvm_slots: slots_c,
+            attr:       this.attr,
+            pointee_ty: this.pointee_ty,
+        };
+    }
 }
 
 type struct SignaturePlan {
@@ -180,14 +197,14 @@ type struct AbiClassifier {
     /// source-language parameter list (excluding the variadic trailing
     /// bucket); `return_type` may be invalid for `void`/`unit` returns.
     classify_signature(mut &this,
-                       params: TypeRef[],
+                       params: &TypeRef[],
                        return_type: TypeRef,
                        is_variadic: boolean) -> SignaturePlan {
         const return_plan: ParamPlan = this.classify_return(return_type);
 
         mut param_plans: ParamPlan[] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
-            param_plans.push(this.classify_param(params[i]));
+            param_plans.push(this.classify_param((*params)[i]));
         }
 
         const sret: boolean = return_plan.cls == ArgClass::Indirect;
@@ -902,7 +919,7 @@ type struct AbiClassifier {
             this.apply_sret_call_attribute(call_val, plan.return_plan.pointee_ty);
         }
         for (mut i: i64 = 0; i < plan.param_plans.length; i++) {
-            const pp: ParamPlan = plan.param_plans[i];
+            const pp: &ParamPlan = &plan.param_plans[i];
             if (pp.cls == ArgClass::Indirect
                     && pp.attr == AbiAttr::ByVal
                     && pp.pointee_ty.is_valid()) {
@@ -965,12 +982,12 @@ function llvm_param_count(plan: SignaturePlan*) -> u32 {
 /// DirectPair params the ordinal no longer equals the LLVM slot index,
 /// and a `byval(%T)` attached at the wrong index lands on an incompatible
 /// (non-pointer) slot - an LLVM verifier failure.
-function llvm_slot_index_of_param(param_plans: ParamPlan[],
+function llvm_slot_index_of_param(param_plans: &ParamPlan[],
                                   sret: boolean, param_idx: i64) -> u32 {
     mut idx: u32 = if (sret) { 1 } else { 0 } as u32;
     mut i: i64 = 0;
     while (i < param_idx && i < param_plans.length) {
-        idx += param_plans[i].llvm_slots.length as u32;
+        idx += (*param_plans)[i].llvm_slots.length as u32;
         i += 1;
     }
     return idx;
@@ -980,14 +997,10 @@ function llvm_slot_index_of_param(param_plans: ParamPlan[],
 /// `Indirect`, parameters in order) into the slot array LLVM's
 /// `LLVMFunctionType` consumes.  Returns the assembled function type.
 ///
-/// The plans are passed by value here.  Cryo's move-checker emits a
-/// "use of moved value" warning when the caller re-uses these to stamp
-/// out a `SignaturePlan` after this call, but it is a *warning only*
-/// today (the same shape appears throughout `instance.cryo`); no actual
-/// double-drop happens because nothing in `ParamPlan` owns heap memory
-/// uniquely.  A future move-check tightening should reconsider this seam.
-function build_llvm_fn_type(return_plan:  ParamPlan,
-                            param_plans:  ParamPlan[],
+/// `return_plan` / `param_plans` are borrowed: this only reads the plans to
+/// assemble the LLVM type, so the caller keeps ownership for the SignaturePlan.
+function build_llvm_fn_type(return_plan:  &ParamPlan,
+                            param_plans:  &ParamPlan[],
                             is_variadic:  boolean) -> LType {
     // Step 1: pick the LLVM return type.  `Indirect` returns become
     // `void` because the value is written through the hidden sret
@@ -1015,7 +1028,7 @@ function build_llvm_fn_type(return_plan:  ParamPlan,
     mut total: u32 = 0;
     if (return_plan.cls == ArgClass::Indirect) { total += 1; }
     for (mut i: i64 = 0; i < param_plans.length; i++) {
-        total += param_plans[i].llvm_slots.length as u32;
+        total += (*param_plans)[i].llvm_slots.length as u32;
     }
 
     if (total == 0) {
@@ -1035,7 +1048,7 @@ function build_llvm_fn_type(return_plan:  ParamPlan,
     }
 
     for (mut pi: i64 = 0; pi < param_plans.length; pi++) {
-        const pp: ParamPlan = param_plans[pi];
+        const pp: &ParamPlan = &(*param_plans)[pi];
         for (mut si: i64 = 0; si < pp.llvm_slots.length; si++) {
             const slot: LType = pp.llvm_slots[si];
             if (!slot.is_valid()) { all_valid = false; }

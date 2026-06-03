@@ -613,11 +613,15 @@ type struct CompilerInstance {
                 }
             }
             if (chosen >= 0) {
-                config = make_bin_view(config, config.bins[chosen]);
+                // BinTarget is Copy; pull the selection out before `config`
+                // is moved into make_bin_view so the read isn't after-move.
+                const sel: BinTarget = config.bins[chosen];
+                config = make_bin_view(config, sel);
             } else if (config.lib.is_present()) {
                 config = make_lib_view(config);
             } else if (config.bins.length > 0) {
-                config = make_bin_view(config, config.bins[0]);
+                const sel: BinTarget = config.bins[0];
+                config = make_bin_view(config, sel);
             }
         }
         return this.compile_project_with_ctx(ctx, config);
@@ -634,7 +638,9 @@ type struct CompilerInstance {
             const slot: void** = intrinsics::ptr_add(ast_buf, (mod_idx * 8) as i64) as void**;
             const ast: ProgramNode* = *slot as ProgramNode*;
             if (ast != null) {
-                const info: ModuleInfo = ctx.module_graph.modules[mod_idx];
+                // Borrow the stored ModuleInfo; a value copy would shallow-alias
+                // its owning arrays and double-free them at scope exit.
+                const info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
                 const ns: string = intern.resolve(info.namespace_name);
                 ctx.artifacts.ast = ASTOutput {
                     root: ast,
@@ -654,7 +660,7 @@ type struct CompilerInstance {
             const sc_slot: u64* = intrinsics::ptr_add(scope_buf, (mod_idx * 8) as i64) as u64*;
             const saved_scope: u64 = *sc_slot;
             if (saved_scope > 0) {
-                const info: ModuleInfo = ctx.module_graph.modules[mod_idx];
+                const info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
                 ctx.resolver.set_module_with_scope(info.name, saved_scope);
             }
         }
@@ -725,7 +731,8 @@ type struct CompilerInstance {
         if (base.lib.is_present()) {
             cdebug("[Compiler] Multi-target: building lib '%s' from %s\n",
                 base.lib.name, base.lib.source_dir);
-            const lib_view: ProjectConfig = make_lib_view(base);
+            // Clone so `base` survives for the per-bin views below.
+            const lib_view: ProjectConfig = make_lib_view(base.clone());
             const r: CompilationResult = this.compile_project_with_config(lib_view);
             if (!r.success) { return r; }
         }
@@ -733,7 +740,9 @@ type struct CompilerInstance {
         for (mut i: int = 0; i < base.bins.length; i++) {
             cdebug("[Compiler] Multi-target: building bin '%s' from %s\n",
                 base.bins[i].name, base.bins[i].entry_point);
-            const bin_view: ProjectConfig = make_bin_view(base, base.bins[i]);
+            // Clone `base` per iteration; make_bin_view consumes its first arg.
+            const sel: BinTarget = base.bins[i];
+            const bin_view: ProjectConfig = make_bin_view(base.clone(), sel);
             const r: CompilationResult = this.compile_project_with_config(bin_view);
             if (!r.success) { return r; }
             if (intrinsics::strlen(r.output_path) > 0) { last_output = r.output_path; }
@@ -833,7 +842,10 @@ type struct CompilerInstance {
         ctx.project_no_std = config.no_std;
         ctx.target_triple = config.target_triple;
 
-        const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config);
+        // Box an independent clone so the local `config` stays usable for the
+        // rest of this function (stdlib resolution, dep scan, loader setup);
+        // the leaked box owns the copy that lives for `ctx`'s lifetime.
+        const _box_config: Box<ProjectConfig> = Box<ProjectConfig>::new(config.clone());
         ctx.set_project_config(_box_config.leak());
 
         // Resolve stdlib root.  See resolve_stdlib_root above for the
@@ -1046,7 +1058,7 @@ type struct CompilerInstance {
 
         cdebug("[Compiler] Discovered %u modules, compilation order:\n", n);
         for (mut i: u32 = 0; i < n; i++) {
-            const info: ModuleInfo = ctx.module_graph.modules[order[i]];
+            const info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
             cdebug("  [%u] %s (%s)\n", i,
                 ctx.intern_table.resolve(info.name), info.file_path);
         }
@@ -1429,7 +1441,7 @@ type struct CompilerInstance {
                     const dump_slot: void** = intrinsics::ptr_add(ast_buf, (mi * 8) as i64) as void**;
                     const dump_ast: ProgramNode* = *dump_slot as ProgramNode*;
                     if (dump_ast != null) {
-                        const mod_info: ModuleInfo = ctx.module_graph.modules[mi];
+                        const mod_info: ModuleInfo* = &ctx.module_graph.modules[mi];
                         intrinsics::printf("\n=== AST: %s ===\n", mod_info.file_path);
                         ASTDumper::dump(dump_ast, ctx.intern_table);
                     }
@@ -1447,7 +1459,7 @@ type struct CompilerInstance {
         if (!phase6_failed) {
             for (mut i: u32 = 0; i < n; i++) {
                 const mod_idx: u32 = order[i];
-                const mod_info: ModuleInfo = ctx.module_graph.modules[mod_idx];
+                const mod_info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
                 const mod_sym: SymbolStr = ctx.intern(mod_info.file_path);
                 build_cross_module_descriptors(
                     ctx.module_graph, mod_sym, ctx.decl_index, ctx.type_arena);
@@ -1488,7 +1500,7 @@ type struct CompilerInstance {
             }
 
             for (mut i: u32 = 0; i < n; i++) {
-                const _mi: ModuleInfo = ctx.module_graph.modules[order[i]];
+                const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.resolve(_mi.name);
                 cdebug("[Compiler] Phase 7: module %u/%u (%s)\n", i, n, _mn);
                 CompilerInstance::load_module_with_scope(
@@ -1513,7 +1525,7 @@ type struct CompilerInstance {
                 const pipeline_ok: boolean = pipeline.run_all(ctx);
 
                 if (ctx.artifacts.ir.is_valid()) {
-                    const mod_info: ModuleInfo = ctx.module_graph.modules[order[i]];
+                    const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                     const mod_name: string = ctx.intern_table.resolve(mod_info.name);
 
                     // Write .ll text file when --emit-llvm is set

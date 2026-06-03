@@ -246,15 +246,18 @@ type struct GenericRegistry {
     /// Register a template entry.  Deduplicates by qualified_name;
     /// if an entry with the same name exists, it is overwritten.
     register_template(mut &this, entry: TemplateEntry) -> void {
-        const h: u64 = hash_int(entry.qualified_name.id as u64);
-        const existing: Option<i64> = this.name_index.get(&entry.qualified_name.id);
+        // Capture the Copy fields before `entry` is moved into the store.
+        const qname_id:  u32     = entry.qualified_name.id;
+        const base_type: TypeRef = entry.base_type;
+        const h: u64 = hash_int(qname_id as u64);
+        const existing: Option<i64> = this.name_index.get(&qname_id);
 
         if (existing.is_some()) {
             // Overwrite existing
             const i: i64 = existing.unwrap();
             this.entries[i] = entry;
-            if (entry.base_type.is_valid()) {
-                this.update_type_index(entry.base_type.id, i);
+            if (base_type.is_valid()) {
+                this.update_type_index(base_type.id, i);
             }
             return;
         }
@@ -262,12 +265,12 @@ type struct GenericRegistry {
         // New entry
         const idx: i64 = this.entries.length;
         this.entries.push(entry);
-        this.name_index.insert(entry.qualified_name.id, idx);
+        this.name_index.insert(qname_id, idx);
 
-        if (entry.base_type.is_valid()) {
-            this.tmpl_type_ids.push(entry.base_type.id);
+        if (base_type.is_valid()) {
+            this.tmpl_type_ids.push(base_type.id);
             this.tmpl_type_indices.push(idx);
-            this.type_index.insert(entry.base_type.id, idx);
+            this.type_index.insert(base_type.id, idx);
         }
     }
 
@@ -500,7 +503,7 @@ type struct GenericRegistry {
     /// Get or create an InstantiatedType for the given base + type args.
     /// Deduplicates via string key so the same instantiation always returns
     /// the same TypeRef.
-    instantiate(mut &this, base: TypeRef, args: TypeRef[]) -> TypeRef {
+    instantiate(mut &this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
         const key: string = this.make_cache_key(base, args);
         const h: u64 = hash_str(key);
 
@@ -521,7 +524,7 @@ type struct GenericRegistry {
 
     /// Like instantiate(), but also records which module requested it.
     /// Used by TypeResolution to track per-module demand for codegen.
-    instantiate_for_module(mut &this, base: TypeRef, args: TypeRef[],
+    instantiate_for_module(mut &this, base: TypeRef, args: &TypeRef[],
                            module: SymbolStr) -> TypeRef {
         const result: TypeRef = this.instantiate(base, args);
         // Record the demand regardless of cache hit; a module that uses
@@ -556,13 +559,13 @@ type struct GenericRegistry {
     //  Monomorphization tracking
 
     /// Check if an instantiation has already been monomorphized.
-    is_monomorphized(&this, base: TypeRef, args: TypeRef[]) -> boolean {
+    is_monomorphized(&this, base: TypeRef, args: &TypeRef[]) -> boolean {
         const key: string = this.make_cache_key(base, args);
         return this.mono_set.contains_key(&key);
     }
 
     /// Mark an instantiation as monomorphized (specialization completed).
-    mark_monomorphized(mut &this, base: TypeRef, args: TypeRef[]) -> void {
+    mark_monomorphized(mut &this, base: TypeRef, args: &TypeRef[]) -> void {
         const key: string = this.make_cache_key(base, args);
         const h: u64 = hash_str(key);
         if (!this.mono_set.contains_key(&key)) {
@@ -593,13 +596,13 @@ type struct GenericRegistry {
         return this.mono_set.length() as i64;
     }
 
-    make_cache_key(&this, base: TypeRef, args: TypeRef[]) -> string {
+    make_cache_key(&this, base: TypeRef, args: &TypeRef[]) -> string {
         mut key: string = format("%llu<", base.id);
         for (mut i: i64 = 0; i < args.length; i++) {
             if (i > 0) {
                 key += ",";
             }
-            key += format("%llu", args[i].id);
+            key += format("%llu", (*args)[i].id);
         }
         key += ">";
         return key;

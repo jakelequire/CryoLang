@@ -76,8 +76,8 @@ type struct ASTSpecializer {
     ///   4. Run ASTTypeSubstituter on the clone
     ///   5. Clone + substitute each impl block
     ///   6. Return result
-    specialize(&this, entry: TemplateEntry*, type_args: TypeRef[],
-               type_arg_displays: string[]) -> SpecializationResult {
+    specialize(&this, entry: TemplateEntry*, type_args: &TypeRef[],
+               type_arg_displays: &string[]) -> SpecializationResult {
         // Validate
         if (entry == null) {
             return SpecializationResult::fail("null template entry");
@@ -89,14 +89,7 @@ type struct ASTSpecializer {
             );
         }
 
-        // 1. Build substitution
-        const subst: TypeSubstitution = TypeSubstitution::from_params(
-            entry.param_type_ids, type_args
-        );
-        const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
-        *subst_ptr = subst;
-
-        // 2. Generate the specialized identifier through the central mangler
+        // 1. Generate the specialized identifier through the central mangler
         //    so the encoding stays the single source of truth across
         //    specializer / sema / codegen.  For static method templates,
         //    `spec_base_name` folds the owner type's leaf into the bare
@@ -107,6 +100,13 @@ type struct ASTSpecializer {
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
             this.intern_table, this.arena, base_qname, type_args);
         const spec_name: string = this.intern_table.resolve(spec_sym);
+
+        // 2. Build substitution (borrows + copies `type_args`).
+        const subst: TypeSubstitution = TypeSubstitution::from_params(
+            entry.param_type_ids, type_args
+        );
+        const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
+        *subst_ptr = subst;
 
         // 3. Clone AST: using for_specialization() so the clone is created
         //    with the specialized name and empty generic_params from the
@@ -124,7 +124,7 @@ type struct ASTSpecializer {
         //    entry.name and entry.param_names are already SymbolStr; no re-interning.
         mut arg_syms: SymbolStr[] = [];
         for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
-            arg_syms.push(this.intern_table.intern(type_arg_displays[ai]));
+            arg_syms.push(this.intern_table.intern((*type_arg_displays)[ai]));
         }
 
         mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
@@ -193,7 +193,7 @@ type struct ASTSpecializer {
     ///     spec'ing Result<X, Y>: args=[X, Y] match the spec's display
     ///     names -> modified=false (keep, this is not a real shape change)
     method_has_modified_self_type(&this, method: MethodNode*, entry: TemplateEntry*,
-                                   type_arg_displays: string[]) -> boolean {
+                                   type_arg_displays: &string[]) -> boolean {
         if (method == null || method.func == null) { return false; }
         const func: FunctionDeclNode* = method.func;
 
@@ -220,7 +220,7 @@ type struct ASTSpecializer {
     /// NEITHER the bare outer param in its position NOR equal to the
     /// corresponding spec type-arg display (or its leaf).
     annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*,
-                                  type_arg_displays: string[]) -> boolean {
+                                  type_arg_displays: &string[]) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
             TypeAnnotation::Reference(ref) => {
@@ -239,7 +239,7 @@ type struct ASTSpecializer {
                         for (mut i: i64 = 0; i < gen.args.length; i++) {
                             mut spec_disp: string = "";
                             if (i < type_arg_displays.length) {
-                                spec_disp = type_arg_displays[i];
+                                spec_disp = (*type_arg_displays)[i];
                             }
                             if (!this.annotation_matches_param_or_spec(
                                 gen.args[i], entry.param_names[i], spec_disp)) {

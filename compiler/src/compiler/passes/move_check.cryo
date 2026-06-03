@@ -763,6 +763,14 @@ type struct MoveChecker {
         // A storage-duplicating move of a non-Copy field out of an owned
         // value is a double free (no partial-move tracking). Reject it.
         if (real) { this.check_field_move_out(expr); }
+        // Same hazard for an array element read by value: the array keeps
+        // ownership of the element, so the duplicated handle is freed twice.
+        if (real) { this.check_array_move_out(expr); }
+        // ...and for a whole owning-array field read by value THROUGH a
+        // pointer/reference (`x = node.fields`): `check_field_move_out` only
+        // covers owned-value places, but an owning `T[]` field aliases its
+        // buffer regardless of how the struct is reached, so it double-frees.
+        if (real) { this.check_array_field_move_out(expr); }
         if (expr.kind == NodeKind::Identifier) {
             this.handle_ident(expr as IdentifierNode*, true, real);
             return;
@@ -1145,6 +1153,77 @@ type struct MoveChecker {
             "moving this field out leaves the source to drop it again at scope exit (double free)");
         diag = diag.help(
             "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// Reject a value-copy of a droppable element out of an owning array.
+    ///
+    /// `const x: T = arr[i];` (and the return / assignment-RHS /
+    /// aggregate-literal forms) bitwise-copies the element's owning handle
+    /// into an independently-dropped place while the array keeps owning the
+    /// same element, so the buffer is freed twice at scope exit.  Cryo has
+    /// no partial-move tracking for arrays, so this is a hard error (E0453);
+    /// borrow the element instead (`const x: &T = &arr[i];`) or, when an
+    /// owned copy is genuinely needed, clone it.  Indexing a raw pointer
+    /// (`ptr[i]`, where `ptr: T*`) is borrowed/heap storage the caller
+    /// manages and is deliberately allowed - mirrors `is_owned_value_place`.
+    check_array_move_out(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null || expr.kind != NodeKind::ArrayAccess) { return; }
+        const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+        if (aa.array == null) { return; }
+        // Only a droppable element double-frees; Copy / non-owning elements
+        // are bitwise-independent of the array and safe to duplicate.
+        const elem_ty: TypeRef = expr.resolved_type;
+        if (!elem_ty.is_valid() || !this.type_needs_drop(elem_ty)) { return; }
+        // The indexed operand must be an owning array value (`T[]`/`Array<T>`),
+        // not a raw-pointer deref the caller is responsible for.
+        const arr_ty: TypeRef = aa.array.resolved_type;
+        if (!arr_ty.is_valid() || this.is_ptr_or_ref(arr_ty)) { return; }
+        this.emit_array_move_out_error(aa);
+    }
+
+    emit_array_move_out_error(mut &this, aa: ArrayAccessNode*) -> void {
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0453_DOUBLE_FREE,
+            "cannot move an element out of an array that owns a destructor");
+        diag = diag.at_with_label(aa.span,
+            "copying this element out leaves the array to drop it again at scope exit (double free)");
+        diag = diag.help(
+            "borrow the element instead (`const x: &T = &arr[i];`); or clone it when an owned copy is required");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// Reject a value-copy of a whole owning array (`T[]`) out of a struct
+    /// FIELD reached through a pointer/reference (`x = node.fields`,
+    /// `f(node.fields)`).  `check_field_move_out` already catches the
+    /// owned-value-place form; this covers the through-pointer form, which it
+    /// deliberately skips.  The buffer is owned by the struct regardless of
+    /// how it's reached, so the bitwise-copied handle is freed twice.  Borrow
+    /// it (`&node.fields`) or clone it.
+    check_array_field_move_out(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null || expr.kind != NodeKind::MemberAccess) { return; }
+        const ma: MemberAccessNode* = expr as MemberAccessNode*;
+        if (ma.object == null) { return; }
+        const field_ty: TypeRef = expr.resolved_type;
+        if (!field_ty.is_valid()) { return; }
+        const t: Type* = this.arena.lookup(field_ty.id);
+        if (t == null || t.kind != TypeKind::Array) { return; }
+        // Only an owning (droppable) array buffer double-frees on copy.
+        if (!this.type_needs_drop(field_ty)) { return; }
+        // The owned-value-place form is already handled by
+        // `check_field_move_out`; don't double-report it.
+        if (this.is_owned_value_place(ma.object)) { return; }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0453_DOUBLE_FREE,
+            "cannot move an owning array out of a value that owns a destructor");
+        diag = diag.at_with_label(ma.span,
+            "copying this array field out aliases the buffer the source still owns (double free)");
+        diag = diag.help(
+            "borrow it (`const x: &T[] = &place.field;`) or clone it when an owned copy is required");
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;

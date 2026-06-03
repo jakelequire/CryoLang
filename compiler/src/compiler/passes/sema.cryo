@@ -4267,13 +4267,26 @@ public:
         }
         if (base_t == null) { return []; }
 
-        mut methods: MethodInfo[] = [];
+        // Collect arity-matching overloads as borrows (MethodInfo*) into the
+        // owning method arrays; copying a MethodInfo by value would alias its
+        // `param_types` buffer and double-free when the copy drops.
+        mut found: MethodInfo*[] = [];
         if (base_t.kind == TypeKind::Class) {
             const ct: ClassType* = base_t as ClassType*;
-            methods = ct.methods;
+            for (mut i: i64 = 0; i < ct.methods.length; i++) {
+                const m: MethodInfo* = &ct.methods[i];
+                if (m.name.equals(member.member) && m.param_types.length == arg_count) {
+                    found.push(m);
+                }
+            }
         } else if (base_t.kind == TypeKind::Struct) {
             const st: StructType* = base_t as StructType*;
-            methods = st.methods;
+            for (mut i: i64 = 0; i < st.methods.length; i++) {
+                const m: MethodInfo* = &st.methods[i];
+                if (m.name.equals(member.member) && m.param_types.length == arg_count) {
+                    found.push(m);
+                }
+            }
         } else if (base_t.kind == TypeKind::BoundedParam) {
             // Bound-aware param-type hint: when the receiver is a generic
             // param `T: Trait`, look up `member` on each bound trait so
@@ -4289,26 +4302,26 @@ public:
                 if (bt == null || bt.kind != TypeKind::Trait) { continue; }
                 const tt: TraitType* = bt as TraitType*;
                 for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
-                    methods.push(tt.required_methods[mi]);
+                    const m: MethodInfo* = &tt.required_methods[mi];
+                    if (m.name.equals(member.member) && m.param_types.length == arg_count) {
+                        found.push(m);
+                    }
                 }
             }
-            if (methods.length == 0) { return []; }
         } else {
             return [];
         }
 
-        // Narrow to overloads whose arity matches the call; an overload
-        // with a different param count can't participate in this call's
-        // type-checking, so it shouldn't influence the hint.
-        mut found: MethodInfo[] = [];
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            if (methods[i].name.equals(member.member) &&
-                methods[i].param_types.length == arg_count) {
-                found.push(methods[i]);
-            }
-        }
         if (found.length == 0) { return []; }
-        if (found.length == 1) { return found[0].param_types; }
+        if (found.length == 1) {
+            // Return an independent copy (TypeRef is Copy); the owning method
+            // keeps its own param_types array.
+            mut single: TypeRef[] = [];
+            for (mut i: i64 = 0; i < found[0].param_types.length; i++) {
+                single.push(found[0].param_types[i]);
+            }
+            return single;
+        }
 
         // Multiple arity-matching overloads: return a position-wise hint
         // only where every overload agrees on the type.  A TypeRef::invalid()
@@ -4316,11 +4329,11 @@ public:
         // pushes when param_types[i].is_valid()).
         mut merged: TypeRef[] = [];
         for (mut p: i64 = 0; p < arg_count; p++) {
-            const first_info: MethodInfo = found[0];
+            const first_info: MethodInfo* = found[0];
             const first_ty: TypeRef = first_info.param_types[p];
             mut agree: boolean = true;
             for (mut j: i64 = 1; j < found.length; j++) {
-                const j_info: MethodInfo = found[j];
+                const j_info: MethodInfo* = found[j];
                 const j_ty: TypeRef = j_info.param_types[p];
                 if (j_ty.id != first_ty.id) {
                     agree = false;
@@ -5184,7 +5197,7 @@ public:
     /// `FunctionDeclNode.origin_trait`, which TypeResolution stamps on every
     /// trait-impl method. Used to detect two-trait dispatch ambiguity even
     /// when both methods sit in the receiver's inherent method table.
-    method_origin_trait(&this, m: MethodInfo) -> SymbolStr {
+    method_origin_trait(&this, m: &MethodInfo) -> SymbolStr {
         if (m.ast_node == null) { return SymbolStr::empty(); }
         const mn: MethodNode* = m.ast_node as MethodNode*;
         if (mn.func == null) { return SymbolStr::empty(); }
@@ -5277,7 +5290,7 @@ public:
         mut depth: i32 = 0;
         while (depth < 16) {
             for (mut mi: i64 = 0; mi < cur.length; mi++) {
-                const m: MethodInfo = cur[mi];
+                const m: &MethodInfo = &cur[mi];
                 if (!m.name.equals(member.member)) { continue; }
                 if (this.method_type_is_variadic(m.function_type)) {
                     variadic_ok = true;
@@ -5602,7 +5615,7 @@ public:
         mut name_seen:  i64 = 0;
         mut uniq_arity: i64 = -1;
         for (mut mi: i64 = 0; mi < methods.length; mi++) {
-            const m: MethodInfo = methods[mi];
+            const m: &MethodInfo = &methods[mi];
             if (!m.is_static) { continue; }
             if (!m.name.equals(scope.member_name)) { continue; }
             if (this.method_type_is_variadic(m.function_type)) {
@@ -5636,7 +5649,7 @@ public:
             mut fit_count:  i64 = 0;
             mut fit_params: TypeRef[] = [];
             for (mut mi: i64 = 0; mi < methods.length; mi++) {
-                const m: MethodInfo = methods[mi];
+                const m: &MethodInfo = &methods[mi];
                 if (!m.is_static) { continue; }
                 if (!m.name.equals(scope.member_name)) { continue; }
                 if (this.method_type_is_variadic(m.function_type)) { continue; }
@@ -6361,7 +6374,7 @@ public:
                                  member: MemberAccessNode*,
                                  block: ImplBlockNode*,
                                  owner_str: string,
-                                 arg_types: TypeRef[]) -> boolean {
+                                 arg_types: &TypeRef[]) -> boolean {
         if (block == null) { return false; }
         const this_amp: SymbolStr = this.intern.intern("&this");
         const this_val: SymbolStr = this.intern.intern("this");
@@ -6390,9 +6403,9 @@ public:
 
                 mut compat: boolean = true;
                 for (mut pi: i64 = 0; pi < params.length; pi++) {
-                    if (params[pi].id == arg_types[pi].id) { continue; }
+                    if (params[pi].id == (*arg_types)[pi].id) { continue; }
                     if (allow_implicit && this.checker.can_implicit_convert(
-                            arg_types[pi], params[pi])) {
+                            (*arg_types)[pi], params[pi])) {
                         continue;
                     }
                     compat = false;
@@ -6474,7 +6487,7 @@ public:
 
         // Find the first bound whose concrete argument doesn't satisfy it.
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
-            const bound: TraitBound = func.trait_bounds[bi];
+            const bound: &TraitBound = &func.trait_bounds[bi];
             mut concrete: TypeRef = TypeRef::invalid();
             for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
                 if (tmpl.param_names[pi].equals(bound.type_parameter)) {
@@ -6484,7 +6497,7 @@ public:
             }
             if (!concrete.is_valid()) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
-                const tref: TraitRef = bound.trait_refs[ri];
+                const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (this.ctx.monomorphizer.type_implements_trait(concrete, trait_name, 0)) {
@@ -6569,7 +6582,7 @@ public:
         // Find a `where <param>: Copy` bound on iter() whose concrete
         // argument doesn't satisfy `Copy`.
         for (mut bi: i64 = 0; bi < iter_fn.trait_bounds.length; bi++) {
-            const bound: TraitBound = iter_fn.trait_bounds[bi];
+            const bound: &TraitBound = &iter_fn.trait_bounds[bi];
             mut concrete: TypeRef = TypeRef::invalid();
             for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
                 if (tmpl.param_names[pi].equals(bound.type_parameter)) {
@@ -6579,7 +6592,7 @@ public:
             }
             if (!concrete.is_valid()) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
-                const tref: TraitRef = bound.trait_refs[ri];
+                const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (strcmp(this.intern.resolve(trait_name), "Copy") != 0) { continue; }
