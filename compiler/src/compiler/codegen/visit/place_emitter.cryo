@@ -255,6 +255,31 @@ type struct PlaceEmitter {
             return;
         }
 
+        // Reference indexing: `foo[i]` on a `&T[]` means deref-then-index,
+        // mirroring how member access auto-derefs references.  A reference is
+        // a pointer at the ABI level holding the address of the referent (the
+        // array header `{data, len}`).  Load that address when the reference
+        // lives in a slot (the usual lvalue case), otherwise it is already in
+        // hand (e.g. a call returning `&T[]`).  Recurse on the referent: the
+        // loaded address acts as the array's lvalue.  This is NOT done for raw
+        // pointers `T*`, which index as C pointer arithmetic below.
+        if (t.kind == TypeKind::Reference) {
+            const rt: ReferenceType* = t as ReferenceType*;
+            if (!array_val.is_valid()) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            mut header_ptr: LValue = array_val;
+            if (array_is_lvalue) {
+                header_ptr = this.cg.builder.build_load(
+                    LType::pointer_to(LType::i8()), array_val, "refderef");
+            }
+            this.codegen_array_access(header_ptr, rt.referent, true,
+                                      index_val, site_span);
+            return;
+        }
+
         // Pointer indexing (C-style `ptr[i]` == `*(ptr + i)`).  When
         // `array_is_lvalue` is true, `array_val` is a slot containing the
         // pointer (e.g. a local variable of type `T*`) and needs a load
