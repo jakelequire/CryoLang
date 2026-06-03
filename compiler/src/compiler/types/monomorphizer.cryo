@@ -101,6 +101,17 @@ function mono_str_ends_with(s: string, suffix: string) -> boolean {
     return true;
 }
 
+/// Independent copy of a `TypeRef[]`. `TypeRef` is `Copy`, so an element-wise
+/// push duplicates the buffer without aliasing the source's owned storage.
+/// Used wherever an owning request/local would otherwise alias an
+/// `InstantiatedType`'s `type_args` (or a variant's payload) buffer — a shared
+/// buffer would be freed twice. Mirrors `MonomorphRequest::clone`'s copy.
+function mono_copy_type_refs(src: &TypeRef[]) -> TypeRef[] {
+    mut out: TypeRef[] = [];
+    for (mut i: i64 = 0; i < src.length; i++) { out.push((*src)[i]); }
+    return out;
+}
+
 // Monomorphizer: worklist engine
 
 type struct Monomorphizer {
@@ -490,11 +501,11 @@ type struct Monomorphizer {
         }
     }
 
-    annotate_dispatch_in_methods(mut &this, methods: MethodNode*[],
+    annotate_dispatch_in_methods(mut &this, methods: &MethodNode*[],
                                  impl_bounds: &TraitBound[],
                                  trait_leaf: SymbolStr) -> void {
         for (mut k: i64 = 0; k < methods.length; k++) {
-            const m: MethodNode* = methods[k];
+            const m: MethodNode* = (*methods)[k];
             if (m == null || m.func == null) { continue; }
             // Rule 1 needs the param's bound, which may be impl-level
             // (`implement<T> ... where T: Debug`) or method-level; merge both.
@@ -1272,14 +1283,14 @@ type struct Monomorphizer {
 
     /// Resolve signatures on an array of methods; delegates core signature
     /// resolution to TypeResolver, then resolves body locals.
-    resolve_methods(mut &this, methods: MethodNode*[], res_ctx: ResolutionContext*,
+    resolve_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*,
                     subst: TypeSubstitution*, this_type: TypeRef) -> void {
         // Share `nested_visited` across all methods in this impl block so
         // repeated return types (e.g. the common Option<T> return) only
         // produce a single monomorphization request per impl.
         this.nested_visited = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method: MethodNode* = (*methods)[i];
             if (method == null || method.func == null) { continue; }
             // Self-returning trait defaults (combinators like `map`/`take`
             // returning an adapter over `This`) are instantiated lazily at
@@ -1539,11 +1550,11 @@ type struct Monomorphizer {
     /// don't know how to name is safer than letting codegen attempt to
     /// emit a call to a method that has no impl (which segfaults the
     /// monomorphizer's unguarded MemberAccess path).
-    bounds_satisfied(&this, bounds: TraitBound[], subst: TypeSubstitution*) -> boolean {
+    bounds_satisfied(&this, bounds: &TraitBound[], subst: TypeSubstitution*) -> boolean {
         if (bounds.length == 0) { return true; }
         if (subst == null || subst.replacements.length == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-            const bound: TraitBound* = &bounds[bi];
+            const bound: TraitBound* = &(*bounds)[bi];
             const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
             if (!concrete.is_valid()) {
                 // No substitution for this param; the bound names a
@@ -1620,11 +1631,11 @@ type struct Monomorphizer {
 
     /// Helper: keep only methods whose per-method where-bounds (the
     /// `where T: Trait` after the signature) are satisfied by `subst`.
-    filter_methods(&this, methods: MethodNode*[],
+    filter_methods(&this, methods: &MethodNode*[],
                     subst: TypeSubstitution*) -> MethodNode*[] {
         mut kept: MethodNode*[] = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
+            const m: MethodNode* = (*methods)[i];
             if (m == null || m.func == null) { continue; }
             if (!this.method_bounds_satisfied(m.func, subst)) {
                 continue;
@@ -1863,12 +1874,12 @@ type struct Monomorphizer {
     /// `bounds_satisfied` with explicit recursion depth, used by
     /// `type_implements_trait` so the recursive chain shares a single
     /// depth budget.
-    bounds_satisfied_at_depth(&this, bounds: TraitBound[],
+    bounds_satisfied_at_depth(&this, bounds: &TraitBound[],
                                subst: TypeSubstitution*, depth: i32) -> boolean {
         if (bounds.length == 0) { return true; }
         if (subst == null || subst.replacements.length == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-            const bound: TraitBound* = &bounds[bi];
+            const bound: TraitBound* = &(*bounds)[bi];
             const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
             if (!concrete.is_valid()) { return false; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
@@ -2470,7 +2481,7 @@ type struct Monomorphizer {
             const et: EnumType* = enum_ty as EnumType*;
             const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
             if (variant == null) { continue; }
-            mut payload_types: TypeRef[] = variant.payload_types;
+            mut payload_types: TypeRef[] = mono_copy_type_refs(&variant.payload_types);
             mut subj_t: Type* = this.arena.lookup(subject_type.id);
             if (subj_t != null && subj_t.kind == TypeKind::InstantiatedType
                     && this.generic_registry != null) {
@@ -2888,9 +2899,9 @@ type struct Monomorphizer {
                         // straight off the spec'd StructDeclNode (resolve_fields
                         // already populated it).  Returns directly because no
                         // more arena unwrapping is meaningful at this point.
-                        const fields: FieldDeclNode*[] = this.current_spec_struct.fields;
+                        const fields: &FieldDeclNode*[] = &this.current_spec_struct.fields;
                         for (mut fi: i64 = 0; fi < fields.length; fi++) {
-                            const f: FieldDeclNode* = fields[fi];
+                            const f: FieldDeclNode* = (*fields)[fi];
                             if (f != null && f.name.equals(ma.member) &&
                                 f.resolved_type.is_valid()) {
                                 return f.resolved_type;
@@ -3279,7 +3290,7 @@ type struct Monomorphizer {
         // node (e.g., `Layout::array<T>(n)` parses with the <T> on the SR).
         mut callee_name:  SymbolStr           = SymbolStr::empty();
         mut callee_scope: SymbolStr           = SymbolStr::empty();
-        mut explicit_args: TypeAnnotation*[] = call.generic_args;
+        mut explicit_args: &TypeAnnotation*[] = &call.generic_args;
         if (callee_node.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = call.callee as IdentifierNode*;
             callee_name = ident.name;
@@ -3288,7 +3299,7 @@ type struct Monomorphizer {
             callee_name  = sr.member_name;
             callee_scope = sr.scope_name;
             if (explicit_args.length == 0 && sr.generic_args.length > 0) {
-                explicit_args = sr.generic_args;
+                explicit_args = &sr.generic_args;
             }
         } else {
             return;
@@ -3408,7 +3419,7 @@ type struct Monomorphizer {
             if (res_ctx == null || this.type_resolver == null) { return; }
             mut seeded: TypeRef[] = [];
             for (mut i: i64 = 0; i < explicit_args.length; i++) {
-                mut tr: TypeRef = this.type_resolver.resolve(explicit_args[i], res_ctx);
+                mut tr: TypeRef = this.type_resolver.resolve((*explicit_args)[i], res_ctx);
                 if (!tr.is_valid()) { return; }
                 if (subst != null) {
                     tr = subst.apply(tr, this.arena);
@@ -3865,7 +3876,7 @@ type struct Monomorphizer {
         // inst; force the link, then return the concrete type.
         if (this.is_cached(key)) {
             const req_c: MonomorphRequest = MonomorphRequest {
-                generic_type: ty,            type_args: inst.type_args,
+                generic_type: ty,            type_args: mono_copy_type_refs(&inst.type_args),
                 base_type:    inst.generic_base, span:   SourceSpan::none(),
             };
             this.propagate_cached_resolution(key, req_c);
@@ -3885,7 +3896,7 @@ type struct Monomorphizer {
         if (reg_t == null || reg_t.kind != TypeKind::InstantiatedType) { return ty; }
         const reg_inst: InstantiatedType* = reg_t as InstantiatedType*;
         const request: MonomorphRequest = MonomorphRequest {
-            generic_type: reg,                  type_args: reg_inst.type_args,
+            generic_type: reg,                  type_args: mono_copy_type_refs(&reg_inst.type_args),
             base_type:    reg_inst.generic_base, span:      SourceSpan::none(),
         };
         this.in_progress.insert(key, true);
@@ -4203,22 +4214,25 @@ type struct Monomorphizer {
     /// (which would leak across all instantiations).
     find_spec_inline_method(mut &this, target_type: TypeRef, method_name: SymbolStr,
                              out_owner_ast: ASTNode**) -> MethodNode* {
+        // Borrow target: the method arrays below belong to AST decl nodes;
+        // aliasing them into an owning local would free the node's buffer.
+        const empty_methods: MethodNode*[] = [];
         for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
             const entry: SpecializationEntry* = &this.spec_entries[i];
             if (entry.specialized_type.id != target_type.id) { continue; }
             if (entry.ast_node == null) { continue; }
-            mut owner_methods: MethodNode*[] = [];
+            mut owner_methods: &MethodNode*[] = &empty_methods;
             if (entry.ast_node.kind == NodeKind::StructDeclaration) {
                 const sn: StructDeclNode* = entry.ast_node as StructDeclNode*;
-                owner_methods = sn.methods;
+                owner_methods = &sn.methods;
             } else if (entry.ast_node.kind == NodeKind::ClassDeclaration) {
                 const cn: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
-                owner_methods = cn.methods;
+                owner_methods = &cn.methods;
             } else {
                 continue;
             }
             for (mut k: i64 = 0; k < owner_methods.length; k++) {
-                const m: MethodNode* = owner_methods[k];
+                const m: MethodNode* = (*owner_methods)[k];
                 if (m == null || m.func == null) { continue; }
                 if (!m.func.name.equals(method_name)) { continue; }
                 if (m.func.generic_params.length == 0) { continue; }
@@ -4244,18 +4258,18 @@ type struct Monomorphizer {
         const tmpl: TemplateEntry* =
             this.generic_registry.get_template_by_type_id(inst.generic_base.id);
         if (tmpl == null || tmpl.ast_node == null) { return null; }
-        mut tmpl_methods: MethodNode*[] = [];
+        mut tmpl_methods: &MethodNode*[] = &empty_methods;
         if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
             const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
-            tmpl_methods = sn.methods;
+            tmpl_methods = &sn.methods;
         } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-            tmpl_methods = cn.methods;
+            tmpl_methods = &cn.methods;
         } else {
             return null;
         }
         for (mut k: i64 = 0; k < tmpl_methods.length; k++) {
-            const m: MethodNode* = tmpl_methods[k];
+            const m: MethodNode* = (*tmpl_methods)[k];
             if (m == null || m.func == null) { continue; }
             if (!m.func.name.equals(method_name)) { continue; }
             if (m.func.generic_params.length == 0) { continue; }
@@ -4339,18 +4353,19 @@ type struct Monomorphizer {
         }
         if (owner_ast == null) { return null; }
 
-        mut owner_methods: MethodNode*[] = [];
+        const empty_methods: MethodNode*[] = [];
+        mut owner_methods: &MethodNode*[] = &empty_methods;
         if (owner_ast.kind == NodeKind::StructDeclaration) {
             const sn: StructDeclNode* = owner_ast as StructDeclNode*;
-            owner_methods = sn.methods;
+            owner_methods = &sn.methods;
         } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
-            owner_methods = cn.methods;
+            owner_methods = &cn.methods;
         } else {
             return null;
         }
         for (mut k: i64 = 0; k < owner_methods.length; k++) {
-            const m: MethodNode* = owner_methods[k];
+            const m: MethodNode* = (*owner_methods)[k];
             if (m == null || m.func == null) { continue; }
             if (!m.func.name.equals(method_name)) { continue; }
             if (m.func.generic_params.length == 0) { continue; }
@@ -4987,7 +5002,7 @@ type struct Monomorphizer {
     /// the spec'd MethodNode, or null on failure.  No-op when the method
     /// is non-generic; caller should filter those out.
     specialize_method(mut &this, original: MethodNode*,
-                       param_names: SymbolStr[], args: TypeRef[],
+                       param_names: SymbolStr[], args: &TypeRef[],
                        owner_type: TypeRef) -> MethodNode* {
         if (original == null || original.func == null) { return null; }
         if (param_names.length != args.length) { return null; }
@@ -4995,17 +5010,17 @@ type struct Monomorphizer {
         // Build display SymbolStrs for the substituter.
         mut arg_displays: SymbolStr[] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
-            const arg_t: Type* = this.arena.lookup(args[i].id);
+            const arg_t: Type* = this.arena.lookup((*args)[i].id);
             mut display: string = "";
             if (arg_t != null) {
-                const qname: SymbolStr = this.arena.get_qualified_name(args[i]);
+                const qname: SymbolStr = this.arena.get_qualified_name((*args)[i]);
                 if (qname.is_valid()) {
                     display = this.intern_table.resolve(qname);
                 } else {
                     display = this.arena.format_display(arg_t);
                 }
             } else {
-                display = format("unknown_%llu", args[i].id);
+                display = format("unknown_%llu", (*args)[i].id);
             }
             arg_displays.push(this.intern_table.intern(display));
         }
@@ -5988,7 +6003,7 @@ type struct Monomorphizer {
     enqueue_from_inst(mut &this, ty: TypeRef, inst: InstantiatedType*) -> void {
         const request: MonomorphRequest = MonomorphRequest {
             generic_type: ty,
-            type_args:    inst.type_args,
+            type_args:    mono_copy_type_refs(&inst.type_args),
             base_type:    inst.generic_base,
             span:         SourceSpan::none(),
         };

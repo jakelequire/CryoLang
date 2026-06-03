@@ -1326,7 +1326,12 @@ public:
             // Heap-allocated struct literal: new Type { field: value, ... }
             // Parse the struct literal body and attach it to the NewExprNode
             // so sema knows to return a pointer type.
-            const gen: TypeAnnotation*[] = node.generic_args;
+            // Independent DEEP copy: `TypeAnnotation*[]` owns its pointees
+            // (drop frees each node, like `ASTCloner::clone_type_annotations`),
+            // so the struct literal must get its own cloned nodes — a shallow
+            // pointer copy would let both arrays free the same nodes.
+            mut gen: TypeAnnotation*[] = [];
+            for (mut gi: i64 = 0; gi < node.generic_args.length; gi++) { gen.push(TypeAnnotation::clone_ptr(node.generic_args[gi])); }
             const lit: StructLiteralNode* = this.parse_struct_literal_body(type_name, gen, start) as StructLiteralNode*;
             node.struct_init = lit;
             node.span = this.span_from_token(start);
@@ -1792,7 +1797,13 @@ public:
         if (callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = callee as MemberAccessNode*;
             if (ma.generic_args.length > 0) {
-                call.set_generic_args(ma.generic_args);
+                // Independent DEEP copy: `set_generic_args` stores and owns the
+                // array, and `TypeAnnotation*[]` owns its pointees, so the call
+                // node and the member-access node must each get their own cloned
+                // nodes — a shallow pointer copy double-frees the shared nodes.
+                mut ga_copy: TypeAnnotation*[] = [];
+                for (mut gi: i64 = 0; gi < ma.generic_args.length; gi++) { ga_copy.push(TypeAnnotation::clone_ptr(ma.generic_args[gi])); }
+                call.set_generic_args(ga_copy);
             }
         }
 

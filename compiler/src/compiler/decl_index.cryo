@@ -355,7 +355,7 @@ type struct DeclarationIndex {
     /// This adds each method to the per-module function list under the
     /// combined key "QualifiedType::method" so that cross-module externs
     /// can declare them and codegen can find them.
-    register_methods_with_module(mut &this, type_sym: SymbolStr, methods: MethodNode*[],
+    register_methods_with_module(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
                                   module: SymbolStr, intern: InternTable*,
                                   arena: TypeArena*) -> void {
         this.register_methods_with_module_aliased(
@@ -369,13 +369,13 @@ type struct DeclarationIndex {
     /// MemberAccess path on primitives) still find the signature.
     register_methods_with_module_aliased(mut &this,
                                           type_sym: SymbolStr, bare_alias: SymbolStr,
-                                          methods: MethodNode*[],
+                                          methods: &MethodNode*[],
                                           module: SymbolStr, intern: InternTable*,
                                           arena: TypeArena*) -> void {
         const type_str: string = intern.resolve(type_sym);
         const bare_str: string = if (bare_alias.is_valid()) { intern.resolve(bare_alias) } else { "" };
         for (mut i: i64 = 0; i < methods.length; i++) {
-            const method: MethodNode* = methods[i];
+            const method: MethodNode* = (*methods)[i];
             if (method == null || method.func == null) { continue; }
             // Self-returning trait defaults (combinators) are deferred
             // templates with unresolved signatures - they are instantiated
@@ -577,13 +577,18 @@ type struct DeclarationIndex {
 
         // Compute the mangled symbol name including the full signature.
         const qname: QualifiedName = QualifiedName::from_symbol(name);
+        // Borrow the FunctionType's param list rather than aliasing it into an
+        // owning local: a `mut params: TypeRef[] = ...; params = fn_ty.param_types`
+        // local would free the FunctionType's buffer when it drops (the
+        // signature array is still owned by the arena type) — a use-after-free
+        // the mangler hit while reading the borrowed params.
         const empty_params: TypeRef[] = [];
-        mut params: TypeRef[] = empty_params;
+        mut params: &TypeRef[] = &empty_params;
         mut is_variadic: boolean = false;
         const ft: Type* = arena.lookup(func_type_ref.id);
         if (ft != null && ft.kind == TypeKind::Function) {
             const fn_ty: FunctionType* = ft as FunctionType*;
-            params = fn_ty.param_types;
+            params = &fn_ty.param_types;
             is_variadic = fn_ty.is_variadic;
         }
         const mangled: MangledName = MangledName::for_free_function(
