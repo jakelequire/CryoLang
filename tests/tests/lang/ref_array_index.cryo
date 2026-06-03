@@ -1,0 +1,93 @@
+///! Auto-deref of references on the index operator `[]`.
+///!
+///! Indexing a reference-to-array (`&T[]`) with `foo[i]` means
+///! "deref the reference, then index" - exactly mirroring how member
+///! access (`foo.length`) already auto-derefs references.  The verbose
+///! `(*foo)[i]` form must keep working, and raw pointers `T*` must keep
+///! their C pointer-arithmetic indexing (NOT auto-dereffed).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::RefArrayIndex;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// Read `foo[i]` through a `&T[]` param - auto-derefs the reference.
+function read_at(foo: &i64[], i: i64) -> i64 {
+    return foo[i];
+}
+
+// Write `foo[i] = v` through a `&T[]` param - the referent buffer is
+// shared with the caller, so the mutation is visible after return.
+function write_at(foo: &i64[], i: i64, v: i64) -> void {
+    foo[i] = v;
+}
+
+// The explicit deref-then-index form must still compile and behave
+// identically (no regression).
+function read_explicit(foo: &i64[], i: i64) -> i64 {
+    return (*foo)[i];
+}
+
+// Element-borrow through a reference: `&foo[i]` yields the address of
+// element `i` in the referent buffer.
+function elem_via_borrow(foo: &i64[], i: i64) -> i64 {
+    const p: i64* = &foo[i];
+    return *p;
+}
+
+![test]
+function read_through_reference() -> Result<(), TestError> {
+    const xs: i64[] = [10, 20, 30, 40, 50];
+    expect_eq(read_at(&xs, 0), 10)?;
+    expect_eq(read_at(&xs, 2), 30)?;
+    expect_eq(read_at(&xs, 4), 50)?;
+    return Result::Ok(());
+}
+
+![test]
+function write_through_reference_mutates_caller() -> Result<(), TestError> {
+    mut xs: i64[] = [1, 2, 3, 4];
+    write_at(&xs, 1, 99);
+    write_at(&xs, 3, 77);
+    expect_eq(xs[0], 1)?;     // untouched
+    expect_eq(xs[1], 99)?;    // mutated through the reference
+    expect_eq(xs[3], 77)?;
+    return Result::Ok(());
+}
+
+![test]
+function element_borrow_through_reference() -> Result<(), TestError> {
+    const xs: i64[] = [5, 6, 7];
+    expect_eq(elem_via_borrow(&xs, 0), 5)?;
+    expect_eq(elem_via_borrow(&xs, 2), 7)?;
+    return Result::Ok(());
+}
+
+// `(*foo)[i]` and `foo[i]` must produce identical results.
+![test]
+function explicit_deref_still_works() -> Result<(), TestError> {
+    const xs: i64[] = [100, 200, 300];
+    expect_eq(read_explicit(&xs, 0), 100)?;
+    expect_eq(read_explicit(&xs, 1), 200)?;
+    expect_eq(read_at(&xs, 1), read_explicit(&xs, 1))?;
+    return Result::Ok(());
+}
+
+// Negative control: a raw pointer `T*` still indexes as C pointer
+// arithmetic (`p[i]` == `*(p + i)`), NOT deref-then-index.  If pointers
+// were wrongly auto-dereffed like references, `p[1]` would no longer
+// reach the second element.
+![test]
+function pointer_index_is_unaffected() -> Result<(), TestError> {
+    mut buf: i32[3];
+    buf[0] = 11;
+    buf[1] = 22;
+    buf[2] = 33;
+    const p: i32* = &buf[0];
+    expect_eq(p[0], 11)?;
+    expect_eq(p[1], 22)?;
+    expect_eq(p[2], 33)?;
+    return Result::Ok(());
+}
