@@ -1,0 +1,169 @@
+///! HTTP request parsing through a persistent BufReader.
+///!
+///! The server now wraps each connection's socket in ONE `BufReader`
+///! that lives across the keep-alive loop, so `Request::parse` reads
+///! headers and the Content-Length body through a shared buffer. The
+///! correctness risk in that design is FRAMING: after the first
+///! request's body is consumed, any bytes of the NEXT request that
+///! arrived in the same fill must still be in the buffer, not lost.
+///!
+///! These tests pin exactly that by parsing two back-to-back requests
+///! through a single BufReader over an in-memory source whose entire
+///! byte stream is pulled into the buffer in one fill.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HttpBufferedParse;
+
+import std::core::intrinsics;
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::io::error;
+import std::io::traits;
+import std::io::buf;
+import std::net::http::request;
+import std::net::http::method;
+import std::test::error;
+import std::test::assert;
+
+// In-memory byte source (mirrors io_buf's MemSource): serves the backing
+// Str in `chunk`-sized reads (chunk == 0 means "as much as asked").
+type struct MemSource {
+    src: Str;
+    pos: u64;
+    chunk: u64;
+
+    static new(src: Str, chunk: u64) -> MemSource {
+        return MemSource { src: src, pos: 0, chunk: chunk };
+    }
+}
+
+implement trait Read for struct MemSource {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        const bytes: Slice<u8> = this.src.as_bytes();
+        mut n: u64 = bytes.length() - this.pos;
+        if (n > length) { n = length; }
+        if (this.chunk > 0 && n > this.chunk) { n = this.chunk; }
+        if (n > 0) {
+            intrinsics::memcpy(
+                buffer as void*,
+                (bytes.as_ptr() + this.pos) as void*,
+                n
+            );
+            this.pos = this.pos + n;
+        }
+        return Result::Ok(n);
+    }
+}
+
+![test]
+function parses_single_request_with_body() -> Result<(), TestError> {
+    const wire: Str = Str::new(
+        "POST /submit HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    mut src: MemSource = MemSource::new(wire, 0);
+    mut br: BufReader<MemSource> = BufReader::new(&src);
+
+    match (Request::parse(&br)) {
+        Result::Ok(req) => {
+            mut r: Request = req;
+            const m_ok: boolean = r.method.as_str().equals(&Str::new("POST"));
+            const p_ok: boolean = r.path.as_str().equals(&Str::new("/submit"));
+            const len_ok: boolean = r.body.length() == 5;
+            const body_ok: boolean = slice_eq_str(r.body.as_slice(), Str::new("hello"));
+            r.drop();
+            expect_true(m_ok, Str::new("method POST"))?;
+            expect_true(p_ok, Str::new("path /submit"))?;
+            expect_true(len_ok, Str::new("body length 5"))?;
+            return expect_true(body_ok, Str::new("body 'hello'"));
+        }
+        Result::Err(_) => { return bail(Str::new("parse failed")); }
+    }
+}
+
+![test]
+function keep_alive_two_requests_one_buffer() -> Result<(), TestError> {
+    // Two complete requests concatenated. The first has a 3-byte body;
+    // the second's bytes immediately follow. A large BufReader pulls the
+    // WHOLE stream into one fill, so the second request is parsed
+    // entirely from leftover buffered bytes - proving none were dropped
+    // at the body boundary.
+    const wire: Str = Str::new(
+        "POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\n");
+    mut src: MemSource = MemSource::new(wire, 0);
+    mut br: BufReader<MemSource> = BufReader::new(&src);
+
+    // First request.
+    match (Request::parse(&br)) {
+        Result::Ok(req1) => {
+            mut r1: Request = req1;
+            const m1: boolean = r1.method.as_str().equals(&Str::new("POST"));
+            const p1: boolean = r1.path.as_str().equals(&Str::new("/a"));
+            const b1: boolean = slice_eq_str(r1.body.as_slice(), Str::new("abc"));
+            r1.drop();
+            expect_true(m1, Str::new("req1 method POST"))?;
+            expect_true(p1, Str::new("req1 path /a"))?;
+            expect_true(b1, Str::new("req1 body 'abc'"))?;
+        }
+        Result::Err(_) => { return bail(Str::new("req1 parse failed")); }
+    }
+
+    // Second request - must come entirely from the buffer.
+    match (Request::parse(&br)) {
+        Result::Ok(req2) => {
+            mut r2: Request = req2;
+            const m2: boolean = r2.method.as_str().equals(&Str::new("GET"));
+            const p2: boolean = r2.path.as_str().equals(&Str::new("/b"));
+            const b2: boolean = r2.body.is_empty();
+            r2.drop();
+            expect_true(m2, Str::new("req2 method GET"))?;
+            expect_true(p2, Str::new("req2 path /b"))?;
+            return expect_true(b2, Str::new("req2 empty body"));
+        }
+        Result::Err(_) => { return bail(Str::new("req2 parse failed (leftover bytes lost?)")); }
+    }
+}
+
+![test]
+function tiny_chunks_still_frame_correctly() -> Result<(), TestError> {
+    // Source hands back one byte per read; BufReader coalesces. Framing
+    // must be identical regardless of how the stream is chunked.
+    const wire: Str = Str::new(
+        "GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    mut src: MemSource = MemSource::new(wire, 1);
+    mut br: BufReader<MemSource> = BufReader::new(&src);
+
+    match (Request::parse(&br)) {
+        Result::Ok(req) => {
+            mut r: Request = req;
+            const m_ok: boolean = r.method.as_str().equals(&Str::new("GET"));
+            const p_ok: boolean = r.path.as_str().equals(&Str::new("/x"));
+            r.drop();
+            expect_true(m_ok, Str::new("method GET"))?;
+            return expect_true(p_ok, Str::new("path /x"));
+        }
+        Result::Err(_) => { return bail(Str::new("parse failed under 1-byte chunks")); }
+    }
+}
+
+// Byte-equality between an Array<u8> slice and a Str's bytes.
+function slice_eq_str(a: Slice<u8>, s: Str) -> boolean {
+    const b: Slice<u8> = s.as_bytes();
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}

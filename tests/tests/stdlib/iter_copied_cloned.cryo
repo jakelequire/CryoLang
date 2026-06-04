@@ -1,0 +1,103 @@
+///! CopiedIter / ClonedIter - the by-reference -> by-value bridge.
+///!
+///! `Array::iter_ref()` yields `T*` (sound for every `T`); these two
+///! adapters turn that pointer stream back into values without each
+///! container carrying its own by-value iterator struct:
+///!
+///!   * `CopiedIter` derefs each `T*` into a bitwise copy (`T: Copy`).
+///!   * `ClonedIter` clones each pointee into an owned `T` (`T: Clone`),
+///!     which is what lets a loop walk an `Array<String>` by value - the
+///!     `Copy`-gated `iter()` can't.
+///!
+///! The element type is *inferred*: `CopiedIter<I>` recovers `T` from
+///! the `where I: Iterator<T*>` bound (the monomorphizer peels the `T*`
+///! against the inner iterator's concrete element type). No explicit
+///! element parameter is needed - `CopiedIter::new(arr.iter_ref())` is
+///! enough. Built via `::new` (a fluent `.copied()` default method still
+///! crashes the bootstrap compiler; see core/iter.cryo).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IterCopiedCloned;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::collections::array;
+import std::collections::string;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function copied_iter_sums_via_loop() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(1); a.push(2); a.push(3); a.push(4);
+    mut it: CopiedIter<RefIter<i32>> = CopiedIter::new(a.iter_ref());
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(sum, 10)?;
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function copied_iter_drives_for_in() -> Result<(), TestError> {
+    // for-in over the adapter: the binding is `T` by value (i32), not
+    // `T*`, so the loop body reads it directly. The element type is
+    // inferred from the bound - no turbofish needed.
+    mut a: Array<i32> = Array::new();
+    a.push(5); a.push(10); a.push(15);
+    mut sum: i32 = 0;
+    for (x in CopiedIter<RefIter<i32>>::new(a.iter_ref())) {
+        sum = sum + x;
+    }
+    expect_eq(sum, 30)?;
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function cloned_iter_over_copy_type() -> Result<(), TestError> {
+    // i32 is `Clone` as well as `Copy`; ClonedIter exercises the same
+    // deref path as CopiedIter but routes through `clone()`.
+    mut a: Array<i32> = Array::new();
+    a.push(2); a.push(4); a.push(6);
+    mut it: ClonedIter<RefIter<i32>> = ClonedIter::new(a.iter_ref());
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(sum, 12)?;
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function cloned_iter_walks_owning_array() -> Result<(), TestError> {
+    // The capability `iter()` can't give: iterate an `Array<String>` by
+    // value. Each yielded clone is an independent heap buffer, dropped at
+    // the end of its match arm; the originals are freed by `a.drop()`.
+    mut a: Array<String> = Array::new();
+    a.push(String::from_str(Str::new("ab")));      // len 2
+    a.push(String::from_str(Str::new("cde")));     // len 3
+    a.push(String::from_str(Str::new("f")));       // len 1
+    mut it: ClonedIter<RefIter<String>> = ClonedIter::new(a.iter_ref());
+    mut total: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(s) => { total = total + s.length(); }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(total, 6u64)?;
+    a.drop();
+    return Result::Ok(());
+}

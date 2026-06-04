@@ -1528,25 +1528,77 @@ type struct Monomorphizer {
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
                     const ta: TypeAnnotation* = tr.type_args[ai];
                     if (ta == null) { continue; }
-                    match (*ta) {
-                        TypeAnnotation::Named(n) => {
-                            // Bind a bare where-bound param (e.g. `A`) that the
-                            // Self-type substitution doesn't already fix and
-                            // that isn't already bound.  The spec'd impl clone
-                            // has its `generic_params` cleared, so we can't
-                            // gate on membership there; the subst/res_ctx
-                            // checks keep this from rebinding a concrete param.
-                            if (this.lookup_subst_for_param(n.name, subst).is_invalid()
-                                    && res_ctx.lookup_binding(n.name).is_invalid()
-                                    && concrete_args[ai].is_valid()) {
-                                res_ctx.add_binding(n.name, concrete_args[ai]);
-                            }
-                        }
-                        _ => {}
-                    }
+                    this.bind_where_arg_param(ta, concrete_args[ai], subst, res_ctx);
                 }
             }
         }
+    }
+
+    /// Bind a where-bound trait-arg annotation against a concrete trait
+    /// arg, descending through pointer/reference wrappers so a param that
+    /// appears only *inside* a pointer can still be recovered. Examples:
+    ///
+    ///   bound `I: Iterator<A>`  vs concrete `Iterator<i32>`   -> A = i32
+    ///   bound `I: Iterator<T*>` vs concrete `Iterator<i32*>`  -> T = i32
+    ///   bound `I: Iterator<&T>` vs concrete `Iterator<&i32>`  -> T = i32
+    ///
+    /// The bare-`Named` case is the original behaviour (TakeIter's `A`);
+    /// the pointer/reference cases are what let by-reference adapters
+    /// (`CopiedIter<I> where I: Iterator<T*>`) recover their element type
+    /// `T` from the inner iterator instead of carrying it as an explicit
+    /// struct parameter. Peeling stops when the annotation and the
+    /// concrete type stop agreeing in shape (the bound just pins nothing).
+    bind_where_arg_param(mut &this, ta: TypeAnnotation*, concrete: TypeRef,
+                         subst: TypeSubstitution*,
+                         res_ctx: ResolutionContext*) -> void {
+        if (ta == null || !concrete.is_valid()) { return; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                // Bind a where-bound param (e.g. `A` / `T`) that the
+                // Self-type substitution doesn't already fix and that
+                // isn't already bound. The spec'd impl clone has its
+                // `generic_params` cleared, so we can't gate on membership
+                // there; the subst/res_ctx checks keep this from rebinding
+                // a concrete param.
+                if (this.lookup_subst_for_param(n.name, subst).is_invalid()
+                        && res_ctx.lookup_binding(n.name).is_invalid()) {
+                    res_ctx.add_binding(n.name, concrete);
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                // `T*` vs a concrete `i32*`: peel one pointer layer off
+                // both sides and recurse on `T` vs `i32`.
+                const inner: TypeRef = this.peel_pointer_pointee(concrete);
+                if (inner.is_valid()) {
+                    this.bind_where_arg_param(p.inner, inner, subst, res_ctx);
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                const inner: TypeRef = this.peel_reference_referent(concrete);
+                if (inner.is_valid()) {
+                    this.bind_where_arg_param(r.inner, inner, subst, res_ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pointee of a concrete pointer TypeRef, or invalid if not a pointer.
+    peel_pointer_pointee(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty != null && ty.kind == TypeKind::Pointer) {
+            return (ty as PointerType*).pointee;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Referent of a concrete reference TypeRef, or invalid if not a ref.
+    peel_reference_referent(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty != null && ty.kind == TypeKind::Reference) {
+            return (ty as ReferenceType*).referent;
+        }
+        return TypeRef::invalid();
     }
 
     /// Check that every TraitBound in `bounds` has a registered trait-impl

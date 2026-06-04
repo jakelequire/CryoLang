@@ -1,0 +1,54 @@
+///! REPRO: trait-bound unifier must peel `T*` from `I: Iterator<T*>`.
+///! `Deref<I>` recovers `T` by matching the inner iterator's element
+///! type `I::Item == T*` against `T*`. This currently crashes mono.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::PeelPtrBoundRepro;
+
+import std::core::option;
+import std::core::iter;
+import std::test::error;
+import std::test::assert;
+
+// A minimal by-reference iterator: yields the same `T*` `n` times.
+type struct PtrIter<T> {
+    ptr: T*;
+    n: u64;
+}
+
+implement<T> trait Iterator<T*> for struct PtrIter<T> {
+    next(mut &this) -> Option<T*> {
+        if (this.n == 0) { return Option::None; }
+        this.n = this.n - 1;
+        const p: T* = this.ptr;
+        return Option::Some(p);
+    }
+}
+
+// The adapter under test: `T` appears ONLY inside the pointer in the
+// bound, so binding it requires peeling `T*`.
+type struct Deref<I> {
+    inner: I;
+}
+
+implement<I, T> trait Iterator<T> for struct Deref<I>
+where I: Iterator<T*> {
+    next(mut &this) -> Option<T> {
+        return match (this.inner.next()) {
+            Option::Some(p) => { Option::Some(*p) }
+            Option::None    => { Option::None }
+        };
+    }
+}
+
+![test]
+function peel_ptr_bound() -> Result<(), TestError> {
+    mut x: i32 = 5;
+    mut d: Deref<PtrIter<i32>> = Deref<PtrIter<i32>> {
+        inner: PtrIter<i32> { ptr: &x, n: 1 }
+    };
+    match (d.next()) {
+        Option::Some(v) => { return expect_eq(v, 5); }
+        Option::None    => { return bail(Str::new("unexpected none")); }
+    }
+}

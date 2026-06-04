@@ -39,6 +39,7 @@ namespace std::net::http::server;
 import core::option;
 import core::result;
 import io::error;
+import io::buf;
 import collections::str;
 import collections::string;
 import net::socket_addr;
@@ -196,10 +197,19 @@ type struct HttpServer {
                 Result::Err(_) => { }
             }
         }
+        // One buffered reader for the WHOLE connection. `read_line` (and
+        // the Content-Length body read) inside `Request::parse` pull
+        // through this, turning per-byte header scanning into a few
+        // buffer-sized syscalls. Critically, the buffer persists across
+        // keep-alive iterations: any bytes of the NEXT request that
+        // arrived in the same packet as the previous body are retained
+        // here, not lost. The wrapped `stream` is still used directly for
+        // writes; only reads go through `br`.
+        mut br: BufReader<TcpStream> = BufReader::new(stream);
         mut served: u64 = 0;
         loop {
             served = served + 1;
-            match (Request::parse(stream)) {
+            match (Request::parse(&br)) {
                 Result::Ok(req) => {
                     mut request_local: Request = req;
                     const keep_alive: boolean = should_keep_alive(&request_local, served);
