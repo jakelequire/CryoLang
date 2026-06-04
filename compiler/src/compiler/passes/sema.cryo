@@ -6466,6 +6466,29 @@ public:
         const this_amp: SymbolStr = this.intern.intern("&this");
         const this_val: SymbolStr = this.intern.intern("this");
 
+        // A `self_returning_default` method (a combinator like `copied`/
+        // `take` whose return type mentions `This`) is a DEFERRED TEMPLATE:
+        // its `This`-bearing return type is left unresolved. The
+        // monomorphizer instantiates the one actually called and pushes a
+        // concrete (non-deferred) spec of the same name onto this very
+        // block. When that spec exists it — not the template — is the real
+        // callee, but it was appended AFTER the template, so a naive
+        // first-match would pin the template's invalid return type and
+        // hit the mangler guard (E0636). Skip the template whenever a
+        // concrete sibling of the same name is present; own-generic
+        // defaults (`map<B>`), which the monomorphizer leaves to the
+        // inference path and never gives a concrete sibling, still match.
+        mut has_concrete_sibling: boolean = false;
+        for (mut ci: i64 = 0; ci < block.methods.length; ci++) {
+            const cm: MethodNode* = block.methods[ci];
+            if (cm != null && cm.func != null
+                    && cm.func.name.equals(member.member)
+                    && !cm.func.is_self_returning_default) {
+                has_concrete_sibling = true;
+                break;
+            }
+        }
+
         for (mut sub_pass: i32 = 0; sub_pass < 2; sub_pass++) {
             const allow_implicit: boolean = (sub_pass == 1);
             for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
@@ -6473,6 +6496,10 @@ public:
                 if (mn == null || mn.func == null) { continue; }
                 const fn_node: FunctionDeclNode* = mn.func;
                 if (!fn_node.name.equals(member.member)) { continue; }
+                // Prefer the concrete spec over its deferred template.
+                if (fn_node.is_self_returning_default && has_concrete_sibling) {
+                    continue;
+                }
 
                 // Build the overload parameter list (skip self in both
                 // forms) the same way ClassType/StructType registration
