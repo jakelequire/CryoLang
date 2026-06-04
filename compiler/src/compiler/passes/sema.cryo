@@ -681,7 +681,8 @@ public:
     /// Returns invalid TypeRef if no match found.
     resolve_module_qualified_function(mut &this, scope_name: SymbolStr,
                                       member_name: SymbolStr,
-                                      call: CallExprNode*) -> TypeRef {
+                                      call: CallExprNode*,
+                                      scope: ScopeResolutionNode*) -> TypeRef {
         const scope_str: string = this.intern.resolve(scope_name);
         const member_str: string = this.intern.resolve(member_name);
         const scope_len: i64 = strlen(scope_str) as i64;
@@ -721,10 +722,41 @@ public:
                     // arena (sema creates the wrapper; mono never queues it)
                     // and GenericValidation rejects with E0900.
                     mut is_fn_template: boolean = false;
+                    mut tmpl: TemplateEntry* = null;
                     if (this.ctx.generic_registry != null) {
-                        const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(q_sym);
+                        tmpl = this.ctx.generic_registry.get_template(q_sym);
                         if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) {
                             is_fn_template = true;
+                        }
+                    }
+                    // Generic module-qualified call (`mod::f<T, U>(...)`): the
+                    // raw template return (`Wrap<U>`) is still generic, so
+                    // return the SPECIALIZED function's concrete return type,
+                    // mirroring the bare-identifier path (`f<T>(...)`).
+                    if (is_fn_template) {
+                        // Prefer mono's already-pinned specialization symbol
+                        // (it mangled the exact spec key, including the bare-vs-
+                        // owner base name); only recompute as a fallback, using
+                        // the template's spec base name (bare for free
+                        // functions, `Owner_method` for static methods) so the
+                        // mangling matches what the monomorphizer registered.
+                        mut spec_sym: SymbolStr = call.resolved_callee;
+                        if (!spec_sym.is_valid()) {
+                            const base: SymbolStr = tmpl.spec_base_name(this.intern);
+                            if (scope != null && scope.generic_args.length > 0) {
+                                spec_sym = this.resolve_generic_scope_name(
+                                    base, scope.generic_args);
+                            } else if (call.generic_args.length > 0) {
+                                spec_sym = this.resolve_generic_scope_name(
+                                    base, call.generic_args);
+                            }
+                        }
+                        if (spec_sym.is_valid()) {
+                            const spec_ret: TypeRef = this.lookup_func_return(spec_sym);
+                            if (spec_ret.is_valid()) {
+                                call.set_resolved_callee(spec_sym);
+                                return spec_ret;
+                            }
                         }
                     }
                     if (!is_fn_template) {
@@ -7795,7 +7827,7 @@ public:
         // the earlier type-based interpretations matched, so it's safe
         // to try a module-function lookup unconditionally.
         const q_ret: TypeRef = this.resolve_module_qualified_function(
-            scope.scope_name, scope.member_name, call);
+            scope.scope_name, scope.member_name, call, scope);
         if (q_ret.is_valid()) {
             scope.set_resolved_type(q_ret);
             return q_ret;
