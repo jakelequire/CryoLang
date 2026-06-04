@@ -115,7 +115,7 @@ type struct Array<T, A = GlobalAlloc> {
     /// an independent bitwise duplicate while the array retains ownership
     /// of the stored element, so handing back a copy is only sound when
     /// `T` carries no `Drop` obligation. For owning `T`, borrow in place
-    /// with `get_ptr` (or move an element out with `swap_remove`/`pop`).
+    /// with `get_ref` (or move an element out with `swap_remove`/`pop`).
     get(&this, index: u64) -> Option<T> where T: Copy {
         if (index >= this.length) {
             return Option::None;
@@ -127,7 +127,7 @@ type struct Array<T, A = GlobalAlloc> {
     /// the array keeps ownership, so this is sound for every `T` (Copy or
     /// owning). The pointer is invalidated by any reallocating method
     /// (`push`, `reserve`, `shrink_to_fit`).
-    get_ptr(&this, index: u64) -> Option<T*> {
+    get_ref(&this, index: u64) -> Option<T*> {
         if (index >= this.length) {
             return Option::None;
         }
@@ -149,7 +149,7 @@ type struct Array<T, A = GlobalAlloc> {
     /// Iterate over the elements in order, yielding each by value
     /// (bitwise copy). Gated on `T: Copy` for the same reason as `get`:
     /// a yielded owning value would alias storage the array still owns.
-    /// For owning `T`, walk by index with `length()` + `get_ptr`. The
+    /// For owning `T`, walk by index with `length()` + `get_ref`. The
     /// iterator is invalidated by any reallocating method on the array
     /// (`push`, `reserve`, `shrink_to_fit`).
     iter(&this) -> SliceIter<T> where T: Copy {
@@ -255,27 +255,27 @@ type struct Array<T, A = GlobalAlloc> {
     }
 
     /// Append every element of `source` to the end of this array.
-    /// Panics on allocation failure; use `try_push_slice` to recover.
+    /// Panics on allocation failure; use `try_append` to recover.
     ///
     /// Gated on `T: Copy` for the same reason as `get`/`iter`: the bulk
     /// append is a bitwise `memcpy` out of the borrowed `source`, so for an
     /// owning `T` both arrays would end up owning the same heap buffers and
     /// double-free on drop. For owning `T`, append elements one at a time
     /// with `push` after cloning, or move them out of `source` by index.
-    push_slice(mut &this, source: Slice<T>) -> void where T: Copy {
-        match (this.try_push_slice(source)) {
+    append(mut &this, source: Slice<T>) -> void where T: Copy {
+        match (this.try_append(source)) {
             Result::Ok(_) => { return; }
             Result::Err(_) => {
-                intrinsics::panic("Array::push_slice: allocation failed", FILE, LINE);
+                intrinsics::panic("Array::append: allocation failed", FILE, LINE);
             }
         }
     }
 
     /// Fallible bulk append. Reserves space for all elements first so
     /// partial copies are impossible; either all elements are appended
-    /// or none are. Gated on `T: Copy` (see `push_slice`): the append is a
+    /// or none are. Gated on `T: Copy` (see `append`): the append is a
     /// bitwise `memcpy` out of the borrowed `source`.
-    try_push_slice(mut &this, source: Slice<T>) -> Result<(), AllocError> where T: Copy {
+    try_append(mut &this, source: Slice<T>) -> Result<(), AllocError> where T: Copy {
         const add: u64 = source.length();
         if (add == 0) { return Result::Ok(()); }
         this.reserve_grow(add)?;
@@ -296,7 +296,7 @@ type struct Array<T, A = GlobalAlloc> {
         const required: u64 = this.length + additional;
         // A wrapped `length + additional` (sum < length) means the requested
         // capacity can't be represented in u64. Reject it rather than
-        // under-sizing: `try_push_slice` would otherwise see `required <=
+        // under-sizing: `try_append` would otherwise see `required <=
         // capacity`, skip the realloc, and memcpy `additional` elements past
         // the end of the buffer. Mirrors RawBuffer::reserve_exact.
         if (required < this.length) {
