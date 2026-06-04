@@ -1,0 +1,174 @@
+///! New collection methods: Array insert/remove/reverse/contains/
+///! index_of/first/last/truncate/iter_ref, HashMap get_or_insert/keys/
+///! values, and Iterator any/all/find adapters.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::CollectionsMethods;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::collections::array;
+import std::collections::hashmap;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function array_insert_remove_preserve_order() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(1); a.push(2); a.push(4);
+    a.insert(2, 3);          // [1,2,3,4]
+    a.insert(0, 0);          // [0,1,2,3,4]
+    a.insert(5, 5);          // [0,1,2,3,4,5] (append at end)
+    expect_eq(a.length(), 6)?;
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(v) => { expect_eq(v, i as i32)?; }
+            Option::None    => { a.drop(); return bail(Str::new("get failed")); }
+        }
+        i = i + 1;
+    }
+    const removed: i32 = a.remove(0);   // remove 0 -> [1,2,3,4,5]
+    expect_eq(removed, 0)?;
+    const removed2: i32 = a.remove(2);  // remove value 3 -> [1,2,4,5]
+    expect_eq(removed2, 3)?;
+    expect_eq(a.length(), 4)?;
+    match (a.get(2)) {
+        Option::Some(v) => { expect_eq(v, 4)?; }
+        Option::None    => { a.drop(); return bail(Str::new("post-remove get")); }
+    }
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function array_reverse_first_last() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(10); a.push(20); a.push(30);
+    a.reverse();             // [30,20,10]
+    match (a.first()) {
+        Option::Some(p) => { const fv: i32 = *p; expect_eq(fv, 30i32)?; }
+        Option::None    => { a.drop(); return bail(Str::new("first")); }
+    }
+    match (a.last()) {
+        Option::Some(p) => { const lv: i32 = *p; expect_eq(lv, 10i32)?; }
+        Option::None    => { a.drop(); return bail(Str::new("last")); }
+    }
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function array_contains_index_of() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(5); a.push(7); a.push(9);
+    const k7: i32 = 7;
+    const k8: i32 = 8;
+    const k9: i32 = 9;
+    expect_true(a.contains(&k7), Str::new("contains 7"))?;
+    expect_true(!a.contains(&k8), Str::new("not contains 8"))?;
+    match (a.index_of(&k9)) {
+        Option::Some(i) => { expect_eq(i, 2u64)?; }
+        Option::None    => { a.drop(); return bail(Str::new("index_of 9")); }
+    }
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function array_truncate_drops_tail() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(1); a.push(2); a.push(3); a.push(4);
+    a.truncate(2);
+    expect_eq(a.length(), 2)?;
+    a.truncate(9);           // no-op when >= length
+    expect_eq(a.length(), 2)?;
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function array_iter_ref_sums() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(1); a.push(2); a.push(3);
+    mut it: RefIter<i32> = a.iter_ref();
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(p) => { sum = sum + *p; }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(sum, 6)?;
+    a.drop();
+    return Result::Ok(());
+}
+
+![test]
+function hashmap_get_or_insert() -> Result<(), TestError> {
+    mut m: HashMap<i32, i32> = HashMap::new();
+    const p1: i32* = m.get_or_insert(1, 100);
+    const v1: i32 = *p1;
+    expect_eq(v1, 100i32)?;
+    // Second call with the same key returns the existing value; default
+    // 999 is ignored.
+    const p2: i32* = m.get_or_insert(1, 999);
+    const v2: i32 = *p2;
+    expect_eq(v2, 100i32)?;
+    *p2 = 7;                 // mutate through the borrow
+    const k1: i32 = 1;
+    match (m.get(&k1)) {
+        Option::Some(v) => { expect_eq(v, 7i32)?; }
+        Option::None    => { m.drop(); return bail(Str::new("get after mutate")); }
+    }
+    expect_eq(m.length(), 1u64)?;
+    m.drop();
+    return Result::Ok(());
+}
+
+![test]
+function hashmap_keys_values_sum() -> Result<(), TestError> {
+    mut m: HashMap<i32, i32> = HashMap::new();
+    m.insert(1, 10); m.insert(2, 20); m.insert(3, 30);
+    mut ks: KeysIter<i32, i32> = m.keys();
+    mut key_sum: i32 = 0;
+    loop {
+        match (ks.next()) {
+            Option::Some(k) => { key_sum = key_sum + k; }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(key_sum, 6i32)?;
+    mut vs: ValuesIter<i32, i32> = m.values();
+    mut val_sum: i32 = 0;
+    loop {
+        match (vs.next()) {
+            Option::Some(v) => { val_sum = val_sum + v; }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(val_sum, 60i32)?;
+    m.drop();
+    return Result::Ok(());
+}
+
+function is_even(x: i32) -> boolean { return x % 2 == 0; }
+function is_positive(x: i32) -> boolean { return x > 0; }
+
+![test]
+function iter_any_all_find() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(2); a.push(4); a.push(5);
+    mut it1: SliceIter<i32> = a.iter();
+    expect_true(it1.any(is_even), Str::new("any even"))?;
+    mut it2: SliceIter<i32> = a.iter();
+    expect_true(it2.all(is_positive), Str::new("all positive"))?;
+    mut it3: SliceIter<i32> = a.iter();
+    match (it3.find(is_even)) {
+        Option::Some(v) => { expect_eq(v, 2)?; }
+        Option::None    => { a.drop(); return bail(Str::new("find even")); }
+    }
+    a.drop();
+    return Result::Ok(());
+}

@@ -1,0 +1,59 @@
+///! Regression: a generic free function called inside a `match` / `if`
+///! used as an EXPRESSION, from within a generic body.
+///!
+///! Sema skips generic-call discovery inside generic bodies; the
+///! monomorphizer's `discover_inferred_calls_in_expr` does it post-hoc.
+///! That walker recursed into `?` operands but NOT into match/if
+///! expressions, so `const x = match (gen_free<T>(..)) { ... }` failed
+///! with E0636 "cannot resolve function". These tests exercise the
+///! match-expression and if-expression discovery paths.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchGenericFreeFn;
+
+import std::core::result;
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+// Generic free functions — the call sites below infer their type args.
+function wrap_ok<T>(x: T) -> Result<T, i32> {
+    return Result::Ok(x);
+}
+
+function identity<T>(x: T) -> T {
+    return x;
+}
+
+// Generic caller: the generic free-fn call lives in a `match`-expression
+// scrutinee used as an initializer. This is the shape that regressed.
+function via_match<T>(x: T) -> T where T: Copy {
+    const r: T = match (wrap_ok<T>(x)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { x }
+    };
+    return r;
+}
+
+// Generic caller: the generic free-fn call lives in an `if`-expression
+// branch used as an initializer.
+function via_if<T>(cond: boolean, x: T) -> T where T: Copy {
+    const r: T = if (cond) { identity<T>(x) } else { x };
+    return r;
+}
+
+![test]
+function match_expression_discovers_generic_free_fn() -> Result<(), TestError> {
+    const got: i32 = via_match<i32>(7);
+    expect_eq(got, 7i32)?;
+    return Result::Ok(());
+}
+
+![test]
+function if_expression_discovers_generic_free_fn() -> Result<(), TestError> {
+    const a: i32 = via_if<i32>(true, 5);
+    const b: i32 = via_if<i32>(false, 9);
+    expect_eq(a, 5i32)?;
+    expect_eq(b, 9i32)?;
+    return Result::Ok(());
+}

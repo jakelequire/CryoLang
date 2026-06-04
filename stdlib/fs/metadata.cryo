@@ -1,0 +1,145 @@
+///! File metadata: `stat(2)` / `lstat(2)` wrapped in a typed `Metadata`.
+///!
+///! `struct stat` is opaque across glibc versions, so it is read as a
+///! 144-byte buffer (`SIZEOF_STAT`) and the needed fields are pulled out
+///! by their Linux x86_64 offsets: `st_mode` @ 24 (u32), `st_size` @ 48
+///! (u64), `st_mtim.tv_sec` @ 88 (i64). A future per-arch split would
+///! gate these offsets the way `ffi::syscall` gates its numbers.
+
+namespace std::fs::metadata;
+
+import core::option;
+import core::result;
+import collections::string;
+import collections::str;
+import io::error;
+import ffi::libc;
+import fs::path;
+
+// `struct stat` field byte-offsets on Linux x86_64 / glibc.
+const STAT_OFF_MODE:      u64 = 24;
+const STAT_OFF_SIZE:      u64 = 48;
+const STAT_OFF_MTIME_SEC: u64 = 88;
+
+/// The broad category of a filesystem entry.
+type enum FileType {
+    File;
+    Dir;
+    Symlink;
+    Other;
+}
+
+implement enum FileType {
+    /// Classify from a `st_mode` value (the `S_IFMT` bits).
+    static from_mode(mode: u32) -> FileType {
+        const masked: u32 = mode & libc::S_IFMT;
+        if (masked == libc::S_IFREG) { return FileType::File; }
+        if (masked == libc::S_IFDIR) { return FileType::Dir; }
+        if (masked == libc::S_IFLNK) { return FileType::Symlink; }
+        return FileType::Other;
+    }
+}
+
+/// A snapshot of a path's metadata. POD (no owned resources), freely
+/// copied; no `drop` needed.
+type struct Metadata {
+    raw_mode:   u32;
+    byte_size:  u64;
+    mtime_sec:  i64;
+
+    file_type(&this) -> FileType {
+        return FileType::from_mode(this.raw_mode);
+    }
+
+    is_file(&this) -> boolean {
+        return (this.raw_mode & libc::S_IFMT) == libc::S_IFREG;
+    }
+
+    is_dir(&this) -> boolean {
+        return (this.raw_mode & libc::S_IFMT) == libc::S_IFDIR;
+    }
+
+    is_symlink(&this) -> boolean {
+        return (this.raw_mode & libc::S_IFMT) == libc::S_IFLNK;
+    }
+
+    /// Size in bytes (meaningful for regular files).
+    len(&this) -> u64 {
+        return this.byte_size;
+    }
+
+    /// Full `st_mode` (type bits + permission bits).
+    mode(&this) -> u32 {
+        return this.raw_mode;
+    }
+
+    /// Unix permission bits (the low 12 bits of `st_mode`).
+    permissions(&this) -> u32 {
+        return this.raw_mode & 0xFFF;
+    }
+
+    /// Last-modification time in whole seconds since the Unix epoch.
+    modified_secs(&this) -> i64 {
+        return this.mtime_sec;
+    }
+}
+
+/// Decode a filled `struct stat` buffer into a `Metadata`.
+function decode_stat(buf: u8*) -> Metadata {
+    const mode: u32 = *((buf + STAT_OFF_MODE) as u32*);
+    const size: u64 = *((buf + STAT_OFF_SIZE) as u64*);
+    const mtime: i64 = *((buf + STAT_OFF_MTIME_SEC) as i64*);
+    return Metadata { raw_mode: mode, byte_size: size, mtime_sec: mtime };
+}
+
+/// Metadata for `p`, following symlinks (`stat(2)`).
+function metadata(p: Path) -> Result<Metadata, IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    mut buf: u8[144];
+    const rc: i32 = libc::stat(c_path.as_ptr(), &buf[0]);
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (rc != 0) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(decode_stat(&buf[0]));
+}
+
+/// Metadata for `p` without following a final symlink (`lstat(2)`).
+function symlink_metadata(p: Path) -> Result<Metadata, IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    mut buf: u8[144];
+    const rc: i32 = libc::lstat(c_path.as_ptr(), &buf[0]);
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (rc != 0) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(decode_stat(&buf[0]));
+}
+
+/// True iff `p` exists (any type). Uses `access(2)` with `F_OK` (0).
+/// A non-existence answer is not distinguished from a permission error
+/// on an intermediate directory; use `metadata` if you need the reason.
+function exists(p: Path) -> boolean {
+    mut c_path: String = String::from_str_c(p.as_str());
+    const rc: i32 = libc::access(c_path.as_ptr(), 0);
+    c_path.drop();
+    return rc == 0;
+}
+
+/// True iff `p` exists and is a regular file.
+function is_file(p: Path) -> boolean {
+    match (metadata(p)) {
+        Result::Ok(m)  => { return m.is_file(); }
+        Result::Err(_) => { return false; }
+    }
+}
+
+/// True iff `p` exists and is a directory.
+function is_dir(p: Path) -> boolean {
+    match (metadata(p)) {
+        Result::Ok(m)  => { return m.is_dir(); }
+        Result::Err(_) => { return false; }
+    }
+}

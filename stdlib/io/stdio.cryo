@@ -33,19 +33,35 @@
 ///! not special in its byte-pumping behaviour. A `File` or a
 ///! `TcpStream` or a `BufReader` gets the same methods for free.
 ///!
-///! # Locking: future work
+///! # Locking
 ///!
-///! Cryo is single-threaded today, so interleaving between
-///! concurrent writers is not yet a concern. When threads arrive,
-///! this module gains `Stdout::lock() -> StdoutLock` and
-///! `Stdin::lock() -> StdinLock` that serialize access through a
-///! process-global mutex (matching Rust's surface). Handle methods
-///! today are forward-compatible with that model; callers that
-///! only hold the bare handle still get the right behaviour because
-///! the lock is acquired per-syscall.
+///! Cryo now has threads (`std::thread`), so concurrent writers to the
+///! same stream can interleave. The bare handles (`stdout()`, etc.)
+///! issue one unsynchronized `write(2)`/`read(2)` per call and do NOT
+///! serialize across threads.
+///!
+///! To order output from multiple threads, acquire a lock guard:
+///!
+///! ```cryo
+///! mut out: StdoutLock = stdout().lock();   // blocks other lockers
+///! out.write_all(part_a)?;
+///! out.write_all(part_b)?;                   // a/b are adjacent
+///! out.drop();                               // releases the lock
+///! ```
+///!
+///! `Stdout::lock()`, `Stderr::lock()`, and `Stdin::lock()` each return
+///! an RAII guard backed by a process-global mutex (one per stream, so
+///! a blocking stdin read does not stall stdout writers). The guard
+///! implements `Write` (`StdoutLock`/`StderrLock`) or `Read`
+///! (`StdinLock`) and releases the lock on `drop`. A guard must be
+///! dropped on the thread that created it (a POSIX mutex is unlocked by
+///! its locking thread); do not move one across a thread boundary.
+///! Locking only serializes other `lock()` callers — code mixing a bare
+///! handle with a lock guard on the same stream is still unordered.
 
 namespace std::io::stdio;
 
+import core::intrinsics;
 import core::option;
 import core::result;
 import core::slice;
@@ -61,6 +77,22 @@ import ffi::libc;
 const STDIN_FD:  i32 = 0;
 const STDOUT_FD: i32 = 1;
 const STDERR_FD: i32 = 2;
+
+// Process-global locks for the three standard streams.
+//
+// A zero-filled `pthread_mutex_t` is byte-for-byte equivalent to
+// `PTHREAD_MUTEX_INITIALIZER` on Linux/glibc, so these BSS-zeroed
+// buffers are ready to `pthread_mutex_lock` without an explicit
+// `pthread_mutex_init`. 40 bytes is `sizeof(pthread_mutex_t)` on Linux
+// x86_64 (matches `sync::mutex::MutexInner.pthread_buf`).
+//
+// Each stream has its own lock so that a thread blocked in a `Stdin`
+// read does not stall `Stdout` writers. The locks guard only the
+// `lock()`-based API; the bare handles still issue one unsynchronized
+// `write(2)`/`read(2)` per call (see the module doc).
+mut g_stdin_lock:  u8[40];
+mut g_stdout_lock: u8[40];
+mut g_stderr_lock: u8[40];
 
 // Line-ending primitives
 
@@ -100,6 +132,17 @@ type struct Stdin {
     /// that still needs to pass fd 0 to a system call directly.
     as_fd(&this) -> i32 {
         return STDIN_FD as i32;
+    }
+
+    /// Acquire the process-global stdin lock, blocking until it is
+    /// free. The returned `StdinLock` reads through fd 0 and releases
+    /// the lock on `drop`. See the module doc for the ownership rules.
+    lock(&this) -> StdinLock {
+        const rc: i32 = libc::pthread_mutex_lock(&g_stdin_lock[0]);
+        if (rc != 0) {
+            intrinsics::panic("Stdin::lock: pthread_mutex_lock failed", FILE, LINE);
+        }
+        return StdinLock { };
     }
 
     /// Read one line of input and return it as an owned `String`
@@ -179,6 +222,17 @@ type struct Stdout {
     as_fd(&this) -> i32 {
         return STDOUT_FD as i32;
     }
+
+    /// Acquire the process-global stdout lock, blocking until it is
+    /// free. The returned `StdoutLock` writes through fd 1 and releases
+    /// the lock on `drop`. See the module doc for the ownership rules.
+    lock(&this) -> StdoutLock {
+        const rc: i32 = libc::pthread_mutex_lock(&g_stdout_lock[0]);
+        if (rc != 0) {
+            intrinsics::panic("Stdout::lock: pthread_mutex_lock failed", FILE, LINE);
+        }
+        return StdoutLock { };
+    }
 }
 
 function stdout() -> Stdout {
@@ -209,6 +263,17 @@ type struct Stderr {
     as_fd(&this) -> i32 {
         return STDERR_FD as i32;
     }
+
+    /// Acquire the process-global stderr lock, blocking until it is
+    /// free. The returned `StderrLock` writes through fd 2 and releases
+    /// the lock on `drop`. See the module doc for the ownership rules.
+    lock(&this) -> StderrLock {
+        const rc: i32 = libc::pthread_mutex_lock(&g_stderr_lock[0]);
+        if (rc != 0) {
+            intrinsics::panic("Stderr::lock: pthread_mutex_lock failed", FILE, LINE);
+        }
+        return StderrLock { };
+    }
 }
 
 function stderr() -> Stderr {
@@ -222,5 +287,71 @@ implement trait Write for struct Stderr {
 
     flush(mut &this) -> Result<(), IoError> {
         return Result::Ok(());
+    }
+}
+
+// Stream lock guards
+//
+// Each guard is a zero-field RAII token: it owns the process-global
+// lock for one stream and releases it on `drop`. Because it carries a
+// `Drop` impl it is move-only (never `Copy`), so the lock is released
+// exactly once. Do not move a guard to another thread: a POSIX mutex
+// must be unlocked by the thread that locked it.
+
+/// RAII guard over the stdin lock; reads through fd 0. Get one from
+/// `stdin().lock()`. Inherits the `Read` trait defaults (`read_line`,
+/// `read_to_string`, ...).
+type struct StdinLock { }
+
+implement trait Read for struct StdinLock {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        return fd::read_fd(STDIN_FD, buffer, length);
+    }
+}
+
+implement trait Drop for struct StdinLock {
+    drop(mut &this) -> void {
+        libc::pthread_mutex_unlock(&g_stdin_lock[0]);
+    }
+}
+
+/// RAII guard over the stdout lock; writes through fd 1. Get one from
+/// `stdout().lock()`. Inherits the `Write` trait defaults
+/// (`write_all`, `write_str`, `write_line`, ...).
+type struct StdoutLock { }
+
+implement trait Write for struct StdoutLock {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        return fd::write_fd(STDOUT_FD, bytes);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return Result::Ok(());
+    }
+}
+
+implement trait Drop for struct StdoutLock {
+    drop(mut &this) -> void {
+        libc::pthread_mutex_unlock(&g_stdout_lock[0]);
+    }
+}
+
+/// RAII guard over the stderr lock; writes through fd 2. Get one from
+/// `stderr().lock()`.
+type struct StderrLock { }
+
+implement trait Write for struct StderrLock {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        return fd::write_fd(STDERR_FD, bytes);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return Result::Ok(());
+    }
+}
+
+implement trait Drop for struct StderrLock {
+    drop(mut &this) -> void {
+        libc::pthread_mutex_unlock(&g_stderr_lock[0]);
     }
 }

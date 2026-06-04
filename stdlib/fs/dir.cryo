@@ -1,0 +1,191 @@
+///! Directory iteration and whole-path operations.
+///!
+///! `read_dir(p)` returns a `ReadDir` iterator over `DirEntry` values
+///! (skipping `.` and `..`). The remaining free functions wrap the
+///! single-syscall path operations: `create_dir`, `remove_file`,
+///! `remove_dir`, `rename`, and `canonicalize`. All report failure
+///! through `IoError` mapped from `errno`.
+
+namespace std::fs::dir;
+
+import core::option;
+import core::result;
+import core::iter;
+import core::drop;
+import collections::string;
+import collections::str;
+import io::error;
+import ffi::libc;
+import fs::path;
+import fs::metadata;
+
+// `struct dirent` field offsets on Linux x86_64 / glibc: d_type @ 18
+// (u8), d_name @ 19 (NUL-terminated).
+const DIRENT_OFF_TYPE: u64 = 18;
+const DIRENT_OFF_NAME: u64 = 19;
+
+// `d_type` values we classify (others fall through to FileType::Other).
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+
+// Default mode for a newly created directory: 0755.
+const DEFAULT_DIR_MODE: u32 = 493;
+
+/// One entry returned by `ReadDir`. Owns its name; drop releases it.
+type struct DirEntry {
+    entry_name: String;
+    dtype:      u8;
+
+    /// The entry's file name (no directory components). Borrows this
+    /// entry's storage.
+    name(&this) -> Str {
+        return this.entry_name.as_str();
+    }
+
+    /// File type from the dirent `d_type` field. Some filesystems
+    /// report `DT_UNKNOWN`; call `metadata` on the full path for an
+    /// authoritative answer in that case.
+    file_type(&this) -> FileType {
+        if (this.dtype == DT_DIR) { return FileType::Dir; }
+        if (this.dtype == DT_REG) { return FileType::File; }
+        if (this.dtype == DT_LNK) { return FileType::Symlink; }
+        return FileType::Other;
+    }
+
+    is_dir(&this) -> boolean { return this.dtype == DT_DIR; }
+    is_file(&this) -> boolean { return this.dtype == DT_REG; }
+}
+
+implement trait Drop for struct DirEntry {
+    drop(mut &this) -> void {
+        this.entry_name.drop();
+    }
+}
+
+/// Forward iterator over the entries of a directory. Yields owned
+/// `DirEntry` values, skipping `.` and `..`. Closes the underlying
+/// `DIR*` on drop. Order is filesystem-defined.
+type struct ReadDir {
+    dirp: void*;
+}
+
+implement trait Iterator<DirEntry> for struct ReadDir {
+    next(mut &this) -> Option<DirEntry> {
+        if (this.dirp == null) { return Option::None; }
+        loop {
+            const ent: u8* = libc::readdir(this.dirp);
+            if (ent == null) { return Option::None; }
+            const dtype: u8 = *((ent + DIRENT_OFF_TYPE) as u8*);
+            const name_ptr: u8* = ent + DIRENT_OFF_NAME;
+            const name_view: Str = Str::from_raw(name_ptr, libc::strlen(name_ptr));
+            if (is_dot_or_dotdot(name_view)) {
+                continue;
+            }
+            return Option::Some(DirEntry {
+                entry_name: String::from_str(name_view),
+                dtype: dtype
+            });
+        }
+    }
+}
+
+implement trait Drop for struct ReadDir {
+    drop(mut &this) -> void {
+        if (this.dirp != null) {
+            libc::closedir(this.dirp);
+            this.dirp = null;
+        }
+    }
+}
+
+/// True for the `.` and `..` pseudo-entries `readdir` reports.
+function is_dot_or_dotdot(name: Str) -> boolean {
+    if (name.length() == 1) {
+        return name.equals(&Str::new("."));
+    }
+    if (name.length() == 2) {
+        return name.equals(&Str::new(".."));
+    }
+    return false;
+}
+
+/// Open `p` for iteration. The returned `ReadDir` must be dropped to
+/// close the directory handle.
+function read_dir(p: Path) -> Result<ReadDir, IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    const dirp: void* = libc::opendir(c_path.as_ptr());
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (dirp == null) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(ReadDir { dirp: dirp });
+}
+
+/// Create a single directory (mode 0755). Fails if it already exists or
+/// a parent component is missing; use `create_dir_all` for the latter.
+function create_dir(p: Path) -> Result<(), IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    const rc: i32 = libc::mkdir(c_path.as_ptr(), DEFAULT_DIR_MODE);
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (rc != 0) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(());
+}
+
+/// Remove a file (or symlink). `unlink(2)`.
+function remove_file(p: Path) -> Result<(), IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    const rc: i32 = libc::unlink(c_path.as_ptr());
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (rc != 0) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(());
+}
+
+/// Remove an empty directory. `rmdir(2)`.
+function remove_dir(p: Path) -> Result<(), IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    const rc: i32 = libc::rmdir(c_path.as_ptr());
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (rc != 0) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(());
+}
+
+/// Rename / move `from` to `to`. `rename(2)` (atomic within a
+/// filesystem; fails with `EXDEV` across filesystems).
+function rename(from: Path, to: Path) -> Result<(), IoError> {
+    mut c_from: String = String::from_str_c(from.as_str());
+    mut c_to: String = String::from_str_c(to.as_str());
+    const rc: i32 = libc::rename(c_from.as_ptr(), c_to.as_ptr());
+    const err: i32 = libc::errno();
+    c_to.drop();
+    c_from.drop();
+    if (rc != 0) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    return Result::Ok(());
+}
+
+/// Resolve `p` to an absolute, symlink-free canonical path
+/// (`realpath(3)`). The result fits in `PATH_MAX` (4096) bytes.
+function canonicalize(p: Path) -> Result<PathBuf, IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    mut buf: u8[4096];
+    const res: u8* = libc::realpath(c_path.as_ptr(), &buf[0]);
+    const err: i32 = libc::errno();
+    c_path.drop();
+    if (res == null) {
+        return Result::Err(IoError::from_errno(err));
+    }
+    const view: Str = Str::from_raw(&buf[0], libc::strlen(&buf[0]));
+    return Result::Ok(PathBuf::from_str(view));
+}

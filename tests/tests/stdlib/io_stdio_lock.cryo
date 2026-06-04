@@ -1,0 +1,63 @@
+///! Stdio stream locks - single-threaded coverage of lock/unlock and
+///! guard drop releasing the lock. The re-lock after drop would deadlock
+///! if the first guard leaked the lock, so reaching the end proves the
+///! release path works. Cross-thread serialization needs orchestration
+///! beyond the single-threaded test harness; the lock primitive itself
+///! is a process-global pthread mutex (see io::stdio).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoStdioLock;
+
+import std::core::result;
+import std::core::slice;
+import std::core::drop;
+import std::io::stdio;
+import std::io::traits;
+import std::io::error;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function stdout_lock_acquires_and_releases() -> Result<(), TestError> {
+    mut out: StdoutLock = stdout().lock();
+    // Zero-length write exercises the Write impl without polluting the
+    // test's captured output.
+    match (out.write_all(Slice::from_raw("", 0))) {
+        Result::Ok(_) => { }
+        Result::Err(_) => { out.drop(); return bail(Str::new("write_all failed")); }
+    }
+    out.drop();
+    // Re-lock: deadlocks if the first guard leaked the lock.
+    mut out2: StdoutLock = stdout().lock();
+    out2.drop();
+    return Result::Ok(());
+}
+
+![test]
+function stderr_lock_acquires_and_releases() -> Result<(), TestError> {
+    mut err: StderrLock = stderr().lock();
+    err.drop();
+    mut err2: StderrLock = stderr().lock();
+    err2.drop();
+    return Result::Ok(());
+}
+
+![test]
+function stdin_lock_acquires_and_releases() -> Result<(), TestError> {
+    mut in_lock: StdinLock = stdin().lock();
+    in_lock.drop();
+    mut in_lock2: StdinLock = stdin().lock();
+    in_lock2.drop();
+    return Result::Ok(());
+}
+
+![test]
+function stdout_and_stdin_locks_are_independent() -> Result<(), TestError> {
+    // Holding the stdout lock must not block acquiring the stdin lock:
+    // separate per-stream mutexes. A shared lock would deadlock here.
+    mut out: StdoutLock = stdout().lock();
+    mut in_lock: StdinLock = stdin().lock();
+    in_lock.drop();
+    out.drop();
+    return Result::Ok(());
+}

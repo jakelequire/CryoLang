@@ -1,0 +1,173 @@
+///! fs metadata + directory operations + read_to_string + seek.
+///!
+///! Each test uses PID-unique paths under /tmp and cleans up after
+///! itself so the suite leaves no residue.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FsMetaDir;
+
+import std::core::intrinsics;
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::core::drop;
+import std::core::iter;
+import std::collections::str;
+import std::collections::string;
+import std::io::error;
+import std::io::traits;
+import std::fs::path;
+import std::fs::file;
+import std::fs::metadata;
+import std::fs::dir;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+function tmp_file(buf: i8*, tag: string) -> Path {
+    const n: i32 = intrinsics::snprintf(buf, 96, "/tmp/cryo_md_%s_%d.dat", tag, libc::getpid());
+    return Path::from_str(Str::from_raw(buf as u8*, n as u64));
+}
+
+![test]
+function read_to_string_roundtrip() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = tmp_file(&namebuf[0], "rts");
+    const payload: Str = Str::new("line one\nline two\n");
+    match (write(p, payload.as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("write failed")); }
+    }
+    mut got: String = String::new();
+    match (read_to_string(p)) {
+        Result::Ok(s)  => { got = s; }
+        Result::Err(_) => { libc::unlink(p.as_str().as_ptr()); return bail(Str::new("read_to_string failed")); }
+    }
+    const ok: boolean = got.as_str().equals(&payload);
+    got.drop();
+    libc::unlink(p.as_str().as_ptr());
+    expect_true(ok, Str::new("contents match"))?;
+    return Result::Ok(());
+}
+
+![test]
+function metadata_reports_file() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = tmp_file(&namebuf[0], "meta");
+    const payload: Str = Str::new("12345");   // 5 bytes
+    match (write(p, payload.as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("write failed")); }
+    }
+    mut is_file: boolean = false;
+    mut is_dir: boolean = true;
+    mut size: u64 = 0;
+    match (metadata(p)) {
+        Result::Ok(m)  => { is_file = m.is_file(); is_dir = m.is_dir(); size = m.len(); }
+        Result::Err(_) => { libc::unlink(p.as_str().as_ptr()); return bail(Str::new("metadata failed")); }
+    }
+    libc::unlink(p.as_str().as_ptr());
+    expect_true(is_file, Str::new("is_file"))?;
+    expect_true(!is_dir, Str::new("not is_dir"))?;
+    expect_eq(size, 5u64)?;
+    return Result::Ok(());
+}
+
+![test]
+function exists_true_and_false() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = tmp_file(&namebuf[0], "exists");
+    // Not created yet.
+    expect_true(!exists(p), Str::new("absent before create"))?;
+    match (write(p, Str::new("x").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("write failed")); }
+    }
+    const present: boolean = exists(p);
+    libc::unlink(p.as_str().as_ptr());
+    expect_true(present, Str::new("present after create"))?;
+    return Result::Ok(());
+}
+
+![test]
+function create_read_remove_dir() -> Result<(), TestError> {
+    mut dirbuf: i8[96];
+    const dn: i32 = intrinsics::snprintf(&dirbuf[0], 96, "/tmp/cryo_md_dir_%d", libc::getpid());
+    const dpath: Path = Path::from_str(Str::from_raw((&dirbuf[0]) as u8*, dn as u64));
+
+    match (create_dir(dpath)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("create_dir failed")); }
+    }
+
+    // A file inside the directory.
+    mut filebuf: i8[128];
+    const fn2: i32 = intrinsics::snprintf(&filebuf[0], 128, "/tmp/cryo_md_dir_%d/entry.dat", libc::getpid());
+    const fpath: Path = Path::from_str(Str::from_raw((&filebuf[0]) as u8*, fn2 as u64));
+    match (write(fpath, Str::new("hi").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { remove_dir(dpath); return bail(Str::new("write in dir failed")); }
+    }
+
+    // read_dir should surface exactly the one entry "entry.dat".
+    mut found: boolean = false;
+    mut count: u64 = 0;
+    match (read_dir(dpath)) {
+        Result::Ok(rd) => {
+            mut it: ReadDir = rd;
+            loop {
+                match (it.next()) {
+                    Option::Some(e) => {
+                        mut entry: DirEntry = e;
+                        count = count + 1;
+                        if (entry.name().equals(&Str::new("entry.dat"))) { found = true; }
+                        entry.drop();
+                    }
+                    Option::None => { break; }
+                }
+            }
+            it.drop();
+        }
+        Result::Err(_) => {
+            remove_file(fpath); remove_dir(dpath);
+            return bail(Str::new("read_dir failed"));
+        }
+    }
+
+    // Cleanup.
+    match (remove_file(fpath)) { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (remove_dir(dpath))  { Result::Ok(_) => { } Result::Err(_) => { } }
+
+    expect_eq(count, 1u64)?;
+    expect_true(found, Str::new("entry.dat found"))?;
+    return Result::Ok(());
+}
+
+![test]
+function file_seek_cur_end_and_position() -> Result<(), TestError> {
+    mut namebuf: i8[96];
+    const p: Path = tmp_file(&namebuf[0], "seek");
+    match (write(p, Str::new("0123456789").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("write failed")); }
+    }
+    mut pos: u64 = 0;
+    mut endpos: u64 = 0;
+    mut cur: u64 = 99;
+    match (File::open(p)) {
+        Result::Ok(h)  => {
+            mut f: File = h;
+            match (f.seek_set(3)) { Result::Ok(v) => { pos = v; } Result::Err(_) => { } }
+            match (f.seek_cur(2)) { Result::Ok(v) => { pos = v; } Result::Err(_) => { } }   // -> 5
+            match (f.stream_position()) { Result::Ok(v) => { cur = v; } Result::Err(_) => { } }
+            match (f.seek_end(0)) { Result::Ok(v) => { endpos = v; } Result::Err(_) => { } } // -> 10
+            f.drop();
+        }
+        Result::Err(_) => { libc::unlink(p.as_str().as_ptr()); return bail(Str::new("open failed")); }
+    }
+    libc::unlink(p.as_str().as_ptr());
+    expect_eq(pos, 5u64)?;
+    expect_eq(cur, 5u64)?;
+    expect_eq(endpos, 10u64)?;
+    return Result::Ok(());
+}
