@@ -74,7 +74,7 @@ type struct RawBuffer<T, A = GlobalAlloc> {
         if (required <= this.capacity) {
             return Result::Ok(());
         }
-        return resize(this, next_capacity(this.capacity, required, min_capacity));
+        return this.resize(next_capacity(this.capacity, required, min_capacity));
     }
 
     /// Allocate exactly enough for `used + additional`. No over-
@@ -93,7 +93,7 @@ type struct RawBuffer<T, A = GlobalAlloc> {
         if (required <= this.capacity) {
             return Result::Ok(());
         }
-        return resize(this, required);
+        return this.resize(required);
     }
 
     /// Shrink capacity to `target`, which must be at least `used`.
@@ -112,38 +112,39 @@ type struct RawBuffer<T, A = GlobalAlloc> {
             this.capacity = 0;
             return;
         }
-        match (resize(this, target)) {
+        match (this.resize(target)) {
             Result::Ok(_) => { }
             Result::Err(_) => { }
         }
     }
 
-}
+    /// Reallocate to `new_capacity`. Assumes `new_capacity` is the value
+    /// the caller wants; bounds against `used` are the caller's problem.
+    /// A method (not a free function) so the monomorphizer specializes it
+    /// alongside the rest of `RawBuffer<T, A>`'s body, mirroring
+    /// `Array::resize_storage`.
+    resize(mut &this, new_capacity: u64) -> Result<(), AllocError> {
+        if (new_capacity == this.capacity) {
+            return Result::Ok(());
+        }
+        const new_layout: Layout = Layout::array<T>(new_capacity);
+        if (this.ptr == null) {
+            const raw: NonNull<u8> = this.alloc.allocate(new_layout)?;
+            this.ptr = raw.as_ptr() as T*;
+            this.capacity = new_capacity;
+            return Result::Ok(());
+        }
+        const old_layout: Layout = Layout::array<T>(this.capacity);
+        const raw: NonNull<u8> = this.alloc.reallocate(
+            NonNull::new(this.ptr as u8*),
+            old_layout,
+            new_layout
+        )?;
+        this.ptr = raw.as_ptr() as T*;
+        this.capacity = new_capacity;
+        return Result::Ok(());
+    }
 
-/// Reallocate to `new_capacity`. Assumes `new_capacity` is the value
-/// the caller wants; bounds against `used` are the caller's problem.
-function resize<T, A>(buffer: mut &RawBuffer<T, A>,
-                      new_capacity: u64) -> Result<(), AllocError>
-where A: Allocator {
-    if (new_capacity == buffer.capacity) {
-        return Result::Ok(());
-    }
-    const new_layout: Layout = Layout::array<T>(new_capacity);
-    if (buffer.ptr == null) {
-        const raw: NonNull<u8> = buffer.alloc.allocate(new_layout)?;
-        buffer.ptr = raw.as_ptr() as T*;
-        buffer.capacity = new_capacity;
-        return Result::Ok(());
-    }
-    const old_layout: Layout = Layout::array<T>(buffer.capacity);
-    const raw: NonNull<u8> = buffer.alloc.reallocate(
-        NonNull::new(buffer.ptr as u8*),
-        old_layout,
-        new_layout
-    )?;
-    buffer.ptr = raw.as_ptr() as T*;
-    buffer.capacity = new_capacity;
-    return Result::Ok(());
 }
 
 /// Release the backing allocation. Storage-only; callers must have

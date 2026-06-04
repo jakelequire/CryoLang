@@ -1,70 +1,198 @@
-///! math: float operations.
+///! math: numeric operations on floats and integers.
 ///!
-///! Thin wrappers over libm. Every function delegates to the C
-///! implementation and inherits its platform behavior (rounding
-///! mode, errno on domain errors, subnormal handling). We don't
-///! re-derive the IEEE 754 corner cases in Cryo.
-///!
-///! The naming follows C (`sqrt`, `sinh`, `atan2`). f64 is the
-///! default; f32 versions live alongside with an `f32` suffix only
-///! when the C name already carries one (`sqrtf` -> `sqrt_f32`).
+///! Float functions are thin wrappers over libm and inherit its
+///! platform behavior (rounding mode, errno on domain errors,
+///! subnormal handling); we don't re-derive the IEEE 754 corner cases
+///! in Cryo. Naming follows C: `sqrt`, `ln`, `sin`, `atan2`. f64 is the
+///! default; an `_f32` suffix marks a single-precision variant, and
+///! integer variants carry an `_i64` / `_u64` / `_i32` suffix (the
+///! plain name is the f64 form).
 
 namespace std::math;
 
 import ffi::libc;
 
-const PI: f64 = 3.141592653589793;
-const TAU: f64 = 6.283185307179586;
-const E: f64 = 2.718281828459045;
+// --- constants ---------------------------------------------------------
+
+const PI: f64     = 3.141592653589793;
+const TAU: f64    = 6.283185307179586;
+const E: f64      = 2.718281828459045;
+const PHI: f64    = 1.618033988749895;   // golden ratio
 const SQRT_2: f64 = 1.4142135623730951;
-const LN_2: f64 = 0.6931471805599453;
-const LN_10: f64 = 2.302585092994046;
+const SQRT_3: f64 = 1.7320508075688772;
+const LN_2: f64   = 0.6931471805599453;
+const LN_10: f64  = 2.302585092994046;
+const LOG2_E: f64  = 1.4426950408889634;
+const LOG10_E: f64 = 0.4342944819032518;
 
-// f64 entrypoints (thin aliases over libm for naming symmetry)
+// IEEE-754 limits. `*_MIN_POSITIVE` is the smallest positive normal.
+const F64_EPSILON: f64      = 2.220446049250313e-16;
+const F64_MAX: f64          = 1.7976931348623157e308;
+const F64_MIN_POSITIVE: f64 = 2.2250738585072014e-308;
+const F32_EPSILON: f32      = 1.1920929e-7;
+const F32_MAX: f32          = 3.4028235e38;
+const F32_MIN_POSITIVE: f32 = 1.1754944e-38;
 
-function square_root(value: f64) -> f64 { return libc::sqrt(value); }
-function cube_root(value: f64) -> f64 { return libc::cbrt(value); }
-function power(base: f64, exponent: f64) -> f64 { return libc::pow(base, exponent); }
+// --- non-finite values -------------------------------------------------
+//
+// Provided as functions rather than `const`s: the values are produced by
+// IEEE overflow / invalid operations (`F64_MAX * 2` -> +inf, `inf - inf`
+// -> NaN) rather than spellable literals, and computing them at use-site
+// sidesteps any compile-time constant folding.
 
-function natural_log(value: f64) -> f64 { return libc::log(value); }
-function log_base2(value: f64) -> f64 { return libc::log2(value); }
-function log_base10(value: f64) -> f64 { return libc::log10(value); }
-function exponential(value: f64) -> f64 { return libc::exp(value); }
+function infinity() -> f64 { return F64_MAX * 2.0; }
+function neg_infinity() -> f64 { return 0.0 - infinity(); }
+function nan() -> f64 { const inf: f64 = infinity(); return inf - inf; }
 
-function sine(value: f64) -> f64 { return libc::sin(value); }
-function cosine(value: f64) -> f64 { return libc::cos(value); }
-function tangent(value: f64) -> f64 { return libc::tan(value); }
+// --- roots & powers ----------------------------------------------------
 
-function absolute(value: f64) -> f64 { return libc::fabs(value); }
-function absolute_f32(value: f32) -> f32 { return libc::fabsf(value); }
+function sqrt(value: f64) -> f64 { return libc::sqrt(value); }
+function sqrt_f32(value: f32) -> f32 { return libc::sqrtf(value); }
+function cbrt(value: f64) -> f64 { return libc::cbrt(value); }
+function pow(base: f64, exponent: f64) -> f64 { return libc::pow(base, exponent); }
+function hypot(x: f64, y: f64) -> f64 { return libc::sqrt(x * x + y * y); }
 
-function hypot(x: f64, y: f64) -> f64 {
-    return libc::sqrt(x * x + y * y);
+// --- exponential & logarithm -------------------------------------------
+
+function exp(value: f64) -> f64 { return libc::exp(value); }
+function exp2(value: f64) -> f64 { return libc::exp2(value); }
+function ln(value: f64) -> f64 { return libc::log(value); }
+function log2(value: f64) -> f64 { return libc::log2(value); }
+function log10(value: f64) -> f64 { return libc::log10(value); }
+
+/// Logarithm of `value` in an arbitrary `base`.
+function log(value: f64, base: f64) -> f64 {
+    return libc::log(value) / libc::log(base);
 }
 
-// Integer absolute: cheap enough to be intrinsic-free.
-function abs_i32(value: i32) -> i32 {
-    if (value < 0) { return 0 - value; }
+// --- trigonometry ------------------------------------------------------
+
+function sin(value: f64) -> f64 { return libc::sin(value); }
+function cos(value: f64) -> f64 { return libc::cos(value); }
+function tan(value: f64) -> f64 { return libc::tan(value); }
+function asin(value: f64) -> f64 { return libc::asin(value); }
+function acos(value: f64) -> f64 { return libc::acos(value); }
+function atan(value: f64) -> f64 { return libc::atan(value); }
+function atan2(y: f64, x: f64) -> f64 { return libc::atan2(y, x); }
+
+function sinh(value: f64) -> f64 { return libc::sinh(value); }
+function cosh(value: f64) -> f64 { return libc::cosh(value); }
+function tanh(value: f64) -> f64 { return libc::tanh(value); }
+
+/// Convert degrees to radians and back.
+function to_radians(degrees: f64) -> f64 { return degrees * (PI / 180.0); }
+function to_degrees(radians: f64) -> f64 { return radians * (180.0 / PI); }
+
+// --- rounding ----------------------------------------------------------
+
+function floor(value: f64) -> f64 { return libc::floor(value); }
+function ceil(value: f64) -> f64 { return libc::ceil(value); }
+function round(value: f64) -> f64 { return libc::round(value); }
+function trunc(value: f64) -> f64 { return libc::trunc(value); }
+
+/// Fractional part, with the sign of `value` (`fract(-2.25) == -0.25`).
+function fract(value: f64) -> f64 { return value - libc::trunc(value); }
+
+// --- sign & absolute value ---------------------------------------------
+
+function fabs(value: f64) -> f64 { return libc::fabs(value); }
+function fabs_f32(value: f32) -> f32 { return libc::fabsf(value); }
+
+/// `magnitude` with the sign of `sign` (IEEE copysign).
+function copysign(magnitude: f64, sign: f64) -> f64 {
+    return libc::copysign(magnitude, sign);
+}
+
+/// Floating-point remainder of `x / y` (IEEE fmod).
+function fmod(x: f64, y: f64) -> f64 { return libc::fmod(x, y); }
+
+/// +1.0 / -1.0 for non-zero values; preserves +0.0, -0.0, and NaN.
+function signum(value: f64) -> f64 {
+    if (value > 0.0) { return 1.0; }
+    if (value < 0.0) { return 0.0 - 1.0; }
     return value;
 }
 
-function abs_i64(value: i64) -> i64 {
-    if (value < 0) { return 0 - value; }
+// Integer absolute value: cheap enough to be intrinsic-free.
+function abs_i64(value: i64) -> i64 { if (value < 0) { return 0 - value; } return value; }
+function abs_i32(value: i32) -> i32 { if (value < 0) { return 0 - value; } return value; }
+
+// --- min / max / clamp -------------------------------------------------
+//
+// The plain names operate on f64; integer variants carry a type suffix.
+// Free-function overloading is avoided deliberately (it tickles the
+// generic-codegen path), so each width gets its own name.
+
+function min(a: f64, b: f64) -> f64 { if (a < b) { return a; } return b; }
+function max(a: f64, b: f64) -> f64 { if (a > b) { return a; } return b; }
+function clamp(value: f64, lo: f64, hi: f64) -> f64 {
+    if (value < lo) { return lo; }
+    if (value > hi) { return hi; }
     return value;
 }
 
+function min_i64(a: i64, b: i64) -> i64 { if (a < b) { return a; } return b; }
+function max_i64(a: i64, b: i64) -> i64 { if (a > b) { return a; } return b; }
+function clamp_i64(value: i64, lo: i64, hi: i64) -> i64 {
+    if (value < lo) { return lo; }
+    if (value > hi) { return hi; }
+    return value;
+}
+
+function min_u64(a: u64, b: u64) -> u64 { if (a < b) { return a; } return b; }
+function max_u64(a: u64, b: u64) -> u64 { if (a > b) { return a; } return b; }
+function clamp_u64(value: u64, lo: u64, hi: u64) -> u64 {
+    if (value < lo) { return lo; }
+    if (value > hi) { return hi; }
+    return value;
+}
+
+// --- classification ----------------------------------------------------
+//
 // `isnan` / `isinf` in libc are macros; the underlying primitive
 // implementations (`__isnan`, `__isinf`) live in `ffi::libc` alongside
 // the rest of libm.
 
-function is_nan(value: f64) -> boolean {
-    return libc::__isnan(value) != 0;
-}
-
-function is_infinite(value: f64) -> boolean {
-    return libc::__isinf(value) != 0;
-}
-
+function is_nan(value: f64) -> boolean { return libc::__isnan(value) != 0; }
+function is_infinite(value: f64) -> boolean { return libc::__isinf(value) != 0; }
 function is_finite(value: f64) -> boolean {
     return !is_nan(value) && !is_infinite(value);
+}
+
+// --- integer helpers ---------------------------------------------------
+
+/// Greatest common divisor (Euclid). `gcd(0, 0) == 0`.
+function gcd(a: u64, b: u64) -> u64 {
+    mut x: u64 = a;
+    mut y: u64 = b;
+    while (y != 0) {
+        const t: u64 = y;
+        y = x % y;
+        x = t;
+    }
+    return x;
+}
+
+/// Least common multiple. `lcm(_, 0) == 0`.
+function lcm(a: u64, b: u64) -> u64 {
+    if (a == 0 || b == 0) { return 0; }
+    return (a / gcd(a, b)) * b;
+}
+
+/// True iff `value` is a power of two (zero is not).
+function is_power_of_two(value: u64) -> boolean {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+/// Smallest power of two >= `value`. `next_power_of_two(0) == 1`.
+function next_power_of_two(value: u64) -> u64 {
+    if (value <= 1) { return 1; }
+    mut n: u64 = value - 1;
+    n = n | (n >> 1);
+    n = n | (n >> 2);
+    n = n | (n >> 4);
+    n = n | (n >> 8);
+    n = n | (n >> 16);
+    n = n | (n >> 32);
+    return n + 1;
 }

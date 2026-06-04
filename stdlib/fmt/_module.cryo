@@ -9,8 +9,11 @@
 ///!   - `error`   - `FmtError` wraps either an `IoError` or `AllocError`
 ///!   - `write`   - `FmtWrite` trait + stdlib impls (`Stdout`, `Stderr`, `String`)
 ///!   - `float`   - `f64.to_buf` / `to_buf_with`: decimal + scientific writer
-///!   - `display` - `Display`, `Debug`, `Formatter<W>`, `print`/`println`,
+///!   - `display` - `Display`, `Debug`, `Formatter<W>`,
 ///!                 `format_to_string`, `format_debug_to_string`
+///!
+///! The printf-style `print` / `println` / `eprint` / `eprintln` family
+///! lives directly in this module, so `import std::fmt;` brings them in.
 ///!   - `interp`  - f-string (`f"...{expr}..."`) desugar runtime
 ///!
 ///! Integer formatting (`to_decimal_buf`, `to_hex_buf`, `to_oct_buf`,
@@ -27,8 +30,68 @@
 
 namespace std::fmt;
 
+import core::intrinsics;
+
 public module fmt::error;
 public module fmt::write;
 public module fmt::float;
 public module fmt::display;
 public module fmt::interp;
+
+// print / println / eprint / eprintln: printf-style variadic output.
+//
+// These live at the `std::fmt` level (not in a sub-module) so that a
+// plain `import std::fmt;` brings them into scope.  `println("%s is %d",
+// name, age)` forwards the variadic bucket to libc's `vprintf` (stdout)
+// and appends a newline.  Format specifiers follow C `printf`: `%d`/`%i`,
+// `%u`, `%s`, `%f`, `%x`, `%c`, `%p`, `%%`, plus width/precision.  They
+// are NOT type-checked against the arguments (this is the C variadic
+// ABI); a wrong specifier is undefined behaviour, exactly as in C.  For
+// type-safe, Display-based formatting, build a `String` via
+// `format_to_string` and the `Display` trait.
+
+/// Write a printf-style formatted string to stdout.  Returns the number of
+/// bytes written, or a negative value on error (libc `printf` convention).
+function print(fmt: string, args...) -> i32 {
+    return intrinsics::vprintf(fmt, args);
+}
+
+/// Like `print`, followed by a newline.
+function println(fmt: string, args...) -> i32 {
+    const n: i32 = intrinsics::vprintf(fmt, args);
+    if (n < 0) { return n; }
+    intrinsics::putchar(0x0A);
+    return n + 1;
+}
+
+// Lazily-opened stderr stream for the `eprint` family.  libc's `stderr`
+// global FILE* isn't reachable by name from Cryo, so `fdopen(2)` yields an
+// equivalent stream over fd 2.  Cached to avoid leaking a FILE per call; each
+// write is flushed since this fdopen'd stream is fully-buffered (unlike a
+// real tty stderr).
+mut g_fmt_stderr: void*;
+
+private function fmt_stderr_stream() -> void* {
+    if (g_fmt_stderr == null) {
+        g_fmt_stderr = intrinsics::fdopen(2, "w");
+    }
+    return g_fmt_stderr;
+}
+
+/// Write a printf-style formatted string to stderr.  Same specifier rules as
+/// `print` (see above).  Returns the number of bytes `vfprintf` reported.
+function eprint(fmt: string, args...) -> i32 {
+    const stream: void* = fmt_stderr_stream();
+    const n: i32 = intrinsics::vfprintf(stream, fmt, args);
+    intrinsics::fflush(stream);
+    return n;
+}
+
+/// Like `eprint`, followed by a newline.
+function eprintln(fmt: string, args...) -> i32 {
+    const stream: void* = fmt_stderr_stream();
+    const n: i32 = intrinsics::vfprintf(stream, fmt, args);
+    intrinsics::fputc(0x0A, stream);
+    intrinsics::fflush(stream);
+    return n;
+}

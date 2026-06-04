@@ -30,8 +30,6 @@ import collections::raw_buffer;
 import collections::str;
 import collections::string;
 import alloc::allocator;
-import ffi::cstr;
-import ffi::libc;
 import ffi::libc;
 import process::child;
 
@@ -41,7 +39,7 @@ import process::child;
 // `Array<T>::drop` requires `T: Drop` and raw pointers can't sit on
 // the impl-target side (the parser only accepts identifier/keyword/`()`).
 // The pointers themselves are non-owning aliases into `argv_storage`'s
-// CStrings; drop just releases the slot array.
+// NUL-terminated strings; drop just releases the slot array.
 
 type struct ArgvBuf {
     buf:    RawBuffer<u8*>;
@@ -274,43 +272,31 @@ function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
 }
 
 /// Build an argv u8** buffer from (program, args). `storage` keeps the
-/// CStrings alive; the returned `ArgvBuf` aliases into them.
+/// NUL-terminated argument strings alive; the returned `ArgvBuf`
+/// aliases the `as_ptr()` of each (the heap buffers stay put even when
+/// `storage` reallocates, since only the String headers move).
 function build_argv(program: &String,
                     args: &Array<String>,
-                    storage: mut &Array<CString>,
+                    storage: mut &Array<String>,
                     argv: mut &ArgvBuf) -> Result<(), IoError> {
-    match (CString::from_str(program.as_str())) {
-        Result::Ok(c_program) => {
-            storage.push(c_program);
-            const slot: u8* = storage.get_ref(storage.length() - 1).unwrap().as_ptr();
-            match (argv.push(slot)) {
-                Result::Ok(_) => { }
-                Result::Err(_) => {
-                    return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
-                }
-            }
-        }
+    storage.push(String::from_str_c(program.as_str()));
+    const slot: u8* = storage.get_ref(storage.length() - 1).unwrap().as_ptr();
+    match (argv.push(slot)) {
+        Result::Ok(_) => { }
         Result::Err(_) => {
-            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
         }
     }
     mut i: u64 = 0;
     while (i < args.length()) {
         match (args.get_ref(i)) {
             Option::Some(arg) => {
-                match (CString::from_str(arg.as_str())) {
-                    Result::Ok(c_arg) => {
-                        storage.push(c_arg);
-                        const slot: u8* = storage.get_ref(storage.length() - 1).unwrap().as_ptr();
-                        match (argv.push(slot)) {
-                            Result::Ok(_) => { }
-                            Result::Err(_) => {
-                                return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
-                            }
-                        }
-                    }
+                storage.push(String::from_str_c(arg.as_str()));
+                const arg_slot: u8* = storage.get_ref(storage.length() - 1).unwrap().as_ptr();
+                match (argv.push(arg_slot)) {
+                    Result::Ok(_) => { }
                     Result::Err(_) => {
-                        return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+                        return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
                     }
                 }
             }
@@ -338,25 +324,13 @@ function apply_env(clear_env: boolean,
     while (i < envs.length()) {
         match (envs.get_ref(i)) {
             Option::Some(entry) => {
-                // CString is heap; this is post-fork, single-
-                // threaded, so malloc is fine. If it fails we just
-                // propagate the error.
-                match (CString::from_str(entry.key.as_str())) {
-                    Result::Ok(c_key) => {
-                        mut key: CString = c_key;
-                        match (CString::from_str(entry.value.as_str())) {
-                            Result::Ok(c_value) => {
-                                mut value: CString = c_value;
-                                if (libc::setenv(key.as_ptr(), value.as_ptr(), 1) < 0) {
-                                    return false;
-                                }
-                            }
-                            Result::Err(_) => {
-                                return false;
-                            }
-                        }
-                    }
-                    Result::Err(_) => { return false; }
+                // NUL-terminated heap copies; this is post-fork, single-
+                // threaded, so malloc is fine.  They drop at the end of
+                // each iteration.
+                mut key: String = String::from_str_c(entry.key.as_str());
+                mut value: String = String::from_str_c(entry.value.as_str());
+                if (libc::setenv(key.as_ptr(), value.as_ptr(), 1) < 0) {
+                    return false;
                 }
             }
             Option::None => { break; }
@@ -389,7 +363,7 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     }
 
     // 2. Build argv (parent-side; child inherits via fork COW).
-    mut argv_storage: Array<CString> = Array::new();
+    mut argv_storage: Array<String> = Array::new();
     mut argv: ArgvBuf = ArgvBuf::new();
     match (build_argv(&cmd.program, &cmd.args, &argv_storage, &argv)) {
         Result::Ok(_) => { }
@@ -401,19 +375,11 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         }
     }
 
-    // 3. Prepare an optional cwd CString.
-    mut cwd_cstr: Option<CString> = Option::None;
+    // 3. Prepare an optional NUL-terminated cwd path.
+    mut cwd_cstr: Option<String> = Option::None;
     match (cmd.cwd) {
         Option::Some(path) => {
-            match (CString::from_str(path.as_str())) {
-                Result::Ok(c_path) => { cwd_cstr = Option::Some(c_path); }
-                Result::Err(_) => {
-                    close_pipe(&stdin_pipe);
-                    close_pipe(&stdout_pipe);
-                    close_pipe(&stderr_pipe);
-                    return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
-                }
-            }
+            cwd_cstr = Option::Some(String::from_str_c(path.as_str()));
         }
         Option::None => { }
     }
@@ -510,8 +476,8 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         _ => { }
     }
 
-    // The CStrings + pointer array fall out of scope at function exit;
-    // the synthesized drops release them.  The child has its own COW
+    // The argument strings + pointer array fall out of scope at function
+    // exit; the synthesized drops release them.  The child has its own COW
     // copies, which are either replaced by exec or abandoned on _exit.
     return Result::Ok(Child::new(pid, stdin_handle, stdout_handle, stderr_handle));
 }
