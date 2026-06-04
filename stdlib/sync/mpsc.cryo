@@ -1,0 +1,328 @@
+///! std::sync::mpsc: multi-producer, single-consumer channels.
+///!
+///! `channel<T>()` returns the owning `Receiver<T>`; mint producers with
+///! `rx.sender()` (each `Sender<T>` is independently owned and movable
+///! into its own thread, and is cloneable for further multi-producer
+///! fan-out). Values of any type `T` - including owned data like
+///! `String` - are moved through the unbounded FIFO queue.
+///!
+///!   ```cryo
+///!   mut rx: mpsc::Receiver<i32> = mpsc::channel<i32>();
+///!   const tx: mpsc::Sender<i32> = rx.sender();
+///!   // move `tx` into a worker thread; keep `rx` here
+///!   const h = thread::spawn<mpsc::Sender<i32>, i32>(tx, (s: mpsc::Sender<i32>) -> i32 {
+///!       mut snd: mpsc::Sender<i32> = s;
+///!       snd.send(42);
+///!       snd.close();    // explicit drop of the moved-in sender
+///!       return 0;
+///!   });
+///!   match (rx.recv()) { Result::Ok(v) => { use(v); } Result::Err(_) => {} }
+///!   h.join();
+///!   ```
+///!
+///! ## Disconnection
+///!
+///! When every `Sender` has been dropped, a blocked `recv()` returns
+///! `Err(RecvError::Disconnected)` and `try_recv()` returns
+///! `Err(TryRecvError::Disconnected)`. When the `Receiver` is dropped,
+///! `send()` returns `Err(SendError)` (handing the value back) instead of
+///! queueing into a channel no one will drain.
+///!
+///! ## Implementation
+///!
+///! A heap `ChannelInner<T>` holds a pthread mutex + condition variable
+///! guarding a raw singly-linked node queue plus a live-sender count and
+///! a total-handle refcount. The inner is reclaimed when the last handle
+///! (sender or receiver) drops. Values move out of dequeued nodes through
+///! raw pointers, so the move-checker treats each as a clean transfer
+///! (no aliasing, no double-free).
+
+namespace std::sync::mpsc;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::option;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import ffi::libc;
+
+
+/// A queued value plus a raw link to the next node. Allocated per `send`,
+/// freed when the value is dequeued (or when the channel is torn down).
+type struct ChanNode<T> {
+    next:  ChanNode<T>*;
+    value: T;
+}
+
+/// Shared channel state. Heap-pinned: the pthread buffers must not move
+/// after init while threads block on them.
+type struct ChannelInner<T> {
+    mutex:   u8[40];   // pthread_mutex_t (Linux x86_64)
+    cond:    u8[48];   // pthread_cond_t
+    head:    ChanNode<T>*;   // dequeue end (null when empty)
+    tail:    ChanNode<T>*;   // enqueue end
+    senders: i64;            // live Sender handles (guarded by mutex)
+    refs:    i64;            // live Sender + Receiver handles (guarded by mutex)
+    rx_open: boolean;        // receiver still alive
+}
+
+
+/// Allocate + initialize a fresh `ChannelInner<T>` owned solely by the
+/// receiver `channel` returns (no senders yet; one live handle).
+function new_inner<T>() -> ChannelInner<T>* {
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut inner: ChannelInner<T>* = null;
+    match (alloc.allocate(Layout::of<ChannelInner<T>>())) {
+        Result::Ok(raw) => { inner = raw.cast<ChannelInner<T>>().as_ptr(); }
+        Result::Err(_)  => { intrinsics::panic("mpsc::channel: allocation failed", FILE, LINE); }
+    }
+    const mtx: u8* = &inner.mutex[0];
+    const cnd: u8* = &inner.cond[0];
+    if (pthread_mutex_init(mtx, null) != 0) {
+        intrinsics::panic("mpsc::channel: mutex init failed", FILE, LINE);
+    }
+    if (pthread_cond_init(cnd, null) != 0) {
+        intrinsics::panic("mpsc::channel: cond init failed", FILE, LINE);
+    }
+    inner.head    = null;
+    inner.tail    = null;
+    inner.senders = 0i64;
+    inner.refs    = 1i64;   // the Receiver
+    inner.rx_open = true;
+    return inner;
+}
+
+/// Tear down the pthread primitives and free the inner box. Called by the
+/// last handle to drop; the queue is expected empty (the receiver drains
+/// it on its way out).
+function free_inner<T>(inner: ChannelInner<T>*) -> void {
+    pthread_cond_destroy(&inner.cond[0]);
+    pthread_mutex_destroy(&inner.mutex[0]);
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(inner as u8*), Layout::of<ChannelInner<T>>());
+}
+
+
+/// Error returned by `Sender::send` when the receiver has been dropped.
+/// Carries the value back so the caller does not lose it.
+type struct SendError<T> {
+    value: T;
+}
+
+/// Error returned by a blocking `Receiver::recv`.
+type enum RecvError {
+    Disconnected;   // all senders dropped and the queue is empty
+}
+
+/// Error returned by the non-blocking `Receiver::try_recv`.
+type enum TryRecvError {
+    Empty;          // no value ready, but senders remain
+    Disconnected;   // all senders dropped and the queue is empty
+}
+
+
+/// The sending half of a channel. Cloneable for multiple producers.
+type struct Sender<T> {
+    inner: ChannelInner<T>*;
+
+    /// Enqueue `value`. Returns `Err(SendError{value})` if the receiver
+    /// has already been dropped (the value is handed back unconsumed).
+    send(&this, value: T) -> Result<(), SendError<T>> {
+        const inner: ChannelInner<T>* = this.inner;
+        pthread_mutex_lock(&inner.mutex[0]);
+        if (!inner.rx_open) {
+            pthread_mutex_unlock(&inner.mutex[0]);
+            return Result::Err(SendError<T> { value: value });
+        }
+        mut node: ChanNode<T>* = null;
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        match (alloc.allocate(Layout::of<ChanNode<T>>())) {
+            Result::Ok(raw) => { node = raw.cast<ChanNode<T>>().as_ptr(); }
+            Result::Err(_)  => {
+                pthread_mutex_unlock(&inner.mutex[0]);
+                return Result::Err(SendError<T> { value: value });
+            }
+        }
+        (*node).next = null;
+        // Move `value` into the node through a raw pointer so no drop is
+        // synthesized on the uninitialized destination.
+        const slot: T* = &(*node).value;
+        *slot = value;
+        if (inner.tail == null) {
+            inner.head = node;
+            inner.tail = node;
+        } else {
+            (*inner.tail).next = node;
+            inner.tail = node;
+        }
+        // Wake one blocked receiver (there is at most one).
+        pthread_cond_signal(&inner.cond[0]);
+        pthread_mutex_unlock(&inner.mutex[0]);
+        return Result::Ok(());
+    }
+
+    /// Create another sender on the same channel (multi-producer).
+    clone(&this) -> Sender<T> {
+        const inner: ChannelInner<T>* = this.inner;
+        pthread_mutex_lock(&inner.mutex[0]);
+        inner.senders = inner.senders + 1i64;
+        inner.refs    = inner.refs + 1i64;
+        pthread_mutex_unlock(&inner.mutex[0]);
+        return Sender<T> { inner: inner };
+    }
+
+    /// Explicitly drop this sender now (rather than at scope end). Useful
+    /// after moving a sender into a thread body, where the value must be
+    /// released before the body returns.
+    close(mut this) -> void {
+        const { inner }: Sender<T> = this;
+        release_sender<T>(inner);
+    }
+}
+
+/// Decrement the sender/handle counts; wake the receiver if this was the
+/// last sender (so a blocked `recv` observes disconnection); free the
+/// inner if this was the last handle of any kind.
+function release_sender<T>(inner: ChannelInner<T>*) -> void {
+    pthread_mutex_lock(&inner.mutex[0]);
+    inner.senders = inner.senders - 1i64;
+    if (inner.senders == 0i64) {
+        pthread_cond_broadcast(&inner.cond[0]);
+    }
+    inner.refs = inner.refs - 1i64;
+    const last: boolean = inner.refs == 0i64;
+    pthread_mutex_unlock(&inner.mutex[0]);
+    if (last) { free_inner<T>(inner); }
+}
+
+implement<T> trait Drop for struct Sender<T> {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        release_sender<T>(this.inner);
+        this.inner = null;
+    }
+}
+
+
+/// The receiving half of a channel, and the channel's owner. Not
+/// cloneable (single consumer); mint producers with `sender()`.
+type struct Receiver<T> {
+    inner: ChannelInner<T>*;
+
+    /// Create a new `Sender<T>` feeding this channel. Call once per
+    /// producer (each returned sender is independently owned and may be
+    /// moved into its own thread); clone an existing sender as an
+    /// alternative. The channel stays open for `recv` as long as any
+    /// sender is alive.
+    sender(&this) -> Sender<T> {
+        const inner: ChannelInner<T>* = this.inner;
+        pthread_mutex_lock(&inner.mutex[0]);
+        inner.senders = inner.senders + 1i64;
+        inner.refs    = inner.refs + 1i64;
+        pthread_mutex_unlock(&inner.mutex[0]);
+        return Sender<T> { inner: inner };
+    }
+
+    /// Block until a value is available and return it, or return
+    /// `Err(Disconnected)` once every sender has dropped and the queue is
+    /// drained.
+    recv(&this) -> Result<T, RecvError> {
+        const inner: ChannelInner<T>* = this.inner;
+        pthread_mutex_lock(&inner.mutex[0]);
+        while (inner.head == null && inner.senders > 0i64) {
+            pthread_cond_wait(&inner.cond[0], &inner.mutex[0]);
+        }
+        if (inner.head == null) {
+            // No value and no senders left.
+            pthread_mutex_unlock(&inner.mutex[0]);
+            return Result::Err(RecvError::Disconnected);
+        }
+        const node: ChanNode<T>* = inner.head;
+        inner.head = (*node).next;
+        if (inner.head == null) { inner.tail = null; }
+        pthread_mutex_unlock(&inner.mutex[0]);
+        // Move the value out of the node (raw pointer read), free the node
+        // without dropping the moved-from slot.
+        const slot: T* = &(*node).value;
+        const value: T = *slot;
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
+        return Result::Ok(value);
+    }
+
+    /// Non-blocking receive. Returns `Err(Empty)` if no value is ready but
+    /// senders remain, `Err(Disconnected)` if the channel is drained and
+    /// all senders have dropped.
+    try_recv(&this) -> Result<T, TryRecvError> {
+        const inner: ChannelInner<T>* = this.inner;
+        pthread_mutex_lock(&inner.mutex[0]);
+        if (inner.head == null) {
+            const disconnected: boolean = inner.senders == 0i64;
+            pthread_mutex_unlock(&inner.mutex[0]);
+            if (disconnected) { return Result::Err(TryRecvError::Disconnected); }
+            return Result::Err(TryRecvError::Empty);
+        }
+        const node: ChanNode<T>* = inner.head;
+        inner.head = (*node).next;
+        if (inner.head == null) { inner.tail = null; }
+        pthread_mutex_unlock(&inner.mutex[0]);
+        const slot: T* = &(*node).value;
+        const value: T = *slot;
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
+        return Result::Ok(value);
+    }
+}
+
+implement<T> trait Drop for struct Receiver<T>
+where T: Drop {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner: ChannelInner<T>* = this.inner;
+        pthread_mutex_lock(&inner.mutex[0]);
+        inner.rx_open = false;
+        // Drain and drop any values still queued: with the receiver gone
+        // they would otherwise leak.
+        mut node: ChanNode<T>* = inner.head;
+        while (node != null) {
+            const nxt: ChanNode<T>* = (*node).next;
+            const slot: T* = &(*node).value;
+            (*slot).drop();
+            mut a: GlobalAlloc = GlobalAlloc::new();
+            a.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
+            node = nxt;
+        }
+        inner.head = null;
+        inner.tail = null;
+        inner.refs = inner.refs - 1i64;
+        const last: boolean = inner.refs == 0i64;
+        pthread_mutex_unlock(&inner.mutex[0]);
+        if (last) { free_inner<T>(inner); }
+        this.inner = null;
+    }
+}
+
+
+/// Create an unbounded channel and return its `Receiver<T>` - the
+/// channel's owning end. Mint one or more producers with `rx.sender()`
+/// (each is independently owned and movable into its own thread):
+///
+///   ```cryo
+///   mut rx: mpsc::Receiver<i32> = mpsc::channel<i32>();
+///   const tx: mpsc::Sender<i32> = rx.sender();
+///   thread::spawn<mpsc::Sender<i32>, i32>(tx, (s: mpsc::Sender<i32>) -> i32 {
+///       mut snd: mpsc::Sender<i32> = s; snd.send(1); snd.close(); return 0;
+///   });
+///   match (rx.recv()) { Result::Ok(v) => {} Result::Err(_) => {} }
+///   ```
+///
+/// Returning a single owned value (rather than a sender/receiver pair)
+/// sidesteps the current restriction on moving owning fields out of an
+/// aggregate (E0453); it also makes the receiver the unambiguous owner of
+/// the channel's lifetime. Panics only on allocation / pthread-init
+/// failure.
+function channel<T>() -> Receiver<T> {
+    return Receiver<T> { inner: new_inner<T>() };
+}

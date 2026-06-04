@@ -1,0 +1,99 @@
+///! Native threads: spawn/join, message-passing channels, and scoped
+///! fork-join parallelism.
+///!
+///! Cryo threads use a move-context model: data is moved INTO a thread
+///! through an explicit context argument and the body's result is moved
+///! back OUT through `JoinHandle::join`. The bodies here are plain
+///! functions (or non-capturing lambdas), so there are no hidden captures
+///! to reason about - what crosses the thread boundary is exactly the
+///! context you pass.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::core::intrinsics;
+import std::thread;
+import std::sync::mpsc;
+import std::sync::atomic;
+import std::collections::string;
+
+/// A worker that doubles its input. Used to show a value moving in and
+/// the result moving back out via `join`.
+function double_it(x: i32) -> i32 {
+    return x * 2;
+}
+
+/// A worker that takes ownership of a `String`, mutates it, and hands it
+/// back. Demonstrates moving owned heap data across the thread boundary
+/// in both directions with no copy and no leak.
+function decorate(mut s: String) -> String {
+    s.push_cstr(" [done on worker]");
+    return s;
+}
+
+/// A producer: send five numbers down a channel, then drop the sender so
+/// the receiver observes disconnection.
+function produce(tx: mpsc::Sender<i32>) -> i32 {
+    mut snd: mpsc::Sender<i32> = tx;
+    mut i: i32 = 1;
+    while (i <= 5) {
+        snd.send(i * i);   // 1, 4, 9, 16, 25
+        i = i + 1;
+    }
+    snd.close();
+    return 0;
+}
+
+function main() -> int {
+    // 1. spawn + join: move a value in, get the result back.
+    const h: thread::JoinHandle<i32> = thread::spawn<i32, i32>(21, double_it);
+    intrinsics::printf("spawn/join:   double(21) = %d\n", h.join());
+
+    // 2. Move owned data (a String) into a thread and back out.
+    mut greeting: String = String::new();
+    greeting.push_cstr("hello from main");
+    const sh: thread::JoinHandle<String> =
+        thread::spawn<String, String>(greeting, decorate);
+    mut result: String = sh.join();
+    intrinsics::printf("move String:  %.*s\n",
+        result.length() as i32, result.as_str().as_ptr());
+    result.drop();
+
+    // 3. Message passing: a producer thread feeds a channel, main drains
+    //    it until every sender has dropped (disconnection).
+    mut rx: mpsc::Receiver<i32> = mpsc::channel<i32>();
+    const tx: mpsc::Sender<i32> = rx.sender();
+    const ph: thread::JoinHandle<i32> = thread::spawn<mpsc::Sender<i32>, i32>(tx, produce);
+    mut sum: i32 = 0;
+    mut draining: boolean = true;
+    while (draining) {
+        match (rx.recv()) {
+            Result::Ok(v)  => { sum = sum + v; }
+            Result::Err(_) => { draining = false; }   // all senders dropped
+        }
+    }
+    intrinsics::printf("channel:      sum of squares 1..5 = %d\n", sum);
+    ph.join();
+
+    // 4. Scoped fork-join: four threads each bump a shared atomic counter
+    //    that lives on main's stack. The scope joins them all before it is
+    //    torn down, so borrowing the stack counter by pointer is safe.
+    mut counter: AtomicU8 = AtomicU8::new(0u8);
+    const cptr: AtomicU8* = &counter;
+    {
+        mut s: thread::Scope = thread::Scope::new();
+        mut w: i32 = 0;
+        while (w < 4) {
+            s.spawn<AtomicU8*>(cptr, (p: AtomicU8*) -> void {
+                (*p).fetch_add(1u8, MemoryOrder::SeqCst);
+            });
+            w = w + 1;
+        }
+        s.join_all();
+    }
+    intrinsics::printf("scoped:       4 workers bumped counter to %d\n",
+        counter.load(MemoryOrder::SeqCst) as i32);
+
+    return 0;
+}

@@ -2609,8 +2609,64 @@ type struct Monomorphizer {
                         al.elements[i], res_ctx, subst, names, types);
                 }
             }
+            NodeKind::Identifier => {
+                // A bare identifier carrying turbofish args is a generic
+                // function-reference VALUE (`tramp<i32>` passed/cast/assigned,
+                // not called). Pin its specialized symbol + queue the
+                // instantiation, mirroring the call path. Ordinary identifiers
+                // (no generic args) bail out immediately on the length check.
+                this.try_resolve_function_value_ref(
+                    expr as IdentifierNode*, res_ctx, subst);
+            }
             _ => { }
         }
+    }
+
+    /// Resolve a generic function-reference value `name<Args>` used as a
+    /// first-class value (GAP 1): look up the named function template,
+    /// resolve the explicit turbofish args to concrete types (applying the
+    /// enclosing specialization's `subst` so `name<C,T>` inside a spec'd
+    /// body maps `C,T` to their concrete bindings), then pin the specialized
+    /// callee symbol on the identifier and queue the instantiation so the
+    /// concrete function is produced in this same mono iteration and codegen
+    /// can take its address. No-op for ordinary identifiers (no turbofish).
+    try_resolve_function_value_ref(mut &this, ident: IdentifierNode*,
+                                   res_ctx: ResolutionContext*,
+                                   subst: TypeSubstitution*) -> void {
+        if (ident == null) { return; }
+        if (ident.generic_args.length == 0) { return; }
+        if (ident.resolved_callee.is_valid()) { return; }
+        if (this.type_resolver == null || res_ctx == null) { return; }
+        if (this.generic_registry == null) { return; }
+
+        const entry: TemplateEntry* =
+            this.find_function_template_for_call(ident.name);
+        if (entry == null) { return; }
+        if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+
+        // Resolve each explicit arg to a TypeRef; apply the enclosing
+        // spec's subst so generic-param args become concrete.
+        mut seeded: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ident.generic_args.length; i++) {
+            mut tr: TypeRef = this.type_resolver.resolve(ident.generic_args[i], res_ctx);
+            if (!tr.is_valid()) { return; }
+            if (subst != null) {
+                tr = subst.apply(tr, this.arena);
+            }
+            seeded.push(tr);
+        }
+        seeded = this.type_resolver.expand_default_type_args(entry, seeded, res_ctx);
+        if (seeded.length != entry.param_type_ids.length) { return; }
+
+        const base_sym: SymbolStr = entry.spec_base_name(this.intern_table);
+        const base_qname: QualifiedName = QualifiedName::from_symbol(base_sym);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern_table, this.arena, base_qname, seeded);
+        if (!spec_sym.is_valid()) { return; }
+        ident.set_resolved_callee(spec_sym);
+        const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
+            entry.base_type, seeded, this.current_module);
+        this.enqueue_from_type_ref(new_inst);
     }
 
     /// Resolve an identifier, `&ident`, `obj.field`, or `value as TYPE`

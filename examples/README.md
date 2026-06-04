@@ -19,6 +19,7 @@ builds and executes it.
 | 11 | [11-http-server](11-http-server/)      | `std::net::http` Router, four routes, drop discipline in handlers.            |
 | 12 | [12-guessing-game](12-guessing-game/)  | Stdin reads (`stdio::stdin().line()`), seeded RNG via `libc::time` + `rand`.  |
 | 13 | [13-closures](13-closures/)            | Capturing closures over `Copy` values, passed through `(Args) -> Ret` slots. |
+| 14 | [14-threads](14-threads/)              | Native threads: `thread::spawn`/`join` (move data in & out), `sync::mpsc` channels, scoped fork-join over a borrowed atomic. |
 
 ## Running
 

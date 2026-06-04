@@ -1,15 +1,449 @@
-///! std::thread: thread spawning and per-thread storage.
+///! std::thread: native OS threads.
+///!
+///! Spawn a thread with `thread::spawn(ctx, body)`: `ctx` is moved into
+///! the new thread and handed to `body`, a `(C) -> T` function (a named
+///! function or a non-capturing lambda). The returned `JoinHandle<T>`
+///! hands back the body's `T` result via `join()`:
+///!
+///!   ```cryo
+///!   const h = thread::spawn<i32, i32>(21, (n: i32) -> i32 { return n * 2; });
+///!   const r: i32 = h.join();   // 42
+///!   ```
+///!
+///! Owned data (String, Box, Vec, ...) can be moved across the thread
+///! boundary in either direction - into the thread through `ctx`, and
+///! back out through the returned `T`. The move-checker tracks the
+///! transfer, so there is no aliasing and no double-free.
+///!
+///! ## Why an explicit context instead of a capturing closure
+///!
+///! A capturing closure passed to a generic `(C) -> T` parameter does
+///! not yet compile (see build-logs/threading_compiler_gaps.md, GAP 2/3).
+///! Passing the captured state explicitly through `ctx` is the sound
+///! design that works today; once the closure-capture carve-out lands,
+///! `spawn(move || ...)` becomes sugar over this.
+///!
+///! ## Implementation
+///!
+///! Each spawn heap-allocates a `Payload<C,T>` (the body fn-pointer plus
+///! the moved-in `ctx`) and a `Shared<T>` control block (an atomic state
+///! byte plus storage for the result). `pthread_create` runs a
+///! monomorphized `thread_trampoline<C,T>` - a real named generic
+///! function, made addressable by the function-reference fix (GAP 1) -
+///! which moves `ctx` out, runs `body`, stores the result, frees the
+///! payload, and hands the control block off to `join`/`detach` via a
+///! lock-free two-actor handshake on the state byte. No leaks on any
+///! path; verified valgrind-clean.
+///!
+///! ## Lifecycle
+///!
+///! A `JoinHandle<T>` must be `join()`ed (waits, returns `T`) or
+///! `detach()`ed (fire-and-forget). Dropping a handle without either is
+///! equivalent to `detach()`. `is_finished()` polls without consuming.
+///! `try_spawn` is the fallible variant (returns `Result` instead of
+///! panicking on OS thread-creation failure).
 ///!
 ///! Sub-modules:
-///!   - `local`  : `ThreadLocal<T>` backed by `pthread_key_create` /
-///!                `pthread_setspecific`.  Lazy per-thread init via a
-///!                `() -> T` function pointer; explicit `clear()` for
-///!                cleanup.
-///!
-///! `thread::spawn`, `JoinHandle<T>`, and `Builder` land alongside
-///! the closure-`move` carve-out - they need to take ownership of
-///! captured state to be useful.
+///!   - `local` : `ThreadLocal<T>`, per-thread storage.
 
 namespace std::thread;
 
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import collections::array;
+import ffi::libc;
+import sync::atomic;
+
 public module thread::local;
+
+
+// ---------------------------------------------------------------------------
+// Control-block state machine (single atomic byte, two actors: the spawned
+// thread and the JoinHandle). Each actor performs exactly one `swap`; the
+// actor that observes the OTHER has already finished owns the teardown.
+// ---------------------------------------------------------------------------
+
+/// Neither actor has reached its terminal point yet.
+const STATE_LIVE:        u8 = 0u8;
+/// The spawned thread finished and stored its result.
+const STATE_THREAD_DONE: u8 = 1u8;
+/// The handle detached (or dropped); the result will never be read.
+const STATE_DETACHED:    u8 = 2u8;
+
+
+/// Heap control block shared between the spawned thread and the
+/// `JoinHandle`. Outlives the thread so `join` can read the result after
+/// the thread exits. `result` storage is uninitialized until the thread
+/// writes it; the state machine guarantees no actor reads or drops it
+/// before the write happens-before.
+type struct Shared<T> {
+    state:  AtomicU8;
+    result: T;
+}
+
+/// Heap input to the spawned thread: the body to run plus the moved-in
+/// context and a pointer to the shared control block. Consumed (and
+/// freed) by the trampoline as soon as the thread starts.
+type struct Payload<C, T> {
+    body:   (C) -> T;
+    ctx:    C;
+    shared: Shared<T>*;
+}
+
+
+/// The C entry point handed to `pthread_create`. A real named generic
+/// function (one monomorphization per `(C,T)`), addressable thanks to the
+/// generic function-reference fix. Runs entirely on the new thread.
+function thread_trampoline<C, T>(arg: u8*) -> u8* {
+    const p: Payload<C, T>* = arg as Payload<C, T>*;
+    const body:   (C) -> T  = (*p).body;
+    const shared: Shared<T>* = (*p).shared;
+    // Move the context out of the payload, then release the payload box;
+    // `ctx` now solely owns whatever heap state it carried.
+    const c: C = (*p).ctx;
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(arg), Layout::of<Payload<C, T>>());
+
+    // Run the user body and publish the result. Writing through a raw
+    // `T*` avoids drop-synthesis on the (uninitialized) destination.
+    const rptr: T* = &(*shared).result;
+    *rptr = body(c);
+
+    // Handshake: announce completion. If the handle already detached, no
+    // one will ever read the result, so we own teardown here.
+    const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
+    if (prev == STATE_DETACHED) {
+        (*rptr).drop();
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+    }
+    return null;
+}
+
+
+/// Tear down a control block from the handle side (detach or drop).
+/// Mirrors the trampoline's handshake: announce detachment, and if the
+/// thread has already finished, reclaim the result and the block here.
+function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
+    // Let the OS reclaim the thread's own resources when it exits.
+    pthread_detach(tid);
+    const prev: u8 = (*shared).state.swap(STATE_DETACHED, MemoryOrder::AcqRel);
+    if (prev == STATE_THREAD_DONE) {
+        // Thread already finished and left the result for us; drop it.
+        const rptr: T* = &(*shared).result;
+        (*rptr).drop();
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+    }
+    // Otherwise the thread is still running and will reclaim the block
+    // when it observes STATE_DETACHED.
+}
+
+
+/// Handle to a spawned thread. Carries the OS thread id and the shared
+/// control block. `T` is the body's return type; the context type `C` is
+/// erased (its storage was consumed on the thread).
+type struct JoinHandle<T> {
+    tid:    u64;
+    shared: Shared<T>*;
+
+    /// Block until the thread finishes and return its result. Consumes
+    /// the handle; the control block is freed here.
+    join(mut this) -> T {
+        const { tid, shared }: JoinHandle<T> = this;
+        mut ret: u8* = null;
+        pthread_join(tid, &ret);
+        // Thread has exited and left the result (it observed STATE_LIVE,
+        // so it did not tear down). Move the result out, then free the
+        // block without dropping the (now-moved-from) result storage.
+        const rptr: T* = &(*shared).result;
+        const out: T = *rptr;
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+        return out;
+    }
+
+    /// Detach: give up the ability to join. The thread runs to
+    /// completion independently; its result is dropped. Consumes the
+    /// handle.
+    detach(mut this) -> void {
+        const { tid, shared }: JoinHandle<T> = this;
+        reap_detached<T>(tid, shared);
+    }
+
+    /// True once the thread has finished running its body. Does not
+    /// consume the handle and never blocks.
+    is_finished(&this) -> boolean {
+        return (*this.shared).state.load(MemoryOrder::Acquire) != STATE_LIVE;
+    }
+
+    /// The spawned thread's id.
+    id(&this) -> ThreadId {
+        return ThreadId { raw: this.tid };
+    }
+}
+
+/// Dropping a handle without `join`/`detach` detaches the thread, so the
+/// thread and its control block are still reclaimed. `join`/`detach`
+/// destructure `this`, suppressing this path.
+implement<T> trait Drop for struct JoinHandle<T> {
+    drop(mut &this) -> void {
+        if (this.shared == null) { return; }
+        reap_detached<T>(this.tid, this.shared);
+        this.shared = null;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// spawn
+// ---------------------------------------------------------------------------
+
+/// Spawn a thread that runs `body(ctx)` and returns a handle to its
+/// `T` result. `ctx` is moved into the new thread. `body` must be a
+/// function pointer or non-capturing lambda. Panics on allocation or
+/// `pthread_create` failure; use `try_spawn` for a fallible spawn.
+function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T> {
+    match (spawn_with_attr<C, T>(ctx, body, null)) {
+        Result::Ok(h)  => { return h; }
+        Result::Err(_) => {
+            intrinsics::panic("thread::spawn: failed to create thread", FILE, LINE);
+        }
+    }
+}
+
+/// Fallible spawn with an optional pthread attribute buffer. `attr` may
+/// be null for default attributes (the only path exercised today; a
+/// future `Builder` will pass a configured `pthread_attr_t`).
+function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
+                               attr: u8*) -> Result<JoinHandle<T>, SpawnError> {
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+
+    mut shared: Shared<T>* = null;
+    match (alloc.allocate(Layout::of<Shared<T>>())) {
+        Result::Ok(raw) => { shared = raw.cast<Shared<T>>().as_ptr(); }
+        Result::Err(_)  => { return Result::Err(SpawnError::OutOfMemory); }
+    }
+    (*shared).state = AtomicU8::new(STATE_LIVE);
+
+    mut p: Payload<C, T>* = null;
+    match (alloc.allocate(Layout::of<Payload<C, T>>())) {
+        Result::Ok(raw) => { p = raw.cast<Payload<C, T>>().as_ptr(); }
+        Result::Err(_)  => {
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+            return Result::Err(SpawnError::OutOfMemory);
+        }
+    }
+    (*p).body   = body;
+    (*p).ctx    = ctx;
+    (*p).shared = shared;
+
+    const tramp_fn: (u8*) -> u8* = thread_trampoline<C, T>;
+    mut tbuf: u8[8] = [0u8; 8];
+    const rc: i32 = pthread_create(&tbuf[0], attr, tramp_fn as void*, p as u8*);
+    if (rc != 0) {
+        // The thread never started, so we still own both boxes. The
+        // payload's `ctx` was moved in; reclaim it so owned state inside
+        // it is released rather than leaked, then free both boxes.
+        const cback: C = (*p).ctx;
+        cback.drop();
+        alloc.deallocate(NonNull::new(p as u8*), Layout::of<Payload<C, T>>());
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+        return Result::Err(SpawnError::from_errno(rc));
+    }
+    return Result::Ok(JoinHandle<T> { tid: *(&tbuf[0] as u64*), shared: shared });
+}
+
+
+/// Why a spawn failed.
+type enum SpawnError {
+    OutOfMemory;
+    PermissionDenied;   // EPERM
+    ResourceLimit;      // EAGAIN
+    Other;
+}
+
+implement enum SpawnError {
+    /// Map a `pthread_create` errno return to a `SpawnError`.
+    static from_errno(rc: i32) -> SpawnError {
+        return match (rc) {
+            1  => { SpawnError::PermissionDenied }  // EPERM
+            11 => { SpawnError::ResourceLimit }     // EAGAIN
+            12 => { SpawnError::OutOfMemory }       // ENOMEM
+            _  => { SpawnError::Other }
+        };
+    }
+}
+
+
+/// Fallible spawn: like `spawn`, but returns `Err(SpawnError)` instead of
+/// panicking when the OS cannot create the thread (e.g. `EAGAIN` under a
+/// thread-count limit). The body's `T` is still delivered through the
+/// returned handle's `join()`.
+///
+///   ```cryo
+///   match (thread::try_spawn<i32, i32>(arg, body)) {
+///       Result::Ok(h)  => { use(h.join()); }
+///       Result::Err(e) => { /* back off / report */ }
+///   }
+///   ```
+function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError> {
+    return spawn_with_attr<C, T>(ctx, body, null);
+}
+
+// NOTE: stack-size / OS-thread-name configuration (a `Builder`) is
+// deferred. A generic spawn helper that takes the config struct by
+// value/reference and returns `Result<JoinHandle<T>, SpawnError>`
+// miscompiles at the cross-module call site ("incorrect number of
+// arguments"); see build-logs/threading_compiler_gaps.md GAP 7. Once
+// that codegen bug is fixed, a `Builder` lands on top of `spawn_with_attr`
+// (which already threads a `pthread_attr_t` through).
+
+
+// ---------------------------------------------------------------------------
+// Thread identity and scheduling utilities.
+// ---------------------------------------------------------------------------
+
+/// An opaque OS thread identity. Compare with `==` via `equals`.
+type struct ThreadId {
+    raw: u64;
+
+    equals(&this, other: &ThreadId) -> boolean {
+        return pthread_equal(this.raw, other.raw) != 0;
+    }
+}
+
+/// A handle to a running thread (currently just its identity). Returned
+/// by `thread::current()`.
+type struct Thread {
+    id_: ThreadId;
+
+    id(&this) -> ThreadId {
+        return this.id_;
+    }
+}
+
+/// The thread invoking this call.
+function current() -> Thread {
+    return Thread { id_: ThreadId { raw: pthread_self() } };
+}
+
+/// Yield the remainder of the current timeslice to the scheduler.
+function yield_now() -> void {
+    sched_yield();
+}
+
+/// Sleep the current thread for at least `nanos` nanoseconds. Restarts
+/// across signal interruptions (EINTR) using the kernel's remaining-time
+/// readout so the full duration elapses.
+function sleep(nanos: u64) -> void {
+    mut req: timespec = timespec { tv_sec: (nanos / 1000000000u64) as i64,
+                                   tv_nsec: (nanos % 1000000000u64) as i64 };
+    mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    while (nanosleep(&req, &rem) != 0) {
+        // EINTR: resume with the time the kernel says is left.
+        req = rem;
+    }
+}
+
+/// Sleep for at least `millis` milliseconds.
+function sleep_ms(millis: u64) -> void {
+    sleep(millis * 1000000u64);
+}
+
+
+// ---------------------------------------------------------------------------
+// Scoped threads: fork-join parallelism with auto-join at scope end.
+// ---------------------------------------------------------------------------
+
+/// Heap input to a scoped thread: a void-returning body plus its moved-in
+/// context. Freed by the scope trampoline once the body has been invoked.
+type struct ScopePayload<C> {
+    body: (C) -> void;
+    ctx:  C;
+}
+
+/// C entry point for scoped threads. Moves the context out, frees the
+/// payload, then runs the body. Scoped bodies return no value, so there
+/// is no result/handshake machinery.
+function scope_trampoline<C>(arg: u8*) -> u8* {
+    const p: ScopePayload<C>* = arg as ScopePayload<C>*;
+    const body: (C) -> void = (*p).body;
+    const c: C = (*p).ctx;
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(arg), Layout::of<ScopePayload<C>>());
+    body(c);
+    return null;
+}
+
+/// A thread scope. Every thread spawned through it is guaranteed to be
+/// joined before the scope is torn down (explicitly via `join_all()` or
+/// automatically when the `Scope` drops), so scoped bodies may safely
+/// borrow data that outlives the scope - pass a pointer to it through the
+/// body's context:
+///
+///   ```cryo
+///   mut counter: i64 = 0i64;
+///   mut s: thread::Scope = thread::Scope::new();
+///   s.spawn<i64*>(&counter, (p: i64*) -> void { *p = *p + 1i64; });
+///   s.spawn<i64*>(&counter, (p: i64*) -> void { *p = *p + 10i64; });
+///   s.join_all();   // both threads finished; `counter` safe to read
+///   ```
+///
+/// (Cryo has no borrow checker, so the join-before-teardown discipline -
+/// not the type system - is what keeps borrowed data alive; do not let a
+/// scope outlive what its threads point at.)
+type struct Scope {
+    tids: u64[];
+
+    /// Create an empty scope.
+    static new() -> Scope {
+        return Scope { tids: [] };
+    }
+
+    /// Spawn a scoped thread running `body(ctx)`. `ctx` is moved in (often
+    /// a pointer into scope-outliving state). The thread is recorded and
+    /// joined by `join_all()` / the scope's drop. Panics on allocation or
+    /// thread-creation failure.
+    spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut p: ScopePayload<C>* = null;
+        match (alloc.allocate(Layout::of<ScopePayload<C>>())) {
+            Result::Ok(raw) => { p = raw.cast<ScopePayload<C>>().as_ptr(); }
+            Result::Err(_)  => { intrinsics::panic("Scope::spawn: alloc failed", FILE, LINE); }
+        }
+        (*p).body = body;
+        (*p).ctx  = ctx;
+        const tramp_fn: (u8*) -> u8* = scope_trampoline<C>;
+        mut tbuf: u8[8] = [0u8; 8];
+        const rc: i32 = pthread_create(&tbuf[0], null, tramp_fn as void*, p as u8*);
+        if (rc != 0) { intrinsics::panic("Scope::spawn: pthread_create failed", FILE, LINE); }
+        this.tids.push(*(&tbuf[0] as u64*));
+    }
+
+    /// Join every thread spawned so far, blocking until all have
+    /// finished. Idempotent: clears the recorded set, so a later
+    /// drop/join is a no-op.
+    join_all(mut &this) -> void {
+        const n: i64 = this.tids.length() as i64;
+        for (mut i: i64 = 0; i < n; i = i + 1) {
+            mut ret: u8* = null;
+            pthread_join(this.tids[i], &ret);
+        }
+        this.tids.clear();
+    }
+}
+
+/// Joins any not-yet-joined scoped threads, guaranteeing none outlives
+/// the data it may have borrowed, then releases the tid buffer. (A struct
+/// with an explicit `Drop` does not get field glue auto-run, so the
+/// owning `tids` array is dropped here explicitly.)
+implement trait Drop for struct Scope {
+    drop(mut &this) -> void {
+        this.join_all();
+        this.tids.drop();
+    }
+}

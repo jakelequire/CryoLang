@@ -912,11 +912,14 @@ public:
                 this.advance(); // consume '::'
                 expr = this.parse_scope_member(name, gen_args, this.span_from_token(tok));
             } else {
-                // Generic args parsed but no `(`, `{`, or `::` follows, so
-                // nothing consumes `gen_args` on this path.  Release its
-                // array spine here rather than leaking it; the arena-owned
-                // element nodes are unaffected.
-                gen_args.drop();
+                // Generic args parsed but no `(`, `{`, or `::` follows: this is
+                // a generic function-reference VALUE, e.g. `tramp<i32>` used as
+                // a value (passed/cast/assigned, not called). Attach the args to
+                // the identifier so the monomorphizer can instantiate the named
+                // template for them and codegen can reference the specialized
+                // symbol. `expr` is the IdentifierNode built at the top of this
+                // routine; nothing else has consumed it yet.
+                (expr as IdentifierNode*).set_generic_args(gen_args);
             }
             // Generic args parsed but nothing useful follows; just continue with postfix
         }
@@ -1973,6 +1976,10 @@ public:
                     if (next.kind == TokenType::LSquare)   { return true; }
                     if (next.kind == TokenType::Question)  { return true; }
                     if (next.kind == TokenType::Arrow)     { return true; }
+                    // Generic function-reference value cast: `tramp<i32> as void*`.
+                    // Without this, `<` is mis-parsed as less-than and the cast
+                    // fails to parse. (GAP 1a)
+                    if (next.kind == TokenType::KwAs)      { return true; }
                     // Trait-impl follower: `Foo<T> for Bar`. Only meaningful
                     // when parsing a trait annotation inside parse_impl block.
                     if (next.kind == TokenType::KwFor)     { return true; }
