@@ -24,6 +24,7 @@ import core::ptr;
 import core::drop;
 import core::clone;
 import core::cmp;
+import core::iter;
 import alloc::layout;
 import alloc::allocator;
 
@@ -152,6 +153,16 @@ type struct Array<T, A = GlobalAlloc> {
         return SliceIter<T> { ptr: this.ptr, remaining: this.length };
     }
 
+    /// Iterate by shared borrow, yielding `T*` for each element in
+    /// order. Unlike `iter`, this is sound for every `T` (Copy or
+    /// owning) because it hands out borrows, never copies. The pointers
+    /// are invalidated by any reallocating method (`push`, `reserve`,
+    /// `insert`, `shrink_to_fit`). This is the way to walk an
+    /// `Array<String>` / `Array<Box<...>>` without cloning.
+    iter_ref(&this) -> RefIter<T> {
+        return RefIter<T> { ptr: this.ptr, index: 0, length: this.length };
+    }
+
     push(mut &this, value: T) -> void {
         match (this.try_push(value)) {
             Result::Ok(_) => { return; }
@@ -198,6 +209,130 @@ type struct Array<T, A = GlobalAlloc> {
         }
         this.length = last;
         return removed;
+    }
+
+    /// First element by shared borrow, or `None` if empty. Sound for
+    /// every `T` (the array keeps ownership). Invalidated by any
+    /// reallocating method.
+    first(&this) -> Option<T*> {
+        if (this.length == 0) { return Option::None; }
+        return Option::Some(this.ptr);
+    }
+
+    /// Last element by shared borrow, or `None` if empty.
+    last(&this) -> Option<T*> {
+        if (this.length == 0) { return Option::None; }
+        return Option::Some(mem::offset(this.ptr, (this.length - 1) as i64));
+    }
+
+    /// Index of the first element equal to `value`, or `None`. Linear
+    /// scan; `T: Eq`.
+    index_of(&this, value: &T) -> Option<u64> where T: Eq {
+        mut i: u64 = 0;
+        while (i < this.length) {
+            if (this.ptr[i].equals(value)) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// True iff some element equals `value`. `T: Eq`.
+    contains(&this, value: &T) -> boolean where T: Eq {
+        match (this.index_of(value)) {
+            Option::Some(_) => { return true; }
+            Option::None    => { return false; }
+        }
+    }
+
+    /// Reverse the elements in place. Sound for owning `T`: each pair is
+    /// exchanged with a three-step move (identical to `mem::swap`'s body,
+    /// inlined here so the method stays self-contained — see note below).
+    reverse(mut &this) -> void {
+        if (this.length < 2) { return; }
+        mut lo: u64 = 0;
+        mut hi: u64 = this.length - 1;
+        while (lo < hi) {
+            // Inlined move-swap. `mem::swap` is deliberately NOT called:
+            // the monomorphizer does not queue a cross-module generic
+            // free function (`core::mem::swap<T>`) referenced from a
+            // force-emitted method body, so calling it leaves an
+            // undefined symbol for `Array<T>` instantiations that never
+            // call `sort`. `mem::offset` is already emitted for every
+            // `Array<T>` (used by `get_ref`), so it stays a call.
+            const a: T* = mem::offset(this.ptr, lo as i64);
+            const b: T* = mem::offset(this.ptr, hi as i64);
+            const tmp: T = *a;
+            *a = *b;
+            *b = tmp;
+            lo = lo + 1;
+            hi = hi - 1;
+        }
+    }
+
+    /// Insert `value` at `index`, shifting later elements right by one.
+    /// `index == length` appends. Panics if `index > length`. Panics on
+    /// allocation failure; use the `Result`-returning forms for recovery
+    /// via `try_push` if you need fallibility on the common (append) path.
+    insert(mut &this, index: u64, value: T) -> void {
+        if (index > this.length) {
+            intrinsics::panic("Array::insert: index out of range", FILE, LINE);
+        }
+        if (this.length == this.capacity) {
+            match (this.reserve_grow(1)) {
+                Result::Ok(_) => { }
+                Result::Err(_) => {
+                    intrinsics::panic("Array::insert: allocation failed", FILE, LINE);
+                }
+            }
+        }
+        const tail: u64 = this.length - index;
+        if (tail > 0) {
+            // Shift [index, length) right by one slot. memmove handles the
+            // overlap; this relocates owning elements without aliasing.
+            intrinsics::memmove(
+                mem::offset(this.ptr, (index + 1) as i64) as void*,
+                mem::offset(this.ptr, index as i64) as void*,
+                tail * sizeof(T)
+            );
+        }
+        this.ptr[index] = value;
+        this.length = this.length + 1;
+    }
+
+    /// Remove and return the element at `index`, shifting later elements
+    /// left by one to preserve order (O(n)). Panics if out of range. For
+    /// O(1) removal when order doesn't matter, use `swap_remove`.
+    remove(mut &this, index: u64) -> T {
+        if (index >= this.length) {
+            intrinsics::panic("Array::remove: index out of range", FILE, LINE);
+        }
+        const removed: T = this.ptr[index];
+        const tail: u64 = this.length - index - 1;
+        if (tail > 0) {
+            // Shift [index+1, length) left by one over the vacated slot.
+            intrinsics::memmove(
+                mem::offset(this.ptr, index as i64) as void*,
+                mem::offset(this.ptr, (index + 1) as i64) as void*,
+                tail * sizeof(T)
+            );
+        }
+        this.length = this.length - 1;
+        return removed;
+    }
+
+    /// Shorten to at most `new_length`, dropping the truncated elements
+    /// via `T::drop`. A no-op if `new_length >= length`. Keeps capacity.
+    truncate(mut &this, new_length: u64) -> void
+    where T: Drop {
+        if (new_length >= this.length) { return; }
+        mut i: u64 = new_length;
+        while (i < this.length) {
+            this.ptr[i].drop();
+            i++;
+        }
+        this.length = new_length;
     }
 
     /// Drop every initialized element (the `[0, length)` prefix) via
@@ -572,3 +707,23 @@ where T: Clone {
     }
 }
 
+
+/// Borrowing iterator over an `Array<T>`, yielding `T*` (a pointer to
+/// each element in place). Created by `Array::iter_ref`; sound for
+/// owning `T`. Invalidated by any reallocating method on the array.
+type struct RefIter<T> {
+    ptr:    T*;
+    index:  u64;
+    length: u64;
+}
+
+implement<T> trait Iterator<T*> for struct RefIter<T> {
+    next(mut &this) -> Option<T*> {
+        if (this.index >= this.length) {
+            return Option::None;
+        }
+        const elem: T* = mem::offset(this.ptr, this.index as i64);
+        this.index = this.index + 1;
+        return Option::Some(elem);
+    }
+}

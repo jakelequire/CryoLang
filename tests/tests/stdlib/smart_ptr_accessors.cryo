@@ -1,0 +1,75 @@
+///! Box/Rc/Arc get_ref / get_mut accessors and Box Deref.
+///! get_mut on Rc/Arc is gated on unique ownership (strong_count == 1).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SmartPtrAccessors;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::core::ops;
+import std::alloc::box;
+import std::alloc::rc;
+import std::alloc::arc;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function box_get_ref_get_mut_deref() -> Result<(), TestError> {
+    mut b: Box<i32> = Box::new(5);
+    const m: i32* = b.get_mut();
+    *m = 9;
+    const r: i32* = b.get_ref();
+    const v: i32 = *r;
+    const d: i32* = b.deref();
+    const dv: i32 = *d;
+    b.drop();
+    expect_eq(v, 9i32)?;
+    expect_eq(dv, 9i32)?;
+    return Result::Ok(());
+}
+
+![test]
+function rc_get_mut_unique_then_shared() -> Result<(), TestError> {
+    mut r: Rc<i32> = Rc::new(10);
+    // Unique: get_mut yields Some.
+    match (r.get_mut()) {
+        Option::Some(p) => { *p = 20; }
+        Option::None    => { r.drop(); return bail(Str::new("unique get_mut should be Some")); }
+    }
+    // Clone -> count 2 -> get_mut must be None on both handles.
+    mut r2: Rc<i32> = r.clone();
+    mut blocked: boolean = false;
+    match (r.get_mut()) {
+        Option::Some(_) => { blocked = false; }
+        Option::None    => { blocked = true; }
+    }
+    const shared: i32 = *r2.get_ref();
+    r2.drop();
+    // Back to unique after dropping the clone.
+    mut now_unique: boolean = false;
+    match (r.get_mut()) {
+        Option::Some(_) => { now_unique = true; }
+        Option::None    => { now_unique = false; }
+    }
+    r.drop();
+    expect_true(blocked, Str::new("shared get_mut is None"))?;
+    expect_eq(shared, 20i32)?;
+    expect_true(now_unique, Str::new("get_mut Some again after clone dropped"))?;
+    return Result::Ok(());
+}
+
+![test]
+function arc_get_mut_unique() -> Result<(), TestError> {
+    mut a: Arc<i32> = Arc::new(42);
+    mut ok: boolean = false;
+    match (a.get_mut()) {
+        Option::Some(p) => { *p = 43; ok = true; }
+        Option::None    => { ok = false; }
+    }
+    const got: i32 = *a.get_ref();
+    a.drop();
+    expect_true(ok, Str::new("unique arc get_mut Some"))?;
+    expect_eq(got, 43i32)?;
+    return Result::Ok(());
+}

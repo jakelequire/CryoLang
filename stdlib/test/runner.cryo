@@ -21,6 +21,11 @@
 ///!                  running anything.
 ///!   -q, --quiet    Suppress per-test "ok" / "ignored" lines; only show
 ///!                  failures and the summary.
+///!   --timeout=N    Per-test wall-clock limit in seconds (default 60).
+///!                  A test exceeding it is killed (SIGALRM in the child)
+///!                  and reported as a timeout failure. `--timeout=0`
+///!                  disables the watchdog. Also set via the
+///!                  `CRYO_TEST_TIMEOUT` environment variable.
 ///!
 ///! Exit code is 0 iff every selected test passed (or was expected to
 ///! panic and did). Any single failure -> 1.
@@ -32,6 +37,7 @@ import core::option;
 import core::result;
 import core::slice;
 import core::drop;
+import core::convert;
 import collections::str;
 import collections::string;
 import env;
@@ -102,6 +108,12 @@ type struct RunOptions {
     /// TTY check land on "emit escapes". Reporters consult this flag
     /// rather than re-evaluating the policy on each test.
     color_active:  boolean;
+    /// Per-test wall-clock limit in seconds. The child arms `alarm()`
+    /// with this value before running; 0 disables the watchdog.
+    timeout_secs:  u32;
+    /// True iff `--timeout=` was passed explicitly (suppresses the
+    /// `CRYO_TEST_TIMEOUT` env default).
+    timeout_explicit: boolean;
 
     static default() -> RunOptions {
         return RunOptions {
@@ -115,6 +127,8 @@ type struct RunOptions {
             color:           ColorMode::Auto,
             color_explicit:  false,
             color_active:    false,
+            timeout_secs:    60,
+            timeout_explicit: false,
         };
     }
 
@@ -140,6 +154,10 @@ type enum TestOutcome {
     /// `![should_panic]` was set but the test exited 0; that is itself
     /// a failure.
     DidNotPanic;
+    /// The test exceeded the per-test wall-clock limit and was killed by
+    /// the `alarm()` watchdog (SIGALRM). Always a failure, even under
+    /// `![should_panic]`. Carries the configured limit in seconds.
+    Timeout(u32);
     /// Couldn't `fork()` or `waitpid()`; runner-internal error.
     RunnerError(i32);            // errno
 }
@@ -191,6 +209,11 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
             const v: Str = arg.sub_bytes(8, arg.length());
             if (apply_color(&opts, v)) {
                 opts.color_explicit = true;
+            }
+        } else if (arg_starts_with(arg, "--timeout=")) {
+            const v: Str = arg.sub_bytes(10, arg.length());
+            if (apply_timeout(&opts, v)) {
+                opts.timeout_explicit = true;
             }
         } else if (arg.length() >= 1 && arg.as_ptr()[0] == 0x2D) { // '-'
             // Unknown flag: warn but keep going.
@@ -259,13 +282,40 @@ function apply_color(opts: mut &RunOptions, value: Str) -> boolean {
     return false;
 }
 
+/// Parse a per-test timeout (whole seconds) and store it. Returns false
+/// on a non-numeric / out-of-range value (caller leaves the default).
+function apply_timeout(opts: mut &RunOptions, value: Str) -> boolean {
+    match (u32::try_from(value)) {
+        Result::Ok(secs) => {
+            opts.timeout_secs = secs;
+            return true;
+        }
+        Result::Err(_) => {
+            intrinsics::printf("warning: invalid --timeout value: %.*s (expected a non-negative integer)\n",
+                value.length() as i32, value.as_ptr());
+            return false;
+        }
+    }
+}
+
 /// Fill in any field the user didn't pass on the CLI from environment
 /// variables. CLI > env > cryoconfig (via env, set by `cryo test`) > default.
 ///
-///   CRYO_TEST_FORMAT = plain|pretty|compact
-///   CRYO_TEST_COLOR  = auto|always|never
-///   NO_COLOR         = (any value) -> force ColorMode::Never
+///   CRYO_TEST_FORMAT  = plain|pretty|compact
+///   CRYO_TEST_COLOR   = auto|always|never
+///   CRYO_TEST_TIMEOUT = per-test timeout in seconds (0 disables)
+///   NO_COLOR          = (any value) -> force ColorMode::Never
 function apply_env_defaults(opts: mut &RunOptions) -> void {
+    if (!opts.timeout_explicit) {
+        const to_opt: Option<String> = env::var(Str::new("CRYO_TEST_TIMEOUT"));
+        match (to_opt) {
+            Option::Some(mut s) => {
+                apply_timeout(opts, s.as_str());
+                s.drop();
+            }
+            Option::None => { }
+        }
+    }
     if (!opts.format_explicit) {
         const fmt_opt: Option<String> = env::var(Str::new("CRYO_TEST_FORMAT"));
         match (fmt_opt) {
@@ -437,7 +487,7 @@ function contains_substring(haystack: Str, needle: Str) -> boolean {
 /// always actually runs the test.  When `--ignored` is passed the
 /// runner deliberately wants to execute `![ignore]`-marked tests and
 /// see their real outcome.
-function run_one(d: TestDescriptor) -> TestOutcome {
+function run_one(d: TestDescriptor, timeout_secs: u32) -> TestOutcome {
     // Drain libc-buffered stdio in the parent before fork so the child
     // doesn't inherit a half-full FILE buffer and re-emit it on flush.
     intrinsics::fflush(null);
@@ -451,7 +501,7 @@ function run_one(d: TestDescriptor) -> TestOutcome {
         // Child: run the test and exit. Use `_exit` (not `exit`) so we
         // don't run atexit handlers that would flush parent-inherited
         // FILE buffers.
-        run_test_in_child(d);
+        run_test_in_child(d, timeout_secs);
         // run_test_in_child does not return.
         libc::_exit(127);
     }
@@ -468,13 +518,19 @@ function run_one(d: TestDescriptor) -> TestOutcome {
     }
 
     const exit_status: ExitStatus = decode_wstatus(status);
-    return classify_outcome(exit_status, d.should_panic);
+    return classify_outcome(exit_status, d.should_panic, timeout_secs);
 }
 
 /// Child-side test invocation. Calls the user function, prints any
 /// `Err` payload to stderr, and exits with a code the parent can
 /// classify. Never returns.
-function run_test_in_child(d: TestDescriptor) -> void {
+function run_test_in_child(d: TestDescriptor, timeout_secs: u32) -> void {
+    // Arm the per-test watchdog. SIGALRM's default disposition
+    // terminates the process; the parent sees the signal and classifies
+    // it as a timeout. `alarm(0)` (timeout disabled) is a no-op cancel.
+    if (timeout_secs > 0) {
+        libc::alarm(timeout_secs);
+    }
     match (d.func()) {
         Result::Ok(_) => {
             libc::_exit(0);
@@ -513,7 +569,14 @@ function run_test_in_child(d: TestDescriptor) -> void {
 /// Without `should_panic`: only code 0 passes.
 /// With    `should_panic`: any non-zero exit OR any signal passes; a
 ///                         clean code-0 exit is reported as DidNotPanic.
-function classify_outcome(exit_status: ExitStatus, should_panic: boolean) -> TestOutcome {
+function classify_outcome(exit_status: ExitStatus, should_panic: boolean,
+                          timeout_secs: u32) -> TestOutcome {
+    // A SIGALRM kill is our watchdog firing: always a timeout failure,
+    // even for `![should_panic]` tests (a hung test is not a panic).
+    const SIGALRM: i32 = 14;
+    if (exit_status.signaled && exit_status.signal == SIGALRM && timeout_secs > 0) {
+        return TestOutcome::Timeout(timeout_secs);
+    }
     const clean_zero: boolean = !exit_status.signaled && exit_status.code == 0;
     if (should_panic) {
         if (clean_zero) {
@@ -561,6 +624,9 @@ function print_outcome(outcome: TestOutcome, was_should_panic: boolean) -> void 
         TestOutcome::DidNotPanic => {
             intrinsics::printf("FAILED (test did not panic as expected)\n");
         }
+        TestOutcome::Timeout(secs) => {
+            intrinsics::printf("FAILED (timed out after %u s)\n", secs);
+        }
         TestOutcome::RunnerError(code) => {
             intrinsics::printf("FAILED (runner error: errno=%d)\n", code);
         }
@@ -572,6 +638,7 @@ function is_failure(outcome: TestOutcome) -> boolean {
     match (outcome) {
         TestOutcome::Fail(_, _, _)   => { return true;  }
         TestOutcome::DidNotPanic     => { return true;  }
+        TestOutcome::Timeout(_)      => { return true;  }
         TestOutcome::RunnerError(_)  => { return true;  }
         _                            => { return false; }
     }
@@ -697,6 +764,10 @@ function pretty_end_test(opts: &RunOptions, outcome: TestOutcome,
             chip_fail(opts.color_active);
             intrinsics::printf("  (test did not panic as expected)\n");
         }
+        TestOutcome::Timeout(secs) => {
+            chip_fail(opts.color_active);
+            intrinsics::printf("  (timed out after %u s)\n", secs);
+        }
         TestOutcome::RunnerError(code) => {
             chip_fail(opts.color_active);
             intrinsics::printf("  (runner error: errno=%d)\n", code);
@@ -786,6 +857,10 @@ function compact_end_test(state: mut &ReporterState, outcome: TestOutcome) -> vo
         }
         TestOutcome::DidNotPanic => {
             state.cur_dots.push(0x50 as u8); // 'P'
+            state.cur_fail = state.cur_fail + 1;
+        }
+        TestOutcome::Timeout(_) => {
+            state.cur_dots.push(0x54 as u8); // 'T'
             state.cur_fail = state.cur_fail + 1;
         }
         TestOutcome::RunnerError(_) => {
@@ -925,7 +1000,7 @@ function run_all(argc: i32, argv: u8**,
         // Always emit a prefix for runs we actually execute so the
         // user can see which test is in flight (helps debug a hang).
         reporter_begin_test(&opts, &rstate, d.name);
-        const outcome: TestOutcome = run_one(d);
+        const outcome: TestOutcome = run_one(d, opts.timeout_secs);
         const failed: boolean = is_failure(outcome);
         reporter_end_test(&opts, &rstate, outcome, d.should_panic);
 

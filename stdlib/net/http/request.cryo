@@ -68,6 +68,20 @@ type struct Request {
         }
     }
 
+    /// Builder: insert a header and return the request so calls chain.
+    /// Consumes and returns `this` (the owning fields are moved, not
+    /// copied): `Request::new(m, p).with_header(n, v).with_body(b)`.
+    with_header(mut this, name: Str, value: Str) -> Request {
+        this.headers.insert(name, value);
+        return this;
+    }
+
+    /// Builder: set the body (and Content-Length) and return the request.
+    with_body(mut this, body: Array<u8>) -> Request {
+        this.set_body(body);
+        return this;
+    }
+
     /// Replace the body and set Content-Length accordingly.
     set_body(mut &this, body: Array<u8>) -> void {
         mut old: Array<u8> = this.body;
@@ -234,6 +248,15 @@ implement trait Drop for struct Request {
 
 /// Read bytes into `out` until CRLF. Trailing CRLF is consumed but
 /// not appended. Returns `InvalidData` if the line exceeds `max`.
+///
+/// PERF (v1.0, known limitation): this reads one byte per `read(2)`
+/// syscall, so parsing a request with N header bytes costs N syscalls.
+/// The correct fix is to drive parsing through a buffered reader that
+/// fills a 4-8 KiB buffer and scans for CRLF in memory; the wrinkle is
+/// that the body reader (`Content-Length` bytes) must continue from the
+/// SAME buffer so leftover bytes after the header block are not lost.
+/// That shared-buffer refactor is deferred to avoid destabilising the
+/// request/response framing; framing is correct today, just syscall-heavy.
 function read_line<R>(reader: mut &R,
                       out: mut &String,
                       max: u64) -> Result<(), IoError>

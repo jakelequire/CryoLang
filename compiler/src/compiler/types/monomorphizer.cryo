@@ -2578,6 +2578,42 @@ type struct Monomorphizer {
                 const te: TryExprNode* = expr as TryExprNode*;
                 this.discover_inferred_calls_in_expr(te.operand, res_ctx, subst, names, types);
             }
+            NodeKind::IfExpression => {
+                // `if` used as a VALUE (initializer, call arg, match
+                // scrutinee). Without this, a generic free-fn call in the
+                // condition or a branch is never discovered and codegen
+                // can't resolve it. Each sub-expr may be null (the
+                // recursion guards on null).
+                const ie: IfExprNode* = expr as IfExprNode*;
+                this.discover_inferred_calls_in_expr(ie.condition, res_ctx, subst, names, types);
+                this.discover_inferred_calls_in_expr(ie.then_expr, res_ctx, subst, names, types);
+                this.discover_inferred_calls_in_expr(ie.else_expr, res_ctx, subst, names, types);
+            }
+            NodeKind::MatchExpression => {
+                // `match` used as a VALUE (e.g. `const x = match (gen())
+                // {...}`). Mirrors the MatchStatement handler: recurse
+                // into the subject, then each arm body with the arm's
+                // pattern bindings pushed so method-call inference inside
+                // arms resolves. Previously this fell through to the
+                // no-op default, so a generic free-fn call in the subject
+                // (`match (alloc_entry(...)) {...}`) was never discovered.
+                const me: MatchExprNode* = expr as MatchExprNode*;
+                this.discover_inferred_calls_in_expr(me.subject, res_ctx, subst, names, types);
+                mut subj_type: TypeRef = this.resolve_arg_type_for_inference(
+                    me.subject, names, types);
+                if (subj_type.is_valid() && subst != null) {
+                    subj_type = subst.apply(subj_type, this.arena);
+                }
+                for (mut i: i64 = 0; i < me.arms.length; i++) {
+                    const arm: MatchArmNode* = me.arms[i];
+                    if (arm == null) { continue; }
+                    const pushed: i64 = this.push_arm_bindings_to_scope(arm, subj_type);
+                    if (arm.body != null) {
+                        this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
+                    }
+                    this.pop_scope_bindings(pushed);
+                }
+            }
             NodeKind::MemberAccess => {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 this.discover_inferred_calls_in_expr(ma.object, res_ctx, subst, names, types);

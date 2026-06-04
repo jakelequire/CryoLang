@@ -19,6 +19,7 @@ import core::slice;
 import core::cmp;
 import core::convert;
 import core::hash;
+import core::iter;
 import collections::string;
 
 type struct Str {
@@ -133,6 +134,108 @@ type struct Str {
         return out;
     }
 
+    /// True iff this string begins with `prefix` (byte-wise).
+    starts_with(&this, prefix: &Str) -> boolean {
+        const pl: u64 = prefix.length;
+        if (pl > this.length) { return false; }
+        if (pl == 0) { return true; }
+        return intrinsics::memcmp(
+            this.bytes as void*, prefix.bytes as void*, pl) == 0;
+    }
+
+    /// True iff this string ends with `suffix` (byte-wise).
+    ends_with(&this, suffix: &Str) -> boolean {
+        const sl: u64 = suffix.length;
+        if (sl > this.length) { return false; }
+        if (sl == 0) { return true; }
+        return intrinsics::memcmp(
+            (this.bytes + (this.length - sl)) as void*,
+            suffix.bytes as void*, sl) == 0;
+    }
+
+    /// Byte index of the first occurrence of `needle`, or `None`.
+    /// An empty needle matches at index 0. O(n*m) naive scan; inputs in
+    /// practice are short. **Not UTF-8-aware** (matches on bytes).
+    find(&this, needle: &Str) -> Option<u64> {
+        const nl: u64 = needle.length;
+        if (nl == 0) { return Option::Some(0); }
+        if (nl > this.length) { return Option::None; }
+        mut i: u64 = 0;
+        const stop: u64 = this.length - nl;
+        while (i <= stop) {
+            if (intrinsics::memcmp(
+                    (this.bytes + i) as void*,
+                    needle.bytes as void*, nl) == 0) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// True iff `needle` appears anywhere in this string.
+    contains(&this, needle: &Str) -> boolean {
+        match (this.find(needle)) {
+            Option::Some(_) => { return true; }
+            Option::None    => { return false; }
+        }
+    }
+
+    /// Borrowed sub-slice with leading ASCII whitespace removed.
+    trim_start(&this) -> Str {
+        mut start: u64 = 0;
+        while (start < this.length && is_ascii_ws(this.bytes[start])) {
+            start = start + 1;
+        }
+        return Str { bytes: this.bytes + start, length: this.length - start };
+    }
+
+    /// Borrowed sub-slice with trailing ASCII whitespace removed.
+    trim_end(&this) -> Str {
+        mut end: u64 = this.length;
+        while (end > 0 && is_ascii_ws(this.bytes[end - 1])) {
+            end = end - 1;
+        }
+        return Str { bytes: this.bytes, length: end };
+    }
+
+    /// Borrowed sub-slice with leading and trailing ASCII whitespace
+    /// removed. ASCII whitespace is space, tab, LF, VT, FF, CR.
+    trim(&this) -> Str {
+        return this.trim_start().trim_end();
+    }
+
+    /// Return a new `String` with every ASCII lowercase byte folded to
+    /// uppercase. Non-ASCII bytes pass through unchanged. Mirror of
+    /// `to_ascii_lowercase`.
+    to_ascii_uppercase(&this) -> String {
+        mut out: String = String::with_capacity(this.length);
+        mut i: u64 = 0;
+        while (i < this.length) {
+            mut b: u8 = this.bytes[i];
+            if (b >= 0x61 && b <= 0x7A) { b = b - 32; }
+            out.push(b);
+            i++;
+        }
+        return out;
+    }
+
+    /// Iterator over the (non-overlapping) pieces between occurrences of
+    /// the byte separator `sep`. A leading/trailing/doubled separator
+    /// yields an empty piece, matching Rust's `str::split`. Each yielded
+    /// `Str` borrows from this one. `split` on a one-byte separator is
+    /// the common case; multi-byte separators are supported too.
+    split(&this, sep: &Str) -> SplitIter {
+        return SplitIter {
+            bytes: this.bytes,
+            length: this.length,
+            sep_bytes: sep.bytes,
+            sep_length: sep.length,
+            pos: 0,
+            done: false,
+        };
+    }
+
     try_to_hex(&this) -> Result<u64, ConversionError> {
         if (this.length() == 0) {
             return Result::Err(ConversionError::new("empty input"));
@@ -164,6 +267,56 @@ type struct Str {
             i++;
         }
         return Result::Ok(value);
+    }
+}
+
+/// ASCII whitespace test used by `trim`: space, tab, LF, VT, FF, CR.
+function is_ascii_ws(b: u8) -> boolean {
+    return b == 0x20 || (b >= 0x09 && b <= 0x0D);
+}
+
+/// Lazy iterator over the pieces of a `Str` separated by a byte
+/// sequence. Yields borrowed `Str` views; see `Str::split`. Borrows
+/// from the source `Str`, which must outlive the iterator.
+type struct SplitIter {
+    bytes:      u8*;
+    length:     u64;
+    sep_bytes:  u8*;
+    sep_length: u64;
+    pos:        u64;
+    done:       boolean;
+}
+
+implement trait Iterator<Str> for struct SplitIter {
+    next(mut &this) -> Option<Str> {
+        if (this.done) { return Option::None; }
+        // An empty separator does not split: yield the whole string once.
+        if (this.sep_length == 0) {
+            this.done = true;
+            return Option::Some(Str { bytes: this.bytes, length: this.length });
+        }
+        if (this.sep_length <= this.length) {
+            const stop: u64 = this.length - this.sep_length;
+            mut i: u64 = this.pos;
+            while (i <= stop) {
+                if (intrinsics::memcmp(
+                        (this.bytes + i) as void*,
+                        this.sep_bytes as void*, this.sep_length) == 0) {
+                    const piece: Str = Str {
+                        bytes: this.bytes + this.pos, length: i - this.pos
+                    };
+                    this.pos = i + this.sep_length;
+                    return Option::Some(piece);
+                }
+                i = i + 1;
+            }
+        }
+        // No further separator: the final piece is the remaining tail.
+        const tail: Str = Str {
+            bytes: this.bytes + this.pos, length: this.length - this.pos
+        };
+        this.done = true;
+        return Option::Some(tail);
     }
 }
 

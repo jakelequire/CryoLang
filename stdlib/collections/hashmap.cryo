@@ -121,6 +121,31 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         };
     }
 
+    /// Iterate over the keys, yielding each by value (bitwise copy).
+    /// Gated on `K: Copy` for the same reason as `iter`. Order is
+    /// bucket-major and unstable across resizes.
+    keys(&this) -> KeysIter<K, V>
+    where K: Copy {
+        return KeysIter<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
+    }
+
+    /// Iterate over the values, yielding each by value (bitwise copy).
+    /// Gated on `V: Copy`. Order is bucket-major and unstable.
+    values(&this) -> ValuesIter<K, V>
+    where V: Copy {
+        return ValuesIter<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
+    }
+
     contains_key(&this, key: &K) -> boolean
     where K: Hash + Eq {
         // Borrow rather than copy out, so this stays sound for owning V
@@ -224,6 +249,58 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         this.buckets[index] = fresh;
         this.length = this.length + 1;
         return Result::Ok(Option::None);
+    }
+
+    /// Borrow the value for `key`, inserting `default` first if the key
+    /// is absent. Returns a pointer to the (existing or freshly inserted)
+    /// value, valid until the next mutation that removes this key or
+    /// drops the map (a resize keeps entry storage in place). A single
+    /// lookup, unlike `get_ref`-then-`insert`. Panics on allocation
+    /// failure; the common case (key present) never allocates.
+    ///
+    /// When the key is already present, the passed `key` and `default`
+    /// are unused and dropped automatically at return (drop insertion),
+    /// matching `try_insert`'s handling of a duplicate key.
+    get_or_insert(mut &this, key: K, default: V) -> V*
+    where K: Hash + Eq {
+        match (this.try_get_or_insert(key, default)) {
+            Result::Ok(p)  => { return p; }
+            Result::Err(_) => {
+                intrinsics::panic("HashMap::get_or_insert: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible `get_or_insert`: returns `Err(AllocError)` instead of
+    /// panicking when a needed resize or entry allocation fails.
+    try_get_or_insert(mut &this, key: K, default: V) -> Result<V*, AllocError>
+    where K: Hash + Eq {
+        if (this.bucket_count == 0) {
+            this.resize_buckets(INITIAL_BUCKETS)?;
+        } else if (this.length >= this.bucket_count) {
+            this.resize_buckets(this.bucket_count * 2)?;
+        }
+        const h: u64 = hash_key(&key);
+        const index: u64 = h & (this.bucket_count - 1);
+        mut node: Entry<K, V>* = this.buckets[index];
+        loop {
+            if (node == null) { break; }
+            if (node.hash == h && node.key.equals(&key)) {
+                return Result::Ok(&node.value);
+            }
+            node = node.next;
+        }
+        // Mirror try_insert: call the generic `alloc_entry` via `?`. (The
+        // `match`-on-generic-free-fn form also resolves now that the
+        // monomorphizer recurses into match/if expressions during call
+        // discovery, but stdlib is built by the *pinned* compiler, which
+        // predates that fix — so keep the `?` form here until the pin is
+        // refreshed. The fix is exercised by a stage-2-compiled test.)
+        const fresh: Entry<K, V>* = alloc_entry(this, h, key, default)?;
+        fresh.next = this.buckets[index];
+        this.buckets[index] = fresh;
+        this.length = this.length + 1;
+        return Result::Ok(&fresh.value);
     }
 
     /// Remove the entry with matching key. Returns the removed
@@ -367,6 +444,58 @@ implement<K, V> trait Iterator<Pair<K, V>> for struct HashMapIter<K, V> {
                     first: entry.key,
                     second: entry.value
                 });
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
+}
+
+// KeysIter / ValuesIter: bucket-major projections of HashMapIter that
+// yield only the key (resp. value) of each entry. Same state machine
+// and invalidation contract as HashMapIter.
+
+type struct KeysIter<K, V> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    bucket_index: u64;
+    current: Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<K> for struct KeysIter<K, V> {
+    next(mut &this) -> Option<K> {
+        loop {
+            if (this.current != null) {
+                const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(entry.key);
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
+}
+
+type struct ValuesIter<K, V> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    bucket_index: u64;
+    current: Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> {
+    next(mut &this) -> Option<V> {
+        loop {
+            if (this.current != null) {
+                const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(entry.value);
             }
             if (this.bucket_index >= this.bucket_count) {
                 return Option::None;
