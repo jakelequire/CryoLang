@@ -112,17 +112,11 @@ type struct BufWriter<W> {
             return Result::Ok(());
         }
         const bytes: Slice<u8> = Slice::from_raw(this.buffer, this.length);
-        match (this.writer.write_all(bytes)) {
-            Result::Ok(_) => {
-                this.length = 0;
-                return Result::Ok(());
-            }
-            Result::Err(err) => {
-                // Leave `length` intact; a follow-up retry still has
-                // the bytes. Callers that want to give up call `clear`.
-                return Result::Err(err);
-            }
-        }
+        // On error, `length` is left intact; a follow-up retry still has
+        // the bytes. Callers that want to give up call `clear`.
+        this.writer.write_all(bytes)?;
+        this.length = 0;
+        return Result::Ok(());
     }
 
 }
@@ -133,10 +127,7 @@ where W: Write {
         const incoming: u64 = bytes.length();
         // Buffer would overflow; flush what we have.
         if (this.length + incoming > this.capacity) {
-            match (this.flush_buffer()) {
-                Result::Ok(_) => { }
-                Result::Err(err) => { return Result::Err(err); }
-            }
+            this.flush_buffer()?;
         }
         // After flushing, if the incoming chunk is itself larger than
         // the buffer there's no point double-copying; send straight
@@ -154,10 +145,7 @@ where W: Write {
     }
 
     flush(mut &this) -> Result<(), IoError> {
-        match (this.flush_buffer()) {
-            Result::Ok(_) => { }
-            Result::Err(err) => { return Result::Err(err); }
-        }
+        this.flush_buffer()?;
         return this.writer.flush();
     }
 }
@@ -218,22 +206,14 @@ where W: Write {
 
         const head_len: u64 = (last_nl as u64) + 1;
         const head: Slice<u8> = bytes.subslice(0, head_len);
-        match (this.inner.write(head)) {
-            Result::Ok(_) => { }
-            Result::Err(err) => { return Result::Err(err); }
-        }
-        match (this.inner.flush_buffer()) {
-            Result::Ok(_) => { }
-            Result::Err(err) => { return Result::Err(err); }
-        }
+        this.inner.write(head)?;
+        this.inner.flush_buffer()?;
         if (head_len == bytes.length()) {
             return Result::Ok(head_len);
         }
         const tail: Slice<u8> = bytes.subslice(head_len, bytes.length());
-        match (this.inner.write(tail)) {
-            Result::Ok(n) => { return Result::Ok(head_len + n); }
-            Result::Err(err) => { return Result::Err(err); }
-        }
+        const n: u64 = this.inner.write(tail)?;
+        return Result::Ok(head_len + n);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -337,13 +317,9 @@ type struct BufReader<R> {
     /// many bytes are actually wanted, consume that many.
     fill_buf(mut &this) -> Result<Slice<u8>, IoError> {
         if (this.position >= this.filled) {
-            match (this.reader.read(this.buffer, this.capacity)) {
-                Result::Ok(n) => {
-                    this.position = 0;
-                    this.filled = n;
-                }
-                Result::Err(err) => { return Result::Err(err); }
-            }
+            const n: u64 = this.reader.read(this.buffer, this.capacity)?;
+            this.position = 0;
+            this.filled = n;
         }
         return Result::Ok(Slice::from_raw(
             this.buffer + this.position,
@@ -361,22 +337,18 @@ where R: Read {
         if (this.position >= this.filled && length >= this.capacity) {
             return this.reader.read(buffer, length);
         }
-        match (this.fill_buf()) {
-            Result::Ok(filled) => {
-                mut n: u64 = filled.length();
-                if (n > length) { n = length; }
-                if (n > 0) {
-                    intrinsics::memcpy(
-                        buffer as void*,
-                        filled.as_ptr() as void*,
-                        n
-                    );
-                    this.consume(n);
-                }
-                return Result::Ok(n);
-            }
-            Result::Err(err) => { return Result::Err(err); }
+        const filled: Slice<u8> = this.fill_buf()?;
+        mut n: u64 = filled.length();
+        if (n > length) { n = length; }
+        if (n > 0) {
+            intrinsics::memcpy(
+                buffer as void*,
+                filled.as_ptr() as void*,
+                n
+            );
+            this.consume(n);
         }
+        return Result::Ok(n);
     }
 
     /// Override the trait default; line-reading is the whole point
@@ -386,38 +358,34 @@ where R: Read {
     read_line(mut &this, out: mut &String) -> Result<u64, IoError> {
         const start: u64 = out.length();
         loop {
-            match (this.fill_buf()) {
-                Result::Ok(filled) => {
-                    if (filled.is_empty()) {
-                        return Result::Ok(out.length() - start);
-                    }
-                    mut scan: u64 = 0;
-                    mut hit_nl: boolean = false;
-                    while (scan < filled.length()) {
-                        match (filled.get(scan)) {
-                            Option::Some(byte) => {
-                                scan++;
-                                if (byte == BYTE_LF) {
-                                    hit_nl = true;
-                                    break;
-                                }
-                            }
-                            Option::None => { break; }
+            const filled: Slice<u8> = this.fill_buf()?;
+            if (filled.is_empty()) {
+                return Result::Ok(out.length() - start);
+            }
+            mut scan: u64 = 0;
+            mut hit_nl: boolean = false;
+            while (scan < filled.length()) {
+                match (filled.get(scan)) {
+                    Option::Some(byte) => {
+                        scan++;
+                        if (byte == BYTE_LF) {
+                            hit_nl = true;
+                            break;
                         }
                     }
-                    const prefix: Slice<u8> = filled.subslice(0, scan);
-                    match (out.try_push_str(Str::from_bytes(prefix))) {
-                        Result::Ok(_) => { }
-                        Result::Err(_) => {
-                            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
-                        }
-                    }
-                    this.consume(scan);
-                    if (hit_nl) {
-                        return Result::Ok(out.length() - start);
-                    }
+                    Option::None => { break; }
                 }
-                Result::Err(err) => { return Result::Err(err); }
+            }
+            const prefix: Slice<u8> = filled.subslice(0, scan);
+            match (out.try_push_str(Str::from_bytes(prefix))) {
+                Result::Ok(_) => { }
+                Result::Err(_) => {
+                    return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                }
+            }
+            this.consume(scan);
+            if (hit_nl) {
+                return Result::Ok(out.length() - start);
             }
         }
     }

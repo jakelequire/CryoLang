@@ -171,15 +171,23 @@ type struct AbiClassifier {
     sret_kind:   u32;
     /// Cached `LLVMGetEnumAttributeKindForName("byval", 5)`.
     byval_kind:  u32;
+    /// Cached `LLVMGetEnumAttributeKindForName("alwaysinline", 12)`.
+    /// Drives `![inline]`.  0 => unset.
+    inline_kind: u32;
+    /// Cached `LLVMGetEnumAttributeKindForName("noinline", 8)`.
+    /// Drives `![noinline]`.  0 => unset.
+    noinline_kind: u32;
 
     /// Stage 1 of two-phase init.  Produces an AbiClassifier with a
     /// null back-pointer; the parent calls `wire()` once it is at its
     /// stable (heap) address.
     static null() -> AbiClassifier {
         return AbiClassifier {
-            type_mapper: null,
-            sret_kind:   0,
-            byval_kind:  0,
+            type_mapper:   null,
+            sret_kind:     0,
+            byval_kind:    0,
+            inline_kind:   0,
+            noinline_kind: 0,
         };
     }
 
@@ -808,6 +816,20 @@ type struct AbiClassifier {
         return this.byval_kind;
     }
 
+    inline_attr_kind(mut &this) -> u32 {
+        if (this.inline_kind == 0) {
+            this.inline_kind = llvm::LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+        }
+        return this.inline_kind;
+    }
+
+    noinline_attr_kind(mut &this) -> u32 {
+        if (this.noinline_kind == 0) {
+            this.noinline_kind = llvm::LLVMGetEnumAttributeKindForName("noinline", 8);
+        }
+        return this.noinline_kind;
+    }
+
     /// Apply an `sret(%T)` type attribute to LLVM parameter slot 0 of a
     /// function declaration.  LLVM's attribute-index convention is
     /// 1-based, so "param 0" is index 1.
@@ -855,6 +877,29 @@ type struct AbiClassifier {
         const kind: u32 = this.byval_attr_kind();
         const attr: void* = llvm::LLVMCreateTypeAttribute(ctx.raw, kind, pointee_ty.raw);
         llvm::LLVMAddCallSiteAttribute(call_val.raw, llvm_idx + 1, attr);
+    }
+
+    /// Apply the `alwaysinline` function attribute, the LLVM realization of
+    /// `![inline]`.  `alwaysinline` is an enum attribute (no carried type or
+    /// value), attached to the function itself via the function-attribute
+    /// index `LLVMAttributeFunctionIndex` (-1 / UINT_MAX).
+    apply_inline_attribute(mut &this, fn_val: LValue) -> void {
+        if (!fn_val.is_valid()) { return; }
+        const ctx: LContext = LContext::global();
+        const kind: u32 = this.inline_attr_kind();
+        const attr: void* = llvm::LLVMCreateEnumAttribute(ctx.raw, kind, 0 as u64);
+        llvm::LLVMAddAttributeAtIndex(fn_val.raw, 0xFFFFFFFF as u32, attr);
+    }
+
+    /// Apply the `noinline` function attribute, the LLVM realization of
+    /// `![noinline]`.  Mirrors `apply_inline_attribute`; the two attributes
+    /// are mutually exclusive, so a declaration carries at most one.
+    apply_noinline_attribute(mut &this, fn_val: LValue) -> void {
+        if (!fn_val.is_valid()) { return; }
+        const ctx: LContext = LContext::global();
+        const kind: u32 = this.noinline_attr_kind();
+        const attr: void* = llvm::LLVMCreateEnumAttribute(ctx.raw, kind, 0 as u64);
+        llvm::LLVMAddAttributeAtIndex(fn_val.raw, 0xFFFFFFFF as u32, attr);
     }
 
     /// Detect whether an LLVM function declaration was built with an

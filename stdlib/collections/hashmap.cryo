@@ -194,15 +194,9 @@ type struct HashMap<K, V, A = GlobalAlloc> {
     try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError>
     where K: Hash + Eq {
         if (this.bucket_count == 0) {
-            match (this.resize_buckets(INITIAL_BUCKETS)) {
-                Result::Ok(_) => { }
-                Result::Err(err) => { return Result::Err(err); }
-            }
+            this.resize_buckets(INITIAL_BUCKETS)?;
         } else if (this.length >= this.bucket_count) {
-            match (this.resize_buckets(this.bucket_count * 2)) {
-                Result::Ok(_) => { }
-                Result::Err(err) => { return Result::Err(err); }
-            }
+            this.resize_buckets(this.bucket_count * 2)?;
         }
 
         const h: u64 = hash_key(&key);
@@ -225,15 +219,11 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         }
 
         // Not present: prepend a new node.
-        match (alloc_entry(this, h, key, value)) {
-            Result::Ok(fresh) => {
-                fresh.next = this.buckets[index];
-                this.buckets[index] = fresh;
-                this.length = this.length + 1;
-                return Result::Ok(Option::None);
-            }
-            Result::Err(err) => { return Result::Err(err); }
-        }
+        const fresh: Entry<K, V>* = alloc_entry(this, h, key, value)?;
+        fresh.next = this.buckets[index];
+        this.buckets[index] = fresh;
+        this.length = this.length + 1;
+        return Result::Ok(Option::None);
     }
 
     /// Remove the entry with matching key. Returns the removed
@@ -317,43 +307,39 @@ type struct HashMap<K, V, A = GlobalAlloc> {
 
     resize_buckets(mut &this, new_count: u64) -> Result<(), AllocError> {
         const new_layout: Layout = Layout::array<Entry<K, V>*>(new_count);
-        match (this.alloc.allocate(new_layout)) {
-            Result::Ok(raw) => {
-                const new_buckets: Entry<K, V>** = raw.as_ptr() as Entry<K, V>**;
-                // Zero the bucket array; null pointers are "empty bucket".
-                intrinsics::memset(
-                    new_buckets as void*,
-                    0,
-                    new_count * sizeof(Entry<K, V>*)
-                );
+        const raw: NonNull<u8> = this.alloc.allocate(new_layout)?;
+        const new_buckets: Entry<K, V>** = raw.as_ptr() as Entry<K, V>**;
+        // Zero the bucket array; null pointers are "empty bucket".
+        intrinsics::memset(
+            new_buckets as void*,
+            0,
+            new_count * sizeof(Entry<K, V>*)
+        );
 
-                // Move every existing entry into the new table.
-                mut i: u64 = 0;
-                while (i < this.bucket_count) {
-                    mut node: Entry<K, V>* = this.buckets[i];
-                    loop {
-                        if (node == null) { break; }
-                        const next: Entry<K, V>* = node.next;
-                        const index: u64 = node.hash & (new_count - 1);
-                        node.next = new_buckets[index];
-                        new_buckets[index] = node;
-                        node = next;
-                    }
-                    i++;
-                }
-
-                if (this.buckets != null) {
-                    this.alloc.deallocate(
-                        NonNull::new(this.buckets as u8*),
-                        Layout::array<Entry<K, V>*>(this.bucket_count)
-                    );
-                }
-                this.buckets = new_buckets;
-                this.bucket_count = new_count;
-                return Result::Ok(());
+        // Move every existing entry into the new table.
+        mut i: u64 = 0;
+        while (i < this.bucket_count) {
+            mut node: Entry<K, V>* = this.buckets[i];
+            loop {
+                if (node == null) { break; }
+                const next: Entry<K, V>* = node.next;
+                const index: u64 = node.hash & (new_count - 1);
+                node.next = new_buckets[index];
+                new_buckets[index] = node;
+                node = next;
             }
-            Result::Err(err) => { return Result::Err(err); }
+            i++;
         }
+
+        if (this.buckets != null) {
+            this.alloc.deallocate(
+                NonNull::new(this.buckets as u8*),
+                Layout::array<Entry<K, V>*>(this.bucket_count)
+            );
+        }
+        this.buckets = new_buckets;
+        this.bucket_count = new_count;
+        return Result::Ok(());
     }
 }
 
@@ -455,17 +441,13 @@ function alloc_entry<K, V, A>(map: mut &HashMap<K, V, A>,
                               value: V) -> Result<Entry<K, V>*, AllocError>
 where A: Allocator {
     const block: Layout = Layout::of<Entry<K, V>>();
-    match (map.alloc.allocate(block)) {
-        Result::Ok(raw) => {
-            const entry: Entry<K, V>* = raw.as_ptr() as Entry<K, V>*;
-            entry.hash = h;
-            entry.key = key;
-            entry.value = value;
-            entry.next = null;
-            return Result::Ok(entry);
-        }
-        Result::Err(err) => { return Result::Err(err); }
-    }
+    const raw: NonNull<u8> = map.alloc.allocate(block)?;
+    const entry: Entry<K, V>* = raw.as_ptr() as Entry<K, V>*;
+    entry.hash = h;
+    entry.key = key;
+    entry.value = value;
+    entry.next = null;
+    return Result::Ok(entry);
 }
 
 function free_entry<K, V, A>(map: mut &HashMap<K, V, A>, entry: Entry<K, V>*) -> void
