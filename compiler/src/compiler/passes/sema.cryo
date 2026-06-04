@@ -5051,7 +5051,7 @@ public:
                 // at codegen, e.g. `take_u8(300_i64)` arriving as 44.  The
                 // spec (section 2.9) requires an explicit `as` cast for these.  An
                 // integer literal that fits the target is exempt: it
-                // materializes as a correct constant (e.g. `push_byte(91)`).
+                // materializes as a correct constant (e.g. `push(91)`).
                 this.emit_type_mismatch_with_value(
                     ErrorCode::E0214_ARGUMENT_MISMATCH,
                     arg.span,
@@ -5103,7 +5103,7 @@ public:
 
     /// True when `arg` is an integer literal whose value fits the target
     /// integer type's bit width.  Such a literal is materialized as a
-    /// correct constant by codegen (e.g. `push_byte(91)` into a `u8`), so
+    /// correct constant by codegen (e.g. `push(91)` into a `u8`), so
     /// the call-arg narrowing check must not flag it.  Oversized literals
     /// (`take_u8(300)`) and runtime-typed narrowing still fall through to
     /// the error.  Mirrors the bound logic in `resolve_integer_literal`.
@@ -6260,6 +6260,23 @@ public:
                         }
                         if (allow_implicit && this.checker.can_implicit_convert(
                             arg_types[pi], m.param_types[pi])) {
+                            continue;
+                        }
+                        // Integer literal that fits a narrower int parameter
+                        // (e.g. `s.push(91)` -> `push(u8)`): codegen
+                        // materializes it as a correct constant, so accept it
+                        // as a match.  Mirrors the free-call narrowing
+                        // exemption (`int_literal_fits_target`).  Without this
+                        // an int-literal arg matches NO inherent overload, so
+                        // `resolved_callee` stays null and codegen falls back
+                        // to arity-only resolution that can't distinguish
+                        // `push(Str)` from `push(u8)` and picks the first
+                        // declared (a hard miscompile / DirectPair-expand crash
+                        // on a spec'd receiver).
+                        if (pi < call.arguments.length
+                                && call.arguments[pi] != null
+                                && this.int_literal_fits_target(
+                                    call.arguments[pi], m.param_types[pi])) {
                             continue;
                         }
                         const pt: Type* = this.arena.lookup(m.param_types[pi].id);
