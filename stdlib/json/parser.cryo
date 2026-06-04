@@ -366,10 +366,8 @@ type struct Parser {
     // Strings
 
     parse_string_value(mut &this) -> Result<JsonValue, JsonError> {
-        match (this.parse_string_raw()) {
-            Result::Ok(s)  => { return Result::Ok(JsonValue::String(s)); }
-            Result::Err(e) => { return Result::Err(e); }
-        }
+        const s: String = this.parse_string_raw()?;
+        return Result::Ok(JsonValue::String(s));
     }
 
     /// Parse a JSON string literal into an owned `String`. Assumes the
@@ -399,10 +397,7 @@ type struct Parser {
                 if (this.eof()) {
                     return Result::Err(this.err_eof());
                 }
-                match (this.parse_escape(&out)) {
-                    Result::Ok(_)  => { }
-                    Result::Err(e) => { return Result::Err(e); }
-                }
+                this.parse_escape(&out)?;
                 continue;
             }
             // Reject unescaped control characters per RFC 8259 section 7.
@@ -443,47 +438,39 @@ type struct Parser {
     /// pairs are recombined into the corresponding scalar; lone
     /// surrogates produce InvalidUnicode.
     parse_unicode_escape(mut &this, out: mut &String) -> Result<(), JsonError> {
-        match (this.read_hex4()) {
-            Result::Ok(hi) => {
-                if (hi >= 0xD800 && hi <= 0xDBFF) {
-                    // High surrogate; must be followed by `\uYYYY`
-                    // with YYYY in the low surrogate range.
-                    if (this.pos + 1 >= this.len ||
-                        this.src[this.pos] != BACKSLASH ||
-                        this.src[this.pos + 1] != LOWER_U) {
-                        return Result::Err(this.err_at(
-                            JsonErrorKind::InvalidUnicode,
-                            Str::new("lone high surrogate")
-                        ));
-                    }
-                    this.advance();
-                    this.advance();
-                    match (this.read_hex4()) {
-                        Result::Ok(lo) => {
-                            if (lo < 0xDC00 || lo > 0xDFFF) {
-                                return Result::Err(this.err_at(
-                                    JsonErrorKind::InvalidUnicode,
-                                    Str::new("invalid low surrogate")
-                                ));
-                            }
-                            const cp: u32 = 0x10000 +
-                                (((hi - 0xD800) as u32) << 10) +
-                                ((lo - 0xDC00) as u32);
-                            return encode_utf8(out, cp);
-                        }
-                        Result::Err(e) => { return Result::Err(e); }
-                    }
-                }
-                if (hi >= 0xDC00 && hi <= 0xDFFF) {
-                    return Result::Err(this.err_at(
-                        JsonErrorKind::InvalidUnicode,
-                        Str::new("lone low surrogate")
-                    ));
-                }
-                return encode_utf8(out, hi as u32);
+        const hi: u32 = this.read_hex4()?;
+        if (hi >= 0xD800 && hi <= 0xDBFF) {
+            // High surrogate; must be followed by `\uYYYY`
+            // with YYYY in the low surrogate range.
+            if (this.pos + 1 >= this.len ||
+                this.src[this.pos] != BACKSLASH ||
+                this.src[this.pos + 1] != LOWER_U) {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidUnicode,
+                    Str::new("lone high surrogate")
+                ));
             }
-            Result::Err(e) => { return Result::Err(e); }
+            this.advance();
+            this.advance();
+            const lo: u32 = this.read_hex4()?;
+            if (lo < 0xDC00 || lo > 0xDFFF) {
+                return Result::Err(this.err_at(
+                    JsonErrorKind::InvalidUnicode,
+                    Str::new("invalid low surrogate")
+                ));
+            }
+            const cp: u32 = 0x10000 +
+                (((hi - 0xD800) as u32) << 10) +
+                ((lo - 0xDC00) as u32);
+            return encode_utf8(out, cp);
         }
+        if (hi >= 0xDC00 && hi <= 0xDFFF) {
+            return Result::Err(this.err_at(
+                JsonErrorKind::InvalidUnicode,
+                Str::new("lone low surrogate")
+            ));
+        }
+        return encode_utf8(out, hi as u32);
     }
 
     /// Read exactly four hex digits and assemble them MSB-first.
@@ -541,12 +528,8 @@ type struct Parser {
 
         while (true) {
             this.skip_ws();
-            match (this.parse_value()) {
-                Result::Ok(v)  => { arr.push(v); }
-                Result::Err(e) => {
-                    return Result::Err(e);
-                }
-            }
+            const v: JsonValue = this.parse_value()?;
+            arr.push(v);
             this.skip_ws();
             if (this.eof()) {
                 return Result::Err(this.err_eof());
@@ -599,11 +582,7 @@ type struct Parser {
                     Str::new("expected string key")
                 ));
             }
-            mut key: String = String::new();
-            match (this.parse_string_raw()) {
-                Result::Ok(k)  => { key = k; }
-                Result::Err(e) => { return Result::Err(e); }
-            }
+            mut key: String = this.parse_string_raw()?;
             this.skip_ws();
             if (this.eof() || this.peek() != COLON) {
                 return Result::Err(this.err_at(
@@ -613,10 +592,8 @@ type struct Parser {
             }
             this.advance();
             this.skip_ws();
-            match (this.parse_value()) {
-                Result::Ok(v)  => { obj.insert(key, v); }
-                Result::Err(e) => { return Result::Err(e); }
-            }
+            const v: JsonValue = this.parse_value()?;
+            obj.insert(key, v);
             this.skip_ws();
             if (this.eof()) {
                 return Result::Err(this.err_eof());
@@ -687,19 +664,15 @@ extern "C" {
 function parse(text: Str) -> Result<JsonValue, JsonError> {
     mut p: Parser = Parser::new(text);
     p.skip_ws();
-    match (p.parse_value()) {
-        Result::Ok(v) => {
-            p.skip_ws();
-            if (p.pos < p.len) {
-                mut owned: JsonValue = v;
-                return Result::Err(JsonError::new(
-                    JsonErrorKind::TrailingData,
-                    p.line, p.column, p.pos,
-                    String::from_str(Str::new("trailing data after value"))
-                ));
-            }
-            return Result::Ok(v);
-        }
-        Result::Err(e) => { return Result::Err(e); }
+    const v: JsonValue = p.parse_value()?;
+    p.skip_ws();
+    if (p.pos < p.len) {
+        mut owned: JsonValue = v;
+        return Result::Err(JsonError::new(
+            JsonErrorKind::TrailingData,
+            p.line, p.column, p.pos,
+            String::from_str(Str::new("trailing data after value"))
+        ));
     }
+    return Result::Ok(v);
 }

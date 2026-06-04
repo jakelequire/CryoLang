@@ -252,8 +252,19 @@ function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
         // `![test]` alongside `![ignore]`) is enforced later by the
         // test-mode validator - directive_processing only checks each
         // directive's own shape and target.
-        "inline" | "noinline" | "entry" | "test"
-        | "ignore" | "should_panic" => {
+        // `![inline]` / `![noinline]`: zero args; function- or method-target.
+        // Both apply to anything that lowers to an LLVM function body, so a
+        // method (whose body is a function too) is a valid target.
+        "inline" | "noinline" => {
+            if (argc != 0) {
+                emit_arity_error(ctx, dir, name, 0, argc);
+            }
+            if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                emit_placement_error(ctx, dir, name, "function or method", target);
+            }
+        }
+
+        "entry" | "test" | "ignore" | "should_panic" => {
             if (argc != 0) {
                 emit_arity_error(ctx, dir, name, 0, argc);
             }
@@ -782,7 +793,7 @@ function apply_layout_effects_enum(ctx: CompilationContext*,
 /// Apply known semantic side-effects of a directive to its target decl.
 /// Currently:
 ///   ![inline]         -> sets FunctionDeclNode.is_inline = true
-///   ![noinline]       -> sets FunctionDeclNode.is_inline = false
+///   ![noinline]       -> sets FunctionDeclNode.is_noinline = true
 ///   ![sink]           -> sets MethodNode.is_sink = true
 ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/class/enum decl
 ///   ![align(N)]       -> sets min_alignment on struct/class/enum decl
@@ -794,11 +805,13 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
     if (decl.kind == NodeKind::FunctionDeclaration) {
         const fn: FunctionDeclNode* = decl as FunctionDeclNode*;
         if (strcmp(name, "inline") == 0) {
-            fn.is_inline = true;
+            fn.is_inline   = true;
+            fn.is_noinline = false;
             return;
         }
         if (strcmp(name, "noinline") == 0) {
-            fn.is_inline = false;
+            fn.is_noinline = true;
+            fn.is_inline   = false;
             return;
         }
         if (strcmp(name, "implicit") == 0) {
@@ -877,6 +890,22 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
         }
         if (strcmp(name, "implicit") == 0) {
             if (m.func != null) { m.func.is_implicit = true; }
+            return;
+        }
+        // `![inline]` / `![noinline]` on a method: record on the wrapped
+        // FunctionDeclNode, which is what codegen's declare_method reads.
+        if (strcmp(name, "inline") == 0) {
+            if (m.func != null) {
+                m.func.is_inline   = true;
+                m.func.is_noinline = false;
+            }
+            return;
+        }
+        if (strcmp(name, "noinline") == 0) {
+            if (m.func != null) {
+                m.func.is_noinline = true;
+                m.func.is_inline   = false;
+            }
             return;
         }
     }
