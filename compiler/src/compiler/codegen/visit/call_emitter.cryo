@@ -1089,9 +1089,28 @@ type struct CallEmitter {
         const ret_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         const void_ty: LType = LType::void_type();
         // Void calls and unresolved return types must use empty name;
-        // LLVM doesn't allow naming void-typed instructions.
+        // LLVM doesn't allow naming void-typed instructions.  The ABI/
+        // definition side (`abi.cryo` classify, `declaration_emitter`)
+        // lowers a `Unit`/`Void`/`Never` return to an LLVM `void`-returning
+        // function, but `map_type(Unit)` yields an empty `{}` struct (the
+        // value representation of unit), not LLVM void.  Keying `is_void`
+        // off the mapped LLVM type alone therefore names the call
+        // instruction for a unit return (e.g. `Result<(), E>::expect`),
+        // which LLVM rejects: "Instruction has a name, but provides a void
+        // value!".  Detect the void-returning ABI from the source-level
+        // return-type kind to stay in lockstep with the definition side.
+        mut ret_kind_is_void: boolean = false;
+        if (node.resolved_type.is_valid()) {
+            const _rt: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            if (_rt != null && (_rt.kind == TypeKind::Unit
+                                || _rt.kind == TypeKind::Void
+                                || _rt.kind == TypeKind::Never)) {
+                ret_kind_is_void = true;
+            }
+        }
         const is_void: boolean = !ret_ty.is_valid() || ret_ty.raw == void_ty.raw ||
-                                  type_kind_of(ret_ty.raw) == LTypeKind::Void;
+                                  type_kind_of(ret_ty.raw) == LTypeKind::Void ||
+                                  ret_kind_is_void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
