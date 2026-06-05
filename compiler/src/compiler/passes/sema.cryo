@@ -34,6 +34,7 @@ import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Lex;
 import Compiler::Types;
+import Compiler::Types::Registry;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Type;
 import Compiler::Types::UserDefined;
@@ -1215,6 +1216,14 @@ public:
     override visit(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null || node.is_generic()) { return; }
         const _fn_name: string = this.intern.resolve(node.name);
+        // A `private` type from another module may not appear in a public
+        // signature (params / return) either.
+        this.check_annotation_visibility(node.return_type_annotation);
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            if (node.parameters[pi] != null) {
+                this.check_annotation_visibility(node.parameters[pi].type_annotation);
+            }
+        }
         this.enter_function(node, TypeRef::invalid());
         this.visit(node.body);
         this.body_count += 1;
@@ -1757,6 +1766,11 @@ public:
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
 
         const var_node: VarDeclNode* = decl as VarDeclNode*;
+
+        // Reject `mut x: <private type from another module> = ...;` — the
+        // primary surface for keeping iterator engines (`SliceIter`, …)
+        // unnameable outside their module.
+        this.check_annotation_visibility(var_node.type_annotation);
 
         // Enforce the lambda-only inference rule (the parser deliberately
         // allows `const name = expr;` without a `:T` annotation; sema is
@@ -8263,6 +8277,93 @@ public:
         this.ctx.emit_diagnostic(diag);
     }
 
+    // Cross-module top-level `private` type enforcement (E0503)
+
+    /// Module identity for the code currently being checked, matching the key
+    /// types are registered under (TypeResolution's `module_name`).  During an
+    /// injected specialization, `dispatch_top_level` swaps the namespace to
+    /// the template's module, so this stays the type's defining module.
+    current_module_name(&this) -> string {
+        if (this.ctx.has_namespace()) { return this.ctx.namespace_display(); }
+        return this.ctx.source_file;
+    }
+
+    /// Bare leaf of a possibly-qualified type name (`a::b::Secret` -> `Secret`);
+    /// the type registry keys on the unqualified local name.
+    visibility_leaf_name(&this, name: SymbolStr) -> SymbolStr {
+        const s: string = this.intern.resolve(name);
+        const n: i64 = intrinsics::strlen(s) as i64;
+        mut last: i64 = 0;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last = i + 2; }
+        }
+        if (last == 0) { return name; }
+        mut tail: string = "";
+        for (mut i: i64 = last; i < n; i++) {
+            tail = format("%s%c", tail, s[i] as i32);
+        }
+        return this.intern.intern(tail);
+    }
+
+    /// Reject a user-written reference to a `private` type owned by another
+    /// module.  No-op unless the registry reports a cross-module private match,
+    /// so it is inert until a type is actually marked `private`.
+    check_type_name_visibility(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+        if (this.ctx.type_resolver == null) { return; }
+        const reg: ModuleTypeRegistry* = this.ctx.type_resolver.module_registry;
+        if (reg == null) { return; }
+        const leaf: SymbolStr = this.visibility_leaf_name(name);
+        const owner: string = reg.private_owner_module(leaf, this.current_module_name());
+        if (intrinsics::strcmp(owner, "") == 0) { return; }
+        const leaf_str: string = this.intern.resolve(leaf);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
+            format("type `%s` is private to module `%s`", leaf_str, owner));
+        diag = diag.at_with_label(span,
+            format("`%s` cannot be named outside its module `%s`", leaf_str, owner));
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Walk a user-written type annotation, checking every `Named` leaf for
+    /// cross-module private access.  Skips `pre_resolved` leaves (mangled spec
+    /// names the monomorphizer produced — not source-level references).
+    check_annotation_visibility(mut &this, ann: TypeAnnotation*) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                if (n.pre_resolved.is_valid()) { return; }
+                this.check_type_name_visibility(n.name, n.span);
+            }
+            TypeAnnotation::Generic(g) => {
+                this.check_annotation_visibility(g.base);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    this.check_annotation_visibility(g.args[i]);
+                }
+            }
+            TypeAnnotation::Pointer(p)   => { this.check_annotation_visibility(p.inner); }
+            TypeAnnotation::Reference(r) => { this.check_annotation_visibility(r.inner); }
+            TypeAnnotation::Array(a)     => { this.check_annotation_visibility(a.element); }
+            TypeAnnotation::Optional(o)  => { this.check_annotation_visibility(o.inner); }
+            TypeAnnotation::Tuple(t)     => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    this.check_annotation_visibility(t.elements[i]);
+                }
+            }
+            TypeAnnotation::Function(f)  => {
+                this.check_annotation_visibility(f.return_type);
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    this.check_annotation_visibility(f.parameters[i]);
+                }
+            }
+            TypeAnnotation::ImplTrait(imp) => {
+                for (mut i: i64 = 0; i < imp.bounds.length; i++) {
+                    this.check_annotation_visibility(imp.bounds[i]);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Method-call counterpart to enforce_field_visibility.  Searches the
     /// receiver's Struct/Class for the named method (walking the class
     /// inheritance chain for Class receivers) and emits E0353 if the matched
@@ -8423,11 +8524,21 @@ public:
             return result.result_type;
         }
 
-        // Fall back to method lookup with inheritance chain
-        const type_sym: SymbolStr = this.lookup_type_sym(obj_type);
+        // Fall back to method lookup with inheritance chain. Resolve the type
+        // symbol from the *dereferenced* receiver (`walk_ty`, already walked
+        // past pointer/reference/instantiation wrappers above) rather than the
+        // raw `obj_type`. A bare pointer/reference type carries no registered
+        // type name, so `lookup_type_sym(obj_type)` returns empty for a
+        // receiver like `p: T*` (e.g. an enum-variant payload binding such as
+        // `match (a) { Foo::Bar(p) => ... }` where the payload is `T*`). That
+        // empty symbol skips the E0204 emission below, letting an
+        // undefined-field access (`p.no_such_field`) slip silently past sema
+        // into codegen, where it surfaces as an opaque "unterminated basic
+        // block" crash instead of a user-facing error.
+        const type_sym: SymbolStr = this.lookup_type_sym(walk_ty);
         if (type_sym.is_valid()) {
             const method_ret: TypeRef = this.lookup_method_with_inheritance(
-                obj_type, type_sym, member.member);
+                walk_ty, type_sym, member.member);
             if (method_ret.is_valid()) {
                 const acc_span: SourceSpan = if (member.member_span.has_location()) {
                     member.member_span
@@ -8869,6 +8980,9 @@ public:
     }
 
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
+        // A `private` type can't be constructed by name from another module.
+        this.check_type_name_visibility(lit.struct_type, (lit as ASTNode*).span);
+
         // Resolve the struct's type first so we know its field layout.
         // Push each field's declared type as `expected_type` while we
         // resolve the field's initializer; same motivation as

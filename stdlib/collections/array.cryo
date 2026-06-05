@@ -711,7 +711,11 @@ where T: Clone {
 /// Borrowing iterator over an `Array<T>`, yielding `T*` (a pointer to
 /// each element in place). Created by `Array::iter_ref`; sound for
 /// owning `T`. Invalidated by any reallocating method on the array.
-type struct RefIter<T> {
+///
+/// `private`: this cursor is an implementation detail. Callers obtain it
+/// only as the opaque `implement Iterator<T*>` returned by `iter_ref`, and
+/// never name it.
+private type struct RefIter<T> {
     ptr:    T*;
     index:  u64;
     length: u64;
@@ -747,5 +751,58 @@ implement<T> trait Iterator<T*> for struct RefIter<T> {
         const elem: T* = mem::offset(this.ptr, this.index as i64);
         this.index = this.index + 1;
         return Option::Some(elem);
+    }
+}
+
+/// Adapter dereferencing each `T*` yielded by `inner` into a `T` by bitwise
+/// copy. Bridges the by-reference `RefIter` cursor to the by-value consumers,
+/// so an owning collection needs no separate by-value iterator struct. The
+/// element type `T` is recovered from the inner iterator via the
+/// `where I: Iterator<T*>` bound (the monomorphizer peels the `T*`), so it is
+/// not a struct parameter. Sound only when `T: Copy`.
+///
+/// `private`: produced only as the opaque `implement Iterator<T>` returned by
+/// `RefIter::copied`; never named outside this module. Lives here, with the
+/// `RefIter` it bridges, rather than in `core::iter`.
+private type struct CopiedIter<I> {
+    inner: I;
+
+    static new(inner: I) -> CopiedIter<I> {
+        return CopiedIter<I> { inner: inner };
+    }
+}
+
+implement<I, T> trait Iterator<T> for struct CopiedIter<I>
+where I: Iterator<T*>, T: Copy {
+    next(mut &this) -> Option<T> {
+        return match (this.inner.next()) {
+            Option::Some(p) => { Option::Some(*p) }
+            Option::None    => { Option::None }
+        };
+    }
+}
+
+/// Adapter cloning each `T*` yielded by `inner` into an owned `T` via `Clone`.
+/// The owning-type counterpart of `CopiedIter`: this is what lets a `loop`/`for`
+/// over `strings.iter_ref()` walk an `Array<String>` by value (each element an
+/// independent clone) — something the `Copy`-gated `iter()` can't express.
+///
+/// `private`: same rationale as `CopiedIter`; produced only as the opaque
+/// `implement Iterator<T>` returned by `RefIter::cloned`.
+private type struct ClonedIter<I> {
+    inner: I;
+
+    static new(inner: I) -> ClonedIter<I> {
+        return ClonedIter<I> { inner: inner };
+    }
+}
+
+implement<I, T> trait Iterator<T> for struct ClonedIter<I>
+where I: Iterator<T*>, T: Clone {
+    next(mut &this) -> Option<T> {
+        return match (this.inner.next()) {
+            Option::Some(p) => { Option::Some((*p).clone()) }
+            Option::None    => { Option::None }
+        };
     }
 }
