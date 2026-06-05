@@ -1,0 +1,98 @@
+///! Fluent trait-default combinators that return a `Self`-dependent
+///! adapter (`copied(this) -> Adapter<This>`).
+///!
+///! This exercises the full chain that was previously broken end-to-end:
+///!   1. The monomorphizer recovers the adapter's element type `T` from
+///!      the `where I: MyIter<T*>` bound by peeling the pointer
+///!      (`bind_where_arg_param`), so `Adapter<This>` is constructible.
+///!   2. The monomorphizer lazily instantiates the zero-generic
+///!      self-returning default at the call site, pushing a concrete spec.
+///!   3. Sema's `match_methods_on_impl_block` prefers that concrete spec
+///!      over the deferred (`This`-unresolved) template.
+///!   4. Codegen resolves the spec's symbol across modules even though it
+///!      was emitted in a different module than the call site.
+///!
+///! `MyCopied` deliberately uses a pointer-gated bound (`I: MyIter<T*>`)
+///! so the element type is recovered by pointer-peeling, the case that
+///! used to crash the mangler / fail to resolve.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::FluentDefaultMethodCombinator;
+
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+type trait MyIter<Item> {
+    mynext(mut &this) -> Option<Item>;
+
+    // Self-returning default combinator: returns an adapter over `This`.
+    mycopied(this) -> MyCopied<This> {
+        return MyCopied::new(this);
+    }
+}
+
+// A by-reference source: yields `T*`.
+type struct PtrSrc<T> {
+    ptr: T*;
+    n: u64;
+}
+
+implement<T> trait MyIter<T*> for struct PtrSrc<T> {
+    mynext(mut &this) -> Option<T*> {
+        if (this.n == 0) { return Option::None; }
+        this.n = this.n - 1;
+        const p: T* = this.ptr;
+        return Option::Some(p);
+    }
+}
+
+// Adapter whose element type `T` lives ONLY inside the pointer in its
+// bound, so it must be recovered by peeling `T*`.
+type struct MyCopied<I> {
+    inner: I;
+
+    static new(inner: I) -> MyCopied<I> {
+        return MyCopied<I> { inner: inner };
+    }
+}
+
+implement<I, T> trait MyIter<T> for struct MyCopied<I>
+where I: MyIter<T*>, T: Copy {
+    mynext(mut &this) -> Option<T> {
+        return match (this.inner.mynext()) {
+            Option::Some(p) => { Option::Some(*p) }
+            Option::None    => { Option::None }
+        };
+    }
+}
+
+![test]
+function fluent_copied_resolves_and_runs() -> Result<(), TestError> {
+    mut x: i32 = 7;
+    mut src: PtrSrc<i32> = PtrSrc<i32> { ptr: &x, n: 1 };
+    // The fluent call: `src.mycopied()` returns `MyCopied<PtrSrc<i32>>`,
+    // element type inferred. Then iterate it by value.
+    mut c: MyCopied<PtrSrc<i32>> = src.mycopied();
+    match (c.mynext()) {
+        Option::Some(v) => { return expect_eq(v, 7); }
+        Option::None    => { return bail(Str::new("expected Some(7)")); }
+    }
+}
+
+![test]
+function fluent_copied_yields_all_elements() -> Result<(), TestError> {
+    mut x: i32 = 42;
+    mut src: PtrSrc<i32> = PtrSrc<i32> { ptr: &x, n: 3 };
+    mut c: MyCopied<PtrSrc<i32>> = src.mycopied();
+    mut count: i32 = 0;
+    mut sum: i32 = 0;
+    loop {
+        match (c.mynext()) {
+            Option::Some(v) => { sum = sum + v; count = count + 1; }
+            Option::None    => { break; }
+        }
+    }
+    expect_eq(count, 3)?;
+    return expect_eq(sum, 126);   // 42 * 3
+}
