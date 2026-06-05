@@ -3,8 +3,9 @@
 ///! `read_dir(p)` returns a `ReadDir` iterator over `DirEntry` values
 ///! (skipping `.` and `..`). The remaining free functions wrap the
 ///! single-syscall path operations: `create_dir`, `remove_file`,
-///! `remove_dir`, `rename`, and `canonicalize`. All report failure
-///! through `IoError` mapped from `errno`.
+///! `remove_dir`, `rename`, and `canonicalize`, plus the recursive
+///! `create_dir_all` (mkdir -p) and `remove_dir_all` (rm -r). All
+///! report failure through `IoError` mapped from `errno`.
 
 namespace std::fs::dir;
 
@@ -136,6 +137,35 @@ function create_dir(p: Path) -> Result<(), IoError> {
     return Result::Ok(());
 }
 
+/// Recursively create `p` and any missing parent directories, like
+/// `mkdir -p`. Succeeds if `p` already exists as a directory. Each
+/// created component uses mode 0755. A concurrent creator racing on
+/// the same path is tolerated (an `AlreadyExists` that resolves to a
+/// directory is success); any other failure is returned as-is.
+function create_dir_all(p: Path) -> Result<(), IoError> {
+    if (metadata::is_dir(p)) { return Result::Ok(()); }
+    match (p.parent()) {
+        Option::Some(parent) => {
+            if (parent.as_str().length() > 0 && !metadata::is_dir(parent)) {
+                create_dir_all(parent)?;
+            }
+        }
+        Option::None => { }
+    }
+    match (create_dir(p)) {
+        Result::Ok(_) => { return Result::Ok(()); }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::AlreadyExists => {
+                    if (metadata::is_dir(p)) { return Result::Ok(()); }
+                    return Result::Err(e);
+                }
+                _ => { return Result::Err(e); }
+            }
+        }
+    }
+}
+
 /// Remove a file (or symlink). `unlink(2)`.
 function remove_file(p: Path) -> Result<(), IoError> {
     mut c_path: String = String::from_str_c(p.as_str());
@@ -146,6 +176,33 @@ function remove_file(p: Path) -> Result<(), IoError> {
         return Result::Err(IoError::from_errno(err));
     }
     return Result::Ok(());
+}
+
+/// Recursively remove `p` and everything under it, like `rm -r` on a
+/// directory. `p` must be a real directory. Entries that are symlinks
+/// are unlinked, not followed (a symlink reports a non-directory
+/// `d_type`, so it routes to `remove_file`). Returns the first
+/// failure. Relies on the directory's `d_type`; the supported Linux
+/// filesystems (ext4, btrfs, xfs, tmpfs) report entry types correctly.
+function remove_dir_all(p: Path) -> Result<(), IoError> {
+    mut rd: ReadDir = read_dir(p)?;
+    loop {
+        match (rd.next()) {
+            Option::Some(entry) => {
+                mut child: PathBuf = PathBuf::from_str(p.as_str());
+                child.push(entry.name());
+                if (entry.is_dir()) {
+                    remove_dir_all(child.as_path())?;
+                } else {
+                    remove_file(child.as_path())?;
+                }
+            }
+            Option::None => { break; }
+        }
+    }
+    // Close the handle before removing the now-empty directory.
+    rd.drop();
+    return remove_dir(p);
 }
 
 /// Remove an empty directory. `rmdir(2)`.

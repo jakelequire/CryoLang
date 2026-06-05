@@ -207,17 +207,17 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// function pointer or non-capturing lambda. Panics on allocation or
 /// `pthread_create` failure; use `try_spawn` for a fallible spawn.
 ///
-/// Thread-safety note (v1.0): `spawn` does NOT carry a `where C: Send`
-/// bound, so the compiler does not statically reject moving a
-/// non-thread-safe value into the new thread. This is deliberate — the
-/// scoped-thread pattern passes a raw pointer (e.g. `AtomicU8*`) to
-/// share state, and raw pointers are not `Send`, so a `Send` bound here
-/// would reject that idiom. The `Send`/`Sync` marker traits in
-/// `core::marker` ARE checked where an explicit `where T: Send` bound is
-/// written; they are simply not required by `spawn`. Ensuring the moved
-/// `ctx` is safe to use from another thread is the caller's
-/// responsibility in v1.0.
-function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T> {
+/// Thread-safety: `spawn` requires `C: Send` (the moved context) and
+/// `T: Send` (the result handed back through `JoinHandle::join`). Both
+/// are computed structurally — primitives, raw pointers, references, and
+/// the standard containers built on them (`Box`, `Arc`, `Array`,
+/// `String`, `mpsc::Sender`, ...) are `Send`, so the scoped-thread
+/// idiom of moving a raw pointer (e.g. `AtomicU8*`) into the body still
+/// compiles. The bound statically rejects the genuinely-unsafe types on
+/// the thread-safety deny-list (`Rc<T>` and the lock guards), closing the
+/// "move a non-thread-safe value into a thread" hole.
+function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
+where C: Send, T: Send {
     match (spawn_with_attr<C, T>(ctx, body, null)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
@@ -230,7 +230,8 @@ function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T> {
 /// be null for default attributes (the only path exercised today; a
 /// future `Builder` will pass a configured `pthread_attr_t`).
 function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
-                               attr: u8*) -> Result<JoinHandle<T>, SpawnError> {
+                               attr: u8*) -> Result<JoinHandle<T>, SpawnError>
+where C: Send, T: Send {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
     mut shared: Shared<T>* = null;
@@ -301,7 +302,8 @@ implement enum SpawnError {
 ///       Result::Err(e) => { /* back off / report */ }
 ///   }
 ///   ```
-function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError> {
+function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
+where C: Send, T: Send {
     return spawn_with_attr<C, T>(ctx, body, null);
 }
 
@@ -418,8 +420,11 @@ type struct Scope {
     /// Spawn a scoped thread running `body(ctx)`. `ctx` is moved in (often
     /// a pointer into scope-outliving state). The thread is recorded and
     /// joined by `join_all()` / the scope's drop. Panics on allocation or
-    /// thread-creation failure.
-    spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void {
+    /// thread-creation failure. `C: Send` — a raw pointer into the scope's
+    /// state qualifies (raw pointers are `Send`); a deny-listed type
+    /// (`Rc`, a lock guard) does not.
+    spawn<C>(mut &this, ctx: C, body: (C) -> void) -> void
+    where C: Send {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut p: ScopePayload<C>* = null;
         match (alloc.allocate(Layout::of<ScopePayload<C>>())) {

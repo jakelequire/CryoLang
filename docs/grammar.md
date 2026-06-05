@@ -277,6 +277,7 @@ Type               ::= BaseType "*"+                       (* pointer *)
                      | "(" (Type ("," Type)*)? ")" "->" Type  (* fn *)
                      | "()"                                (* unit *)
                      | Type "?"                            (* optional: T? desugars to Option<T> *)
+                     | "implement" QualName GenericArgs?   (* opaque: implement Trait (see cryo.md §2.11) *)
                      | BaseType
 BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"
@@ -293,12 +294,15 @@ HexLit             ::= /* 0[xX][0-9a-fA-F][0-9a-fA-F_]*         */
 BinLit             ::= /* 0[bB][01][01_]*                       */
 OctLit             ::= /* 0[oO][0-7][0-7_]*                     */
 FloatLit           ::= /* [0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)? */
-                       TypeSuffix?
+                       FloatSuffix?
 TypeSuffix         ::= "u8" | "u16" | "u32" | "u64"
                      | "i8" | "i16" | "i32" | "i64"
-                     | "f32" | "f64" | "usize" | "isize"
-StringLit          ::= /* "..."  with standard escapes           */
-CharLit            ::= /* '.'    with standard escapes           */
+                     | "usize" | "isize" | FloatSuffix
+FloatSuffix        ::= "f32" | "f64"
+StringLit          ::= /* "..."  with implemented escapes; an f-prefix  */
+                       /* (f"...{expr}...") is an interpolated string    */
+                       /* literal — see cryo.md §1.4.                    */
+CharLit            ::= /* '.'    with implemented escapes           */
 BoolLit            ::= "true" | "false"
 Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 

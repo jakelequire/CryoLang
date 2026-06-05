@@ -236,7 +236,8 @@ implement trait Eq for i32 {
 function find<T>(xs: &Array<T>, target: T) -> Option<u64>
     where T: Eq + Copy {
     for (mut i: u64 = 0; i < xs.length(); i++) {
-        if (xs.get(i).contains(&target)) {
+        const item: T = xs.get(i).unwrap();
+        if (item.equals(&target)) {
             return Option::Some(i);
         }
     }
@@ -396,7 +397,7 @@ entry_point = "src/tool/main.cryo"
 | `net` | TCP sockets and an HTTP/1.1 layer: `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server (`HttpServer::with_router(addr, &router).run()`), `Client::get`/`post`. |
 | `process` | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`. |
 | `sync` | Atomics (`AtomicU8` / `U32` / `U64` / `I32` / `I64` / `Bool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
-| `thread` | `ThreadLocal<T>` via POSIX TLS. (`thread::spawn` / `JoinHandle` are post-1.0; see Roadmap below.) |
+| `thread` | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
 | `test` | The built-in unit-test framework. |
 
 The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `collections::array`, and `alloc::box`.
@@ -497,7 +498,7 @@ for the full 1.0 release notes.
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`, `Arc`.
 - Synchronization primitives: atomics (`AtomicU{8,32,64}`, `AtomicI{32,64}`, `AtomicBool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with call-site enforcement.
-- `ThreadLocal<T>` via POSIX TLS.
+- `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, scoped threads (`thread::Scope`), and `sync::mpsc` channels.
 - I/O over `Read` / `Write` traits with buffered wrappers.
 - HTTP/1.1 server (keep-alive, read timeouts), client, router. JSON parser and serializer.
 - POSIX subprocess spawning with `fork + execve`.
@@ -507,10 +508,10 @@ for the full 1.0 release notes.
 
 **Beyond 1.0 (post-stable):**
 
-- `thread::spawn` / `JoinHandle` / `Builder` (the `sync` primitives ship in 1.0; what's missing is the way to start a second thread from Cryo source). `mpsc` channels.
+- A named `thread::Builder` configuration API (`thread::spawn` / `try_spawn` / `JoinHandle` / `spawn_with_attr`, scoped threads, and `mpsc` channels ship in 1.0).
 - Async / await / coroutines (currently parser-only).
 - Pattern guard clauses (`x if cond =>`).
-- Iterator adapters (`.map`, `.filter`, `.collect`, …). (`for (x in iter)` itself — over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator` — ships in 1.0, as do range expressions `a..b` / `a..=b`.)
+- The remaining iterator adapters (`.collect`, `.zip`, `.chain`, `.enumerate`, …). `.take`, `.map`, `.filter`, `.copied`, and `.cloned` partially ship in 1.0 — they work directly on iterators consumed by `.count` / `.fold` / `for-in`, but own-generic adapters chained after another adapter (e.g. `.take().map()`) are not supported. `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
 - TLS, UDP, HTTP/2, and WebSocket for `net::http`.
 - Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, `metadata`, …).
 - `time` (`Instant`, `Duration`, `sleep`) and `random` modules.

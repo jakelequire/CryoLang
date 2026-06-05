@@ -4,11 +4,10 @@
 ///! and `set_var` read and write environment variables; `exit`
 ///! terminates the process with a status code.
 ///!
-///! Argv comes from the C runtime. We expose a `raw_argc`/`raw_argv`
-///! intrinsic pair; cryoc wires these to the actual
-///! `main(argc, argv)` it generates. Until that wiring is established,
-///! `args()` returns an empty array rather than lying about what's
-///! present.
+///! Argv comes from the C runtime: the generated `main(argc, argv)`
+///! calls `set_args` before user code runs, so `args()` returns the
+///! real argument vector. `current_dir`/`set_current_dir` wrap
+///! `getcwd`/`chdir`.
 
 namespace std::env;
 
@@ -72,6 +71,24 @@ function remove_var(name: Str) -> boolean {
     mut n: String = String::from_str_c(name);
     const rc: i32 = libc::unsetenv(n.as_ptr());
     return rc == 0;
+}
+
+/// The process's current working directory as an owned `String`.
+/// Returns `None` if the path could not be read (e.g. it exceeds the
+/// 4096-byte buffer, or a parent component was removed/unreadable).
+function current_dir() -> Option<String> {
+    mut buf: u8[4096];
+    const rc: u8* = libc::getcwd(&buf[0], 4096);
+    if (rc == null) { return Option::None; }
+    return Option::Some(String::from_str(Str::from_cstr(rc as string)));
+}
+
+/// Change the process's current working directory to `path`. Returns
+/// `true` on success. This affects the whole process, not just the
+/// calling thread.
+function set_current_dir(path: Str) -> boolean {
+    mut p: String = String::from_str_c(path);
+    return libc::chdir(p.as_ptr()) == 0;
 }
 
 /// Exit the process with `code`. Does not return; anything written

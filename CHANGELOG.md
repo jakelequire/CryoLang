@@ -99,8 +99,12 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `MemoryOrder`, `fence`, `compiler_fence`), `Mutex<T>`, `RwLock<T>`,
   `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with
   call-site enforcement.
-- **`thread`:** `ThreadLocal<T>` via `pthread_key`. (`thread::spawn`,
-  `JoinHandle`, `Builder` are post-1.0.)
+- **`thread`:** `ThreadLocal<T>` via `pthread_key`; OS threads via
+  `spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on
+  `join`), `spawn_with_attr`, scoped threads (`thread::Scope`),
+  `current` / `yield_now` / `sleep` / `sleep_ms`. Channels in
+  `sync::mpsc` (`channel`, `Sender`, `Receiver`). (A named `Builder`
+  configuration API is post-1.0.)
 - **`math`:** `square_root`, `cube_root`, `power`, `sine`/`cosine`/`tangent`,
   `natural_log`/`log_base2`/`log_base10`/`exponential`, `absolute` (f64)
   /`absolute_f32`, `abs_i32`/`abs_i64`, `is_nan`/`is_infinite`/`is_finite`,
@@ -143,11 +147,12 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 
 ### Examples
 
-Thirteen worked examples under `examples/`, covering hello-world,
+Fourteen worked examples under `examples/`, covering hello-world,
 fizzbuzz, recursion, structs and methods, `Array<T>` ownership, file
 I/O and `HashMap`, traits with `where` bounds, 2D simulation,
 `std::json` parsing, recursive-descent parsing, an HTTP server,
-stdin-driven interactive I/O, and capturing closures.
+stdin-driven interactive I/O, capturing closures, and OS threads with
+`thread::spawn` / `JoinHandle` / `mpsc` channels.
 
 ### Known limitations (deferred to post-1.0)
 
@@ -176,9 +181,10 @@ authoritative list.
 - Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - Async / await / coroutines.
-- `thread::spawn` / `JoinHandle` / `Builder` and `mpsc` channels. (The
-  primitives under `std::sync` and `Arc<T>` ship in 1.0; what's missing
-  is the way to start a second thread from Cryo source.)
+- A named `thread::Builder` configuration API. (`thread::spawn` /
+  `try_spawn` / `JoinHandle` / `spawn_with_attr`, scoped threads, and
+  `sync::mpsc` channels ship in 1.0; use `spawn_with_attr` for
+  stack-size control until `Builder` lands.)
 - `time::Instant` / `Duration` / `sleep`; `random` module.
 - Filesystem operations beyond read/write/open (`remove_file`,
   `create_dir`, `read_dir`, `metadata`, `rename`, `exists`, `copy`).
