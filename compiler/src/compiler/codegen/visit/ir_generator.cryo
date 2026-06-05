@@ -445,10 +445,19 @@ public:
             }
 
             // Emit the OR-pattern comparison chain for this arm.  A hit on
-            // any pattern branches to arm_bbs[i]; a full miss falls through
-            // to next_bb.
-            this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
-                minfo, is_string_subj, subject, current_fn, "match");
+            // any pattern branches to arm_bbs[i] (or, for a guarded arm, to a
+            // guard block that re-checks the condition before committing); a
+            // full miss falls through to next_bb.
+            if (arm.guard != null) {
+                const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
+                    format("match.guard%lld", i));
+                this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
+                    minfo, is_string_subj, subject, current_fn, "match");
+                this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
+            } else {
+                this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
+                    minfo, is_string_subj, subject, current_fn, "match");
+            }
 
             // Position at next_bb for the next test (if not the last arm).
             if (i + 1 < num_arms) {
@@ -464,9 +473,11 @@ public:
 
             this.cg.builder.position_at_end(arm_bbs[i]);
 
-            // Bind enum pattern payloads (scoped to arm body).
+            // Bind enum pattern payloads + any top-level identifier binding
+            // (scoped to arm body).
             this.cg.values.push_scope();
             this.patterns.bind_arm_enum_payloads(arm, minfo);
+            this.patterns.bind_arm_value_bindings(arm, minfo);
 
             if (arm.body != null) {
                 this.dispatch.generate_statement(this,arm.body);
@@ -504,6 +515,33 @@ public:
         // verifiable.
         if (!any_arm_falls_through && !merge_bb.has_terminator()) {
             this.cg.builder.build_unreachable();
+        }
+    }
+
+    /// Emit a pattern-guard test block. The comparison chain branches here
+    /// when the arm's pattern(s) matched; we bind the pattern payloads,
+    /// evaluate the guard with those bindings in scope, then branch to
+    /// `body_bb` when the guard holds or `next_bb` (the next arm's test, or
+    /// the no-match trap for the final arm) when it fails — this is what
+    /// gives a failed guard its fall-through semantics. The bindings live in
+    /// a temporary value scope so they don't leak into the body block, which
+    /// re-binds them itself. Shared by the statement- and expression-match
+    /// drivers.
+    emit_guard_block(mut &this, arm: MatchArmNode*, guard_bb: LBasicBlock,
+                     body_bb: LBasicBlock, next_bb: LBasicBlock,
+                     minfo: MatchSubjectInfo) -> void {
+        this.cg.builder.position_at_end(guard_bb);
+        this.cg.values.push_scope();
+        this.patterns.bind_arm_enum_payloads(arm, minfo);
+        this.patterns.bind_arm_value_bindings(arm, minfo);
+        const cond: LValue = this.dispatch.codegen_rvalue(this, arm.guard);
+        this.cg.values.pop_scope();
+        if (cond.is_valid()) {
+            this.cg.builder.build_cond_br(cond, body_bb, next_bb);
+        } else {
+            // Guard failed to lower (should not happen after sema); fall
+            // through to the next arm rather than leave the block unterminated.
+            this.cg.builder.build_br(next_bb);
         }
     }
 
@@ -1323,8 +1361,17 @@ public:
 
             // Emit the OR-pattern comparison chain for this arm (see
             // visit(MatchStmtNode*); identical lowering, "mexpr" prefix).
-            this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
-                minfo, is_string_subj_e, subject, current_fn, "mexpr");
+            // Guarded arms route a pattern hit through a guard block first.
+            if (arm.guard != null) {
+                const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
+                    format("mexpr.guard%lld", i));
+                this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
+                    minfo, is_string_subj_e, subject, current_fn, "mexpr");
+                this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
+            } else {
+                this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
+                    minfo, is_string_subj_e, subject, current_fn, "mexpr");
+            }
 
             if (i + 1 < num_arms) {
                 this.cg.builder.position_at_end(next_bb);
@@ -1348,6 +1395,7 @@ public:
 
             this.cg.values.push_scope();
             this.patterns.bind_arm_enum_payloads(arm, minfo);
+            this.patterns.bind_arm_value_bindings(arm, minfo);
 
             // Match expression arms produce values.
             // The arm body is a statement; for expression arms, it's typically

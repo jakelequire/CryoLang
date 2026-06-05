@@ -25,9 +25,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **Enums:** algebraic enums with explicit discriminants and discriminant
   base type (`type enum X : u8 { … }`), exhaustive match enforcement on
   enum subjects.
-- **Pattern matching:** literal, identifier, wildcard, enum-destructure,
-  range patterns (`a..b` and the explicit `a..=b`; both are inclusive in
-  pattern position), and or-patterns (`a | b | c`).
+- **Pattern matching:** literal, identifier-binding, wildcard,
+  enum-destructure, range patterns (`a..b` and the explicit `a..=b`; both
+  are inclusive in pattern position), or-patterns (`a | b | c`), and guard
+  clauses (`pattern if (cond) => ...`, checked after the pattern matches
+  with a false guard falling through to the next arm).
 - **Ownership:**
   - `Copy` and `Drop` traits with automatic recursive drop glue through
     struct fields, enum payloads, and container elements.
@@ -178,7 +180,6 @@ authoritative list.
   `next`/`count`/`fold`/`for_each`; `for (x in iter)` iteration and range
   *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0 and work
   against any of these.
-- Pattern guard clauses (`x if cond =>`).
 - Nested patterns in `match`.
 - Async / await / coroutines.
 - A named `thread::Builder` configuration API. (`thread::spawn` /
