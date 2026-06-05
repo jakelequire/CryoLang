@@ -21,6 +21,8 @@ import Compiler::Diag::SourceSpan;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::Resolver;
@@ -218,6 +220,15 @@ type struct TypeResolver {
                 }
                 return TypeRef::invalid();
             }
+            TypeAnnotation::ImplTrait(imp) => {
+                // `implement Trait` stands for a single concrete type the
+                // monomorphizer infers (from the function body's `return`
+                // exprs) / sema infers (from a local's initializer) and
+                // caches in `resolved`.  Like `Typeof`, the resolver itself
+                // can't derive it — it just hands back the cached value.
+                // Invalid here means inference hasn't primed it yet.
+                imp.resolved
+            }
         };
     }
 
@@ -240,6 +251,15 @@ type struct TypeResolver {
             const ret: TypeRef = this.resolve(func.return_type_annotation, res_ctx);
             if (ret.is_valid()) {
                 func.resolved_return_type = ret;
+            } else {
+                // `implement Trait` returns invalid from `resolve` until inference
+                // primes its `resolved` slot.  Infer the concrete type the
+                // opaque alias stands for from the body's return expression,
+                // here — before any caller mangles this signature.  Runs for
+                // both non-generic methods (concrete body) and generic
+                // templates / specializations (body already substituted by
+                // the time the spec path re-enters this function).
+                this.infer_impl_trait_return(func, res_ctx);
             }
         }
         // Default to void if no return type annotation was provided.
@@ -260,6 +280,113 @@ type struct TypeResolver {
             }
         }
 
+    }
+
+    /// Infer the concrete type an `implement Trait` return annotation stands for,
+    /// from `func`'s first `return` expression, and cache it into both the
+    /// annotation's `resolved` slot (so a later `resolve` of the same
+    /// annotation hands it back) and `func.resolved_return_type`.
+    ///
+    /// Cryo is fully monomorphizing with no type erasure, so `implement Trait` is
+    /// an opaque ALIAS: each function has exactly one concrete return type.
+    /// Currently the return expression must be a struct literal
+    /// (`return SomeIter<T> { ... }`), which covers every collection iterator
+    /// entry point; other shapes leave the return unresolved (a clear
+    /// downstream error rather than a silent miscompile).
+    infer_impl_trait_return(&this, func: FunctionDeclNode*,
+                            res_ctx: ResolutionContext*) -> void {
+        if (func == null || func.return_type_annotation == null) { return; }
+        mut imp: ImplTraitAnnotation* = null;
+        match (*func.return_type_annotation) {
+            TypeAnnotation::ImplTrait(node) => { imp = node; }
+            _ => { return; }
+        }
+        if (imp == null) { return; }
+        if (imp.resolved.is_valid()) {
+            func.resolved_return_type = imp.resolved;
+            return;
+        }
+        const ret_expr: ExpressionNode* =
+            this.find_first_return_expr(func.body);
+        if (ret_expr == null) { return; }
+        const concrete: TypeRef = this.type_of_impl_return_expr(ret_expr, res_ctx);
+        if (!concrete.is_valid()) { return; }
+        imp.resolved = concrete;
+        func.resolved_return_type = concrete;
+    }
+
+    /// Type an `implement Trait` body's return expression.  Only struct literals
+    /// are supported for now; their type is `Name<Args>` recovered from the
+    /// literal's struct name + generic args (already substituted to concrete
+    /// types in a specialized body) and resolved through `res_ctx`.
+    type_of_impl_return_expr(&this, expr: ExpressionNode*,
+                             res_ctx: ResolutionContext*) -> TypeRef {
+        if (expr == null) { return TypeRef::invalid(); }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind != NodeKind::StructLiteral) {
+            return TypeRef::invalid();
+        }
+        const sl: StructLiteralNode* = expr as StructLiteralNode*;
+        const name_ann: NamedAnnotation* = new NamedAnnotation {
+            name:         sl.struct_type,
+            span:         SourceSpan::none(),
+            pre_resolved: TypeRef::invalid(),
+        };
+        mut result_ann: TypeAnnotation* = new TypeAnnotation::Named(name_ann);
+        if (sl.generic_args.length > 0) {
+            mut cloned_args: TypeAnnotation*[] = [];
+            for (mut i: i64 = 0; i < sl.generic_args.length; i++) {
+                cloned_args.push(TypeAnnotation::clone_ptr(sl.generic_args[i]));
+            }
+            const gen: GenericAnnotation* = new GenericAnnotation {
+                base: result_ann,
+                args: cloned_args,
+                span: SourceSpan::none(),
+            };
+            result_ann = new TypeAnnotation::Generic(gen);
+        }
+        return this.resolve(result_ann, res_ctx);
+    }
+
+    /// First `return <expr>;` expression reachable from `block`, descending
+    /// through nested blocks and `if` branches.  All returns of an
+    /// `implement Trait` body must yield the same concrete type, so the first one
+    /// is authoritative.
+    find_first_return_expr(&this, block: BlockStmtNode*) -> ExpressionNode* {
+        if (block == null) { return null; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const e: ExpressionNode* =
+                this.find_first_return_expr_in_stmt(block.statements[i]);
+            if (e != null) { return e; }
+        }
+        return null;
+    }
+
+    find_first_return_expr_in_stmt(&this, stmt: StatementNode*) -> ExpressionNode* {
+        if (stmt == null) { return null; }
+        const node: ASTNode* = stmt as ASTNode*;
+        match (node.kind) {
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                return rs.expression;
+            }
+            NodeKind::BlockStatement => {
+                return this.find_first_return_expr(stmt as BlockStmtNode*);
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                if (ifs.then_stmt != null) {
+                    const e: ExpressionNode* =
+                        this.find_first_return_expr_in_stmt(ifs.then_stmt);
+                    if (e != null) { return e; }
+                }
+                if (ifs.has_else() && ifs.else_stmt != null) {
+                    return this.find_first_return_expr_in_stmt(ifs.else_stmt);
+                }
+                return null;
+            }
+            _ => { return null; }
+        }
     }
 
     /// Resolve type annotations on an array of FieldDeclNode.

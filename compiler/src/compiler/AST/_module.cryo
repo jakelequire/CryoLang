@@ -201,6 +201,13 @@ type enum TypeAnnotation {
     /// The parser captures it as a tagged sentinel; sema later resolves it
     /// to the implementing type (Phase B.1).
     ThisType(ThisTypeAnnotation*);
+    /// `implement Trait` in return / binding position. An OPAQUE ALIAS for a
+    /// single concrete type the compiler infers (from the function body's
+    /// `return` exprs, or from the initializer of a local binding) and
+    /// caches into `ImplTraitAnnotation.resolved`. Cryo is fully
+    /// monomorphizing with no type erasure, so this is not `dyn`/existential
+    /// — it merely lets the name be elided. See ImplTraitAnnotation.
+    ImplTrait(ImplTraitAnnotation*);
 }
 
 
@@ -317,6 +324,27 @@ implement enum TypeAnnotation {
                 *tt = ThisTypeAnnotation { span: t.span };
                 *result = TypeAnnotation::ThisType(tt);
             }
+            TypeAnnotation::ImplTrait(imp) => {
+                mut new_bounds: TypeAnnotation*[] = [];
+                for (mut i: i64 = 0; i < imp.bounds.length; i++) {
+                    new_bounds.push(TypeAnnotation::clone_ptr(imp.bounds[i]));
+                }
+                const it: ImplTraitAnnotation* = malloc(sizeof(ImplTraitAnnotation)) as ImplTraitAnnotation*;
+                // Deliberately DROP the cached `resolved`: a clone is taken
+                // when specializing a generic method, and the original may
+                // have been inferred in the template context (e.g.
+                // `BufIter<T>`).  The body travels with the clone and is
+                // substituted to concrete types, so the spec re-infers a
+                // fresh, correctly-substituted `resolved` (`BufIter<i32>`).
+                // Carrying the template's value here would poison every
+                // specialization with the unsubstituted type.
+                *it = ImplTraitAnnotation {
+                    bounds:   new_bounds,
+                    resolved: TypeRef::invalid(),
+                    span:     imp.span,
+                };
+                *result = TypeAnnotation::ImplTrait(it);
+            }
         }
 
         return result;
@@ -416,6 +444,20 @@ type struct TypeofAnnotation {
 /// later by sema using the enclosing trait/impl context.
 type struct ThisTypeAnnotation {
     span: SourceSpan;
+}
+
+/// `implement Trait + Trait2 + ...` in return / binding position. Each bound
+/// is itself a type annotation (typically `Generic(Named("Iterator"), [args])`
+/// or a bare `Named`), so the existing substituter/resolver machinery
+/// recurses into the bounds for free. `resolved` caches the single concrete
+/// type the opaque alias stands for — inferred from the function body's
+/// `return` exprs (return position) or from the initializer (local binding).
+/// `TypeRef::invalid()` until inference fills it; the TypeResolver returns
+/// it directly, exactly like `TypeofAnnotation.resolved`.
+type struct ImplTraitAnnotation {
+    bounds:   TypeAnnotation*[];
+    resolved: TypeRef;
+    span:     SourceSpan;
 }
 
 /// A generic type parameter declaration (e.g., `T: Default`).
