@@ -1,0 +1,129 @@
+///! Pattern guard clauses: `pattern if (cond) => body`.
+///!
+///! A guard is checked after the pattern matches; a false guard falls
+///! through to the next arm. Covers: top-level binding guards with
+///! fall-through, expression-match guards, enum-payload guards,
+///! OR-pattern guards, guards calling a method on the binding, and a
+///! plain top-level identifier binding (which also exercises the
+///! identifier-binding codegen path the guard work fixed).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::PatternGuards;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type enum Opt : i32 { None; Some(i32); }
+
+type struct Cell { v: i32; }
+implement Cell {
+    big(&this) -> boolean { return this.v > 10; }
+}
+
+// Several guarded arms over the same binding fall through in order.
+function classify(n: i32) -> i32 {
+    match (n) {
+        x if (x > 100) => { return 3; }
+        x if (x > 10)  => { return 2; }
+        x if (x > 0)   => { return 1; }
+        _              => { return 0; }
+    }
+    return -1;
+}
+
+// Guard in expression-match position.
+function label(n: i32) -> i32 {
+    return match (n) {
+        x if (x < 0) => { -1 }
+        0            => { 0 }
+        _            => { 1 }
+    };
+}
+
+// Guard over an enum payload binding.
+function payload(o: Opt) -> i32 {
+    match (o) {
+        Opt::Some(v) if (v > 5) => { return v * 10; }
+        Opt::Some(v)            => { return v; }
+        Opt::None               => { return -1; }
+    }
+    return -99;
+}
+
+// A guard shared across an OR-pattern.
+function orguard(n: i32) -> i32 {
+    match (n) {
+        1 | 2 | 3 if (n != 2) => { return 100; }
+        _                     => { return 0; }
+    }
+    return -1;
+}
+
+// Guard calls a method on the bound value.
+function method_guard(c: Cell) -> i32 {
+    match (c) {
+        x if (x.big()) => { return 1; }
+        _              => { return 0; }
+    }
+    return -1;
+}
+
+// Plain top-level identifier binding (no guard): binds and yields the
+// subject. Exercises the identifier-binding codegen path.
+function bind_only(n: i32) -> i32 {
+    match (n) {
+        5 => { return 50; }
+        x => { return x + 1000; }
+    }
+    return -1;
+}
+
+![test]
+function guarded_binding_fall_through() -> Result<(), TestError> {
+    match (expect_eq(classify(200), 3)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(50), 2))  { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(5), 1))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(-1), 0))  { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function guarded_expression_match() -> Result<(), TestError> {
+    match (expect_eq(label(-7), -1)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(label(0), 0))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(label(9), 1))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function guarded_enum_payload() -> Result<(), TestError> {
+    match (expect_eq(payload(Opt::Some(8)), 80)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(payload(Opt::Some(3)), 3))  { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(payload(Opt::None), -1))    { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function guarded_or_pattern() -> Result<(), TestError> {
+    match (expect_eq(orguard(1), 100)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(orguard(2), 0))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(orguard(3), 100)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function guard_calls_method() -> Result<(), TestError> {
+    const big: Cell = Cell { v: 20 };
+    const small: Cell = Cell { v: 5 };
+    match (expect_eq(method_guard(big), 1))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(method_guard(small), 0)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function top_level_identifier_binding() -> Result<(), TestError> {
+    match (expect_eq(bind_only(5), 50))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(bind_only(7), 1007)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}

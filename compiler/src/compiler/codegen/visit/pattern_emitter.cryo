@@ -270,6 +270,43 @@ type struct PatternEmitter {
         }
     }
 
+    /// Materialize a top-level bare-identifier binding (`x => ...` /
+    /// `x if (cond) => ...`), which binds the whole subject to a name. The
+    /// binding is registered as a pointer-to-storage so `codegen_rvalue`
+    /// loads through it like any local. `minfo.subject_ptr` is already a
+    /// pointer for ADT enums (and reference/pointer subjects); for a scalar
+    /// or simple-enum subject it is the SSA value, so we spill it to a fresh
+    /// alloca first. Called in both the arm body and the guard block so each
+    /// sees the binding. No-op for wildcard / enum / literal patterns.
+    bind_arm_value_bindings(mut &this, arm: MatchArmNode*,
+                            minfo: MatchSubjectInfo) -> void {
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: PatternNode* = arm.patterns[p];
+            if (pat == null || pat.pattern_kind != PatternKind::Identifier) {
+                continue;
+            }
+            if (!pat.binding_name.is_valid()) { continue; }
+            if (!minfo.subject_ptr.is_valid()) { continue; }
+
+            // Already an addressable slot (e.g. an ADT enum's alloca/ptr): bind
+            // directly. Otherwise spill the value into a fresh slot of the
+            // subject's type.
+            mut slot: LValue = minfo.subject_ptr;
+            const sp_ty: void* = llvm::LLVMTypeOf(minfo.subject_ptr.raw);
+            const is_ptr: boolean = sp_ty != null
+                && type_kind_of(sp_ty) == LTypeKind::Pointer;
+            if (!is_ptr) {
+                const vty: LType = this.cg.type_mapper.map_type(minfo.subject_ty);
+                if (!vty.is_valid()) { continue; }
+                slot = this.cg.builder.build_alloca(vty, "match.bind");
+                if (!slot.is_valid()) { continue; }
+                this.cg.builder.build_store(minfo.subject_ptr, slot);
+            }
+            this.cg.values.set(pat.binding_name, slot);
+            return;
+        }
+    }
+
 
     // Per-arm comparison chain
 
@@ -307,16 +344,21 @@ type struct PatternEmitter {
                     format("%s.or", name_prefix));
             }
 
-            if (pat.pattern_kind == PatternKind::Wildcard) {
-                // Wildcard matches unconditionally; branch straight to the
-                // arm body; any later OR alternatives are unreachable.
+            if (pat.pattern_kind == PatternKind::Wildcard
+                || pat.pattern_kind == PatternKind::Identifier) {
+                // Wildcard and bare-identifier bindings match unconditionally
+                // (an identifier binds the whole subject, like `_` but named);
+                // branch straight to the arm body. Any later OR alternatives
+                // are unreachable. The binding itself is materialized by
+                // `bind_arm_value_bindings` in the arm/guard block. Cryo enum
+                // variants are always written `Enum::Variant`, so a bare
+                // identifier is never a variant reference.
                 this.cg.builder.build_br(arm_bb);
                 return;
             }
 
             mut cmp: LValue = LValue::null();
-            if (pat.pattern_kind == PatternKind::Literal
-                || pat.pattern_kind == PatternKind::Identifier) {
+            if (pat.pattern_kind == PatternKind::Literal) {
                 // For string subjects, build the pattern as a global string
                 // pointer and compare via strcmp; `codegen_pattern_value`
                 // lowers every literal to an i32 and would compare pointer

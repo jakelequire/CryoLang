@@ -1525,9 +1525,11 @@ public:
     match_is_exhaustive(&this, subject: ExpressionNode*,
                          arms: &MatchArmNode*[]) -> boolean {
         // Pass 1: any wildcard / identifier-binding arm short-circuits.
+        // A guarded arm is conditional and never an unconditional catch-all.
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null) { continue; }
+            if (arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
                 if (pat == null) { continue; }
@@ -1547,6 +1549,7 @@ public:
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null) { continue; }
+            if (arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
                 if (pat == null) { continue; }
@@ -2659,6 +2662,12 @@ public:
 
             const save: i64 = this.save_scope();
             this.bind_arm_patterns(arm, subject_type);
+            // The guard is resolved with the arm's bindings in scope so it can
+            // reference them (`x if (x > 0)`). Resolve before the body so its
+            // generic calls / literals are type-checked like any condition.
+            if (arm.guard != null) {
+                this.resolve_expr(arm.guard);
+            }
             if (arm.body != null) {
                 this.dispatch_stmt(arm.body);
             }
@@ -2679,6 +2688,9 @@ public:
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null) { continue; }
+            // A guarded `_ if (..)` is conditional, not the literal default;
+            // several may legitimately precede one unconditional `_`.
+            if (arm.guard != null) { continue; }
             mut is_default: boolean = false;
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
@@ -2776,6 +2788,11 @@ public:
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null) { continue; }
+            // A guarded arm matches conditionally, so it never guarantees
+            // coverage of a variant (or acts as a catch-all). Exclude its
+            // patterns entirely; a guarded `_ if (..)` still leaves the
+            // match non-exhaustive and requires a later unconditional arm.
+            if (arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
                 if (pat == null) { continue; }
@@ -8747,6 +8764,12 @@ public:
 
             const save: i64 = this.save_scope();
             this.bind_arm_patterns(arm, subject_type);
+
+            // Guard (`if (cond)`) resolved with bindings in scope, before the
+            // arm body; mirrors the statement-match path.
+            if (arm.guard != null) {
+                this.resolve_expr(arm.guard);
+            }
 
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
