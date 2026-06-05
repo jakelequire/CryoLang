@@ -187,86 +187,127 @@ type struct PatternEmitter {
             const epat: EnumPatternNode* = pat as EnumPatternNode*;
             if (!epat.has_bindings()) { continue; }
 
-            const variant: EnumVariantInfo* = minfo.enum_type.get_variant(epat.variant_name);
-            if (variant == null || !variant.has_payload()) { continue; }
-
-            // Simple enum (no payload on any variant) -> nothing to bind.
-            if (minfo.enum_type.is_simple_enum()) { continue; }
-
-            // GEP to payload field (field 1 of { i32 tag, [N x i8] payload }).
-            const payload_ptr: LValue = this.cg.builder.build_struct_gep(
-                minfo.enum_llvm, minfo.subject_ptr, 1, "enum.payload.ptr");
-            if (!payload_ptr.is_valid()) { continue; }
-
-            // Precompute payload field offsets using the SAME field alignment
-            // rules as compute_enum_layout (type_map) and the construction side
-            // (EnumVariantEmitter): align_up the running offset to each field's
-            // alignment before recording it. A naive packed running sum would
-            // bind e.g. a `u64` after a `u8` at byte +1, reading it with a
-            // false `align 8` off an odd address (UB / strict-align fault).
-            const num_payload: i64 = variant.payload_types.length;
-            mut offsets: u64[] = [];
-            mut running: u64 = 0;
-            for (mut pi: i64 = 0; pi < num_payload; pi++) {
-                mut ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[pi].id);
-                // Follow an InstantiatedType wrapper (reports size/align 0) to
-                // its concrete spec'd struct, as type_map does.
-                if (ft != null && ft.kind == TypeKind::InstantiatedType) {
-                    const inst: InstantiatedType* = ft as InstantiatedType*;
-                    if (inst.has_resolved_type()) {
-                        const r: Type* = this.cg.lookup_type_by_id(inst.resolved_type.id);
-                        if (r != null) { ft = r; }
-                    }
-                }
-                if (ft != null) {
-                    const fa: u64 = ft.alignment();
-                    if (fa > 0) {
-                        const rem: u64 = running % fa;
-                        if (rem != 0) { running += (fa - rem); }
-                    }
-                }
-                offsets.push(running);
-                if (ft != null) {
-                    running += ft.size_bytes();
-                }
-            }
-
-            for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
-                const pb: PatternBinding* = epat.binding_at(pos);
-                if (pb == null) { continue; }
-                if (pos >= num_payload) { continue; }
-
-                const field_ref: TypeRef = variant.payload_types[pos];
-                const field_llvm: LType = this.cg.type_mapper.map_type(field_ref);
-                if (!field_llvm.is_valid()) { continue; }
-                if (type_kind_of(field_llvm.raw) == LTypeKind::Void) { continue; }
-
-                // field_ptr = payload_ptr + offsets[pos] (byte offset via i8 GEP).
-                mut field_ptr_raw: LValue = payload_ptr;
-                if (offsets[pos] != 0) {
-                    const byte_off: LValue = LType::const_int(
-                        LType::i64(), offsets[pos], false);
-                    const obuf: void* = intrinsics::malloc(8);
-                    const obuf_arr: void** = obuf as void**;
-                    obuf_arr[0] = byte_off.raw;
-                    field_ptr_raw = this.cg.builder.build_gep(
-                        LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
-                    intrinsics::free(obuf);
-                }
-                const field_ptr: LValue = this.cg.builder.build_bitcast(
-                    field_ptr_raw, LType::pointer_to(field_llvm), "enum.field.cast");
-
-                // Register the ptr-to-payload as a named lvalue.  Reads through
-                // the binding will load via `codegen_rvalue` using the
-                // identifier's resolved_type.
-                if (field_ptr.is_valid()) {
-                    this.cg.values.set(pb.name, field_ptr);
-                }
-            }
+            this.bind_enum_payloads_rec(epat, minfo.enum_type, minfo.enum_llvm,
+                                        minfo.subject_ptr);
 
             // Only bind for the first enum pattern in this arm (multi-pattern
             // arms with different variants can't share bindings anyway).
             return;
+        }
+    }
+
+    /// Compute the byte offset of each payload field of `variant`, applying
+    /// the SAME align-up rules as compute_enum_layout (type_map) and the
+    /// construction side (EnumVariantEmitter). A naive packed running sum
+    /// would bind e.g. a `u64` after a `u8` at byte +1, reading it with a
+    /// false `align 8` off an odd address (UB / strict-align fault).
+    payload_field_offsets(mut &this, variant: EnumVariantInfo*) -> u64[] {
+        mut offsets: u64[] = [];
+        mut running: u64 = 0;
+        for (mut pi: i64 = 0; pi < variant.payload_types.length; pi++) {
+            mut ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[pi].id);
+            // Follow an InstantiatedType wrapper (reports size/align 0) to its
+            // concrete spec'd struct, as type_map does.
+            if (ft != null && ft.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = ft as InstantiatedType*;
+                if (inst.has_resolved_type()) {
+                    const r: Type* = this.cg.lookup_type_by_id(inst.resolved_type.id);
+                    if (r != null) { ft = r; }
+                }
+            }
+            if (ft != null) {
+                const fa: u64 = ft.alignment();
+                if (fa > 0) {
+                    const rem: u64 = running % fa;
+                    if (rem != 0) { running += (fa - rem); }
+                }
+            }
+            offsets.push(running);
+            if (ft != null) {
+                running += ft.size_bytes();
+            }
+        }
+        return offsets;
+    }
+
+    /// Pointer to payload field `pos` of an ADT enum at `subject_ptr`
+    /// (LLVM type `enum_llvm`), bitcast to `field_llvm*`. Null on failure.
+    payload_field_ptr(mut &this, enum_llvm: LType, subject_ptr: LValue,
+                      offsets: &u64[], pos: i64, field_llvm: LType) -> LValue {
+        const payload_ptr: LValue = this.cg.builder.build_struct_gep(
+            enum_llvm, subject_ptr, 1, "enum.payload.ptr");
+        if (!payload_ptr.is_valid()) { return LValue::null(); }
+        mut field_ptr_raw: LValue = payload_ptr;
+        if (offsets[pos] != 0) {
+            const byte_off: LValue = LType::const_int(LType::i64(), offsets[pos], false);
+            const obuf: void* = intrinsics::malloc(8);
+            const obuf_arr: void** = obuf as void**;
+            obuf_arr[0] = byte_off.raw;
+            field_ptr_raw = this.cg.builder.build_gep(
+                LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
+            intrinsics::free(obuf);
+        }
+        return this.cg.builder.build_bitcast(
+            field_ptr_raw, LType::pointer_to(field_llvm), "enum.field.cast");
+    }
+
+    /// Unwrap a payload TypeRef to its concrete `EnumType*`, or null when it
+    /// is not an enum. Follows InstantiatedType to its resolved spec.
+    payload_enum_type(mut &this, ty: TypeRef) -> EnumType* {
+        mut t: Type* = this.cg.lookup_type_by_id(ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                t = this.cg.lookup_type_by_id(inst.resolved_type.id);
+            }
+        }
+        if (t != null && t.kind == TypeKind::Enum) { return t as EnumType*; }
+        return null;
+    }
+
+    /// Recursively bind an enum pattern's payload elements to named lvalues,
+    /// descending through nested sub-patterns (`Some(Some(n))`). `subject_ptr`
+    /// points to a value of `enum_type` (LLVM type `enum_llvm`). Reads through
+    /// each registered binding load via `codegen_rvalue` using the binding's
+    /// resolved_type.
+    bind_enum_payloads_rec(mut &this, epat: EnumPatternNode*, enum_type: EnumType*,
+                           enum_llvm: LType, subject_ptr: LValue) -> void {
+        if (enum_type == null || !subject_ptr.is_valid() || !enum_llvm.is_valid()) {
+            return;
+        }
+        const variant: EnumVariantInfo* = enum_type.get_variant(epat.variant_name);
+        if (variant == null || !variant.has_payload()) { return; }
+        if (enum_type.is_simple_enum()) { return; }
+
+        const num_payload: i64 = variant.payload_types.length;
+        const offsets: u64[] = this.payload_field_offsets(variant);
+
+        for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
+            if (pos >= num_payload) { continue; }
+            const pb: PatternBinding* = epat.binding_at(pos);
+            const sub: PatternNode* = epat.sub_at(pos);
+            if (pb == null && sub == null) { continue; }
+
+            const field_ref: TypeRef = variant.payload_types[pos];
+            const field_llvm: LType = this.cg.type_mapper.map_type(field_ref);
+            if (!field_llvm.is_valid()) { continue; }
+            if (type_kind_of(field_llvm.raw) == LTypeKind::Void) { continue; }
+
+            const field_ptr: LValue = this.payload_field_ptr(
+                enum_llvm, subject_ptr, &offsets, pos, field_llvm);
+            if (!field_ptr.is_valid()) { continue; }
+
+            if (pb != null) {
+                this.cg.values.set(pb.name, field_ptr);
+            } else if (sub != null && sub.pattern_kind == PatternKind::Enum) {
+                // Nested enum sub-pattern: recurse using the payload field as
+                // the new subject pointer and its concrete enum type.
+                const nested_ty: EnumType* = this.payload_enum_type(field_ref);
+                if (nested_ty != null) {
+                    this.bind_enum_payloads_rec(sub as EnumPatternNode*, nested_ty,
+                                                field_llvm, field_ptr);
+                }
+            }
         }
     }
 
@@ -358,6 +399,11 @@ type struct PatternEmitter {
             }
 
             mut cmp: LValue = LValue::null();
+            // Set when the pattern emits its own complete test (terminating the
+            // block via its own branches), so the generic cond_br below is
+            // skipped. Used by enum patterns with payload tests (literal
+            // payloads / nested sub-patterns).
+            mut handled: boolean = false;
             if (pat.pattern_kind == PatternKind::Literal) {
                 // For string subjects, build the pattern as a global string
                 // pointer and compare via strcmp; `codegen_pattern_value`
@@ -388,9 +434,19 @@ type struct PatternEmitter {
                 cmp = this.codegen_range_compare(pat, minfo.subject_ty,
                                                  subject, name_prefix);
             } else if (pat.pattern_kind == PatternKind::Enum) {
-                // Enum pattern: compare the subject's tag to the variant tag.
-                if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
-                    const epat: EnumPatternNode* = pat as EnumPatternNode*;
+                const epat: EnumPatternNode* = pat as EnumPatternNode*;
+                if (minfo.enum_type != null
+                        && this.enum_pattern_needs_payload_test(epat)) {
+                    // Payload literals (`Some(5)`) or nested sub-patterns
+                    // (`Some(Some(n))`) need value/tag checks beyond the outer
+                    // tag. Emit the full recursive test, which terminates the
+                    // block by branching to arm_bb (full match) / miss_bb.
+                    this.emit_enum_pattern_test(epat, minfo.enum_type,
+                        minfo.enum_llvm, minfo.subject_ptr, arm_bb, miss_bb,
+                        current_fn, name_prefix);
+                    handled = true;
+                } else if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
+                    // Tag-only check (bindings/wildcards in payload need no test).
                     const variant: EnumVariantInfo* =
                         minfo.enum_type.get_variant(epat.variant_name);
                     if (variant != null) {
@@ -407,7 +463,9 @@ type struct PatternEmitter {
                 }
             }
 
-            if (cmp.is_valid()) {
+            if (handled) {
+                // The pattern emitted its own terminating branches.
+            } else if (cmp.is_valid()) {
                 this.cg.builder.build_cond_br(cmp, arm_bb, miss_bb);
             } else {
                 // Pattern produced no comparison (a codegen gap); treat it
@@ -430,6 +488,132 @@ type struct PatternEmitter {
         const tail: LBasicBlock = this.cg.builder.get_insert_block();
         if (tail.is_valid() && !tail.has_terminator()) {
             this.cg.builder.build_br(next_bb);
+        }
+    }
+
+    /// True when an enum pattern's payload requires a value/tag check beyond
+    /// the outer variant tag: a literal payload (`Some(5)`) or a nested
+    /// sub-pattern (`Some(Some(n))`). Bindings and wildcards need no test.
+    enum_pattern_needs_payload_test(mut &this, epat: EnumPatternNode*) -> boolean {
+        for (mut i: i64 = 0; i < epat.elements.length; i++) {
+            const need: boolean = match (epat.elements[i]) {
+                PatternElement::LiteralInt(_)    => { true }
+                PatternElement::LiteralFloat(_)  => { true }
+                PatternElement::Sub(_)           => { true }
+                _                                => { false }
+            };
+            if (need) { return true; }
+        }
+        return false;
+    }
+
+    /// Emit the full match test for an enum pattern against a value of
+    /// `enum_type` (LLVM type `enum_llvm`) at `subject_ptr`: check the variant
+    /// tag, then each literal-payload value and nested sub-pattern. On a full
+    /// match branch to `match_bb`; on any mismatch branch to `miss_bb`.
+    /// Recurses for nested enum sub-patterns, so `Some(Some(5))` checks all
+    /// levels. Only invoked for ADT enums (those with payloads), so
+    /// `subject_ptr` is a real pointer.
+    emit_enum_pattern_test(mut &this, epat: EnumPatternNode*, enum_type: EnumType*,
+                           enum_llvm: LType, subject_ptr: LValue,
+                           match_bb: LBasicBlock, miss_bb: LBasicBlock,
+                           current_fn: LValue, name_prefix: string) -> void {
+        const variant: EnumVariantInfo* = enum_type.get_variant(epat.variant_name);
+        if (variant == null || !subject_ptr.is_valid() || !enum_llvm.is_valid()) {
+            this.cg.builder.build_br(miss_bb);
+            return;
+        }
+
+        // Load the discriminant: a simple enum's value IS the tag; an ADT
+        // enum keeps it in struct field 0.
+        const tag_ty: LType = this.cg.type_mapper.enum_tag_ltype(enum_type);
+        mut tag: LValue = LValue::null();
+        if (enum_type.is_simple_enum()) {
+            tag = this.cg.builder.build_load(tag_ty, subject_ptr, "enum.tag");
+        } else {
+            const tag_ptr: LValue = this.cg.builder.build_struct_gep(
+                enum_llvm, subject_ptr, 0, "enum.tag.ptr");
+            if (!tag_ptr.is_valid()) { this.cg.builder.build_br(miss_bb); return; }
+            tag = this.cg.builder.build_load(tag_ty, tag_ptr, "enum.tag");
+        }
+        const tag_const: LValue = LType::const_int(tag_ty, variant.tag_value, false);
+        const tagcmp: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ,
+            tag, tag_const, format("%s.tag", name_prefix));
+
+        // Collect payload positions that need a check (literal value / sub).
+        const num_payload: i64 = variant.payload_types.length;
+        mut checks: i64[] = [];
+        for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
+            if (pos >= num_payload) { continue; }
+            const needs: boolean = match (epat.elements[pos]) {
+                PatternElement::LiteralInt(_)   => { true }
+                PatternElement::LiteralFloat(_) => { true }
+                PatternElement::Sub(_)          => { true }
+                _                               => { false }
+            };
+            if (needs) { checks.push(pos); }
+        }
+
+        if (checks.length == 0) {
+            this.cg.builder.build_cond_br(tagcmp, match_bb, miss_bb);
+            return;
+        }
+
+        // Tag must match before inspecting the payload.
+        const tagok: LBasicBlock = LBasicBlock::append(current_fn,
+            format("%s.tagok", name_prefix));
+        this.cg.builder.build_cond_br(tagcmp, tagok, miss_bb);
+        this.cg.builder.position_at_end(tagok);
+
+        const offsets: u64[] = this.payload_field_offsets(variant);
+        for (mut ci: i64 = 0; ci < checks.length; ci++) {
+            const pos: i64 = checks[ci];
+            const is_last: boolean = (ci + 1 >= checks.length);
+            const success_bb: LBasicBlock = if (is_last) {
+                match_bb
+            } else {
+                LBasicBlock::append(current_fn, format("%s.pchk", name_prefix))
+            };
+
+            const field_ref: TypeRef = variant.payload_types[pos];
+            const field_llvm: LType = this.cg.type_mapper.map_type(field_ref);
+            const field_ptr: LValue = this.payload_field_ptr(
+                enum_llvm, subject_ptr, &offsets, pos, field_llvm);
+            if (!field_ptr.is_valid()) { this.cg.builder.build_br(miss_bb); return; }
+
+            match (epat.elements[pos]) {
+                PatternElement::LiteralInt(pli) => {
+                    const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, "pat.fld");
+                    const cst: LValue = LType::const_int(field_llvm, pli.value as u64, false);
+                    const c: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ, lv, cst, "pat.eq");
+                    this.cg.builder.build_cond_br(c, success_bb, miss_bb);
+                }
+                PatternElement::LiteralFloat(plf) => {
+                    const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, "pat.fld");
+                    const cst: LValue = LType::const_real(field_llvm, plf.value);
+                    const c: LValue = this.cg.builder.build_fcmp(LRealPredicate::OEQ, lv, cst, "pat.feq");
+                    this.cg.builder.build_cond_br(c, success_bb, miss_bb);
+                }
+                PatternElement::Sub(ps) => {
+                    const sub: PatternNode* = ps.pattern as PatternNode*;
+                    const nested_ty: EnumType* = if (sub != null
+                            && sub.pattern_kind == PatternKind::Enum) {
+                        this.payload_enum_type(field_ref)
+                    } else { null };
+                    if (nested_ty != null) {
+                        this.emit_enum_pattern_test(sub as EnumPatternNode*,
+                            nested_ty, field_llvm, field_ptr, success_bb, miss_bb,
+                            current_fn, name_prefix);
+                    } else {
+                        this.cg.builder.build_br(success_bb);
+                    }
+                }
+                _ => { this.cg.builder.build_br(success_bb); }
+            }
+
+            if (!is_last) {
+                this.cg.builder.position_at_end(success_bb);
+            }
         }
     }
 

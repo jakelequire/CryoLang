@@ -264,7 +264,10 @@ Pattern            ::= "_"
                                                              same kind: char or
                                                              integer literal *)
 RangeBound         ::= CharLit | "-"? IntLit
-PatElem            ::= "_" | Ident | Literal | "mut" Ident
+(* A PatElem may itself be a (qualified) enum pattern, giving nested
+   destructuring: `Some(Some(n))`, `Branch(Leaf(x), r)`.                 *)
+PatElem            ::= "_" | "mut"? Ident | Literal
+                     | QualName ("(" PatElem ("," PatElem)* ")")?  (* nested *)
 
 
 (*  Types & Literals =========================================== *)

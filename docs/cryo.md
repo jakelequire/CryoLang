@@ -2219,7 +2219,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
-| Nested patterns | Patterns currently destructure one level deep; nested destructuring is not implemented. |
 | Tuple literals `[a, b]` + `.N` access | The tuple *type* `[T, U]` is accepted in type position, but a `[a, b]` literal parses as an array and `.N` element access is not lowered, so constructing or reading a tuple value does not compile (`E0200`). See [§ 2.6](#26-tuple-types). |
 | Struct field defaults (`field: T = expr`) | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
