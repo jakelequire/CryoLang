@@ -1022,14 +1022,32 @@ type struct DropInserter {
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
             const pat: PatternNode* = arm.patterns[p];
             if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
-            const epat: EnumPatternNode* = pat as EnumPatternNode*;
-            for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
-                const pb: PatternBinding* = epat.binding_at(pos);
-                if (pb == null || !pb.name.is_valid()) { continue; }
+            count = count + this.register_enum_pattern_bindings(
+                pat as EnumPatternNode*, proxy_ty, subject_id);
+        }
+        return count;
+    }
+
+    /// Register an enum pattern's payload bindings (direct and nested) for
+    /// consumption detection. Recurses into sub-patterns so a consumed
+    /// nested binding (`Wrap(Inner(s))` then `s.drop()`) still suppresses the
+    /// subject's drop glue and avoids a double-free.
+    register_enum_pattern_bindings(mut &this, epat: EnumPatternNode*,
+                                   proxy_ty: TypeRef, subject_id: u32) -> i64 {
+        mut count: i64 = 0;
+        for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
+            const pb: PatternBinding* = epat.binding_at(pos);
+            if (pb != null && pb.name.is_valid()) {
                 this.register_param_type(pb.name, proxy_ty);
                 this.link_payload.push(pb.name.id);
                 this.link_subject.push(subject_id);
                 count = count + 1;
+                continue;
+            }
+            const sub: PatternNode* = epat.sub_at(pos);
+            if (sub != null && sub.pattern_kind == PatternKind::Enum) {
+                count = count + this.register_enum_pattern_bindings(
+                    sub as EnumPatternNode*, proxy_ty, subject_id);
             }
         }
         return count;

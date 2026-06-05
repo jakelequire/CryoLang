@@ -2598,8 +2598,6 @@ type struct Monomorphizer {
                 }
             }
             for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
-                const pb: PatternBinding* = enum_pat.binding_at(j);
-                if (pb == null) { continue; }
                 mut bind_t: TypeRef = TypeRef::invalid();
                 if (j < payload_types.length && payload_types[j].is_valid()) {
                     bind_t = payload_types[j];
@@ -2607,9 +2605,71 @@ type struct Monomorphizer {
                     bind_t = subject_type;
                 }
                 if (!bind_t.is_valid()) { continue; }
+                const pb: PatternBinding* = enum_pat.binding_at(j);
+                if (pb != null) {
+                    this.scope_names.push(pb.name);
+                    this.scope_types.push(bind_t);
+                    added += 1;
+                    continue;
+                }
+                // Nested sub-pattern: recurse so its bindings are in scope for
+                // generic-call discovery in the arm body.
+                const sub: PatternNode* = enum_pat.sub_at(j);
+                if (sub != null) {
+                    added += this.push_subpattern_bindings_mono(sub, bind_t);
+                }
+            }
+        }
+        return added;
+    }
+
+    /// Recursive companion of `push_arm_bindings_to_scope` for nested
+    /// sub-patterns: pushes the names introduced by `pat` (matched against a
+    /// value of `value_type`) onto the walker's scope stack. Returns the count
+    /// pushed.
+    push_subpattern_bindings_mono(mut &this, pat: PatternNode*,
+                                  value_type: TypeRef) -> i64 {
+        if (pat == null || !value_type.is_valid()) { return 0; }
+        if (pat.pattern_kind == PatternKind::Identifier) {
+            this.scope_names.push(pat.binding_name);
+            this.scope_types.push(value_type);
+            return 1;
+        }
+        if (pat.pattern_kind != PatternKind::Enum) { return 0; }
+        const enum_pat: EnumPatternNode* = pat as EnumPatternNode*;
+        mut t: Type* = this.arena.lookup(value_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5 && t.kind != TypeKind::Enum) {
+            if (t.kind == TypeKind::Pointer) {
+                t = this.arena.lookup((t as PointerType*).pointee.id);
+            } else if (t.kind == TypeKind::Reference) {
+                t = this.arena.lookup((t as ReferenceType*).referent.id);
+            } else if (t.kind == TypeKind::InstantiatedType
+                    && (t as InstantiatedType*).has_resolved_type()) {
+                t = this.arena.lookup((t as InstantiatedType*).resolved_type.id);
+            } else { break; }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::Enum) { return 0; }
+        const variant: EnumVariantInfo* =
+            (t as EnumType*).get_variant(enum_pat.variant_name);
+        if (variant == null) { return 0; }
+        mut added: i64 = 0;
+        for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
+            mut elem_t: TypeRef = value_type;
+            if (j < variant.payload_types.length && variant.payload_types[j].is_valid()) {
+                elem_t = variant.payload_types[j];
+            }
+            const pb: PatternBinding* = enum_pat.binding_at(j);
+            if (pb != null) {
                 this.scope_names.push(pb.name);
-                this.scope_types.push(bind_t);
+                this.scope_types.push(elem_t);
                 added += 1;
+                continue;
+            }
+            const sub: PatternNode* = enum_pat.sub_at(j);
+            if (sub != null) {
+                added += this.push_subpattern_bindings_mono(sub, elem_t);
             }
         }
         return added;

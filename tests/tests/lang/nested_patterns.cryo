@@ -1,0 +1,75 @@
+///! Nested patterns in `match`: an enum payload element may itself be a
+///! pattern (`Some(Some(n))`, `Branch(Leaf(x), r)`). Covers nested variant
+///! discrimination, nested literals, nested bindings, deep nesting, nesting
+///! over a generic enum, exhaustiveness via nested coverage, and the
+///! literal-payload discrimination this work also fixed (`Some(5)` must not
+///! match every `Some`).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::NestedPatterns;
+
+import std::core::result;
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+type enum Inner : i32 { A; B(i32); }
+type enum Outer : i32 { None; Wrap(Inner); Pair(Inner, i32); }
+
+// Nested variant + nested literal + nested binding + sibling binding.
+// Exhaustive via nesting: Wrap is covered by A + B(n); Pair by an
+// irrefutable arm.
+function classify(o: Outer) -> i32 {
+    return match (o) {
+        Outer::Wrap(Inner::A)    => { 1 }
+        Outer::Wrap(Inner::B(5)) => { 2 }
+        Outer::Wrap(Inner::B(n)) => { 100 + n }
+        Outer::Pair(i, k)        => { 1000 + k }
+        Outer::None              => { -1 }
+    };
+}
+
+// Literal payload discrimination: `Som(5)` must match only Som(5).
+type enum Opt : i32 { Non; Som(i32); }
+function pick(o: Opt) -> i32 {
+    return match (o) {
+        Opt::Som(5) => { 500 }
+        Opt::Som(v) => { v }
+        Opt::Non    => { -1 }
+    };
+}
+
+// Nesting over a generic enum.
+function flatten(oo: Option<Option<i32>>) -> i32 {
+    return match (oo) {
+        Option::Some(Option::Some(n)) => { n }
+        Option::Some(Option::None)    => { -2 }
+        Option::None                  => { -1 }
+    };
+}
+
+![test]
+function nested_variant_literal_binding() -> Result<(), TestError> {
+    match (expect_eq(classify(Outer::Wrap(Inner::A)), 1))      { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(Outer::Wrap(Inner::B(5))), 2))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(Outer::Wrap(Inner::B(7))), 107)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(Outer::Pair(Inner::A, 3)), 1003)){ Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(classify(Outer::None), -1))               { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function literal_payload_discriminates() -> Result<(), TestError> {
+    match (expect_eq(pick(Opt::Som(5)), 500)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(pick(Opt::Som(7)), 7))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(pick(Opt::Non), -1))     { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function nested_over_generic_enum() -> Result<(), TestError> {
+    match (expect_eq(flatten(Option::Some(Option::Some(42))), 42)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(flatten(Option::Some(Option::None)), -2))     { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(flatten(Option::None), -1))                   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}

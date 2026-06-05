@@ -1001,96 +1001,112 @@ public:
             }
 
             if (pat.pattern_kind != PatternKind::Enum) { continue; }
+            // Recurse so nested sub-patterns (`Some(Some(n))`) bind their
+            // names against the right payload types, level by level.
+            this.bind_enum_pattern(pat as EnumPatternNode*, subject_type);
+        }
+    }
 
-            const enum_pat: EnumPatternNode* = pat as EnumPatternNode*;
+    /// Resolve the positional payload types of `enum_pat`'s variant against a
+    /// value of type `value_type`, applying generic substitution from the
+    /// value's instantiation. Factored out of `bind_arm_patterns` so both the
+    /// top-level and nested (sub-pattern) cases share identical resolution.
+    resolve_variant_payload_types(mut &this, value_type: TypeRef,
+                                  enum_pat: EnumPatternNode*) -> TypeRef[] {
+        mut payload_types: TypeRef[] = [];
+        mut enum_ty: Type* = this.unwrap_to_enum(value_type);
+        const peeled_inst: InstantiatedType* = this.peel_to_instantiation(value_type);
 
-            // Look up variant payload types from the enum's type info.
-            // Unwrap the subject type through references and instantiations
-            // to find the concrete EnumType with resolved payload types.
-            mut payload_types: TypeRef[] = [];
-            mut enum_ty: Type* = null;
+        // Fallback A: an InstantiatedType with no concrete enum yet -> use the
+        // generic base enum template directly.
+        if ((enum_ty == null || enum_ty.kind != TypeKind::Enum) && peeled_inst != null) {
+            const base_t: Type* = this.arena.lookup(peeled_inst.generic_base.id);
+            if (base_t != null && base_t.kind == TypeKind::Enum) {
+                enum_ty = base_t;
+            }
+        }
+        // Fallback B: look up by the pattern's enum name (non-generic enums
+        // where the pattern name matches the type name exactly).
+        if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
+            const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
+            if (enum_type_ref.is_valid()) {
+                enum_ty = this.unwrap_to_enum(enum_type_ref);
+            }
+        }
+        if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return payload_types; }
 
-            // Primary path: unwrap the subject type to find the concrete enum.
-            // This handles &Option_string -> Option_string, and
-            // InstantiatedType(Option, [string]) -> Option_string.
-            enum_ty = this.unwrap_to_enum(subject_type);
+        const et: EnumType* = enum_ty as EnumType*;
+        const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
+        if (variant == null) { return payload_types; }
+        payload_types = this.copy_type_refs(&variant.payload_types);
 
-            // Capture the instantiation (even if not yet monomorphized) so we
-            // can substitute generic params into payload_types below.
-            const peeled_inst: InstantiatedType* = this.peel_to_instantiation(subject_type);
-
-            // Fallback A: if we have an InstantiatedType but no concrete enum
-            // yet, use the generic base enum template directly.
-            if ((enum_ty == null || enum_ty.kind != TypeKind::Enum) && peeled_inst != null) {
-                const base_t: Type* = this.arena.lookup(peeled_inst.generic_base.id);
-                if (base_t != null && base_t.kind == TypeKind::Enum) {
-                    enum_ty = base_t;
+        // Substitute the template's generic params with the instantiation's
+        // type_args (e.g. `Result<T*, E>` payload `ptr` -> `T*`, not the raw
+        // GenericParam byte type).
+        const gr: GenericRegistry* = this.ctx.get_generic_registry();
+        if (peeled_inst != null && gr != null) {
+            const tmpl: TemplateEntry* = gr.get_template_by_type_id(
+                peeled_inst.generic_base.id);
+            if (tmpl != null &&
+                tmpl.param_type_ids.length == peeled_inst.type_args.length) {
+                mut subst: TypeSubstitution = TypeSubstitution::from_params(
+                    tmpl.param_type_ids, peeled_inst.type_args);
+                mut substituted: TypeRef[] = [];
+                for (mut k: i64 = 0; k < payload_types.length; k++) {
+                    substituted.push(subst.apply(payload_types[k], this.arena));
                 }
+                payload_types = substituted;
+            }
+        }
+        return payload_types;
+    }
+
+    /// Bind the names introduced by an enum pattern matched against a value of
+    /// `value_type`, recursing into nested sub-patterns. Each element is bound
+    /// against its positional payload type.
+    bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*,
+                      value_type: TypeRef) -> void {
+        const payload_types: TypeRef[] =
+            this.resolve_variant_payload_types(value_type, enum_pat);
+        for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
+            // Positional payload type, with the same defined-but-wrong
+            // fallbacks the flat path used (avoids "undefined variable"
+            // cascades when payload resolution fails).
+            mut elem_ty: TypeRef = this.arena.get_void();
+            if (j < payload_types.length && payload_types[j].is_valid()) {
+                elem_ty = payload_types[j];
+            } else if (value_type.is_valid()) {
+                elem_ty = value_type;
             }
 
-            // Fallback B: look up by pattern's enum name (works for non-generic
-            // enums where the pattern name matches the type name exactly).
-            if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
-                const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
-                if (enum_type_ref.is_valid()) {
-                    enum_ty = this.unwrap_to_enum(enum_type_ref);
-                }
-            }
-
-            if (enum_ty != null && enum_ty.kind == TypeKind::Enum) {
-                const et: EnumType* = enum_ty as EnumType*;
-                const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
-                if (variant != null) {
-                    payload_types = this.copy_type_refs(&variant.payload_types);
-
-                    // When the subject is a generic instantiation whose concrete
-                    // specialization hasn't been monomorphized yet (or when the
-                    // enum template we're looking at still carries GenericParam
-                    // payload types), substitute the template's generic params
-                    // with the instantiation's type_args so the binding resolves
-                    // to the correct concrete type.  Without this, methods like
-                    // `copied(this: Result<T*, E>)` bind `ptr` to GenericParam T
-                    // (mapped as the raw payload byte type) instead of T*.
-                    const gr: GenericRegistry* = this.ctx.get_generic_registry();
-                    if (peeled_inst != null && gr != null) {
-                        const tmpl: TemplateEntry* = gr.get_template_by_type_id(
-                            peeled_inst.generic_base.id);
-                        if (tmpl != null &&
-                            tmpl.param_type_ids.length == peeled_inst.type_args.length) {
-                            mut subst: TypeSubstitution = TypeSubstitution::from_params(
-                                tmpl.param_type_ids, peeled_inst.type_args);
-                            mut substituted: TypeRef[] = [];
-                            for (mut k: i64 = 0; k < payload_types.length; k++) {
-                                substituted.push(subst.apply(payload_types[k], this.arena));
-                            }
-                            payload_types = substituted;
-                        }
-                    }
-                }
-            }
-
-            // Register each binding. If variant payload types are available
-            // AND valid, use the positional type. Otherwise fall back to
-            // subject_type so the variable is at least defined (prevents
-            // cascading "undefined variable" errors).
-            for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
-                const pb: PatternBinding* = enum_pat.binding_at(j);
-                if (pb == null) { continue; }
-                // Remember this binding so a `return` that escapes a
-                // pointer/reference to it is caught (E0455).  The payload
-                // lives in a match temporary that dies at function return.
+            const pb: PatternBinding* = enum_pat.binding_at(j);
+            if (pb != null) {
+                // Remember this binding so a `return` escaping a ptr/ref to it
+                // is caught (E0455) - the payload dies with the match temp.
                 if (pb.name.is_valid()) { this.payload_binding_ids.push(pb.name.id); }
-                if (j < payload_types.length && payload_types[j].is_valid()) {
-                    this.register_local(pb.name, payload_types[j]);
-                } else if (subject_type.is_valid()) {
-                    this.register_local(pb.name, subject_type);
-                } else {
-                    // Last resort: register with a generic type to prevent
-                    // "undefined variable" cascading.  The type is wrong but
-                    // the variable is at least accessible.
-                    this.register_local(pb.name, this.arena.get_void());
-                }
+                this.register_local(pb.name, elem_ty);
+                continue;
             }
+            const sub: PatternNode* = enum_pat.sub_at(j);
+            if (sub != null) {
+                this.bind_subpattern(sub, elem_ty);
+            }
+        }
+    }
+
+    /// Bind names in an arbitrary nested pattern matched against `value_type`.
+    /// Only identifier bindings and nested enum patterns introduce names;
+    /// wildcards, literals, and ranges bind nothing.
+    bind_subpattern(mut &this, pat: PatternNode*, value_type: TypeRef) -> void {
+        if (pat == null) { return; }
+        if (pat.pattern_kind == PatternKind::Identifier) {
+            if (value_type.is_valid()) {
+                this.register_local(pat.binding_name, value_type);
+            }
+            return;
+        }
+        if (pat.pattern_kind == PatternKind::Enum) {
+            this.bind_enum_pattern(pat as EnumPatternNode*, value_type);
         }
     }
 
@@ -1522,52 +1538,23 @@ public:
     /// enum subjects without a wildcard, every variant must appear
     /// as an enum-pattern arm.  Non-enum subjects without a wildcard
     /// are never considered exhaustive (their value space is open).
-    match_is_exhaustive(&this, subject: ExpressionNode*,
+    match_is_exhaustive(mut &this, subject: ExpressionNode*,
                          arms: &MatchArmNode*[]) -> boolean {
-        // Pass 1: any wildcard / identifier-binding arm short-circuits.
-        // A guarded arm is conditional and never an unconditional catch-all.
-        for (mut i: i64 = 0; i < arms.length; i++) {
-            const arm: MatchArmNode* = arms[i];
-            if (arm == null) { continue; }
-            if (arm.guard != null) { continue; }
-            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
-                const pat: PatternNode* = arm.patterns[j];
-                if (pat == null) { continue; }
-                if (pat.pattern_kind == PatternKind::Wildcard
-                    || pat.pattern_kind == PatternKind::Identifier) {
-                    return true;
-                }
-            }
-        }
-        // Pass 2: enum-variant-by-variant check.
         if (subject == null) { return false; }
-        const enum_ty: Type* = this.unwrap_to_enum(subject.resolved_type);
-        if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return false; }
-        const et: EnumType* = enum_ty as EnumType*;
-        if (et.variants.length == 0) { return false; }
-        mut covered_ids: u32[] = [];
+        // Gather unguarded top-level patterns; guarded arms are conditional
+        // and never act as a catch-all. `patterns_cover` handles the
+        // wildcard/identifier short-circuit and per-variant coverage,
+        // recursing into nested sub-patterns.
+        mut top_pats: PatternNode*[] = [];
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
-            if (arm == null) { continue; }
-            if (arm.guard != null) { continue; }
+            if (arm == null || arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
-                if (pat == null) { continue; }
-                if (pat.pattern_kind == PatternKind::Enum) {
-                    const ep: EnumPatternNode* = pat as EnumPatternNode*;
-                    covered_ids.push(ep.variant_name.id);
-                }
+                if (pat != null) { top_pats.push(pat); }
             }
         }
-        for (mut i: i64 = 0; i < et.variants.length; i++) {
-            const vid: u32 = et.variants[i].name.id;
-            mut found: boolean = false;
-            for (mut k: i64 = 0; k < covered_ids.length; k++) {
-                if (covered_ids[k] == vid) { found = true; break; }
-            }
-            if (!found) { return false; }
-        }
-        return true;
+        return this.patterns_cover(&top_pats, subject.resolved_type, 0);
     }
 
     override visit(mut &this, node: StructDeclNode*) -> void {
@@ -2771,6 +2758,83 @@ public:
     /// subjects (literals, integers, structs etc.); those have an
     /// open universe of values, so exhaustiveness is structural rather
     /// than enumerable.
+    /// True when an enum arm's payload is irrefutable: no payload, or every
+    /// element is a binding/wildcard, so every value of the variant matches.
+    /// `None` / `Some(x)` / `Some(_)` are irrefutable; `Some(5)` /
+    /// `Some(Some(n))` narrow the payload and are not.
+    arm_payload_irrefutable(&this, epat: EnumPatternNode*) -> boolean {
+        for (mut i: i64 = 0; i < epat.elements.length; i++) {
+            const ok: boolean = match (epat.elements[i]) {
+                PatternElement::Binding(_)  => { true }
+                PatternElement::Wildcard(_) => { true }
+                _                           => { false }
+            };
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /// Do the alternative patterns `pats` exhaustively cover `value_type`?
+    /// Recurses into nested enum sub-patterns so `Wrap(Inner::A)` +
+    /// `Wrap(Inner::B(n))` counts as covering `Wrap`. Conservative for
+    /// non-enum slots (need a wildcard/binding) and for multi-payload-position
+    /// narrowing (needs an irrefutable arm or `_`). `depth` guards against
+    /// pathologically deep recursive types.
+    patterns_cover(mut &this, pats: &PatternNode*[], value_type: TypeRef,
+                   depth: i32) -> boolean {
+        if (depth > 16) { return false; }
+        for (mut i: i64 = 0; i < pats.length; i++) {
+            const p: PatternNode* = pats[i];
+            if (p == null) { continue; }
+            if (p.pattern_kind == PatternKind::Wildcard
+                    || p.pattern_kind == PatternKind::Identifier) {
+                return true;
+            }
+        }
+        const enum_ty: Type* = this.unwrap_to_enum(value_type);
+        if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return false; }
+        const et: EnumType* = enum_ty as EnumType*;
+        if (et.variants.length == 0) { return false; }
+        for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
+            const vname: SymbolStr = et.variants[vi].name;
+            mut v_arms: EnumPatternNode*[] = [];
+            for (mut i: i64 = 0; i < pats.length; i++) {
+                const p: PatternNode* = pats[i];
+                if (p != null && p.pattern_kind == PatternKind::Enum) {
+                    const ep: EnumPatternNode* = p as EnumPatternNode*;
+                    if (ep.variant_name.id == vname.id) { v_arms.push(ep); }
+                }
+            }
+            if (v_arms.length == 0) { return false; }
+            if (!this.variant_covered(&v_arms, value_type, depth)) { return false; }
+        }
+        return true;
+    }
+
+    /// Is a variant fully covered by the enum-pattern arms `v_arms` (all of
+    /// the same variant), against a value of `parent_value_type`?
+    variant_covered(mut &this, v_arms: &EnumPatternNode*[],
+                    parent_value_type: TypeRef, depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < v_arms.length; i++) {
+            if (this.arm_payload_irrefutable(v_arms[i])) { return true; }
+        }
+        // All arms narrow the payload. Only single-position narrowing is
+        // analysed: recurse on the position-0 sub-patterns.
+        const payload_types: TypeRef[] =
+            this.resolve_variant_payload_types(parent_value_type, v_arms[0]);
+        if (payload_types.length != 1) { return false; }
+        mut sub_alts: PatternNode*[] = [];
+        for (mut i: i64 = 0; i < v_arms.length; i++) {
+            const ep: EnumPatternNode* = v_arms[i];
+            if (ep.elements.length < 1) { continue; }
+            const sub: PatternNode* = ep.sub_at(0);
+            if (sub != null) { sub_alts.push(sub); }
+            // A literal element narrows to a single value and can't make an
+            // enum payload exhaustive, so it contributes nothing.
+        }
+        return this.patterns_cover(&sub_alts, payload_types[0], depth + 1);
+    }
+
     check_match_exhaustive(mut &this, subject: ExpressionNode*,
                             subject_type: TypeRef, arms: &MatchArmNode*[],
                             match_span: SourceSpan) -> void {
@@ -2780,45 +2844,45 @@ public:
         const et: EnumType* = enum_ty as EnumType*;
         if (et.variants.length == 0) { return; }
 
-        // Walk arms.  Any wildcard or bare-identifier pattern catches
-        // every remaining variant; collect the explicit variant names
-        // covered otherwise.
+        // Gather every unguarded top-level pattern. An unguarded wildcard /
+        // bare-identifier arm catches everything; guarded arms match
+        // conditionally and never act as a catch-all, so they are excluded.
+        mut top_pats: PatternNode*[] = [];
         mut has_wildcard: boolean = false;
-        mut covered_ids: u32[] = [];
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
-            if (arm == null) { continue; }
-            // A guarded arm matches conditionally, so it never guarantees
-            // coverage of a variant (or acts as a catch-all). Exclude its
-            // patterns entirely; a guarded `_ if (..)` still leaves the
-            // match non-exhaustive and requires a later unconditional arm.
-            if (arm.guard != null) { continue; }
+            if (arm == null || arm.guard != null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
                 if (pat == null) { continue; }
                 if (pat.pattern_kind == PatternKind::Wildcard
                     || pat.pattern_kind == PatternKind::Identifier) {
                     has_wildcard = true;
-                    break;
                 }
-                if (pat.pattern_kind == PatternKind::Enum) {
-                    const ep: EnumPatternNode* = pat as EnumPatternNode*;
-                    covered_ids.push(ep.variant_name.id);
-                }
+                top_pats.push(pat);
             }
-            if (has_wildcard) { break; }
         }
         if (has_wildcard) { return; }
 
-        // Find variants not in covered_ids.
+        // Per-variant coverage, recursing into nested sub-patterns so that
+        // e.g. `Wrap(Inner::A)` + `Wrap(Inner::B(n))` counts as covering
+        // `Wrap`. A variant with no arm, or whose narrowing arms don't
+        // collectively cover its payload, is reported missing.
         mut missing_names: SymbolStr[] = [];
         for (mut i: i64 = 0; i < et.variants.length; i++) {
             const vn: SymbolStr = et.variants[i].name;
-            mut covered: boolean = false;
-            for (mut k: i64 = 0; k < covered_ids.length; k++) {
-                if (covered_ids[k] == vn.id) { covered = true; break; }
+            mut v_arms: EnumPatternNode*[] = [];
+            for (mut k: i64 = 0; k < top_pats.length; k++) {
+                const p: PatternNode* = top_pats[k];
+                if (p != null && p.pattern_kind == PatternKind::Enum) {
+                    const ep: EnumPatternNode* = p as EnumPatternNode*;
+                    if (ep.variant_name.id == vn.id) { v_arms.push(ep); }
+                }
             }
-            if (!covered) { missing_names.push(vn); }
+            if (v_arms.length == 0
+                    || !this.variant_covered(&v_arms, subject_type, 0)) {
+                missing_names.push(vn);
+            }
         }
         if (missing_names.length == 0) { return; }
 
