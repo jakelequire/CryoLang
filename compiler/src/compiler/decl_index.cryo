@@ -427,12 +427,27 @@ type struct DeclarationIndex {
                     param_types.push(this_ptr_ref);
                 }
             }
-            // Collect all explicit parameter types: both `&this` and `this`
-            // already carry the correct resolved_type from type resolution.
+            // Collect all explicit parameter types.  `&this` / `mut &this`
+            // carry a resolved pointer type from type resolution, but a
+            // by-value `this` receiver is left WITHOUT a resolved_type;
+            // recover it as the target struct by value (`T`) so the
+            // cross-module FunctionType keeps the receiver slot.  Skipping
+            // it (the `is_valid()` gate alone) drops the receiver, leaving
+            // the extern declaration one argument short of the definition
+            // emitted by `declare_method` (which classifies the receiver
+            // from the target type directly) - every cross-module call to
+            // a by-value method then fails LLVM verification with
+            // "incorrect number of arguments".
             for (mut p: i64 = 0; p < func.parameters.length; p++) {
                 const param: VarDeclNode* = func.parameters[p];
-                if (param != null && param.resolved_type.is_valid()) {
+                if (param == null) { continue; }
+                if (param.resolved_type.is_valid()) {
                     param_types.push(param.resolved_type);
+                } else if (param.name.equals(this_val_name)) {
+                    const recv_ref: TypeRef = this.lookup_type(type_sym);
+                    if (recv_ref.is_valid()) {
+                        param_types.push(recv_ref);
+                    }
                 }
             }
             const func_type_ref: TypeRef = arena.get_function(

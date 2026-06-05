@@ -112,8 +112,8 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on
   `join`), `spawn_with_attr`, scoped threads (`thread::Scope`),
   `current` / `yield_now` / `sleep` / `sleep_ms`. Channels in
-  `sync::mpsc` (`channel`, `Sender`, `Receiver`). (A named `Builder`
-  configuration API is post-1.0.)
+  `sync::mpsc` (`channel`, `Sender`, `Receiver`). `Builder` for
+  configured spawns (`stack_size`, `name`; `spawn` / `try_spawn`).
 - **`math`:** `square_root`, `cube_root`, `power`, `sine`/`cosine`/`tangent`,
   `natural_log`/`log_base2`/`log_base10`/`exponential`, `absolute` (f64)
   /`absolute_f32`, `abs_i32`/`abs_i64`, `is_nan`/`is_infinite`/`is_finite`,
@@ -199,10 +199,6 @@ authoritative list.
   *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0 and work
   against any of these.
 - Async / await / coroutines.
-- A named `thread::Builder` configuration API. (`thread::spawn` /
-  `try_spawn` / `JoinHandle` / `spawn_with_attr`, scoped threads, and
-  `sync::mpsc` channels ship in 1.0; use `spawn_with_attr` for
-  stack-size control until `Builder` lands.)
 - TLS, UDP, HTTP/2, WebSocket in `net`.
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.

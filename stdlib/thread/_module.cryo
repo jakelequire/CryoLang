@@ -55,6 +55,7 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import collections::array;
+import collections::str;
 import ffi::libc;
 import sync::atomic;
 
@@ -307,13 +308,121 @@ where C: Send, T: Send {
     return spawn_with_attr<C, T>(ctx, body, null);
 }
 
-// NOTE: stack-size / OS-thread-name configuration (a `Builder`) is
-// deferred. A generic spawn helper that takes the config struct by
-// value/reference and returns `Result<JoinHandle<T>, SpawnError>`
-// miscompiles at the cross-module call site ("incorrect number of
-// arguments"); see build-logs/threading_compiler_gaps.md GAP 7. Once
-// that codegen bug is fixed, a `Builder` lands on top of `spawn_with_attr`
-// (which already threads a `pthread_attr_t` through).
+// ---------------------------------------------------------------------------
+// Builder: configurable spawning (stack size + OS thread name)
+// ---------------------------------------------------------------------------
+
+// pthread_attr_t storage. Linux x86_64 lays it out in 56 bytes (see
+// `libc::SIZEOF_PTHREAD_ATTR_T`); `pthread_attr_init` only touches what
+// it needs, so a fixed local buffer is enough. The OS thread name is
+// capped at 15 bytes plus a NUL by `pthread_setname_np`.
+const ATTR_BUF_LEN:    u64 = 56;
+const MAX_THREAD_NAME: u64 = 15;
+
+/// A configurable thread spawn: set a stack size and/or an OS-visible
+/// thread name, then `spawn` (panics on failure) or `try_spawn` (returns
+/// a `Result`). Configuration is applied through a `pthread_attr_t`; the
+/// name is set with `pthread_setname_np` once the thread is running.
+///
+///   ```cryo
+///   const h = thread::Builder::new()
+///       .stack_size(1u64 << 20)            // 1 MiB stack
+///       .name(Str::new("worker"))
+///       .spawn<i32, i32>(21, (n: i32) -> i32 { return n * 2; });
+///   const r: i32 = h.join();               // 42
+///   ```
+///
+/// POD: a `Builder` owns no resources (the name lives in a fixed inline
+/// buffer), so it is copied by value and needs no `drop`. The same
+/// `C: Send` / `T: Send` thread-safety bounds as `spawn` apply.
+type struct Builder {
+    stack_bytes: u64;       // 0 -> OS default stack size
+    name_buf:    u8[16];    // NUL-terminated C string for pthread_setname_np
+    name_len:    u64;       // 0 -> no name set
+
+    /// A builder with default attributes: OS-default stack, no name.
+    static new() -> Builder {
+        mut nb: u8[16];
+        mut i: u64 = 0u64;
+        while (i < 16u64) { nb[i] = 0u8; i = i + 1u64; }
+        return Builder { stack_bytes: 0u64, name_buf: nb, name_len: 0u64 };
+    }
+
+    /// Set the new thread's stack size in bytes. The OS rounds up to a
+    /// page and enforces a platform minimum (`PTHREAD_STACK_MIN`); a size
+    /// below it surfaces as a spawn error rather than a silent clamp.
+    stack_size(mut this, bytes: u64) -> Builder {
+        this.stack_bytes = bytes;
+        return this;
+    }
+
+    /// Set the OS-visible thread name, truncated to 15 bytes (the
+    /// `pthread_setname_np` limit). Shows up in `/proc/<pid>/task/*/comm`,
+    /// `ps -T`, `top -H`, and debuggers.
+    name(mut this, n: Str) -> Builder {
+        mut len: u64 = n.length();
+        if (len > MAX_THREAD_NAME) { len = MAX_THREAD_NAME; }
+        const src: u8* = n.as_ptr();
+        mut i: u64 = 0u64;
+        while (i < len) {
+            this.name_buf[i] = src[i];
+            i = i + 1u64;
+        }
+        this.name_buf[len] = 0u8;   // NUL-terminate
+        this.name_len = len;
+        return this;
+    }
+
+    /// Spawn with the configured attributes, panicking on failure. Use
+    /// `try_spawn` for a fallible spawn.
+    spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T>
+    where C: Send, T: Send {
+        match (this.try_spawn<C, T>(ctx, body)) {
+            Result::Ok(h)  => { return h; }
+            Result::Err(_) => {
+                intrinsics::panic("thread::Builder::spawn: failed to create thread", FILE, LINE);
+            }
+        }
+    }
+
+    /// Spawn with the configured attributes, returning `Err(SpawnError)`
+    /// if the OS rejects the configuration (e.g. an out-of-range stack
+    /// size) or cannot create the thread.
+    try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
+    where C: Send, T: Send {
+        mut attr: u8[56];
+        mut i: u64 = 0u64;
+        while (i < ATTR_BUF_LEN) { attr[i] = 0u8; i = i + 1u64; }
+        if (pthread_attr_init(&attr[0]) != 0) {
+            return Result::Err(SpawnError::Other);
+        }
+        if (this.stack_bytes > 0u64) {
+            if (pthread_attr_setstacksize(&attr[0], this.stack_bytes) != 0) {
+                pthread_attr_destroy(&attr[0]);
+                return Result::Err(SpawnError::Other);
+            }
+        }
+
+        // `pthread_create` (inside `spawn_with_attr`) copies what it needs
+        // from `attr`, so the buffer can be torn down as soon as it
+        // returns - on both the success and failure paths.
+        mut result: Result<JoinHandle<T>, SpawnError> =
+            spawn_with_attr<C, T>(ctx, body, &attr[0]);
+        pthread_attr_destroy(&attr[0]);
+
+        match (result) {
+            Result::Ok(h) => {
+                if (this.name_len > 0u64) {
+                    // Best-effort: a naming failure (e.g. an unsupported
+                    // platform) does not invalidate the live thread.
+                    pthread_setname_np(h.tid, &this.name_buf[0]);
+                }
+                return Result::Ok(h);
+            }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+}
 
 
 // ---------------------------------------------------------------------------

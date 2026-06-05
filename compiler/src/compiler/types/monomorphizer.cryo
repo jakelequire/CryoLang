@@ -4810,6 +4810,91 @@ type struct Monomorphizer {
         return true;
     }
 
+    /// Resolve a static call's scope name (`T` in `T::new()`) to its
+    /// registered type, tolerating a relative module path (`thread::Builder`
+    /// for the registered `std::thread::Builder`). Monomorphization runs
+    /// before sema, so the import-expanded name isn't on the node; recover
+    /// it by trying the name as written, its bare->qualified mapping, and
+    /// finally the leaf segment's mapping. The leaf fallback is skipped when
+    /// the leaf is ambiguous across modules (so it can't silently bind the
+    /// wrong same-leaf type).
+    resolve_scope_type(&this, scope_name: SymbolStr) -> TypeRef {
+        if (this.decl_index == null) { return TypeRef::invalid(); }
+        mut t: TypeRef = this.decl_index.lookup_type(scope_name);
+        if (t.is_valid()) { return t; }
+        t = this.decl_index.lookup_type(this.decl_index.resolve_qualified(scope_name));
+        if (t.is_valid()) { return t; }
+        const s: string = this.intern_table.resolve(scope_name);
+        const qn: QualifiedName = QualifiedName::parse(this.intern_table, s);
+        const leaf: SymbolStr = qn.leaf();
+        if (leaf.is_valid() && leaf.id != scope_name.id) {
+            // Don't guess through an ambiguous leaf (two `Builder`s in
+            // sibling modules); only resolve when it's unique.
+            if (this.decl_index.lookup_qualified_alternatives(leaf).length <= 1) {
+                t = this.decl_index.lookup_type(this.decl_index.resolve_qualified(leaf));
+                if (t.is_valid()) { return t; }
+                t = this.decl_index.lookup_type(leaf);
+                if (t.is_valid()) { return t; }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Best-effort receiver type for a generic method call whose receiver
+    /// is a CALL EXPRESSION (a temporary) - the fluent-builder shape
+    /// `T::new().cfg(..).generic_method<..>()`, including a chain of
+    /// non-generic configuration methods. Resolves ONLY to a plain,
+    /// NON-GENERIC concrete struct/class/enum: a generic static-call
+    /// receiver (`Box::new(..)`, `Range<i32>::new(..)`) is deliberately
+    /// left unresolved (its return is an `InstantiatedType` /
+    /// unsubstituted `Box<T>`, which the kind gate below rejects), matching
+    /// the exclusion in `resolve_arg_type_for_inference`. Used ONLY for the
+    /// receiver of a generic method call (never for argument inference), so
+    /// it cannot perturb generic-argument type inference.
+    resolve_concrete_call_receiver_type(&this, expr: ExpressionNode*) -> TypeRef {
+        if (expr == null || this.decl_index == null) { return TypeRef::invalid(); }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind != NodeKind::CallExpression) { return TypeRef::invalid(); }
+        const ce: CallExprNode* = expr as CallExprNode*;
+        if (ce.callee == null) { return TypeRef::invalid(); }
+        const cnode: ASTNode* = ce.callee as ASTNode*;
+
+        mut type_sym: SymbolStr = SymbolStr::empty();
+        mut member:   SymbolStr = SymbolStr::empty();
+        if (cnode.kind == NodeKind::ScopeResolution) {
+            // Static call `T::member(..)`: the receiver type is `T` itself.
+            const sr: ScopeResolutionNode* = ce.callee as ScopeResolutionNode*;
+            const base: TypeRef = this.resolve_scope_type(sr.scope_name);
+            if (!base.is_valid()) { return TypeRef::invalid(); }
+            type_sym = this.decl_index.lookup_type_name(base);
+            member   = sr.member_name;
+        } else if (cnode.kind == NodeKind::MemberAccess) {
+            // A configuration-method link `recv.member(..)`: resolve `recv`
+            // (recursing through earlier chain links), then this member's
+            // return type on it.
+            const ma2: MemberAccessNode* = ce.callee as MemberAccessNode*;
+            const recv_t: TypeRef = this.resolve_concrete_call_receiver_type(ma2.object);
+            if (!recv_t.is_valid()) { return TypeRef::invalid(); }
+            type_sym = this.decl_index.lookup_type_name(recv_t);
+            member   = ma2.member;
+        } else {
+            return TypeRef::invalid();
+        }
+
+        if (!type_sym.is_valid()) { return TypeRef::invalid(); }
+        const ret: TypeRef = this.decl_index.lookup_method_return(type_sym, member);
+        if (!ret.is_valid() || !this.infer_type_is_concrete(ret)) {
+            return TypeRef::invalid();
+        }
+        const rt: Type* = this.arena.lookup(ret.id);
+        if (rt == null) { return TypeRef::invalid(); }
+        if (rt.kind == TypeKind::Struct || rt.kind == TypeKind::Class
+                || rt.kind == TypeKind::Enum) {
+            return ret;
+        }
+        return TypeRef::invalid();
+    }
+
     try_infer_method_call(mut &this, call: CallExprNode*,
                           subst: TypeSubstitution*,
                           names: &SymbolStr[], types: &TypeRef[]) -> void {
@@ -4846,6 +4931,15 @@ type struct Monomorphizer {
                     }
                 }
             }
+        }
+        // Fluent-builder receiver: a call-expression temporary whose chain
+        // returns a concrete, non-generic struct/class/enum
+        // (`Builder::new().cfg(..).spawn<C,T>(..)`). The general path can't
+        // type a call-expression receiver before sema runs; recover it from
+        // the declared method-return types. Scoped to the receiver only, so
+        // it can't perturb generic-argument inference.
+        if (!recv_type.is_valid()) {
+            recv_type = this.resolve_concrete_call_receiver_type(ma.object);
         }
         if (!recv_type.is_valid()) { return; }
         if (subst != null) {
