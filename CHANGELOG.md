@@ -91,7 +91,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`io`:** `Read`/`Write` traits with default `read_all`/`read_byte`/
   `read_line`/`read_to_end`/`write_all`; `Stdin`/`Stdout`/`Stderr`/
   `BufReader<R>`/`BufWriter<W>`/`LineWriter<W>`.
-- **`fs`:** file `read`/`write`/`open`/`create`/`seek` over `Path`/`PathBuf`.
+- **`fs`:** files (`read`/`write`/`read_to_string`/`open`/`create`/`seek`/
+  `copy`) and whole-path operations (`remove_file`, `rename`,
+  `create_dir`/`create_dir_all`, `remove_dir`/`remove_dir_all`, `read_dir`,
+  `canonicalize`) over `Path`/`PathBuf`; `metadata`/`symlink_metadata`/
+  `exists`/`is_file`/`is_dir` backed by `stat`/`lstat`/`access`.
 - **`net`:** `TcpStream`, `TcpListener`, `IpAddr`/`IpV4Addr`/`IpV6Addr`,
   `SocketAddr`. HTTP/1.1 server with keep-alive and read timeouts, HTTP
   client, router with route registration.
@@ -114,6 +118,17 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `natural_log`/`log_base2`/`log_base10`/`exponential`, `absolute` (f64)
   /`absolute_f32`, `abs_i32`/`abs_i64`, `is_nan`/`is_infinite`/`is_finite`,
   `hypot`.
+- **`time`:** `Duration` (normalized seconds + sub-second nanos; built
+  and read in seconds/millis/micros/nanos; `add`/`saturating_sub`,
+  `Eq`/`Ord`), `Instant` (monotonic clock - `now`/`elapsed`/
+  `duration_since`), `SystemTime` (wall clock - `now`/`duration_since_epoch`
+  for a Unix timestamp), and `sleep(Duration)`. Differences saturate at
+  zero.
+- **`random`:** `Rng`, a fast non-cryptographic xoshiro256** generator
+  seeded deterministically (`from_seed`) or from the OS (`from_os`):
+  `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` /
+  `range_u64(lo, hi)`, and `fill_bytes`. `secure_bytes(buf, len)` pulls
+  cryptographically secure bytes from the kernel CSPRNG (`getrandom`).
 - **`fmt`:** `Display`/`Debug`/`FmtWrite` traits, `Formatter<W>`,
   `print`/`println`/`eprint`/`eprintln`, `format_to_string`,
   `format_debug_to_string`, floating-point formatting.
@@ -188,9 +203,6 @@ authoritative list.
   `try_spawn` / `JoinHandle` / `spawn_with_attr`, scoped threads, and
   `sync::mpsc` channels ship in 1.0; use `spawn_with_attr` for
   stack-size control until `Builder` lands.)
-- `time::Instant` / `Duration` / `sleep`; `random` module.
-- Filesystem operations beyond read/write/open (`remove_file`,
-  `create_dir`, `read_dir`, `metadata`, `rename`, `exists`, `copy`).
 - TLS, UDP, HTTP/2, WebSocket in `net`.
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.

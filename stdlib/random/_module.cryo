@@ -1,0 +1,201 @@
+///! std::random: pseudo-random and OS-backed randomness.
+///!
+///! `Rng` is a fast, non-cryptographic generator (xoshiro256**) seeded
+///! either deterministically (`Rng::from_seed(seed)` - same seed, same
+///! stream, good for tests and simulations) or from the operating
+///! system (`Rng::from_os()`). Draw with `next_u64` / `next_u32` /
+///! `next_bool` / `next_f64`, bounded integers with `below(bound)` /
+///! `range_u64(lo, hi)` (both unbiased via rejection), or raw bytes with
+///! `fill_bytes(buf, len)`. POD: an `Rng` is copied by value, so a copy
+///! forks the stream rather than sharing it.
+///!
+///! For keys, tokens, and nonces use `secure_bytes(buf, len)` instead -
+///! it pulls straight from the kernel CSPRNG (`getrandom`) and never
+///! exposes a predictable algorithm. `Rng` is NOT suitable for security.
+
+namespace std::random;
+
+import core::intrinsics;
+import ffi::libc;
+
+const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFFu64;
+
+/// A fast non-cryptographic PRNG (xoshiro256**). Seed with `from_seed`
+/// for a reproducible stream or `from_os` for an unpredictable one.
+type struct Rng {
+    s0: u64;
+    s1: u64;
+    s2: u64;
+    s3: u64;
+
+    /// Seed deterministically from a single 64-bit value. The same seed
+    /// always produces the same sequence.
+    static from_seed(seed: u64) -> Rng {
+        // Expand the 64-bit seed into the 256-bit state with SplitMix64,
+        // as the xoshiro authors recommend.
+        mut sm: u64 = seed;
+        const a: u64 = splitmix64(&sm);
+        const b: u64 = splitmix64(&sm);
+        const c: u64 = splitmix64(&sm);
+        const d: u64 = splitmix64(&sm);
+        return non_zero_state(a, b, c, d);
+    }
+
+    /// Seed from the OS CSPRNG (`getrandom`). Falls back to a
+    /// monotonic-clock + pid mix if the kernel source is briefly
+    /// unavailable, so it never hard-fails. (The fallback is fine for
+    /// non-crypto use; for crypto use `secure_bytes`.)
+    static from_os() -> Rng {
+        mut buf: u8[32];
+        const got: i64 = getrandom(&buf[0], 32u64, 0u32);
+        if (got == 32i64) {
+            return non_zero_state(load_u64_le(&buf[0]),  load_u64_le(&buf[8]),
+                                  load_u64_le(&buf[16]), load_u64_le(&buf[24]));
+        }
+        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+        clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
+        const seed: u64 = ((ts.tv_sec as u64) * 1000000000u64 + (ts.tv_nsec as u64))
+                          ^ ((getpid() as u64) << 32u64);
+        return Rng::from_seed(seed);
+    }
+
+    /// The next 64 random bits.
+    next_u64(mut &this) -> u64 {
+        const result: u64 = rotl(this.s1 * 5u64, 7u32) * 9u64;
+        const t: u64 = this.s1 << 17u64;
+        this.s2 = this.s2 ^ this.s0;
+        this.s3 = this.s3 ^ this.s1;
+        this.s1 = this.s1 ^ this.s2;
+        this.s0 = this.s0 ^ this.s3;
+        this.s2 = this.s2 ^ t;
+        this.s3 = rotl(this.s3, 45u32);
+        return result;
+    }
+
+    /// The next 32 random bits (the high half of `next_u64`, whose bits
+    /// are all well-mixed).
+    next_u32(mut &this) -> u32 {
+        return (this.next_u64() >> 32u64) as u32;
+    }
+
+    /// A random `boolean` (from the top, highest-quality bit).
+    next_bool(mut &this) -> boolean {
+        return (this.next_u64() >> 63u64) == 1u64;
+    }
+
+    /// A uniform `f64` in `[0.0, 1.0)`, using the top 53 bits so every
+    /// representable value is equally likely.
+    next_f64(mut &this) -> f64 {
+        const bits: u64 = this.next_u64() >> 11u64;        // 53 bits
+        return (bits as f64) / 9007199254740992.0;         // / 2^53
+    }
+
+    /// A uniform integer in `[0, bound)`. `bound` must be > 0. Unbiased:
+    /// the top partial bucket is rejected so the modulo introduces no
+    /// skew.
+    below(mut &this, bound: u64) -> u64 {
+        if (bound == 0u64) {
+            intrinsics::panic("random::Rng::below: bound must be > 0", FILE, LINE);
+        }
+        // threshold == 2^64 mod bound (computed without overflow).
+        const threshold: u64 = (U64_MAX - bound + 1u64) % bound;
+        loop {
+            const x: u64 = this.next_u64();
+            if (x >= threshold) {
+                return x % bound;
+            }
+        }
+    }
+
+    /// A uniform integer in `[lo, hi)`. Requires `lo < hi`.
+    range_u64(mut &this, lo: u64, hi: u64) -> u64 {
+        if (lo >= hi) {
+            intrinsics::panic("random::Rng::range_u64: lo must be < hi", FILE, LINE);
+        }
+        return lo + this.below(hi - lo);
+    }
+
+    /// Fill `buf[0..len]` with pseudo-random bytes.
+    fill_bytes(mut &this, buf: u8*, len: u64) -> void {
+        mut i: u64 = 0u64;
+        while (i + 8u64 <= len) {
+            store_u64_le(buf + i, this.next_u64());
+            i = i + 8u64;
+        }
+        if (i < len) {
+            mut last: u64 = this.next_u64();
+            while (i < len) {
+                buf[i] = (last & 0xFFu64) as u8;
+                last = last >> 8u64;
+                i = i + 1u64;
+            }
+        }
+    }
+}
+
+/// Build an `Rng` from four state words, nudging the all-zero state (a
+/// xoshiro fixed point that emits only zeros) off itself. SplitMix64 and
+/// the kernel CSPRNG make all-zero astronomically unlikely, but the guard
+/// is cheap.
+function non_zero_state(a: u64, b: u64, c: u64, d: u64) -> Rng {
+    mut r: Rng = Rng { s0: a, s1: b, s2: c, s3: d };
+    if (r.s0 == 0u64 && r.s1 == 0u64 && r.s2 == 0u64 && r.s3 == 0u64) {
+        r.s0 = 1u64;
+    }
+    return r;
+}
+
+/// SplitMix64: advances `*state` and returns a well-mixed 64-bit value.
+/// Used to expand a single seed into xoshiro's 256-bit state.
+function splitmix64(state: u64*) -> u64 {
+    *state = *state + 0x9E3779B97F4A7C15u64;
+    mut z: u64 = *state;
+    z = (z ^ (z >> 30u64)) * 0xBF58476D1CE4E5B9u64;
+    z = (z ^ (z >> 27u64)) * 0x94D049BB133111EBu64;
+    return z ^ (z >> 31u64);
+}
+
+/// Rotate `x` left by `k` bits (`k` in `1..=63`).
+function rotl(x: u64, k: u32) -> u64 {
+    return (x << (k as u64)) | (x >> ((64u32 - k) as u64));
+}
+
+/// Load 8 bytes at `p` as a little-endian `u64`.
+function load_u64_le(p: u8*) -> u64 {
+    mut v: u64 = 0u64;
+    mut i: u64 = 0u64;
+    while (i < 8u64) {
+        v = v | ((p[i] as u64) << (i * 8u64));
+        i = i + 1u64;
+    }
+    return v;
+}
+
+/// Store `v` as 8 little-endian bytes at `p`.
+function store_u64_le(p: u8*, v: u64) -> void {
+    mut x: u64 = v;
+    mut i: u64 = 0u64;
+    while (i < 8u64) {
+        p[i] = (x & 0xFFu64) as u8;
+        x = x >> 8u64;
+        i = i + 1u64;
+    }
+}
+
+/// Fill `buf[0..len]` with cryptographically secure bytes from the OS
+/// CSPRNG (`getrandom`), looping until the full request is satisfied.
+/// Returns `false` if the kernel source could not supply bytes (the
+/// caller decides how to react); on `true` the buffer is fully written.
+/// Use this for keys / tokens / nonces; use an `Rng` for fast
+/// non-crypto randomness.
+function secure_bytes(buf: u8*, len: u64) -> boolean {
+    mut done: u64 = 0u64;
+    while (done < len) {
+        const n: i64 = getrandom(buf + done, len - done, 0u32);
+        if (n <= 0i64) {
+            return false;
+        }
+        done = done + (n as u64);
+    }
+    return true;
+}

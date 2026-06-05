@@ -22,6 +22,7 @@ import collections::string;
 import collections::str;
 import ffi::libc;
 import fs::path;
+import fs::metadata;
 
 // POSIX `open` flags and `lseek` whence values live in `ffi::libc`
 // (`O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`/... and `Whence::SEEK_*`).
@@ -237,4 +238,40 @@ function read_to_string(p: Path) -> Result<String, IoError> {
     mut out: String = String::from_str(Str::from_bytes(data.as_slice()));
     data.drop();
     return Result::Ok(out);
+}
+
+/// Copy the contents of `from` to `to`, returning the number of bytes
+/// copied. `to` is created if missing and truncated if it already
+/// exists; the source's Unix permission bits are then applied to it,
+/// mirroring `cp` (and `std::fs::copy`). `from` must be a regular file -
+/// copying a directory (or other non-regular entry) fails with
+/// `InvalidInput`. On an I/O failure mid-copy the partially written
+/// destination is left in place and the error is returned as-is.
+function copy(from: Path, to: Path) -> Result<u64, IoError> {
+    const info: Metadata = metadata::metadata(from)?;
+    if (!info.is_file()) {
+        return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+    }
+
+    const src_handle: File = File::open(from)?;
+    mut src: File = src_handle;
+    const dst_handle: File = File::create(to)?;
+    mut dst: File = dst_handle;
+
+    mut total: u64 = 0;
+    mut chunk: u8[65536];
+    loop {
+        const n: u64 = src.read(&chunk[0], 65536)?;
+        if (n == 0) { break; }
+        dst.write_all(Slice<u8>::from_raw(&chunk[0], n))?;
+        total = total + n;
+    }
+
+    // Mirror the source's permission bits onto the freshly-created
+    // destination fd (the `create` above used the default 0644 mode).
+    if (libc::fchmod(dst.fd, info.permissions()) != 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+
+    return Result::Ok(total);
 }
