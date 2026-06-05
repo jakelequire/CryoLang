@@ -192,11 +192,5 @@ authoritative list.
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.
 - Cross-module trait-impl coherence checks (same-file only in 1.0).
-  Relatedly, two distinct user types that share the same *leaf* name in
-  different modules (e.g. `ModA::Widget` and `ModB::Widget`) are
-  disambiguated correctly as types, but trait-method dispatch on them
-  resolves through the bare leaf name and can bind to the
-  first-registered type's impl. Give such types distinct names until
-  fully-qualified trait dispatch lands post-1.0.
 
 [1.0.0]: https://github.com/jakelequire/CryoLang/releases/tag/v1.0.0

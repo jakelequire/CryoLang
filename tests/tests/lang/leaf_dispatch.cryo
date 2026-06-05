@@ -1,0 +1,118 @@
+///! Same-leaf-name cross-module type & trait dispatch.
+///!
+///! `LeafDispatchA::Cell` and `LeafDispatchB::Cell` share the leaf name
+///! `Cell` but live in different modules with different fields and
+///! different `Pulse` impls. Before the fix, a fully-qualified reference
+///! (`ModB::Cell`) resolved through the bare leaf name and bound to the
+///! first-registered type — so `b.pulse()` returned A's `100`, a
+///! fully-qualified struct literal silently miscompiled to garbage, and
+///! field access went to the wrong layout. This locks in correct behavior:
+///!
+///!   * qualified type annotations resolve to the *named* module's type,
+///!   * qualified struct literals construct the right type & fields,
+///!   * inherent + trait + generic-constrained dispatch all bind to the
+///!     impl of the type actually referenced.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LeafDispatch;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+import CryoTests::Tests::Lang::LeafDispatchA;
+import CryoTests::Tests::Lang::LeafDispatchB;
+
+// Generic dispatch through a trait bound on module A's `Pulse`. Both
+// `Cell` types implement it; monomorphization must pick the impl of the
+// concrete type argument, not the first-registered same-leaf type.
+function describe<T>(value: &T) -> i32
+where T: CryoTests::Tests::Lang::LeafDispatchA::Pulse {
+    return value.pulse();
+}
+
+// Qualified struct literals build the correct per-module layout, and
+// field reads land at the right offsets.
+![test]
+function qualified_struct_literals_construct_right_type() -> Result<(), TestError> {
+    const a: CryoTests::Tests::Lang::LeafDispatchA::Cell =
+        CryoTests::Tests::Lang::LeafDispatchA::Cell { a: 7 };
+    const b: CryoTests::Tests::Lang::LeafDispatchB::Cell =
+        CryoTests::Tests::Lang::LeafDispatchB::Cell { b1: 11, b2: 22, only_b: 42 };
+
+    match (expect_eq(a.a, 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.b1, 11)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.b2, 22)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.only_b, 42)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Inherent methods dispatch to the impl of the referenced module's type.
+![test]
+function inherent_methods_dispatch_per_module() -> Result<(), TestError> {
+    const a: CryoTests::Tests::Lang::LeafDispatchA::Cell =
+        CryoTests::Tests::Lang::LeafDispatchA::Cell { a: 9 };
+    const b: CryoTests::Tests::Lang::LeafDispatchB::Cell =
+        CryoTests::Tests::Lang::LeafDispatchB::Cell { b1: 1, b2: 2, only_b: 99 };
+
+    match (expect_eq(a.get_a(), 9)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.get_only(), 99)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Direct trait-method calls bind to each type's own impl.
+![test]
+function trait_methods_dispatch_per_module() -> Result<(), TestError> {
+    const a: CryoTests::Tests::Lang::LeafDispatchA::Cell =
+        CryoTests::Tests::Lang::LeafDispatchA::Cell { a: 0 };
+    const b: CryoTests::Tests::Lang::LeafDispatchB::Cell =
+        CryoTests::Tests::Lang::LeafDispatchB::Cell { b1: 0, b2: 0, only_b: 0 };
+
+    match (expect_eq(a.pulse(), 100)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.pulse(), 200)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Generic-constrained dispatch monomorphizes to the right impl for each
+// concrete same-leaf type argument.
+![test]
+function generic_dispatch_per_module() -> Result<(), TestError> {
+    const a: CryoTests::Tests::Lang::LeafDispatchA::Cell =
+        CryoTests::Tests::Lang::LeafDispatchA::Cell { a: 0 };
+    const b: CryoTests::Tests::Lang::LeafDispatchB::Cell =
+        CryoTests::Tests::Lang::LeafDispatchB::Cell { b1: 0, b2: 0, only_b: 0 };
+
+    match (expect_eq(describe<CryoTests::Tests::Lang::LeafDispatchA::Cell>(&a), 100)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(describe<CryoTests::Tests::Lang::LeafDispatchB::Cell>(&b), 200)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

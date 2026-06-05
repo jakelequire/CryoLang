@@ -452,6 +452,34 @@ public:
                 }
                 const no_gen_args: TypeAnnotation*[] = [];
                 expr = this.parse_scope_member(scope_name, no_gen_args, expr.span);
+            } else if (this.check(TokenType::LBrace)
+                       && expr.kind == NodeKind::ScopeResolution
+                       && this.is_struct_literal_ahead()) {
+                // Qualified struct literal at the tail of a *deep* scope path
+                // (`A::B::C::Type { ... }`).  The 2-segment case is handled in
+                // `parse_identifier_or_call`; this branch covers the longer
+                // paths assembled by the `::` handling above.  Build the
+                // literal under the fully-qualified `scope::member` name so
+                // sema resolves the right type — without it the trailing
+                // `{...}` was parsed against the bare scope name, skipping
+                // field validation and miscompiling to garbage.  Mirrors the
+                // bare-name path's `is_struct_literal_ahead()` guard, so it
+                // adds no new ambiguity beyond what already applies there.
+                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
+                const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
+                const qname: SymbolStr = this.ctx.intern_table.intern(
+                    format("%s::%s", scope_s, member_s));
+                // Deep-clone the member generic args; `sr` owns its pointees.
+                mut sl_gen: TypeAnnotation*[] = [];
+                for (mut gi: i64 = 0; gi < sr.generic_args.length; gi++) {
+                    sl_gen.push(TypeAnnotation::clone_ptr(sr.generic_args[gi]));
+                }
+                // Synthesize a start token from the scope path's span so the
+                // literal's overall span covers `A::B::C::Type { ... }`.
+                const start_tok: Token = Token::new(TokenType::Identifier, "",
+                    expr.span.start_line as int, expr.span.start_col as int);
+                expr = this.parse_struct_literal_body(qname, sl_gen, start_tok);
             } else if (this.check(TokenType::PlusPlus) || this.check(TokenType::MinusMinus)) {
                 // Postfix increment/decrement.  Mark the node so codegen
                 // returns the old (pre-update) value; prefix forms (handled
@@ -934,9 +962,32 @@ public:
         // Check for struct literal: Name { field: value }
         // Relies on structural heuristic (ident followed by '{' then 'field:' pattern)
         // rather than naming conventions, so lowercase type names work too.
+        //
+        // When a scope resolution was parsed above (`Module::Type`), `expr` is
+        // a ScopeResolutionNode and `name` holds only the leading segment
+        // ("Module"). A trailing struct-literal body must be built under the
+        // *qualified* `Module::Type` name — otherwise sema resolves the literal
+        // against the bare scope name, fails to find a type, skips field
+        // validation, and codegen emits garbage. This is what makes
+        // `ModB::Widget { ... }` work for same-leaf-name types in different
+        // modules (member generic args carry through for `Module::Type<T> {}`).
         if (this.check(TokenType::LBrace) && this.is_struct_literal_ahead()) {
-            const empty_args: TypeAnnotation*[] = [];
-            return this.parse_struct_literal_body(name, empty_args, tok);
+            mut lit_name: SymbolStr = name;
+            mut lit_gen: TypeAnnotation*[] = [];
+            if (expr.kind == NodeKind::ScopeResolution) {
+                const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                const scope_s: string  = this.ctx.intern_table.resolve(sr.scope_name);
+                const member_s: string = this.ctx.intern_table.resolve(sr.member_name);
+                lit_name = this.ctx.intern_table.intern(
+                    format("%s::%s", scope_s, member_s));
+                // Deep-clone: `sr` owns its `generic_args` pointees; a shallow
+                // alias would let both `sr` and the struct literal free the
+                // same nodes. Mirrors the `new Type {}` clone at the heap path.
+                for (mut gi: i64 = 0; gi < sr.generic_args.length; gi++) {
+                    lit_gen.push(TypeAnnotation::clone_ptr(sr.generic_args[gi]));
+                }
+            }
+            return this.parse_struct_literal_body(lit_name, lit_gen, tok);
         }
 
         return expr;
