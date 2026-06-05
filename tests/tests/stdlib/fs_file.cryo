@@ -134,6 +134,71 @@ function seek_set_reads_from_offset() -> Result<(), TestError> {
 }
 
 ![test]
+function copy_duplicates_contents() -> Result<(), TestError> {
+    mut srcbuf: i8[96];
+    mut dstbuf: i8[96];
+    const src: Path = temp_path(&srcbuf[0], "copy_src");
+    const dst: Path = temp_path(&dstbuf[0], "copy_dst");
+    const payload: Str = Str::new("copy me verbatim\n");   // 17 bytes
+
+    // Seed the source.
+    match (write(src, payload.as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("seed write failed")); }
+    }
+
+    // Copy and capture the returned byte count.
+    mut copied: u64 = 0;
+    match (copy(src, dst)) {
+        Result::Ok(n)  => { copied = n; }
+        Result::Err(_) => {
+            libc::unlink(&srcbuf[0] as u8*);
+            return bail(Str::new("copy failed"));
+        }
+    }
+
+    // Read the destination back and compare it byte-for-byte.
+    mut readbuf: u8[64];
+    mut got: u64 = 0;
+    mut ok: boolean = false;
+    match (File::open(dst)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.read_all(&readbuf[0], 64)) {
+                Result::Ok(n)  => { got = n; }
+                Result::Err(_) => { }
+            }
+            f.drop();
+            ok = slices_eq(Slice::from_raw(&readbuf[0], got), payload.as_bytes());
+        }
+        Result::Err(_) => { }
+    }
+
+    libc::unlink(&srcbuf[0] as u8*);
+    libc::unlink(&dstbuf[0] as u8*);
+
+    match (expect_eq(copied, 17)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("destination contents must equal the source"));
+}
+
+![test]
+function copy_missing_source_errors() -> Result<(), TestError> {
+    mut srcbuf: i8[96];
+    mut dstbuf: i8[96];
+    const src: Path = temp_path(&srcbuf[0], "copy_absent_src");
+    const dst: Path = temp_path(&dstbuf[0], "copy_absent_dst");
+    // Guarantee the source really is absent.
+    libc::unlink(&srcbuf[0] as u8*);
+
+    const r: Result<u64, IoError> = copy(src, dst);
+    const is_err: boolean = r.is_err();
+
+    // A missing source must fail before the destination is created.
+    libc::unlink(&dstbuf[0] as u8*);
+    return expect(is_err, Str::new("copying a missing source must fail"));
+}
+
+![test]
 function open_nonexistent_errors() -> Result<(), TestError> {
     mut namebuf: i8[96];
     const p: Path = temp_path(&namebuf[0], "does_not_exist");

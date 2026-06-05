@@ -1,0 +1,90 @@
+///! std::time: Duration unit math, Instant monotonicity, SystemTime
+///! wall-clock sanity, and sleep.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Time;
+
+import std::core::result;
+import std::core::cmp;
+import std::collections::str;
+import std::time;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function duration_unit_conversions() -> Result<(), TestError> {
+    // 1500 ms == 1 s + 500_000_000 ns.
+    const d: Duration = Duration::from_millis(1500u64);
+    expect_eq(d.as_secs(), 1u64)?;
+    expect_eq(d.subsec_nanos(), 500000000u32)?;
+    expect_eq(d.subsec_millis(), 500u32)?;
+    expect_eq(d.as_millis(), 1500u64)?;
+    expect_eq(d.as_micros(), 1500000u64)?;
+    expect_eq(d.as_nanos(), 1500000000u64)?;
+    return Result::Ok(());
+}
+
+![test]
+function duration_new_normalizes_overflow() -> Result<(), TestError> {
+    // 1 s + 1_500_000_000 ns must carry into 2 s + 500_000_000 ns.
+    const d: Duration = Duration::new(1u64, 1500000000u32);
+    expect_eq(d.as_secs(), 2u64)?;
+    expect_eq(d.subsec_nanos(), 500000000u32)?;
+    return Result::Ok(());
+}
+
+![test]
+function duration_add_and_saturating_sub() -> Result<(), TestError> {
+    const a: Duration = Duration::from_millis(750u64);
+    const b: Duration = Duration::from_millis(500u64);
+
+    // 750ms + 500ms = 1250ms (carries the nanos overflow into secs).
+    const sum: Duration = a.add(&b);
+    expect_eq(sum.as_secs(), 1u64)?;
+    expect_eq(sum.as_millis(), 1250u64)?;
+
+    // 750ms - 500ms = 250ms.
+    const diff: Duration = a.saturating_sub(&b);
+    expect_eq(diff.as_millis(), 250u64)?;
+
+    // 500ms - 750ms saturates to zero.
+    const under: Duration = b.saturating_sub(&a);
+    expect_true(under.is_zero(), Str::new("smaller minus larger saturates to zero"))?;
+    return Result::Ok(());
+}
+
+![test]
+function duration_ordering() -> Result<(), TestError> {
+    const a: Duration = Duration::from_nanos(1u64);
+    const b: Duration = Duration::from_secs(1u64);
+    expect_true(a.compare(&b) == Ordering::Less, Str::new("1ns < 1s"))?;
+    expect_true(b.compare(&a) == Ordering::Greater, Str::new("1s > 1ns"))?;
+    expect_true(a.equals(&Duration::from_nanos(1u64)), Str::new("1ns == 1ns"))?;
+    return Result::Ok(());
+}
+
+![test]
+function instant_elapsed_is_monotonic() -> Result<(), TestError> {
+    const start: Instant = Instant::now();
+    time::sleep(Duration::from_millis(5u64));
+    const elapsed: Duration = start.elapsed();
+    // sleep guarantees the full span elapses; assert a conservative lower
+    // bound (>= 2ms) so coarse-clock rounding can't make this flaky.
+    expect_true(elapsed.as_millis() >= 2u64,
+                Str::new("elapsed since a 5ms sleep is at least 2ms"))?;
+
+    // A later reading is never ordered before an earlier one.
+    const later: Instant = Instant::now();
+    expect_true(later.compare(&start) != Ordering::Less,
+                Str::new("monotonic clock does not go backward"))?;
+    return Result::Ok(());
+}
+
+![test]
+function system_time_is_after_2020() -> Result<(), TestError> {
+    // A real wall clock reads well past the 2020 epoch second.
+    const since: Duration = SystemTime::now().duration_since_epoch();
+    expect_true(since.as_secs() >= 1600000000u64,
+                Str::new("wall clock is past 2020-09"))?;
+    return Result::Ok(());
+}

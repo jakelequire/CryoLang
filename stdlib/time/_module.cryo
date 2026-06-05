@@ -1,0 +1,285 @@
+///! std::time: durations and clocks.
+///!
+///! Three types, mirroring the usual shape:
+///!
+///!   - `Duration` - a span of time, stored as whole seconds plus a
+///!     sub-second nanosecond remainder (always `< 1_000_000_000`).
+///!     Built from any unit (`from_secs`/`from_millis`/`from_micros`/
+///!     `from_nanos`) and read back in any unit. POD: freely copied,
+///!     no `drop`.
+///!   - `Instant` - a reading of the monotonic clock
+///!     (`CLOCK_MONOTONIC`). It only goes forward and is unaffected by
+///!     wall-clock adjustments, so it is the right tool for measuring
+///!     elapsed time: `const t = Instant::now(); ...; t.elapsed()`.
+///!   - `SystemTime` - a reading of the wall clock (`CLOCK_REALTIME`).
+///!     Use `duration_since_epoch()` for a Unix timestamp. Subject to
+///!     NTP steps and manual clock changes, so it must NOT be used to
+///!     measure elapsed time.
+///!
+///! `sleep(dur)` parks the current thread for at least `dur`, restarting
+///! across signal interruptions so the full span elapses. (The same
+///! primitive is exposed as `thread::sleep` over raw nanoseconds.)
+///!
+///! All differences (`elapsed`, `duration_since`, `duration_since_epoch`)
+///! saturate at zero rather than producing a negative or wrapped span:
+///! the monotonic clock should preclude a later-minus-earlier underflow,
+///! but callers may legitimately compare two readings in either order.
+
+namespace std::time;
+
+import core::cmp;
+import ffi::libc;
+
+const NANOS_PER_SEC:   u64 = 1000000000;
+const NANOS_PER_MILLI: u64 = 1000000;
+const NANOS_PER_MICRO: u64 = 1000;
+const MILLIS_PER_SEC:  u64 = 1000;
+const MICROS_PER_SEC:  u64 = 1000000;
+
+// Duration: a span of time
+
+/// A length of time, normalized so `nanos` is always the sub-second
+/// remainder (`0 <= nanos < 1_000_000_000`). POD; copy-by-value, no
+/// owned resources.
+type struct Duration {
+    secs:  u64;
+    nanos: u32;
+
+    /// Construct from a `(seconds, nanoseconds)` pair, carrying any
+    /// nanosecond overflow (`>= 1e9`) into the seconds field so the
+    /// stored value is always normalized.
+    static new(secs: u64, nanos: u32) -> Duration {
+        mut s: u64 = secs;
+        mut n: u64 = nanos as u64;
+        if (n >= NANOS_PER_SEC) {
+            s = s + (n / NANOS_PER_SEC);
+            n = n % NANOS_PER_SEC;
+        }
+        return Duration { secs: s, nanos: n as u32 };
+    }
+
+    /// The zero duration.
+    static zero() -> Duration {
+        return Duration { secs: 0u64, nanos: 0u32 };
+    }
+
+    static from_secs(secs: u64) -> Duration {
+        return Duration { secs: secs, nanos: 0u32 };
+    }
+
+    static from_millis(millis: u64) -> Duration {
+        return Duration {
+            secs:  millis / MILLIS_PER_SEC,
+            nanos: ((millis % MILLIS_PER_SEC) * NANOS_PER_MILLI) as u32
+        };
+    }
+
+    static from_micros(micros: u64) -> Duration {
+        return Duration {
+            secs:  micros / MICROS_PER_SEC,
+            nanos: ((micros % MICROS_PER_SEC) * NANOS_PER_MICRO) as u32
+        };
+    }
+
+    static from_nanos(nanos: u64) -> Duration {
+        return Duration {
+            secs:  nanos / NANOS_PER_SEC,
+            nanos: (nanos % NANOS_PER_SEC) as u32
+        };
+    }
+
+    /// Whole seconds (the sub-second part is dropped).
+    as_secs(&this) -> u64 { return this.secs; }
+
+    /// The sub-second remainder in nanoseconds (`< 1e9`).
+    subsec_nanos(&this) -> u32 { return this.nanos; }
+
+    /// The sub-second remainder in whole milliseconds (`< 1000`).
+    subsec_millis(&this) -> u32 {
+        return ((this.nanos as u64) / NANOS_PER_MILLI) as u32;
+    }
+
+    /// The sub-second remainder in whole microseconds (`< 1_000_000`).
+    subsec_micros(&this) -> u32 {
+        return ((this.nanos as u64) / NANOS_PER_MICRO) as u32;
+    }
+
+    /// Total whole milliseconds. Wraps for spans beyond ~584 million
+    /// years; not a real concern.
+    as_millis(&this) -> u64 {
+        return this.secs * MILLIS_PER_SEC + (this.nanos as u64) / NANOS_PER_MILLI;
+    }
+
+    /// Total whole microseconds.
+    as_micros(&this) -> u64 {
+        return this.secs * MICROS_PER_SEC + (this.nanos as u64) / NANOS_PER_MICRO;
+    }
+
+    /// Total nanoseconds. Wraps for spans beyond ~584 years (the u64
+    /// nanosecond range); use `as_micros`/`as_millis` for longer spans.
+    as_nanos(&this) -> u64 {
+        return this.secs * NANOS_PER_SEC + (this.nanos as u64);
+    }
+
+    is_zero(&this) -> boolean {
+        return this.secs == 0u64 && this.nanos == 0u32;
+    }
+
+    /// `this + other`, carrying the nanosecond overflow.
+    add(&this, other: &Duration) -> Duration {
+        mut secs:  u64 = this.secs + other.secs;
+        mut nanos: u64 = (this.nanos as u64) + (other.nanos as u64);
+        if (nanos >= NANOS_PER_SEC) {
+            secs  = secs + 1u64;
+            nanos = nanos - NANOS_PER_SEC;
+        }
+        return Duration { secs: secs, nanos: nanos as u32 };
+    }
+
+    /// `this - other`, saturating at zero when `other` is the larger.
+    saturating_sub(&this, other: &Duration) -> Duration {
+        if (this.secs < other.secs) { return Duration { secs: 0u64, nanos: 0u32 }; }
+        if (this.secs == other.secs && this.nanos <= other.nanos) {
+            return Duration { secs: 0u64, nanos: 0u32 };
+        }
+        mut secs:  u64 = this.secs - other.secs;
+        mut nanos: i64 = (this.nanos as i64) - (other.nanos as i64);
+        if (nanos < 0i64) {
+            secs  = secs - 1u64;
+            nanos = nanos + (NANOS_PER_SEC as i64);
+        }
+        return Duration { secs: secs, nanos: nanos as u32 };
+    }
+}
+
+implement trait Eq for struct Duration {
+    equals(&this, other: &Duration) -> boolean {
+        return this.secs == other.secs && this.nanos == other.nanos;
+    }
+}
+
+implement trait Ord for struct Duration {
+    compare(&this, other: &Duration) -> Ordering {
+        if (this.secs < other.secs) { return Ordering::Less; }
+        if (this.secs > other.secs) { return Ordering::Greater; }
+        if (this.nanos < other.nanos) { return Ordering::Less; }
+        if (this.nanos > other.nanos) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+
+// Internal: (a - b) as a saturating Duration, over raw (sec, nsec) pairs.
+
+/// Compute `(a_sec.a_nsec) - (b_sec.b_nsec)` as a `Duration`, borrowing
+/// from the seconds when the nanoseconds underflow and clamping the whole
+/// result to zero if it would go negative.
+function diff_saturating(a_sec: i64, a_nsec: i64,
+                         b_sec: i64, b_nsec: i64) -> Duration {
+    mut sec:  i64 = a_sec - b_sec;
+    mut nsec: i64 = a_nsec - b_nsec;
+    if (nsec < 0i64) {
+        sec  = sec - 1i64;
+        nsec = nsec + (NANOS_PER_SEC as i64);
+    }
+    if (sec < 0i64) {
+        return Duration { secs: 0u64, nanos: 0u32 };
+    }
+    return Duration { secs: sec as u64, nanos: nsec as u32 };
+}
+
+// Instant: a monotonic-clock reading
+
+/// A measurement of the monotonic clock. Opaque: the stored fields are
+/// the raw `CLOCK_MONOTONIC` `timespec`, meaningful only relative to
+/// another `Instant`. Use `now()` to read it and `elapsed()` /
+/// `duration_since()` to measure spans. POD; copy-by-value.
+type struct Instant {
+    secs:  i64;
+    nanos: i64;
+
+    /// Read the monotonic clock now.
+    static now() -> Instant {
+        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+        clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
+        return Instant { secs: ts.tv_sec, nanos: ts.tv_nsec };
+    }
+
+    /// The time elapsed from `earlier` to `this` (saturating at zero).
+    duration_since(&this, earlier: &Instant) -> Duration {
+        return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
+    }
+
+    /// The time elapsed from `this` until now (saturating at zero).
+    elapsed(&this) -> Duration {
+        const cur: Instant = Instant::now();
+        return diff_saturating(cur.secs, cur.nanos, this.secs, this.nanos);
+    }
+}
+
+implement trait Eq for struct Instant {
+    equals(&this, other: &Instant) -> boolean {
+        return this.secs == other.secs && this.nanos == other.nanos;
+    }
+}
+
+implement trait Ord for struct Instant {
+    compare(&this, other: &Instant) -> Ordering {
+        if (this.secs < other.secs) { return Ordering::Less; }
+        if (this.secs > other.secs) { return Ordering::Greater; }
+        if (this.nanos < other.nanos) { return Ordering::Less; }
+        if (this.nanos > other.nanos) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+
+// SystemTime: a wall-clock reading
+
+/// A measurement of the wall clock (`CLOCK_REALTIME`), as a raw
+/// `timespec`. Unlike `Instant` it tracks calendar time, so
+/// `duration_since_epoch()` yields a Unix timestamp - but it can jump
+/// backward (NTP, manual changes) and must not be used for elapsed-time
+/// measurement. POD; copy-by-value.
+type struct SystemTime {
+    secs:  i64;
+    nanos: i64;
+
+    /// Read the wall clock now.
+    static now() -> SystemTime {
+        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+        clock_gettime(ClockId::CLOCK_REALTIME, &ts);
+        return SystemTime { secs: ts.tv_sec, nanos: ts.tv_nsec };
+    }
+
+    /// The Unix epoch (1970-01-01 00:00:00 UTC).
+    static unix_epoch() -> SystemTime {
+        return SystemTime { secs: 0i64, nanos: 0i64 };
+    }
+
+    /// Time since the Unix epoch (a Unix timestamp). Saturates at zero
+    /// for a clock set before 1970.
+    duration_since_epoch(&this) -> Duration {
+        return diff_saturating(this.secs, this.nanos, 0i64, 0i64);
+    }
+
+    /// The time elapsed from `earlier` to `this` (saturating at zero).
+    /// Only meaningful if the wall clock has not been stepped between
+    /// the two readings.
+    duration_since(&this, earlier: &SystemTime) -> Duration {
+        return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
+    }
+}
+
+// sleep
+
+/// Park the current thread for at least `dur`. Restarts across signal
+/// interruptions (EINTR) using the kernel's remaining-time readout so the
+/// full span elapses. (`Duration` keeps `nanos < 1e9`, so the underlying
+/// `nanosleep` never sees an out-of-range request.)
+function sleep(dur: Duration) -> void {
+    mut req: timespec = timespec { tv_sec:  dur.secs as i64,
+                                   tv_nsec: dur.nanos as i64 };
+    mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    while (nanosleep(&req, &rem) != 0) {
+        req = rem;
+    }
+}

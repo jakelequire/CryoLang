@@ -1,0 +1,120 @@
+///! std::random: PRNG determinism, bounded-draw correctness, OS seeding,
+///! and the secure (kernel CSPRNG) byte source.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Random;
+
+import std::core::result;
+import std::collections::str;
+import std::random;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function from_seed_is_deterministic() -> Result<(), TestError> {
+    // Same seed -> identical stream.
+    mut a: Rng = Rng::from_seed(12345u64);
+    mut b: Rng = Rng::from_seed(12345u64);
+    expect_eq(a.next_u64(), b.next_u64())?;
+    expect_eq(a.next_u64(), b.next_u64())?;
+    expect_eq(a.next_u64(), b.next_u64())?;
+
+    // Different seeds -> different first draw (collision prob ~2^-64).
+    mut c: Rng = Rng::from_seed(1u64);
+    mut d: Rng = Rng::from_seed(2u64);
+    expect_true(c.next_u64() != d.next_u64(),
+                Str::new("distinct seeds produce distinct streams"))?;
+    return Result::Ok(());
+}
+
+![test]
+function below_is_in_range_and_spreads() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(777u64);
+    mut in_range: boolean = true;
+    mut saw_low:  boolean = false;
+    mut saw_high: boolean = false;
+    mut i: i32 = 0;
+    while (i < 2000) {
+        const v: u64 = r.below(10u64);
+        if (v >= 10u64) { in_range = false; }
+        if (v < 5u64) { saw_low = true; } else { saw_high = true; }
+        i = i + 1;
+    }
+    expect_true(in_range, Str::new("below(10) always yields < 10"))?;
+    expect_true(saw_low && saw_high, Str::new("below(10) spans its range"))?;
+    return Result::Ok(());
+}
+
+![test]
+function range_u64_respects_bounds() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(424242u64);
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < 2000) {
+        const v: u64 = r.range_u64(100u64, 110u64);
+        if (v < 100u64 || v >= 110u64) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("range_u64(100,110) stays within [100,110)"))?;
+    return Result::Ok(());
+}
+
+![test]
+function next_f64_is_unit_interval() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(2024u64);
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < 2000) {
+        const f: f64 = r.next_f64();
+        if (f < 0.0 || f >= 1.0) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("next_f64 stays in [0.0, 1.0)"))?;
+    return Result::Ok(());
+}
+
+![test]
+function fill_bytes_writes_exact_length() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(9u64);
+    mut buf: u8[8];
+    mut j: u64 = 0u64;
+    while (j < 8u64) { buf[j] = 0xAAu8; j = j + 1u64; }
+
+    // Fill only the first 5 bytes; the tail must be untouched.
+    r.fill_bytes(&buf[0], 5u64);
+    expect_eq(buf[5], 0xAAu8)?;
+    expect_eq(buf[6], 0xAAu8)?;
+    expect_eq(buf[7], 0xAAu8)?;
+    return Result::Ok(());
+}
+
+![test]
+function from_os_produces_varied_draws() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_os();
+    const x: u64 = r.next_u64();
+    const y: u64 = r.next_u64();
+    // Two consecutive draws colliding is ~2^-64.
+    expect_true(x != y, Str::new("OS-seeded draws vary"))?;
+    return Result::Ok(());
+}
+
+![test]
+function secure_bytes_fills_buffer() -> Result<(), TestError> {
+    mut buf: u8[32];
+    mut j: u64 = 0u64;
+    while (j < 32u64) { buf[j] = 0u8; j = j + 1u64; }
+
+    const ok: boolean = secure_bytes(&buf[0], 32u64);
+    expect_true(ok, Str::new("secure_bytes succeeds"))?;
+
+    // An all-zero 32-byte CSPRNG result is ~2^-256; treat a nonzero byte
+    // as proof entropy was written.
+    mut nonzero: boolean = false;
+    j = 0u64;
+    while (j < 32u64) {
+        if (buf[j] != 0u8) { nonzero = true; }
+        j = j + 1u64;
+    }
+    expect_true(nonzero, Str::new("secure_bytes wrote entropy"))?;
+    return Result::Ok(());
+}
