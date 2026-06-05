@@ -1695,6 +1695,58 @@ public:
         this.resolve_expr(node.expression);
     }
 
+    /// Return the `ImplTraitAnnotation*` if `ann` is an `implement Trait`
+    /// opaque type, else null.  Used to detect `mut x: implement Iterator<T>`
+    /// bindings, whose concrete type is taken from the initializer.
+    impl_trait_annotation_of(&this, ann: TypeAnnotation*) -> ImplTraitAnnotation* {
+        if (ann == null) { return null; }
+        match (*ann) {
+            TypeAnnotation::ImplTrait(imp) => { return imp; }
+            _ => { return null; }
+        }
+    }
+
+    /// Verify that `concrete` (the initializer's type for an `implement Trait`
+    /// binding) satisfies every declared trait bound, e.g. that `SliceIter<i32>`
+    /// implements `Iterator` for `mut it: implement Iterator<i32> = ...`.
+    /// Emits E0200 on the first unmet bound. The trait-argument (`<i32>`) is
+    /// not yet checked against the type's associated item — `type_implements_trait`
+    /// keys on the trait name only — so this catches "wrong trait", not
+    /// "right trait, wrong element type".
+    verify_impl_trait_bounds(mut &this, imp: ImplTraitAnnotation*,
+                             concrete: TypeRef, var_node: VarDeclNode*) -> void {
+        if (imp == null || this.ctx.monomorphizer == null) { return; }
+        for (mut i: i64 = 0; i < imp.bounds.length; i++) {
+            const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
+            if (!trait_name.is_valid()) { continue; }
+            if (this.ctx.monomorphizer.type_satisfies_opaque_bound(concrete, trait_name)) {
+                continue;
+            }
+            const var_name:  string = this.intern.resolve(var_node.name);
+            const trait_str: string = this.intern.resolve(trait_name);
+            const conc_str:  string = this.type_display_name(concrete);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0200_TYPE_MISMATCH,
+                format("`%s` is declared `implement %s`, but its initializer has type `%s`, which does not implement `%s`",
+                       var_name, trait_str, conc_str, trait_str));
+            diag = diag.at_with_label(annotation_span(var_node.type_annotation),
+                "this opaque type requires the initializer to implement the trait");
+            this.ctx.emit_diagnostic(diag);
+            return;
+        }
+    }
+
+    /// Leaf trait name of a bound annotation: `Iterator<i32>` -> `Iterator`,
+    /// `Copy` -> `Copy`.
+    trait_leaf_name(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        match (*ann) {
+            TypeAnnotation::Named(n)    => { return n.name; }
+            TypeAnnotation::Generic(g)  => { return this.trait_leaf_name(g.base); }
+            _ => { return SymbolStr::empty(); }
+        }
+    }
+
     override visit(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
@@ -1914,13 +1966,25 @@ public:
             // The initializer's resolved_type IS the iterator type; we
             // copy it onto the binding so downstream calls to `.next()`
             // and the scope-exit drop see a normally-typed local.
+            // `mut it: implement Iterator<i32> = arr.iter();`. The opaque
+            // annotation names no concrete type, so resolving it above
+            // yielded invalid; the concrete type IS the initializer's. Take
+            // it (mirroring the lambda/is_auto back-fill) and verify it
+            // satisfies the declared trait bounds just below.
+            const imp_ann: ImplTraitAnnotation* =
+                this.impl_trait_annotation_of(var_node.type_annotation);
             if (!var_node.has_resolved_type() && init_type.is_valid()
                     && var_node.initializer != null
                     && ((var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression
-                        || var_node.is_auto)) {
+                        || var_node.is_auto
+                        || imp_ann != null)) {
                 var_node.resolved_type = init_type;
             }
-            if (var_node.has_resolved_type() && init_type.is_valid()) {
+            if (imp_ann != null && init_type.is_valid()) {
+                this.verify_impl_trait_bounds(imp_ann, init_type, var_node);
+            }
+            if (var_node.has_resolved_type() && init_type.is_valid()
+                    && imp_ann == null) {
                 // Declared type exists; check that the initializer is compatible
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
                     const var_name: string = this.intern.resolve(var_node.name);

@@ -2071,10 +2071,40 @@ public:
             return this.parse_type_suffixes(tup);
         }
 
+        // `implement Trait + Trait2` opaque type. `implement` is already a
+        // reserved keyword (it heads `implement` blocks), so it can never be
+        // a type name; seeing it at the start of a type annotation is an
+        // unambiguous opaque-type marker.
+        if (this.check(TokenType::KwImplement)) {
+            return this.parse_impl_trait_type();
+        }
+
         // Base type + optional suffixes
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
         return this.parse_type_suffixes(base);
+    }
+
+    /// Parse `implement Trait + Trait2 + ...`. Each bound is a base type
+    /// (`Named` or `Generic`, e.g. `Iterator<i32>`); pointer/array/optional
+    /// suffixes are not meaningful on a trait bound, so `parse_base_type` is
+    /// used directly rather than `parse_type_annotation`.
+    parse_impl_trait_type() -> TypeAnnotation* {
+        const start: Token = this.current();
+        this.advance(); // consume `implement`
+        mut bounds: TypeAnnotation*[] = [];
+        while (true) {
+            const bound: TypeAnnotation* = this.parse_base_type();
+            if (bound == null) { break; }
+            bounds.push(bound);
+            if (!this.match_tok(TokenType::Plus)) { break; }
+        }
+        const imp: ImplTraitAnnotation* = new ImplTraitAnnotation {
+            bounds:   bounds,
+            resolved: TypeRef::invalid(),
+            span:     this.span_from(start),
+        };
+        return new TypeAnnotation::ImplTrait(imp);
     }
 
     /// Parse a base type (primitive, `This`, or named).

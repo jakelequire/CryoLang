@@ -1,0 +1,143 @@
+// `implement Trait` opaque return / binding types.
+//
+// `implement Iterator<T>` in return or binding position is an opaque ALIAS
+// for the single concrete type the compiler infers from the body's return
+// expression (Cryo monomorphizes; this is not `dyn`/erasure). It lets a
+// method hide its concrete iterator struct, and lets a caller bind the
+// result without naming that struct.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ImplTraitIter;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::collections::array;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// A user iterator + a non-generic producer returning `implement Iterator`.
+// ---------------------------------------------------------------------------
+
+type struct CountUp {
+    value: i32;
+    limit: i32;
+}
+
+implement trait Iterator<i32> for struct CountUp {
+    next(mut &this) -> Option<i32> {
+        if (this.value >= this.limit) { return Option::None; }
+        const v: i32 = this.value;
+        this.value = this.value + 1;
+        return Option::Some(v);
+    }
+}
+
+type struct Counter {
+    cap: i32;
+}
+
+implement struct Counter {
+    // Return position: the concrete `CountUp` never appears in the signature.
+    iter(&this) -> implement Iterator<i32> {
+        return CountUp { value: 0, limit: this.cap };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A generic producer: the inferred concrete type carries the owner's `T`
+// and must specialize per instantiation.
+// ---------------------------------------------------------------------------
+
+type struct BufIter<T> {
+    ptr: T*;
+    remaining: u64;
+}
+
+implement<T> trait Iterator<T> for struct BufIter<T> {
+    next(mut &this) -> Option<T> {
+        if (this.remaining == 0) { return Option::None; }
+        const v: T = *this.ptr;
+        this.ptr = mem::offset(this.ptr, 1);
+        this.remaining = this.remaining - 1;
+        return Option::Some(v);
+    }
+}
+
+type struct MyVec<T> {
+    data: T*;
+    len: u64;
+}
+
+implement<T> struct MyVec<T> {
+    iter(&this) -> implement Iterator<T> where T: Copy {
+        return BufIter<T> { ptr: this.data, remaining: this.len };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+![test]
+function for_in_over_opaque_return() -> Result<(), TestError> {
+    const c: Counter = Counter { cap: 5 };
+    mut sum: i32 = 0;
+    for (x in c.iter()) { sum = sum + x; }   // 0+1+2+3+4
+    return expect_eq(sum, 10);
+}
+
+![test]
+function opaque_local_binding_manual_drive() -> Result<(), TestError> {
+    const c: Counter = Counter { cap: 4 };
+    // Bind the opaque iterator to a named local without naming `CountUp`.
+    mut it: implement Iterator<i32> = c.iter();
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None    => { break; }
+        }
+    }
+    return expect_eq(sum, 6);   // 0+1+2+3
+}
+
+![test]
+function opaque_binding_trait_default_consumer() -> Result<(), TestError> {
+    const c: Counter = Counter { cap: 7 };
+    mut it: implement Iterator<i32> = c.iter();
+    const n: u64 = it.count();   // Iterator::count default on the opaque type
+    return expect_eq(n, 7);
+}
+
+![test]
+function generic_opaque_two_instantiations() -> Result<(), TestError> {
+    mut bi: i32[] = [10, 20, 30, 40];
+    const vi: MyVec<i32> = MyVec<i32> { data: &bi[0], len: 4 };
+    mut si: i32 = 0;
+    for (x in vi.iter()) { si = si + x; }
+
+    mut bu: u64[] = [1, 2, 3];
+    const vu: MyVec<u64> = MyVec<u64> { data: &bu[0], len: 3 };
+    mut it: implement Iterator<u64> = vu.iter();
+    const cu: u64 = it.count();
+
+    match (expect_eq(si, 100)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cu, 3);
+}
+
+![test]
+function stdlib_array_iter_is_opaque() -> Result<(), TestError> {
+    // Array::iter() now returns `implement Iterator<i32>`; bind it as such.
+    mut a: Array<i32> = Array::new();
+    a.push(3);
+    a.push(4);
+    a.push(5);
+    mut it: implement Iterator<i32> = a.iter();
+    const n: u64 = it.count();
+    a.drop();
+    return expect_eq(n, 3);
+}

@@ -409,6 +409,69 @@ type struct Config {
 
 ---
 
+### 2.11 Opaque Types (`implement Trait`)
+
+`implement Trait` in a return type or a variable annotation is an *opaque
+type*: it stands for one specific concrete type without naming it. The
+compiler infers the real type and uses it everywhere; you simply do not have
+to write it.
+
+```cryo
+// The concrete iterator (`SliceIter<T>`) never appears in the signature.
+iter(&this) -> implement Iterator<T> where T: Copy {
+    return SliceIter<T> { ptr: this.ptr, remaining: this.length };
+}
+
+// A caller binds the result without naming the concrete type either.
+mut it: implement Iterator<i32> = arr.iter();
+const n: u64 = it.count();          // trait methods are available
+```
+
+Because Cryo monomorphises, this is a purely static, zero-cost construct: an
+`implement Iterator<i32>` value *is* the underlying concrete type (here
+`SliceIter<i32>`), method calls dispatch statically, and there is no heap
+allocation, vtable, or runtime indirection. It corresponds to "return some
+single type that implements this trait", **not** to a dynamically-dispatched
+trait object. (`implement` is the same keyword used for implement blocks; in
+*type position* it introduces an opaque type, while at the *start of a
+declaration* it introduces an implement block — the two never overlap.)
+
+**Where it is allowed.** Two positions:
+
+- **Return type** — the concrete type is inferred from the body's first
+  `return` expression. That expression must currently be a *struct literal*
+  (e.g. `return SliceIter<T> { … }`), which is how every standard-library
+  iterator is written.
+- **Variable binding** — `mut it: implement Iterator<i32> = expr;`. The type
+  is taken from the initialiser, which is then checked to actually implement
+  the named trait; a mismatch is `E0200`:
+
+  ```cryo
+  mut it: implement Iterator<i32> = some_non_iterator;  // E0200
+  ```
+
+To accept *any* iterator as a **parameter**, use a generic with a trait bound
+instead — that is the tool for the input side:
+
+```cryo
+function sum<I>(mut it: I) -> i32 where I: Iterator<i32> { … }
+```
+
+**Multiple bounds** combine with `+`: `implement Iterator<i32> + Clone`.
+
+**One concrete type per site.** An opaque return names a single underlying
+type — every `return` in the body must produce the same one. Two iterators of
+different concrete types cannot be returned from one `implement Trait`
+function (that would require a dynamically-dispatched trait object, which Cryo
+does not provide).
+
+The trait argument is matched by name, not by its associated item: a binding
+annotated `implement Iterator<i32>` is verified to implement `Iterator`, but
+the `<i32>` element type is not yet cross-checked against the iterator's
+actual item type.
+
+---
+
 ## 3. Variables and Constants
 
 Every variable declaration in Cryo has three parts: a mutability qualifier (`const` or `mut`), a name with a type annotation, and an optional initialiser.
@@ -1411,6 +1474,8 @@ where T: Hash + Eq, V: Clone
 | `Allocator` | Heap allocation strategy. |
 
 Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FmtWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
+
+The collection iterator entry points (`Array::iter`, `HashMap::keys`/`values`, `Str::split`, …) return [`implement Iterator<…>`](#211-opaque-types-implement-trait) rather than naming their concrete cursor structs, so you consume them through the trait and a `for-in` loop without ever spelling the underlying type.
 
 ---
 

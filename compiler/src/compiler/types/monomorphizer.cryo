@@ -1930,6 +1930,36 @@ type struct Monomorphizer {
         return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
     }
 
+    /// Lenient "does `ty` implement `trait_name`" check for verifying an
+    /// `implement Trait` binding annotation against its initializer.
+    ///
+    /// `type_implements_trait` fully verifies an impl's where-bounds, but it
+    /// can't bind where-clause-ONLY generics — e.g. the `T` in
+    /// `implement<I, T> Iterator<T> for CopiedIter<I> where I: Iterator<T*>`
+    /// is recovered by pointer-peeling at instantiation, which the bound
+    /// checker doesn't replay — so it wrongly reports `CopiedIter`/`TakeIter`/
+    /// `MapIter`/`FilterIter` as non-implementers. For an opaque-binding
+    /// sanity check the precise where-bounds don't matter: it's enough that
+    /// the trait is implemented for this type at all (a genuinely unrelated
+    /// type has no such impl). Any truly-unsatisfied where-bound still
+    /// surfaces precisely at the first trait-method call on the concrete type.
+    type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: SymbolStr) -> boolean {
+        if (this.type_implements_trait(ty, trait_name, 0)) { return true; }
+        if (this.generic_registry == null) { return false; }
+        mut subject: TypeRef = ty;
+        const subj_t0: Type* = this.arena.lookup(ty.id);
+        if (subj_t0 != null
+                && (subj_t0.kind == TypeKind::Struct
+                    || subj_t0.kind == TypeKind::Class
+                    || subj_t0.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, ty);
+            if (wrapper.is_valid()) { subject = wrapper; }
+        }
+        const target_name: SymbolStr = this.bare_name_of(subject);
+        if (!target_name.is_valid()) { return false; }
+        return this.generic_registry.lookup_trait_impl(trait_name, target_name) != null;
+    }
+
     /// `bounds_satisfied` with explicit recursion depth, used by
     /// `type_implements_trait` so the recursive chain shares a single
     /// depth budget.
