@@ -1,0 +1,89 @@
+///! std::thread::Builder: configured spawning (stack size + OS thread
+///! name) on top of `spawn_with_attr`.
+///!
+///! Exercises the by-value generic builder methods (`spawn` / `try_spawn`
+///! take `this` by value) end-to-end, including the OS thread name set
+///! via `pthread_setname_np` and stack-size validation.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ThreadBuilder;
+
+import std::core::result;
+import std::collections::str;
+import std::thread;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+/// Plain worker: double its input.
+function double_it(x: i32) -> i32 {
+    return x * 2;
+}
+
+/// Worker that checks its OWN OS thread name matches "worker". The name
+/// is applied by the parent right after `pthread_create` returns, so poll
+/// briefly to avoid racing the set. Returns 1 on match, 0 on timeout.
+function name_is_worker(tag: i32) -> i32 {
+    const expected: Str = Str::new("worker");
+    mut tries: i32 = 0;
+    while (tries < 500) {
+        mut buf: u8[32];
+        mut i: u64 = 0u64;
+        while (i < 32u64) { buf[i] = 0u8; i = i + 1u64; }
+        libc::pthread_getname_np(libc::pthread_self(), &buf[0], 32u64);
+        const got: Str = Str::from_raw(&buf[0], libc::strlen(&buf[0]));
+        if (got.equals(&expected)) { return 1; }
+        thread::sleep_ms(1u64);
+        tries = tries + 1;
+    }
+    return 0;
+}
+
+![test]
+function builder_default_spawn_join() -> Result<(), TestError> {
+    // A default Builder behaves like thread::spawn.
+    const h: thread::JoinHandle<i32> =
+        thread::Builder::new().spawn<i32, i32>(21, double_it);
+    const r: i32 = h.join();
+    expect_eq(r, 42)?;
+    return Result::Ok(());
+}
+
+![test]
+function builder_stack_size_spawns() -> Result<(), TestError> {
+    // A custom (valid) stack size must not disturb the result.
+    const h: thread::JoinHandle<i32> = thread::Builder::new()
+        .stack_size(1u64 << 20)            // 1 MiB
+        .spawn<i32, i32>(50, double_it);
+    const r: i32 = h.join();
+    expect_eq(r, 100)?;
+    return Result::Ok(());
+}
+
+![test]
+function builder_sets_os_thread_name() -> Result<(), TestError> {
+    // The worker reads back its own name and confirms the Builder set it.
+    const h: thread::JoinHandle<i32> = thread::Builder::new()
+        .name(Str::new("worker"))
+        .stack_size(1u64 << 20)
+        .spawn<i32, i32>(0, name_is_worker);
+    const matched: i32 = h.join();
+    expect_eq(matched, 1)?;
+    return Result::Ok(());
+}
+
+![test]
+function builder_try_spawn_rejects_tiny_stack() -> Result<(), TestError> {
+    // A stack size below PTHREAD_STACK_MIN must be rejected by the OS
+    // (EINVAL from pthread_attr_setstacksize), surfacing as an Err rather
+    // than a silent clamp or a crash.
+    const res: Result<thread::JoinHandle<i32>, thread::SpawnError> =
+        thread::Builder::new().stack_size(1u64).try_spawn<i32, i32>(7, double_it);
+    const is_err: boolean = res.is_err();
+    match (res) {
+        Result::Ok(h)  => { h.join(); }   // shouldn't happen; join to not leak
+        Result::Err(_) => { }
+    }
+    expect_true(is_err, Str::new("a 1-byte stack must be rejected"))?;
+    return Result::Ok(());
+}

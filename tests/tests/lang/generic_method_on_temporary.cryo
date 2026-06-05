@@ -1,0 +1,76 @@
+///! Regression: a GENERIC method called on a TEMPORARY (call-expression)
+///! receiver - the fluent-builder shape `T::new().cfg(..).run<U>(..)`.
+///!
+///! Two compiler bugs used to break this pattern:
+///!
+///!  1. A by-value (`this` / `mut this`) method called cross-module dropped
+///!     its receiver from the extern signature (the receiver param had no
+///!     resolved_type, so decl_index skipped it) -> LLVM "incorrect number
+///!     of arguments". Fixed by recovering the receiver's target type.
+///!  2. A generic method on a temporary receiver was never specialized,
+///!     because the monomorphizer couldn't type a call-expression receiver
+///!     before sema ran -> codegen E0636 "no method found". Fixed by
+///!     resolving a concrete, non-generic builder-chain receiver from the
+///!     declared method-return types.
+///!
+///! This file pins the second (and the by-value receiver path) same-module;
+///! the cross-module angle is covered by tests/stdlib/thread_builder.cryo.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::GenericMethodOnTemporary;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// A POD builder: by-value config methods plus a generic terminal method.
+type struct Cfg {
+    scale: i32;
+
+    static new() -> Cfg {
+        return Cfg { scale: 1 };
+    }
+
+    // By-value `mut this` config method, returns Self (builder chaining).
+    with_scale(mut this, s: i32) -> Cfg {
+        this.scale = s;
+        return this;
+    }
+
+    // Generic method taking `this` by value. Applies `f` to `ctx` and
+    // scales the result. `run<C, T>` is the shape that used to fail when
+    // the receiver was a temporary.
+    run<C>(this, ctx: C, f: (C) -> i32) -> i32 {
+        return f(ctx) * this.scale;
+    }
+}
+
+function ident(x: i32) -> i32 {
+    return x;
+}
+
+![test]
+function generic_method_on_chained_temporary() -> Result<(), TestError> {
+    // Receiver is the temporary returned by `with_scale` - the case that
+    // used to surface E0636 at codegen.
+    const r: i32 = Cfg::new().with_scale(10).run<i32>(5, ident);
+    expect_eq(r, 50)?;
+    return Result::Ok(());
+}
+
+![test]
+function generic_method_on_new_temporary() -> Result<(), TestError> {
+    // Receiver is the `new()` temporary directly (scale defaults to 1).
+    const r: i32 = Cfg::new().run<i32>(7, ident);
+    expect_eq(r, 7)?;
+    return Result::Ok(());
+}
+
+![test]
+function generic_method_on_named_local() -> Result<(), TestError> {
+    // The path that always worked - guard it stays working.
+    const c: Cfg = Cfg::new().with_scale(3);
+    const r: i32 = c.run<i32>(4, ident);
+    expect_eq(r, 12)?;
+    return Result::Ok(());
+}
