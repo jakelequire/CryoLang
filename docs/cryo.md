@@ -1694,11 +1694,26 @@ Wildcard imports are convenient but can cause name collisions; prefer the brace 
 
 | Modifier | Meaning |
 | --- | --- |
-| *(none)* / `private` | Accessible only within the same module. |
-| `public` | Accessible to any module that imports this one. |
+| *(none)* / `public` | Accessible to any module that imports this one. This is the default for top-level items. |
+| `private` | Accessible only within the same module. |
 | `protected` | Class-only; accessible to the class and its subclasses. |
 
-Items are private by default. Visibility is part of an item's signature: only what you explicitly mark `public` becomes part of your module's public interface.
+Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `class` / `enum`), `private` is enforced across modules: naming a `private` type from another module — in a type annotation, a struct literal, or a function signature — is rejected with `E0503`. A `private` type remains fully usable within its own module.
+
+This is the mechanism behind hiding iterator engines: a cursor struct can be `private` while its producer returns [`implement Iterator<…>`](#211-opaque-types-implement-trait), so callers consume the sequence through the trait and can never name the concrete type.
+
+```cryo
+// engine.cryo
+namespace app::engine;
+private type struct Cursor { /* … */ }          // hidden outside app::engine
+public function scan(...) -> implement Iterator<i32> { return Cursor { ... }; }
+
+// main.cryo
+namespace app;
+import app::engine;
+for (x in scan(...)) { ... }                     // fine — never names Cursor
+mut c: Cursor = ...;                             // E0503: `Cursor` is private to `app::engine`
+```
 
 ---
 
