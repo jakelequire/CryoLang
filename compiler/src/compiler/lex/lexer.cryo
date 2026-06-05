@@ -170,6 +170,10 @@ private:
         const start: string = intrinsics::ptr_add(this.current as void*, -1) as string;
 
         mut is_special_base: boolean = false;
+        // Set once a fractional part or exponent is seen, so the suffix
+        // check below can reject an integer type suffix on a float
+        // literal (`1.5u8`, `2.0i32`).
+        mut is_float: boolean = false;
 
         // Special base prefixes (0x, 0b, 0o)
         if (*start == '0' && !this.at_end()) {
@@ -235,6 +239,7 @@ private:
             if (!this.at_end() && this.peek() == '.') {
                 const next: char = this.peek_ahead(1);
                 if (Lexer::is_digit(next)) {
+                    is_float = true;
                     this.advance(); // consume '.'
                     while (!this.at_end() && (Lexer::is_digit(this.peek()) || this.peek() == '_')) {
                         this.advance();
@@ -243,6 +248,7 @@ private:
             }
 
             if (!this.at_end() && (this.peek() == 'e' || this.peek() == 'E')) {
+                is_float = true;
                 this.advance();
                 if (!this.at_end()) {
                     if (this.peek() == '+' || this.peek() == '-') {
@@ -279,6 +285,13 @@ private:
             if (!Lexer::is_valid_numeric_suffix(suffix)) {
                 // Not a valid suffix, backtrack
                 this.current = suffix_start;
+            } else if (is_float && !Lexer::is_float_suffix(suffix)) {
+                // A float literal (has a fractional part or exponent) may
+                // only carry a float suffix. `1.5u8` / `2.0i32` were
+                // previously accepted with the contradictory integer
+                // suffix riding along in the lexeme.
+                return this.emit_error(ErrorCode::E0011_LEXING_EXCEPTION,
+                    "integer type suffix on a floating-point literal; use `f32`/`f64` or drop the suffix");
             }
         }
 
@@ -891,6 +904,12 @@ private:
             if (s == table[i]) { return true; }
         }
         return false;
+    }
+
+    /// True iff `s` is a floating-point type suffix (`f32`/`f64`). Used to
+    /// reject an integer suffix on a float literal (`1.5u8`).
+    static is_float_suffix(s: string) -> boolean {
+        return s == "f32" || s == "f64";
     }
 
     /// Processes escape sequences in a string literal, converting backslash

@@ -104,9 +104,11 @@ type struct TcpStream {
         mut sockaddr_buf: u8[16];
         const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &remote)?;
 
+        // `SOCK_CLOEXEC` opens the socket close-on-exec so a concurrent
+        // `fork`+`exec` does not leak it into the child.
         const sock: i32 = libc::socket(
             libc::AddressFamily::AF_INET,
-            libc::SOCK_STREAM,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
             libc::Protocol::IPPROTO_IP);
         if (sock < 0) {
             return Result::Err(IoError::from_errno(libc::errno()));
@@ -193,9 +195,11 @@ type struct TcpListener {
         mut sockaddr_buf: u8[16];
         const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &local)?;
 
+        // `SOCK_CLOEXEC` opens the listening socket close-on-exec so a
+        // concurrent `fork`+`exec` does not leak it into the child.
         const sock: i32 = libc::socket(
             libc::AddressFamily::AF_INET,
-            libc::SOCK_STREAM,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
             libc::Protocol::IPPROTO_IP);
         if (sock < 0) {
             return Result::Err(IoError::from_errno(libc::errno()));
@@ -228,7 +232,11 @@ type struct TcpListener {
         mut sockaddr_buf: u8[16];
         mut addrlen: u32 = 16;
         loop {
-            const client_fd: i32 = libc::accept(this.fd, &sockaddr_buf[0], &addrlen);
+            // `accept4` with `SOCK_CLOEXEC`: an accepted fd does NOT
+            // inherit the listener's close-on-exec, so set it atomically
+            // here to avoid leaking the connection into a forked child.
+            const client_fd: i32 = libc::accept4(this.fd, &sockaddr_buf[0],
+                                                 &addrlen, libc::SOCK_CLOEXEC);
             if (client_fd >= 0) {
                 return Result::Ok(TcpStream::from_fd(client_fd));
             }

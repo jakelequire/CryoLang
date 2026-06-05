@@ -250,10 +250,13 @@ implement trait Drop for struct ChildStderr {
     }
 }
 
-/// Close any captured pipe ends. Does **not** reap the child;
-/// forgetting to `wait` leaks a zombie in the kernel. Documented
-/// obligation; a future revision can make this best-effort-reap when
-/// the type system can express "must be used" linearity.
+/// Close any captured pipe ends and best-effort-reap the child. The
+/// reap is **non-blocking** (`WNOHANG`): if the child has already
+/// exited, its zombie is released here; if it is still running we
+/// cannot block in a destructor, so a still-running child that is
+/// dropped without `wait` remains detached and the caller is still
+/// responsible for reaping it. This closes the common "spawn, child
+/// finishes, drop without wait" zombie leak without ever blocking.
 implement trait Drop for struct Child {
     drop(mut &this) -> void {
         // Drop synthesis releases each `mut handle` at its match-arm
@@ -274,5 +277,27 @@ implement trait Drop for struct Child {
             Option::None => { }
         }
         this.stderr = Option::None;
+
+        // Non-blocking reap. Skips a child already reaped via
+        // `wait`/`try_wait`. A WNOHANG `waitpid` never blocks: it
+        // returns the pid (zombie reaped), 0 (still running — left
+        // detached), or -1 (already reaped / no such child). EINTR is
+        // retried once; any other error is ignored in a destructor.
+        if (!this.waited) {
+            mut status: i32 = 0;
+            loop {
+                const rc: i32 = libc::waitpid(this.pid, &status, libc::WNOHANG);
+                if (rc < 0) {
+                    const err: IoError = IoError::from_errno(libc::errno());
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return; }
+                    }
+                } else {
+                    if (rc > 0) { this.waited = true; }
+                    return;
+                }
+            }
+        }
     }
 }

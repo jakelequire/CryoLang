@@ -128,18 +128,17 @@ Integer literals support four bases. Underscores are visual separators that the 
 
 #### String and Character Literals
 
-Strings are enclosed in double quotes; characters in single quotes. Both share the same set of escape sequences. Raw strings, prefixed with `r`, treat backslashes literally.
+Strings are enclosed in double quotes; characters in single quotes. Both share the same set of escape sequences.
 
 ```cryo
 "Hello, world!"
 "line one\nline two"
-r"C:\Users\name\file"     // raw: backslashes are literal
 'A'
 '\n'
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\a` `\b` `\f` `\v` `\0` `\\` `\'` `\"` `\xHH` (hex byte).
+**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented — see [§ 21](#21-reserved-syntax).
 
 #### f-strings (string interpolation)
 
@@ -2112,7 +2111,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. TLS, UDP, HTTP/2, and WebSocket are out of scope for 1.0 and are tracked on the post-1.0 roadmap. |
 | **`process`** | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported. |
 | **`sync`** | Atomics (`AtomicU8`/`U32`/`U64`/`I32`/`I64`/`Bool`, `MemoryOrder`, `fence`, `compiler_fence`), `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement. |
-| **`thread`** | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `JoinHandle` / `Builder` and `mpsc` channels are post-1.0; the primitives under `sync` and `Arc<T>` already ship. |
+| **`thread`** | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. A named-`Builder` configuration API is post-1.0 (use `spawn_with_attr` for stack-size control today). |
 | **`test`** | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing). |
 
 ### 19.3 Naming Conventions in the Standard Library
@@ -2212,6 +2211,9 @@ The lexer and grammar reserve the following forms because the language plans to 
 
 | Reserved | Status |
 | --- | --- |
+| `i128` / `u128` | Reserved. The lexer and type system accept the `i128` / `u128` type keywords, but 128-bit code generation is incomplete: the SysV ABI lowering truncates a 128-bit value to 64 bits across a call boundary, generic instantiation collapses `i128`/`u128` onto `i64`/`u64`, and there is no `i128`/`u128` integer-literal suffix. Use `i64` / `u64` for now. |
+| Raw strings `r"..."` | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal. |
+| Escapes `\a` `\b` `\f` `\v` | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`. |
 | `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
 | `yield` | Parser accepts a `yield` expression; no generator semantics exist. |
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
