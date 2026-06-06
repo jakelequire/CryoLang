@@ -1,0 +1,118 @@
+///! Regression: an owning-enum `match` whose arm moves the subject's
+///! payload, nested inside another scope (a block or an outer match arm).
+///!
+///! Two codegen bugs used to break this:
+///!  1. The subject is partially moved (one arm extracts the payload, others
+///!     don't), so drop_insertion synthesizes a `<subj>__dropflag` and a
+///!     scope-exit `if (!flag) { drop }`.  When the match is nested, the
+///!     flag's name binding was popped with the inner block scope before the
+///!     conditional drop (which runs at an outer scope) read it -> the
+///!     condition failed to codegen -> a `cond_br` with an invalid condition
+///!     emitted NO terminator -> "N of M basic blocks unterminated" (E0633),
+///!     body discarded.  Fixed by registering drop-flag locals persistently.
+///!  2. The flag's `store false` init sat inside a conditional arm, so a
+///!     sibling path reaching the drop read the flag uninitialized (benign
+///!     in effect - the enum drop glue tag-guards - but UB).  Fixed by
+///!     defaulting drop-flag slots to false in the entry block.
+///!
+///! Each arm mutates an accumulator so a mis-compile is observable, and the
+///! owning payloads (String / Array) mean a wrong drop would leak or
+///! double-free (caught by the suite's valgrind gate).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::NestedMatchConditionalMove;
+
+import std::core::result;
+import std::collections::string;
+import std::collections::str;
+import std::collections::array;
+import std::test::error;
+import std::test::assert;
+
+type enum Message {
+    Text(String);
+    Binary(Array<u8>);
+    Close;
+}
+
+function make(which: i32) -> Message {
+    if (which == 0) { return Message::Text(String::from_str(Str::new("hello"))); }
+    if (which == 1) { return Message::Binary(Array<u8>::new()); }
+    return Message::Close;
+}
+
+/// Inner owning-enum match nested in a plain block; the Text arm moves the
+/// payload out, the others don't.
+function probe(which: i32) -> i32 {
+    mut out: i32 = 0;
+    {
+        match (make(which)) {
+            Message::Text(s)   => { mut o: String = s; out = o.length() as i32; o.drop(); }
+            Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); out = 7; }
+            Message::Close     => { out = 9; }
+        }
+    }
+    return out;
+}
+
+![test]
+function nested_match_payload_move_compiles_and_runs() -> Result<(), TestError> {
+    expect_eq(probe(0), 5)?;   // "hello".length()
+    expect_eq(probe(1), 7)?;   // Binary
+    expect_eq(probe(2), 9)?;   // Close
+    return Result::Ok(());
+}
+
+/// The outer-match-arm-subject variant: the inner match's subject is bound by
+/// the OUTER match arm, and the Err path reaches the subject's conditional
+/// drop without binding it — the case that exposed the uninitialized-flag
+/// read.
+function probe_result(r: Result<Message, i32>) -> i32 {
+    mut out: i32 = 0;
+    match (r) {
+        Result::Ok(msg) => {
+            match (msg) {
+                Message::Text(s)   => { mut o: String = s; out = o.length() as i32; o.drop(); }
+                Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); out = 7; }
+                Message::Close     => { out = 9; }
+            }
+        }
+        Result::Err(_) => { out = -1; }
+    }
+    return out;
+}
+
+![test]
+function nested_match_in_outer_arm_is_defined_on_all_paths() -> Result<(), TestError> {
+    expect_eq(probe_result(Result::Ok(Message::Text(String::from_str(Str::new("hi"))))), 2)?;
+    expect_eq(probe_result(Result::Ok(Message::Close)), 9)?;
+    expect_eq(probe_result(Result::Err(3)), -1)?;
+    return Result::Ok(());
+}
+
+/// A loop body re-entering the nested move match: the flag must reset per
+/// iteration (the decl's own `store false` runs each pass), not stick at the
+/// first iteration's value.
+function loopy() -> i32 {
+    mut total: i32 = 0;
+    mut i: i32 = 0;
+    while (i < 6) {
+        {
+            mut m: Message = make(i % 3);
+            match (m) {
+                Message::Text(s)   => { mut o: String = s; total = total + (o.length() as i32); o.drop(); }
+                Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); total = total + 1; }
+                Message::Close     => { total = total + 100; }
+            }
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+![test]
+function nested_match_move_in_loop_resets_flag() -> Result<(), TestError> {
+    // i%3: 0,1,2,0,1,2 -> Text x2 (5 each), Binary x2 (1 each), Close x2 (100 each)
+    expect_eq(loopy(), 5 + 5 + 1 + 1 + 100 + 100)?;
+    return Result::Ok(());
+}
