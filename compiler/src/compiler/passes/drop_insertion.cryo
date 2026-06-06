@@ -1098,6 +1098,14 @@ type struct DropInserter {
             subj_ty   = subject.resolved_type;
         }
         mut subject_consumed: boolean = false;
+        // Arm indices that consume the subject's payload.  When the subject
+        // already carries a drop flag (an earlier conditional move/assignment,
+        // e.g. inside a loop), a later match that consumes it must SET that
+        // flag on the consuming arms so the scope-exit conditional drop is
+        // skipped - otherwise the subject's heap is freed twice (once by the
+        // arm, once at exit). Recorded per-arm because only the consuming arms
+        // get the flag-set.
+        mut consumed_arm_idx: i64[] = [];
 
         // Each arm is a separate control-flow path; same
         // intersection/union join as walk_if, generalised over N arms.
@@ -1161,6 +1169,7 @@ type struct DropInserter {
             if (reg_count > 0) {
                 if (this.check_and_unregister_arm_bindings(reg_count)) {
                     subject_consumed = true;
+                    consumed_arm_idx.push(a);
                 }
             }
             if (arm_div) {
@@ -1237,6 +1246,26 @@ type struct DropInserter {
         // non-consuming arms (e.g. `None`) carry no payload to leak.
         if (subj_name.is_valid() && subject_consumed && subject != null) {
             this.mark_moved(subj_name, subject.span);
+            // If the subject already had a drop flag (it was conditionally
+            // moved/assigned earlier - typically reassigned inside a loop),
+            // marking it moved in the static set is not enough: its scope-exit
+            // drop is emitted CONDITIONALLY on the flag, so the consuming arms
+            // must set the flag to the moved state. The cond-move flag synthesis
+            // above only fires for NEW conditional moves (and never for match
+            // EXPRESSIONS, where `m` is null), so a definite consume of an
+            // already-flagged subject would otherwise leave the flag stale and
+            // double-free. Set it on each consuming arm. (No-op when the subject
+            // has no flag - the common, unconditional case stays byte-identical.)
+            const subj_flag: SymbolStr = this.get_drop_flag(subj_name);
+            if (subj_flag.is_valid()) {
+                for (mut c: i64 = 0; c < consumed_arm_idx.length; c++) {
+                    const ai: i64 = consumed_arm_idx[c];
+                    const carm: MatchArmNode* = arms[ai];
+                    if (carm == null || carm.body == null) { continue; }
+                    carm.body = this.splice_flag_set_at_front(
+                        carm.body, subj_flag, subject.span);
+                }
+            }
         }
         return false;
     }
@@ -1958,6 +1987,30 @@ type struct DropInserter {
         const blk: BlockStmtNode* = new BlockStmtNode(span);
         blk.statements.push(branch);
         blk.statements.push(set_stmt);
+        return blk as StatementNode*;
+    }
+
+    /// Prepend `<flag>=true;` to the FRONT of a branch body.  Unlike
+    /// `splice_flag_set_into_branch` (which appends), this keeps the branch's
+    /// trailing statement intact - essential for a match-EXPRESSION arm whose
+    /// last statement is the yielded value (`{ p }`): appending would make the
+    /// flag-set the arm's value.  Front insertion is order-safe because the
+    /// flag merely records that the matched subject is consumed on this arm's
+    /// path, independent of where in the arm the consumption textually occurs.
+    splice_flag_set_at_front(mut &this, branch: StatementNode*,
+                             flag_name: SymbolStr,
+                             span: SourceSpan) -> StatementNode* {
+        if (branch == null) { return branch; }
+        const set_stmt: StatementNode* = this.make_drop_flag_set(flag_name, span);
+        if (branch.kind == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = branch as BlockStmtNode*;
+            blk.statements.insert(0, set_stmt);
+            return branch;
+        }
+        // Non-block: wrap so the flag-set runs before the original stmt.
+        const blk: BlockStmtNode* = new BlockStmtNode(span);
+        blk.statements.push(set_stmt);
+        blk.statements.push(branch);
         return blk as StatementNode*;
     }
 

@@ -96,9 +96,12 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `create_dir`/`create_dir_all`, `remove_dir`/`remove_dir_all`, `read_dir`,
   `canonicalize`) over `Path`/`PathBuf`; `metadata`/`symlink_metadata`/
   `exists`/`is_file`/`is_dir` backed by `stat`/`lstat`/`access`.
-- **`net`:** `TcpStream`, `TcpListener`, `IpAddr`/`IpV4Addr`/`IpV6Addr`,
-  `SocketAddr`. HTTP/1.1 server with keep-alive and read timeouts, HTTP
-  client, router with route registration.
+- **`net`:** `TcpStream`, `TcpListener`, `UdpSocket`, `IpAddr`/`IpV4Addr`/
+  `IpV6Addr`, `SocketAddr`; `dns` name resolution; `tls` (OpenSSL) with
+  `https` on top; `ws` (RFC 6455) over any `Read + Write` transport. HTTP/1.1
+  server with keep-alive and read timeouts, HTTP client, router with route
+  registration. HTTP/2 (`net::http2`): HPACK (RFC 7541), framing (RFC 7540),
+  h2c client + server over any stream, generic over the transport.
 - **`json`:** parser and serializer for `JsonValue`/`JsonObject`/`JsonNumber`;
   round-trip clean.
 - **`process`:** `Command`/`Child`/`ExitStatus` via `fork + execve`;
@@ -203,7 +206,6 @@ authoritative list.
   `for (x in iter)` iteration and range *expressions* (`a..b` / `a..=b`, see
   Compiler above) ship in 1.0 and work against any of these.
 - Async / await / coroutines.
-- HTTP/2 in `net` (TLS, UDP, and WebSocket ship in 1.0).
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.
 - Cross-module trait-impl coherence checks (same-file only in 1.0).

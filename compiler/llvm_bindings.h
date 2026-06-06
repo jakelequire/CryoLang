@@ -178,8 +178,6 @@ const char    *LLVMGetValueName2(LLVMValueRef Val, unsigned long *Length);
 void           LLVMSetValueName2(LLVMValueRef Val, const char *Name, unsigned long NameLen);
 void           LLVMDumpValue(LLVMValueRef Val);
 char          *LLVMPrintValueToString(LLVMValueRef Val);
-char          *LLVMPrintTypeToString(LLVMTypeRef Val);
-const char    *LLVMGetValueName(LLVMValueRef Val);
 void           LLVMSetLinkage(LLVMValueRef Global, int Linkage);
 int            LLVMGetLinkage(LLVMValueRef Global);
 
