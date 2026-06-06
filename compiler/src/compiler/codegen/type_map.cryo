@@ -360,8 +360,23 @@ type struct TypeMapper {
             return cached;
         }
 
-        // Forward-declare to handle recursive references.
         const ctx: LContext = LContext::global();
+
+        // Reuse an existing identified struct of the same mangled name.
+        // Monomorphization can hand the same struct a fresh type id (e.g.
+        // an enum payload `Frame` resolved inside a specialized generic
+        // body vs. the canonical `Frame`); without this, a second
+        // `LLVMStructCreateNamed` mints `Name.0`, a distinct type, and a
+        // phi/store bridging the two fails LLVM verification.  If the
+        // existing handle is still opaque it is mid-construction (a
+        // recursive reference); the original creator fills its body.
+        const existing: LType = LType::struct_by_name(ctx, mangled);
+        if (existing.is_valid()) {
+            this.store_cache(t.id, existing);
+            return existing;
+        }
+
+        // Forward-declare to handle recursive references.
         mut llvm_ty: LType = LType::named_struct(ctx, mangled);
         this.store_cache(t.id, llvm_ty);
 
@@ -405,6 +420,15 @@ type struct TypeMapper {
         }
 
         const ctx: LContext = LContext::global();
+
+        // Reuse an existing identified struct of the same mangled name
+        // across type ids (see `map_struct` for the rationale).
+        const existing: LType = LType::struct_by_name(ctx, mangled);
+        if (existing.is_valid()) {
+            this.store_cache(t.id, existing);
+            return existing;
+        }
+
         mut llvm_ty: LType = LType::named_struct(ctx, mangled);
         this.store_cache(t.id, llvm_ty);
 

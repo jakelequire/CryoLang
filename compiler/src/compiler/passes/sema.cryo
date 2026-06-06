@@ -689,12 +689,33 @@ public:
         const scope_len: i64 = strlen(scope_str) as i64;
         if (scope_len == 0) { return TypeRef::invalid(); }
 
-        // Search the module graph for a module whose namespace ends with
+        // Search the module graph for modules whose namespace ends with
         // "::scope_name" (e.g., scope_name="intrinsics" matches namespace
         // "std::core::intrinsics").  Functions are registered under their
         // full namespace during type resolution.
+        //
+        // Two modules can share a leaf segment: both `net::ws::frame` and
+        // `net::http2::frame` end with "::frame", so `frame::read_frame`
+        // matches both.  Returning the FIRST match silently binds the call
+        // to the wrong module's function (whose return type then poisons
+        // every downstream inference - a same-leaf collision that surfaces
+        // as a type mismatch, not a name error).  Disambiguate by the
+        // call's arity first, then by the namespace prefix shared with the
+        // calling module; only fall back to the first match when neither
+        // distinguishes the candidates (the historical single-candidate
+        // behaviour, preserved for every non-colliding call).
         const mg: ModuleGraph* = this.ctx.module_graph;
         const modules: &ModuleInfo[] = &mg.modules;
+        const call_arity: i64 = if (call != null) { call.arguments.length } else { -1 };
+        const cur_ns: string = this.current_module_name();
+
+        mut first_i: i64 = -1;
+        mut arity_i: i64 = -1;
+        mut arity_count: i64 = 0;
+        mut prefix_i: i64 = -1;
+        mut prefix_best: i64 = -1;
+        mut prefix_ties: i64 = 0;
+
         for (mut i: i64 = 0; i < modules.length; i++) {
             const ns_str: string = this.intern.resolve(modules[i].namespace_name);
             const ns_len: i64 = strlen(ns_str) as i64;
@@ -709,65 +730,108 @@ public:
                     is_match = strcmp(ns_str + suffix_start, scope_str) == 0;
                 }
             }
+            if (!is_match) { continue; }
 
-            if (is_match) {
-                const qualified: string = ns_str + "::" + member_str;
-                const q_sym: SymbolStr = this.ctx.intern(qualified);
-                const ret: TypeRef = this.lookup_func_return(q_sym);
-                if (ret.is_valid()) {
-                    // Skip pinning when the target is a generic function
-                    // template: mono's try_infer_function_call needs to see
-                    // call.resolved_callee unpinned so it can run inference,
-                    // pin the specialized symbol, and call instantiate_for_module.
-                    // Premature pin here strands the InstantiatedType in the
-                    // arena (sema creates the wrapper; mono never queues it)
-                    // and GenericValidation rejects with E0900.
-                    mut is_fn_template: boolean = false;
-                    mut tmpl: TemplateEntry* = null;
-                    if (this.ctx.generic_registry != null) {
-                        tmpl = this.ctx.generic_registry.get_template(q_sym);
-                        if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) {
-                            is_fn_template = true;
-                        }
-                    }
-                    // Generic module-qualified call (`mod::f<T, U>(...)`): the
-                    // raw template return (`Wrap<U>`) is still generic, so
-                    // return the SPECIALIZED function's concrete return type,
-                    // mirroring the bare-identifier path (`f<T>(...)`).
-                    if (is_fn_template) {
-                        // Prefer mono's already-pinned specialization symbol
-                        // (it mangled the exact spec key, including the bare-vs-
-                        // owner base name); only recompute as a fallback, using
-                        // the template's spec base name (bare for free
-                        // functions, `Owner_method` for static methods) so the
-                        // mangling matches what the monomorphizer registered.
-                        mut spec_sym: SymbolStr = call.resolved_callee;
-                        if (!spec_sym.is_valid()) {
-                            const base: SymbolStr = tmpl.spec_base_name(this.intern);
-                            if (scope != null && scope.generic_args.length > 0) {
-                                spec_sym = this.resolve_generic_scope_name(
-                                    base, scope.generic_args);
-                            } else if (call.generic_args.length > 0) {
-                                spec_sym = this.resolve_generic_scope_name(
-                                    base, call.generic_args);
-                            }
-                        }
-                        if (spec_sym.is_valid()) {
-                            const spec_ret: TypeRef = this.lookup_func_return(spec_sym);
-                            if (spec_ret.is_valid()) {
-                                call.set_resolved_callee(spec_sym);
-                                return spec_ret;
-                            }
-                        }
-                    }
-                    if (!is_fn_template) {
-                        this.pin_scope_callee_qsym(call, q_sym);
-                    }
-                    return ret;
+            const qualified: string = ns_str + "::" + member_str;
+            const q_sym: SymbolStr = this.ctx.intern(qualified);
+            if (!this.lookup_func_return(q_sym).is_valid()) { continue; }
+
+            if (first_i < 0) { first_i = i; }
+            if (call_arity >= 0 && this.scope_fn_arity(q_sym) == call_arity) {
+                arity_i = i;
+                arity_count = arity_count + 1;
+            }
+            const shared: i64 = this.ns_shared_prefix_len(cur_ns, ns_str);
+            if (shared > prefix_best) {
+                prefix_best = shared; prefix_i = i; prefix_ties = 1;
+            } else if (shared == prefix_best) {
+                prefix_ties = prefix_ties + 1;
+            }
+        }
+
+        mut chosen_i: i64 = first_i;
+        if (arity_count == 1) {
+            chosen_i = arity_i;                 // exactly one candidate fits the call
+        } else if (prefix_ties == 1 && prefix_i >= 0) {
+            chosen_i = prefix_i;                // one shares the longest namespace prefix
+        }
+        if (chosen_i < 0) { return TypeRef::invalid(); }
+
+        const chosen_ns: string = this.intern.resolve(modules[chosen_i].namespace_name);
+        const qualified: string = chosen_ns + "::" + member_str;
+        const q_sym: SymbolStr = this.ctx.intern(qualified);
+        const ret: TypeRef = this.lookup_func_return(q_sym);
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
+
+        // Skip pinning when the target is a generic function template:
+        // mono's try_infer_function_call needs to see call.resolved_callee
+        // unpinned so it can run inference, pin the specialized symbol, and
+        // call instantiate_for_module.  Premature pin here strands the
+        // InstantiatedType in the arena (sema creates the wrapper; mono never
+        // queues it) and GenericValidation rejects with E0900.
+        mut is_fn_template: boolean = false;
+        mut tmpl: TemplateEntry* = null;
+        if (this.ctx.generic_registry != null) {
+            tmpl = this.ctx.generic_registry.get_template(q_sym);
+            if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) {
+                is_fn_template = true;
+            }
+        }
+        // Generic module-qualified call (`mod::f<T, U>(...)`): the raw
+        // template return (`Wrap<U>`) is still generic, so return the
+        // SPECIALIZED function's concrete return type, mirroring the bare-
+        // identifier path (`f<T>(...)`).
+        if (is_fn_template && call != null) {
+            // Prefer mono's already-pinned specialization symbol (it mangled
+            // the exact spec key, including the bare-vs-owner base name); only
+            // recompute as a fallback, using the template's spec base name
+            // (bare for free functions, `Owner_method` for static methods) so
+            // the mangling matches what the monomorphizer registered.
+            mut spec_sym: SymbolStr = call.resolved_callee;
+            if (!spec_sym.is_valid()) {
+                const base: SymbolStr = tmpl.spec_base_name(this.intern);
+                if (scope != null && scope.generic_args.length > 0) {
+                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args);
+                } else if (call.generic_args.length > 0) {
+                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args);
+                }
+            }
+            if (spec_sym.is_valid()) {
+                const spec_ret: TypeRef = this.lookup_func_return(spec_sym);
+                if (spec_ret.is_valid()) {
+                    call.set_resolved_callee(spec_sym);
+                    return spec_ret;
                 }
             }
         }
-        return TypeRef::invalid();
+        if (!is_fn_template) {
+            this.pin_scope_callee_qsym(call, q_sym);
+        }
+        return ret;
+    }
+
+    /// Parameter count of the free function registered under qualified name
+    /// `q_sym`, or -1 if it isn't a known function. Used to disambiguate
+    /// same-leaf module-qualified calls by the call's arity.
+    scope_fn_arity(&this, q_sym: SymbolStr) -> i64 {
+        if (this.ctx.decl_index == null) { return -1; }
+        const ft_ref: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+        if (!ft_ref.is_valid()) { return -1; }
+        const t: Type* = this.arena.lookup(ft_ref.id);
+        if (t == null || t.kind != TypeKind::Function) { return -1; }
+        const ft: FunctionType* = t as FunctionType*;
+        return ft.param_types.length;
+    }
+
+    /// Length of the common leading-character prefix of two namespace
+    /// strings. A longer shared prefix means the candidate module lives in
+    /// the same subsystem as the caller (e.g. `net::http2::connection` shares
+    /// more with `net::http2::frame` than with `net::ws::frame`).
+    ns_shared_prefix_len(&this, a: string, b: string) -> i64 {
+        if (a == null || b == null) { return 0; }
+        mut i: i64 = 0;
+        while (a[i] != 0 && b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+        return i;
     }
 
 

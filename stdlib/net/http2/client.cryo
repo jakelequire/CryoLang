@@ -1,0 +1,78 @@
+///! HTTP/2 client.
+///!
+///! `connect` upgrades an established `Read + Write` stream to an HTTP/2
+///! client connection (preface + SETTINGS), generic over the transport
+///! so it serves h2c (`TcpStream`) and h2 (`TlsStream`) alike. The
+///! returned `Http2Connection` issues requests with `request`; reuse it
+///! for several sequential requests on the one connection.
+///!
+///! `Http2Client` is a convenience for one-shot h2c requests over plain
+///! TCP: dial, handshake, one request/response, close.
+
+namespace std::net::http2::client;
+
+import core::option;
+import core::result;
+import io::error;
+import io::traits;
+import collections::array;
+import collections::str;
+import net::socket_addr;
+import net::tcp;
+import net::http::method;
+import net::http::request;
+import net::http::response;
+import net::http2::connection;
+
+/// Upgrade `stream` to an HTTP/2 client connection by performing the
+/// preface + SETTINGS handshake. The caller owns `stream` and drops it
+/// after dropping the returned connection.
+function connect<S>(stream: S*) -> Result<Http2Connection<S>, IoError>
+where S: Read + Write {
+    mut conn: Http2Connection<S> = Http2Connection<S>::new_client(stream);
+    match (conn.handshake_client()) {
+        Result::Ok(_)  => { return Result::Ok(conn); }
+        Result::Err(e) => { conn.drop(); return Result::Err(e); }
+    }
+}
+
+/// One-shot h2c (cleartext) requests over plain TCP.
+type struct Http2Client {
+    static new() -> Http2Client {
+        return Http2Client { };
+    }
+
+    /// `GET` over h2c. `authority` is the `:authority` pseudo-header
+    /// (host[:port]); `path` is the request target.
+    get(&this, addr: SocketAddr, authority: Str, path: Str) -> Result<Response, IoError> {
+        mut req: Request = Request::new(Method::Get, path);
+        return one_shot(addr, authority, req);
+    }
+
+    /// `POST` over h2c with a body and Content-Type.
+    post(&this, addr: SocketAddr, authority: Str, path: Str,
+         content_type: Str, body: Array<u8>) -> Result<Response, IoError> {
+        mut req: Request = Request::new(Method::Post, path);
+        req.headers.insert(Str::new("content-type"), content_type);
+        req.set_body(body);
+        return one_shot(addr, authority, req);
+    }
+}
+
+/// Dial `addr`, upgrade to h2c, run one request/response, close.
+function one_shot(addr: SocketAddr, authority: Str, req: Request) -> Result<Response, IoError> {
+    mut request_local: Request = req;
+    mut tcp: TcpStream = match (TcpStream::connect(addr)) {
+        Result::Ok(s)  => { s }
+        Result::Err(e) => { request_local.drop(); return Result::Err(e); }
+    };
+    mut conn: Http2Connection<TcpStream> = match (connect(&tcp)) {
+        Result::Ok(c)  => { c }
+        Result::Err(e) => { request_local.drop(); tcp.drop(); return Result::Err(e); }
+    };
+    const result: Result<Response, IoError> =
+        conn.request(request_local, Str::new("http"), authority);
+    conn.drop();
+    tcp.drop();
+    return result;
+}

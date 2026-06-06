@@ -101,6 +101,17 @@ function mono_str_ends_with(s: string, suffix: string) -> boolean {
     return true;
 }
 
+/// Length of the common leading-character prefix of two strings. Used to
+/// prefer the same-subsystem candidate when a module alias matches several
+/// same-leaf modules (e.g. `net::http2::frame` over `net::ws::frame` for a
+/// caller in `net::http2`).
+function mono_shared_prefix_len(a: string, b: string) -> i64 {
+    if (a == null || b == null) { return 0; }
+    mut i: i64 = 0;
+    while (a[i] != 0 && b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return i;
+}
+
 /// Independent copy of a `TypeRef[]`. `TypeRef` is `Copy`, so an element-wise
 /// push duplicates the buffer without aliasing the source's owned storage.
 /// Used wherever an owning request/local would otherwise alias an
@@ -3484,8 +3495,22 @@ type struct Monomorphizer {
     /// leaf `parse` (which then fails its `where R: Read` bound, E0306).  A
     /// type's static method has the type as its module/scope, so it won't
     /// match a module namespace here.
+    /// True when a function template's value arity is compatible with a
+    /// call of `call_arity` arguments: an exact param-count match, or the
+    /// template is variadic, or the arity is unknown (call_arity < 0).
+    /// Used to reject a same-leaf module's wrong-arity overload before it
+    /// shadows the correct one.
+    fn_template_arity_compatible(&this, entry: TemplateEntry*, call_arity: i64) -> boolean {
+        if (call_arity < 0) { return true; }
+        if (entry == null || entry.ast_node == null) { return true; }
+        if (entry.node_kind != NodeKind::FunctionDeclaration) { return true; }
+        const fd: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (fd.is_variadic) { return true; }
+        return fd.parameters.length == call_arity;
+    }
+
     find_scoped_function_template(mut &this, name: SymbolStr,
-                                  scope: SymbolStr) -> TemplateEntry* {
+                                  scope: SymbolStr, call_arity: i64) -> TemplateEntry* {
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null || !scope.is_valid()) { return null; }
         // Match by qualified-name suffix against the scope AS WRITTEN, e.g.
@@ -3494,12 +3519,28 @@ type struct Monomorphizer {
         // `std::net::http::request::Request::parse` does NOT (its suffix is
         // `::Request::parse`).  This is independent of `resolve_qualified`,
         // which doesn't reliably expand a module alias to its full path.
+        //
+        // Two modules can share a leaf segment (`net::ws::frame` and
+        // `net::http2::frame` both end with `::frame`), so the suffix match
+        // alone is ambiguous.  Disambiguate exactly as sema's
+        // `resolve_module_qualified_function` does — by the call's value
+        // arity, then the namespace prefix shared with the calling module —
+        // so the instantiated spec and the call site's resolved callee agree.
         const scope_str: string = this.intern_table.resolve(scope);
         const name_str: string  = this.intern_table.resolve(name);
         const tail: string      = format("%s::%s", scope_str, name_str);
         const sep_tail: string  = format("::%s", tail);
         const tail_len: i64     = strlen(tail) as i64;
+        const cur_ns: string    = this.intern_table.resolve(this.current_module);
         const total: i64 = registry.template_count();
+
+        mut first: TemplateEntry* = null;
+        mut arity_match: TemplateEntry* = null;
+        mut arity_count: i64 = 0;
+        mut prefix_match: TemplateEntry* = null;
+        mut prefix_best: i64 = -1;
+        mut prefix_ties: i64 = 0;
+
         for (mut i: i64 = 0; i < total; i++) {
             const cand: TemplateEntry* = &registry.entries[i];
             if (cand == null) { continue; }
@@ -3507,12 +3548,37 @@ type struct Monomorphizer {
             if (!cand.name.equals(name)) { continue; }
             const qn: string = this.intern_table.resolve(cand.qualified_name);
             // qn ends with `::scope::name`, or IS exactly `scope::name`.
-            if (mono_str_ends_with(qn, sep_tail)) { return cand; }
-            if (strlen(qn) as i64 == tail_len && mono_str_ends_with(qn, tail)) {
-                return cand;
+            mut is_match: boolean = mono_str_ends_with(qn, sep_tail);
+            if (!is_match && strlen(qn) as i64 == tail_len && mono_str_ends_with(qn, tail)) {
+                is_match = true;
+            }
+            if (!is_match) { continue; }
+
+            if (first == null) { first = cand; }
+            if (call_arity >= 0 && cand.ast_node != null) {
+                const fd: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
+                if (fd.parameters.length == call_arity) {
+                    arity_match = cand;
+                    arity_count = arity_count + 1;
+                }
+            }
+            const shared: i64 = mono_shared_prefix_len(cur_ns, qn);
+            if (shared > prefix_best) {
+                prefix_best = shared; prefix_match = cand; prefix_ties = 1;
+            } else if (shared == prefix_best) {
+                prefix_ties = prefix_ties + 1;
             }
         }
-        return null;
+
+        mut chosen_fsft: TemplateEntry* = first;
+        if (arity_count == 1) { chosen_fsft = arity_match; }
+        else if (prefix_ties == 1 && prefix_match != null) { chosen_fsft = prefix_match; }
+        if (strcmp(name_str, "read_frame") == 0) {
+            const ch_qn: string = if (chosen_fsft != null) { this.intern_table.resolve(chosen_fsft.qualified_name) } else { "<null>" };
+            intrinsics::printf("[FSFT] name=%s scope=%s arity=%lld cur_ns=%s arity_count=%lld prefix_ties=%lld -> %s\n",
+                name_str, scope_str, call_arity, cur_ns, arity_count, prefix_ties, ch_qn);
+        }
+        return chosen_fsft;
     }
 
     find_function_template_for_call(mut &this, name: SymbolStr) -> TemplateEntry* {
@@ -3618,8 +3684,19 @@ type struct Monomorphizer {
             const qscope_str: string = this.intern_table.resolve(qualified_scope);
             const qualified_str: string = qscope_str + "::" + member_str;
             const qsym: SymbolStr = this.intern_table.intern(qualified_str);
+            // Arity-gate the direct lookups: `resolve_qualified` expands a
+            // bare module alias (`frame`) to ONE qualified module, and when
+            // two modules share that leaf (`net::ws::frame` vs
+            // `net::http2::frame`) it can pick the wrong one.  Accepting its
+            // template unconditionally would bind the call to a same-named
+            // function in the wrong module.  Requiring the template's value
+            // arity to match the call lets a mismatch fall through to the
+            // arity/prefix-aware `find_scoped_function_template` below, which
+            // disambiguates the same way sema does.
+            const call_arity_di: i64 = if (call != null) { call.arguments.length } else { -1 };
             const qe: TemplateEntry* = this.generic_registry.get_template(qsym);
-            if (qe != null && qe.node_kind == NodeKind::FunctionDeclaration) {
+            if (qe != null && qe.node_kind == NodeKind::FunctionDeclaration
+                    && this.fn_template_arity_compatible(qe, call_arity_di)) {
                 entry = qe;
             }
             // Bare-scope form (in case the scope is already qualified or
@@ -3629,7 +3706,8 @@ type struct Monomorphizer {
                 const bare_str: string = bscope_str + "::" + member_str;
                 const bsym: SymbolStr = this.intern_table.intern(bare_str);
                 const be: TemplateEntry* = this.generic_registry.get_template(bsym);
-                if (be != null && be.node_kind == NodeKind::FunctionDeclaration) {
+                if (be != null && be.node_kind == NodeKind::FunctionDeclaration
+                        && this.fn_template_arity_compatible(be, call_arity_di)) {
                     entry = be;
                 }
             }
@@ -3652,7 +3730,8 @@ type struct Monomorphizer {
                     // would wrongly bind `parser::parse` to a same-named
                     // static method on an unrelated type (e.g.
                     // `Request::parse<R> where R: Read`) and fail its bound.
-                    entry = this.find_scoped_function_template(callee_name, callee_scope);
+                    entry = this.find_scoped_function_template(
+                        callee_name, callee_scope, call.arguments.length);
                 }
                 // Static-method-on-generic-struct case: scope IS a known
                 // type AND it's a generic template (e.g. `Slice<T>`).  The

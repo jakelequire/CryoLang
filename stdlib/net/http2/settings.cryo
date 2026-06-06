@@ -1,0 +1,86 @@
+///! HTTP/2 SETTINGS parameters (RFC 7540 §6.5).
+///!
+///! A SETTINGS frame payload is a sequence of 6-octet entries: a 16-bit
+///! identifier followed by a 32-bit value. `Settings` holds the
+///! parameters this stdlib cares about, seeded with the protocol
+///! defaults; unknown identifiers are ignored on parse, as required.
+
+namespace std::net::http2::settings;
+
+import core::option;
+import core::slice;
+import collections::array;
+
+const SETTINGS_HEADER_TABLE_SIZE:      u16 = 0x1;
+const SETTINGS_ENABLE_PUSH:            u16 = 0x2;
+const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+const SETTINGS_INITIAL_WINDOW_SIZE:    u16 = 0x4;
+const SETTINGS_MAX_FRAME_SIZE:         u16 = 0x5;
+const SETTINGS_MAX_HEADER_LIST_SIZE:   u16 = 0x6;
+
+type struct Settings {
+    header_table_size:      u32;
+    enable_push:            u32;
+    max_concurrent_streams: u32;
+    initial_window_size:    u32;
+    max_frame_size:         u32;
+    max_header_list_size:   u32;
+
+    /// Protocol defaults (RFC 7540 §6.5.2). "Unlimited" parameters use
+    /// the u32 maximum as a sentinel.
+    static defaults() -> Settings {
+        return Settings {
+            header_table_size:      4096,
+            enable_push:            1,
+            max_concurrent_streams: 4294967295,
+            initial_window_size:    65535,
+            max_frame_size:         16384,
+            max_header_list_size:   4294967295
+        };
+    }
+
+    /// Apply a single parsed (identifier, value). Unknown identifiers
+    /// are ignored.
+    apply_one(mut &this, id: u16, value: u32) -> void {
+        if (id == SETTINGS_HEADER_TABLE_SIZE)      { this.header_table_size = value; }
+        else if (id == SETTINGS_ENABLE_PUSH)            { this.enable_push = value; }
+        else if (id == SETTINGS_MAX_CONCURRENT_STREAMS) { this.max_concurrent_streams = value; }
+        else if (id == SETTINGS_INITIAL_WINDOW_SIZE)    { this.initial_window_size = value; }
+        else if (id == SETTINGS_MAX_FRAME_SIZE)         { this.max_frame_size = value; }
+        else if (id == SETTINGS_MAX_HEADER_LIST_SIZE)   { this.max_header_list_size = value; }
+    }
+
+    /// Parse a SETTINGS frame payload, applying every entry. Returns
+    /// false if the payload length is not a multiple of 6.
+    apply_payload(mut &this, payload: Slice<u8>) -> boolean {
+        if (payload.length() % 6 != 0) { return false; }
+        mut i: u64 = 0;
+        while (i < payload.length()) {
+            const id: u16 = ((byte_at(payload, i) as u16) << 8) | (byte_at(payload, i + 1) as u16);
+            const value: u32 = ((byte_at(payload, i + 2) as u32) << 24)
+                             | ((byte_at(payload, i + 3) as u32) << 16)
+                             | ((byte_at(payload, i + 4) as u32) << 8)
+                             | (byte_at(payload, i + 5) as u32);
+            this.apply_one(id, value);
+            i = i + 6;
+        }
+        return true;
+    }
+}
+
+/// Append a (identifier, value) entry to a SETTINGS payload buffer.
+function push_entry(out: mut &Array<u8>, id: u16, value: u32) -> void {
+    out.push((id >> 8) as u8);
+    out.push((id) as u8);
+    out.push((value >> 24) as u8);
+    out.push((value >> 16) as u8);
+    out.push((value >> 8) as u8);
+    out.push((value) as u8);
+}
+
+function byte_at(s: Slice<u8>, index: u64) -> u8 {
+    match (s.get(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}

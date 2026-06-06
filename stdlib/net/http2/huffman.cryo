@@ -1,0 +1,275 @@
+///! HPACK Huffman coding (RFC 7541 Appendix B).
+///!
+///! The static Huffman code used by HPACK to compress header field
+///! names and values. `encode` packs bytes MSB-first and pads the final
+///! byte with the most-significant bits of the EOS symbol (all ones);
+///! `decode` walks a prefix tree built from the same table and validates
+///! the padding (RFC 7541 §5.2: a padding longer than 7 bits, a padding
+///! not formed from EOS's prefix, or the EOS symbol appearing in the
+///! input are all decoding errors).
+
+namespace std::net::http2::huffman;
+
+import core::option;
+import core::slice;
+import collections::array;
+
+/// Fill the per-symbol code-value and code-length tables. Index is the
+/// byte value 0..255 plus the EOS pseudo-symbol at 256. Transcribed
+/// verbatim from RFC 7541 Appendix B.
+function fill_tables(c: u32*, l: u8*) -> void {
+    c[0]=0x1ff8; l[0]=13;       c[1]=0x7fffd8; l[1]=23;     c[2]=0xfffffe2; l[2]=28;
+    c[3]=0xfffffe3; l[3]=28;    c[4]=0xfffffe4; l[4]=28;    c[5]=0xfffffe5; l[5]=28;
+    c[6]=0xfffffe6; l[6]=28;    c[7]=0xfffffe7; l[7]=28;    c[8]=0xfffffe8; l[8]=28;
+    c[9]=0xffffea; l[9]=24;     c[10]=0x3ffffffc; l[10]=30; c[11]=0xfffffe9; l[11]=28;
+    c[12]=0xfffffea; l[12]=28;  c[13]=0x3ffffffd; l[13]=30; c[14]=0xfffffeb; l[14]=28;
+    c[15]=0xfffffec; l[15]=28;  c[16]=0xfffffed; l[16]=28;  c[17]=0xfffffee; l[17]=28;
+    c[18]=0xfffffef; l[18]=28;  c[19]=0xffffff0; l[19]=28;  c[20]=0xffffff1; l[20]=28;
+    c[21]=0xffffff2; l[21]=28;  c[22]=0x3ffffffe; l[22]=30; c[23]=0xffffff3; l[23]=28;
+    c[24]=0xffffff4; l[24]=28;  c[25]=0xffffff5; l[25]=28;  c[26]=0xffffff6; l[26]=28;
+    c[27]=0xffffff7; l[27]=28;  c[28]=0xffffff8; l[28]=28;  c[29]=0xffffff9; l[29]=28;
+    c[30]=0xffffffa; l[30]=28;  c[31]=0xffffffb; l[31]=28;  c[32]=0x14; l[32]=6;
+    c[33]=0x3f8; l[33]=10;      c[34]=0x3f9; l[34]=10;      c[35]=0xffa; l[35]=12;
+    c[36]=0x1ff9; l[36]=13;     c[37]=0x15; l[37]=6;        c[38]=0xf8; l[38]=8;
+    c[39]=0x7fa; l[39]=11;      c[40]=0x3fa; l[40]=10;      c[41]=0x3fb; l[41]=10;
+    c[42]=0xf9; l[42]=8;        c[43]=0x7fb; l[43]=11;      c[44]=0xfa; l[44]=8;
+    c[45]=0x16; l[45]=6;        c[46]=0x17; l[46]=6;        c[47]=0x18; l[47]=6;
+    c[48]=0x0; l[48]=5;         c[49]=0x1; l[49]=5;         c[50]=0x2; l[50]=5;
+    c[51]=0x19; l[51]=6;        c[52]=0x1a; l[52]=6;        c[53]=0x1b; l[53]=6;
+    c[54]=0x1c; l[54]=6;        c[55]=0x1d; l[55]=6;        c[56]=0x1e; l[56]=6;
+    c[57]=0x1f; l[57]=6;        c[58]=0x5c; l[58]=7;        c[59]=0xfb; l[59]=8;
+    c[60]=0x7ffc; l[60]=15;     c[61]=0x20; l[61]=6;        c[62]=0xffb; l[62]=12;
+    c[63]=0x3fc; l[63]=10;      c[64]=0x1ffa; l[64]=13;     c[65]=0x21; l[65]=6;
+    c[66]=0x5d; l[66]=7;        c[67]=0x5e; l[67]=7;        c[68]=0x5f; l[68]=7;
+    c[69]=0x60; l[69]=7;        c[70]=0x61; l[70]=7;        c[71]=0x62; l[71]=7;
+    c[72]=0x63; l[72]=7;        c[73]=0x64; l[73]=7;        c[74]=0x65; l[74]=7;
+    c[75]=0x66; l[75]=7;        c[76]=0x67; l[76]=7;        c[77]=0x68; l[77]=7;
+    c[78]=0x69; l[78]=7;        c[79]=0x6a; l[79]=7;        c[80]=0x6b; l[80]=7;
+    c[81]=0x6c; l[81]=7;        c[82]=0x6d; l[82]=7;        c[83]=0x6e; l[83]=7;
+    c[84]=0x6f; l[84]=7;        c[85]=0x70; l[85]=7;        c[86]=0x71; l[86]=7;
+    c[87]=0x72; l[87]=7;        c[88]=0xfc; l[88]=8;        c[89]=0x73; l[89]=7;
+    c[90]=0xfd; l[90]=8;        c[91]=0x1ffb; l[91]=13;     c[92]=0x7fff0; l[92]=19;
+    c[93]=0x1ffc; l[93]=13;     c[94]=0x3ffc; l[94]=14;     c[95]=0x22; l[95]=6;
+    c[96]=0x7ffd; l[96]=15;     c[97]=0x3; l[97]=5;         c[98]=0x23; l[98]=6;
+    c[99]=0x4; l[99]=5;         c[100]=0x24; l[100]=6;      c[101]=0x5; l[101]=5;
+    c[102]=0x25; l[102]=6;      c[103]=0x26; l[103]=6;      c[104]=0x27; l[104]=6;
+    c[105]=0x6; l[105]=5;       c[106]=0x74; l[106]=7;      c[107]=0x75; l[107]=7;
+    c[108]=0x28; l[108]=6;      c[109]=0x29; l[109]=6;      c[110]=0x2a; l[110]=6;
+    c[111]=0x7; l[111]=5;       c[112]=0x2b; l[112]=6;      c[113]=0x76; l[113]=7;
+    c[114]=0x2c; l[114]=6;      c[115]=0x8; l[115]=5;       c[116]=0x9; l[116]=5;
+    c[117]=0x2d; l[117]=6;      c[118]=0x77; l[118]=7;      c[119]=0x78; l[119]=7;
+    c[120]=0x79; l[120]=7;      c[121]=0x7a; l[121]=7;      c[122]=0x7b; l[122]=7;
+    c[123]=0x7ffe; l[123]=15;   c[124]=0x7fc; l[124]=11;    c[125]=0x3ffd; l[125]=14;
+    c[126]=0x1ffd; l[126]=13;   c[127]=0xffffffc; l[127]=28; c[128]=0xfffe6; l[128]=20;
+    c[129]=0x3fffd2; l[129]=22; c[130]=0xfffe7; l[130]=20;  c[131]=0xfffe8; l[131]=20;
+    c[132]=0x3fffd3; l[132]=22; c[133]=0x3fffd4; l[133]=22; c[134]=0x3fffd5; l[134]=22;
+    c[135]=0x7fffd9; l[135]=23; c[136]=0x3fffd6; l[136]=22; c[137]=0x7fffda; l[137]=23;
+    c[138]=0x7fffdb; l[138]=23; c[139]=0x7fffdc; l[139]=23; c[140]=0x7fffdd; l[140]=23;
+    c[141]=0x7fffde; l[141]=23; c[142]=0xffffeb; l[142]=24; c[143]=0x7fffdf; l[143]=23;
+    c[144]=0xffffec; l[144]=24; c[145]=0xffffed; l[145]=24; c[146]=0x3fffd7; l[146]=22;
+    c[147]=0x7fffe0; l[147]=23; c[148]=0xffffee; l[148]=24; c[149]=0x7fffe1; l[149]=23;
+    c[150]=0x7fffe2; l[150]=23; c[151]=0x7fffe3; l[151]=23; c[152]=0x7fffe4; l[152]=23;
+    c[153]=0x1fffdc; l[153]=21; c[154]=0x3fffd8; l[154]=22; c[155]=0x7fffe5; l[155]=23;
+    c[156]=0x3fffd9; l[156]=22; c[157]=0x7fffe6; l[157]=23; c[158]=0x7fffe7; l[158]=23;
+    c[159]=0xffffef; l[159]=24; c[160]=0x3fffda; l[160]=22; c[161]=0x1fffdd; l[161]=21;
+    c[162]=0xfffe9; l[162]=20;  c[163]=0x3fffdb; l[163]=22; c[164]=0x3fffdc; l[164]=22;
+    c[165]=0x7fffe8; l[165]=23; c[166]=0x7fffe9; l[166]=23; c[167]=0x1fffde; l[167]=21;
+    c[168]=0x7fffea; l[168]=23; c[169]=0x3fffdd; l[169]=22; c[170]=0x3fffde; l[170]=22;
+    c[171]=0xfffff0; l[171]=24; c[172]=0x1fffdf; l[172]=21; c[173]=0x3fffdf; l[173]=22;
+    c[174]=0x7fffeb; l[174]=23; c[175]=0x7fffec; l[175]=23; c[176]=0x1fffe0; l[176]=21;
+    c[177]=0x1fffe1; l[177]=21; c[178]=0x3fffe0; l[178]=22; c[179]=0x1fffe2; l[179]=21;
+    c[180]=0x7fffed; l[180]=23; c[181]=0x3fffe1; l[181]=22; c[182]=0x7fffee; l[182]=23;
+    c[183]=0x7fffef; l[183]=23; c[184]=0xfffea; l[184]=20;  c[185]=0x3fffe2; l[185]=22;
+    c[186]=0x3fffe3; l[186]=22; c[187]=0x3fffe4; l[187]=22; c[188]=0x7ffff0; l[188]=23;
+    c[189]=0x3fffe5; l[189]=22; c[190]=0x3fffe6; l[190]=22; c[191]=0x7ffff1; l[191]=23;
+    c[192]=0x3ffffe0; l[192]=26; c[193]=0x3ffffe1; l[193]=26; c[194]=0xfffeb; l[194]=20;
+    c[195]=0x7fff1; l[195]=19;  c[196]=0x3fffe7; l[196]=22; c[197]=0x7ffff2; l[197]=23;
+    c[198]=0x3fffe8; l[198]=22; c[199]=0x1ffffec; l[199]=25; c[200]=0x3ffffe2; l[200]=26;
+    c[201]=0x3ffffe3; l[201]=26; c[202]=0x3ffffe4; l[202]=26; c[203]=0x7ffffde; l[203]=27;
+    c[204]=0x7ffffdf; l[204]=27; c[205]=0x3ffffe5; l[205]=26; c[206]=0xfffff1; l[206]=24;
+    c[207]=0x1ffffed; l[207]=25; c[208]=0x7fff2; l[208]=19; c[209]=0x1fffe3; l[209]=21;
+    c[210]=0x3ffffe6; l[210]=26; c[211]=0x7ffffe0; l[211]=27; c[212]=0x7ffffe1; l[212]=27;
+    c[213]=0x3ffffe7; l[213]=26; c[214]=0x7ffffe2; l[214]=27; c[215]=0xfffff2; l[215]=24;
+    c[216]=0x1fffe4; l[216]=21; c[217]=0x1fffe5; l[217]=21; c[218]=0x3ffffe8; l[218]=26;
+    c[219]=0x3ffffe9; l[219]=26; c[220]=0xffffffd; l[220]=28; c[221]=0x7ffffe3; l[221]=27;
+    c[222]=0x7ffffe4; l[222]=27; c[223]=0x7ffffe5; l[223]=27; c[224]=0xfffec; l[224]=20;
+    c[225]=0xfffff3; l[225]=24; c[226]=0xfffed; l[226]=20;  c[227]=0x1fffe6; l[227]=21;
+    c[228]=0x3fffe9; l[228]=22; c[229]=0x1fffe7; l[229]=21; c[230]=0x1fffe8; l[230]=21;
+    c[231]=0x7ffff3; l[231]=23; c[232]=0x3fffea; l[232]=22; c[233]=0x3fffeb; l[233]=22;
+    c[234]=0x1ffffee; l[234]=25; c[235]=0x1ffffef; l[235]=25; c[236]=0xfffff4; l[236]=24;
+    c[237]=0xfffff5; l[237]=24; c[238]=0x3ffffea; l[238]=26; c[239]=0x7ffff4; l[239]=23;
+    c[240]=0x3ffffeb; l[240]=26; c[241]=0x7ffffe6; l[241]=27; c[242]=0x3ffffec; l[242]=26;
+    c[243]=0x3ffffed; l[243]=26; c[244]=0x7ffffe7; l[244]=27; c[245]=0x7ffffe8; l[245]=27;
+    c[246]=0x7ffffe9; l[246]=27; c[247]=0x7ffffea; l[247]=27; c[248]=0x7ffffeb; l[248]=27;
+    c[249]=0xffffffe; l[249]=28; c[250]=0x7ffffec; l[250]=27; c[251]=0x7ffffed; l[251]=27;
+    c[252]=0x7ffffee; l[252]=27; c[253]=0x7ffffef; l[253]=27; c[254]=0x7fffff0; l[254]=27;
+    c[255]=0x3ffffee; l[255]=26; c[256]=0x3fffffff; l[256]=30;
+}
+
+/// Number of bytes `encode(data)` will produce, without allocating.
+function encoded_len(data: Slice<u8>) -> u64 {
+    mut codes: u32[257];
+    mut lens: u8[257];
+    fill_tables(&codes[0], &lens[0]);
+    mut bits: u64 = 0;
+    mut i: u64 = 0;
+    while (i < data.length()) {
+        bits = bits + (lens[byte_at(data, i) as u64] as u64);
+        i++;
+    }
+    return (bits + 7) / 8;
+}
+
+/// Huffman-encode `data`. Bytes are packed MSB-first; the final byte is
+/// padded with EOS's most-significant bits (all ones).
+function encode(data: Slice<u8>) -> Array<u8> {
+    mut codes: u32[257];
+    mut lens: u8[257];
+    fill_tables(&codes[0], &lens[0]);
+
+    mut out: Array<u8> = Array<u8>::new();
+    mut acc: u64 = 0;
+    mut nbits: u32 = 0;
+    mut i: u64 = 0;
+    while (i < data.length()) {
+        const b: u64 = byte_at(data, i) as u64;
+        const code: u64 = codes[b] as u64;
+        const clen: u32 = lens[b] as u32;
+        acc = (acc << (clen as u64)) | code;
+        nbits = nbits + clen;
+        while (nbits >= 8) {
+            nbits = nbits - 8;
+            out.push(((acc >> (nbits as u64)) & 0xFF) as u8);
+        }
+        i++;
+    }
+    if (nbits > 0) {
+        const pad: u32 = 8 - nbits;
+        const ones: u64 = (1 << (pad as u64)) - 1;
+        acc = (acc << (pad as u64)) | ones;
+        out.push((acc & 0xFF) as u8);
+    }
+    return out;
+}
+
+/// A prefix tree over the HPACK Huffman code, for decoding. Each node
+/// has a `zero`/`one` child index (-1 = none) and a `sym` (-1 = internal,
+/// 0..256 = a decoded symbol; 256 is EOS and must never appear in input).
+type struct HuffTree {
+    zero: Array<i32>;
+    one:  Array<i32>;
+    sym:  Array<i32>;
+
+    static build() -> HuffTree {
+        mut t: HuffTree = HuffTree {
+            zero: Array<i32>::new(),
+            one:  Array<i32>::new(),
+            sym:  Array<i32>::new()
+        };
+        t.add_node();   // root at index 0
+
+        mut codes: u32[257];
+        mut lens: u8[257];
+        fill_tables(&codes[0], &lens[0]);
+
+        mut s: u64 = 0;
+        while (s < 257) {
+            const code: u32 = codes[s];
+            const len: i64 = lens[s] as i64;
+            mut node: i32 = 0;
+            mut k: i64 = len - 1;
+            while (k >= 0) {
+                const bit: u32 = (code >> (k as u32)) & 1;
+                mut next: i32 = if (bit == 1) { t.one_of(node) } else { t.zero_of(node) };
+                if (next < 0) {
+                    next = t.add_node();
+                    if (bit == 1) { t.set_one(node, next); } else { t.set_zero(node, next); }
+                }
+                node = next;
+                k = k - 1;
+            }
+            t.set_sym(node, s as i32);
+            s++;
+        }
+        return t;
+    }
+
+    add_node(mut &this) -> i32 {
+        const idx: i32 = this.zero.length() as i32;
+        this.zero.push(-1);
+        this.one.push(-1);
+        this.sym.push(-1);
+        return idx;
+    }
+
+    zero_of(&this, node: i32) -> i32 { return at(&this.zero, node as u64); }
+    one_of(&this, node: i32)  -> i32 { return at(&this.one, node as u64); }
+    sym_of(&this, node: i32)  -> i32 { return at(&this.sym, node as u64); }
+
+    set_zero(mut &this, node: i32, v: i32) -> void { this.zero.as_ptr()[node as u64] = v; }
+    set_one(mut &this, node: i32, v: i32)  -> void { this.one.as_ptr()[node as u64]  = v; }
+    set_sym(mut &this, node: i32, v: i32)  -> void { this.sym.as_ptr()[node as u64]  = v; }
+
+    drop(mut &this) -> void {
+        this.zero.drop();
+        this.one.drop();
+        this.sym.drop();
+    }
+}
+
+/// Huffman-decode `data`. Returns `None` on a decoding error: an
+/// undefined code path, the EOS symbol appearing in the stream, or
+/// invalid trailing padding (more than 7 bits, or not all ones).
+function decode(data: Slice<u8>) -> Option<Array<u8>> {
+    mut tree: HuffTree = HuffTree::build();
+    mut out: Array<u8> = Array<u8>::new();
+
+    mut node: i32 = 0;
+    mut partial: u32 = 0;          // bits consumed since the last symbol
+    mut partial_ones: boolean = true;
+    mut i: u64 = 0;
+    while (i < data.length()) {
+        const byte: u8 = byte_at(data, i);
+        mut b: i64 = 7;
+        while (b >= 0) {
+            const bit: u8 = (byte >> (b as u8)) & 1;
+            node = if (bit == 1) { tree.one_of(node) } else { tree.zero_of(node) };
+            partial = partial + 1;
+            if (bit == 0) { partial_ones = false; }
+            if (node < 0) { tree.drop(); out.drop(); return Option::None; }
+            const sy: i32 = tree.sym_of(node);
+            if (sy >= 0) {
+                if (sy == 256) { tree.drop(); out.drop(); return Option::None; }
+                out.push(sy as u8);
+                node = 0;
+                partial = 0;
+                partial_ones = true;
+            }
+            b = b - 1;
+        }
+        i++;
+    }
+
+    if (node != 0) {
+        // Anything left mid-symbol must be valid EOS-prefix padding.
+        if (partial > 7 || !partial_ones) { tree.drop(); out.drop(); return Option::None; }
+    }
+    tree.drop();
+    return Option::Some(out);
+}
+
+/// Array element read without the `Option` ceremony; callers stay in range.
+function at(arr: &Array<i32>, index: u64) -> i32 {
+    match (arr.get(index)) {
+        Option::Some(v) => { return v; }
+        Option::None    => { return -1; }
+    }
+}
+
+/// Slice byte access without the `Option` ceremony; callers stay in range.
+function byte_at(s: Slice<u8>, index: u64) -> u8 {
+    match (s.get(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}
