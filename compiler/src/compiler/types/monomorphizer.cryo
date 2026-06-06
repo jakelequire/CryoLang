@@ -1287,6 +1287,19 @@ type struct Monomorphizer {
                 // signatures resolve it concretely.
                 this.derive_impl_where_generics(decl, subst, &res_ctx);
                 this.bind_trait_args_for_spec_impl(decl, &res_ctx);
+                // Persist the concrete trait-element bindings (`A -> i32`,
+                // `Item -> i32`) onto the spec'd impl.  Self-returning default
+                // combinators (`map`/`filter`) are skipped by `resolve_methods`
+                // below (instantiated lazily at call sites), so their cloned
+                // signatures keep the bare element name (`A`) unresolved.  When
+                // a chained call (`r.take(n).map(f)`) later specializes such a
+                // default via `specialize_method`, it re-seeds these bindings so
+                // the element resolves concretely.  Only concrete bindings are
+                // kept (a residual generic param would mint a bogus spec).  This
+                // is a pure snapshot of the already-populated context - it does
+                // NOT re-enter the resolver, avoiding the re-entrancy that the
+                // where-clause derivation machinery is not safe for here.
+                this.cache_derived_trait_params(decl, &res_ctx);
                 this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
             _ => {}
@@ -1536,6 +1549,26 @@ type struct Monomorphizer {
                     this.bind_where_arg_param(ta, concrete_args[ai], subst, res_ctx);
                 }
             }
+        }
+    }
+
+    /// Snapshot the concrete generic bindings accumulated in `res_ctx` (by
+    /// `derive_impl_where_generics` + `bind_trait_args_for_spec_impl`) onto the
+    /// spec'd impl node, so a self-returning default specialized later can
+    /// recover the trait element it doesn't carry as a struct parameter.  Only
+    /// fully-concrete bindings are kept: a binding still containing a generic
+    /// param would let `specialize_method` resolve a partially-generic signature
+    /// and mint a bogus spec (a GenericParam reads as "resolved" to the mangler).
+    cache_derived_trait_params(mut &this, impl_node: ImplBlockNode*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || res_ctx == null) { return; }
+        for (mut i: i64 = 0; i < res_ctx.generic_bindings.length; i++) {
+            const name: SymbolStr = res_ctx.generic_bindings[i].first;
+            const ty: TypeRef = res_ctx.generic_bindings[i].second;
+            if (!ty.is_valid()) { continue; }
+            if (this.type_contains_generic_param(ty)) { continue; }
+            if (impl_node.lookup_derived_param(name).is_valid()) { continue; }
+            impl_node.add_derived_param(name, ty);
         }
     }
 
@@ -4778,7 +4811,7 @@ type struct Monomorphizer {
         mut empty_names: SymbolStr[] = [];
         mut empty_args: TypeRef[] = [];
         const spec_method: MethodNode* = this.specialize_method(
-            orig, empty_names, empty_args, recv_type);
+            orig, empty_names, empty_args, recv_type, impl_node);
         if (spec_method == null || spec_method.func == null) { return false; }
         // The clone is concrete now, not a deferred template.
         spec_method.func.set_self_returning_default(false);
@@ -5137,6 +5170,19 @@ type struct Monomorphizer {
         if (recv_type.is_valid()) {
             method_ctx.set_this_type(recv_type);
         }
+        // Seed the concrete trait-element bindings cached at impl-spec time
+        // (e.g. `A -> i32` for a `TakeIter` receiver, whose element lives only
+        // in the where-bound).  An own-generic combinator default cloned into
+        // such an impl (`map<B>`, returning `MapIter<This, A, B>` with formal
+        // `f: (A) -> B`) must resolve `A` here so the formal/actual unification
+        // below can bind the method generic `B`; without it the formal's `A`
+        // stays unresolved, unification fails, and the spec is never minted.
+        if (impl_node != null) {
+            for (mut di: i64 = 0; di < impl_node.derived_param_names.length; di++) {
+                method_ctx.add_binding(impl_node.derived_param_names[di],
+                                       impl_node.derived_param_types[di]);
+            }
+        }
 
         // Two paths to populate `inference_bindings`:
         //   - Explicit method-level generic args at the call site
@@ -5242,7 +5288,8 @@ type struct Monomorphizer {
         // get emitted by codegen because `declare_method` skips
         // `generic_params.length > 0`; the spec'd clone is non-generic.
         const spec_method: MethodNode* = this.specialize_method(
-            orig_method, method_param_names, this.inference_bindings, recv_type);
+            orig_method, method_param_names, this.inference_bindings, recv_type,
+            impl_node);
         if (spec_method == null) { return; }
         // The clone is a concrete specialization, not a deferred template - even
         // when the original was a self-returning combinator default (`map<B>`).
@@ -5347,9 +5394,16 @@ type struct Monomorphizer {
     /// `&this` / param annotations resolve to concrete TypeRefs.  Returns
     /// the spec'd MethodNode, or null on failure.  No-op when the method
     /// is non-generic; caller should filter those out.
+    ///
+    /// `owner_impl` (null for inherent owners) supplies the concrete
+    /// trait-element bindings cached at impl-spec time
+    /// (`cache_derived_trait_params`).  They seed the signature-resolution
+    /// context so a self-returning default cloned into a where-clause-element
+    /// impl (`map`/`filter` on a `TakeIter`, whose element `A` lives only in the
+    /// where-bound) resolves its element concretely instead of failing.
     specialize_method(mut &this, original: MethodNode*,
                        param_names: SymbolStr[], args: &TypeRef[],
-                       owner_type: TypeRef) -> MethodNode* {
+                       owner_type: TypeRef, owner_impl: ImplBlockNode*) -> MethodNode* {
         if (original == null || original.func == null) { return null; }
         if (param_names.length != args.length) { return null; }
 
@@ -5419,6 +5473,17 @@ type struct Monomorphizer {
             mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
             if (owner_type.is_valid()) {
                 res_ctx.set_this_type(owner_type);
+            }
+            // Seed the concrete trait-element bindings cached at impl-spec time
+            // (e.g. `A -> i32` for a `TakeIter` receiver) so a default's bare
+            // element name resolves here.  No-op when the element is already a
+            // struct param (the annotation carries the concrete type directly)
+            // or for inherent owners (no impl).
+            if (owner_impl != null) {
+                for (mut di: i64 = 0; di < owner_impl.derived_param_names.length; di++) {
+                    res_ctx.add_binding(owner_impl.derived_param_names[di],
+                                        owner_impl.derived_param_types[di]);
+                }
             }
             this.type_resolver.resolve_func_signature(spec_method.func, &res_ctx);
             // Back-fill `&this` / `this` param's resolved_type the same

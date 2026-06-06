@@ -794,6 +794,22 @@ public:
     /// type's hover / jump to its declaration.
     target_type_span: SourceSpan;
 
+    /// Concrete trait-element bindings captured at impl-specialization time
+    /// (parallel arrays: name -> resolved concrete TypeRef).  Populated by the
+    /// monomorphizer for a SPEC'd trait impl whose Self type doesn't carry the
+    /// trait's element as a struct parameter - e.g. `A` in
+    /// `implement<I, A> Iterator<A> for TakeIter<I> where I: Iterator<A>`,
+    /// where `A` is recovered from the where-bound (`A := i32`) rather than from
+    /// a struct arg.  A self-returning default method (`map`/`filter`) cloned
+    /// into such an impl keeps that element name (`A`) bare in its signature;
+    /// when the default is lazily specialized at a chained call site
+    /// (`r.take(n).map(f)`), `specialize_method` re-seeds these bindings into its
+    /// resolution context so the element resolves concretely instead of leaving
+    /// an unresolved `Named("A")` that would reject the spec (E0636).  Empty on
+    /// template impls and on impls whose element is already a struct parameter.
+    derived_param_names: SymbolStr[];
+    derived_param_types: TypeRef[];
+
     ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ImplementationBlock, span) {
         this.target_type           = target_type;
@@ -804,6 +820,8 @@ public:
         this.trait_annotation      = null;
         this.where_bounds          = [];
         this.target_type_span      = SourceSpan::none();
+        this.derived_param_names   = [];
+        this.derived_param_types   = [];
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -836,6 +854,23 @@ public:
 
     add_method(m: MethodNode*) -> void {
         this.methods.push(m);
+    }
+
+    /// Record a concrete trait-element binding recovered at impl-spec time.
+    /// See `derived_param_names` / `derived_param_types`.
+    add_derived_param(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        this.derived_param_names.push(name);
+        this.derived_param_types.push(ty);
+    }
+
+    /// Concrete element type previously cached for `name`, or invalid.
+    lookup_derived_param(&this, name: SymbolStr) -> TypeRef {
+        for (mut i: i64 = 0; i < this.derived_param_names.length; i++) {
+            if (this.derived_param_names[i].equals(name)) {
+                return this.derived_param_types[i];
+            }
+        }
+        return TypeRef::invalid();
     }
 }
 
