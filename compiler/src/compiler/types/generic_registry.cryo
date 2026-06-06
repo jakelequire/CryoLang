@@ -46,6 +46,13 @@ type struct TemplateEntry {
     node_kind:      NodeKind;
     base_type:      TypeRef;            // The uninstantiated generic type in arena
     impl_blocks:    ImplBlockNode*[];   // Associated impl blocks
+    // True when this is a free-function template whose bare leaf name also
+    // exists as a free function in another module (e.g. `read_frame` in both
+    // `net::ws::frame` and `net::http2::frame`).  Set once by
+    // `GenericRegistry::finalize_disambiguation()`; consulted by
+    // `spec_base_name` to fold the defining module into the spec symbol so the
+    // two specializations don't collapse to one (`read_frame_TcpStream`).
+    module_disambig: boolean;
 
     /// Create a new template entry.
     static new(name: SymbolStr, qualified_name: SymbolStr, module_name: SymbolStr,
@@ -64,6 +71,7 @@ type struct TemplateEntry {
             node_kind:      node_kind,
             base_type:      base_type,
             impl_blocks:    [],
+            module_disambig: false,
         };
     }
 
@@ -87,6 +95,27 @@ type struct TemplateEntry {
             module_len + 2 + name_len
         };
         if (qualified_len <= expected_no_owner) {
+            // Free function (no owner type segment).  Normally the bare leaf
+            // is a unique spec base, but two same-leaf free functions in
+            // different modules (`net::ws::frame::read_frame` vs
+            // `net::http2::frame::read_frame`) would otherwise collapse to one
+            // spec symbol (`read_frame_TcpStream`), poisoning return-type
+            // lookups.  When flagged, fold the full defining module path into
+            // the base (`std_net_ws_frame_read_frame`) so each module's
+            // specialization gets a distinct symbol.  Only colliding leaves are
+            // flagged, so non-colliding free functions keep their bare base.
+            if (this.module_disambig && module_len > 0) {
+                mut folded: string = "";
+                for (mut ci: i64 = 0; ci < module_len; ci += 1) {
+                    if (module_str[ci] == ':') {
+                        const flen: i64 = strlen(folded) as i64;
+                        if (flen > 0 && folded[flen - 1] != '_') { folded += "_"; }
+                    } else {
+                        folded += substr(module_str, ci, 1);
+                    }
+                }
+                return table.intern(folded + "_" + name_str);
+            }
             return this.name;
         }
         // qualified = "module::Owner::name": extract `Owner` (the segment
@@ -215,6 +244,10 @@ type struct GenericRegistry {
     inherent_impl_keys:  u32[];
     inherent_impl_nodes: ImplBlockNode*[];
 
+    // Set once by `finalize_disambiguation()` so the O(N^2) leaf-collision
+    // scan runs a single time even though `process_all` is invoked per module.
+    disambig_finalized: boolean;
+
 
     static new(arena: TypeArena*) -> GenericRegistry {
         return GenericRegistry {
@@ -237,7 +270,59 @@ type struct GenericRegistry {
             inherent_owner_nodes: [],
             inherent_impl_keys:   [],
             inherent_impl_nodes:  [],
+            disambig_finalized:   false,
         };
+    }
+
+    /// One-shot pass (after all templates are registered, before any
+    /// specialization) that flags free-function templates whose bare leaf name
+    /// is shared by a free function in a DIFFERENT module.  Such leaves would
+    /// otherwise collapse to a single spec symbol (e.g. both `ws::frame` and
+    /// `http2::frame` define `read_frame`, and `read_frame<TcpStream>` would
+    /// mangle to one `read_frame_TcpStream`), so `spec_base_name` folds the
+    /// module path into the base only for the flagged entries.  Idempotent and
+    /// guarded so the O(N^2) scan runs once across the per-module mono loop.
+    finalize_disambiguation(mut &this, table: InternTable*) -> void {
+        if (this.disambig_finalized) { return; }
+        this.disambig_finalized = true;
+        for (mut i: i64 = 0; i < this.entries.length; i += 1) {
+            if (this.entries[i].node_kind != NodeKind::FunctionDeclaration) {
+                continue;
+            }
+            // Free function only: a static method's qualified name carries an
+            // owner segment, already disambiguated by `spec_base_name`.
+            if (!this.is_free_function(&this.entries[i], table)) { continue; }
+            if (this.entries[i].module_disambig) { continue; }
+            for (mut j: i64 = i + 1; j < this.entries.length; j += 1) {
+                if (this.entries[j].node_kind != NodeKind::FunctionDeclaration) {
+                    continue;
+                }
+                if (!this.is_free_function(&this.entries[j], table)) { continue; }
+                if (!this.entries[i].name.equals(this.entries[j].name)) { continue; }
+                // Same leaf, different defining module: flag both.
+                if (!this.entries[i].module_name.equals(this.entries[j].module_name)) {
+                    this.entries[i].module_disambig = true;
+                    this.entries[j].module_disambig = true;
+                }
+            }
+        }
+    }
+
+    /// True when `entry`'s qualified name is exactly `module::name` (no owner
+    /// type segment), i.e. a module-level free function rather than a static
+    /// method whose qualified name is `module::Owner::name`.
+    is_free_function(&this, entry: TemplateEntry*, table: InternTable*) -> boolean {
+        const qualified_str: string = table.resolve(entry.qualified_name);
+        const module_str: string = table.resolve(entry.module_name);
+        const name_str: string = table.resolve(entry.name);
+        const module_len: i64 = strlen(module_str) as i64;
+        const name_len: i64 = strlen(name_str) as i64;
+        const expected: i64 = if (module_len == 0) {
+            name_len
+        } else {
+            module_len + 2 + name_len
+        };
+        return (strlen(qualified_str) as i64) <= expected;
     }
 
 
