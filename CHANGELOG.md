@@ -203,7 +203,7 @@ authoritative list.
   `for (x in iter)` iteration and range *expressions* (`a..b` / `a..=b`, see
   Compiler above) ship in 1.0 and work against any of these.
 - Async / await / coroutines.
-- TLS, UDP, HTTP/2, WebSocket in `net`.
+- HTTP/2 in `net` (TLS, UDP, and WebSocket ship in 1.0).
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.
 - Cross-module trait-impl coherence checks (same-file only in 1.0).

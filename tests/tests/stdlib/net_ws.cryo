@@ -1,0 +1,112 @@
+///! WebSocket (RFC 6455): the hermetic accept-key vector plus a real
+///! masked-client -> unmasked-server text frame over a TCP loopback.
+///!
+///! The framing exercises `WebSocket<TcpStream>`'s generic methods
+///! (`send_text` -> `frame::encode_frame<TcpStream>`, `recv` ->
+///! `frame::read_frame<TcpStream>`), the nested-generic-dispatch path that
+///! the monomorphizer fix unblocked. Mirrors `net_tls`'s thread layout:
+///! main is the server (binds + listens before spawning), the spawned
+///! thread is the client.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetWs;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::io::error;
+import std::io::traits;
+import std::net::socket_addr;
+import std::net::tcp;
+import std::net::ws::conn;
+import std::net::ws::handshake;
+import std::thread;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+/// RFC 6455 §1.3: `base64(sha1(key + GUID))`.  The canonical worked
+/// example: `dGhlIHNhbXBsZSBub25jZQ==` -> `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
+/// Hermetic - exercises SHA-1 + base64 + the GUID concatenation with no
+/// sockets involved.
+![test]
+function accept_key_rfc6455_vector() -> Result<(), TestError> {
+    mut accept: String = compute_accept(Str::new("dGhlIHNhbXBsZSBub25jZQ=="));
+    const ok: boolean = accept.as_str().equals(
+        &Str::new("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+    accept.drop();
+    return expect(ok, Str::new("compute_accept must match the RFC 6455 vector"));
+}
+
+/// Client thread: wrap the connected socket as a masking client and send a
+/// single text frame. Returns 1 on success.
+function ws_client(port: i32) -> i32 {
+    mut tcp: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port as u16))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return 0; }
+    };
+    mut ws: WebSocket<TcpStream> = WebSocket<TcpStream>::from_upgraded(&tcp, true);
+    mut sent: i32 = 0;
+    match (ws.send_text(Str::new("hello ws"))) {
+        Result::Ok(_)  => { sent = 1; }
+        Result::Err(_) => { }
+    }
+    tcp.drop();
+    return sent;
+}
+
+/// Read one message off the server view and report whether it decoded as
+/// the expected text. Each arm returns explicitly so the message's owned
+/// payload is consumed on every path.
+function server_reads_hello(ws: WebSocket<TcpStream>*) -> boolean {
+    match (ws.recv()) {
+        Result::Ok(msg) => {
+            match (msg) {
+                Message::Text(s) => {
+                    mut owned: String = s;
+                    const ok: boolean = owned.as_str().equals(&Str::new("hello ws"));
+                    owned.drop();
+                    return ok;
+                }
+                Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); return false; }
+                Message::Close => { return false; }
+            }
+        }
+        Result::Err(_) => { return false; }
+    }
+}
+
+![test]
+function masked_text_frame_loopback_round_trip() -> Result<(), TestError> {
+    const port: u16 = (29000 + (libc::getpid() % 20000)) as u16;
+
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(port))) {
+        Result::Ok(l)  => { l }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1 failed")); }
+    };
+
+    const handle: thread::JoinHandle<i32> =
+        thread::spawn<i32, i32>(port as i32, ws_client);
+
+    mut tcp_server: TcpStream = match (listener.accept()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { handle.join(); listener.drop(); return bail(Str::new("accept failed")); }
+    };
+
+    // Unmasked server view; read the message the client framed.
+    mut ws_server: WebSocket<TcpStream> = WebSocket<TcpStream>::from_upgraded(&tcp_server, false);
+    const text_ok: boolean = server_reads_hello(&ws_server);
+
+    const client_sent: i32 = handle.join();
+    tcp_server.drop();
+    listener.drop();
+
+    match (expect(client_sent == 1, Str::new("client should frame and send the text message"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(text_ok, Str::new("server should decode the unmasked text frame as \"hello ws\""));
+}
