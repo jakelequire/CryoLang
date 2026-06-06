@@ -181,23 +181,27 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- Iterator combinators are partial. `.take(n)`, `.map(f)` and `.filter(pred)`
-  ship as lazy `Iterator` defaults returning adapters (`TakeIter`, `MapIter`,
-  `FilterIter`); `f`/`pred` must be non-capturing functions. They work when
-  applied **directly to an iterator** (a named local, an explicitly-typed
-  local bound to the adapter, or a call-expression receiver such as
+- Iterator combinators are a partial set. `.take(n)`, `.map(f)`, `.filter(pred)`
+  and `.chain(other)` ship as lazy `Iterator` defaults returning adapters
+  (`TakeIter`, `MapIter`, `FilterIter`, `ChainIter`); `f`/`pred` must be
+  non-capturing functions, and `chain`'s `other` must be a named or
+  explicitly-typed local iterator with the same element type. They work when
+  applied **directly to an iterator** (a named local, an explicitly-typed local
+  bound to the adapter, or a call-expression receiver such as
   `Range<i32>::new(0,100)`) and consumed by `.count()`, `.fold(...)` or
   `for (x in ...)` - e.g. `r.take(n).count()`, `r.map(f).fold(..)`,
-  `r.filter(p).count()`, `for (x in r.filter(p))`. `take` additionally
-  chains with itself (`r.take(a).take(b)`) and composes with a following
-  `.map`/`.filter` (`r.map(f).filter(p)`). Not yet supported: an
-  **own-generic combinator following another combinator** - `.map` applied to
-  another adapter's result (`r.take(n).map(f)`, `r.map(f).map(g)`) - which
-  surfaces a type-mismatch diagnostic; and `.zip`/`.chain`/`.enumerate`/
-  `.collect` (not yet implemented). The `Iterator` trait otherwise ships with
-  `next`/`count`/`fold`/`for_each`; `for (x in iter)` iteration and range
-  *expressions* (`a..b` / `a..=b`, see Compiler above) ship in 1.0 and work
-  against any of these.
+  `r.filter(p).count()`, `for (x in r.filter(p))`. They also **chain freely**:
+  any combinator may follow any other (`r.take(n).map(f)`, `r.map(f).map(g)`,
+  `r.take(n).filter(p)`, `r.map(f).filter(p)`, `r.take(a).take(b)`,
+  `r.chain(b).map(f)`, and longer mixed chains), and the chained values flow
+  through `.count()`/`.fold(..)`/`for (x in ...)`. Not yet implemented:
+  `.zip`/`.enumerate` (both pending heterogeneous tuple-literal support in
+  generic impl bodies) and `.collect`. Combinators also do not yet apply to an
+  opaque `implement Iterator` value returned by a method (e.g. an
+  `Array`'s `.iter()`) other than through `next`/`for (x in ...)`. The
+  `Iterator` trait otherwise ships with `next`/`count`/`fold`/`for_each`;
+  `for (x in iter)` iteration and range *expressions* (`a..b` / `a..=b`, see
+  Compiler above) ship in 1.0 and work against any of these.
 - Async / await / coroutines.
 - TLS, UDP, HTTP/2, WebSocket in `net`.
 - Macros / user-defined `![attr]` directives.

@@ -212,6 +212,7 @@ function iter_double_i32(x: i32) -> i32 { return x * 2; }
 function iter_widen_i64(x: i32) -> i64 { return (x as i64) * 10; }
 function iter_add_i64(acc: i64, x: i64) -> i64 { return acc + x; }
 function iter_is_even(x: i32) -> boolean { return x % 2 == 0; }
+function iter_is_odd(x: i32) -> boolean { return x % 2 == 1; }
 
 mut g_for_each_sum: i32 = 0;
 function iter_accumulate(x: i32) -> void { g_for_each_sum = g_for_each_sum + x; }
@@ -464,14 +465,18 @@ function take_chain_drives_for_in_with_values() -> Result<(), TestError> {
 //
 // `map<B>` is an own-generic self-returning default; `filter` is a
 // zero-own-generic one.  Both store a non-capturing function in a field, so
-// the element type(s) are struct parameters (`MapIter<I, A, B>`,
+// the element type(s) are struct parameters (`MapIter<I, A, O>`,
 // `FilterIter<I, A>`) rather than where-clause-only generics.  These pin
 // map/filter applied directly to an iterator and `map().filter()`.
 //
-// NOT YET covered (tracked in CHANGELOG known-limitations): an own-generic
-// combinator FOLLOWING another combinator (`r.take(n).map(f)`,
-// `r.map(f).map(g)`) - the intermediate adapter isn't monomorphized when the
-// outer `map` specializes against it.
+// Combinator-following-combinator chaining (a `map`/`filter` applied to
+// another adapter's result) now works for every adapter, including a
+// `TakeIter` receiver whose element lives only in its `where I: Iterator<A>`
+// bound: the concrete element (`A := i32`) is cached on the spec'd impl at
+// monomorphization time and re-seeded when the trailing combinator's default
+// is lazily specialized.  The `chain_*` tests below pin `r.take(n).map(f)`,
+// `r.take(n).filter(p)`, `r.map(f).map(g)`, deeper triple chains, and the
+// values that flow through them.
 
 ![test]
 function map_counts_preserve_length() -> Result<(), TestError> {
@@ -515,4 +520,156 @@ function map_then_filter_composes() -> Result<(), TestError> {
     // map doubles every element (all even), filter keeps evens -> all 10 kept.
     mut r: Range<i32> = Range::new(0, 10);
     return expect_eq(r.map(iter_double_i32).filter(iter_is_even).count(), 10 as u64);
+}
+
+// ============================================================================
+// Combinator-following-combinator chaining
+// ============================================================================
+//
+// An own-generic (`map<B>`) or zero-own-generic (`filter`) combinator applied
+// to ANOTHER adapter's result.  The hard case is a `TakeIter` receiver: its
+// element type is where-clause-only (`implement<I,A> Iterator<A> for
+// TakeIter<I> where I: Iterator<A>`), so the trailing combinator's default
+// must recover `A` from the cached impl-spec binding rather than a struct arg.
+
+![test]
+function chain_take_then_map_counts() -> Result<(), TestError> {
+    // take(5) of 0..10 -> 0,1,2,3,4; map doubles -> count unchanged = 5.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.take(5).map(iter_double_i32).count(), 5 as u64);
+}
+
+![test]
+function chain_take_then_map_folds_values() -> Result<(), TestError> {
+    // take(5) -> 0,1,2,3,4; map doubles -> 0,2,4,6,8; sum = 20.  Proves the
+    // mapped VALUES flow through the recovered element type, not just the count.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.take(5).map(iter_double_i32).fold(0, iter_add_i32), 20);
+}
+
+![test]
+function chain_take_then_map_drives_for_in() -> Result<(), TestError> {
+    mut r: Range<i32> = Range::new(0, 10);
+    mut sum: i32 = 0;
+    for (x in r.take(5).map(iter_double_i32)) { sum = sum + x; }
+    return expect_eq(sum, 20);
+}
+
+![test]
+function chain_take_then_filter_counts() -> Result<(), TestError> {
+    // take(5) -> 0,1,2,3,4; keep odds -> 1,3 -> count 2.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.take(5).filter(iter_is_odd).count(), 2 as u64);
+}
+
+![test]
+function chain_take_then_filter_folds_values() -> Result<(), TestError> {
+    // take(5) -> 0,1,2,3,4; keep odds -> 1,3; sum = 4.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.take(5).filter(iter_is_odd).fold(0, iter_add_i32), 4);
+}
+
+![test]
+function chain_map_then_map_counts() -> Result<(), TestError> {
+    // map.map: own-generic following own-generic on a struct-param adapter.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(r.map(iter_double_i32).map(iter_double_i32).count(), 10 as u64);
+}
+
+![test]
+function chain_map_then_map_folds_values() -> Result<(), TestError> {
+    // each element *4; sum over 0..10 = 4*(0+..+9) = 4*45 = 180.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(
+        r.map(iter_double_i32).map(iter_double_i32).fold(0, iter_add_i32), 180);
+}
+
+![test]
+function chain_map_then_take_then_map_counts() -> Result<(), TestError> {
+    // map -> take(3) -> map: take caps the chain to 3 regardless of mapping.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(
+        r.map(iter_double_i32).take(3).map(iter_double_i32).count(), 3 as u64);
+}
+
+![test]
+function chain_take_then_map_then_filter_counts() -> Result<(), TestError> {
+    // take(6) -> 0..5; map doubles -> all even; keep evens -> all 6 kept.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(
+        r.take(6).map(iter_double_i32).filter(iter_is_even).count(), 6 as u64);
+}
+
+![test]
+function chain_take_then_filter_then_map_folds() -> Result<(), TestError> {
+    // take(6) -> 0..5; keep odds -> 1,3,5; map doubles -> 2,6,10; sum = 18.
+    mut r: Range<i32> = Range::new(0, 10);
+    return expect_eq(
+        r.take(6).filter(iter_is_odd).map(iter_double_i32).fold(0, iter_add_i32), 18);
+}
+
+// ============================================================================
+// ChainIter adapter - `chain` combinator
+// ============================================================================
+//
+// `chain` concatenates two iterators of the same element type; like `take`,
+// `ChainIter`'s element is where-bound-only (`where I: Iterator<A>,
+// J: Iterator<A>`).  The second iterator is passed as a named/typed-local
+// argument (the supported operand form, same as combinator receivers).
+
+![test]
+function chain_concatenates_lengths() -> Result<(), TestError> {
+    mut a: Range<i32> = Range::new(0, 3);
+    mut b: Range<i32> = Range::new(0, 3);
+    return expect_eq(a.chain(b).count(), 6 as u64);
+}
+
+![test]
+function chain_preserves_order_and_values() -> Result<(), TestError> {
+    // 0,1,2 then 10,11,12 -> sum 36.
+    mut a: Range<i32> = Range::new(0, 3);
+    mut b: Range<i32> = Range::new(10, 13);
+    return expect_eq(a.chain(b).fold(0, iter_add_i32), 36);
+}
+
+![test]
+function chain_drives_for_in_with_values() -> Result<(), TestError> {
+    // 0,1,2,3 then 0,1 -> sum 7.
+    mut a: Range<i32> = Range::new(0, 4);
+    mut b: Range<i32> = Range::new(0, 2);
+    mut sum: i32 = 0;
+    for (x in a.chain(b)) { sum = sum + x; }
+    return expect_eq(sum, 7);
+}
+
+![test]
+function chain_then_map_composes() -> Result<(), TestError> {
+    // (0,1,2,0,1,2) doubled -> sum 2*(0+1+2+0+1+2) = 12.
+    mut a: Range<i32> = Range::new(0, 3);
+    mut b: Range<i32> = Range::new(0, 3);
+    return expect_eq(a.chain(b).map(iter_double_i32).fold(0, iter_add_i32), 12);
+}
+
+![test]
+function chain_then_filter_composes() -> Result<(), TestError> {
+    // (0..4 ++ 0..4) keep odds -> 1,3,1,3 -> count 4.
+    mut a: Range<i32> = Range::new(0, 4);
+    mut b: Range<i32> = Range::new(0, 4);
+    return expect_eq(a.chain(b).filter(iter_is_odd).count(), 4 as u64);
+}
+
+![test]
+function take_then_chain_caps_then_concatenates() -> Result<(), TestError> {
+    // take(3) of 0..9 -> 0,1,2; chain 0..2 -> 0,1 -> sum 0+1+2+0+1 = 4.
+    mut r: Range<i32> = Range::new(0, 9);
+    mut b: Range<i32> = Range::new(0, 2);
+    return expect_eq(r.take(3).chain(b).fold(0, iter_add_i32), 4);
+}
+
+![test]
+function map_then_chain_concatenates() -> Result<(), TestError> {
+    // map doubles 0..3 -> 0,2,4; chain 0..2 -> 0,1 -> sum 0+2+4+0+1 = 7.
+    mut r: Range<i32> = Range::new(0, 3);
+    mut b: Range<i32> = Range::new(0, 2);
+    return expect_eq(r.map(iter_double_i32).chain(b).fold(0, iter_add_i32), 7);
 }
