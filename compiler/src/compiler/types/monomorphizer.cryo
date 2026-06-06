@@ -5357,6 +5357,23 @@ type struct Monomorphizer {
         if (inherent_owner_ast != null) {
             this.register_spec_method_in_di_inherent(
                 spec_method, recv_type, inherent_owner_ast);
+            // Pin the precise mangled symbol so codegen targets THIS spec
+            // rather than colliding with a sibling spec under the shared
+            // `<receiver>::<method>` + arity key (see
+            // mangled_symbol_for_spec_method).  Scoped to INHERENT generic
+            // methods on a fixed receiver type (`Request::write_to<TcpStream>`
+            // vs `<TlsStream>`, `Inner::relay<A>` vs `<B>`): there the spec's
+            // DI-registered mangle equals the symbol codegen's `declare_method`
+            // emits, so the pin resolves directly.  Trait-impl / combinator
+            // defaults (the `else` branch) are deliberately left unpinned:
+            // their DI mangle can diverge from the emitted definition symbol,
+            // so pinning would declare an extern that never links; those keep
+            // relying on codegen's overload-aware fallback.
+            const spec_callee: SymbolStr = this.mangled_symbol_for_spec_method(
+                spec_method, this.arena.get_qualified_name(recv_type));
+            if (spec_callee.is_valid()) {
+                call.set_resolved_callee(spec_callee);
+            }
         } else {
             this.register_spec_method_in_di(spec_method, recv_type, impl_node);
         }
@@ -5730,6 +5747,36 @@ type struct Monomorphizer {
         this.decl_index.register_methods_with_module(
             qualified_target, spec_methods, owning_module,
             this.intern_table, this.arena);
+    }
+
+    /// Compute the exact LLVM-mangled symbol a spec'd method will be emitted
+    /// under, so the call site can pin `resolved_callee` straight to it.
+    /// Mirrors the mangle in `DeclarationIndex::register_methods_with_module`
+    /// and codegen's `declare_method` (all three must agree on the symbol).
+    ///
+    /// Without this, a generic INSTANCE method whose own generic varies while
+    /// the RECEIVER type stays fixed (`Inner::relay<A>` vs `Inner::relay<B>`,
+    /// or `Request::write_to<TcpStream>` vs `<TlsStream>`) mints distinct specs
+    /// but leaves `resolved_callee` empty (the substituter cleared it).  Codegen
+    /// then falls back to a `<receiver-type>::<method>` + arity lookup, which
+    /// keys both specs identically and hands back whichever was registered last
+    /// - so every call resolves to the same (wrong) spec.  Pinning the precise
+    /// mangle here disambiguates them.  `qualified_target` is the same owner
+    /// name used to register the spec in DI.  Empty on failure (caller leaves
+    /// `resolved_callee` clear, falling back to the old behavior).
+    mangled_symbol_for_spec_method(mut &this, spec_method: MethodNode*,
+                                   qualified_target: SymbolStr) -> SymbolStr {
+        if (spec_method == null || spec_method.func == null) { return SymbolStr::empty(); }
+        if (!qualified_target.is_valid()) { return SymbolStr::empty(); }
+        const func: FunctionDeclNode* = spec_method.func;
+        const type_qname: QualifiedName = QualifiedName::from_symbol(qualified_target);
+        const method_param_refs: TypeRef[] = method_non_receiver_params(
+            func, this.intern_table);
+        const mangled: MangledName = MangledName::for_method_or_trait_impl(
+            this.intern_table, this.arena, type_qname, func.origin_trait, func.name,
+            method_receiver_kind(func, spec_method.is_static, this.intern_table),
+            method_param_refs, func.resolved_return_type, func.is_variadic);
+        return mangled.value;
     }
 
     /// Find an InstantiatedType in the arena whose resolved_type is the

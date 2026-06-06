@@ -1,0 +1,99 @@
+///! Regression: an INHERENT generic method on a fixed receiver type, whose
+///! OWN generic param (not the receiver's) varies across call sites, that
+///! forwards to a NESTED inherent generic method.
+///!
+///! The bug (net-library HTTPS/WebSocket gate): the nested call's resolved
+///! spec was pinned the FIRST time the outer method specialized, and every
+///! later specialization inherited that stale pin.  After the AST
+///! substituter was taught to clear the pin, both specs were minted, but
+///! codegen resolved the nested call through a `<receiver-type>::<method>`
+///! + arity key that is IDENTICAL for every spec of the same method on the
+///! same receiver - so it handed back whichever spec was registered last.
+///! Concretely `Outer::run<A>` wrongly called `Inner::relay<B>`, passing an
+///! `A` to the `B` impl.  Real-world shape: `Request::write_to<TlsStream>`
+///! calling `Headers::write_to<TcpStream>` -> garbage fd, EBADF, plaintext
+///! on the wire.
+///!
+///! Fix: the monomorphizer pins the nested call's `resolved_callee` to the
+///! spec's precise mangled symbol, so codegen targets the right one.
+///!
+///! Each `Sink` impl mutates a distinct field, so a mis-dispatch (calling
+///! the wrong impl on a punned receiver) is observable as a wrong value.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::GenericMethodNestedDispatch;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type trait Sink {
+    put(mut &this, b: u8) -> void;
+}
+
+type struct A {
+    fd: i32;
+}
+implement trait Sink for struct A {
+    put(mut &this, b: u8) -> void { this.fd = this.fd + 1000; }
+}
+
+type struct B {
+    val: i32;
+}
+implement trait Sink for struct B {
+    put(mut &this, b: u8) -> void { this.val = this.val + 1; }
+}
+
+// Inner inherent generic method - the NESTED dispatch target.
+type struct Inner {
+    tag: i32;
+
+    relay<W>(&this, w: mut &W) -> void
+    where W: Sink {
+        w.put(9);
+    }
+}
+
+// Outer inherent generic method that forwards to Inner::relay<W>.
+type struct Outer {
+    h: Inner;
+
+    run<W>(&this, w: mut &W) -> void
+    where W: Sink {
+        this.h.relay(w);
+    }
+}
+
+![test]
+function nested_generic_dispatch_picks_right_spec() -> Result<(), TestError> {
+    mut a: A = A { fd: 0 };
+    mut b: B = B { val: 0 };
+    const o: Outer = Outer { h: Inner { tag: 1 } };
+
+    // run<A> must reach A::put (fd += 1000); run<B> must reach B::put
+    // (val += 1).  Before the fix, run<A> dispatched to relay<B>, so A::put
+    // never ran and `a.fd` stayed 0.
+    o.run(&a);
+    o.run(&b);
+
+    expect_eq(a.fd, 1000)?;
+    expect_eq(b.val, 1)?;
+    return Result::Ok(());
+}
+
+![test]
+function nested_generic_dispatch_order_independent() -> Result<(), TestError> {
+    // Same check with the call order reversed: whichever specializes first
+    // must not capture the other's nested spec.
+    mut a: A = A { fd: 0 };
+    mut b: B = B { val: 0 };
+    const o: Outer = Outer { h: Inner { tag: 2 } };
+
+    o.run(&b);
+    o.run(&a);
+
+    expect_eq(a.fd, 1000)?;
+    expect_eq(b.val, 1)?;
+    return Result::Ok(());
+}
