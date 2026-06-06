@@ -1,0 +1,124 @@
+///! HTTPS layer - HTTP/1.1 request + response over a TLS loopback.
+///!
+///! Drives the full TLS-carries-HTTP path end to end: the client wraps a
+///! `TcpStream` in TLS, sends a GET, and reads the status line; the
+///! server wraps its accepted socket in TLS and parses the request with
+///! the ordinary `http::Request::parse` (a `TlsStream` is just a
+///! `Read + Write`). Mirrors `net_tls`'s thread layout: main is the
+///! server (binds + listens before spawning), the spawned thread is the
+///! client.
+///!
+///! Requires `ssl` + `crypto` in `tests/cryoconfig` link_libs and the
+///! `fixtures/tls/` cert+key (cwd is the `tests/` project root).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetHttps;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::str;
+import std::io::error;
+import std::io::traits;
+import std::io::buf;
+import std::net::socket_addr;
+import std::net::tcp;
+import std::net::tls::context;
+import std::net::tls::stream;
+import std::net::http::method;
+import std::net::http::request;
+import std::thread;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+const RESPONSE: Str = Str::new("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhi over tls");
+
+/// Client thread: TLS handshake, send a GET, read the response, and
+/// report whether the status line carried "200". Returns 200 on success.
+function https_client(port: i32) -> i32 {
+    mut tcp: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port as u16))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return 0; }
+    };
+    mut conn: TlsConnector = match (TlsConnector::new()) {
+        Result::Ok(c)  => { c }
+        Result::Err(_) => { tcp.drop(); return 0; }
+    };
+    conn = conn.danger_accept_invalid_certs();
+    mut tls: TlsStream = match (conn.connect(tcp, Str::new("127.0.0.1"))) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { conn.drop(); return 0; }
+    };
+    conn.drop();
+
+    mut ok: i32 = 0;
+    mut req: Request = Request::new(Method::Get, Str::new("/"));
+    req.headers.insert(Str::new("Host"), Str::new("127.0.0.1"));
+    match (req.write_to(&tls)) {
+        Result::Ok(_) => { ok = 200; }
+        Result::Err(_) => { }
+    }
+    req.drop();
+    tls.drop();
+    return ok;
+}
+
+/// Parse the request with the real HTTP parser over the TLS stream, then
+/// write a fixed 200 response.
+function serve_one(tls: TlsStream*) -> boolean {
+    mut parsed: boolean = false;
+    {
+        mut br: BufReader<TlsStream> = BufReader::new(tls);
+        match (Request::parse(&br)) {
+            Result::Ok(req) => { mut r: Request = req; r.drop(); parsed = true; }
+            Result::Err(_)  => { return false; }
+        }
+    }
+    if (!parsed) { return false; }
+    match (tls.write_all(RESPONSE.as_bytes())) {
+        Result::Ok(_)  => { return true; }
+        Result::Err(_) => { return false; }
+    }
+}
+
+![test]
+function https_loopback_round_trip() -> Result<(), TestError> {
+    const port: u16 = (28000 + (libc::getpid() % 20000)) as u16;
+
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(port))) {
+        Result::Ok(l)  => { l }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1 failed")); }
+    };
+
+    const handle: thread::JoinHandle<i32> =
+        thread::spawn<i32, i32>(port as i32, https_client);
+
+    mut tcp_server: TcpStream = match (listener.accept()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { handle.join(); listener.drop(); return bail(Str::new("accept failed")); }
+    };
+    mut acceptor: TlsAcceptor = match (TlsAcceptor::new(
+            Str::new("fixtures/tls/cert.pem"), Str::new("fixtures/tls/key.pem"))) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { tcp_server.drop(); handle.join(); listener.drop(); return bail(Str::new("TlsAcceptor::new failed (cert/key fixture?)")); }
+    };
+    mut tls_server: TlsStream = match (acceptor.accept(tcp_server)) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { acceptor.drop(); handle.join(); listener.drop(); return bail(Str::new("server TLS handshake failed")); }
+    };
+
+    const server_ok: boolean = serve_one(&tls_server);
+
+    tls_server.drop();
+    acceptor.drop();
+    listener.drop();
+
+    const client_status: i32 = handle.join();
+
+    match (expect(server_ok, Str::new("server should parse the HTTPS request and respond"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(client_status, 200);
+}

@@ -1,0 +1,98 @@
+///! sockaddr_in packing/unpacking + socket-option helpers.
+///!
+///! Both `net::tcp` and `net::udp` translate between Cryo's
+///! `SocketAddr` and the platform `struct sockaddr_in`; this module is
+///! the shared, single home for that conversion plus the `timeval`
+///! packing behind `SO_RCVTIMEO` / `SO_SNDTIMEO`.
+///!
+///! `sockaddr_in` is packed by hand: 16 bytes, family + port + addr
+///! + 8 bytes padding, port/addr in network byte order. That avoids
+///! needing cryoc to model C struct layouts for every sockaddr
+///! variant. The inverse, `unpack_sockaddr_in`, reads those same
+///! offsets back out of a kernel-filled buffer (e.g. from `recvfrom`
+///! or `getsockname`).
+
+namespace std::net::sockaddr;
+
+import core::option;
+import core::result;
+import io::error;
+import ffi::libc;
+import net::ip;
+import net::socket_addr;
+
+/// Little-endian pack of an `i64` into 8 bytes at `out`.  Linux
+/// x86_64 / arm64 are LE; the host-order assumption matches every
+/// other libc struct field that's passed in host order (e.g.
+/// `struct timeval`).
+function pack_i64_le(out: u8*, value: i64) -> void {
+    const v: u64 = value as u64;
+    out[0] = (v       ) as u8;
+    out[1] = (v >> 8  ) as u8;
+    out[2] = (v >> 16 ) as u8;
+    out[3] = (v >> 24 ) as u8;
+    out[4] = (v >> 32 ) as u8;
+    out[5] = (v >> 40 ) as u8;
+    out[6] = (v >> 48 ) as u8;
+    out[7] = (v >> 56 ) as u8;
+}
+
+/// Apply a `SO_RCVTIMEO` / `SO_SNDTIMEO` to a socket fd.  Packs the
+/// 16-byte `struct timeval` (host byte order, two `i64`s) into a
+/// stack buffer rather than passing the struct by pointer; this keeps
+/// the same shape as `pack_sockaddr_in` and avoids depending on the
+/// compiler emitting `&struct as u8*` as a literal byte-addressable
+/// pointer.
+function apply_so_timeout(fd: i32, optname: i32, secs: i64, usecs: i64) -> Result<(), IoError> {
+    mut buf: u8[16];
+    pack_i64_le(&buf[0], secs);
+    pack_i64_le(&buf[8], usecs);
+    const rc: i32 = libc::setsockopt(fd,
+                                     libc::SocketLevel::SOL_SOCKET,
+                                     optname,
+                                     &buf[0], 16);
+    if (rc < 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+    return Result::Ok(());
+}
+
+/// Pack a `SocketAddr` into a 16-byte `sockaddr_in` buffer. Returns
+/// the number of bytes written (always 16 for IPv4), or an
+/// `Unsupported` error for IPv6; the v6 path will want a 28-byte
+/// `sockaddr_in6` packer, which isn't implemented yet.
+function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> Result<u32, IoError> {
+    match (addr.ip) {
+        IpAddr::V4(v4) => {
+            // sin_family = AF_INET, host byte order
+            out[0] = 2;
+            out[1] = 0;
+            // sin_port, network byte order (big-endian)
+            out[2] = (addr.port >> 8) as u8;
+            out[3] = (addr.port & 0xFF) as u8;
+            // sin_addr, network byte order
+            out[4] = v4.a;
+            out[5] = v4.b;
+            out[6] = v4.c;
+            out[7] = v4.d;
+            // 8 bytes of sin_zero padding
+            mut i: u64 = 8;
+            while (i < 16) { out[i] = 0; i++; }
+            return Result::Ok(16);
+        }
+        IpAddr::V6(_) => {
+            return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+        }
+    }
+}
+
+/// Read an IPv4 `sockaddr_in` back out of a kernel-filled buffer (the
+/// `recvfrom` source address, or `getsockname`'s local address). Reads
+/// `sin_port` (offset 2, big-endian) and `sin_addr` (offset 4, network
+/// order). The family at offset 0 is assumed `AF_INET`; the socket
+/// layer only ever creates v4 sockets, so a v6 reply can't appear here.
+function unpack_sockaddr_in(buf: u8*) -> SocketAddr {
+    const port: u16 = ((buf[2] as u16) << 8) | (buf[3] as u16);
+    const v4: IpV4Addr = IpV4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+    return SocketAddr::new(IpAddr::V4(v4), port);
+}

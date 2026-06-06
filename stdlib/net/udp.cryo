@@ -1,0 +1,187 @@
+///! UDP sockets.
+///!
+///! `UdpSocket` owns a POSIX file descriptor and must have `drop`
+///! called before going out of scope, exactly like `TcpStream`. Unlike
+///! TCP it is connectionless, so it deliberately does NOT implement the
+///! `Read` / `Write` stream traits — datagram boundaries don't survive
+///! a byte-stream abstraction. Instead it exposes `send_to`/`recv_from`
+///! (each datagram carries its peer address) and, once `connect` has
+///! pinned a default peer, the address-less `send`/`recv`.
+///!
+///! IPv4 only for now: `bind`/`connect`/`send_to` reject `IpAddr::V6`
+///! with `IoErrorKind::Unsupported`, the same contract as `net::tcp`.
+
+namespace std::net::udp;
+
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::fd;
+import ffi::libc;
+import net::ip;
+import net::socket_addr;
+import net::sockaddr;
+
+type struct UdpSocket {
+    fd: i32;
+
+    /// Open a datagram socket and bind it to `local`. Use
+    /// `SocketAddr::any_v4(port)` to receive on every interface or
+    /// `localhost_v4(port)` for loopback. Pass port 0 to let the
+    /// kernel pick an ephemeral port, then read it back with
+    /// `local_addr`.
+    static bind(local: SocketAddr) -> Result<UdpSocket, IoError> {
+        // Pack first so an unsupported address family doesn't leak a
+        // freshly-opened socket fd.
+        mut sockaddr_buf: u8[16];
+        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &local)?;
+
+        const sock: i32 = open_dgram()?;
+        if (libc::bind(sock, &sockaddr_buf[0], len) < 0) {
+            const err: IoError = IoError::from_errno(libc::errno());
+            fd::close_fd(sock);
+            return Result::Err(err);
+        }
+        return Result::Ok(UdpSocket { fd: sock });
+    }
+
+    /// Open an unbound datagram socket. The kernel assigns a local
+    /// address lazily on the first `send_to` / `connect`. Handy for a
+    /// pure client that only ever talks to one peer.
+    static unbound() -> Result<UdpSocket, IoError> {
+        const sock: i32 = open_dgram()?;
+        return Result::Ok(UdpSocket { fd: sock });
+    }
+
+    /// Pin a default peer. After this, `send`/`recv` talk to `remote`
+    /// and the kernel filters incoming datagrams to that source. Does
+    /// not exchange packets — UDP `connect` is local bookkeeping only.
+    connect(mut &this, remote: SocketAddr) -> Result<(), IoError> {
+        mut sockaddr_buf: u8[16];
+        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &remote)?;
+        if (libc::connect(this.fd, &sockaddr_buf[0], len) < 0) {
+            return Result::Err(IoError::from_errno(libc::errno()));
+        }
+        return Result::Ok(());
+    }
+
+    /// Send one datagram to `dest`. Returns the number of bytes
+    /// accepted by the kernel; a partial datagram is never sent, so
+    /// this is `bytes.length()` on success.
+    send_to(mut &this, bytes: Slice<u8>, dest: SocketAddr) -> Result<u64, IoError> {
+        mut sockaddr_buf: u8[16];
+        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &dest)?;
+        loop {
+            const n: i64 = libc::sendto(this.fd, bytes.as_ptr(), bytes.length(),
+                                        0, &sockaddr_buf[0], len);
+            if (n >= 0) { return Result::Ok(n as u64); }
+            const err: IoError = IoError::from_errno(libc::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// Receive one datagram into `buffer`, returning the byte count and
+    /// the peer that sent it. A datagram longer than `length` is
+    /// truncated (the tail is discarded — POSIX UDP semantics).
+    recv_from(mut &this, buffer: u8*, length: u64) -> Result<[u64, SocketAddr], IoError> {
+        mut sockaddr_buf: u8[16];
+        mut addrlen: u32 = 16;
+        loop {
+            const n: i64 = libc::recvfrom(this.fd, buffer, length, 0,
+                                          &sockaddr_buf[0], &addrlen);
+            if (n >= 0) {
+                const peer: SocketAddr = sockaddr::unpack_sockaddr_in(&sockaddr_buf[0]);
+                return Result::Ok((n as u64, peer));
+            }
+            const err: IoError = IoError::from_errno(libc::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// Send on a `connect`ed socket. Errors with `NotConnected` if no
+    /// default peer was set.
+    send(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        loop {
+            const n: i64 = libc::send(this.fd, bytes.as_ptr(), bytes.length(), 0);
+            if (n >= 0) { return Result::Ok(n as u64); }
+            const err: IoError = IoError::from_errno(libc::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// Receive on a `connect`ed socket. Drops the peer address (it can
+    /// only be the connected peer). Truncates an oversized datagram.
+    recv(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        loop {
+            const n: i64 = libc::recv(this.fd, buffer, length, 0);
+            if (n >= 0) { return Result::Ok(n as u64); }
+            const err: IoError = IoError::from_errno(libc::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return Result::Err(err); }
+            }
+        }
+    }
+
+    /// The local address the socket is bound to. After `bind(.., 0)`
+    /// this reports the kernel-assigned ephemeral port — the only way
+    /// to learn it.
+    local_addr(&this) -> Result<SocketAddr, IoError> {
+        mut sockaddr_buf: u8[16];
+        mut addrlen: u32 = 16;
+        if (libc::getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
+            return Result::Err(IoError::from_errno(libc::errno()));
+        }
+        return Result::Ok(sockaddr::unpack_sockaddr_in(&sockaddr_buf[0]));
+    }
+
+    /// Cap blocking-`recv` latency. After `secs` + `usecs` with no
+    /// datagram the next receive returns `WouldBlock`. Pass 0/0 to
+    /// clear an existing timeout.
+    set_read_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
+        return sockaddr::apply_so_timeout(this.fd, libc::SO_RCVTIMEO, secs, usecs);
+    }
+
+    /// Allow sending to the broadcast address. Off by default; the
+    /// kernel rejects broadcast sends without it (`EACCES`).
+    set_broadcast(mut &this, on: boolean) -> Result<(), IoError> {
+        mut v: i32 = if (on) { 1 } else { 0 };
+        if (libc::setsockopt(this.fd, libc::SocketLevel::SOL_SOCKET,
+                             libc::SO_BROADCAST, &v as u8*, 4) < 0) {
+            return Result::Err(IoError::from_errno(libc::errno()));
+        }
+        return Result::Ok(());
+    }
+
+    /// Close the socket. Ownership obligation: every UdpSocket must
+    /// have `drop` called before going out of scope.
+    drop(mut &this) -> void {
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+    }
+}
+
+/// Open a `SOCK_DGRAM` IPv4 socket with close-on-exec set atomically so
+/// a concurrent `fork`+`exec` does not leak it into the child.
+function open_dgram() -> Result<i32, IoError> {
+    const sock: i32 = libc::socket(
+        libc::AddressFamily::AF_INET,
+        libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+        libc::Protocol::IPPROTO_UDP);
+    if (sock < 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+    return Result::Ok(sock);
+}

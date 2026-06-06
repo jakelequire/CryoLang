@@ -1,19 +1,32 @@
-///! std::time: Duration unit math, Instant monotonicity, SystemTime
+///! std::time: Duration unit math + checked/saturating/scaling
+///! arithmetic + Display/Debug, Instant monotonicity, SystemTime
 ///! wall-clock sanity, and sleep.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::Time;
 
 import std::core::result;
+import std::core::option;
 import std::core::cmp;
 import std::collections::str;
-import std::time;
+import std::collections::string;
+import std::time::duration;
+import std::time::clock;
 import std::test::error;
 import std::test::assert;
 
+/// Compare an owned `String` (an f-string result) to `want`, dropping it.
+function check(got: String, want: string) -> Result<(), TestError> {
+    mut s: String = got;
+    const view: Str = s.as_str();
+    const w: Str = Str::new(want);
+    const eq: boolean = view.equals(&w);
+    s.drop();
+    return expect(eq, Str::new(want));
+}
+
 ![test]
 function duration_unit_conversions() -> Result<(), TestError> {
-    // 1500 ms == 1 s + 500_000_000 ns.
     const d: Duration = Duration::from_millis(1500u64);
     expect_eq(d.as_secs(), 1u64)?;
     expect_eq(d.subsec_nanos(), 500000000u32)?;
@@ -26,7 +39,6 @@ function duration_unit_conversions() -> Result<(), TestError> {
 
 ![test]
 function duration_new_normalizes_overflow() -> Result<(), TestError> {
-    // 1 s + 1_500_000_000 ns must carry into 2 s + 500_000_000 ns.
     const d: Duration = Duration::new(1u64, 1500000000u32);
     expect_eq(d.as_secs(), 2u64)?;
     expect_eq(d.subsec_nanos(), 500000000u32)?;
@@ -34,22 +46,56 @@ function duration_new_normalizes_overflow() -> Result<(), TestError> {
 }
 
 ![test]
-function duration_add_and_saturating_sub() -> Result<(), TestError> {
+function duration_checked_and_saturating() -> Result<(), TestError> {
     const a: Duration = Duration::from_millis(750u64);
     const b: Duration = Duration::from_millis(500u64);
 
-    // 750ms + 500ms = 1250ms (carries the nanos overflow into secs).
-    const sum: Duration = a.add(&b);
-    expect_eq(sum.as_secs(), 1u64)?;
-    expect_eq(sum.as_millis(), 1250u64)?;
+    // 750ms + 500ms = 1.25s.
+    match (a.checked_add(&b)) {
+        Option::Some(sum) => {
+            expect_eq(sum.as_secs(), 1u64)?;
+            expect_eq(sum.as_millis(), 1250u64)?;
+        }
+        Option::None => {
+            return Result::Err(TestError::failed(Str::new("checked_add overflowed unexpectedly")));
+        }
+    }
 
     // 750ms - 500ms = 250ms.
-    const diff: Duration = a.saturating_sub(&b);
-    expect_eq(diff.as_millis(), 250u64)?;
+    match (a.checked_sub(&b)) {
+        Option::Some(diff) => { expect_eq(diff.as_millis(), 250u64)?; }
+        Option::None       => {
+            return Result::Err(TestError::failed(Str::new("checked_sub underflowed unexpectedly")));
+        }
+    }
 
-    // 500ms - 750ms saturates to zero.
-    const under: Duration = b.saturating_sub(&a);
-    expect_true(under.is_zero(), Str::new("smaller minus larger saturates to zero"))?;
+    // 500ms - 750ms has no representable result.
+    match (b.checked_sub(&a)) {
+        Option::Some(_) => {
+            return Result::Err(TestError::failed(Str::new("checked_sub should be None")));
+        }
+        Option::None => { }
+    }
+
+    // ... but saturating_sub clamps to zero.
+    expect_true(b.saturating_sub(&a).is_zero(),
+                Str::new("smaller minus larger saturates to zero"))?;
+    return Result::Ok(());
+}
+
+![test]
+function duration_scale_divide_and_f64() -> Result<(), TestError> {
+    // 250ms * 4 = 1s.
+    expect_eq(Duration::from_millis(250u64).scale(4u64).as_millis(), 1000u64)?;
+    // 1s / 4 = 250ms.
+    expect_eq(Duration::from_secs(1u64).divide(4u64).as_millis(), 250u64)?;
+
+    // f64 round-trip: 2.5s.
+    const d: Duration = Duration::from_secs_f64(2.5);
+    expect_eq(d.as_secs(), 2u64)?;
+    expect_eq(d.subsec_millis(), 500u32)?;
+    const back: f64 = d.as_secs_f64();
+    expect_true(back > 2.49 && back < 2.51, Str::new("as_secs_f64 round-trips ~2.5"))?;
     return Result::Ok(());
 }
 
@@ -64,25 +110,49 @@ function duration_ordering() -> Result<(), TestError> {
 }
 
 ![test]
+function duration_display() -> Result<(), TestError> {
+    check(Duration::from_millis(1500u64).to_string(), "1.5s")?;
+    check(Duration::from_millis(250u64).to_string(),  "250ms")?;
+    check(Duration::from_micros(3u64).to_string(),    "3us")?;
+    check(Duration::from_nanos(10u64).to_string(),    "10ns")?;
+    check(Duration::from_secs(5u64).to_string(),      "5s")?;
+    check(Duration::zero().to_string(),               "0ns")?;
+    return Result::Ok(());
+}
+
+![test]
+function duration_debug() -> Result<(), TestError> {
+    const d: Duration = Duration::from_millis(1500u64);
+    return check(d.to_debug_string(), "Duration { secs: 1, nanos: 500000000 }");
+}
+
+![test]
 function instant_elapsed_is_monotonic() -> Result<(), TestError> {
     const start: Instant = Instant::now();
-    time::sleep(Duration::from_millis(5u64));
+    sleep(Duration::from_millis(5u64));
     const elapsed: Duration = start.elapsed();
-    // sleep guarantees the full span elapses; assert a conservative lower
-    // bound (>= 2ms) so coarse-clock rounding can't make this flaky.
     expect_true(elapsed.as_millis() >= 2u64,
                 Str::new("elapsed since a 5ms sleep is at least 2ms"))?;
 
-    // A later reading is never ordered before an earlier one.
     const later: Instant = Instant::now();
     expect_true(later.compare(&start) != Ordering::Less,
                 Str::new("monotonic clock does not go backward"))?;
+
+    // Instant + Duration moves forward.
+    match (start.checked_add(&Duration::from_secs(1u64))) {
+        Option::Some(future) => {
+            expect_true(future.compare(&start) == Ordering::Greater,
+                        Str::new("instant + 1s is later"))?;
+        }
+        Option::None => {
+            return Result::Err(TestError::failed(Str::new("instant checked_add overflowed")));
+        }
+    }
     return Result::Ok(());
 }
 
 ![test]
 function system_time_is_after_2020() -> Result<(), TestError> {
-    // A real wall clock reads well past the 2020 epoch second.
     const since: Duration = SystemTime::now().duration_since_epoch();
     expect_true(since.as_secs() >= 1600000000u64,
                 Str::new("wall clock is past 2020-09"))?;

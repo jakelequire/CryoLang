@@ -21,73 +21,12 @@ import io::traits;
 import ffi::libc;
 import net::ip;
 import net::socket_addr;
+import net::sockaddr;
 
 // Socket-domain / type / level / option / shutdown constants and
-// the `ShutdownHow` enum live in `ffi::libc`.
-
-/// Apply a `SO_RCVTIMEO` / `SO_SNDTIMEO` to a socket fd.  Packs the
-/// 16-byte `struct timeval` (host byte order, two `i64`s) into a
-/// stack buffer rather than passing the struct by pointer; this keeps
-/// the same shape as `pack_sockaddr_in` and avoids depending on the
-/// compiler emitting `&struct as u8*` as a literal byte-addressable
-/// pointer.
-function apply_so_timeout(fd: i32, optname: i32, secs: i64, usecs: i64) -> Result<(), IoError> {
-    mut buf: u8[16];
-    pack_i64_le(&buf[0], secs);
-    pack_i64_le(&buf[8], usecs);
-    const rc: i32 = libc::setsockopt(fd,
-                                      libc::SocketLevel::SOL_SOCKET,
-                                      optname,
-                                      &buf[0], 16);
-    if (rc < 0) {
-        return Result::Err(IoError::from_errno(libc::errno()));
-    }
-    return Result::Ok(());
-}
-
-/// Little-endian pack of an `i64` into 8 bytes at `out`.  Linux
-/// x86_64 / arm64 are LE; the host-order assumption matches every
-/// other libc struct field in this module.
-function pack_i64_le(out: u8*, value: i64) -> void {
-    const v: u64 = value as u64;
-    out[0] = (v       ) as u8;
-    out[1] = (v >> 8  ) as u8;
-    out[2] = (v >> 16 ) as u8;
-    out[3] = (v >> 24 ) as u8;
-    out[4] = (v >> 32 ) as u8;
-    out[5] = (v >> 40 ) as u8;
-    out[6] = (v >> 48 ) as u8;
-    out[7] = (v >> 56 ) as u8;
-}
-
-/// Pack a `SocketAddr` into a 16-byte `sockaddr_in` buffer. Returns
-/// the number of bytes written (always 16 for IPv4), or an
-/// `Unsupported` error for IPv6; the v6 path will want a 28-byte
-/// `sockaddr_in6` packer, which isn't implemented yet.
-function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> Result<u32, IoError> {
-    match (addr.ip) {
-        IpAddr::V4(v4) => {
-            // sin_family = AF_INET, host byte order
-            out[0] = 2;
-            out[1] = 0;
-            // sin_port, network byte order (big-endian)
-            out[2] = (addr.port >> 8) as u8;
-            out[3] = (addr.port & 0xFF) as u8;
-            // sin_addr, network byte order
-            out[4] = v4.a;
-            out[5] = v4.b;
-            out[6] = v4.c;
-            out[7] = v4.d;
-            // 8 bytes of sin_zero padding
-            mut i: u64 = 8;
-            while (i < 16) { out[i] = 0; i++; }
-            return Result::Ok(16);
-        }
-        IpAddr::V6(_) => {
-            return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
-        }
-    }
-}
+// the `ShutdownHow` enum live in `ffi::libc`. `sockaddr_in` packing
+// and the `SO_*TIMEO` helper are shared with `net::udp` in
+// `net::sockaddr`.
 
 // TcpStream: connected socket
 
@@ -102,7 +41,7 @@ type struct TcpStream {
         // Pack first so an unsupported address family doesn't leak
         // a freshly-opened socket fd.
         mut sockaddr_buf: u8[16];
-        const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &remote)?;
+        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &remote)?;
 
         // `SOCK_CLOEXEC` opens the socket close-on-exec so a concurrent
         // `fork`+`exec` does not leak it into the child.
@@ -128,6 +67,14 @@ type struct TcpStream {
         return TcpStream { fd: sock };
     }
 
+    /// Borrow the underlying file descriptor without transferring
+    /// ownership. The `TcpStream` still closes it on `drop`. Used by
+    /// `net::tls` to hand the fd to OpenSSL's socket BIO (which is
+    /// created `BIO_NOCLOSE`, so the fd stays this stream's to close).
+    raw_fd(&this) -> i32 {
+        return this.fd;
+    }
+
     /// Close the write half. Signals "no more from me" without tearing
     /// down the read path. Useful for protocols where the client
     /// sends then reads to EOF.
@@ -143,14 +90,14 @@ type struct TcpStream {
     /// 0/0 to clear an existing timeout.  Pairs with
     /// `set_write_timeout` for full slow-loris coverage.
     set_read_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
-        return apply_so_timeout(this.fd, libc::SO_RCVTIMEO, secs, usecs);
+        return sockaddr::apply_so_timeout(this.fd, libc::SO_RCVTIMEO, secs, usecs);
     }
 
     /// Cap blocking-`write` latency.  After `secs` + `usecs` of no
     /// progress the next `write()` returns `WouldBlock` (errno
     /// `EAGAIN`).  Pass 0/0 to clear.
     set_write_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
-        return apply_so_timeout(this.fd, libc::SO_SNDTIMEO, secs, usecs);
+        return sockaddr::apply_so_timeout(this.fd, libc::SO_SNDTIMEO, secs, usecs);
     }
 
     /// Close both halves. Ownership obligation: every TcpStream must
@@ -193,7 +140,7 @@ type struct TcpListener {
         // Pack first so an unsupported address family doesn't leak
         // a freshly-opened socket fd.
         mut sockaddr_buf: u8[16];
-        const len: u32 = pack_sockaddr_in(&sockaddr_buf[0], &local)?;
+        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &local)?;
 
         // `SOCK_CLOEXEC` opens the listening socket close-on-exec so a
         // concurrent `fork`+`exec` does not leak it into the child.

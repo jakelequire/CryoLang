@@ -1,0 +1,359 @@
+///! WebSocket connection: handshake + message send/recv over any stream.
+///!
+///! `WebSocket<S>` borrows any `Read + Write` transport (by pointer, the
+///! same way `io::BufReader`/`BufWriter` do), so the same code speaks
+///! ws:// over `TcpStream` and wss:// over `TlsStream`. The caller owns
+///! the transport and drops it; the `WebSocket` is a protocol view over
+///! it. Messages are reassembled from frames (continuations joined,
+///! control frames handled inline — Ping is auto-answered with Pong).
+///! The opening handshake is plain HTTP/1.1 read one byte at a time so no
+///! payload bytes are ever consumed past the blank line.
+///!
+///! A received `Message::Text` / `Binary` owns its payload — drop it (or
+///! match it out) when done.
+
+namespace std::net::ws::conn;
+
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import collections::array;
+import collections::string;
+import collections::str;
+import net::tcp;
+import net::ws::frame;
+import net::ws::handshake;
+
+const MAX_HEAD: u64 = 16384;
+
+/// A complete application message. Owns its payload.
+type enum Message {
+    Text(String);
+    Binary(Array<u8>);
+    Close;
+}
+
+type struct WebSocket<S> {
+    inner:     S*;
+    is_client: boolean;
+    closed:    boolean;
+
+    /// View an already-upgraded stream as a WebSocket. `is_client`
+    /// selects masked (client) vs unmasked (server) framing per RFC 6455.
+    /// Borrows `stream`; the caller keeps ownership and drops it.
+    static from_upgraded(stream: S*, is_client: boolean) -> WebSocket<S> {
+        return WebSocket<S> { inner: stream, is_client: is_client, closed: false };
+    }
+
+    /// Send a text message in a single frame.
+    send_text(mut &this, text: Str) -> Result<(), IoError>
+    where S: Read + Write {
+        return frame::encode_frame(this.inner, true, OpCode::Text,
+                                   text.as_bytes(), this.is_client);
+    }
+
+    /// Send a binary message in a single frame.
+    send_binary(mut &this, data: Slice<u8>) -> Result<(), IoError>
+    where S: Read + Write {
+        return frame::encode_frame(this.inner, true, OpCode::Binary,
+                                   data, this.is_client);
+    }
+
+    /// Send a Ping with optional application data.
+    ping(mut &this, data: Slice<u8>) -> Result<(), IoError>
+    where S: Read + Write {
+        return frame::encode_frame(this.inner, true, OpCode::Ping,
+                                   data, this.is_client);
+    }
+
+    /// Receive the next application message, reassembling fragments and
+    /// transparently answering Pings with Pongs and skipping Pongs. A
+    /// Close frame surfaces as `Message::Close`.
+    recv(mut &this) -> Result<Message, IoError>
+    where S: Read + Write {
+        mut acc: Array<u8> = Array<u8>::new();
+        mut binary: boolean = false;
+        loop {
+            mut fr: Frame = match (frame::read_frame(this.inner)) {
+                Result::Ok(f)  => { f }
+                Result::Err(e) => { acc.drop(); return Result::Err(e); }
+            };
+            match (fr.opcode) {
+                OpCode::Ping => {
+                    // Best-effort Pong echoing the ping payload.
+                    match (frame::encode_frame(this.inner, true, OpCode::Pong,
+                            Slice::from_raw(fr.payload.as_ptr(), fr.payload.length()),
+                            this.is_client)) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { }
+                    }
+                    fr.drop();
+                }
+                OpCode::Pong => { fr.drop(); }
+                OpCode::Close => {
+                    fr.drop();
+                    acc.drop();
+                    this.closed = true;
+                    return Result::Ok(Message::Close);
+                }
+                OpCode::Text => {
+                    binary = false;
+                    acc.append(Slice::from_raw(fr.payload.as_ptr(), fr.payload.length()));
+                    const fin: boolean = fr.fin;
+                    fr.drop();
+                    if (fin) { return Result::Ok(build_message(acc, binary)); }
+                }
+                OpCode::Binary => {
+                    binary = true;
+                    acc.append(Slice::from_raw(fr.payload.as_ptr(), fr.payload.length()));
+                    const fin: boolean = fr.fin;
+                    fr.drop();
+                    if (fin) { return Result::Ok(build_message(acc, binary)); }
+                }
+                OpCode::Continuation => {
+                    acc.append(Slice::from_raw(fr.payload.as_ptr(), fr.payload.length()));
+                    const fin: boolean = fr.fin;
+                    fr.drop();
+                    if (fin) { return Result::Ok(build_message(acc, binary)); }
+                }
+            }
+        }
+    }
+
+    /// Send a Close frame with a status code and reason. The transport
+    /// itself is closed by the owner dropping it.
+    close(mut &this, code: u16, reason: Str) -> Result<(), IoError>
+    where S: Read + Write {
+        mut payload: Array<u8> = Array<u8>::with_capacity(2 + reason.length());
+        payload.push((code >> 8) as u8);
+        payload.push((code)      as u8);
+        payload.append(reason.as_bytes());
+        const result: Result<(), IoError> = frame::encode_frame(this.inner, true,
+            OpCode::Close, Slice::from_raw(payload.as_ptr(), payload.length()),
+            this.is_client);
+        payload.drop();
+        this.closed = true;
+        return result;
+    }
+}
+
+/// Run the client handshake over `stream`, then view it as a client-mode
+/// `WebSocket`. `stream` must already be connected (TCP for ws://, TLS
+/// for wss://); the caller owns it.
+function connect(stream: TcpStream*, host: Str, path: Str) -> Result<WebSocket<TcpStream>, IoError> {
+    client_handshake(stream, host, path)?;
+    return Result::Ok(WebSocket<TcpStream>::from_upgraded(stream, true));
+}
+
+/// Run the server handshake over an accepted `stream`, then view it as a
+/// server-mode `WebSocket`. The caller owns `stream`.
+function accept(stream: TcpStream*) -> Result<WebSocket<TcpStream>, IoError> {
+    server_handshake(stream)?;
+    return Result::Ok(WebSocket<TcpStream>::from_upgraded(stream, false));
+}
+
+/// Client handshake over any stream: send the GET upgrade, verify the
+/// `101` and the `Sec-WebSocket-Accept` echo.
+function client_handshake<S>(stream: S*, host: Str, path: Str) -> Result<(), IoError>
+where S: Read + Write {
+    mut key: String = handshake::generate_key();
+
+    mut req: String = String::with_capacity(160);
+    req.push(Str::new("GET ")); req.push(path); req.push(Str::new(" HTTP/1.1\r\n"));
+    req.push(Str::new("Host: ")); req.push(host); req.push(Str::new("\r\n"));
+    req.push(Str::new("Upgrade: websocket\r\n"));
+    req.push(Str::new("Connection: Upgrade\r\n"));
+    req.push(Str::new("Sec-WebSocket-Key: ")); req.push(key.as_str()); req.push(Str::new("\r\n"));
+    req.push(Str::new("Sec-WebSocket-Version: 13\r\n\r\n"));
+
+    match (stream.write_all(req.as_str().as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { req.drop(); key.drop(); return Result::Err(e); }
+    }
+    req.drop();
+
+    mut head: String = match (read_head(stream)) {
+        Result::Ok(h)  => { h }
+        Result::Err(e) => { key.drop(); return Result::Err(e); }
+    };
+
+    mut ok: boolean = (status_code(head.as_str()) == 101);
+    if (ok) {
+        mut expected: String = handshake::compute_accept(key.as_str());
+        match (header_value(head.as_str(), Str::new("sec-websocket-accept"))) {
+            Option::Some(got) => {
+                mut g: String = got;
+                if (!str_eq(g.as_str(), expected.as_str())) { ok = false; }
+                g.drop();
+            }
+            Option::None => { ok = false; }
+        }
+        expected.drop();
+    }
+    head.drop();
+    key.drop();
+
+    if (!ok) { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+    return Result::Ok(());
+}
+
+/// Server handshake over any stream: read the client GET, reply `101`
+/// with the computed accept value.
+function server_handshake<S>(stream: S*) -> Result<(), IoError>
+where S: Read + Write {
+    mut head: String = read_head(stream)?;
+
+    mut accept_val: String = match (header_value(head.as_str(), Str::new("sec-websocket-key"))) {
+        Option::Some(k) => {
+            mut key: String = k;
+            const a: String = handshake::compute_accept(key.as_str());
+            key.drop();
+            a
+        }
+        Option::None => {
+            head.drop();
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+    };
+    head.drop();
+
+    mut resp: String = String::with_capacity(130);
+    resp.push(Str::new("HTTP/1.1 101 Switching Protocols\r\n"));
+    resp.push(Str::new("Upgrade: websocket\r\n"));
+    resp.push(Str::new("Connection: Upgrade\r\n"));
+    resp.push(Str::new("Sec-WebSocket-Accept: ")); resp.push(accept_val.as_str()); resp.push(Str::new("\r\n\r\n"));
+    accept_val.drop();
+
+    const result: Result<(), IoError> = stream.write_all(resp.as_str().as_bytes());
+    resp.drop();
+    return result;
+}
+
+/// Reassemble accumulated payload bytes into a `Message`. Consumes `data`.
+function build_message(data: Array<u8>, binary: boolean) -> Message {
+    mut bytes: Array<u8> = data;
+    if (binary) {
+        return Message::Binary(bytes);
+    }
+    const text: String = String::from_str(Str::from_raw(bytes.as_ptr(), bytes.length()));
+    bytes.drop();
+    return Message::Text(text);
+}
+
+/// Read an HTTP head (request or status line + headers) up to and
+/// including the terminating CRLF CRLF, one byte at a time so no body /
+/// frame bytes are consumed.
+function read_head<R>(reader: R*) -> Result<String, IoError>
+where R: Read {
+    mut head: String = String::new();
+    mut state: i32 = 0;   // CRLFCRLF progress: 0 -> \r1 -> \n2 -> \r3 -> \n done
+    mut b: u8[1];
+    loop {
+        if (head.length() > MAX_HEAD) {
+            head.drop();
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        const n: u64 = match (reader.read(&b[0], 1)) {
+            Result::Ok(x)  => { x }
+            Result::Err(e) => { head.drop(); return Result::Err(e); }
+        };
+        if (n == 0) {
+            head.drop();
+            return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+        }
+        const c: u8 = b[0];
+        head.push(c);
+        if (c == 0x0D) {                      // '\r'
+            if (state == 2) { state = 3; } else { state = 1; }
+        } else {
+            if (c == 0x0A) {                  // '\n'
+                if (state == 3) { return Result::Ok(head); }
+                if (state == 1) { state = 2; } else { state = 0; }
+            } else {
+                state = 0;
+            }
+        }
+    }
+}
+
+/// Status code from a response's first line (`HTTP/1.1 <code> ...`).
+function status_code(head: Str) -> u64 {
+    const len: u64 = head.length();
+    mut i: u64 = 0;
+    while (i < len && head_at(head, i) != 0x20) { i++; }   // skip "HTTP/1.1"
+    while (i < len && head_at(head, i) == 0x20) { i++; }   // skip spaces
+    mut code: u64 = 0;
+    while (i < len) {
+        const c: u8 = head_at(head, i);
+        if (c < 0x30 || c > 0x39) { break; }
+        code = code * 10 + ((c - 0x30) as u64);
+        i++;
+    }
+    return code;
+}
+
+/// Find a header value by case-insensitive name. Skips the first line.
+function header_value(head: Str, name_lower: Str) -> Option<String> {
+    const len: u64 = head.length();
+    mut i: u64 = 0;
+    while (i < len && head_at(head, i) != 0x0A) { i++; }   // past request/status line
+    i++;
+
+    while (i < len) {
+        mut j: u64 = i;
+        mut colon: u64 = len;
+        while (j < len && head_at(head, j) != 0x0A) {
+            if (head_at(head, j) == 0x3A && colon == len) { colon = j; }
+            j++;
+        }
+        if (colon != len) {
+            const name: Str = head.sub_bytes(i, colon);
+            if (eq_ignore_case(name, name_lower)) {
+                mut vs: u64 = colon + 1;
+                mut ve: u64 = j;
+                if (ve > vs && head_at(head, ve - 1) == 0x0D) { ve = ve - 1; }  // strip '\r'
+                while (vs < ve && head_at(head, vs) == 0x20) { vs = vs + 1; }    // strip leading SP
+                return Option::Some(String::from_str(head.sub_bytes(vs, ve)));
+            }
+        }
+        i = j + 1;
+    }
+    return Option::None;
+}
+
+/// Case-insensitive equality of `a` against an already-lowercase `b`.
+function eq_ignore_case(a: Str, b_lower: Str) -> boolean {
+    if (a.length() != b_lower.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        if (to_lower(head_at(a, i)) != head_at(b_lower, i)) { return false; }
+        i++;
+    }
+    return true;
+}
+
+/// Byte equality of two `Str`s.
+function str_eq(a: Str, b: Str) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        if (head_at(a, i) != head_at(b, i)) { return false; }
+        i++;
+    }
+    return true;
+}
+
+function to_lower(c: u8) -> u8 {
+    if (c >= 0x41 && c <= 0x5A) { return c + 32; }
+    return c;
+}
+
+/// Byte access without `Option` ceremony; callers stay in range.
+function head_at(s: Str, index: u64) -> u8 {
+    match (s.byte_at(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}

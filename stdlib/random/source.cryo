@@ -1,0 +1,143 @@
+///! std::random::source: the `RandomSource` trait.
+///!
+///! A `RandomSource` produces 64 random bits via the one required
+///! method, `next_u64`. Every other draw - smaller integers, booleans,
+///! floats, bounded ranges, byte fills, in-place shuffling, and uniform
+///! choice - is a default method derived from it, so a generator only
+///! implements `next_u64`.
+///!
+///! Both shipped generators (`Rng`, `SecureRng`) satisfy this trait, so
+///! code written against `R: RandomSource` runs against either.
+
+namespace std::random::source;
+
+import core::intrinsics;
+import core::option;
+import core::slice;
+import core::mem;
+import random::bits;
+
+const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFFu64;
+
+type trait RandomSource {
+    /// The single required primitive: the next 64 random bits.
+    next_u64(mut &this) -> u64;
+
+    /// The next 32 random bits (the high half of `next_u64`, whose bits
+    /// are the best mixed).
+    next_u32(mut &this) -> u32 {
+        return (this.next_u64() >> 32u64) as u32;
+    }
+
+    /// A random `boolean`, taken from the top (highest-quality) bit.
+    next_bool(mut &this) -> boolean {
+        return (this.next_u64() >> 63u64) == 1u64;
+    }
+
+    /// A uniform `f64` in `[0.0, 1.0)`, using the top 53 bits so every
+    /// representable value in the interval is equally likely.
+    next_f64(mut &this) -> f64 {
+        const bits: u64 = this.next_u64() >> 11u64;        // 53 bits
+        return (bits as f64) / 9007199254740992.0;         // / 2^53
+    }
+
+    /// A uniform `f32` in `[0.0, 1.0)`.
+    next_f32(mut &this) -> f32 {
+        return this.next_f64() as f32;
+    }
+
+    /// A uniform integer in `[0, bound)`. Unbiased: the top partial
+    /// bucket is rejected so the modulo introduces no skew. Panics when
+    /// `bound == 0` - an empty range has no value to return.
+    next_below(mut &this, bound: u64) -> u64 {
+        if (bound == 0u64) {
+            intrinsics::panic("RandomSource::next_below: bound must be > 0", FILE, LINE);
+        }
+        const threshold: u64 = (U64_MAX - bound + 1u64) % bound;   // 2^64 mod bound
+        loop {
+            const x: u64 = this.next_u64();
+            if (x >= threshold) {
+                return x % bound;
+            }
+        }
+    }
+
+    /// A uniform unsigned integer in `[lo, hi)`. Requires `lo < hi`.
+    next_range(mut &this, lo: u64, hi: u64) -> u64 {
+        if (lo >= hi) {
+            intrinsics::panic("RandomSource::next_range: lo must be < hi", FILE, LINE);
+        }
+        return lo + this.next_below(hi - lo);
+    }
+
+    /// A uniform signed integer in `[lo, hi)`. Requires `lo < hi`.
+    next_range_i64(mut &this, lo: i64, hi: i64) -> i64 {
+        if (lo >= hi) {
+            intrinsics::panic("RandomSource::next_range_i64: lo must be < hi", FILE, LINE);
+        }
+        const span: u64 = (hi - lo) as u64;
+        return lo + (this.next_below(span) as i64);
+    }
+
+    /// Fill `dst` with random bytes, writing through the view.
+    fill(mut &this, dst: Slice<u8>) -> void {
+        const len: u64 = dst.length();
+        const buf: u8* = dst.as_ptr();
+        mut i: u64 = 0u64;
+        while (i + 8u64 <= len) {
+            store_u64_le(mem::offset(buf, i as i64), this.next_u64());
+            i = i + 8u64;
+        }
+        if (i < len) {
+            mut last: u64 = this.next_u64();
+            while (i < len) {
+                buf[i] = (last & 0xFFu64) as u8;
+                last = last >> 8u64;
+                i = i + 1u64;
+            }
+        }
+    }
+}
+
+// Collection algorithms over a source.
+//
+// These are free generic functions rather than `RandomSource` default
+// methods: a default method carrying its own type parameter does not yet
+// monomorphize cleanly when inherited (codegen passes the wrong argument
+// count). As standalone generics - the same shape as `mem::swap<T>` -
+// they specialize correctly for any element type and any source.
+
+/// Shuffle `items` in place with a uniform Fisher-Yates pass, drawing
+/// from `rng`. Works for any element type - elements are swapped, never
+/// copied out, so no `Copy` bound is needed.
+function shuffle<T, R>(rng: mut &R, items: &Slice<T>) -> void
+where R: RandomSource {
+    const n: u64 = items.length();
+    if (n < 2u64) { return; }
+    const base: T* = items.as_ptr();
+    mut i: u64 = n - 1u64;
+    loop {
+        const j: u64 = rng.next_below(i + 1u64);
+        if (i != j) {
+            const a: T* = mem::offset(base, i as i64);
+            const b: T* = mem::offset(base, j as i64);
+            const tmp: T = *a;
+            *a = *b;
+            *b = tmp;
+        }
+        if (i == 0u64) { break; }
+        i = i - 1u64;
+    }
+}
+
+/// Borrow a uniformly chosen element of `items`, or `None` when `items`
+/// is empty. Returns a pointer in place, so no `Copy` is required and
+/// owning element types are fine.
+function choose<T, R>(rng: mut &R, items: &Slice<T>) -> Option<T*>
+where R: RandomSource {
+    const n: u64 = items.length();
+    if (n == 0u64) {
+        return Option::None;
+    }
+    return items.get_ref(rng.next_below(n));
+}

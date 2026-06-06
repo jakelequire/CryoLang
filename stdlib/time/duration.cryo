@@ -1,0 +1,373 @@
+///! std::time::duration: `Duration`, a span of time.
+///!
+///! A `Duration` is whole seconds plus a sub-second nanosecond remainder,
+///! always normalized so `nanos < 1_000_000_000`. It is POD: copied by
+///! value, no owned resources. Build it from any unit, read it back in
+///! any unit, do checked / saturating / scaling arithmetic, and print it
+///! through `Display` (`1.5s`, `250ms`, `10ns`).
+
+namespace std::time::duration;
+
+import core::cmp;
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import core::primitives;
+import collections::str;
+import collections::string;
+import fmt::display;
+import fmt::write;
+import fmt::error;
+
+const NANOS_PER_SEC:   u64 = 1000000000;
+const NANOS_PER_MILLI: u64 = 1000000;
+const NANOS_PER_MICRO: u64 = 1000;
+const MILLIS_PER_SEC:  u64 = 1000;
+const MICROS_PER_SEC:  u64 = 1000000;
+const U64_MAX:         u64 = 0xFFFFFFFFFFFFFFFFu64;
+
+/// A length of time: whole `secs` plus a sub-second `nanos` remainder
+/// (`0 <= nanos < 1_000_000_000`). POD; copy-by-value, no `drop`.
+type struct Duration {
+    secs:  u64;
+    nanos: u32;
+
+    /// Construct from a `(seconds, nanoseconds)` pair, carrying any
+    /// nanosecond overflow (`>= 1e9`) into the seconds field so the
+    /// stored value is always normalized.
+    static new(secs: u64, nanos: u32) -> Duration {
+        mut s: u64 = secs;
+        mut n: u64 = nanos as u64;
+        if (n >= NANOS_PER_SEC) {
+            s = s + (n / NANOS_PER_SEC);
+            n = n % NANOS_PER_SEC;
+        }
+        return Duration { secs: s, nanos: n as u32 };
+    }
+
+    /// The zero duration.
+    static zero() -> Duration {
+        return Duration { secs: 0u64, nanos: 0u32 };
+    }
+
+    /// One second.
+    static second() -> Duration {
+        return Duration { secs: 1u64, nanos: 0u32 };
+    }
+
+    /// One millisecond.
+    static millisecond() -> Duration {
+        return Duration { secs: 0u64, nanos: NANOS_PER_MILLI as u32 };
+    }
+
+    /// One microsecond.
+    static microsecond() -> Duration {
+        return Duration { secs: 0u64, nanos: NANOS_PER_MICRO as u32 };
+    }
+
+    /// One nanosecond.
+    static nanosecond() -> Duration {
+        return Duration { secs: 0u64, nanos: 1u32 };
+    }
+
+    static from_secs(secs: u64) -> Duration {
+        return Duration { secs: secs, nanos: 0u32 };
+    }
+
+    static from_millis(millis: u64) -> Duration {
+        return Duration {
+            secs:  millis / MILLIS_PER_SEC,
+            nanos: ((millis % MILLIS_PER_SEC) * NANOS_PER_MILLI) as u32
+        };
+    }
+
+    static from_micros(micros: u64) -> Duration {
+        return Duration {
+            secs:  micros / MICROS_PER_SEC,
+            nanos: ((micros % MICROS_PER_SEC) * NANOS_PER_MICRO) as u32
+        };
+    }
+
+    static from_nanos(nanos: u64) -> Duration {
+        return Duration {
+            secs:  nanos / NANOS_PER_SEC,
+            nanos: (nanos % NANOS_PER_SEC) as u32
+        };
+    }
+
+    /// Construct from a floating-point number of seconds. Negative
+    /// inputs clamp to zero.
+    static from_secs_f64(secs: f64) -> Duration {
+        if (secs <= 0.0) {
+            return Duration { secs: 0u64, nanos: 0u32 };
+        }
+        const whole: u64 = secs as u64;
+        const frac:  f64 = secs - (whole as f64);
+        mut nanos: u64 = (frac * 1000000000.0) as u64;
+        if (nanos >= NANOS_PER_SEC) { nanos = NANOS_PER_SEC - 1u64; }
+        return Duration { secs: whole, nanos: nanos as u32 };
+    }
+
+    /// Whole seconds (the sub-second part is dropped).
+    as_secs(&this) -> u64 { return this.secs; }
+
+    /// The sub-second remainder in nanoseconds (`< 1e9`).
+    subsec_nanos(&this) -> u32 { return this.nanos; }
+
+    /// The sub-second remainder in whole milliseconds (`< 1000`).
+    subsec_millis(&this) -> u32 {
+        return ((this.nanos as u64) / NANOS_PER_MILLI) as u32;
+    }
+
+    /// The sub-second remainder in whole microseconds (`< 1_000_000`).
+    subsec_micros(&this) -> u32 {
+        return ((this.nanos as u64) / NANOS_PER_MICRO) as u32;
+    }
+
+    /// Total whole milliseconds.
+    as_millis(&this) -> u64 {
+        return this.secs * MILLIS_PER_SEC + (this.nanos as u64) / NANOS_PER_MILLI;
+    }
+
+    /// Total whole microseconds.
+    as_micros(&this) -> u64 {
+        return this.secs * MICROS_PER_SEC + (this.nanos as u64) / NANOS_PER_MICRO;
+    }
+
+    /// Total nanoseconds. Wraps for spans beyond ~584 years.
+    as_nanos(&this) -> u64 {
+        return this.secs * NANOS_PER_SEC + (this.nanos as u64);
+    }
+
+    /// The whole span as floating-point seconds.
+    as_secs_f64(&this) -> f64 {
+        return (this.secs as f64) + (this.nanos as f64) / 1000000000.0;
+    }
+
+    is_zero(&this) -> boolean {
+        return this.secs == 0u64 && this.nanos == 0u32;
+    }
+
+    /// `this + other`, or `None` if the seconds field would overflow.
+    checked_add(&this, other: &Duration) -> Option<Duration> {
+        mut secs:  u64 = this.secs + other.secs;
+        mut nanos: u64 = (this.nanos as u64) + (other.nanos as u64);
+        if (this.secs > U64_MAX - other.secs) {
+            return Option::None;
+        }
+        if (nanos >= NANOS_PER_SEC) {
+            if (secs == U64_MAX) { return Option::None; }
+            secs  = secs + 1u64;
+            nanos = nanos - NANOS_PER_SEC;
+        }
+        return Option::Some(Duration { secs: secs, nanos: nanos as u32 });
+    }
+
+    /// `this - other`, or `None` when `other` is the larger.
+    checked_sub(&this, other: &Duration) -> Option<Duration> {
+        if (this.secs < other.secs) { return Option::None; }
+        if (this.secs == other.secs && this.nanos < other.nanos) {
+            return Option::None;
+        }
+        mut secs:  u64 = this.secs - other.secs;
+        mut nanos: i64 = (this.nanos as i64) - (other.nanos as i64);
+        if (nanos < 0i64) {
+            secs  = secs - 1u64;
+            nanos = nanos + (NANOS_PER_SEC as i64);
+        }
+        return Option::Some(Duration { secs: secs, nanos: nanos as u32 });
+    }
+
+    /// `this + other`, saturating at the maximum representable span on
+    /// overflow.
+    saturating_add(&this, other: &Duration) -> Duration {
+        return match (this.checked_add(other)) {
+            Option::Some(d) => { d }
+            Option::None    => { Duration { secs: U64_MAX, nanos: 999999999u32 } }
+        };
+    }
+
+    /// `this - other`, saturating at zero when `other` is the larger.
+    saturating_sub(&this, other: &Duration) -> Duration {
+        return match (this.checked_sub(other)) {
+            Option::Some(d) => { d }
+            Option::None    => { Duration { secs: 0u64, nanos: 0u32 } }
+        };
+    }
+
+    /// `this * factor`.
+    scale(&this, factor: u64) -> Duration {
+        const total_nanos: u64 = (this.nanos as u64) * factor;
+        const extra_secs:  u64 = total_nanos / NANOS_PER_SEC;
+        const rem_nanos:   u32 = (total_nanos % NANOS_PER_SEC) as u32;
+        return Duration { secs: this.secs * factor + extra_secs, nanos: rem_nanos };
+    }
+
+    /// `this * factor` for a floating-point factor.
+    mul_f64(&this, factor: f64) -> Duration {
+        return Duration::from_secs_f64(this.as_secs_f64() * factor);
+    }
+
+    /// `this / divisor`. Panics on division by zero.
+    divide(&this, divisor: u64) -> Duration {
+        if (divisor == 0u64) {
+            intrinsics::panic("Duration::divide: division by zero", FILE, LINE);
+        }
+        const secs:        u64 = this.secs / divisor;
+        const rem_secs:    u64 = this.secs % divisor;
+        const total_nanos: u64 = rem_secs * NANOS_PER_SEC + (this.nanos as u64);
+        return Duration { secs: secs, nanos: (total_nanos / divisor) as u32 };
+    }
+
+    /// Render the most natural unit as an owned `String` (`1.5s`,
+    /// `250ms`, `10ns`) - the same text as the `Display` impl, available
+    /// directly without an f-string.
+    to_string(&this) -> String {
+        mut buf: u8[48];
+        mut pos: u64 = 0u64;
+        if (this.secs == 0u64) {
+            if (this.nanos == 0u32) {
+                return String::from_str(Str::new("0ns"));
+            }
+            if ((this.nanos as u64) % NANOS_PER_MILLI == 0u64) {
+                pos = ((this.nanos as u64) / NANOS_PER_MILLI).to_decimal_buf(&buf[0]);
+                buf[pos] = 109u8; buf[pos + 1u64] = 115u8;        // "ms"
+                pos = pos + 2u64;
+            } else if ((this.nanos as u64) % NANOS_PER_MICRO == 0u64) {
+                pos = ((this.nanos as u64) / NANOS_PER_MICRO).to_decimal_buf(&buf[0]);
+                buf[pos] = 117u8; buf[pos + 1u64] = 115u8;        // "us"
+                pos = pos + 2u64;
+            } else {
+                pos = (this.nanos as u64).to_decimal_buf(&buf[0]);
+                buf[pos] = 110u8; buf[pos + 1u64] = 115u8;        // "ns"
+                pos = pos + 2u64;
+            }
+        } else {
+            pos = this.secs.to_decimal_buf(&buf[0]);
+            if (this.nanos != 0u32) {
+                buf[pos] = 46u8;                                  // '.'
+                pos = pos + 1u64;
+                mut digits: u8[9];
+                mut v: u32 = this.nanos;
+                mut i: i32 = 8;
+                while (i >= 0) {
+                    digits[i] = (48u32 + (v % 10u32)) as u8;
+                    v = v / 10u32;
+                    i = i - 1;
+                }
+                mut len: u64 = 9u64;
+                while (len > 1u64 && digits[len - 1u64] == 48u8) { len = len - 1u64; }
+                mut k: u64 = 0u64;
+                while (k < len) { buf[pos] = digits[k]; pos = pos + 1u64; k = k + 1u64; }
+            }
+            buf[pos] = 115u8;                                     // 's'
+            pos = pos + 1u64;
+        }
+        return String::from_str(Str::from_raw(&buf[0], pos));
+    }
+
+    /// Render the `Debug` form (`Duration { secs: S, nanos: N }`) as an
+    /// owned `String`.
+    to_debug_string(&this) -> String {
+        mut buf: u8[64];
+        mut pos: u64 = copy_str(&buf[0], 0u64, Str::new("Duration { secs: "));
+        pos = pos + this.secs.to_decimal_buf(&buf[pos]);
+        pos = copy_str(&buf[0], pos, Str::new(", nanos: "));
+        pos = pos + (this.nanos as u64).to_decimal_buf(&buf[pos]);
+        buf[pos] = 32u8; buf[pos + 1u64] = 125u8;                // " }"
+        pos = pos + 2u64;
+        return String::from_str(Str::from_raw(&buf[0], pos));
+    }
+}
+
+/// Copy `s`'s bytes into `buf` starting at `pos`; return the new offset.
+private function copy_str(buf: u8*, pos: u64, s: Str) -> u64 {
+    const src: u8* = s.as_ptr();
+    const n: u64 = s.length();
+    mut p: u64 = pos;
+    mut i: u64 = 0u64;
+    while (i < n) { buf[p] = src[i]; p = p + 1u64; i = i + 1u64; }
+    return p;
+}
+
+implement trait Eq for struct Duration {
+    equals(&this, other: &Duration) -> boolean {
+        return this.secs == other.secs && this.nanos == other.nanos;
+    }
+}
+
+implement trait Ord for struct Duration {
+    compare(&this, other: &Duration) -> Ordering {
+        if (this.secs < other.secs) { return Ordering::Less; }
+        if (this.secs > other.secs) { return Ordering::Greater; }
+        if (this.nanos < other.nanos) { return Ordering::Less; }
+        if (this.nanos > other.nanos) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+
+// Display / Debug.
+
+/// Write `value` as a decimal integer through `f`.
+private function write_decimal<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
+where W: FmtWrite {
+    mut buffer: u8[20];
+    const digits: u64 = value.to_decimal_buf(&buffer[0]);
+    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+}
+
+/// Write `nanos` as a 9-digit sub-second fraction with trailing zeros
+/// trimmed (so `500_000_000` prints as `5`).
+private function write_fraction<W>(f: mut &Formatter<W>, nanos: u32) -> Result<(), FmtError>
+where W: FmtWrite {
+    mut digits: u8[9];
+    mut v: u32 = nanos;
+    mut i: i32 = 8;
+    while (i >= 0) {
+        digits[i] = (48u32 + (v % 10u32)) as u8;   // '0' + d
+        v = v / 10u32;
+        i = i - 1;
+    }
+    mut len: u64 = 9u64;
+    while (len > 1u64 && digits[len - 1u64] == 48u8) { len = len - 1u64; }
+    return f.write_bytes(Slice::from_raw(&digits[0], len));
+}
+
+implement trait Display for struct Duration {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        if (this.secs == 0u64) {
+            if (this.nanos == 0u32) {
+                return f.write_str(Str::new("0ns"));
+            }
+            if ((this.nanos as u64) % NANOS_PER_MILLI == 0u64) {
+                write_decimal(f, (this.nanos as u64) / NANOS_PER_MILLI)?;
+                return f.write_str(Str::new("ms"));
+            }
+            if ((this.nanos as u64) % NANOS_PER_MICRO == 0u64) {
+                write_decimal(f, (this.nanos as u64) / NANOS_PER_MICRO)?;
+                return f.write_str(Str::new("us"));
+            }
+            write_decimal(f, this.nanos as u64)?;
+            return f.write_str(Str::new("ns"));
+        }
+        write_decimal(f, this.secs)?;
+        if (this.nanos != 0u32) {
+            f.write_str(Str::new("."))?;
+            write_fraction(f, this.nanos)?;
+        }
+        return f.write_str(Str::new("s"));
+    }
+}
+
+implement trait Debug for struct Duration {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        f.write_str(Str::new("Duration { secs: "))?;
+        write_decimal(f, this.secs)?;
+        f.write_str(Str::new(", nanos: "))?;
+        write_decimal(f, this.nanos as u64)?;
+        return f.write_str(Str::new(" }"));
+    }
+}

@@ -1,0 +1,153 @@
+///! TlsStream: an encrypted byte stream over a `TcpStream`.
+///!
+///! Implements `io::Read` + `io::Write`, so it drops straight under the
+///! HTTP layer (`Request::write_to` / `Response::parse`) and `net::ws`
+///! with no changes to either — the whole point of routing TLS through
+///! the same stream traits as plaintext TCP.
+///!
+///! Ownership: a `TlsStream` owns the `SSL*` and the underlying
+///! `TcpStream` (hence the fd). `SSL_new` took a reference on the
+///! `SSL_CTX`, so the context outlives the stream regardless of the
+///! connector's lifetime; `SSL_free` releases that reference. Drop
+///! order is load-bearing: `SSL_shutdown` (send close_notify) →
+///! `SSL_free` (release the SSL + its CTX ref; the socket BIO is
+///! `BIO_NOCLOSE` so the fd survives) → `TcpStream::drop` (close fd).
+
+namespace std::net::tls::stream;
+
+import core::option;
+import core::result;
+import core::slice;
+import core::intrinsics;
+import io::error;
+import io::traits;
+import ffi::libc;
+import ffi::openssl;
+import net::tcp;
+
+/// Largest single `SSL_read`/`SSL_write` length. OpenSSL's count
+/// argument is a C `int`; cap at `INT_MAX` and let `Read`/`Write`
+/// default methods loop for larger buffers.
+const MAX_IO: u64 = 2147483647;
+
+/// Application-layer protocol negotiated during the handshake (ALPN).
+type enum AlpnProtocol {
+    None;
+    Http11;
+    H2;
+}
+
+type struct TlsStream {
+    ssl: void*;
+    inner: TcpStream;
+
+    /// Assemble from a completed handshake. Internal: the
+    /// connector/acceptor owns the `SSL_connect`/`SSL_accept` dance and
+    /// hands over the live `SSL*` plus the socket it's bound to.
+    static from_parts(ssl: void*, inner: TcpStream) -> TlsStream {
+        return TlsStream { ssl: ssl, inner: inner };
+    }
+
+    /// The ALPN protocol the peer agreed on, or `None` if ALPN wasn't
+    /// offered / negotiated. Valid only after the handshake.
+    negotiated_alpn(&this) -> AlpnProtocol {
+        mut data: u8* = null;
+        mut len: u32 = 0;
+        openssl::SSL_get0_alpn_selected(this.ssl, &data, &len);
+        if (len == 0 || data == null) { return AlpnProtocol::None; }
+        if (len == 2 && data[0] == 0x68 && data[1] == 0x32) {     // "h2"
+            return AlpnProtocol::H2;
+        }
+        return AlpnProtocol::Http11;
+    }
+
+    /// Tear down the connection. Ownership obligation: every TlsStream
+    /// must have `drop` called before going out of scope.
+    drop(mut &this) -> void {
+        if (this.ssl != null) {
+            // One-way shutdown: send close_notify and don't wait for the
+            // peer's. Good enough for a stream we're discarding.
+            openssl::SSL_shutdown(this.ssl);
+            openssl::SSL_free(this.ssl);
+            this.ssl = null;
+        }
+        this.inner.drop();
+    }
+}
+
+implement trait Read for struct TlsStream {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        const want: u64 = if (length > MAX_IO) { MAX_IO } else { length };
+        loop {
+            openssl::ERR_clear_error();
+            const n: i32 = openssl::SSL_read(this.ssl, buffer, want as i32);
+            if (n > 0) { return Result::Ok(n as u64); }
+            // n <= 0: classify via SSL_get_error. (Integer SSL codes are
+            // compared, not match-pattern'd: match patterns require local
+            // constants, and these live in `ffi::openssl`.)
+            const code: i32 = openssl::SSL_get_error(this.ssl, n);
+            if (code == openssl::SSL_ERROR_ZERO_RETURN) {
+                return Result::Ok(0);   // clean TLS close -> EOF
+            }
+            if (code != openssl::SSL_ERROR_WANT_READ
+                    && code != openssl::SSL_ERROR_WANT_WRITE) {
+                return Result::Err(ssl_error(code));
+            }
+            // WANT_READ / WANT_WRITE on a blocking socket: retry.
+        }
+    }
+}
+
+implement trait Write for struct TlsStream {
+    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        const total: u64 = bytes.length();
+        intrinsics::printf("[TLS::write] this=%p ssl=%p fd=%d total=%llu\n",
+            &this, this.ssl, this.inner.fd, total);
+        intrinsics::fflush(null);
+        const want: u64 = if (total > MAX_IO) { MAX_IO } else { total };
+        loop {
+            openssl::ERR_clear_error();
+            const n: i32 = openssl::SSL_write(this.ssl, bytes.as_ptr(), want as i32);
+            if (n > 0) { return Result::Ok(n as u64); }
+            const code: i32 = openssl::SSL_get_error(this.ssl, n);
+            if (code != openssl::SSL_ERROR_WANT_READ
+                    && code != openssl::SSL_ERROR_WANT_WRITE) {
+                return Result::Err(ssl_error(code));
+            }
+            // WANT_READ / WANT_WRITE on a blocking socket: retry.
+        }
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        // OpenSSL writes straight through to the socket; no app buffer.
+        return Result::Ok(());
+    }
+}
+
+/// Translate an `SSL_get_error` code into an `IoError`. `SYSCALL`
+/// without a queued error is an unexpected EOF (peer closed without
+/// close_notify); with a live `errno` it maps through `from_errno`.
+function ssl_error(code: i32) -> IoError {
+    // If-chain rather than `match`: the SSL codes are cross-module
+    // constants (`ffi::openssl`), and match patterns require local
+    // constants, so a `match` arm on `openssl::X` silently never fires.
+    if (code == openssl::SSL_ERROR_ZERO_RETURN) {
+        return IoError::new(IoErrorKind::NotConnected, 0);
+    }
+    if (code == openssl::SSL_ERROR_WANT_READ || code == openssl::SSL_ERROR_WANT_WRITE) {
+        return IoError::new(IoErrorKind::WouldBlock, 0);
+    }
+    if (code == openssl::SSL_ERROR_SYSCALL) {
+        return syscall_error();
+    }
+    if (code == openssl::SSL_ERROR_SSL) {
+        return IoError::new(IoErrorKind::InvalidData, 0);
+    }
+    return IoError::new(IoErrorKind::Other, code);
+}
+
+function syscall_error() -> IoError {
+    const e: i32 = libc::errno();
+    if (e != 0) { return IoError::from_errno(e); }
+    return IoError::new(IoErrorKind::UnexpectedEof, 0);
+}

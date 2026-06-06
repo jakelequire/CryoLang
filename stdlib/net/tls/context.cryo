@@ -1,0 +1,199 @@
+///! TLS contexts: `TlsConnector` (client) and `TlsAcceptor` (server).
+///!
+///! Both own an `SSL_CTX` — the shared configuration and certificate
+///! store — and mint per-connection `TlsStream`s from it. A connector
+///! is a fluent builder: `TlsConnector::new()?.with_alpn_h2()` etc.
+///! One context can produce many streams; `SSL_new` reference-counts
+///! the `SSL_CTX`, so a stream outlives the connector if it has to.
+
+namespace std::net::tls::context;
+
+import core::option;
+import core::result;
+import collections::str;
+import collections::string;
+import io::error;
+import ffi::libc;
+import ffi::openssl;
+import net::tcp;
+import net::tls::stream;
+
+// ALPN wire form for "h2" then "http/1.1": each name is length-prefixed.
+//   0x02 'h' '2'   0x08 'h' 't' 't' 'p' '/' '1' '.' '1'
+const ALPN_H2_HTTP11_LEN: u32 = 11;
+
+type struct TlsConnector {
+    ctx: void*;
+    verify: boolean;
+
+    /// New client context with the system trust store loaded and peer
+    /// verification on by default.
+    static new() -> Result<TlsConnector, IoError> {
+        ignore_sigpipe();
+        const method: void* = openssl::TLS_client_method();
+        const ctx: void* = openssl::SSL_CTX_new(method);
+        if (ctx == null) {
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
+        // Load the OS CA bundle so verification can actually succeed.
+        openssl::SSL_CTX_set_default_verify_paths(ctx);
+        return Result::Ok(TlsConnector { ctx: ctx, verify: true });
+    }
+
+    /// Disable certificate + hostname verification. Named to be ugly on
+    /// purpose: only for self-signed test servers or pinned-out-of-band
+    /// peers. Fluent: returns the connector.
+    danger_accept_invalid_certs(mut this) -> TlsConnector {
+        this.verify = false;
+        return this;
+    }
+
+    /// Advertise HTTP/2 (and HTTP/1.1) via ALPN. Read the negotiated
+    /// result back with `TlsStream::negotiated_alpn`. Fluent.
+    with_alpn_h2(mut this) -> TlsConnector {
+        // Wire form: each protocol name is one length byte + the name.
+        //   0x02 "h2"   0x08 "http/1.1"   = 13 bytes.
+        mut wire: u8[13];
+        wire[0] = 2;  wire[1] = 0x68; wire[2] = 0x32;                            // "h2"
+        wire[3] = 8;  wire[4] = 0x68; wire[5] = 0x74; wire[6] = 0x74;            // "htt"
+        wire[7] = 0x70; wire[8] = 0x2F; wire[9] = 0x31; wire[10] = 0x2E;         // "p/1."
+        wire[11] = 0x31; wire[12] = 0x31;                                        // "11"
+        openssl::SSL_CTX_set_alpn_protos(this.ctx, &wire[0], 13);
+        return this;
+    }
+
+    /// Wrap an established `TcpStream` in TLS, performing the client
+    /// handshake with SNI set to `hostname` (also the name verified
+    /// against the peer certificate when verification is on). Consumes
+    /// the `TcpStream`; on failure it is closed before returning.
+    connect(&this, stream: TcpStream, hostname: Str) -> Result<TlsStream, IoError> {
+        mut inner: TcpStream = stream;
+        const ssl: void* = openssl::SSL_new(this.ctx);
+        if (ssl == null) {
+            inner.drop();
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
+        openssl::SSL_set_fd(ssl, inner.raw_fd());
+
+        mut host_c: String = String::from_str_c(hostname);
+        openssl::ssl_set_sni(ssl, host_c.as_ptr());
+        if (this.verify) {
+            openssl::SSL_set1_host(ssl, host_c.as_ptr());
+            openssl::SSL_set_verify(ssl, openssl::SSL_VERIFY_PEER, null);
+        }
+
+        const rc: i32 = drive_handshake(ssl, true);
+        host_c.drop();
+        if (rc != 0) {
+            const err: IoError = stream::ssl_error(rc);
+            openssl::SSL_free(ssl);
+            inner.drop();
+            return Result::Err(err);
+        }
+        return Result::Ok(TlsStream::from_parts(ssl, inner));
+    }
+
+    /// Release the context. Streams already minted keep their own
+    /// reference and remain valid.
+    drop(mut &this) -> void {
+        if (this.ctx != null) {
+            openssl::SSL_CTX_free(this.ctx);
+            this.ctx = null;
+        }
+    }
+}
+
+type struct TlsAcceptor {
+    ctx: void*;
+
+    /// New server context from a PEM certificate chain and private key
+    /// (paths on disk). Fails `InvalidInput` if either file is missing
+    /// or the key doesn't match the certificate.
+    static new(cert_path: Str, key_path: Str) -> Result<TlsAcceptor, IoError> {
+        ignore_sigpipe();
+        const method: void* = openssl::TLS_server_method();
+        const ctx: void* = openssl::SSL_CTX_new(method);
+        if (ctx == null) {
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
+
+        mut cert_c: String = String::from_str_c(cert_path);
+        mut key_c: String = String::from_str_c(key_path);
+
+        mut ok: boolean = true;
+        if (openssl::SSL_CTX_use_certificate_file(ctx, cert_c.as_ptr(),
+                openssl::SSL_FILETYPE_PEM) != 1) { ok = false; }
+        if (ok && openssl::SSL_CTX_use_PrivateKey_file(ctx, key_c.as_ptr(),
+                openssl::SSL_FILETYPE_PEM) != 1) { ok = false; }
+        if (ok && openssl::SSL_CTX_check_private_key(ctx) != 1) { ok = false; }
+
+        cert_c.drop();
+        key_c.drop();
+
+        if (!ok) {
+            openssl::SSL_CTX_free(ctx);
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        return Result::Ok(TlsAcceptor { ctx: ctx });
+    }
+
+    /// Complete the server handshake over an accepted `TcpStream`.
+    /// Consumes it; closes it on failure.
+    accept(&this, stream: TcpStream) -> Result<TlsStream, IoError> {
+        mut inner: TcpStream = stream;
+        const ssl: void* = openssl::SSL_new(this.ctx);
+        if (ssl == null) {
+            inner.drop();
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
+        openssl::SSL_set_fd(ssl, inner.raw_fd());
+        const rc: i32 = drive_handshake(ssl, false);
+        if (rc != 0) {
+            const err: IoError = stream::ssl_error(rc);
+            openssl::SSL_free(ssl);
+            inner.drop();
+            return Result::Err(err);
+        }
+        return Result::Ok(TlsStream::from_parts(ssl, inner));
+    }
+
+    drop(mut &this) -> void {
+        if (this.ctx != null) {
+            openssl::SSL_CTX_free(this.ctx);
+            this.ctx = null;
+        }
+    }
+}
+
+/// Ignore `SIGPIPE` process-wide. OpenSSL writes through a plain socket
+/// BIO, so a write to a peer that has closed raises `SIGPIPE` and kills
+/// the process by default; with it ignored, the write returns `EPIPE`
+/// and surfaces as a normal `BrokenPipe` `IoError` instead. Idempotent;
+/// every TLS context sets it on construction (the standard approach,
+/// matching libcurl and rust-openssl).
+function ignore_sigpipe() -> void {
+    libc::signal(libc::SIGPIPE, libc::SIG_IGN as void*);
+}
+
+/// Drive `SSL_connect` (client) or `SSL_accept` (server) to completion.
+/// Returns 0 on success, or the `SSL_get_error` code on failure (which
+/// `stream::ssl_error` maps to an `IoError`). Sockets are blocking, so
+/// `WANT_READ`/`WANT_WRITE` only appear transiently mid-handshake and
+/// are retried.
+function drive_handshake(ssl: void*, is_client: boolean) -> i32 {
+    loop {
+        openssl::ERR_clear_error();
+        const rc: i32 = if (is_client) {
+            openssl::SSL_connect(ssl)
+        } else {
+            openssl::SSL_accept(ssl)
+        };
+        if (rc == 1) { return 0; }
+        const code: i32 = openssl::SSL_get_error(ssl, rc);
+        if (code == openssl::SSL_ERROR_WANT_READ ||
+            code == openssl::SSL_ERROR_WANT_WRITE) {
+            continue;
+        }
+        return code;
+    }
+}

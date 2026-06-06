@@ -1,0 +1,125 @@
+///! SHA-1 (RFC 3174).
+///!
+///! Cryptographically broken for collision resistance — present only
+///! because the WebSocket handshake (RFC 6455) hard-codes it for the
+///! `Sec-WebSocket-Accept` value. Do not use it for security. A pure
+///! Cryo implementation keeps `net::ws` free of any external crypto
+///! dependency (no OpenSSL link for plain `ws://`).
+
+namespace std::encoding::sha1;
+
+import collections::array;
+
+const DIGEST_LEN: u64 = 20;
+
+/// Hash `len` bytes at `data`, writing the 20-byte digest to `out`.
+/// `out` must point to at least `DIGEST_LEN` bytes.
+function sha1(data: u8*, len: u64, out: u8*) -> void {
+    mut h0: u32 = 0x67452301;
+    mut h1: u32 = 0xEFCDAB89;
+    mut h2: u32 = 0x98BADCFE;
+    mut h3: u32 = 0x10325476;
+    mut h4: u32 = 0xC3D2E1F0;
+
+    // Build the padded message: original bytes, a 0x80 terminator, zero
+    // padding, then the 64-bit big-endian bit length, rounded to a
+    // multiple of 64 bytes.
+    const bit_len: u64 = len * 8;
+    mut total: u64 = len + 1 + 8;
+    const rem: u64 = total % 64;
+    if (rem != 0) { total = total + (64 - rem); }
+
+    mut msg: Array<u8> = Array<u8>::with_capacity(total);
+    mut i: u64 = 0;
+    while (i < len) { msg.push(data[i]); i++; }
+    msg.push(0x80);
+    while (msg.length() < total - 8) { msg.push(0); }
+    mut shift: i64 = 56;
+    while (shift >= 0) {
+        msg.push(((bit_len >> (shift as u64)) & 0xFF) as u8);
+        shift = shift - 8;
+    }
+
+    const p: u8* = msg.as_ptr();
+    mut chunk: u64 = 0;
+    while (chunk < total) {
+        mut w: u32[80];
+        mut t: u64 = 0;
+        while (t < 16) {
+            const b: u64 = chunk + t * 4;
+            w[t] = ((p[b]     as u32) << 24)
+                 | ((p[b + 1] as u32) << 16)
+                 | ((p[b + 2] as u32) << 8)
+                 |  (p[b + 3] as u32);
+            t++;
+        }
+        while (t < 80) {
+            const x: u32 = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+            w[t] = rotl32(x, 1);
+            t++;
+        }
+
+        mut a: u32 = h0;
+        mut b: u32 = h1;
+        mut c: u32 = h2;
+        mut d: u32 = h3;
+        mut e: u32 = h4;
+
+        mut r: u64 = 0;
+        while (r < 80) {
+            mut f: u32 = 0;
+            mut k: u32 = 0;
+            if (r < 20) {
+                f = (b & c) | ((~b) & d);
+                k = 0x5A827999;
+            } else {
+                if (r < 40) {
+                    f = b ^ c ^ d;
+                    k = 0x6ED9EBA1;
+                } else {
+                    if (r < 60) {
+                        f = (b & c) | (b & d) | (c & d);
+                        k = 0x8F1BBCDC;
+                    } else {
+                        f = b ^ c ^ d;
+                        k = 0xCA62C1D6;
+                    }
+                }
+            }
+            const temp: u32 = rotl32(a, 5) + f + e + k + w[r];
+            e = d;
+            d = c;
+            c = rotl32(b, 30);
+            b = a;
+            a = temp;
+            r++;
+        }
+
+        h0 = h0 + a;
+        h1 = h1 + b;
+        h2 = h2 + c;
+        h3 = h3 + d;
+        h4 = h4 + e;
+        chunk = chunk + 64;
+    }
+    msg.drop();
+
+    store_be32(out, 0, h0);
+    store_be32(out, 4, h1);
+    store_be32(out, 8, h2);
+    store_be32(out, 12, h3);
+    store_be32(out, 16, h4);
+}
+
+/// Rotate a 32-bit word left by `n` bits.
+function rotl32(x: u32, n: u32) -> u32 {
+    return (x << n) | (x >> (32 - n));
+}
+
+/// Store a big-endian `u32` at `out + offset`.
+function store_be32(out: u8*, offset: u64, value: u32) -> void {
+    out[offset]     = (value >> 24) as u8;
+    out[offset + 1] = (value >> 16) as u8;
+    out[offset + 2] = (value >> 8)  as u8;
+    out[offset + 3] = (value)       as u8;
+}

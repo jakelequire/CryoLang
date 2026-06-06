@@ -1,0 +1,185 @@
+///! std::time::clock: `Instant`, `SystemTime`, and `sleep`.
+///!
+///!   - `Instant` reads the monotonic clock (`CLOCK_MONOTONIC`): it only
+///!     goes forward and is the right tool for measuring elapsed time.
+///!   - `SystemTime` reads the wall clock (`CLOCK_REALTIME`): it tracks
+///!     calendar time but can jump (NTP, manual changes), so it must NOT
+///!     be used to measure elapsed time.
+///!
+///! `sleep(dur)` parks the current thread for at least `dur`. All
+///! differences saturate at zero rather than wrapping.
+
+namespace std::time::clock;
+
+import core::cmp;
+import core::option;
+import core::intrinsics;
+import ffi::libc;
+import time::duration;
+
+const NSEC_PER_SEC: i64 = 1000000000;
+const I64_MAX:       i64 = 0x7FFFFFFFFFFFFFFF;
+
+/// Compute `(a_sec.a_nsec) - (b_sec.b_nsec)` as a `Duration`, borrowing
+/// from the seconds when the nanoseconds underflow and clamping the whole
+/// result to zero if it would go negative.
+private function diff_saturating(a_sec: i64, a_nsec: i64,
+                                 b_sec: i64, b_nsec: i64) -> Duration {
+    mut sec:  i64 = a_sec - b_sec;
+    mut nsec: i64 = a_nsec - b_nsec;
+    if (nsec < 0i64) {
+        sec  = sec - 1i64;
+        nsec = nsec + NSEC_PER_SEC;
+    }
+    if (sec < 0i64) {
+        return Duration::new(0u64, 0u32);
+    }
+    return Duration::new(sec as u64, nsec as u32);
+}
+
+// Instant: a monotonic-clock reading.
+
+/// A measurement of the monotonic clock. Opaque: the fields are the raw
+/// `timespec`, meaningful only relative to another `Instant`. POD.
+type struct Instant {
+    secs:  i64;
+    nanos: i64;
+
+    /// Read the monotonic clock now.
+    static now() -> Instant {
+        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+        clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
+        return Instant { secs: ts.tv_sec, nanos: ts.tv_nsec };
+    }
+
+    /// The time elapsed from `earlier` to `this` (saturating at zero).
+    duration_since(&this, earlier: &Instant) -> Duration {
+        return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
+    }
+
+    /// Alias for `duration_since`, naming the saturation explicitly.
+    saturating_duration_since(&this, earlier: &Instant) -> Duration {
+        return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
+    }
+
+    /// The time elapsed from `this` until now (saturating at zero).
+    elapsed(&this) -> Duration {
+        const cur: Instant = Instant::now();
+        return diff_saturating(cur.secs, cur.nanos, this.secs, this.nanos);
+    }
+
+    /// `this + dur`, or `None` if the reading would overflow `i64`.
+    checked_add(&this, dur: &Duration) -> Option<Instant> {
+        if (dur.secs > (I64_MAX as u64)) { return Option::None; }
+        const add_secs: i64 = dur.secs as i64;
+        if (this.secs > I64_MAX - add_secs) { return Option::None; }
+        mut sec:  i64 = this.secs + add_secs;
+        mut nsec: i64 = this.nanos + (dur.nanos as i64);
+        if (nsec >= NSEC_PER_SEC) {
+            if (sec == I64_MAX) { return Option::None; }
+            sec  = sec + 1i64;
+            nsec = nsec - NSEC_PER_SEC;
+        }
+        return Option::Some(Instant { secs: sec, nanos: nsec });
+    }
+
+    /// `this - dur`, or `None` if the reading would go below zero.
+    checked_sub(&this, dur: &Duration) -> Option<Instant> {
+        const sub_secs: i64 = dur.secs as i64;
+        mut sec:  i64 = this.secs - sub_secs;
+        mut nsec: i64 = this.nanos - (dur.nanos as i64);
+        if (nsec < 0i64) {
+            sec  = sec - 1i64;
+            nsec = nsec + NSEC_PER_SEC;
+        }
+        if (sec < 0i64) { return Option::None; }
+        return Option::Some(Instant { secs: sec, nanos: nsec });
+    }
+}
+
+implement trait Eq for struct Instant {
+    equals(&this, other: &Instant) -> boolean {
+        return this.secs == other.secs && this.nanos == other.nanos;
+    }
+}
+
+implement trait Ord for struct Instant {
+    compare(&this, other: &Instant) -> Ordering {
+        if (this.secs < other.secs) { return Ordering::Less; }
+        if (this.secs > other.secs) { return Ordering::Greater; }
+        if (this.nanos < other.nanos) { return Ordering::Less; }
+        if (this.nanos > other.nanos) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+
+// SystemTime: a wall-clock reading.
+
+/// A measurement of the wall clock (`CLOCK_REALTIME`) as a raw
+/// `timespec`. `duration_since_epoch()` yields a Unix timestamp. Subject
+/// to NTP steps and manual changes; do not use for elapsed-time
+/// measurement. POD.
+type struct SystemTime {
+    secs:  i64;
+    nanos: i64;
+
+    /// Read the wall clock now.
+    static now() -> SystemTime {
+        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+        clock_gettime(ClockId::CLOCK_REALTIME, &ts);
+        return SystemTime { secs: ts.tv_sec, nanos: ts.tv_nsec };
+    }
+
+    /// The Unix epoch (1970-01-01 00:00:00 UTC).
+    static unix_epoch() -> SystemTime {
+        return SystemTime { secs: 0i64, nanos: 0i64 };
+    }
+
+    /// A wall-clock time from a whole-second Unix timestamp.
+    static from_unix_secs(secs: i64) -> SystemTime {
+        return SystemTime { secs: secs, nanos: 0i64 };
+    }
+
+    /// Whole seconds since the Unix epoch (may be negative before 1970).
+    unix_secs(&this) -> i64 { return this.secs; }
+
+    /// Time since the Unix epoch. Saturates at zero for a clock set
+    /// before 1970.
+    duration_since_epoch(&this) -> Duration {
+        return diff_saturating(this.secs, this.nanos, 0i64, 0i64);
+    }
+
+    /// The time elapsed from `earlier` to `this` (saturating at zero).
+    /// Only meaningful if the wall clock has not been stepped between the
+    /// two readings.
+    duration_since(&this, earlier: &SystemTime) -> Duration {
+        return diff_saturating(this.secs, this.nanos, earlier.secs, earlier.nanos);
+    }
+
+    /// `this + dur`.
+    checked_add(&this, dur: &Duration) -> Option<SystemTime> {
+        const add_secs: i64 = dur.secs as i64;
+        if (this.secs > I64_MAX - add_secs) { return Option::None; }
+        mut sec:  i64 = this.secs + add_secs;
+        mut nsec: i64 = this.nanos + (dur.nanos as i64);
+        if (nsec >= NSEC_PER_SEC) {
+            sec  = sec + 1i64;
+            nsec = nsec - NSEC_PER_SEC;
+        }
+        return Option::Some(SystemTime { secs: sec, nanos: nsec });
+    }
+}
+
+// sleep.
+
+/// Park the current thread for at least `dur`. Restarts across signal
+/// interruptions (EINTR) using the kernel's remaining-time readout so the
+/// full span elapses.
+function sleep(dur: Duration) -> void {
+    mut req: timespec = timespec { tv_sec:  dur.secs as i64,
+                                   tv_nsec: dur.nanos as i64 };
+    mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    while (nanosleep(&req, &rem) != 0) {
+        req = rem;
+    }
+}

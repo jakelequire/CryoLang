@@ -1,25 +1,43 @@
-///! std::random: PRNG determinism, bounded-draw correctness, OS seeding,
-///! and the secure (kernel CSPRNG) byte source.
+///! std::random: the `RandomSource` trait (determinism, bounded draws,
+///! floats, byte fill), generic collection ops (shuffle, choose),
+///! polymorphism over `Rng` and `SecureRng`, and the distribution layer.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::Random;
 
 import std::core::result;
+import std::core::option;
+import std::core::slice;
 import std::collections::str;
-import std::random;
+import std::random::rng;
+import std::random::source;
+import std::random::secure;
+import std::random::distribution;
+import std::random::error;
 import std::test::error;
 import std::test::assert;
 
+// A function generic over any RandomSource - proving the same code runs
+// against both Rng and SecureRng.
+function all_below<R>(r: mut &R, bound: u64, n: i32) -> boolean
+where R: RandomSource {
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < n) {
+        if (r.next_below(bound) >= bound) { ok = false; }
+        i = i + 1;
+    }
+    return ok;
+}
+
 ![test]
 function from_seed_is_deterministic() -> Result<(), TestError> {
-    // Same seed -> identical stream.
     mut a: Rng = Rng::from_seed(12345u64);
     mut b: Rng = Rng::from_seed(12345u64);
     expect_eq(a.next_u64(), b.next_u64())?;
     expect_eq(a.next_u64(), b.next_u64())?;
     expect_eq(a.next_u64(), b.next_u64())?;
 
-    // Different seeds -> different first draw (collision prob ~2^-64).
     mut c: Rng = Rng::from_seed(1u64);
     mut d: Rng = Rng::from_seed(2u64);
     expect_true(c.next_u64() != d.next_u64(),
@@ -28,34 +46,34 @@ function from_seed_is_deterministic() -> Result<(), TestError> {
 }
 
 ![test]
-function below_is_in_range_and_spreads() -> Result<(), TestError> {
+function next_below_is_in_range_and_spreads() -> Result<(), TestError> {
     mut r: Rng = Rng::from_seed(777u64);
     mut in_range: boolean = true;
     mut saw_low:  boolean = false;
     mut saw_high: boolean = false;
     mut i: i32 = 0;
     while (i < 2000) {
-        const v: u64 = r.below(10u64);
+        const v: u64 = r.next_below(10u64);
         if (v >= 10u64) { in_range = false; }
         if (v < 5u64) { saw_low = true; } else { saw_high = true; }
         i = i + 1;
     }
-    expect_true(in_range, Str::new("below(10) always yields < 10"))?;
-    expect_true(saw_low && saw_high, Str::new("below(10) spans its range"))?;
+    expect_true(in_range, Str::new("next_below(10) always yields < 10"))?;
+    expect_true(saw_low && saw_high, Str::new("next_below(10) spans its range"))?;
     return Result::Ok(());
 }
 
 ![test]
-function range_u64_respects_bounds() -> Result<(), TestError> {
+function next_range_respects_bounds() -> Result<(), TestError> {
     mut r: Rng = Rng::from_seed(424242u64);
     mut ok: boolean = true;
     mut i: i32 = 0;
     while (i < 2000) {
-        const v: u64 = r.range_u64(100u64, 110u64);
+        const v: u64 = r.next_range(100u64, 110u64);
         if (v < 100u64 || v >= 110u64) { ok = false; }
         i = i + 1;
     }
-    expect_true(ok, Str::new("range_u64(100,110) stays within [100,110)"))?;
+    expect_true(ok, Str::new("next_range(100,110) stays within [100,110)"))?;
     return Result::Ok(());
 }
 
@@ -74,14 +92,14 @@ function next_f64_is_unit_interval() -> Result<(), TestError> {
 }
 
 ![test]
-function fill_bytes_writes_exact_length() -> Result<(), TestError> {
+function fill_writes_exact_length() -> Result<(), TestError> {
     mut r: Rng = Rng::from_seed(9u64);
     mut buf: u8[8];
     mut j: u64 = 0u64;
     while (j < 8u64) { buf[j] = 0xAAu8; j = j + 1u64; }
 
     // Fill only the first 5 bytes; the tail must be untouched.
-    r.fill_bytes(&buf[0], 5u64);
+    r.fill(Slice::from_raw(&buf[0], 5u64));
     expect_eq(buf[5], 0xAAu8)?;
     expect_eq(buf[6], 0xAAu8)?;
     expect_eq(buf[7], 0xAAu8)?;
@@ -89,32 +107,194 @@ function fill_bytes_writes_exact_length() -> Result<(), TestError> {
 }
 
 ![test]
-function from_os_produces_varied_draws() -> Result<(), TestError> {
-    mut r: Rng = Rng::from_os();
-    const x: u64 = r.next_u64();
-    const y: u64 = r.next_u64();
-    // Two consecutive draws colliding is ~2^-64.
-    expect_true(x != y, Str::new("OS-seeded draws vary"))?;
+function shuffle_is_a_permutation() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(31337u64);
+    mut data: i32[10];
+    mut i: i32 = 0;
+    while (i < 10) { data[i] = i; i = i + 1; }
+
+    const view: Slice<i32> = Slice::from_raw(&data[0], 10u64);
+    shuffle(&r, &view);
+
+    // Every value 0..9 appears exactly once.
+    mut seen: i32[10];
+    i = 0;
+    while (i < 10) { seen[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 10) {
+        const v: i32 = data[i];
+        if (v >= 0 && v < 10) { seen[v] = seen[v] + 1; }
+        i = i + 1;
+    }
+    mut ok: boolean = true;
+    i = 0;
+    while (i < 10) { if (seen[i] != 1) { ok = false; } i = i + 1; }
+    expect_true(ok, Str::new("shuffle yields a permutation"))?;
     return Result::Ok(());
 }
 
 ![test]
-function secure_bytes_fills_buffer() -> Result<(), TestError> {
+function choose_returns_an_element() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(55u64);
+    mut data: i32[5];
+    data[0] = 10; data[1] = 20; data[2] = 30; data[3] = 40; data[4] = 50;
+    const view: Slice<i32> = Slice::from_raw(&data[0], 5u64);
+
+    mut all_member: boolean = true;
+    mut k: i32 = 0;
+    while (k < 200) {
+        match (choose(&r, &view)) {
+            Option::Some(p) => {
+                const v: i32 = *p;
+                if (v != 10 && v != 20 && v != 30 && v != 40 && v != 50) {
+                    all_member = false;
+                }
+            }
+            Option::None => { all_member = false; }
+        }
+        k = k + 1;
+    }
+    expect_true(all_member, Str::new("choose returns a member of the slice"))?;
+    return Result::Ok(());
+}
+
+![test]
+function source_trait_is_polymorphic() -> Result<(), TestError> {
+    // The same generic function drives both generators.
+    mut fast: Rng = Rng::from_seed(8u64);
+    expect_true(all_below(&fast, 100u64, 500),
+                Str::new("Rng satisfies RandomSource"))?;
+
+    mut sec: SecureRng = SecureRng::new();
+    expect_true(all_below(&sec, 100u64, 500),
+                Str::new("SecureRng satisfies RandomSource"))?;
+    return Result::Ok(());
+}
+
+![test]
+function secure_try_fill_fills_buffer() -> Result<(), TestError> {
     mut buf: u8[32];
     mut j: u64 = 0u64;
     while (j < 32u64) { buf[j] = 0u8; j = j + 1u64; }
 
-    const ok: boolean = secure_bytes(&buf[0], 32u64);
-    expect_true(ok, Str::new("secure_bytes succeeds"))?;
+    const sec: SecureRng = SecureRng::new();
+    match (sec.try_fill(Slice::from_raw(&buf[0], 32u64))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => {
+            return Result::Err(TestError::failed(Str::new("try_fill reported entropy failure")));
+        }
+    }
 
-    // An all-zero 32-byte CSPRNG result is ~2^-256; treat a nonzero byte
-    // as proof entropy was written.
     mut nonzero: boolean = false;
     j = 0u64;
-    while (j < 32u64) {
-        if (buf[j] != 0u8) { nonzero = true; }
-        j = j + 1u64;
-    }
-    expect_true(nonzero, Str::new("secure_bytes wrote entropy"))?;
+    while (j < 32u64) { if (buf[j] != 0u8) { nonzero = true; } j = j + 1u64; }
+    expect_true(nonzero, Str::new("try_fill wrote entropy"))?;
     return Result::Ok(());
+}
+
+![test]
+function uniform_distributions_respect_bounds() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(101u64);
+    const ui: UniformU64 = UniformU64::new(50u64, 60u64);
+    const uf: UniformF64 = UniformF64::new(-1.0, 1.0);
+
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < 1000) {
+        const a: u64 = ui.sample(&r);
+        if (a < 50u64 || a >= 60u64) { ok = false; }
+        const b: f64 = uf.sample(&r);
+        if (b < -1.0 || b >= 1.0) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("Uniform samplers stay within their ranges"))?;
+    return Result::Ok(());
+}
+
+![test]
+function bernoulli_matches_probability() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(2718u64);
+    const coin: Bernoulli = Bernoulli::new(0.25);
+    mut heads: i32 = 0;
+    mut i: i32 = 0;
+    while (i < 4000) {
+        if (coin.sample(&r)) { heads = heads + 1; }
+        i = i + 1;
+    }
+    // Expect ~1000 heads; allow a generous band.
+    expect_true(heads > 800 && heads < 1200,
+                Str::new("Bernoulli(0.25) yields ~25% true"))?;
+    return Result::Ok(());
+}
+
+![test]
+function normal_mean_is_sane() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(161803u64);
+    const g: Normal = Normal::new(5.0, 2.0);
+    mut sum: f64 = 0.0;
+    mut i: i32 = 0;
+    while (i < 4000) { sum = sum + g.sample(&r); i = i + 1; }
+    const mean: f64 = sum / 4000.0;
+    expect_true(mean > 4.5 && mean < 5.5,
+                Str::new("Normal(5,2) sample mean is near 5"))?;
+    return Result::Ok(());
+}
+
+![test]
+function exponential_is_positive() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(99u64);
+    const e: Exponential = Exponential::new(2.0);
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < 1000) { if (e.sample(&r) < 0.0) { ok = false; } i = i + 1; }
+    expect_true(ok, Str::new("Exponential samples are non-negative"))?;
+    return Result::Ok(());
+}
+
+![test]
+function weighted_index_skips_zero_weight() -> Result<(), TestError> {
+    mut r: Rng = Rng::from_seed(13u64);
+    mut weights: f64[3];
+    weights[0] = 1.0; weights[1] = 0.0; weights[2] = 3.0;
+
+    mut wi: WeightedIndex = match (WeightedIndex::try_new(Slice::from_raw(&weights[0], 3u64))) {
+        Result::Ok(w)  => { w }
+        Result::Err(_) => {
+            return Result::Err(TestError::failed(Str::new("WeightedIndex::try_new failed")));
+        }
+    };
+
+    mut never_one: boolean = true;
+    mut saw_zero:  boolean = false;
+    mut saw_two:   boolean = false;
+    mut i: i32 = 0;
+    while (i < 2000) {
+        const idx: u64 = wi.sample(&r);
+        if (idx == 1u64) { never_one = false; }
+        if (idx == 0u64) { saw_zero = true; }
+        if (idx == 2u64) { saw_two = true; }
+        i = i + 1;
+    }
+    wi.drop();
+    expect_true(never_one, Str::new("zero-weight index is never chosen"))?;
+    expect_true(saw_zero && saw_two, Str::new("both nonzero indices appear"))?;
+    return Result::Ok(());
+}
+
+![test]
+function weighted_index_rejects_bad_weights() -> Result<(), TestError> {
+    mut empty: f64[1];
+    empty[0] = 0.0;
+    match (WeightedIndex::try_new(Slice::from_raw(&empty[0], 1u64))) {
+        Result::Ok(wi) => {
+            wi.drop();
+            return Result::Err(TestError::failed(Str::new("all-zero weights should be rejected")));
+        }
+        Result::Err(e) => {
+            const want: RandomError = RandomError::InvalidWeights;
+            expect_true(e.equals(&want),
+                        Str::new("all-zero weights -> InvalidWeights"))?;
+            return Result::Ok(());
+        }
+    }
 }

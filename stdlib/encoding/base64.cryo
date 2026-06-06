@@ -1,0 +1,109 @@
+///! Base64 (RFC 4648) — standard alphabet, with padding.
+///!
+///! `encode` is what the WebSocket handshake needs (random key and the
+///! SHA-1 accept value); `decode` rounds it out for general use.
+
+namespace std::encoding::base64;
+
+import core::option;
+import collections::array;
+import collections::string;
+import collections::str;
+
+const ALPHABET: Str = Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+const PAD: u8 = 0x3D;   // '='
+
+/// Encode `len` bytes at `data` to a padded base64 `String`.
+function encode(data: u8*, len: u64) -> String {
+    const table: Str = ALPHABET;
+    mut out: String = String::with_capacity((len + 2) / 3 * 4);
+
+    mut i: u64 = 0;
+    while (i + 3 <= len) {
+        const n: u32 = ((data[i] as u32) << 16)
+                     | ((data[i + 1] as u32) << 8)
+                     |  (data[i + 2] as u32);
+        out.push(sym(table, (n >> 18) & 0x3F));
+        out.push(sym(table, (n >> 12) & 0x3F));
+        out.push(sym(table, (n >> 6)  & 0x3F));
+        out.push(sym(table, (n)       & 0x3F));
+        i = i + 3;
+    }
+
+    const rest: u64 = len - i;
+    if (rest == 1) {
+        const n: u32 = (data[i] as u32) << 16;
+        out.push(sym(table, (n >> 18) & 0x3F));
+        out.push(sym(table, (n >> 12) & 0x3F));
+        out.push(PAD);
+        out.push(PAD);
+    }
+    if (rest == 2) {
+        const n: u32 = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+        out.push(sym(table, (n >> 18) & 0x3F));
+        out.push(sym(table, (n >> 12) & 0x3F));
+        out.push(sym(table, (n >> 6)  & 0x3F));
+        out.push(PAD);
+    }
+    return out;
+}
+
+/// Decode a base64 `Str`. Returns `None` on any invalid character or a
+/// malformed length. Whitespace is not tolerated.
+function decode(source: Str) -> Option<Array<u8>> {
+    const len: u64 = source.length();
+    if (len % 4 != 0) { return Option::None; }
+    mut out: Array<u8> = Array<u8>::new();
+    if (len == 0) { return Option::Some(out); }
+
+    mut i: u64 = 0;
+    while (i < len) {
+        mut acc: u32 = 0;
+        mut pads: u32 = 0;
+        mut j: u64 = 0;
+        while (j < 4) {
+            const ch: u8 = byte_at(source, i + j);
+            acc = acc << 6;
+            if (ch == PAD) {
+                pads = pads + 1;
+            } else {
+                match (decode_sym(ch)) {
+                    Option::Some(v) => {
+                        if (pads != 0) { out.drop(); return Option::None; } // pad mid-group
+                        acc = acc | (v as u32);
+                    }
+                    Option::None => { out.drop(); return Option::None; }
+                }
+            }
+            j++;
+        }
+        out.push(((acc >> 16) & 0xFF) as u8);
+        if (pads < 2) { out.push(((acc >> 8) & 0xFF) as u8); }
+        if (pads < 1) { out.push((acc & 0xFF) as u8); }
+        i = i + 4;
+    }
+    return Option::Some(out);
+}
+
+/// The base64 symbol for a 6-bit value.
+function sym(table: Str, value: u32) -> u8 {
+    return byte_at(table, value as u64);
+}
+
+/// Map a base64 character back to its 6-bit value, or `None`.
+function decode_sym(ch: u8) -> Option<u8> {
+    if (ch >= 0x41 && ch <= 0x5A) { return Option::Some(ch - 0x41); }        // A-Z -> 0..25
+    if (ch >= 0x61 && ch <= 0x7A) { return Option::Some(ch - 0x61 + 26); }   // a-z -> 26..51
+    if (ch >= 0x30 && ch <= 0x39) { return Option::Some(ch - 0x30 + 52); }   // 0-9 -> 52..61
+    if (ch == 0x2B) { return Option::Some(62); }                            // '+'
+    if (ch == 0x2F) { return Option::Some(63); }                            // '/'
+    return Option::None;
+}
+
+/// Byte access without the `Option` ceremony; callers stay in range.
+function byte_at(s: Str, index: u64) -> u8 {
+    match (s.byte_at(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}

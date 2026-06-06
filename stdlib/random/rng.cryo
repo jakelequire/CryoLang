@@ -1,0 +1,94 @@
+///! std::random::rng: `Rng`, a fast non-cryptographic generator.
+///!
+///! `Rng` is xoshiro256** - excellent statistical quality, tiny state,
+///! very fast. Seed it reproducibly with `from_seed` (same seed, same
+///! stream - ideal for tests and simulations) or unpredictably with
+///! `from_os`. It is POD: copying an `Rng` forks the stream rather than
+///! sharing it. NOT suitable for cryptography; use `SecureRng` for that.
+
+namespace std::random::rng;
+
+import random::source;
+import random::bits;
+import ffi::libc;
+
+/// A fast non-cryptographic PRNG (xoshiro256**). The 256-bit state is
+/// the four words `s0..s3`.
+type struct Rng {
+    s0: u64;
+    s1: u64;
+    s2: u64;
+    s3: u64;
+
+    /// Seed deterministically from a single 64-bit value. The same seed
+    /// always produces the same sequence.
+    static from_seed(seed: u64) -> Rng {
+        // Expand the 64-bit seed into the 256-bit state with SplitMix64,
+        // as the xoshiro authors recommend.
+        mut sm: u64 = seed;
+        const a: u64 = splitmix64(&sm);
+        const b: u64 = splitmix64(&sm);
+        const c: u64 = splitmix64(&sm);
+        const d: u64 = splitmix64(&sm);
+        return non_zero_state(a, b, c, d);
+    }
+
+    /// Seed from the OS CSPRNG (`getrandom`). Falls back to a
+    /// monotonic-clock + pid mix if the kernel source is briefly
+    /// unavailable, so it never hard-fails. (The fallback is fine for
+    /// non-crypto use; for cryptography use `SecureRng`.)
+    static from_os() -> Rng {
+        mut buf: u8[32];
+        const got: i64 = getrandom(&buf[0], 32u64, 0u32);
+        if (got == 32i64) {
+            return non_zero_state(load_u64_le(&buf[0]),  load_u64_le(&buf[8]),
+                                  load_u64_le(&buf[16]), load_u64_le(&buf[24]));
+        }
+        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+        clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
+        const seed: u64 = ((ts.tv_sec as u64) * 1000000000u64 + (ts.tv_nsec as u64))
+                          ^ ((getpid() as u64) << 32u64);
+        return Rng::from_seed(seed);
+    }
+}
+
+implement trait RandomSource for struct Rng {
+    next_u64(mut &this) -> u64 {
+        const result: u64 = rotl(this.s1 * 5u64, 7u32) * 9u64;
+        const t: u64 = this.s1 << 17u64;
+        this.s2 = this.s2 ^ this.s0;
+        this.s3 = this.s3 ^ this.s1;
+        this.s1 = this.s1 ^ this.s2;
+        this.s0 = this.s0 ^ this.s3;
+        this.s2 = this.s2 ^ t;
+        this.s3 = rotl(this.s3, 45u32);
+        return result;
+    }
+}
+
+/// Build an `Rng` from four state words, nudging the all-zero state (a
+/// xoshiro fixed point that emits only zeros) off itself. SplitMix64 and
+/// the kernel CSPRNG make all-zero astronomically unlikely, but the
+/// guard is cheap.
+private function non_zero_state(a: u64, b: u64, c: u64, d: u64) -> Rng {
+    mut r: Rng = Rng { s0: a, s1: b, s2: c, s3: d };
+    if (r.s0 == 0u64 && r.s1 == 0u64 && r.s2 == 0u64 && r.s3 == 0u64) {
+        r.s0 = 1u64;
+    }
+    return r;
+}
+
+/// SplitMix64: advances `*state` and returns a well-mixed 64-bit value.
+/// Used to expand a single seed into xoshiro's 256-bit state.
+private function splitmix64(state: u64*) -> u64 {
+    *state = *state + 0x9E3779B97F4A7C15u64;
+    mut z: u64 = *state;
+    z = (z ^ (z >> 30u64)) * 0xBF58476D1CE4E5B9u64;
+    z = (z ^ (z >> 27u64)) * 0x94D049BB133111EBu64;
+    return z ^ (z >> 31u64);
+}
+
+/// Rotate `x` left by `k` bits (`k` in `1..=63`).
+private function rotl(x: u64, k: u32) -> u64 {
+    return (x << (k as u64)) | (x >> ((64u32 - k) as u64));
+}
