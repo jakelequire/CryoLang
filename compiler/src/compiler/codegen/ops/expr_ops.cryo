@@ -425,7 +425,8 @@ type struct ExprOps {
     codegen_local_var(mut &this, name: SymbolStr,
                       ty: TypeRef, init_val: LValue,
                       has_init: boolean,
-                      site_span: SourceSpan) -> void {
+                      site_span: SourceSpan,
+                      persistent_name: boolean) -> void {
         const var_name: string = this.resolve(name);
         const llvm_ty: LType = this.type_mapper.map_type(ty);
         if (!llvm_ty.is_valid()) {
@@ -456,6 +457,14 @@ type struct ExprOps {
         }
 
         const alloca: LValue = this.flow.create_entry_alloca(current_fn, var_name, llvm_ty);
+
+        // Drop-flag slot: default it to false in the entry block so the
+        // conditional drop's read is defined on every path, even ones that
+        // skip this declaration (see ValueTable::set_persistent and
+        // FlowEmitter::zero_init_in_entry).
+        if (persistent_name) {
+            this.flow.zero_init_in_entry(current_fn, alloca, llvm_ty);
+        }
 
         if (has_init && init_val.is_valid()) {
             // Coerce integer literals to the variable's declared width
@@ -496,7 +505,14 @@ type struct ExprOps {
             this.builder.build_store(store_val, alloca);
         }
 
-        this.values.set(name, alloca);
+        // Drop-flag locals register persistently: the conditional drop that
+        // reads the flag can execute in an enclosing scope, after the block
+        // that declared it has popped (the alloca itself is function-scoped).
+        if (persistent_name) {
+            this.values.set_persistent(name, alloca);
+        } else {
+            this.values.set(name, alloca);
+        }
     }
 
 

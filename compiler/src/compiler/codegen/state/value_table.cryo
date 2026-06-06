@@ -21,12 +21,43 @@ type struct ValueTable {
     undo:        Pair<u32, void*>[];   // (key, previous LLVMValueRef or null)
     scope_marks: i64[];                // undo log length at each scope push
 
+    // Function-persistent bindings: names whose binding must outlive the
+    // block scope they're declared in (synthesized drop-flag locals - the
+    // alloca is function-scoped, but the conditional drop that reads the
+    // flag can run at an OUTER scope, after the declaring block popped).
+    // Registered without an undo entry so `pop_scope()` never rolls them
+    // back; cleared explicitly at the function epilogue.
+    persistent_keys: u32[];
+
     static new() -> ValueTable {
         return ValueTable {
-            named:       [],
-            undo:        [],
-            scope_marks: [],
+            named:           [],
+            undo:            [],
+            scope_marks:     [],
+            persistent_keys: [],
         };
+    }
+
+    /// Register a binding that survives `pop_scope()`.  Used for
+    /// synthesized drop-flag locals whose reader (a conditional drop) may
+    /// execute in an enclosing scope.  No undo entry is recorded, so the
+    /// rollback in `pop_scope()` leaves it intact.  `clear_persistent()`
+    /// removes them at function end.
+    set_persistent(mut &this, name: SymbolStr, val: LValue) -> void {
+        this.set_raw(name.id, val.raw);
+        for (mut i: i64 = 0; i < this.persistent_keys.length; i++) {
+            if (this.persistent_keys[i] == name.id) { return; }
+        }
+        this.persistent_keys.push(name.id);
+    }
+
+    /// Drop every persistent binding.  Called from the function epilogue so
+    /// drop-flag names don't leak into the next function's lookups.
+    clear_persistent(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.persistent_keys.length; i++) {
+            this.remove_raw(this.persistent_keys[i]);
+        }
+        this.persistent_keys = [];
     }
 
     push_scope(mut &this) -> void {

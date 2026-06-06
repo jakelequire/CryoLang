@@ -231,4 +231,30 @@ type struct IRFlowEmitter {
 
         return alloca;
     }
+
+    /// Store a zeroinitializer into `alloca` in the function ENTRY block, so
+    /// the slot reads a defined value on every path - including paths that
+    /// never reach the declaring statement.  Used for synthesized
+    /// conditional-drop flags: their decl (with its `store false`) can sit
+    /// inside a conditional arm, but the flag is read at an outer scope that
+    /// other arms also reach; an entry-block default of `false`
+    /// ("not moved -> drop fires; the drop glue then tag-guards") keeps the
+    /// read defined and the semantics correct.  Positions before the entry
+    /// terminator when present, mirroring create_entry_alloca.
+    zero_init_in_entry(mut &this, func: LValue, alloca: LValue, ty: LType) -> void {
+        if (!func.is_valid() || !alloca.is_valid() || !ty.is_valid()) { return; }
+        const saved_block: LBasicBlock = this.builder.get_insert_block();
+        const entry: LBasicBlock = LBasicBlock { raw: llvm::LLVMGetEntryBasicBlock(func.raw) };
+        if (!entry.is_valid()) { return; }
+        const term: void* = llvm::LLVMGetBasicBlockTerminator(entry.raw);
+        if (term != null) {
+            llvm::LLVMPositionBuilderBefore(this.builder.raw, term);
+        } else {
+            this.builder.position_at_end(entry);
+        }
+        this.builder.build_store(LType::const_null(ty), alloca);
+        if (saved_block.is_valid()) {
+            this.builder.position_at_end(saved_block);
+        }
+    }
 }
