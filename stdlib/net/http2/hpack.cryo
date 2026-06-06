@@ -1,0 +1,500 @@
+///! HPACK header compression (RFC 7541).
+///!
+///! `HpackEncoder` and `HpackDecoder` each own a dynamic table and turn
+///! header-field lists into the wire format and back. The static table
+///! (Appendix A), the variable-length integer codec (§5.1), the string
+///! literal codec (§5.2, with optional Huffman), and the four header
+///! field representations (§6) all live here.
+///!
+///! Encoder strategy: a name+value already in a table is emitted as a
+///! single index; a known name with a new value is emitted with an
+///! indexed name and added to the dynamic table (incremental indexing),
+///! unless the caller marks it sensitive, in which case it is emitted
+///! never-indexed and not stored. The decoder accepts every
+///! representation a conformant peer may send.
+
+namespace std::net::http2::hpack;
+
+import core::option;
+import core::slice;
+import collections::array;
+import collections::string;
+import collections::str;
+import net::http2::huffman;
+
+/// First HPACK index of the dynamic table: the static table holds 61
+/// entries (1..61), so the dynamic table begins at 62.
+const DYNAMIC_BASE: u64 = 62;
+
+/// Per-entry overhead the dynamic table charges on top of the name and
+/// value byte lengths (RFC 7541 §4.1).
+const ENTRY_OVERHEAD: u64 = 32;
+
+/// One header field. Owns its name and value bytes.
+type struct HeaderField {
+    name:  String;
+    value: String;
+
+    static new(name: Str, value: Str) -> HeaderField {
+        return HeaderField {
+            name:  String::from_str(name),
+            value: String::from_str(value)
+        };
+    }
+
+    /// Storage size charged against the dynamic table budget.
+    entry_size(&this) -> u64 {
+        return this.name.length() + this.value.length() + ENTRY_OVERHEAD;
+    }
+}
+
+implement trait Drop for struct HeaderField {
+    drop(mut &this) -> void {
+        this.name.drop();
+        this.value.drop();
+    }
+}
+
+/// A read position into a byte slice, threaded through the decode
+/// helpers (a plain `mut &u64` cursor in struct form).
+type struct Cursor {
+    pos: u64;
+}
+
+// ---- dynamic table --------------------------------------------------------
+
+/// HPACK dynamic table: a FIFO of recently-seen header fields, indexed
+/// newest-first. Entry at array slot 0 is the most recent (HPACK index
+/// 62); the oldest entries are evicted when the byte budget is exceeded.
+type struct DynTable {
+    entries:  Array<HeaderField>;
+    size:     u64;
+    max_size: u64;
+
+    static new(max_size: u64) -> DynTable {
+        return DynTable {
+            entries:  Array<HeaderField>::new(),
+            size:     0,
+            max_size: max_size
+        };
+    }
+
+    length(&this) -> u64 {
+        return this.entries.length();
+    }
+
+    /// Insert a field at the front and evict from the back until the
+    /// table fits its budget. A single entry larger than the whole
+    /// budget empties the table (RFC 7541 §4.4).
+    add(mut &this, name: Str, value: Str) -> void {
+        mut field: HeaderField = HeaderField::new(name, value);
+        const added: u64 = field.entry_size();
+        this.entries.insert(0, field);
+        this.size = this.size + added;
+        this.evict();
+    }
+
+    /// Shrink the maximum size (a dynamic table size update), evicting
+    /// to fit immediately.
+    set_max(mut &this, max_size: u64) -> void {
+        this.max_size = max_size;
+        this.evict();
+    }
+
+    evict(mut &this) -> void {
+        while (this.size > this.max_size && this.entries.length() > 0) {
+            mut old: HeaderField = this.entries.remove(this.entries.length() - 1);
+            this.size = this.size - old.entry_size();
+            old.drop();
+        }
+    }
+
+    /// Borrow the field at dynamic slot `i` (0 = newest).
+    get_ref(&this, i: u64) -> HeaderField* {
+        return &this.entries.as_ptr()[i];
+    }
+
+    drop(mut &this) -> void {
+        this.entries.drop();
+    }
+}
+
+// ---- static table ---------------------------------------------------------
+
+/// A name/value pair drawn from the static table. Both `Str`s point at
+/// string literals (static storage), so the value is freely copyable
+/// and never needs dropping.
+type struct StaticEntry {
+    name:  Str;
+    value: Str;
+    found: boolean;
+}
+
+/// Look up static-table entry `index` (1..61). `found` is false for any
+/// out-of-range index.
+function static_entry(index: u64) -> StaticEntry {
+    if (index == 1)  { return se(":authority", ""); }
+    if (index == 2)  { return se(":method", "GET"); }
+    if (index == 3)  { return se(":method", "POST"); }
+    if (index == 4)  { return se(":path", "/"); }
+    if (index == 5)  { return se(":path", "/index.html"); }
+    if (index == 6)  { return se(":scheme", "http"); }
+    if (index == 7)  { return se(":scheme", "https"); }
+    if (index == 8)  { return se(":status", "200"); }
+    if (index == 9)  { return se(":status", "204"); }
+    if (index == 10) { return se(":status", "206"); }
+    if (index == 11) { return se(":status", "304"); }
+    if (index == 12) { return se(":status", "400"); }
+    if (index == 13) { return se(":status", "404"); }
+    if (index == 14) { return se(":status", "500"); }
+    if (index == 15) { return se("accept-charset", ""); }
+    if (index == 16) { return se("accept-encoding", "gzip, deflate"); }
+    if (index == 17) { return se("accept-language", ""); }
+    if (index == 18) { return se("accept-ranges", ""); }
+    if (index == 19) { return se("accept", ""); }
+    if (index == 20) { return se("access-control-allow-origin", ""); }
+    if (index == 21) { return se("age", ""); }
+    if (index == 22) { return se("allow", ""); }
+    if (index == 23) { return se("authorization", ""); }
+    if (index == 24) { return se("cache-control", ""); }
+    if (index == 25) { return se("content-disposition", ""); }
+    if (index == 26) { return se("content-encoding", ""); }
+    if (index == 27) { return se("content-language", ""); }
+    if (index == 28) { return se("content-length", ""); }
+    if (index == 29) { return se("content-location", ""); }
+    if (index == 30) { return se("content-range", ""); }
+    if (index == 31) { return se("content-type", ""); }
+    if (index == 32) { return se("cookie", ""); }
+    if (index == 33) { return se("date", ""); }
+    if (index == 34) { return se("etag", ""); }
+    if (index == 35) { return se("expect", ""); }
+    if (index == 36) { return se("expires", ""); }
+    if (index == 37) { return se("from", ""); }
+    if (index == 38) { return se("host", ""); }
+    if (index == 39) { return se("if-match", ""); }
+    if (index == 40) { return se("if-modified-since", ""); }
+    if (index == 41) { return se("if-none-match", ""); }
+    if (index == 42) { return se("if-range", ""); }
+    if (index == 43) { return se("if-unmodified-since", ""); }
+    if (index == 44) { return se("last-modified", ""); }
+    if (index == 45) { return se("link", ""); }
+    if (index == 46) { return se("location", ""); }
+    if (index == 47) { return se("max-forwards", ""); }
+    if (index == 48) { return se("proxy-authenticate", ""); }
+    if (index == 49) { return se("proxy-authorization", ""); }
+    if (index == 50) { return se("range", ""); }
+    if (index == 51) { return se("referer", ""); }
+    if (index == 52) { return se("refresh", ""); }
+    if (index == 53) { return se("retry-after", ""); }
+    if (index == 54) { return se("server", ""); }
+    if (index == 55) { return se("set-cookie", ""); }
+    if (index == 56) { return se("strict-transport-security", ""); }
+    if (index == 57) { return se("transfer-encoding", ""); }
+    if (index == 58) { return se("user-agent", ""); }
+    if (index == 59) { return se("vary", ""); }
+    if (index == 60) { return se("via", ""); }
+    if (index == 61) { return se("www-authenticate", ""); }
+    return StaticEntry { name: Str::new(""), value: Str::new(""), found: false };
+}
+
+function se(name: string, value: string) -> StaticEntry {
+    return StaticEntry { name: Str::new(name), value: Str::new(value), found: true };
+}
+
+/// Count of static-table entries.
+const STATIC_COUNT: u64 = 61;
+
+// ---- integer codec (RFC 7541 §5.1) ----------------------------------------
+
+/// Append `value` as an N-bit-prefix integer. `prefix_value` carries the
+/// representation's high bits (the prefix bits themselves must be zero).
+function encode_integer(out: mut &Array<u8>, prefix_bits: u32, prefix_value: u8, value: u64) -> void {
+    const max: u64 = (1 << (prefix_bits as u64)) - 1;
+    if (value < max) {
+        out.push(prefix_value | (value as u8));
+        return;
+    }
+    out.push(prefix_value | (max as u8));
+    mut v: u64 = value - max;
+    while (v >= 128) {
+        out.push(((v & 0x7f) | 0x80) as u8);
+        v = v >> 7;
+    }
+    out.push(v as u8);
+}
+
+/// Decode an N-bit-prefix integer starting at the cursor. Advances the
+/// cursor. `None` on truncation or an over-long continuation.
+function decode_integer(data: Slice<u8>, cur: mut &Cursor, prefix_bits: u32) -> Option<u64> {
+    if (cur.pos >= data.length()) { return Option::None; }
+    const max: u64 = (1 << (prefix_bits as u64)) - 1;
+    mut value: u64 = (byte_at(data, cur.pos) as u64) & max;
+    cur.pos = cur.pos + 1;
+    if (value < max) { return Option::Some(value); }
+    mut m: u64 = 0;
+    loop {
+        if (cur.pos >= data.length()) { return Option::None; }
+        const b: u64 = byte_at(data, cur.pos) as u64;
+        cur.pos = cur.pos + 1;
+        if (m > 56) { return Option::None; }   // would overflow u64
+        value = value + ((b & 0x7f) << m);
+        m = m + 7;
+        if ((b & 0x80) == 0) { break; }
+    }
+    return Option::Some(value);
+}
+
+// ---- string codec (RFC 7541 §5.2) -----------------------------------------
+
+/// Append a string literal, Huffman-coding it when that is strictly
+/// shorter than the raw bytes.
+function encode_string(out: mut &Array<u8>, s: Slice<u8>) -> void {
+    const raw_len: u64 = s.length();
+    const huff_len: u64 = huffman::encoded_len(s);
+    if (huff_len < raw_len) {
+        encode_integer(out, 7, 0x80, huff_len);
+        mut coded: Array<u8> = huffman::encode(s);
+        out.append(coded.as_slice());
+        coded.drop();
+    } else {
+        encode_integer(out, 7, 0x00, raw_len);
+        out.append(s);
+    }
+}
+
+/// Decode a string literal starting at the cursor. Advances it.
+function decode_string(data: Slice<u8>, cur: mut &Cursor) -> Option<String> {
+    if (cur.pos >= data.length()) { return Option::None; }
+    const huffman_flag: boolean = (byte_at(data, cur.pos) & 0x80) != 0;
+    const len: u64 = match (decode_integer(data, cur, 7)) {
+        Option::Some(n) => { n }
+        Option::None    => { return Option::None; }
+    };
+    if (cur.pos + len > data.length()) { return Option::None; }
+    const raw: Slice<u8> = Slice::from_raw(data.as_ptr() + cur.pos, len);
+    cur.pos = cur.pos + len;
+    if (huffman_flag) {
+        match (huffman::decode(raw)) {
+            Option::Some(mut bytes) => {
+                const out: String = String::from_str(Str::from_raw(bytes.as_ptr(), bytes.length()));
+                bytes.drop();
+                return Option::Some(out);
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+    return Option::Some(String::from_str(Str::from_raw(raw.as_ptr(), len)));
+}
+
+// ---- decoder --------------------------------------------------------------
+
+type struct HpackDecoder {
+    table: DynTable;
+
+    static new(max_dynamic: u64) -> HpackDecoder {
+        return HpackDecoder { table: DynTable::new(max_dynamic) };
+    }
+
+    /// Decode a complete header block into a list of fields. Returns
+    /// `None` on any malformed representation. The caller owns the
+    /// returned fields and drops the array.
+    decode(mut &this, data: Slice<u8>) -> Option<Array<HeaderField>> {
+        mut out: Array<HeaderField> = Array<HeaderField>::new();
+        mut cur: Cursor = Cursor { pos: 0 };
+
+        while (cur.pos < data.length()) {
+            const b: u8 = byte_at(data, cur.pos);
+            if ((b & 0x80) != 0) {
+                // §6.1 Indexed header field.
+                const index: u64 = match (decode_integer(data, &cur, 7)) {
+                    Option::Some(n) => { n }
+                    Option::None    => { out.drop(); return Option::None; }
+                };
+                if (index == 0) { out.drop(); return Option::None; }
+                match (this.entry_at(index)) {
+                    Option::Some(field) => { out.push(field); }
+                    Option::None        => { out.drop(); return Option::None; }
+                }
+            } else if ((b & 0x40) != 0) {
+                // §6.2.1 Literal with incremental indexing.
+                match (this.decode_literal(data, &cur, 6, true)) {
+                    Option::Some(field) => { out.push(field); }
+                    Option::None        => { out.drop(); return Option::None; }
+                }
+            } else if ((b & 0x20) != 0) {
+                // §6.3 Dynamic table size update.
+                const new_max: u64 = match (decode_integer(data, &cur, 5)) {
+                    Option::Some(n) => { n }
+                    Option::None    => { out.drop(); return Option::None; }
+                };
+                this.table.set_max(new_max);
+            } else {
+                // §6.2.2 / §6.2.3 Literal without indexing / never indexed.
+                // Both use a 4-bit index prefix and do not touch the table.
+                match (this.decode_literal(data, &cur, 4, false)) {
+                    Option::Some(field) => { out.push(field); }
+                    Option::None        => { out.drop(); return Option::None; }
+                }
+            }
+        }
+        return Option::Some(out);
+    }
+
+    /// Decode a literal representation whose index field uses
+    /// `prefix_bits` bits. When `add` is set the field is also inserted
+    /// into the dynamic table (incremental indexing).
+    decode_literal(mut &this, data: Slice<u8>, cur: mut &Cursor,
+                   prefix_bits: u32, add: boolean) -> Option<HeaderField> {
+        const name_index: u64 = match (decode_integer(data, cur, prefix_bits)) {
+            Option::Some(n) => { n }
+            Option::None    => { return Option::None; }
+        };
+        mut name: String = String::new();
+        if (name_index == 0) {
+            match (decode_string(data, cur)) {
+                Option::Some(n) => { name = n; }
+                Option::None    => { return Option::None; }
+            }
+        } else {
+            match (this.name_at(name_index)) {
+                Option::Some(n) => { name = n; }
+                Option::None    => { return Option::None; }
+            }
+        }
+        mut value: String = String::new();
+        match (decode_string(data, cur)) {
+            Option::Some(v) => { value = v; }
+            Option::None    => { name.drop(); return Option::None; }
+        }
+        if (add) {
+            this.table.add(name.as_str(), value.as_str());
+        }
+        return Option::Some(HeaderField { name: name, value: value });
+    }
+
+    /// Resolve a full entry (owned copies) for an index across the
+    /// static then dynamic tables.
+    entry_at(&this, index: u64) -> Option<HeaderField> {
+        if (index >= 1 && index <= STATIC_COUNT) {
+            const e: StaticEntry = static_entry(index);
+            return Option::Some(HeaderField::new(e.name, e.value));
+        }
+        const d: u64 = index - DYNAMIC_BASE;
+        if (d < this.table.length()) {
+            const stored: HeaderField* = this.table.get_ref(d);
+            return Option::Some(HeaderField::new(stored.name.as_str(), stored.value.as_str()));
+        }
+        return Option::None;
+    }
+
+    /// Resolve just the name (owned copy) for an index.
+    name_at(&this, index: u64) -> Option<String> {
+        if (index >= 1 && index <= STATIC_COUNT) {
+            const e: StaticEntry = static_entry(index);
+            return Option::Some(String::from_str(e.name));
+        }
+        const d: u64 = index - DYNAMIC_BASE;
+        if (d < this.table.length()) {
+            const stored: HeaderField* = this.table.get_ref(d);
+            return Option::Some(String::from_str(stored.name.as_str()));
+        }
+        return Option::None;
+    }
+
+    drop(mut &this) -> void {
+        this.table.drop();
+    }
+}
+
+// ---- encoder --------------------------------------------------------------
+
+type struct HpackEncoder {
+    table: DynTable;
+
+    static new(max_dynamic: u64) -> HpackEncoder {
+        return HpackEncoder { table: DynTable::new(max_dynamic) };
+    }
+
+    /// Cap the dynamic table to the peer decoder's advertised
+    /// SETTINGS_HEADER_TABLE_SIZE, evicting to fit. We never grow past
+    /// our own default, so this only ever shrinks.
+    set_capacity(mut &this, max_size: u64) -> void {
+        if (max_size < this.table.max_size) {
+            this.table.set_max(max_size);
+        }
+    }
+
+    /// Encode one field into `out`. A name+value already in a table is a
+    /// single index; a known name is reused with the new value and the
+    /// pair is added to the dynamic table; a fully novel field is emitted
+    /// with a literal name. `sensitive` forces the never-indexed
+    /// representation and skips the dynamic table.
+    encode_field(mut &this, out: mut &Array<u8>, name: Str, value: Str, sensitive: boolean) -> void {
+        const full: u64 = this.find_full(name, value);
+        if (full != 0) {
+            encode_integer(out, 7, 0x80, full);   // §6.1 indexed
+            return;
+        }
+        const name_idx: u64 = this.find_name(name);
+        if (sensitive) {
+            // §6.2.3 never indexed (0001 prefix), not stored.
+            encode_integer(out, 4, 0x10, name_idx);
+            if (name_idx == 0) { encode_string(out, name.as_bytes()); }
+            encode_string(out, value.as_bytes());
+            return;
+        }
+        // §6.2.1 literal with incremental indexing (01 prefix).
+        encode_integer(out, 6, 0x40, name_idx);
+        if (name_idx == 0) { encode_string(out, name.as_bytes()); }
+        encode_string(out, value.as_bytes());
+        this.table.add(name, value);
+    }
+
+    /// Combined-index of an exact name+value match, or 0.
+    find_full(&this, name: Str, value: Str) -> u64 {
+        mut i: u64 = 1;
+        while (i <= STATIC_COUNT) {
+            const e: StaticEntry = static_entry(i);
+            if (e.name.equals(&name) && e.value.equals(&value)) { return i; }
+            i++;
+        }
+        mut d: u64 = 0;
+        while (d < this.table.length()) {
+            const stored: HeaderField* = this.table.get_ref(d);
+            if (stored.name.as_str().equals(&name) && stored.value.as_str().equals(&value)) {
+                return DYNAMIC_BASE + d;
+            }
+            d++;
+        }
+        return 0;
+    }
+
+    /// Combined-index of the first name match, or 0.
+    find_name(&this, name: Str) -> u64 {
+        mut i: u64 = 1;
+        while (i <= STATIC_COUNT) {
+            const e: StaticEntry = static_entry(i);
+            if (e.name.equals(&name)) { return i; }
+            i++;
+        }
+        mut d: u64 = 0;
+        while (d < this.table.length()) {
+            const stored: HeaderField* = this.table.get_ref(d);
+            if (stored.name.as_str().equals(&name)) { return DYNAMIC_BASE + d; }
+            d++;
+        }
+        return 0;
+    }
+
+    drop(mut &this) -> void {
+        this.table.drop();
+    }
+}
+
+/// Slice byte access without the `Option` ceremony; callers stay in range.
+function byte_at(s: Slice<u8>, index: u64) -> u8 {
+    match (s.get(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}

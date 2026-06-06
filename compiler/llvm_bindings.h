@@ -139,6 +139,7 @@ LLVMTypeRef LLVMGetReturnType(LLVMTypeRef FunctionTy);
 LLVMTypeRef LLVMStructTypeInContext(LLVMContextRef C, LLVMTypeRef *ElementTypes,
                                     unsigned ElementCount, LLVMBool Packed);
 LLVMTypeRef LLVMStructCreateNamed(LLVMContextRef C, const char *Name);
+LLVMTypeRef LLVMGetTypeByName2(LLVMContextRef C, const char *Name);
 void        LLVMStructSetBody(LLVMTypeRef StructTy, LLVMTypeRef *ElementTypes,
                               unsigned ElementCount, LLVMBool Packed);
 unsigned    LLVMCountStructElementTypes(LLVMTypeRef StructTy);
@@ -177,6 +178,8 @@ const char    *LLVMGetValueName2(LLVMValueRef Val, unsigned long *Length);
 void           LLVMSetValueName2(LLVMValueRef Val, const char *Name, unsigned long NameLen);
 void           LLVMDumpValue(LLVMValueRef Val);
 char          *LLVMPrintValueToString(LLVMValueRef Val);
+char          *LLVMPrintTypeToString(LLVMTypeRef Val);
+const char    *LLVMGetValueName(LLVMValueRef Val);
 void           LLVMSetLinkage(LLVMValueRef Global, int Linkage);
 int            LLVMGetLinkage(LLVMValueRef Global);
 

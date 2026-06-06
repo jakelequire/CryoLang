@@ -1,0 +1,266 @@
+///! HPACK (RFC 7541) — Huffman, integer codec, and the Appendix C
+///! request examples.
+///!
+///! The Huffman vector and the C.4.1 wire-format decode anchor absolute
+///! correctness against the RFC; the round-trip tests exercise the
+///! encoder + decoder together, including the dynamic table across a
+///! sequence of requests.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetHttp2Hpack;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::array;
+import std::collections::string;
+import std::collections::str;
+import std::net::http2::huffman;
+import std::net::http2::hpack;
+import std::test::error;
+import std::test::assert;
+
+/// Parse an ASCII hex string into bytes.
+function from_hex(s: Str) -> Array<u8> {
+    mut out: Array<u8> = Array<u8>::new();
+    mut i: u64 = 0;
+    while (i + 2 <= s.length()) {
+        const hi: u8 = hex_digit(byte_at_str(s, i));
+        const lo: u8 = hex_digit(byte_at_str(s, i + 1));
+        out.push((hi << 4) | lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+function hex_digit(c: u8) -> u8 {
+    if (c >= 0x30 && c <= 0x39) { return c - 0x30; }
+    if (c >= 0x61 && c <= 0x66) { return c - 0x61 + 10; }
+    if (c >= 0x41 && c <= 0x46) { return c - 0x41 + 10; }
+    return 0;
+}
+
+function byte_at_str(s: Str, i: u64) -> u8 {
+    match (s.byte_at(i)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}
+
+function bytes_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+/// Check the field at `idx` in a decoded block equals name/value.
+function field_is(block: &Array<HeaderField>, idx: u64, name: Str, value: Str) -> boolean {
+    match (block.get_ref(idx)) {
+        Option::Some(f) => {
+            return (*f).name.as_str().equals(&name) && (*f).value.as_str().equals(&value);
+        }
+        Option::None => { return false; }
+    }
+}
+
+// ---- Huffman --------------------------------------------------------------
+
+![test]
+function huffman_vector_www_example_com() -> Result<(), TestError> {
+    const input: Str = Str::new("www.example.com");
+    mut coded: Array<u8> = huffman::encode(input.as_bytes());
+    mut expected: Array<u8> = from_hex(Str::new("f1e3c2e5f23a6ba0ab90f4ff"));
+    const ok: boolean = bytes_eq(coded.as_slice(), expected.as_slice());
+    coded.drop();
+    expected.drop();
+    return expect(ok, Str::new("huffman('www.example.com') != RFC C.4.1 vector"));
+}
+
+![test]
+function huffman_round_trip() -> Result<(), TestError> {
+    const samples: Str = Str::new("Mon, 21 Oct 2013 20:13:21 GMT");
+    mut coded: Array<u8> = huffman::encode(samples.as_bytes());
+    match (huffman::decode(coded.as_slice())) {
+        Option::Some(mut back) => {
+            const ok: boolean = bytes_eq(back.as_slice(), samples.as_bytes());
+            back.drop();
+            coded.drop();
+            return expect(ok, Str::new("huffman round-trip mismatch"));
+        }
+        Option::None => {
+            coded.drop();
+            return bail(Str::new("huffman decode returned None"));
+        }
+    }
+}
+
+![test]
+function huffman_decode_vector() -> Result<(), TestError> {
+    mut coded: Array<u8> = from_hex(Str::new("a8eb10649cbf"));   // "no-cache" (RFC C.4.2)
+    match (huffman::decode(coded.as_slice())) {
+        Option::Some(mut back) => {
+            const ok: boolean = bytes_eq(back.as_slice(), Str::new("no-cache").as_bytes());
+            back.drop();
+            coded.drop();
+            return expect(ok, Str::new("huffman decode of C.4.2 vector != 'no-cache'"));
+        }
+        Option::None => {
+            coded.drop();
+            return bail(Str::new("huffman decode returned None"));
+        }
+    }
+}
+
+// ---- integer codec --------------------------------------------------------
+
+![test]
+function integer_codec_rfc_examples() -> Result<(), TestError> {
+    // RFC 7541 §5.1: 10 in a 5-bit prefix -> 0x0a.
+    mut a: Array<u8> = Array<u8>::new();
+    hpack::encode_integer(&a, 5, 0x00, 10);
+    mut exp_a: Array<u8> = from_hex(Str::new("0a"));
+    const ok_a: boolean = bytes_eq(a.as_slice(), exp_a.as_slice());
+    a.drop(); exp_a.drop();
+    expect(ok_a, Str::new("encode_integer(10, 5-bit) != 0x0a"))?;
+
+    // 1337 in a 5-bit prefix -> 0x1f 0x9a 0x0a.
+    mut b: Array<u8> = Array<u8>::new();
+    hpack::encode_integer(&b, 5, 0x00, 1337);
+    mut exp_b: Array<u8> = from_hex(Str::new("1f9a0a"));
+    const ok_b: boolean = bytes_eq(b.as_slice(), exp_b.as_slice());
+    b.drop(); exp_b.drop();
+    expect(ok_b, Str::new("encode_integer(1337, 5-bit) != 1f9a0a"))?;
+
+    // Decode them back.
+    mut wire: Array<u8> = from_hex(Str::new("1f9a0a"));
+    mut cur: Cursor = Cursor { pos: 0 };
+    match (hpack::decode_integer(wire.as_slice(), &cur, 5)) {
+        Option::Some(v) => {
+            wire.drop();
+            return expect(v == 1337, Str::new("decode_integer(1f9a0a, 5-bit) != 1337"));
+        }
+        Option::None => {
+            wire.drop();
+            return bail(Str::new("decode_integer returned None"));
+        }
+    }
+}
+
+// ---- HPACK decode of the RFC C.4 request examples -------------------------
+
+![test]
+function hpack_decode_c41() -> Result<(), TestError> {
+    // RFC 7541 C.4.1: Huffman-coded first request.
+    mut wire: Array<u8> = from_hex(Str::new("828684418cf1e3c2e5f23a6ba0ab90f4ff"));
+    mut dec: HpackDecoder = HpackDecoder::new(4096);
+    match (dec.decode(wire.as_slice())) {
+        Option::Some(mut block) => {
+            mut ok: boolean = block.length() == 4;
+            ok = ok && field_is(&block, 0, Str::new(":method"), Str::new("GET"));
+            ok = ok && field_is(&block, 1, Str::new(":scheme"), Str::new("http"));
+            ok = ok && field_is(&block, 2, Str::new(":path"), Str::new("/"));
+            ok = ok && field_is(&block, 3, Str::new(":authority"), Str::new("www.example.com"));
+            block.drop();
+            dec.drop();
+            wire.drop();
+            return expect(ok, Str::new("C.4.1 decode mismatch"));
+        }
+        Option::None => {
+            dec.drop();
+            wire.drop();
+            return bail(Str::new("C.4.1 decode returned None"));
+        }
+    }
+}
+
+// ---- encoder + decoder round-trip, including the dynamic table ------------
+
+![test]
+function hpack_round_trip_dynamic_table() -> Result<(), TestError> {
+    mut enc: HpackEncoder = HpackEncoder::new(4096);
+    mut dec: HpackDecoder = HpackDecoder::new(4096);
+
+    // First request: a custom header populates both dynamic tables.
+    mut b1: Array<u8> = Array<u8>::new();
+    enc.encode_field(&b1, Str::new(":method"), Str::new("GET"), false);
+    enc.encode_field(&b1, Str::new(":path"), Str::new("/resource"), false);
+    enc.encode_field(&b1, Str::new("x-trace"), Str::new("abc123"), false);
+    mut r1_ok: boolean = false;
+    match (dec.decode(b1.as_slice())) {
+        Option::Some(mut block) => {
+            r1_ok = block.length() == 3
+                 && field_is(&block, 0, Str::new(":method"), Str::new("GET"))
+                 && field_is(&block, 1, Str::new(":path"), Str::new("/resource"))
+                 && field_is(&block, 2, Str::new("x-trace"), Str::new("abc123"));
+            block.drop();
+        }
+        Option::None => { }
+    }
+    b1.drop();
+    expect(r1_ok, Str::new("round-trip request 1 mismatch"))?;
+
+    // Second request: the custom header should now resolve from the
+    // dynamic table on both sides (single-index indexed field).
+    mut b2: Array<u8> = Array<u8>::new();
+    enc.encode_field(&b2, Str::new("x-trace"), Str::new("abc123"), false);
+    mut r2_ok: boolean = false;
+    match (dec.decode(b2.as_slice())) {
+        Option::Some(mut block) => {
+            r2_ok = block.length() == 1
+                 && field_is(&block, 0, Str::new("x-trace"), Str::new("abc123"));
+            block.drop();
+        }
+        Option::None => { }
+    }
+    // It must have used the indexed representation (1 byte: 0x80 | index).
+    const compact: boolean = b2.length() == 1;
+    b2.drop();
+    enc.drop();
+    dec.drop();
+    expect(r2_ok, Str::new("round-trip request 2 mismatch"))?;
+    return expect(compact, Str::new("second send did not use the dynamic-table index"));
+}
+
+// ---- sensitive (never-indexed) header -------------------------------------
+
+![test]
+function hpack_sensitive_not_indexed() -> Result<(), TestError> {
+    mut enc: HpackEncoder = HpackEncoder::new(4096);
+    mut dec: HpackDecoder = HpackDecoder::new(4096);
+
+    mut b: Array<u8> = Array<u8>::new();
+    enc.encode_field(&b, Str::new("authorization"), Str::new("secret-token"), true);
+    mut ok: boolean = false;
+    match (dec.decode(b.as_slice())) {
+        Option::Some(mut block) => {
+            ok = block.length() == 1
+              && field_is(&block, 0, Str::new("authorization"), Str::new("secret-token"));
+            block.drop();
+        }
+        Option::None => { }
+    }
+    b.drop();
+
+    // A second send must NOT collapse to an index, because never-indexed
+    // fields are not stored in the dynamic table.
+    mut b2: Array<u8> = Array<u8>::new();
+    enc.encode_field(&b2, Str::new("authorization"), Str::new("secret-token"), true);
+    const not_indexed: boolean = b2.length() > 1;
+    b2.drop();
+    enc.drop();
+    dec.drop();
+    expect(ok, Str::new("sensitive header round-trip mismatch"))?;
+    return expect(not_indexed, Str::new("sensitive header was stored in the dynamic table"));
+}

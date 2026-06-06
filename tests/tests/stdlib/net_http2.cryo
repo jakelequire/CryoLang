@@ -1,0 +1,102 @@
+///! HTTP/2 over h2c (cleartext) — loopback request/response.
+///!
+///! The main thread is the server: it binds + listens FIRST, then spawns
+///! the client thread, so `connect` can't race ahead of `accept`. The
+///! client issues one `GET /hello` over a prior-knowledge h2c connection;
+///! the server dispatches it to a handler that replies `200 OK` with a
+///! known body. This exercises the full stack end to end: the connection
+///! preface, the SETTINGS handshake, HPACK-encoded HEADERS, DATA framing,
+///! and flow-control WINDOW_UPDATEs, in both directions.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetHttp2;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::array;
+import std::collections::str;
+import std::io::error;
+import std::net::ip;
+import std::net::socket_addr;
+import std::net::http::method;
+import std::net::http::status;
+import std::net::http::request;
+import std::net::http::response;
+import std::net::http2::client;
+import std::net::http2::server;
+import std::thread;
+import std::ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+const BODY: Str = Str::new("Hello, HTTP/2!");
+
+/// Server handler: reply 200 OK with a fixed body. Consumes the request.
+function h2_handler(req: Request) -> Response {
+    mut request_local: Request = req;
+    const resp: Response = Response::text(StatusCode::ok(), Str::new("Hello, HTTP/2!"));
+    request_local.drop();
+    return resp;
+}
+
+/// Client thread: one h2c GET; returns 1 on a verified 200 + body.
+function h2_client(port: i32) -> i32 {
+    const c: Http2Client = Http2Client::new();
+    const addr: SocketAddr = SocketAddr::localhost_v4(port as u16);
+    mut resp: Response = match (c.get(addr, Str::new("localhost"), Str::new("/hello"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return 0; }
+    };
+    mut ok: boolean = resp.status.as_u16() == 200;
+    ok = ok && body_eq(&resp.body, Str::new("Hello, HTTP/2!"));
+    resp.drop();
+    if (ok) { return 1; }
+    return 0;
+}
+
+function body_eq(body: &Array<u8>, expected: Str) -> boolean {
+    if (body.length() != expected.length()) { return false; }
+    const eb: Slice<u8> = expected.as_bytes();
+    mut i: u64 = 0;
+    while (i < body.length()) {
+        match (body.get(i)) {
+            Option::Some(b) => {
+                match (eb.get(i)) {
+                    Option::Some(e) => { if (b != e) { return false; } }
+                    Option::None    => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+![test]
+function loopback_h2c_round_trip() -> Result<(), TestError> {
+    // PID-derived port in a band distinct from the other net tests so a
+    // full-suite run never collides.
+    const port: u16 = (44000 + (libc::getpid() % 20000)) as u16;
+
+    mut server: Http2Server = match (Http2Server::bind(SocketAddr::localhost_v4(port))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 server bind failed")); }
+    };
+
+    const handle: thread::JoinHandle<i32> =
+        thread::spawn<i32, i32>(port as i32, h2_client);
+
+    // Serve exactly one connection (the client's), then return.
+    const server_result: Result<(), IoError> = server.serve_one(h2_handler);
+    server.drop();
+
+    const client_ok: i32 = handle.join();
+
+    match (server_result) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("h2 server failed to serve the connection")); }
+    }
+    return expect(client_ok == 1, Str::new("client should receive 200 with the expected body"));
+}

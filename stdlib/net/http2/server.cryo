@@ -1,0 +1,70 @@
+///! HTTP/2 server.
+///!
+///! `serve` runs the server side of HTTP/2 over an already-accepted
+///! `Read + Write` stream, dispatching each request to a handler until
+///! the peer closes the connection — generic over the transport, so it
+///! serves h2c (`TcpStream`) and, layered under a `TlsAcceptor`, h2.
+///!
+///! `Http2Server` is a blocking h2c (cleartext) listener: bind, then
+///! `serve_one` for a single connection or `run` to accept and serve
+///! connections forever, one at a time. Requests are dispatched through
+///! the same `(Request) -> Response` handler the HTTP/1.1 server uses.
+
+namespace std::net::http2::server;
+
+import core::option;
+import core::result;
+import io::error;
+import io::traits;
+import net::socket_addr;
+import net::tcp;
+import net::http::request;
+import net::http::response;
+import net::http2::connection;
+
+/// Serve HTTP/2 over `stream`, dispatching each request to `handler`
+/// until the peer closes or sends GOAWAY. The caller owns `stream`.
+function serve<S>(stream: S*, handler: (Request) -> Response) -> Result<(), IoError>
+where S: Read + Write {
+    mut conn: Http2Connection<S> = Http2Connection<S>::new_server(stream);
+    const r: Result<(), IoError> = conn.serve(handler);
+    conn.drop();
+    return r;
+}
+
+/// A blocking, single-threaded h2c (cleartext) server.
+type struct Http2Server {
+    listener: TcpListener;
+
+    /// Bind + listen on `addr` for h2c connections.
+    static bind(addr: SocketAddr) -> Result<Http2Server, IoError> {
+        const l: TcpListener = TcpListener::bind(addr)?;
+        return Result::Ok(Http2Server { listener: l });
+    }
+
+    /// Accept one connection and serve it to completion, then return.
+    serve_one(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
+        mut stream: TcpStream = this.listener.accept()?;
+        const r: Result<(), IoError> = serve(&stream, handler);
+        stream.drop();
+        return r;
+    }
+
+    /// Accept and serve connections forever, one at a time. A failure on
+    /// a single connection is swallowed so one client can't stop the
+    /// server; only an `accept` failure ends the loop.
+    run(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
+        loop {
+            mut stream: TcpStream = this.listener.accept()?;
+            match (serve(&stream, handler)) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+            stream.drop();
+        }
+    }
+
+    drop(mut &this) -> void {
+        this.listener.drop();
+    }
+}
