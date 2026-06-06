@@ -522,6 +522,20 @@ public:
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
+        // Specialization changes the concrete types of this call's receiver
+        // and arguments, so a `resolved_callee` / `resolved_method` pinned for
+        // the pre-substitution template (or copied by the cloner from a SIBLING
+        // specialization) is stale for THIS instantiation.  The classic break:
+        // `Request::write_to<W>` calls `this.headers.write_to(writer)`; the
+        // nested `Headers::write_to<W>` got pinned to `<TcpStream>` the first
+        // time `write_to` specialized, and the cloner copies that pin into
+        // every later `write_to<S>` body - so `write_to<TlsStream>` wrongly
+        // calls `Headers::write_to<TcpStream>` (passing a `TlsStream*` to the
+        // TcpStream impl: garbage fd, EBADF, plaintext on the wire).  Clear the
+        // pins so the monomorphizer's discovery re-infers the right spec for
+        // this body; codegen's resolver re-derives any discovery doesn't pin.
+        node.resolved_method = null;
+        node.set_resolved_callee(SymbolStr::empty());
     }
 
     /// Generic function-reference value `name<Args>` used as a value (GAP 1):

@@ -1674,24 +1674,43 @@ type struct DeclarationEmitter {
             // detects this and strips the function body.
         }
 
-        // Sweep orphaned blocks that body codegen left empty + unterminated.
+        // Sweep orphaned blocks that body codegen left unterminated.
         // The classic source is the merge block of an infinite `loop { ... }`
         // (no `break`, so nothing branches into `loop.end`); the same shape
         // appears for any control-flow scaffolding that creates a join block
         // that ends up unused.  Without this fixup the function-body
         // validator strips the WHOLE body to a declare, producing silent
-        // link-time `undefined reference` errors.  An empty block has no
-        // semantic meaning; terminating it with `unreachable` is a no-op
-        // for any reachable path and keeps LLVM happy.
+        // link-time `undefined reference` errors.
+        //
+        // Two unterminated-but-dead shapes need terminating:
+        //   (a) the block is empty (a pure join scaffold), or
+        //   (b) the block has NO predecessors (nothing branches to it) yet
+        //       still holds instructions — e.g. `loop.end` after an infinite
+        //       loop, into which end-of-scope drop glue for an owning local
+        //       was emitted.  These are unreachable, so `unreachable` is a
+        //       no-op for any real path.
+        // A reachable block left unterminated (a genuine missing `return` in
+        // a non-void function) HAS predecessors and is intentionally left
+        // alone so the validator strips the body.  The entry block is never
+        // swept on the no-predecessor rule: it has no predecessors by
+        // definition but is reachable as the function entry.
         const fn_val: LValue = this.builder.get_insert_block().get_parent();
         if (fn_val.is_valid()) {
+            const entry_bb: void* = llvm::LLVMGetEntryBasicBlock(fn_val.raw);
             mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val.raw);
             while (bb != null) {
                 const lbb: LBasicBlock = LBasicBlock { raw: bb };
-                if (!lbb.has_terminator()
-                        && llvm::LLVMGetFirstInstruction(bb) == null) {
-                    this.builder.position_at_end(lbb);
-                    this.builder.build_unreachable();
+                if (!lbb.has_terminator()) {
+                    const is_empty: boolean = llvm::LLVMGetFirstInstruction(bb) == null;
+                    mut no_preds: boolean = false;
+                    if (bb != entry_bb) {
+                        const bb_val: void* = llvm::LLVMBasicBlockAsValue(bb);
+                        no_preds = llvm::LLVMGetFirstUse(bb_val) == null;
+                    }
+                    if (is_empty || no_preds) {
+                        this.builder.position_at_end(lbb);
+                        this.builder.build_unreachable();
+                    }
                 }
                 bb = llvm::LLVMGetNextBasicBlock(bb);
             }

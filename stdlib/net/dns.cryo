@@ -1,0 +1,191 @@
+///! DNS resolution via `getaddrinfo`.
+///!
+///! `getaddrinfo` returns a heap-allocated linked list of
+///! `struct addrinfo`; this module walks it by field offset (cryoc
+///! doesn't model the C struct layout), copies out the addresses, and
+///! calls `freeaddrinfo` before returning — the borrowed C memory never
+///! escapes. Both IPv4 (`AF_INET`) and IPv6 (`AF_INET6`) results are
+///! surfaced as `IpAddr`; note the socket layer (`net::tcp`/`net::udp`)
+///! still only *connects* over v4, so a v6 result is carriable but not
+///! yet dialable.
+///!
+///! `struct addrinfo` offsets (Linux x86_64, from `man getaddrinfo`):
+///!   ai_flags @0  ai_family @4  ai_socktype @8  ai_protocol @12
+///!   ai_addrlen @16  ai_addr @24 (sockaddr*)  ai_canonname @32
+///!   ai_next @40 (addrinfo*).
+
+namespace std::net::dns;
+
+import core::option;
+import core::result;
+import collections::str;
+import collections::string;
+import collections::array;
+import io::error;
+import ffi::libc;
+import net::ip;
+import net::socket_addr;
+
+const AF_INET:  u32 = 2;
+const AF_INET6: u32 = 10;
+
+/// The addresses a hostname resolved to. Owns the backing `Array`;
+/// call `drop` when done.
+type struct ResolvedAddrs {
+    addrs: Array<IpAddr>;
+
+    /// Number of resolved addresses (>= 1 on a successful `resolve`).
+    length(&this) -> u64 {
+        return this.addrs.length();
+    }
+
+    /// The i-th resolved address, or `None` if out of range.
+    get(&this, index: u64) -> Option<IpAddr> {
+        return this.addrs.get(index);
+    }
+
+    drop(mut &this) -> void {
+        this.addrs.drop();
+    }
+}
+
+/// Resolve `host` to every A / AAAA record the resolver returns, in
+/// the order it returns them (already preference-sorted by glibc's
+/// RFC 3484 rules). `host` may be a name or a numeric literal — a
+/// numeric address resolves to itself. Fails with `NotFound` for an
+/// unknown name, `WouldBlock` for a temporary resolver failure.
+function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
+    // getaddrinfo needs a NUL-terminated node string.
+    mut host_c: String = String::from_str_c(host);
+
+    // Zeroed `struct addrinfo` hints: AF_UNSPEC (both families),
+    // SOCK_STREAM to collapse the per-socktype duplicate entries,
+    // AI_ADDRCONFIG to skip families with no configured interface.
+    mut hints: u8[48];
+    mut z: u64 = 0;
+    while (z < 48) { hints[z] = 0; z++; }
+    write_u32(&hints[0], 0, libc::AI_ADDRCONFIG as u32);   // ai_flags
+    write_u32(&hints[0], 8, libc::SOCK_STREAM as u32);     // ai_socktype
+
+    mut res: u8* = null;
+    const rc: i32 = libc::getaddrinfo(host_c.as_ptr(), null, &hints[0], &res);
+    if (rc != 0) {
+        const err: IoError = eai_to_io(rc);
+        host_c.drop();
+        return Result::Err(err);
+    }
+
+    mut addrs: Array<IpAddr> = Array<IpAddr>::new();
+    mut cur: u8* = res;
+    while (cur != null) {
+        const family: u32 = read_u32(cur, 4);
+        const sa: u8* = read_ptr(cur, 24);
+        if (sa != null) {
+            if (family == AF_INET) {
+                // sockaddr_in: sin_addr at offset 4, network order.
+                addrs.push(IpAddr::V4(IpV4Addr::new(sa[4], sa[5], sa[6], sa[7])));
+            }
+            if (family == AF_INET6) {
+                // sockaddr_in6: sin6_addr (16 bytes) at offset 8.
+                mut seg: u8[16];
+                mut j: u64 = 0;
+                while (j < 16) { seg[j] = sa[8 + j]; j++; }
+                addrs.push(IpAddr::V6(IpV6Addr { segments: seg }));
+            }
+        }
+        cur = read_ptr(cur, 40);   // ai_next
+    }
+
+    libc::freeaddrinfo(res);
+    host_c.drop();
+
+    if (addrs.is_empty()) {
+        addrs.drop();
+        return Result::Err(IoError::new(IoErrorKind::NotFound, 0));
+    }
+    return Result::Ok(ResolvedAddrs { addrs: addrs });
+}
+
+/// Resolve `host` and pair every address with `port`, ready to hand to
+/// `TcpStream::connect` / `UdpSocket::connect`. The returned `Array`
+/// must be dropped by the caller.
+function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
+    mut resolved: ResolvedAddrs = resolve(host)?;
+    mut out: Array<SocketAddr> = Array<SocketAddr>::new();
+    mut i: u64 = 0;
+    while (i < resolved.length()) {
+        match (resolved.get(i)) {
+            Option::Some(ip) => { out.push(SocketAddr::new(ip, port)); }
+            Option::None     => { }
+        }
+        i++;
+    }
+    resolved.drop();
+    return Result::Ok(out);
+}
+
+/// Resolve `host` to a single address — the first (most-preferred)
+/// record. The common case for "connect to this name".
+function resolve_one(host: Str) -> Result<IpAddr, IoError> {
+    mut resolved: ResolvedAddrs = resolve(host)?;
+    const first: Option<IpAddr> = resolved.get(0);
+    resolved.drop();
+    match (first) {
+        Option::Some(ip) => { return Result::Ok(ip); }
+        Option::None     => { return Result::Err(IoError::new(IoErrorKind::NotFound, 0)); }
+    }
+}
+
+/// Map a `getaddrinfo` `EAI_*` code to an `IoError`. `EAI_SYSTEM`
+/// defers to the live `errno`; everything else folds to the nearest
+/// kind with the raw code preserved.
+function eai_to_io(code: i32) -> IoError {
+    // If-chain rather than `match`: `EAI_*` are cross-module constants
+    // (`ffi::libc`), and `match` patterns require local constants, so an
+    // arm on `libc::EAI_NONAME` would silently never fire.
+    if (code == libc::EAI_NONAME || code == libc::EAI_NODATA) {
+        return IoError::new(IoErrorKind::NotFound, code);
+    }
+    if (code == libc::EAI_AGAIN) {
+        return IoError::new(IoErrorKind::WouldBlock, code);
+    }
+    if (code == libc::EAI_MEMORY) {
+        return IoError::new(IoErrorKind::OutOfMemory, code);
+    }
+    if (code == libc::EAI_FAMILY || code == libc::EAI_SOCKTYPE || code == libc::EAI_SERVICE) {
+        return IoError::new(IoErrorKind::Unsupported, code);
+    }
+    if (code == libc::EAI_SYSTEM) {
+        return IoError::from_errno(libc::errno());
+    }
+    return IoError::new(IoErrorKind::Other, code);
+}
+
+/// Read a little-endian `u32` field at `base + off`.
+function read_u32(base: u8*, off: u64) -> u32 {
+    return (base[off]       as u32)
+         | ((base[off + 1]  as u32) << 8)
+         | ((base[off + 2]  as u32) << 16)
+         | ((base[off + 3]  as u32) << 24);
+}
+
+/// Read a little-endian pointer field (8 bytes) at `base + off` and
+/// reinterpret it as a `u8*`. This is how the `addrinfo` chain is
+/// walked: the kernel writes native-width pointers, we read them back.
+function read_ptr(base: u8*, off: u64) -> u8* {
+    mut v: u64 = 0;
+    mut i: u64 = 0;
+    while (i < 8) {
+        v = v | ((base[off + i] as u64) << (i * 8));
+        i++;
+    }
+    return v as u8*;
+}
+
+/// Write a little-endian `u32` field at `base + off`.
+function write_u32(base: u8*, off: u64, value: u32) -> void {
+    base[off]     = (value)       as u8;
+    base[off + 1] = (value >> 8)  as u8;
+    base[off + 2] = (value >> 16) as u8;
+    base[off + 3] = (value >> 24) as u8;
+}

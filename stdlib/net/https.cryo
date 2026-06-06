@@ -1,0 +1,125 @@
+///! HTTPS client: one-shot requests over TLS.
+///!
+///! Ties together `net::dns` (resolve the hostname), `net::tcp` (dial),
+///! `net::tls` (wrap + verify), and `net::http` (serialize the request /
+///! parse the response). The HTTP layer never learns it's talking to
+///! TLS — `TlsStream` is just another `Read + Write`, so `send_over`
+///! drives it exactly like a plaintext socket.
+///!
+///! Linking: pulls in `net::tls`, so a binary using this module must add
+///! `ssl` + `crypto` to its project `cryoconfig` `link_libs`.
+
+namespace std::net::https;
+
+import core::option;
+import core::result;
+import collections::array;
+import collections::str;
+import io::error;
+import net::ip;
+import net::socket_addr;
+import net::tcp;
+import net::dns;
+import net::tls::context;
+import net::tls::stream;
+import net::http::method;
+import net::http::request;
+import net::http::response;
+import net::http::client;
+
+type struct HttpsClient {
+    connector: TlsConnector;
+
+    /// New client with full certificate + hostname verification against
+    /// the system trust store.
+    static new() -> Result<HttpsClient, IoError> {
+        const c: TlsConnector = TlsConnector::new()?;
+        return Result::Ok(HttpsClient { connector: c });
+    }
+
+    /// New client that skips certificate verification. For self-signed
+    /// or out-of-band-pinned servers only — never for the open web.
+    static insecure() -> Result<HttpsClient, IoError> {
+        mut c: TlsConnector = TlsConnector::new()?;
+        c = c.danger_accept_invalid_certs();
+        return Result::Ok(HttpsClient { connector: c });
+    }
+
+    /// `GET https://host:port/path`. Resolves `host`, dials, performs the
+    /// TLS handshake with SNI = `host`, then sends the request and reads
+    /// one response.
+    get(&this, host: Str, port: u16, path: Str) -> Result<Response, IoError> {
+        mut req: Request = Request::new(Method::Get, path);
+        req.headers.insert(Str::new("Host"), host);
+        return this.send(host, port, req);
+    }
+
+    /// `POST https://host:port/path` with a body. Sets Host and the
+    /// given Content-Type; the request's Content-Length is set by
+    /// `set_body`.
+    post(&this,
+         host: Str,
+         port: u16,
+         path: Str,
+         content_type: Str,
+         body: Array<u8>) -> Result<Response, IoError> {
+        mut req: Request = Request::new(Method::Post, path);
+        req.headers.insert(Str::new("Host"), host);
+        req.headers.insert(Str::new("Content-Type"), content_type);
+        req.set_body(body);
+        return this.send(host, port, req);
+    }
+
+    /// Resolve, dial, wrap in TLS, and run one request/response. The
+    /// `TlsStream` is closed before returning regardless of outcome.
+    send(&this, host: Str, port: u16, req: Request) -> Result<Response, IoError> {
+        // The socket layer is IPv4-only, so pick the first A record even
+        // if the resolver preference-orders a AAAA ahead of it.
+        const addr: SocketAddr = match (first_ipv4(host, port)) {
+            Result::Ok(a)  => { a }
+            Result::Err(e) => { req.drop(); return Result::Err(e); }
+        };
+        mut tcp: TcpStream = match (TcpStream::connect(addr)) {
+            Result::Ok(s)  => { s }
+            Result::Err(e) => { req.drop(); return Result::Err(e); }
+        };
+        mut tls: TlsStream = match (this.connector.connect(tcp, host)) {
+            Result::Ok(t)  => { t }   // consumed `tcp`
+            Result::Err(e) => { req.drop(); return Result::Err(e); }
+        };
+        const result: Result<Response, IoError> = client::send_over(&tls, req);
+        tls.drop();
+        return result;
+    }
+
+    /// Release the underlying TLS context.
+    drop(mut &this) -> void {
+        this.connector.drop();
+    }
+}
+
+/// Resolve `host` and return the first IPv4 address paired with `port`.
+/// IPv6 results are skipped until the socket layer can dial them; if
+/// none are IPv4, fails `Unsupported`.
+function first_ipv4(host: Str, port: u16) -> Result<SocketAddr, IoError> {
+    mut resolved: ResolvedAddrs = dns::resolve(host)?;
+    mut chosen: Option<SocketAddr> = Option::None;
+    mut i: u64 = 0;
+    while (i < resolved.length()) {
+        match (resolved.get(i)) {
+            Option::Some(ip) => {
+                if (ip.is_ipv4()) {
+                    chosen = Option::Some(SocketAddr::new(ip, port));
+                    i = resolved.length();   // stop at the first match
+                }
+            }
+            Option::None => { }
+        }
+        i++;
+    }
+    resolved.drop();
+    match (chosen) {
+        Option::Some(addr) => { return Result::Ok(addr); }
+        Option::None       => { return Result::Err(IoError::new(IoErrorKind::Unsupported, 0)); }
+    }
+}

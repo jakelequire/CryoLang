@@ -1,0 +1,132 @@
+///! UdpSocket - loopback datagram round-trip over 127.0.0.1.
+///!
+///! Both sockets bind to port 0 and read their kernel-assigned port
+///! back with `local_addr()`, so concurrent test runs never collide and
+///! the test needs no hard-coded ports. A datagram is sent each way and
+///! the payload plus the reported peer address are checked.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetUdp;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::str;
+import std::io::error;
+import std::net::ip;
+import std::net::socket_addr;
+import std::net::udp;
+import std::test::error;
+import std::test::assert;
+
+function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+![test]
+function loopback_datagram_round_trip() -> Result<(), TestError> {
+    mut server: UdpSocket = match (UdpSocket::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("server bind failed")); }
+    };
+    mut client: UdpSocket = match (UdpSocket::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { server.drop(); return bail(Str::new("client bind failed")); }
+    };
+
+    const server_addr: SocketAddr = match (server.local_addr()) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("server local_addr failed")); }
+    };
+
+    // client -> server
+    match (client.send_to(Str::new("ping").as_bytes(), server_addr)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("client send_to failed")); }
+    }
+
+    mut sbuf: u8[64];
+    mut client_addr: SocketAddr = SocketAddr::localhost_v4(0);
+    mut sgot: u64 = 0;
+    match (server.recv_from(&sbuf[0], 64)) {
+        Result::Ok(pair) => { sgot = pair[0]; client_addr = pair[1]; }
+        Result::Err(_)   => { client.drop(); server.drop(); return bail(Str::new("server recv_from failed")); }
+    }
+    const ping_ok: boolean = slices_eq(Slice::from_raw(&sbuf[0], sgot), Str::new("ping").as_bytes());
+
+    // server -> client, replying to the peer the datagram came from
+    match (server.send_to(Str::new("pong").as_bytes(), client_addr)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("server send_to failed")); }
+    }
+
+    mut cbuf: u8[64];
+    mut cgot: u64 = 0;
+    match (client.recv_from(&cbuf[0], 64)) {
+        Result::Ok(pair) => { cgot = pair[0]; }
+        Result::Err(_)   => { client.drop(); server.drop(); return bail(Str::new("client recv_from failed")); }
+    }
+    const pong_ok: boolean = slices_eq(Slice::from_raw(&cbuf[0], cgot), Str::new("pong").as_bytes());
+
+    // The peer the server saw must be the client's loopback address.
+    const peer_is_loopback: boolean = client_addr.ip.is_ipv4();
+
+    client.drop();
+    server.drop();
+
+    match (expect(ping_ok, Str::new("server should receive \"ping\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect(pong_ok, Str::new("client should receive \"pong\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(peer_is_loopback, Str::new("server should see an IPv4 peer address"));
+}
+
+![test]
+function connected_socket_send_recv() -> Result<(), TestError> {
+    // `connect` pins a default peer so the address-less send/recv work.
+    mut server: UdpSocket = match (UdpSocket::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("server bind failed")); }
+    };
+    const server_addr: SocketAddr = match (server.local_addr()) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { server.drop(); return bail(Str::new("server local_addr failed")); }
+    };
+
+    mut client: UdpSocket = match (UdpSocket::unbound()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { server.drop(); return bail(Str::new("client unbound failed")); }
+    };
+    match (client.connect(server_addr)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("client connect failed")); }
+    }
+    match (client.send(Str::new("hello").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("client send failed")); }
+    }
+
+    mut buf: u8[64];
+    mut got: u64 = 0;
+    match (server.recv_from(&buf[0], 64)) {
+        Result::Ok(pair) => { got = pair[0]; }
+        Result::Err(_)   => { client.drop(); server.drop(); return bail(Str::new("server recv_from failed")); }
+    }
+    const ok: boolean = slices_eq(Slice::from_raw(&buf[0], got), Str::new("hello").as_bytes());
+
+    client.drop();
+    server.drop();
+    return expect(ok, Str::new("connected send should deliver \"hello\""));
+}

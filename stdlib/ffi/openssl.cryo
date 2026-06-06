@@ -1,0 +1,105 @@
+///! ffi::openssl: bindings to the system OpenSSL (`libssl` + `libcrypto`).
+///!
+///! These are raw `extern "C"` declarations for the subset of the
+///! OpenSSL 3.x API that `net::tls` drives. Opaque handles (`SSL`,
+///! `SSL_CTX`, `SSL_METHOD`) cross the boundary as `void*`; the caller
+///! owns lifetime and must pair every `*_new` with its `*_free`.
+///!
+///! Linking: a binary that pulls in `net::tls` must add `ssl` and
+///! `crypto` to its project `cryoconfig` `link_libs`. Nothing here is
+///! referenced unless `net::tls` is used, so non-TLS binaries link
+///! without OpenSSL.
+///!
+///! Symbol-vs-macro caveat: several "functions" in `<openssl/ssl.h>`
+///! are preprocessor macros over `SSL_ctrl` / `SSL_CTX_ctrl`, NOT
+///! exported symbols. `SSL_set_tlsext_host_name` (SNI) is the one we
+///! need; it is wrapped below as `ssl_set_sni` over the real `SSL_ctrl`
+///! symbol. Every extern here was checked against
+///! `nm -D libssl.so.3 / libcrypto.so.3`.
+
+namespace std::ffi::openssl;
+
+// --- file types -----------------------------------------------------
+const SSL_FILETYPE_PEM:  i32 = 1;
+const SSL_FILETYPE_ASN1: i32 = 2;
+
+// --- verify modes (bitmask) -----------------------------------------
+const SSL_VERIFY_NONE:                 i32 = 0;
+const SSL_VERIFY_PEER:                 i32 = 1;
+const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: i32 = 2;
+
+// --- SSL_get_error result codes -------------------------------------
+const SSL_ERROR_NONE:        i32 = 0;
+const SSL_ERROR_SSL:         i32 = 1;
+const SSL_ERROR_WANT_READ:   i32 = 2;
+const SSL_ERROR_WANT_WRITE:  i32 = 3;
+const SSL_ERROR_WANT_X509_LOOKUP: i32 = 4;
+const SSL_ERROR_SYSCALL:     i32 = 5;
+const SSL_ERROR_ZERO_RETURN: i32 = 6;
+const SSL_ERROR_WANT_CONNECT: i32 = 7;
+const SSL_ERROR_WANT_ACCEPT:  i32 = 8;
+
+// --- certificate verification result --------------------------------
+const X509_V_OK: i64 = 0;
+
+// --- SSL_ctrl command numbers (from openssl/ssl.h / tls1.h) ----------
+// SNI: `SSL_set_tlsext_host_name(s, name)` expands to
+// `SSL_ctrl(s, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, name)`.
+const SSL_CTRL_SET_TLSEXT_HOSTNAME: i32 = 55;
+const TLSEXT_NAMETYPE_host_name:    i64 = 0;
+
+extern "C" {
+    // Library version (used as a cheap link-availability probe).
+    function OpenSSL_version_num() -> u64;
+
+    // Protocol method constructors (version-flexible TLS).
+    function TLS_client_method() -> void*;
+    function TLS_server_method() -> void*;
+
+    // SSL_CTX: shared configuration / certificate store.
+    function SSL_CTX_new(method: void*) -> void*;
+    function SSL_CTX_free(ctx: void*) -> void;
+    function SSL_CTX_set_verify(ctx: void*, mode: i32, callback: void*) -> void;
+    function SSL_CTX_set_default_verify_paths(ctx: void*) -> i32;
+    function SSL_CTX_use_certificate_file(ctx: void*, file: u8*, type_: i32) -> i32;
+    function SSL_CTX_use_PrivateKey_file(ctx: void*, file: u8*, type_: i32) -> i32;
+    function SSL_CTX_check_private_key(ctx: void*) -> i32;
+    // ALPN advertise: `protos` is the wire form (length-prefixed names).
+    // Returns 0 on success (note the inverted convention).
+    function SSL_CTX_set_alpn_protos(ctx: void*, protos: u8*, protos_len: u32) -> i32;
+
+    // SSL: a single connection bound to one fd.
+    function SSL_new(ctx: void*) -> void*;
+    function SSL_free(ssl: void*) -> void;
+    function SSL_set_fd(ssl: void*, fd: i32) -> i32;
+    // Generic control channel; SNI rides on this (see ssl_set_sni).
+    function SSL_ctrl(ssl: void*, cmd: i32, larg: i64, parg: void*) -> i64;
+    // Enable built-in hostname verification against the peer cert.
+    function SSL_set1_host(ssl: void*, hostname: u8*) -> i32;
+    function SSL_set_verify(ssl: void*, mode: i32, callback: void*) -> void;
+
+    // Handshake + I/O.
+    function SSL_connect(ssl: void*) -> i32;
+    function SSL_accept(ssl: void*) -> i32;
+    function SSL_read(ssl: void*, buf: u8*, num: i32) -> i32;
+    function SSL_write(ssl: void*, buf: u8*, num: i32) -> i32;
+    function SSL_shutdown(ssl: void*) -> i32;
+    function SSL_get_error(ssl: void*, ret: i32) -> i32;
+    function SSL_get_verify_result(ssl: void*) -> i64;
+    function SSL_pending(ssl: void*) -> i32;
+    // ALPN result after the handshake (`data`/`len` are out-params).
+    function SSL_get0_alpn_selected(ssl: void*, data: u8**, len: u32*) -> void;
+
+    // Error queue (libcrypto).
+    function ERR_get_error() -> u64;
+    function ERR_error_string_n(e: u64, buf: u8*, len: u64) -> void;
+    function ERR_clear_error() -> void;
+}
+
+/// Set the SNI hostname on a client `SSL` before the handshake. Wraps
+/// the `SSL_set_tlsext_host_name` header macro over the real `SSL_ctrl`
+/// symbol. `name` must be NUL-terminated. Returns 1 on success.
+function ssl_set_sni(ssl: void*, name: u8*) -> i64 {
+    return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                    TLSEXT_NAMETYPE_host_name, name as void*);
+}

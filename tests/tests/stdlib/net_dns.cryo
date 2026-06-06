@@ -1,0 +1,76 @@
+///! dns::resolve - hostname resolution via getaddrinfo.
+///!
+///! Hermetic: only `localhost` and numeric literals are resolved, which
+///! glibc answers from `/etc/hosts` / the numeric fast-path without
+///! touching the network, so the test is deterministic in CI.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetDns;
+
+import std::core::result;
+import std::core::option;
+import std::collections::str;
+import std::collections::array;
+import std::io::error;
+import std::net::ip;
+import std::net::socket_addr;
+import std::net::dns;
+import std::test::error;
+import std::test::assert;
+
+![test]
+function resolve_localhost_yields_at_least_one_address() -> Result<(), TestError> {
+    mut resolved: ResolvedAddrs = match (dns::resolve(Str::new("localhost"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return bail(Str::new("resolve(localhost) failed")); }
+    };
+    const n: u64 = resolved.length();
+    resolved.drop();
+    return expect(n >= 1, Str::new("localhost should resolve to >= 1 address"));
+}
+
+![test]
+function resolve_numeric_v4_is_identity() -> Result<(), TestError> {
+    const ip: IpAddr = match (dns::resolve_one(Str::new("127.0.0.1"))) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { return bail(Str::new("resolve_one(127.0.0.1) failed")); }
+    };
+    match (ip) {
+        IpAddr::V4(v4) => {
+            match (expect_eq(v4.a as i32, 127)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            match (expect_eq(v4.b as i32, 0))   { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            match (expect_eq(v4.c as i32, 0))   { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+            return expect_eq(v4.d as i32, 1);
+        }
+        IpAddr::V6(_) => {
+            return bail(Str::new("127.0.0.1 should resolve to an IPv4 address"));
+        }
+    }
+}
+
+![test]
+function lookup_attaches_port() -> Result<(), TestError> {
+    mut addrs: Array<SocketAddr> = match (dns::lookup(Str::new("127.0.0.1"), 8080)) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { return bail(Str::new("lookup(127.0.0.1, 8080) failed")); }
+    };
+    mut port_ok: boolean = false;
+    match (addrs.get(0)) {
+        Option::Some(sa) => { port_ok = sa.port == 8080; }
+        Option::None     => { }
+    }
+    addrs.drop();
+    return expect(port_ok, Str::new("lookup should attach port 8080"));
+}
+
+![test]
+function resolve_unknown_name_fails() -> Result<(), TestError> {
+    // `.invalid` is reserved by RFC 6761 to always fail resolution.
+    const r: Result<ResolvedAddrs, IoError> = dns::resolve(Str::new("nonexistent.invalid"));
+    const is_err: boolean = r.is_err();
+    match (r) {
+        Result::Ok(x)  => { mut resolved: ResolvedAddrs = x; resolved.drop(); }
+        Result::Err(_) => { }
+    }
+    return expect(is_err, Str::new("an unresolvable name should error"));
+}

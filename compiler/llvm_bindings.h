@@ -253,6 +253,13 @@ LLVMBasicBlockRef LLVMInsertBasicBlock(LLVMBasicBlockRef InsertBeforeBB, const c
 void              LLVMDeleteBasicBlock(LLVMBasicBlockRef BB);
 LLVMValueRef      LLVMGetBasicBlockTerminator(LLVMBasicBlockRef BB);
 LLVMValueRef      LLVMGetBasicBlockParent(LLVMBasicBlockRef BB);
+LLVMValueRef      LLVMBasicBlockAsValue(LLVMBasicBlockRef BB);
+
+/* Use list — `LLVMGetFirstUse` returns NULL when a value has no uses.
+ * For a basic-block-as-value that means no branch/blockaddress targets
+ * it, i.e. the block has no predecessors (dead / unreachable). */
+typedef void *LLVMUseRef;
+LLVMUseRef        LLVMGetFirstUse(LLVMValueRef Val);
 
 
 /* ===================================================================

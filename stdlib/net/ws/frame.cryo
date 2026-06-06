@@ -1,0 +1,184 @@
+///! WebSocket framing (RFC 6455 §5).
+///!
+///! A frame is a 2-byte header, an extended length (0 / 2 / 8 bytes), an
+///! optional 4-byte masking key, then the payload. Clients MUST mask;
+///! servers MUST NOT. `encode_frame` / `read_frame` are generic over the
+///! `Write` / `Read` transport, so they run over `TcpStream` (ws://) and
+///! `TlsStream` (wss://) alike.
+
+namespace std::net::ws::frame;
+
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import collections::array;
+import ffi::libc;
+
+/// Largest payload we'll buffer for a single frame (64 MiB). A frame
+/// claiming more is rejected rather than risking an unbounded alloc.
+const MAX_PAYLOAD: u64 = 67108864;
+
+type enum OpCode : u8 {
+    Continuation = 0x0;
+    Text         = 0x1;
+    Binary       = 0x2;
+    Close        = 0x8;
+    Ping         = 0x9;
+    Pong         = 0xA;
+}
+
+/// One decoded frame. Owns its payload bytes; call `drop`.
+type struct Frame {
+    fin:     boolean;
+    opcode:  OpCode;
+    payload: Array<u8>;
+
+    drop(mut &this) -> void {
+        this.payload.drop();
+    }
+}
+
+/// Write one frame. `mask` selects client framing (a random masking key
+/// is generated and applied) vs server framing (no mask). The payload is
+/// not consumed.
+function encode_frame<W>(writer: mut &W, fin: boolean, opcode: OpCode,
+                         payload: Slice<u8>, mask: boolean) -> Result<(), IoError>
+where W: Write {
+    const len: u64 = payload.length();
+    mut frame: Array<u8> = Array<u8>::with_capacity(len + 14);
+
+    // Byte 0: FIN + opcode.
+    mut b0: u8 = op_to_u8(opcode);
+    if (fin) { b0 = b0 | 0x80; }
+    frame.push(b0);
+
+    // Byte 1: mask bit + length (7-bit, or 126/127 escape).
+    const mask_bit: u8 = if (mask) { 0x80 } else { 0 };
+    if (len < 126) {
+        frame.push(mask_bit | (len as u8));
+    } else {
+        if (len <= 0xFFFF) {
+            frame.push(mask_bit | 126);
+            frame.push((len >> 8) as u8);
+            frame.push((len)      as u8);
+        } else {
+            frame.push(mask_bit | 127);
+            mut s: i64 = 56;
+            while (s >= 0) { frame.push((len >> (s as u64)) as u8); s = s - 8; }
+        }
+    }
+
+    // Masking key + masked payload, or raw payload.
+    if (mask) {
+        mut key: u8[4];
+        gen_mask(&key[0]);
+        frame.push(key[0]); frame.push(key[1]); frame.push(key[2]); frame.push(key[3]);
+        mut i: u64 = 0;
+        while (i < len) {
+            frame.push(byte_at(payload, i) ^ key[i % 4]);
+            i++;
+        }
+    } else {
+        mut i: u64 = 0;
+        while (i < len) { frame.push(byte_at(payload, i)); i++; }
+    }
+
+    const result: Result<(), IoError> =
+        writer.write_all(Slice::from_raw(frame.as_ptr(), frame.length()));
+    frame.drop();
+    return result;
+}
+
+/// Read one frame off `reader`. Unmasks if the mask bit is set. Rejects
+/// reserved opcodes and oversized payloads (`InvalidData`).
+function read_frame<R>(reader: mut &R) -> Result<Frame, IoError>
+where R: Read {
+    mut header: u8[2];
+    reader.read_exact(&header[0], 2)?;
+
+    const fin: boolean = (header[0] & 0x80) != 0;
+    const masked: boolean = (header[1] & 0x80) != 0;
+    const opcode: OpCode = match (op_from_u8(header[0] & 0x0F)) {
+        Option::Some(op) => { op }
+        Option::None     => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+    };
+
+    // Payload length: 7-bit, or 16-/64-bit extended.
+    mut len: u64 = (header[1] & 0x7F) as u64;
+    if (len == 126) {
+        mut ext: u8[2];
+        reader.read_exact(&ext[0], 2)?;
+        len = ((ext[0] as u64) << 8) | (ext[1] as u64);
+    } else {
+        if (len == 127) {
+            mut ext: u8[8];
+            reader.read_exact(&ext[0], 8)?;
+            len = 0;
+            mut i: u64 = 0;
+            while (i < 8) { len = (len << 8) | (ext[i] as u64); i++; }
+        }
+    }
+    if (len > MAX_PAYLOAD) {
+        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+    }
+
+    mut key: u8[4];
+    if (masked) { reader.read_exact(&key[0], 4)?; }
+
+    mut payload: Array<u8> = Array<u8>::with_capacity(len);
+    mut z: u64 = 0;
+    while (z < len) { payload.push(0); z++; }
+    if (len > 0) {
+        match (reader.read_exact(payload.as_ptr(), len)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { payload.drop(); return Result::Err(e); }
+        }
+    }
+    if (masked) {
+        const p: u8* = payload.as_ptr();
+        mut i: u64 = 0;
+        while (i < len) { p[i] = p[i] ^ key[i % 4]; i++; }
+    }
+
+    return Result::Ok(Frame { fin: fin, opcode: opcode, payload: payload });
+}
+
+/// Numeric opcode for the wire.
+function op_to_u8(op: OpCode) -> u8 {
+    match (op) {
+        OpCode::Continuation => { return 0x0; }
+        OpCode::Text         => { return 0x1; }
+        OpCode::Binary       => { return 0x2; }
+        OpCode::Close        => { return 0x8; }
+        OpCode::Ping         => { return 0x9; }
+        OpCode::Pong         => { return 0xA; }
+    }
+}
+
+/// Decode a wire opcode, rejecting the reserved values.
+function op_from_u8(value: u8) -> Option<OpCode> {
+    match (value) {
+        0x0 => { return Option::Some(OpCode::Continuation); }
+        0x1 => { return Option::Some(OpCode::Text); }
+        0x2 => { return Option::Some(OpCode::Binary); }
+        0x8 => { return Option::Some(OpCode::Close); }
+        0x9 => { return Option::Some(OpCode::Ping); }
+        0xA => { return Option::Some(OpCode::Pong); }
+        _   => { return Option::None; }
+    }
+}
+
+/// Fill 4 bytes with a fresh masking key from the kernel CSPRNG.
+function gen_mask(out: u8*) -> void {
+    libc::getrandom(out, 4, 0);
+}
+
+/// Slice byte access without `Option` ceremony; callers stay in range.
+function byte_at(s: Slice<u8>, index: u64) -> u8 {
+    match (s.get(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
+    }
+}
