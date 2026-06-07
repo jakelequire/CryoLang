@@ -39,6 +39,8 @@ The rest of this document is organised by feature area. Examples are runnable ag
 - [20. Testing](#20-testing)
 - [21. Reserved Syntax](#21-reserved-syntax)
 - [22. Grammar Summary](#22-grammar-summary)
+- [23. Project Configuration (cryoconfig)](#23-project-configuration-cryoconfig)
+- [24. Command-Line Interface](#24-command-line-interface)
 
 ---
 
@@ -2292,3 +2294,150 @@ postfix_expr        = primary_expr { postfix_op }
 ```
 
 For the full grammar, including type and pattern productions, see [`grammar.md`](grammar.md).
+
+---
+
+## 23. Project Configuration (cryoconfig)
+
+A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter file with `cryo init`.
+
+`cryoconfig` is an INI-like file: `[section]` headers, `key = value` lines, `#` comments. List values use TOML-style arrays (`["a", "b"]`). Unknown keys are ignored with a warning; keys removed in 1.0 are a hard error that names the replacement.
+
+### 23.1 `[project]`
+
+Project identity and source layout.
+
+```ini
+[project]
+project_name  = "my-app"            # display name
+target_type   = "executable"        # executable | library | stdlib
+entry_point   = "src/main.cryo"     # main file (executables only)
+source_dir    = "src"               # source root (libraries / stdlib)
+output_dir    = "build"             # where build artifacts are written
+source_paths  = ["../shared/src"]   # extra source roots to scan for modules
+target_triple = ""                  # cross-compile triple; empty => build for host
+stdlib_root   = ""                  # project-pinned stdlib root (see §24.3)
+```
+
+`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and suppresses the host link step, so cross-compiled object files are not handed to the host linker. The CLI `--target=TRIPLE` overrides it.
+
+### 23.2 `[compiler]`
+
+Code-generation knobs.
+
+```ini
+[compiler]
+debug     = false                   # verbose compiler logging
+optimize  = "O2"                    # O0 | O1 | O2 | O3 (default O2)
+emit_llvm = false                   # also write LLVM IR (.ll) beside the object
+no_std    = false                   # build without linking the standard library
+```
+
+### 23.3 `[link]`
+
+Native libraries to link, named by *intent* rather than by raw linker flag — so a project never has to juggle two similar lists.
+
+```ini
+[link]
+system = ["ssl", "crypto"]          # system libraries        -> -l<name>
+search = ["/usr/lib/llvm-20/lib"]   # extra -L dirs to resolve `system` libs
+static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by path
+```
+
+| Key | Role | Linker form |
+| --- | --- | --- |
+| `system` | A library the linker finds on its default search path. | `-l<name>` |
+| `search` | Extra directories to search — only needed for `system` libs that live off the default path. | `-L<dir>` |
+| `static` | A local archive in your project; linked by its path. | the path, verbatim |
+
+> Migrating from pre-1.0: `link_libs` → `[link] system`, `link_paths` → `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone — set `emit_llvm = true`. `[compiler] include_paths` → `[project] source_paths`. `[project] target` → `[project] target_triple`.
+
+### 23.4 Multi-target: `[lib]` and `[[bin]]`
+
+A project can build a library and one or more executables from one source tree. `[lib]` declares the library; each `[[bin]]` (array-of-tables) declares an executable. When present these take precedence over the single-target `[project] target_type` / `entry_point`.
+
+```ini
+[lib]
+name       = "mylib"
+source_dir = "src"
+
+[[bin]]
+name        = "mytool"
+entry_point = "src/main.cryo"
+```
+
+### 23.5 `[dependencies]`
+
+Each entry is an inline table — a local path dependency or a git dependency. `cryo fetch` resolves them and writes `cryoconfig.lock`.
+
+```ini
+[dependencies]
+mylib    = { path = "../mylib", alias = "MyLib" }
+remote   = { git = "https://example.com/lib.git", tag = "v0.1.0", alias = "Remote" }
+```
+
+A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). `alias` is the top-level namespace the consumer imports.
+
+### 23.6 `[test]`
+
+Defaults for the test runner; forwarded to the spawned test binary unless overridden on the CLI.
+
+```ini
+[test]
+format = "pretty"                   # plain | pretty | compact
+color  = "auto"                     # auto | always | never
+```
+
+---
+
+## 24. Command-Line Interface
+
+`cryo` is a single binary: the compiler, package manager, test runner, and dependency resolver. Run `cryo` (or `cryo --help`) for a command overview, `cryo help <command>` for one command, and `cryo help <topic>` for the topics below.
+
+### 24.1 Commands
+
+| Command | Purpose |
+| --- | --- |
+| `cryo build [file\|dir]` | Build a single `.cryo` file, or the project whose cryoconfig lives in `dir` (default `.`). |
+| `cryo run` | Build the project and run the resulting executable. |
+| `cryo test [pattern]` | Build and run the project's `![test]` functions. |
+| `cryo check <file>` | Front-end + semantic analysis only; no codegen. |
+| `cryo init [dir]` | Scaffold a new project (`cryoconfig` + `main.cryo`). |
+| `cryo raw <file>` | Compile without the stdlib or prelude. |
+| `cryo demangle <sym>` | Decode a mangled symbol to its source form. |
+| `cryo fetch` | Fetch dependencies and write `cryoconfig.lock`. |
+| `cryo update` | Re-resolve every dependency, ignoring the lockfile. |
+| `cryo version` | Print the compiler version. |
+
+Running `cryo <file.cryo>` with no command compiles that file directly.
+
+### 24.2 Build flags
+
+Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` or `cryo help <flag>` for detail.
+
+| Flag | Effect |
+| --- | --- |
+| `--debug` | Verbose compiler logging. |
+| `--ast` | Dump the AST after parsing. |
+| `--emit-llvm` | Emit LLVM IR (`.ll`) beside the object output. |
+| `--build-dir=PATH` | Override `[project] output_dir`. |
+| `--stdlib=PATH` | Standard-library root for this run (highest priority; see §24.3). |
+| `--target=TRIPLE` | Cross-compile for an LLVM target triple; object files only. |
+| `--opt-level=N` | Optimization level `0`..`3`; overrides `[compiler] optimize`. |
+| `-g`, `--debug-info` | Emit DWARF debug info. |
+| `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable). |
+
+Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
+
+### 24.3 Standard-library lookup
+
+The compiler resolves the stdlib root from the first source that matches:
+
+1. `--stdlib=PATH` — one-off override (this run only)
+2. `$CRYO_STDLIB` — explicit stdlib pointer (environment)
+3. `$CRYO_HOME/stdlib` — install-root pointer (set by `install.sh`)
+4. `<bindir>/../stdlib` — binary-relative auto-detection
+5. `[project] stdlib_root` — project-pinned in cryoconfig (relative to the project root when not absolute)
+6. `<project_root>/../stdlib` — in-tree fallback
+
+Most installs need none of these: the binary-relative default (4) finds the stdlib shipped alongside `cryo`. Projects living outside the Cryo repo pin a specific stdlib with `[project] stdlib_root`.

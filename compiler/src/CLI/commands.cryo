@@ -104,10 +104,12 @@ implement enum CommandKind {
         printf("Usage: %s\n\n", this.usage());
         match (this) {
             CommandKind::Help => {
-                printf("With no argument, prints an overview of every command and global\n");
-                printf("flag.  With a command or flag name, prints this detailed view.\n\n");
+                printf("With no argument, prints a command overview.  With a topic, command,\n");
+                printf("or flag name, prints this detailed view.\n\n");
+                printf("Topics: stdlib (lookup order), config (cryoconfig), flags (build flags).\n\n");
                 printf("Examples:\n");
-                printf("  cryo help              Overview of commands and flags\n");
+                printf("  cryo help              Overview of commands\n");
+                printf("  cryo help config       The cryoconfig file format\n");
                 printf("  cryo help build        Detailed help for the `build` command\n");
                 printf("  cryo help --emit-llvm  Detailed help for the `--emit-llvm` flag\n");
             }
@@ -426,11 +428,14 @@ type struct Executor {
         return 1;
     }
 
-    /// `cryo help <topic>`: detailed help for a single command or flag.
-    /// The topic is resolved as a command first, then as a flag (with or
-    /// without leading dashes).  Returns 0 when the topic resolved, 1 for
-    /// an unrecognized topic.
+    /// `cryo help <topic>`: detailed help for a named topic, a command, or
+    /// a flag.  Resolution order: named topics (stdlib / config / flags)
+    /// first, then commands, then flags (with or without leading dashes).
+    /// Returns 0 when the topic resolved, 1 for an unrecognized topic.
     static help_topic(topic: string) -> int {
+        if (strcmp(topic, "stdlib") == 0) { Executor::print_topic_stdlib(); return 0; }
+        if (strcmp(topic, "config") == 0) { Executor::print_topic_config(); return 0; }
+        if (strcmp(topic, "flags")  == 0) { Executor::print_topic_flags();  return 0; }
         const cmd: CommandKind = Executor::resolve(topic);
         if (cmd != CommandKind::Unknown) {
             cmd.print_details();
@@ -442,8 +447,77 @@ type struct Executor {
             return 0;
         }
         fprintf(g_stderr, "Error: no help topic for '%s'.\n", topic);
-        fprintf(g_stderr, "Run 'cryo help' for the list of commands and flags.\n");
+        fprintf(g_stderr, "Run 'cryo help' for commands; 'cryo help <topic>' for: stdlib, config, flags.\n");
         return 1;
+    }
+
+    /// `cryo help stdlib`: how the standard-library root is resolved.
+    /// Mirrors the priority chain in `resolve_stdlib_root` (instance.cryo).
+    static print_topic_stdlib() -> void {
+        printf("Standard-library lookup\n\n");
+        printf("The compiler resolves the stdlib root from the first source that\n");
+        printf("matches, in this order:\n\n");
+        printf("  1. --stdlib=PATH                     one-off override (this run only)\n");
+        printf("  2. $CRYO_STDLIB                       explicit stdlib pointer (env)\n");
+        printf("  3. $CRYO_HOME/stdlib                  install-root pointer (env;\n");
+        printf("                                        set by install.sh on install)\n");
+        printf("  4. <bindir>/../stdlib                 binary-relative auto-detection\n");
+        printf("  5. [project] stdlib_root             project-pinned in cryoconfig\n");
+        printf("                                        (relative to the project root\n");
+        printf("                                        when not absolute)\n");
+        printf("  6. <project_root>/../stdlib           in-tree fallback\n\n");
+        printf("Most installs need none of these: the binary-relative default (4)\n");
+        printf("finds the stdlib shipped alongside `cryo`.  Pin a project to a\n");
+        printf("specific stdlib with `[project] stdlib_root` in its cryoconfig.\n");
+    }
+
+    /// `cryo help config`: the cryoconfig schema, one source of truth.
+    static print_topic_config() -> void {
+        printf("Project configuration (cryoconfig)\n\n");
+        printf("A `cryoconfig` file at the project root drives `cryo build/run/test`.\n");
+        printf("It is an INI-like file with these sections:\n\n");
+        printf("[project]\n");
+        printf("  project_name  = \"my-app\"            display name\n");
+        printf("  target_type   = \"executable\"        executable | library | stdlib\n");
+        printf("  entry_point   = \"src/main.cryo\"     main file (executables)\n");
+        printf("  source_dir    = \"src\"               source root (libraries/stdlib)\n");
+        printf("  output_dir    = \"build\"             where build artifacts go\n");
+        printf("  source_paths  = [\"../shared/src\"]   extra source roots to scan\n");
+        printf("  target_triple = \"\"                  cross-compile triple (host if empty)\n");
+        printf("  stdlib_root   = \"\"                  project-pinned stdlib (see `help stdlib`)\n\n");
+        printf("[compiler]\n");
+        printf("  debug     = false                   verbose compiler logging\n");
+        printf("  optimize  = \"O2\"                    O0 | O1 | O2 | O3\n");
+        printf("  emit_llvm = false                   also write LLVM IR (.ll)\n");
+        printf("  no_std    = false                   build without the standard library\n\n");
+        printf("[link]                                 native libraries to link\n");
+        printf("  system = [\"ssl\", \"crypto\"]          system libs   -> -l<name>\n");
+        printf("  search = [\"/opt/lib\"]               extra -L dirs for `system` libs\n");
+        printf("  static = [\"helpers/libfoo.a\"]       local archives linked by path\n\n");
+        printf("[lib] / [[bin]]                         multi-target outputs\n");
+        printf("[dependencies]                          path/git deps (see `help fetch`)\n");
+        printf("[test]                                  format = \"...\", color = \"...\"\n\n");
+        printf("Run `cryo init` to scaffold a starter cryoconfig.\n");
+    }
+
+    /// `cryo help flags`: the full set of global build flags.  The concise
+    /// top-level `cryo --help` lists only --help / --version and points here.
+    static print_topic_flags() -> void {
+        printf("Build flags (accepted by build / run / test / check as noted)\n\n");
+        printf("  --debug             Enable debug logging and verbose output\n");
+        printf("  --ast               Dump the AST after parsing\n");
+        printf("  --emit-llvm         Emit LLVM IR (.ll) alongside the object output\n");
+        printf("  --build-dir=PATH    Override cryoconfig's output_dir\n");
+        printf("  --stdlib=PATH       Standard-library root for this run (highest priority;\n");
+        printf("                      see `cryo help stdlib`)\n");
+        printf("  --target=TRIPLE     Cross-compile for an LLVM target triple\n");
+        printf("                      (e.g. x86_64-pc-windows-gnu); object files only\n");
+        printf("  --opt-level=N       Optimization level 0..3 (overrides cryoconfig)\n");
+        printf("  -g, --debug-info    Emit DWARF debug info\n");
+        printf("  -o, --output PATH   Redirect output (single-file builds; kind inferred\n");
+        printf("                      from the extension: .o .s .ll or an executable)\n\n");
+        printf("Test-only flags: --ignored, --list, --exact, -q/--quiet.\n");
+        printf("Run `cryo help <flag>` for detail on any one flag.\n");
     }
 
     // Command Implementations

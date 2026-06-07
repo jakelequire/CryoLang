@@ -357,8 +357,10 @@ entry_point  = "src/main.cryo"
 
 [compiler]
 debug     = false
-optimize  = O2                         # O0 (debuggable) .. O3; default O2
-link_libs = ["sqlite3"]
+optimize  = "O2"                       # O0 (debuggable) .. O3; default O2
+
+[link]
+system = ["sqlite3"]                   # system libs (-l); see `cryo help config`
 
 [dependencies]
 cqlite = { git = "https://github.com/jakelequire/cqlite.git", version = "0.1.0" }
