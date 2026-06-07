@@ -186,9 +186,17 @@ type struct ProjectConfig {
     /// auto-detection in `resolve_stdlib_root`'s priority chain; env
     /// vars and CLI flags can still override it for one-off invocations.
     stdlib_root:  string;
-    link_libs:    string[];    // e.g. ["LLVM-20"]       -> `-lLLVM-20`
-    link_paths:   string[];    // e.g. ["/usr/lib/x"]    -> `-L/usr/lib/x`
-    include_paths: string[];   // extra source roots resolved relative to
+    /// `[link]` section.  Three intent-named roles so a project never has
+    /// to juggle two similar `link_*` lists:
+    ///   system -> `-l<name>`  (linker resolves on its default search path)
+    ///   search -> `-L<dir>`   (extra dirs for resolving `system` libs that
+    ///                          live off the default path, e.g. LLVM-20)
+    ///   static -> the path is passed to the linker verbatim (a local
+    ///             archive such as "helpers/libabihelpers.a")
+    link_system:  string[];    // e.g. ["LLVM-20"]              -> `-lLLVM-20`
+    link_search:  string[];    // e.g. ["/usr/lib/llvm-20/lib"] -> `-L...`
+    link_static:  string[];    // e.g. ["helpers/libabihelpers.a"] (path verbatim)
+    source_paths: string[];    // extra source roots resolved relative to
                                // project_root, e.g. ["../../compiler/src",
                                // "../../stdlib"] for tools that depend on
                                // the compiler library or stdlib sources.
@@ -242,9 +250,10 @@ type struct ProjectConfig {
             project_root: ".",
             target_triple: "",
             stdlib_root:  "",
-            link_libs:    [],
-            link_paths:   [],
-            include_paths: [],
+            link_system:  [],
+            link_search:  [],
+            link_static:  [],
+            source_paths: [],
             lib:          LibTarget::empty(),
             bins:         [],
             dependencies: [],
@@ -254,20 +263,23 @@ type struct ProjectConfig {
         };
     }
 
-    /// Deep copy.  All scalar fields are Copy; the five owning arrays
-    /// (`link_libs`/`link_paths`/`include_paths`/`bins`/`dependencies`) hold
-    /// Copy elements (strings / BinTarget / Dependency), so each is rebuilt
-    /// element-wise into an independent buffer.  Used by multi-target builds
-    /// to derive a per-target view without consuming the shared base config.
+    /// Deep copy.  All scalar fields are Copy; the owning arrays
+    /// (`link_system`/`link_search`/`link_static`/`source_paths`/`bins`/
+    /// `dependencies`) hold Copy elements (strings / BinTarget / Dependency),
+    /// so each is rebuilt element-wise into an independent buffer.  Used by
+    /// multi-target builds to derive a per-target view without consuming the
+    /// shared base config.
     clone(&this) -> ProjectConfig {
-        mut link_libs_c:     string[]      = [];
-        mut link_paths_c:    string[]      = [];
-        mut include_paths_c: string[]      = [];
+        mut link_system_c:   string[]      = [];
+        mut link_search_c:   string[]      = [];
+        mut link_static_c:   string[]      = [];
+        mut source_paths_c:  string[]      = [];
         mut bins_c:          BinTarget[]   = [];
         mut deps_c:          Dependency[]  = [];
-        for (mut i: i64 = 0; i < this.link_libs.length; i++)     { link_libs_c.push(this.link_libs[i]); }
-        for (mut i: i64 = 0; i < this.link_paths.length; i++)    { link_paths_c.push(this.link_paths[i]); }
-        for (mut i: i64 = 0; i < this.include_paths.length; i++) { include_paths_c.push(this.include_paths[i]); }
+        for (mut i: i64 = 0; i < this.link_system.length; i++)   { link_system_c.push(this.link_system[i]); }
+        for (mut i: i64 = 0; i < this.link_search.length; i++)   { link_search_c.push(this.link_search[i]); }
+        for (mut i: i64 = 0; i < this.link_static.length; i++)   { link_static_c.push(this.link_static[i]); }
+        for (mut i: i64 = 0; i < this.source_paths.length; i++)  { source_paths_c.push(this.source_paths[i]); }
         for (mut i: i64 = 0; i < this.bins.length; i++)          { bins_c.push(this.bins[i]); }
         for (mut i: i64 = 0; i < this.dependencies.length; i++)  { deps_c.push(this.dependencies[i]); }
         return ProjectConfig {
@@ -283,9 +295,10 @@ type struct ProjectConfig {
             project_root:  this.project_root,
             target_triple: this.target_triple,
             stdlib_root:   this.stdlib_root,
-            link_libs:     link_libs_c,
-            link_paths:    link_paths_c,
-            include_paths: include_paths_c,
+            link_system:   link_system_c,
+            link_search:   link_search_c,
+            link_static:   link_static_c,
+            source_paths:  source_paths_c,
             lib:           this.lib,
             bins:          bins_c,
             dependencies:  deps_c,
@@ -351,7 +364,8 @@ type struct ProjectConfig {
 
         // Parse INI-like format line by line.
         // Section names use a small extended vocabulary:
-        //   "project" / "compiler" / "dependencies"   (legacy)
+        //   "project" / "compiler" / "dependencies"
+        //   "link"                                    [link]  (system/search/static)
         //   "lib"                                     [lib]
         //   "bin"                                     current [[bin]] entry
         //                                               (use current_bin_idx for which one)
@@ -413,42 +427,65 @@ type struct ProjectConfig {
             match (current_section) {
                 "project" => {
                     match (key) {
-                        "project_name" => { config.project_name = val; }
-                        "output_dir"   => { config.output_dir = val; }
-                        "target_type"  => {
+                        "project_name"  => { config.project_name = val; }
+                        "output_dir"    => { config.output_dir = val; }
+                        "target_type"   => {
                             const tt: int = parse_target_type(val);
                             if (tt == 1) { config.target_type = TargetType::Library; }
                             else if (tt == 2) { config.target_type = TargetType::Stdlib; }
                         }
-                        "entry_point"  => { config.entry_point = val; }
-                        "source_dir"   => { config.source_dir = val; }
-                        "target"       => { config.target_triple = val; }
-                        "stdlib_root"  => { config.stdlib_root = val; }
-                        _ => { }
+                        "entry_point"   => { config.entry_point = val; }
+                        "source_dir"    => { config.source_dir = val; }
+                        "target_triple" => { config.target_triple = val; }
+                        "stdlib_root"   => { config.stdlib_root = val; }
+                        "source_paths"  => { config.source_paths = parse_string_array(raw_val); }
+                        // Renamed in the v1.0 schema:
+                        "target" => {
+                            config.error_count += report_removed_key("project", "target",
+                                "rename it to `target_triple` (it set the cross-compile triple)");
+                        }
+                        _ => { report_unknown_key("project", key); }
                     }
                 }
                 "compiler" => {
                     match (key) {
-                        "debug"    => { config.debug     = parse_bool(val); }
-                        "optimize" => { config.opt_level = parse_opt_level(val); }
-                        "no_std"   => { config.no_std    = parse_bool(val); }
+                        "debug"     => { config.debug     = parse_bool(val); }
+                        "optimize"  => { config.opt_level = parse_opt_level(val); }
+                        "no_std"    => { config.no_std    = parse_bool(val); }
+                        "emit_llvm" => { config.emit_llvm = parse_bool(val); }
+                        // Removed in the v1.0 schema:
                         "args" => {
-                            // Check if the args array contains --emit-llvm
-                            if (intrinsics::strstr(raw_val, "--emit-llvm") != null) {
-                                config.emit_llvm = true;
-                            }
+                            config.error_count += report_removed_key("compiler", "args",
+                                "set `emit_llvm = true` for the only flag this ever honored");
                         }
-                        "link_libs"     => { config.link_libs = parse_string_array(raw_val); }
-                        "link_paths"    => { config.link_paths = parse_string_array(raw_val); }
-                        "include_paths" => { config.include_paths = parse_string_array(raw_val); }
-                        _ => { }
+                        "link_libs" => {
+                            config.error_count += report_removed_key("compiler", "link_libs",
+                                "use [link] system = [...] (or [link] static for local archives)");
+                        }
+                        "link_paths" => {
+                            config.error_count += report_removed_key("compiler", "link_paths",
+                                "use [link] search = [...]");
+                        }
+                        "include_paths" => {
+                            config.error_count += report_removed_key("compiler", "include_paths",
+                                "use [project] source_paths = [...]");
+                        }
+                        _ => { report_unknown_key("compiler", key); }
+                    }
+                }
+                "link" => {
+                    match (key) {
+                        "system" => { config.link_system = parse_string_array(raw_val); }
+                        "search" => { config.link_search = parse_string_array(raw_val); }
+                        "static" => { config.link_static = parse_string_array(raw_val); }
+                        _ => { report_unknown_key("link", key); }
                     }
                 }
                 "lib" => {
                     match (key) {
                         "name"       => { config.lib.name = val; }
                         "source_dir" => { config.lib.source_dir = val; }
-                        _ => { }
+                        _ => { report_unknown_key("lib", key); }
                     }
                 }
                 "bin" => {
@@ -456,7 +493,7 @@ type struct ProjectConfig {
                         match (key) {
                             "name"        => { config.bins[current_bin_idx].name = val; }
                             "entry_point" => { config.bins[current_bin_idx].entry_point = val; }
-                            _ => { }
+                            _ => { report_unknown_key("bin", key); }
                         }
                     }
                 }
@@ -477,7 +514,7 @@ type struct ProjectConfig {
                     match (key) {
                         "format" => { config.test_format = val; }
                         "color"  => { config.test_color  = val; }
-                        _ => { }
+                        _ => { report_unknown_key("test", key); }
                     }
                 }
                 _ => { }
@@ -626,6 +663,24 @@ function parse_string_array(raw: string) -> string[] {
         }
     }
     return result;
+}
+
+/// Report a key that was renamed or removed in the cryoconfig v1.0 schema.
+/// Prints a hard error naming the replacement and returns 1 so the caller
+/// can fold it into `ProjectConfig.error_count` (which aborts the build).
+function report_removed_key(section: string, key: string, hint: string) -> i64 {
+    intrinsics::fprintf(g_stderr,
+        "error: [%s] %s is no longer supported\n", section, key);
+    intrinsics::fprintf(g_stderr, "  %s\n", hint);
+    return 1;
+}
+
+/// Warn about a key the parser doesn't recognize.  Non-fatal: catches typos
+/// and dead config (e.g. the old `stdlib_mode` / `stdlib` keys) instead of
+/// silently ignoring them.  The build still proceeds.
+function report_unknown_key(section: string, key: string) -> void {
+    intrinsics::fprintf(g_stderr,
+        "warning: [%s] ignores unknown key '%s'\n", section, key);
 }
 
 /// Parse a `[dependencies]` inline-table value into the supplied
