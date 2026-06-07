@@ -455,6 +455,11 @@ type struct DeclarationEmitter {
             } else if (node.is_noinline) {
                 this.abi.apply_noinline_attribute(fn_val);
             }
+            // `-g`: keep a frame pointer so `perf record -g` can unwind
+            // cheaply and accurately.
+            if (this.ctx.emit_debug_info) {
+                this.abi.apply_frame_pointer_attribute(fn_val);
+            }
         }
 
         // Register under qualified name (module scope).
@@ -1175,6 +1180,10 @@ type struct DeclarationEmitter {
             } else if (func.is_noinline) {
                 this.abi.apply_noinline_attribute(fn_val);
             }
+            // `-g`: keep a frame pointer (see free-function path).
+            if (this.ctx.emit_debug_info) {
+                this.abi.apply_frame_pointer_attribute(fn_val);
+            }
         }
 
         // Register under the combined key built above.  Also register against the
@@ -1430,19 +1439,39 @@ type struct DeclarationEmitter {
         const subroutine_ty: void* = llvm::LLVMDIBuilderCreateSubroutineType(
             dib, file, null, 0, 0);
 
-        const name: string = this.resolve(node.name);
+        // DW_AT_name: module-qualified source name (e.g.
+        // "Compiler::Codegen::State::FunctionRegistry::get") so same-named
+        // methods are distinguishable in a backtrace, rather than the bare
+        // leaf name.
+        const disp_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        const name: string = this.resolve(disp_sym);
         const name_len: u64 = intrinsics::strlen(name);
+
+        // DW_AT_linkage_name: the function's actual ELF symbol (the mangled
+        // name LLVM emits for `fn_val`).  Setting this to exactly the ELF
+        // symbol is what lets perf/gdb/lldb bridge a sampled address -> ELF
+        // symbol -> this DISubprogram and surface the readable DW_AT_name
+        // instead of the raw mangled symbol.  Previously this slot was
+        // (incorrectly) the source name, so the bridge never matched.
+        mut link_len: u64 = 0;
+        const linkage: string = llvm::LLVMGetValueName2(fn_val.raw, &link_len);
+
         mut line: u32 = node.span.start_line;
         if (line == 0) { line = 1; }
 
+        // IsOptimized: reflect the build's opt level so debuggers know to
+        // warn about optimized-out locals / reordered code.
+        mut is_opt: i32 = 0;
+        if (ctx_ptr.opt_level > 0) { is_opt = 1; }
+
         const sp: void* = llvm::LLVMDIBuilderCreateFunction(
-            dib, file, name, name_len, name, name_len, file, line,
+            dib, file, name, name_len, linkage, link_len, file, line,
             subroutine_ty,
             0,        // IsLocalToUnit
             1,        // IsDefinition
             line,     // ScopeLine
             0,        // Flags
-            0);       // IsOptimized
+            is_opt);  // IsOptimized
         llvm::LLVMSetSubprogram(fn_val.raw, sp);
 
         mut col: u32 = node.span.start_col;

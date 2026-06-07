@@ -553,6 +553,11 @@ LLVMAttributeRef  LLVMCreateEnumAttribute(LLVMContextRef C, unsigned KindID,
                                           unsigned long long Val);
 LLVMAttributeRef  LLVMCreateTypeAttribute(LLVMContextRef C, unsigned KindID,
                                           LLVMTypeRef type_ref);
+/* String ("target-dependent") attribute, e.g. "frame-pointer"="all".
+ * Both key and value are explicit-length strings. */
+LLVMAttributeRef  LLVMCreateStringAttribute(LLVMContextRef C,
+                                            const char *K, unsigned KLength,
+                                            const char *V, unsigned VLength);
 void              LLVMAddAttributeAtIndex(LLVMValueRef F, unsigned Idx,
                                           LLVMAttributeRef A);
 void              LLVMAddCallSiteAttribute(LLVMValueRef C, unsigned Idx,
