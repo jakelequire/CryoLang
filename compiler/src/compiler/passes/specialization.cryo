@@ -201,7 +201,10 @@ function register_inherent_owner(
 /// so that sema can look it up without rescanning the AST.
 /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
 function register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> void {
-    TypeResolutionPasses::register_decl_in_index(stmt, ctx);
+    // Injected spec clones, not source decls: pass is_source_decl=false so
+    // they are skipped by the cross-module coherence check (their canonical
+    // targets recur across every module that instantiates the template).
+    TypeResolutionPasses::register_decl_in_index(stmt, ctx, false);
 }
 
 /// Tag an AST node's source_module field with the template's module name.
@@ -344,33 +347,16 @@ function register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
     if (node.is_trait_impl()) {
         const trait_name: SymbolStr = extract_root_name(node.trait_annotation);
         if (trait_name.is_valid()) {
-            // Coherence: a second *source-level* impl of the same trait for the
-            // same target type is a conflict (the dispatcher can only pick one,
-            // silently). This runs once per source impl during the single
-            // TemplateRegistration pass, so a prior entry under the same
-            // (trait, target) key with a *distinct* node is a candidate
-            // redefinition. Two guards keep it free of false positives:
-            //   - argument-less traits only: the registry key uses the trait's
-            //     *root* name, which conflates `From<i8>` and `From<i16>`.
-            //   - same source file: the key also uses the target's *simple*
-            //     name, which conflates same-named types in different modules
-            //     (one file = one namespace, so same-file simple-name identity
-            //     is exact). Cross-module orphan conflicts are future work.
-            const prior: ImplBlockNode* =
-                registry.lookup_trait_impl(trait_name, node.target_type);
-            if (prior != null && prior != node
-                    && !trait_ann_has_type_args(node.trait_annotation)
-                    && !trait_ann_has_type_args(prior.trait_annotation)
-                    && prior.span.has_location() && node.span.has_location()
-                    && node.span.file == prior.span.file) {
-                const tname: string = ctx.get_intern_table().resolve(trait_name);
-                const gname: string = ctx.get_intern_table().resolve(node.target_type);
-                ctx.emit_error_at(
-                    ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
-                    format("conflicting implementations of trait `%s` for type `%s`: a trait may be implemented at most once per type",
-                           tname, gname),
-                    node.span);
-            }
+            // NOTE: coherence (a trait may be implemented at most once per
+            // type) is NOT checked here.  At this stage (DeclarationCollection)
+            // there is no import-resolved target name, so a key would have to
+            // use bare simple names — which conflate same-named types in
+            // different modules and ignore trait/target type args.  The
+            // single coherence check lives in TypeResolution's
+            // `register_decl_in_index`, after `canonical_target` is stamped;
+            // it covers same-file and cross-module duplicates uniformly,
+            // including generic traits.  This branch only populates the
+            // dispatch registry.
             registry.register_trait_impl(trait_name, node.target_type, node);
         }
     }
@@ -391,23 +377,6 @@ function extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
         _ => { SymbolStr::empty() }
     };
 }
-
-/// True when a trait annotation carries type arguments (e.g. `From<i8>`).
-/// The (trait, target) coherence key is keyed by the trait's *root* name
-/// only, which conflates `From<i8>` and `From<i16>` for the same target -
-/// both legitimate, distinct impls. The E0308 duplicate-impl check is
-/// therefore restricted to argument-less traits, where root-name identity
-/// is exact. Generic-trait coherence (same trait args) is future work.
-function trait_ann_has_type_args(ann: TypeAnnotation*) -> boolean {
-    if (ann == null) { return false; }
-    return match (*ann) {
-        TypeAnnotation::Generic(_) => { true }
-        TypeAnnotation::Reference(r) => { trait_ann_has_type_args(r.inner) }
-        TypeAnnotation::Pointer(p) => { trait_ann_has_type_args(p.inner) }
-        _ => { false }
-    };
-}
-
 
 // SpecializationPasses: static methods for cross-module resolution
 //

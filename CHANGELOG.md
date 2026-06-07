@@ -19,7 +19,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   implicit conversions, no inference on variable bindings. `typeof(expr)`
   in type position.
 - **Traits:** trait declarations with default methods; impls on primitives,
-  structs, classes, and enums; same-file coherence checks.
+  structs, classes, and enums; coherence checks (a trait may be implemented
+  at most once per type) enforced uniformly within a file and across
+  modules, keyed on the import-resolved impl head so generic traits
+  (`From<i8>` vs `From<i16>`), generic targets, and `where`-bounds are all
+  distinguished.
 - **Classes:** single-inheritance with virtual dispatch, destructors,
   `protected`/`private` visibility, `override` and `virtual` modifiers.
 - **Enums:** algebraic enums with explicit discriminants and discriminant
@@ -208,6 +212,5 @@ authoritative list.
 - Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
 - Cross-compilation.
-- Cross-module trait-impl coherence checks (same-file only in 1.0).
 
 [1.0.0]: https://github.com/jakelequire/CryoLang/releases/tag/v1.0.0
