@@ -18,6 +18,7 @@ import Compiler::Diag::Diagnostic;
 import Compiler::Artifacts;
 import Compiler::Passes::PassID;
 import Compiler::Passes::PassRegistry;
+import Compiler::Passes::Specialization;
 import Compiler::ModuleGraph;
 import Compiler::ModuleLoader;
 import Compiler::ProjectConfig;
@@ -1462,8 +1463,39 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
+        // Phase 6a-iii: Route every specialization to its DETERMINISTIC owner
+        // module (the template's defining module) and register+inject it there.
+        // Mono (6a-ii) only *creates* specs; injection is deferred to here so a
+        // spec's object-file home is a function of its template, not of which
+        // module first demanded it.  Each owner module is loaded as `ctx` so
+        // AST placement and DeclarationIndex ownership both reference the owner
+        // and stay consistent.  Runs while still in bootstrap mode (before
+        // `end_bootstrap`) so spec registration can fall back to the arena, and
+        // before Phase 6b so the DI is fully populated for sema.
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            if (!SpecializationPasses::route_specializations_to_owners(ctx).success) {
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
+            }
+        }
+
+        // Soundness assertion: every specialization must have been routed to an
+        // owner module.  A leftover means its owner key matched no module, so
+        // its definition would never be emitted -> link failure.  Fail loudly
+        // here rather than producing a silently broken binary.
+        if (ctx.monomorphizer != null) {
+            const orphaned: i64 = ctx.monomorphizer.uninjected_spec_count();
+            if (orphaned > 0) {
+                ctx.diagnostics.emit(Diagnostic::error(
+                    ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("spec routing left %d specialization(s) unowned (no module matched their owner key)",
+                        orphaned)));
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
+            }
+        }
+
         // End bootstrap mode: the DI is now fully populated from Phase 5
-        // and Phase 6a (GenericExpressionResolution registered all specializations).
+        // and Phase 6a (spec routing registered all specializations).
         // TypeResolver will no longer fall back to arena lookups (steps 4/4a).
         if (ctx.type_resolver != null) {
             ctx.type_resolver.end_bootstrap();

@@ -892,10 +892,19 @@ type struct TypeResolutionPasses {
     /// targets across the modules that instantiate them and would otherwise
     /// false-positive.
     static register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*,
-                                  is_source_decl: boolean) -> void {
+                                  is_source_decl: boolean,
+                                  owner_mod: SymbolStr) -> void {
         if (stmt == null) { return; }
         const arena: TypeArena* = ctx.type_arena;
-        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+        // DeclarationIndex module ownership.  Normally the current module, but
+        // injected specializations pass their template's defining module via
+        // `owner_mod` so DI ownership matches where Phase 6a-iii places the AST
+        // (see `register_injected_decl`).  Invalid `owner_mod` => current module.
+        const module_sym: SymbolStr = if (owner_mod.is_valid()) {
+            owner_mod
+        } else {
+            ctx.intern(ctx.source_file)
+        };
 
         match (stmt.kind) {
             NodeKind::StructDeclaration => {
@@ -2442,8 +2451,9 @@ type struct TypeResolutionPasses {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
 
-            // Register in DeclarationIndex (shared logic with Specialization)
-            TypeResolutionPasses::register_decl_in_index(stmt, ctx, true);
+            // Register in DeclarationIndex (shared logic with Specialization).
+            // Source decls are owned by the current module (empty owner_mod).
+            TypeResolutionPasses::register_decl_in_index(stmt, ctx, true, SymbolStr::empty());
 
             // Phase 4-specific: also register types in ModuleTypeRegistry
             // for cross-module visibility, and handle global variables.

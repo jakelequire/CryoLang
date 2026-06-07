@@ -81,9 +81,13 @@ type struct SpecializationEntry {
     specialized_name:  SymbolStr;
     ast_node:          ASTNode*;
     impl_nodes:        ASTNode*[];
-    origin_module:     SymbolStr;      // Module that first triggered this specialization
-    template_module:   SymbolStr;      // Module where the template is defined
+    origin_module:     SymbolStr;      // Module that created this spec (creating-module fallback owner)
+    template_module:   SymbolStr;      // Module where the template is defined (deterministic owner key)
     instantiated_type: TypeRef;        // The InstantiatedType that was resolved
+    injected:          boolean;        // True once placed into its owner module's AST root (Phase 6a-iii)
+    owner_source:      SymbolStr;      // Resolved owner module's source-file path; drives BOTH DI
+                                       // ownership (register_spec) and AST placement (routing) so they
+                                       // always agree.  Set once in register_spec.
 }
 
 
@@ -1125,17 +1129,14 @@ type struct Monomorphizer {
         this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
 
         // Cache the result.
-        // origin_module is the first module that REQUESTED this instantiation
-        // (via instantiate_for_module), so GenericExpressionResolution injects
-        // each spec into the module that needs it.  Falls back to the
-        // template's module if no demand was recorded (single-file mode).
-        mut origin: SymbolStr = this.current_module;
-        const demand_modules: SymbolStr[] = this.generic_registry.get_modules_using(key);
-        if (demand_modules.length > 0) {
-            origin = demand_modules[0];
-        } else if (entry.module_name.is_valid()) {
-            origin = entry.module_name;
-        }
+        // origin_module is the module that CREATED this spec (the current
+        // module during its Monomorphization pass).  It is only a *fallback*
+        // owner: Phase 6a-iii routes each spec to its DETERMINISTIC owner =
+        // template_module (the template's defining module), independent of
+        // demand order, so a module's object file is a function of its own
+        // source + the templates it defines.  origin_module is used only when
+        // a spec has no template module (synthetic specs in single-file mode).
+        const origin: SymbolStr = this.current_module;
         const spec_entry: SpecializationEntry = SpecializationEntry {
             specialized_type:  concrete_type,
             specialized_name:  spec_name_sym,
@@ -1144,6 +1145,8 @@ type struct Monomorphizer {
             origin_module:     origin,
             template_module:   entry.module_name,
             instantiated_type: request.generic_type,
+            injected:          false,
+            owner_source:      SymbolStr::empty(),
         };
         const idx: i64 = this.spec_entries.length;
         this.spec_keys.push(key);
@@ -6420,6 +6423,18 @@ type struct Monomorphizer {
             this.consumer_spec_indices.push(spec_index);
             this.consumer_modules.push(module.id);
         }
+    }
+
+    /// Count specializations not yet routed into an owner module by
+    /// Phase 6a-iii.  A non-zero count after routing means some spec's owner
+    /// key matched no module in the build — its symbol would never be emitted,
+    /// causing a link failure.  Used as a soundness assertion.
+    uninjected_spec_count(&this) -> i64 {
+        mut n: i64 = 0;
+        for (mut i: i64 = 0; i < this.spec_entries.length; i++) {
+            if (!this.spec_entries[i].injected) { n = n + 1; }
+        }
+        return n;
     }
 
     /// Get all modules that consume a specific specialization.
