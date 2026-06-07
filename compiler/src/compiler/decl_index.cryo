@@ -171,6 +171,15 @@ type struct DeclarationIndex {
     // is_function_in_module and the per-module registration de-dup.
     module_func_first:   HashMap<u32, u32>;
     module_func_pairs:   HashMap<u64, boolean>;
+    // Mangled LLVM name SymbolStr.id -> positions in the `overload_func_*`
+    // arrays (registration order).  Reverse of `overload_func_mangled`, so
+    // `resolve_function_by_mangled` finds an overload by its mangled symbol
+    // without scanning every registered overload in the program (~3% frontend
+    // self-time).  A multimap, not a single slot: a trait-impl method is
+    // registered under both its qualified and bare combined names, which emit
+    // the identical LLVM symbol but only one of which yields a valid extern at
+    // resolve time — the consumer must try each, like the original linear scan.
+    mangled_to_overload_pos: HashMap<u32, u32[]>;
 
 
     static new() -> DeclarationIndex {
@@ -197,6 +206,7 @@ type struct DeclarationIndex {
             bare_alts_index:    HashMap<u32, u32[]>::new(),
             module_func_first:  HashMap<u32, u32>::new(),
             module_func_pairs:  HashMap<u64, boolean>::new(),
+            mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
         };
     }
 
@@ -254,7 +264,16 @@ type struct DeclarationIndex {
                 while (k < (*positions).length) {
                     const pos: u32 = (*positions)[k];
                     if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
+                        const prev: u32 = this.overload_func_mangled[pos as i64];
                         this.overload_func_mangled[pos as i64] = mangled.id;
+                        // Record the reverse mapping only when this position
+                        // newly takes this mangled id, so repeated registration
+                        // of the same (pos, mangled) pair never duplicates the
+                        // bucket entry.
+                        if (prev != mangled.id) {
+                            const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
+                            (*slot).push(pos);
+                        }
                         return;
                     }
                     k = k + 1;

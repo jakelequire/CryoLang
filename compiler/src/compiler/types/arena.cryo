@@ -99,6 +99,17 @@ type struct TypeArena {
     // type references that can't be resolved through the scope chain.
     leaf_index: HashMap<u32, u32>;   // bare SymbolStr.id -> qualified SymbolStr.id
 
+    // -- Index: generic_base.id -> positions of its InstantiatedTypes --
+    // `propagate_instantiated_resolution` and `find_resolved_instantiation`
+    // previously linear-scanned ALL arena types (the #1 frontend self-time,
+    // ~5.6%, quadratic in program size).  This bucket lets them visit only
+    // same-base instantiations.  Append-only and position-stable: alloc_type
+    // only ever pushes, so a recorded position never moves.  Resolved-vs-
+    // unresolved filtering stays in the consumers (has_resolved_type), so the
+    // bucket needs no removal.  Populated in `create_instantiation`, the sole
+    // site that allocates an InstantiatedType.
+    inst_by_base: HashMap<u64, u32[]>;
+
 
     /// Create a new TypeArena and initialize all 20 primitive singletons.
     static new(intern_table: InternTable*) -> TypeArena {
@@ -143,6 +154,7 @@ type struct TypeArena {
             generic_param_cache: HashMap<u64, TypeRef>::new(),
             bounded_param_cache: HashMap<u64, TypeRef>::new(),
             leaf_index:          HashMap<u32, u32>::new(),
+            inst_by_base:        HashMap<u64, u32[]>::new(),
         };
 
         arena.init_primitives();
@@ -489,6 +501,9 @@ type struct TypeArena {
             args_owned.push(args[i]);
         }
         const ref: TypeRef = this.alloc_type(new InstantiatedType(this.next_id, base, args_owned));
+        const pos: u32 = (this.types.length - 1) as u32;
+        const bucket: u32[]* = this.inst_by_base.get_or_insert(base.id, []);
+        (*bucket).push(pos);
         this.instantiated_cache.insert(key, ref);
         return ref;
     }
@@ -511,25 +526,31 @@ type struct TypeArena {
                                        type_args: &TypeRef[],
                                        resolved: TypeRef) -> i64 {
         mut count: i64 = 0;
-        for (mut i: i64 = 0; i < this.types.length; i++) {
-            const t: Type* = this.types[i];
-            if (t == null) { continue; }
-            if (t.kind != TypeKind::InstantiatedType) { continue; }
-            const inst: InstantiatedType* = t as InstantiatedType*;
-            if (inst.has_resolved_type()) { continue; }
-            if (inst.generic_base.id != base.id) { continue; }
-            if (inst.type_args.length != type_args.length) { continue; }
-            mut matches: boolean = true;
-            for (mut j: i64 = 0; j < type_args.length; j++) {
-                if (inst.type_args[j].id != type_args[j].id) {
-                    matches = false;
-                    break;
+        match (this.inst_by_base.get_ref(&base.id)) {
+            Option::Some(plist) => {
+                for (mut k: i64 = 0; k < (*plist).length; k++) {
+                    const pos: u32 = (*plist)[k];
+                    const t: Type* = this.types[pos as i64];
+                    if (t == null) { continue; }
+                    if (t.kind != TypeKind::InstantiatedType) { continue; }
+                    const inst: InstantiatedType* = t as InstantiatedType*;
+                    if (inst.has_resolved_type()) { continue; }
+                    if (inst.generic_base.id != base.id) { continue; }
+                    if (inst.type_args.length != type_args.length) { continue; }
+                    mut matches: boolean = true;
+                    for (mut j: i64 = 0; j < type_args.length; j++) {
+                        if (inst.type_args[j].id != type_args[j].id) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if (matches) {
+                        inst.set_resolved_type(resolved);
+                        count += 1;
+                    }
                 }
             }
-            if (matches) {
-                inst.set_resolved_type(resolved);
-                count += 1;
-            }
+            Option::None => { }
         }
         return count;
     }
@@ -561,24 +582,30 @@ type struct TypeArena {
     /// method's `Range<T>` return holds its `i32` directly, while the spec was
     /// keyed off the same.  Returns the concrete `resolved_type`, or invalid.
     find_resolved_instantiation(&this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
-        for (mut i: i64 = 0; i < this.types.length; i++) {
-            const t: Type* = this.types[i];
-            if (t == null) { continue; }
-            if (t.kind != TypeKind::InstantiatedType) { continue; }
-            const inst: InstantiatedType* = t as InstantiatedType*;
-            if (!inst.has_resolved_type()) { continue; }
-            if (inst.generic_base.id != base.id) { continue; }
-            if (inst.type_args.length != args.length) { continue; }
-            mut matches: boolean = true;
-            for (mut j: i64 = 0; j < args.length; j++) {
-                if (this.canon_type_id(inst.type_args[j]) != this.canon_type_id(args[j])) {
-                    matches = false;
-                    break;
+        match (this.inst_by_base.get_ref(&base.id)) {
+            Option::Some(plist) => {
+                for (mut k: i64 = 0; k < (*plist).length; k++) {
+                    const pos: u32 = (*plist)[k];
+                    const t: Type* = this.types[pos as i64];
+                    if (t == null) { continue; }
+                    if (t.kind != TypeKind::InstantiatedType) { continue; }
+                    const inst: InstantiatedType* = t as InstantiatedType*;
+                    if (!inst.has_resolved_type()) { continue; }
+                    if (inst.generic_base.id != base.id) { continue; }
+                    if (inst.type_args.length != args.length) { continue; }
+                    mut matches: boolean = true;
+                    for (mut j: i64 = 0; j < args.length; j++) {
+                        if (this.canon_type_id(inst.type_args[j]) != this.canon_type_id(args[j])) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if (matches) {
+                        return inst.resolved_type;
+                    }
                 }
             }
-            if (matches) {
-                return inst.resolved_type;
-            }
+            Option::None => { }
         }
         return TypeRef::invalid();
     }
