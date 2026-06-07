@@ -884,7 +884,15 @@ type struct TypeResolutionPasses {
     ///
     /// Shared by TypeResolution (Phase 4) and Specialization (injected decl
     /// registration) so that both use the same registration logic.
-    static register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*) -> void {
+    ///
+    /// `is_source_decl` distinguishes the two callers: true for genuine
+    /// source-level declarations swept by the TypeResolution pass, false
+    /// for monomorphizer-injected spec clones.  Only source decls feed the
+    /// cross-module trait-impl coherence check; spec clones share canonical
+    /// targets across the modules that instantiate them and would otherwise
+    /// false-positive.
+    static register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*,
+                                  is_source_decl: boolean) -> void {
         if (stmt == null) { return; }
         const arena: TypeArena* = ctx.type_arena;
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
@@ -1122,6 +1130,47 @@ type struct TypeResolutionPasses {
                             ctx.generic_registry.register_trait_impl(
                                 trait_root, canonical_target, node);
                         }
+                    }
+                }
+                // Trait-impl coherence (same file AND across modules).  A
+                // trait may be implemented at most once per type.  TypeRes
+                // has stamped `canonical_target` (import-resolved,
+                // defining-module qualified), so the canonical impl-head
+                // signature built here is exact: same-leaf types in
+                // different modules stay distinct, an impl on an imported
+                // type collides with the type's home-module impl, and the
+                // trait's type args (`From<i8>` vs `From<i16>`), the
+                // target's type args, and the where-bounds all participate
+                // so only genuine duplicates collide.  This is the SOLE
+                // coherence check — `register_impl_block`'s earlier
+                // same-file-only check was removed in favor of it, so there
+                // is no double report.  Source decls only: monomorphizer-
+                // injected spec clones share canonical heads across the
+                // modules that instantiate them and would false-positive.
+                if (is_source_decl && node.is_trait_impl()
+                        && canonical_target.is_valid()
+                        && ctx.generic_registry != null) {
+                    const coh_key: string =
+                        TypeResolutionPasses::coherence_key_for(
+                            node, canonical_target, ctx);
+                    const coh_sym: SymbolStr =
+                        ctx.intern_table.intern(coh_key);
+                    const prior: ImplBlockNode* =
+                        ctx.generic_registry.register_coherence(
+                            coh_sym, node);
+                    if (prior != null) {
+                        const c_leaf: SymbolStr =
+                            TypeResolutionPasses::extract_trait_leaf(
+                                node.trait_annotation);
+                        const tname: string =
+                            ctx.intern_table.resolve(c_leaf);
+                        const gname: string =
+                            ctx.intern_table.resolve(canonical_target);
+                        ctx.emit_error_at(
+                            ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                            format("conflicting implementations of trait `%s` for type `%s`: a trait may be implemented at most once per type, including across modules",
+                                   tname, gname),
+                            node.span);
                     }
                 }
                 // Register methods under EVERY form a call site might use:
@@ -1457,6 +1506,180 @@ type struct TypeResolutionPasses {
             }
             _ => { SymbolStr::empty() }
         };
+    }
+
+    /// Positional index of `name` among `node`'s impl-head generic params,
+    /// or -1 when it is not one of them.  Used to normalize a generic param
+    /// to a position (`#0`) in the coherence key so that two otherwise
+    /// identical impls that merely spell the param differently
+    /// (`Box<T>` vs `Box<U>`) fold to the same key.
+    static impl_param_index(node: ImplBlockNode*, name: SymbolStr) -> i64 {
+        if (node == null || !name.is_valid()) { return -1; }
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            if (gp != null && gp.name.is_valid() && gp.name.equals(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /// Canonical key fragment for a type-position NAME.  Resolution order:
+    ///   1. an impl-head generic param -> positional `#n` marker;
+    ///   2. a name that resolves to a concrete arena type -> that type's
+    ///      canonical id (`#T<id>`).  This folds spellings that denote the
+    ///      SAME type to one key: the primitive aliases `int`/`i32`,
+    ///      `uint`/`u32`, `float`/`double`/`f64`, and non-generic type
+    ///      aliases (the arena unwraps them).  Without this, two impls of a
+    ///      trait for `int` and for `i32` — the same dispatch type — would
+    ///      key differently and the duplicate would slip through;
+    ///   3. otherwise the import-resolved name, for things that don't
+    ///      resolve to a concrete arena type in this context (notably a
+    ///      user type referenced by bare name from a module that doesn't
+    ///      register it under that bare name — a residual false-negative,
+    ///      never a false positive).
+    static type_name_key(name: SymbolStr, node: ImplBlockNode*,
+                         ctx: CompilationContext*) -> string {
+        const pidx: i64 = TypeResolutionPasses::impl_param_index(node, name);
+        if (pidx >= 0) { return format("#%lld", pidx); }
+        // Normalize to the import-resolved (qualified) form FIRST.
+        // `resolve_qualified` is a global, module-independent map, so an
+        // imported type folds to the same string from any module — whereas
+        // a raw bare name resolves only in modules that registered it bare.
+        // Resolving the qualified form first, then the raw name, means both
+        // the type-id path and the name-fallback path are module-independent,
+        // so the SAME arg/target type keys identically no matter which module
+        // wrote the impl (closes the cross-module trait-arg false negative).
+        const qual: SymbolStr = ctx.decl_index.resolve_qualified(name);
+        mut tref: TypeRef = ctx.decl_index.lookup_type(qual);
+        if (!tref.is_valid()) {
+            tref = ctx.decl_index.lookup_type(name);
+        }
+        if (tref.is_valid()) {
+            return format("#T%llu", ctx.type_arena.canon_type_id(tref));
+        }
+        return ctx.intern_table.resolve(qual);
+    }
+
+    /// Render a type annotation to a stable, canonical string for coherence
+    /// keying.  Type-position names fold to their resolved type identity
+    /// (see `type_name_key`); the impl's own generic params normalize to
+    /// positional `#n` markers; everything else renders structurally.
+    /// Purely a string identity — never type-checks — so it is safe to call
+    /// this early in TypeResolution.
+    static ann_canon_key(ann: TypeAnnotation*, node: ImplBlockNode*,
+                         ctx: CompilationContext*) -> string {
+        if (ann == null) { return "_"; }
+        return match (*ann) {
+            TypeAnnotation::Primitive(p) => {
+                TypeResolutionPasses::type_name_key(p.name, node, ctx)
+            }
+            TypeAnnotation::Named(n) => {
+                TypeResolutionPasses::type_name_key(n.name, node, ctx)
+            }
+            TypeAnnotation::Generic(g) => {
+                mut s: string =
+                    TypeResolutionPasses::ann_canon_key(g.base, node, ctx);
+                s = s + "<";
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (i > 0) { s = s + ","; }
+                    s = s + TypeResolutionPasses::ann_canon_key(
+                        g.args[i], node, ctx);
+                }
+                s = s + ">";
+                s
+            }
+            TypeAnnotation::Reference(r) => {
+                const pre: string = if (r.is_mutable) { "&mut " } else { "&" };
+                pre + TypeResolutionPasses::ann_canon_key(r.inner, node, ctx)
+            }
+            TypeAnnotation::Pointer(p) => {
+                "*" + TypeResolutionPasses::ann_canon_key(p.inner, node, ctx)
+            }
+            TypeAnnotation::Optional(o) => {
+                "?" + TypeResolutionPasses::ann_canon_key(o.inner, node, ctx)
+            }
+            TypeAnnotation::Array(a) => {
+                "[" + TypeResolutionPasses::ann_canon_key(a.element, node, ctx)
+                    + "]"
+            }
+            TypeAnnotation::Tuple(t) => {
+                mut s: string = "[";
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    if (i > 0) { s = s + ","; }
+                    s = s + TypeResolutionPasses::ann_canon_key(
+                        t.elements[i], node, ctx);
+                }
+                s = s + "]";
+                s
+            }
+            TypeAnnotation::ThisType(_) => { "This" }
+            _ => { "_" }
+        };
+    }
+
+    /// Build the canonical impl-head signature for a trait impl: the
+    /// import-resolved trait reference (with type args), the import-resolved
+    /// target type (`canonical_target`, with its type args), and the
+    /// where-bounds — with the impl's own generic params normalized.  Two
+    /// trait impls conflict for coherence iff this string is identical.
+    /// Bounds are folded in so two impls that differ only by their bounds
+    /// (and may be non-overlapping) are NOT treated as duplicates.
+    static coherence_key_for(node: ImplBlockNode*,
+                             canonical_target: SymbolStr,
+                             ctx: CompilationContext*) -> string {
+        mut key: string = TypeResolutionPasses::ann_canon_key(
+            node.trait_annotation, node, ctx);
+        key = key + " for ";
+        // Target base by resolved type identity (folds primitive aliases
+        // and type aliases).  `canonical_target` is already import-resolved,
+        // so it looks up to the same arena type in the type's home module
+        // (bare name) and in a foreign impl's module (qualified name).
+        key = key + TypeResolutionPasses::type_name_key(
+            canonical_target, node, ctx);
+        if (node.target_args.length > 0) {
+            key = key + "<";
+            for (mut i: i64 = 0; i < node.target_args.length; i++) {
+                if (i > 0) { key = key + ","; }
+                key = key + TypeResolutionPasses::ann_canon_key(
+                    node.target_args[i], node, ctx);
+            }
+            key = key + ">";
+        }
+        if (node.where_bounds.length > 0) {
+            key = key + " where ";
+            for (mut i: i64 = 0; i < node.where_bounds.length; i++) {
+                const wb: TraitBound* = &node.where_bounds[i];
+                const pidx: i64 = TypeResolutionPasses::impl_param_index(
+                    node, wb.type_parameter);
+                if (pidx >= 0) {
+                    key = key + format("#%lld:", pidx);
+                } else {
+                    key = key + ctx.intern_table.resolve(wb.type_parameter)
+                        + ":";
+                }
+                for (mut j: i64 = 0; j < wb.trait_refs.length; j++) {
+                    if (j > 0) { key = key + "+"; }
+                    const tr: TraitRef* = &wb.trait_refs[j];
+                    if (tr.path.length > 0) {
+                        const leaf: SymbolStr = tr.path[tr.path.length - 1];
+                        key = key + ctx.intern_table.resolve(
+                            ctx.decl_index.resolve_qualified(leaf));
+                    }
+                    if (tr.type_args.length > 0) {
+                        key = key + "<";
+                        for (mut k: i64 = 0; k < tr.type_args.length; k++) {
+                            if (k > 0) { key = key + ","; }
+                            key = key + TypeResolutionPasses::ann_canon_key(
+                                tr.type_args[k], node, ctx);
+                        }
+                        key = key + ">";
+                    }
+                }
+                key = key + ";";
+            }
+        }
+        return key;
     }
 
     /// Peel a trait annotation down to its underlying GenericAnnotation
@@ -2220,7 +2443,7 @@ type struct TypeResolutionPasses {
             if (stmt == null) { continue; }
 
             // Register in DeclarationIndex (shared logic with Specialization)
-            TypeResolutionPasses::register_decl_in_index(stmt, ctx);
+            TypeResolutionPasses::register_decl_in_index(stmt, ctx, true);
 
             // Phase 4-specific: also register types in ModuleTypeRegistry
             // for cross-module visibility, and handle global variables.

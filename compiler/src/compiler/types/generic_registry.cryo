@@ -211,6 +211,22 @@ type struct GenericRegistry {
     trait_impls:      Pair<u64, ImplBlockNode*>[];  // .first = key, .second = impl block
     trait_impl_index:   HashMap<u64, i64>;
 
+    // -- Trait-impl coherence index --
+    // Separate from `trait_impls` because that table is keyed on bare,
+    // parser-captured names and is written under several keys per node
+    // (bare/canonical/legacy) and also by monomorphizer-injected spec
+    // clones, so its last-wins overwrites can't distinguish a genuine
+    // duplicate from a re-registration.  This index is keyed on the
+    // interned CANONICAL impl-head signature (import-resolved trait + args,
+    // target + args, where-bounds; impl generic params normalized) and is
+    // written exactly once per source-level trait impl (see
+    // `register_coherence`), so a second distinct node under the same key
+    // is a true conflict — same file or across modules.  `.second` holds
+    // the first node seen; it is nulled after the conflict is reported to
+    // suppress duplicate diagnostics from a re-run of the pass.
+    coherence_records:  Pair<u64, ImplBlockNode*>[];
+    coherence_index:    HashMap<u64, i64>;
+
     // -- Trait-decl registry (Phase B.6) --
     // Maps a bare trait name (SymbolStr.id) to its TraitDeclNode*. Used by
     // default-method synthesis: when an impl block names a trait, we look
@@ -264,6 +280,8 @@ type struct GenericRegistry {
             demand:            [],
             trait_impls:       [],
             trait_impl_index:  HashMap<u64, i64>::new(),
+            coherence_records: [],
+            coherence_index:   HashMap<u64, i64>::new(),
             trait_decl_index:  HashMap<u32, i64>::new(),
             trait_decl_nodes:  [],
             inherent_owner_index: HashMap<u32, i64>::new(),
@@ -433,6 +451,44 @@ type struct GenericRegistry {
         const idx: i64 = this.trait_impls.length;
         this.trait_impls.push(Pair::new(key, block));
         this.trait_impl_index.insert(key, idx);
+    }
+
+    /// Trait-impl coherence: record the first source-level trait impl seen
+    /// for a canonical impl-head key and report a collision when a second,
+    /// distinct impl arrives.  Returns the PRIOR impl node on the first
+    /// conflict for a key (caller emits E0308), otherwise null (first
+    /// registration, same node re-seen, or an already-reported key).
+    ///
+    /// `key` is the interned canonical impl-head signature built by
+    /// `TypeResolutionPasses::coherence_key_for`: the import-resolved trait
+    /// reference (with type args), the import-resolved target type (with
+    /// type args), and the where-bounds, with the impl's own generic params
+    /// normalized to positional markers.  Two impls collide iff their full
+    /// heads are structurally identical, so (a) same-leaf types in different
+    /// modules stay distinct, (b) an impl on an imported type collides with
+    /// the type's home-module impl, (c) `From<i8>` and `From<i16>` for one
+    /// type stay distinct, and (d) bound-differentiated impls stay distinct.
+    /// After the first conflict the stored node is nulled, so a re-run of
+    /// the registering pass — or a third impl of the same key — does not
+    /// double-report.
+    register_coherence(mut &this, key_sym: SymbolStr,
+                       node: ImplBlockNode*) -> ImplBlockNode* {
+        if (node == null || !key_sym.is_valid()) { return null; }
+        const key: u64 = key_sym.id as u64;
+        const existing: Option<i64> = this.coherence_index.get(&key);
+        if (existing.is_none()) {
+            const idx: i64 = this.coherence_records.length;
+            this.coherence_records.push(Pair::new(key, node));
+            this.coherence_index.insert(key, idx);
+            return null;
+        }
+        const idx: i64 = existing.unwrap();
+        const prior: ImplBlockNode* = this.coherence_records[idx].second;
+        if (prior == null || prior == node) { return null; }
+        // First genuine conflict for this key: hand the prior node back to
+        // the caller and clear the slot so later passes/impls stay quiet.
+        this.coherence_records[idx].second = null;
+        return prior;
     }
 
     /// Look up the impl block for a `(trait, target)` pair. Returns null
