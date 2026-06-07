@@ -123,7 +123,9 @@ Build and run:
 cryo run
 ```
 
-`cryo build` compiles to `build/bin/hello`. `cryo run` builds and executes.
+`cryo build` compiles to `build/hello` (the final binary sits at the build
+root; intermediates live under `build/.cryo/<profile>/`). `cryo run` builds
+and executes.
 
 ---
 
@@ -416,7 +418,7 @@ make stdlib            # rebuild the standard library
 make selfhost-check    # 3-round / 6-stage byte-identity gate
 make test              # run the repo-level test suite
 make lsp               # build the Cryo-language LSP (bin/cryolsp)
-make pin-cryo          # refresh bin/cryo from compiler/build/bin/cryo
+make pin-cryo          # refresh bin/cryo from compiler/build/cryo
 make clean             # remove compiler + stdlib build outputs
 ```
 

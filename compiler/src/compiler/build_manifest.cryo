@@ -1,0 +1,341 @@
+/// Build Manifest + Incremental Fingerprint
+///
+/// Emits a self-describing `build-manifest.json` at the build root and a
+/// machine-readable fingerprint sidecar under
+/// `<output_dir>/.cryo/<profile>/incremental/inputs.fp`.
+///
+/// The fingerprint is a 64-bit FNV-1a digest over EVERY build input:
+///   - the compiler binary's own bytes (so a changed compiler rebuilds),
+///   - the resolved knobs (opt level, debug info, emit-llvm, no-std,
+///     target triple, profile, and the `[link]` lists),
+///   - the stdlib archive's bytes (when linked), and
+///   - the full content of every discovered source module.
+///
+/// Whole-build granularity is deliberate: Cryo monomorphizes across ALL
+/// modules before per-module codegen (Phase 6a), so a single module's `.o`
+/// is NOT a pure function of its own source — a sound per-module cache would
+/// need a cross-module instantiation graph. The whole-build short-circuit is
+/// the sound, high-value form of "skip-unchanged": if nothing changed and
+/// the artifacts still exist, the entire compile+link is skipped. The
+/// per-module `source_hash` entries in the manifest are groundwork for a
+/// future per-module engine.
+
+namespace Compiler::BuildManifest;
+
+import Compiler::ProjectConfig;
+import Utils::File;
+import Utils::Logger;
+
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME:  u64 = 1099511628211;
+
+/// A source module feeding the build, as the fingerprint + manifest see it.
+type struct ModuleEntry {
+    namespace_name: string;   // e.g. "std::core::primitives"
+    source_path:    string;   // path on disk
+}
+
+
+// FNV-1a folding helpers
+
+/// Fold a single byte into a running FNV-1a state.
+function fnv_byte(state: u64, b: u8) -> u64 {
+    return (state ^ (b as u64)) * FNV_PRIME;
+}
+
+/// Fold a NUL-terminated string's bytes into the state, plus a separator so
+/// adjacent concatenations can't collide ("ab"+"c" vs "a"+"bc").
+function fnv_str(state: u64, s: string) -> u64 {
+    mut h: u64 = state;
+    const len: u64 = intrinsics::strlen(s);
+    const b: i8* = s as i8*;
+    for (mut i: u64 = 0; i < len; i++) {
+        h = fnv_byte(h, b[i] as u8);
+    }
+    return fnv_byte(h, 0);
+}
+
+/// Fold a u64 (8 bytes, low byte first) into the state.
+function fnv_u64(state: u64, v: u64) -> u64 {
+    mut h: u64 = state;
+    mut x: u64 = v;
+    for (mut i: u64 = 0; i < 8; i++) {
+        h = fnv_byte(h, (x & 255) as u8);
+        x = x >> 8;
+    }
+    return h;
+}
+
+/// Fold a file's full byte content (NULs included) into the state. A
+/// missing or unreadable file folds a distinct marker so it still perturbs
+/// the fingerprint. The byte count is mixed in last as a length guard.
+function fnv_file(state: u64, path: string) -> u64 {
+    mut h: u64 = state;
+    if (!File::exists(path)) {
+        return fnv_str(h, "<missing>");
+    }
+    mut f: File = File::new(path);
+    f.load();
+    if (!f.is_loaded()) {
+        return fnv_str(h, "<unreadable>");
+    }
+    const n: u64 = f.size();
+    const d: i8* = f.data();
+    for (mut i: u64 = 0; i < n; i++) {
+        h = fnv_byte(h, d[i] as u8);
+    }
+    f.close();
+    return fnv_u64(h, n);
+}
+
+
+// Compiler self-fingerprint
+
+/// Path to the running compiler binary via `/proc/self/exe`, or "" on
+/// failure. Mirrors the readlink pattern used elsewhere in the compiler.
+function self_exe_path() -> string {
+    mut buf: i8* = intrinsics::malloc(4096) as i8*;
+    const len: i64 = intrinsics::readlink("/proc/self/exe", buf, 4096);
+    mut out: string = "";
+    if (len > 0 && len < 4096) {
+        buf[len as u64] = 0;
+        out = format("%s", buf as string);
+    }
+    intrinsics::free(buf as void*);
+    return out;
+}
+
+/// FNV-1a digest of the running compiler's own bytes. Changes whenever the
+/// compiler changes, invalidating every cached build it produced.
+function compiler_fingerprint() -> u64 {
+    const exe: string = self_exe_path();
+    mut h: u64 = FNV_OFFSET;
+    if (intrinsics::strlen(exe) == 0) {
+        return fnv_str(h, "<unknown-compiler>");
+    }
+    return fnv_file(h, exe);
+}
+
+
+// Whole-build fingerprint
+
+/// Combined fingerprint over every build input. `opt_level` / `debug_info`
+/// are the RESOLVED values (after profile + CLI overrides), so a `--dev`
+/// vs `--release` switch produces distinct fingerprints. `stdlib_archive`
+/// is "" for `--no-std` builds.
+function compute_fingerprint(cfg: ProjectConfig*, modules: &ModuleEntry[],
+                             opt_level: u32, debug_info: boolean,
+                             stdlib_archive: string) -> u64 {
+    mut h: u64 = FNV_OFFSET;
+    h = fnv_u64(h, compiler_fingerprint());
+    // Resolved knobs.
+    h = fnv_u64(h, opt_level as u64);
+    const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
+    const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
+    const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
+    h = fnv_byte(h, dbg_b);
+    h = fnv_byte(h, ell_b);
+    h = fnv_byte(h, nstd_b);
+    h = fnv_str(h, cfg.target_triple);
+    h = fnv_str(h, cfg.profile);
+    // [link] lists affect the final binary but not the .o files.
+    for (mut i: i64 = 0; i < cfg.link_system.length; i++) { h = fnv_str(h, cfg.link_system[i]); }
+    for (mut i: i64 = 0; i < cfg.link_search.length; i++) { h = fnv_str(h, cfg.link_search[i]); }
+    for (mut i: i64 = 0; i < cfg.link_static.length; i++) { h = fnv_str(h, cfg.link_static[i]); }
+    // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
+    if (intrinsics::strlen(stdlib_archive) > 0) {
+        h = fnv_file(h, stdlib_archive);
+    }
+    // Every source module, in topo order: namespace + full content.
+    for (mut i: i64 = 0; i < modules.length; i++) {
+        h = fnv_str(h, modules[i].namespace_name);
+        h = fnv_file(h, modules[i].source_path);
+    }
+    return h;
+}
+
+
+// Hex / string helpers
+
+/// Lowercase 16-char hex of a u64.
+function u64_to_hex(v: u64) -> string {
+    const digits: string = "0123456789abcdef";
+    const buf: i8* = intrinsics::malloc(17) as i8*;
+    mut x: u64 = v;
+    for (mut i: i64 = 15; i >= 0; i--) {
+        const nib: u64 = x & 15;
+        buf[i] = digits[nib as i64];
+        x = x >> 4;
+    }
+    buf[16] = 0;
+    return buf as string;
+}
+
+/// Read a file's content with trailing whitespace/newlines stripped, or ""
+/// when the file is absent or unreadable.
+function read_file_trimmed(path: string) -> string {
+    if (!File::exists(path)) { return ""; }
+    mut f: File = File::new(path);
+    f.load();
+    if (!f.is_loaded()) { return ""; }
+    const raw: string = f.content();
+    mut len: i64 = intrinsics::strlen(raw) as i64;
+    while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
+                       || raw[len - 1] == 32 || raw[len - 1] == 9)) {
+        len -= 1;
+    }
+    if (len <= 0) { return ""; }
+    const out: i8* = intrinsics::malloc(len as u64 + 1) as i8*;
+    intrinsics::memcpy(out as void*, raw as void*, len as u64);
+    out[len] = 0;
+    return out as string;
+}
+
+/// Escape a string for embedding in a JSON double-quoted value. Escapes the
+/// two characters that would otherwise break the literal; control chars are
+/// not expected in paths/names this manifest carries.
+function json_escape(s: string) -> string {
+    const len: u64 = intrinsics::strlen(s);
+    const buf: i8* = intrinsics::malloc(len * 2 + 1) as i8*;
+    const sb: i8* = s as i8*;
+    mut o: u64 = 0;
+    for (mut i: u64 = 0; i < len; i++) {
+        const ch: i8 = sb[i];
+        if (ch == '"' || ch == '\\') {
+            buf[o] = '\\'; o += 1;
+        }
+        buf[o] = ch; o += 1;
+    }
+    buf[o] = 0;
+    return buf as string;
+}
+
+/// Mangle a namespace to its object-file stem (`::` -> `_`), matching
+/// `CodegenPasses::legacy_obj_path`.
+function mangle_module(ns: string) -> string {
+    const len: u64 = intrinsics::strlen(ns);
+    const buf: i8* = intrinsics::malloc(len + 1) as i8*;
+    intrinsics::memcpy(buf as void*, ns as void*, len);
+    buf[len] = 0;
+    for (mut i: u64 = 0; i < len; i++) {
+        if (buf[i] == ':') { buf[i] = '_'; }
+    }
+    return buf as string;
+}
+
+
+// Up-to-date check + writing
+
+/// True when the saved fingerprint matches `fp_hex` AND every artifact still
+/// exists on disk. A missing sidecar or any missing artifact forces a build.
+function is_up_to_date(cfg: ProjectConfig*, fp_hex: string,
+                       artifacts: &string[]) -> boolean {
+    const saved: string = read_file_trimmed(cfg.fingerprint_path());
+    if (intrinsics::strlen(saved) == 0) { return false; }
+    if (intrinsics::strcmp(saved, fp_hex) != 0) { return false; }
+    for (mut i: i64 = 0; i < artifacts.length; i++) {
+        if (!File::exists(artifacts[i])) { return false; }
+    }
+    return true;
+}
+
+/// Write the fingerprint sidecar (`incremental/inputs.fp`), creating the
+/// incremental dir first.
+function write_fingerprint(cfg: ProjectConfig*, fp_hex: string) -> void {
+    ProjectConfig::mkdir_p(cfg.incremental_dir());
+    const path: string = cfg.fingerprint_path();
+    const f: void* = intrinsics::fopen(path, "w");
+    if (f == null) {
+        intrinsics::fprintf(g_stderr,
+            "warning: cannot write build fingerprint to %s\n", path);
+        return;
+    }
+    intrinsics::fprintf(f, "%s\n", fp_hex);
+    intrinsics::fclose(f);
+}
+
+/// Write the human/tooling-facing `build-manifest.json` at the build root.
+function write_manifest(cfg: ProjectConfig*, modules: &ModuleEntry[],
+                        opt_level: u32, debug_info: boolean,
+                        fp_hex: string, artifacts: &string[],
+                        stdlib_archive: string) -> void {
+    ProjectConfig::mkdir_p(cfg.output_dir);
+    const path: string = cfg.manifest_path();
+    const f: void* = intrinsics::fopen(path, "w");
+    if (f == null) {
+        intrinsics::fprintf(g_stderr,
+            "warning: cannot write build manifest to %s\n", path);
+        return;
+    }
+
+    const compiler_fp: string = u64_to_hex(compiler_fingerprint());
+    const dbg: string = if (debug_info) { "true" } else { "false" };
+    const ell: string = if (cfg.emit_llvm) { "true" } else { "false" };
+    const nstd: string = if (cfg.no_std) { "true" } else { "false" };
+    const deps_dir: string = cfg.deps_dir();
+
+    intrinsics::fputs("{\n", f);
+    intrinsics::fputs("  \"schema_version\": 1,\n", f);
+    intrinsics::fputs("  \"generated_by\": \"cryo\",\n", f);
+    intrinsics::fprintf(f, "  \"compiler_fingerprint\": \"%s\",\n", compiler_fp);
+    intrinsics::fprintf(f, "  \"project\": \"%s\",\n", json_escape(cfg.project_name));
+    intrinsics::fprintf(f, "  \"profile\": \"%s\",\n", json_escape(cfg.profile));
+    intrinsics::fprintf(f, "  \"target_type\": \"%s\",\n", cfg.target_type.label());
+    intrinsics::fprintf(f, "  \"target_triple\": \"%s\",\n", json_escape(cfg.target_triple));
+    intrinsics::fprintf(f, "  \"opt_level\": %u,\n", opt_level);
+    intrinsics::fprintf(f, "  \"debug_info\": %s,\n", dbg);
+    intrinsics::fprintf(f, "  \"emit_llvm\": %s,\n", ell);
+    intrinsics::fprintf(f, "  \"no_std\": %s,\n", nstd);
+    intrinsics::fprintf(f, "  \"stdlib_archive\": \"%s\",\n", json_escape(stdlib_archive));
+    intrinsics::fprintf(f, "  \"inputs_fingerprint\": \"%s\",\n", fp_hex);
+
+    // artifacts (paths relative to the build root would be nicer, but the
+    // absolute/cwd-relative form here matches what `cryo run` execs).
+    intrinsics::fputs("  \"artifacts\": [", f);
+    for (mut i: i64 = 0; i < artifacts.length; i++) {
+        if (i > 0) { intrinsics::fputs(",", f); }
+        intrinsics::fprintf(f, "\n    \"%s\"", json_escape(artifacts[i]));
+    }
+    if (artifacts.length > 0) { intrinsics::fputs("\n  ", f); }
+    intrinsics::fputs("],\n", f);
+
+    // [link] section snapshot.
+    intrinsics::fputs("  \"link\": {\n", f);
+    write_str_array(f, "system", &cfg.link_system, "    ");
+    intrinsics::fputs(",\n", f);
+    write_str_array(f, "search", &cfg.link_search, "    ");
+    intrinsics::fputs(",\n", f);
+    write_str_array(f, "static", &cfg.link_static, "    ");
+    intrinsics::fputs("\n  },\n", f);
+
+    // modules: namespace + source + object path.
+    intrinsics::fputs("  \"modules\": [", f);
+    for (mut i: i64 = 0; i < modules.length; i++) {
+        if (i > 0) { intrinsics::fputs(",", f); }
+        const obj: string = format("%s/%s.o", deps_dir,
+            mangle_module(modules[i].namespace_name));
+        intrinsics::fputs("\n    {\n", f);
+        intrinsics::fprintf(f, "      \"namespace\": \"%s\",\n",
+            json_escape(modules[i].namespace_name));
+        intrinsics::fprintf(f, "      \"source\": \"%s\",\n",
+            json_escape(modules[i].source_path));
+        intrinsics::fprintf(f, "      \"object\": \"%s\"\n", json_escape(obj));
+        intrinsics::fputs("    }", f);
+    }
+    if (modules.length > 0) { intrinsics::fputs("\n  ", f); }
+    intrinsics::fputs("]\n", f);
+
+    intrinsics::fputs("}\n", f);
+    intrinsics::fclose(f);
+}
+
+/// Emit `"<key>": [ "a", "b" ]` (no trailing newline) at the given indent.
+function write_str_array(f: void*, key: string, items: &string[],
+                         indent: string) -> void {
+    intrinsics::fprintf(f, "%s\"%s\": [", indent, key);
+    for (mut i: i64 = 0; i < items.length; i++) {
+        if (i > 0) { intrinsics::fputs(", ", f); }
+        intrinsics::fprintf(f, "\"%s\"", json_escape(items[i]));
+    }
+    intrinsics::fputs("]", f);
+}

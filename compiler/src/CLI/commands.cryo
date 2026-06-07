@@ -382,6 +382,28 @@ type struct Executor {
         runner.add_command(Command::new(update.name(), update.description(), update.usage()));
     }
 
+    /// Apply the build-profile and incremental flags shared by
+    /// `build` / `run` / `test` onto `config`:
+    ///   --release           select the `release` profile (O2, no debug info)
+    ///   --dev               select the `debug` profile (O0 + DWARF)
+    ///   --profile=NAME      select an arbitrary named profile
+    ///   --no-incremental    force a full build (no up-to-date short-circuit,
+    ///                       no manifest/fingerprint write)
+    /// `--release` wins over `--dev` wins over `--profile=` when several are
+    /// passed. Leaving all unset keeps the cryoconfig `[profile] default`.
+    static apply_profile_flags(config: CompilerConfig*, args: &ParsedArgs) -> void {
+        if (args.has_flag("release")) {
+            config.profile_override = "release";
+        } else if (args.has_flag("dev")) {
+            config.profile_override = "debug";
+        } else if (args.has_arg("profile")) {
+            config.profile_override = args.get_value("profile");
+        }
+        if (args.has_flag("no-incremental")) {
+            config.incremental = false;
+        }
+    }
+
     /// Resolves a command name string to a CommandKind.
     static resolve(name: string) -> CommandKind {
         return match (name) {
@@ -490,6 +512,9 @@ type struct Executor {
         printf("  optimize  = \"O2\"                    O0 | O1 | O2 | O3\n");
         printf("  emit_llvm = false                   also write LLVM IR (.ll)\n");
         printf("  no_std    = false                   build without the standard library\n\n");
+        printf("[profile]\n");
+        printf("  default = \"release\"                 release (O2) | debug (O0 + DWARF)\n");
+        printf("                                      override per-build with --release/--dev\n\n");
         printf("[link]                                 native libraries to link\n");
         printf("  system = [\"ssl\", \"crypto\"]          system libs   -> -l<name>\n");
         printf("  search = [\"/opt/lib\"]               extra -L dirs for `system` libs\n");
@@ -497,6 +522,9 @@ type struct Executor {
         printf("[lib] / [[bin]]                         multi-target outputs\n");
         printf("[dependencies]                          path/git deps (see `help fetch`)\n");
         printf("[test]                                  format = \"...\", color = \"...\"\n\n");
+        printf("Build layout: the final executable / library lands at the build root\n");
+        printf("(`build/<name>`); intermediates live under `build/.cryo/<profile>/`, and a\n");
+        printf("`build/build-manifest.json` records the build's metadata + fingerprint.\n\n");
         printf("Run `cryo init` to scaffold a starter cryoconfig.\n");
     }
 
@@ -512,8 +540,13 @@ type struct Executor {
         printf("                      see `cryo help stdlib`)\n");
         printf("  --target=TRIPLE     Cross-compile for an LLVM target triple\n");
         printf("                      (e.g. x86_64-pc-windows-gnu); object files only\n");
-        printf("  --opt-level=N       Optimization level 0..3 (overrides cryoconfig)\n");
+        printf("  --opt-level=N       Optimization level 0..3 (overrides profile/cryoconfig)\n");
         printf("  -g, --debug-info    Emit DWARF debug info\n");
+        printf("  --release           Build with the `release` profile (O2, no debug info)\n");
+        printf("  --dev               Build with the `debug` profile (O0 + DWARF)\n");
+        printf("  --profile=NAME      Build with a named profile (cache: build/.cryo/NAME/)\n");
+        printf("  --no-incremental    Force a full build (skip the up-to-date short-circuit\n");
+        printf("                      and the manifest/fingerprint write)\n");
         printf("  -o, --output PATH   Redirect output (single-file builds; kind inferred\n");
         printf("                      from the extension: .o .s .ll or an executable)\n\n");
         printf("Test-only flags: --ignored, --list, --exact, -q/--quiet.\n");
@@ -832,6 +865,7 @@ type struct Executor {
         if (args.has_flag("g") || args.has_flag("debug-info")) {
             config.emit_debug_info = true;
         }
+        Executor::apply_profile_flags(&config, &args);
 
         mut compiler: CompilerInstance = CompilerInstance::new(config);
         cdebug("[Build] Compiling project from config: %s\n", config_path);
@@ -890,6 +924,7 @@ type struct Executor {
         if (args.has_arg("target")) {
             config.target_triple_override = args.get_value("target");
         }
+        Executor::apply_profile_flags(&config, &args);
 
         mut compiler: CompilerInstance = CompilerInstance::new(config);
         const result: CompilationResult = compiler.compile_project(config_path);
@@ -959,6 +994,7 @@ type struct Executor {
         if (args.has_arg("target")) {
             config.target_triple_override = args.get_value("target");
         }
+        Executor::apply_profile_flags(&config, &args);
         config.test_mode = true;
 
         mut compiler: CompilerInstance = CompilerInstance::new(config);

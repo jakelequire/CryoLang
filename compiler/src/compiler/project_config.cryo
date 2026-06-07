@@ -168,6 +168,19 @@ type struct ProjectConfig {
     // LLVM optimization level 0..3, from `[compiler] optimize` in C-style
     // (`O0`/`O1`/`O2`/`O3`). Defaults to 2. See `parse_opt_level`.
     opt_level:    u32;
+    /// True when `[compiler] optimize` was explicitly set in cryoconfig.
+    /// Lets profile resolution (`debug` => O0, `release` => O2) supply the
+    /// optimization level only when the project did not pin one itself: an
+    /// explicit `optimize = O3` still wins over the profile default, while an
+    /// unset key lets `--dev`/`debug` profile drop to O0 instead of the
+    /// always-O2 historical default.
+    opt_level_explicit: boolean;
+    /// Selected build profile name. Drives the per-profile cache subtree
+    /// (`<output_dir>/.cryo/<profile>/`) and the default optimization /
+    /// debug-info level. `"release"` (O2, no debug info) by default;
+    /// `"debug"` is O0 + DWARF. Set by `[profile] default = "..."` and
+    /// overridden by the CLI `--release` / `--dev` / `--profile=NAME` flags.
+    profile:      string;
     no_std:       boolean;
     emit_llvm:    boolean;
     project_root: string;      // directory containing cryoconfig
@@ -245,6 +258,8 @@ type struct ProjectConfig {
             // --opt-level=N`). Leaving it unset preserves the historical
             // always-O2 behavior.
             opt_level:    2,
+            opt_level_explicit: false,
+            profile:      "release",
             no_std:       false,
             emit_llvm:    false,
             project_root: ".",
@@ -290,6 +305,8 @@ type struct ProjectConfig {
             source_dir:    this.source_dir,
             debug:         this.debug,
             opt_level:     this.opt_level,
+            opt_level_explicit: this.opt_level_explicit,
+            profile:       this.profile,
             no_std:        this.no_std,
             emit_llvm:     this.emit_llvm,
             project_root:  this.project_root,
@@ -450,7 +467,10 @@ type struct ProjectConfig {
                 "compiler" => {
                     match (key) {
                         "debug"     => { config.debug     = parse_bool(val); }
-                        "optimize"  => { config.opt_level = parse_opt_level(val); }
+                        "optimize"  => {
+                            config.opt_level = parse_opt_level(val);
+                            config.opt_level_explicit = true;
+                        }
                         "no_std"    => { config.no_std    = parse_bool(val); }
                         "emit_llvm" => { config.emit_llvm = parse_bool(val); }
                         // Removed in the v1.0 schema:
@@ -506,6 +526,17 @@ type struct ProjectConfig {
                     config.error_count = config.error_count
                         + parse_inline_table_into_dep(raw_val, &config.dependencies[idx]);
                 }
+                "profile" => {
+                    // `[profile] default = "debug"|"release"` selects the
+                    // default build profile when the CLI doesn't pass one.
+                    // Per-profile knob tables (`[profile.debug]` etc.) are not
+                    // parsed yet; the built-in mapping (release => O2/no-debug,
+                    // debug => O0/+debug) is applied in the compiler instance.
+                    match (key) {
+                        "default" => { config.profile = val; }
+                        _ => { report_unknown_key("profile", key); }
+                    }
+                }
                 "test" => {
                     // Test-runner defaults. The values aren't validated
                     // here; the runner-side parser (`apply_format` /
@@ -530,6 +561,104 @@ type struct ProjectConfig {
             return this.entry_point;
         }
         return format("%s/%s", this.project_root, this.entry_point);
+    }
+
+    // Build-directory layout
+    //
+    // Final artifacts live at the ROOT of `output_dir`:
+    //   <output_dir>/<name>          executable        (cryo run / [[bin]])
+    //   <output_dir>/<name>-test     test binary       (cryo test)
+    //   <output_dir>/lib<name>.a     library archive   ([lib] target)
+    //   <output_dir>/<name>.ll       combined IR dump  (when emit_llvm)
+    //   <output_dir>/build-manifest.json
+    // Everything internal lives under a hidden, per-profile cache subtree:
+    //   <output_dir>/.cryo/<profile>/deps/*.o
+    //   <output_dir>/.cryo/<profile>/ir/*.ll
+    //   <output_dir>/.cryo/<profile>/incremental/inputs.fp
+
+    /// Hidden per-profile cache root: `<output_dir>/.cryo/<profile>`.
+    cache_dir(&this) -> string {
+        return format("%s/.cryo/%s", this.output_dir, this.profile);
+    }
+
+    /// Per-module object output dir: `<cache_dir>/deps`.
+    deps_dir(&this) -> string {
+        return format("%s/deps", this.cache_dir());
+    }
+
+    /// Per-module LLVM IR (`.ll`) output dir: `<cache_dir>/ir`.
+    ir_dir(&this) -> string {
+        return format("%s/ir", this.cache_dir());
+    }
+
+    /// Incremental-build state dir: `<cache_dir>/incremental`.
+    incremental_dir(&this) -> string {
+        return format("%s/incremental", this.cache_dir());
+    }
+
+    /// Final executable path at the build root.  `test_suffix` appends
+    /// `-test` so a `cryo test` binary coexists with a `cryo run` build.
+    bin_artifact_path(&this, test_suffix: boolean) -> string {
+        if (test_suffix) {
+            return format("%s/%s-test", this.output_dir, this.project_name);
+        }
+        return format("%s/%s", this.output_dir, this.project_name);
+    }
+
+    /// Final library-archive path at the build root: `<output_dir>/lib<name>.a`.
+    lib_archive_path(&this, archive_name: string) -> string {
+        return format("%s/%s", this.output_dir, archive_name);
+    }
+
+    /// JSON build manifest path: `<output_dir>/build-manifest.json`.
+    manifest_path(&this) -> string {
+        return format("%s/build-manifest.json", this.output_dir);
+    }
+
+    /// Incremental fingerprint sidecar, keyed by target name so a
+    /// multi-target project's `[lib]` and each `[[bin]]` track their inputs
+    /// independently: `<cache_dir>/incremental/<project_name>.fp`.
+    fingerprint_path(&this) -> string {
+        return format("%s/%s.fp", this.incremental_dir(), this.project_name);
+    }
+
+    /// Recursively create `path` and any missing parent directories, like
+    /// `mkdir -p`.  The `mkdir` intrinsic only creates the final component,
+    /// so a nested `<build>/.cryo/<profile>/deps` tree (or a custom
+    /// `--build-dir=a/b/c`) needs each level made in turn.  `mkdir` returning
+    /// EEXIST for an existing prefix is harmless and ignored.  Static so the
+    /// codegen / manifest passes can reach it without a free-function symbol
+    /// that could collide with another module's leaf-name.
+    static mkdir_p(path: string) -> void {
+        const len: u64 = intrinsics::strlen(path);
+        if (len == 0) { return; }
+        const buf: i8* = intrinsics::malloc(len + 1) as i8*;
+        intrinsics::memcpy(buf as void*, path as void*, len);
+        buf[len] = 0;
+        for (mut i: u64 = 1; i < len; i++) {
+            if (buf[i] == '/') {
+                buf[i] = 0;
+                mkdir(buf as string, 493);  // 0755
+                buf[i] = '/';
+            }
+        }
+        mkdir(buf as string, 493);  // 0755
+        intrinsics::free(buf as void*);
+    }
+
+    /// Built-in optimization level for a profile name. `debug` => O0 (keeps
+    /// allocas / no inlining for clean source mapping); everything else
+    /// (`release`, unknown) => O2. An explicit `[compiler] optimize` or
+    /// `--opt-level=N` still overrides this in the compiler instance.
+    static profile_base_opt_level(name: string) -> u32 {
+        if (intrinsics::strcmp(name, "debug") == 0) { return 0; }
+        return 2;
+    }
+
+    /// Built-in debug-info default for a profile name. `debug` emits DWARF;
+    /// `release` does not. `-g` / `--debug-info` can still force it on.
+    static profile_base_debug_info(name: string) -> boolean {
+        return intrinsics::strcmp(name, "debug") == 0;
     }
 }
 

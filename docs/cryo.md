@@ -2333,6 +2333,46 @@ emit_llvm = false                   # also write LLVM IR (.ll) beside the object
 no_std    = false                   # build without linking the standard library
 ```
 
+**Build profiles.** A build runs under a named *profile* that supplies a
+default optimization level and debug-info setting and names the per-profile
+cache subtree. Two are built in:
+
+| Profile | Optimization | Debug info |
+| --- | --- | --- |
+| `release` (default) | `O2` | off |
+| `debug` | `O0` | DWARF (`-g`) |
+
+Set the default in cryoconfig, or pick one per build with `--release` / `--dev`
+(`--dev` = the `debug` profile) / `--profile=NAME`:
+
+```ini
+[profile]
+default = "release"                 # release | debug
+```
+
+An explicit `[compiler] optimize` overrides the profile's level; `--opt-level=N`
+overrides everything; `-g` forces debug info on regardless of profile.
+
+**Build directory layout.** The final artifact lands at the **root** of
+`output_dir`; everything else is internal:
+
+```
+build/
+├── <name>                  # final executable           (cryo run / [[bin]])
+├── lib<name>.a             # final library archive       ([lib] target)
+├── <name>.ll               # combined LLVM IR            (when emit_llvm)
+├── build-manifest.json     # build metadata + fingerprint
+└── .cryo/<profile>/        # hidden per-profile cache
+    ├── deps/   *.o          # per-module objects
+    ├── ir/     *.ll         # per-module IR (when emit_llvm)
+    └── incremental/         # rebuild fingerprint
+```
+
+`cryo build` is incremental: if no input changed (sources, the resolved knobs,
+the compiler binary, or the linked stdlib) and the artifact still exists, the
+build is skipped (`<name> is up to date`). Pass `--no-incremental` to force a
+full rebuild and refresh the manifest.
+
 ### 23.3 `[link]`
 
 Native libraries to link, named by *intent* rather than by raw linker flag — so a project never has to juggle two similar lists.
@@ -2423,8 +2463,12 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--build-dir=PATH` | Override `[project] output_dir`. |
 | `--stdlib=PATH` | Standard-library root for this run (highest priority; see §24.3). |
 | `--target=TRIPLE` | Cross-compile for an LLVM target triple; object files only. |
-| `--opt-level=N` | Optimization level `0`..`3`; overrides `[compiler] optimize`. |
+| `--opt-level=N` | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`. |
 | `-g`, `--debug-info` | Emit DWARF debug info. |
+| `--release` | Build with the `release` profile (O2, no debug info). |
+| `--dev` | Build with the `debug` profile (O0 + DWARF). |
+| `--profile=NAME` | Build with a named profile (cache under `build/.cryo/NAME/`). |
+| `--no-incremental` | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable). |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.

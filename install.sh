@@ -13,7 +13,7 @@
 #   /usr/local/share/cryo/stdlib   → <repo>/stdlib
 #
 # The cryolsp symlink is created when a built LSP binary is found in the
-# repo (preferring <repo>/bin/cryolsp, then <repo>/tools/CryoLSP/build/bin/
+# repo (preferring <repo>/bin/cryolsp, then <repo>/tools/CryoLSP/build/
 # cryolsp).  Skip with --no-lsp.  When installed, the VS Code Cryo
 # Analyzer extension auto-detects cryolsp on $PATH from any project.
 #
@@ -125,8 +125,8 @@ SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/libcryo.a"
 SRC_LSP=""
 if [ -x "${REPO_ROOT}/bin/cryolsp" ]; then
     SRC_LSP="${REPO_ROOT}/bin/cryolsp"
-elif [ -x "${REPO_ROOT}/tools/CryoLSP/build/bin/cryolsp" ]; then
-    SRC_LSP="${REPO_ROOT}/tools/CryoLSP/build/bin/cryolsp"
+elif [ -x "${REPO_ROOT}/tools/CryoLSP/build/cryolsp" ]; then
+    SRC_LSP="${REPO_ROOT}/tools/CryoLSP/build/cryolsp"
 fi
 
 [ -f "${REPO_ROOT}/Makefile" ] || die "could not find Makefile at ${REPO_ROOT} - is install.sh next to it?"
@@ -276,7 +276,7 @@ do_install() {
         run ln -sfn "$SRC_LSP" "$DEST_LSP"
         log_ok "linked: ${DEST_LSP} → ${SRC_LSP}"
     elif [ $INSTALL_LSP -eq 1 ]; then
-        log_info "skipping cryolsp symlink - no built binary at <repo>/bin/cryolsp or <repo>/tools/CryoLSP/build/bin/cryolsp."
+        log_info "skipping cryolsp symlink - no built binary at <repo>/bin/cryolsp or <repo>/tools/CryoLSP/build/cryolsp."
         log_info "build it with 'cryo build' in tools/CryoLSP, then re-run install.sh."
     fi
 
