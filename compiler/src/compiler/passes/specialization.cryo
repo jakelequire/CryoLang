@@ -650,31 +650,51 @@ type struct SpecializationPasses {
         // agree: codegen's `owned_by_current_module` matches the module whose
         // root holds the definition.
         //
-        // Only TYPE specs (struct/enum/class) relocate to their template's
-        // defining module (the deterministic, demand-order-independent owner).
-        // Their symbols are the type's arena qualified name — LOCATION-
-        // INDEPENDENT — so the definition and all callers agree regardless of
-        // which object file emits it.
+        // EVERY spec with a known template module relocates to that template's
+        // defining module — the deterministic, demand-order-independent owner —
+        // so a module's object file is a function of its own source plus the
+        // templates it defines.
         //
-        // FUNCTION / static-method / method-generic specs keep their creating
-        // module: codegen derives their definition symbol from the CONTAINING
-        // module's scope (e.g. `<consuming-module>::swap<u32[]>`) while callers
-        // pin the same consuming-scoped name, so the two only agree when the
-        // definition stays where it was created.  Relocating them yields
-        // undefined-symbol link errors (e.g. `CompileMode::Layout_of<...>`).
-        // Making them relocatable needs placement-independent (template-folded)
-        // spec symbol names across codegen + the resolved_callee pin + the
-        // GenericRegistry disambiguation — a mangling-scheme change, tracked
-        // separately.  Until then their ownership stays demand-ordered.
+        //   * TYPE specs (struct/enum/class) are named by the type's arena
+        //     qualified name, which is LOCATION-INDEPENDENT.
+        //   * FUNCTION / static-method-generic specs have no arena type, so the
+        //     template namespace is stamped onto the spec's FunctionDeclNode
+        //     (`source_module`, below) and read back at DI registration
+        //     (register_decl_in_index) and at codegen (declare_function /
+        //     codegen_function_prologue).  That makes their definition symbol
+        //     and every caller's cross-module reference both qualify by the
+        //     TEMPLATE module, so relocating the definition no longer diverges
+        //     the names (which used to yield undefined-symbol link errors such
+        //     as `CompileMode::Layout_of<...>` / `Sema::swap<u32[]>`).
+        //
+        // Specs with no template module (synthetic single-file specs) fall back
+        // to the creating module.
         mut owner_module_sym: SymbolStr = module_sym;
-        if (entry.specialized_type.is_valid()
-                && entry.template_module.is_valid()
+        if (entry.template_module.is_valid()
                 && ctx.module_graph != null) {
             const owner_path: SymbolStr = ctx.module_graph.source_file_for_owner_key(
                 entry.template_module, ctx.intern_table);
             if (owner_path.is_valid()) { owner_module_sym = owner_path; }
         }
         entry.owner_source = owner_module_sym;
+
+        // Stamp the canonical (template-derived) namespace onto FUNCTION specs
+        // so their definition symbol and every caller reference qualify by the
+        // template module rather than by whichever module emits/demands them.
+        // Type specs get this for free via their arena qualified name; free
+        // functions and static-method generics have no arena type, so the
+        // namespace must ride on the node.  Read back by
+        // `register_decl_in_index` (q_name) and `DeclarationEmitter`
+        // (fn_qualified_name).  Must run BEFORE `SpecInjector::register` below.
+        // `entry.template_module` is the template's namespace (or its source
+        // path for root-namespace templates); either way the stamp is the single
+        // source of truth for the spec's qualifier, so def and callers agree.
+        if (entry.ast_node != null
+                && entry.ast_node.kind == NodeKind::FunctionDeclaration
+                && entry.template_module.is_valid()) {
+            const tmpl_ns: string = ctx.intern_table.resolve(entry.template_module);
+            tag_decl_source_module(entry.ast_node, tmpl_ns);
+        }
 
         // Scope-tag the main AST with its template module origin in the
         // CompilationContext's side table (not on the AST node itself, to

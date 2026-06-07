@@ -136,6 +136,29 @@ type struct DeclarationEmitter {
         return c.qualify_symbol_sym(sym);
     }
 
+    /// Qualified name for a function declaration, honoring a canonical
+    /// (template-derived) namespace stamped on injected generic specs.
+    ///
+    /// Free-function / static-method-generic specializations have no arena
+    /// type to carry a location-independent name (unlike type specs, whose
+    /// methods key off the type's arena qualified name).  Phase 6a stamps the
+    /// spec's TEMPLATE namespace onto the cloned FunctionDeclNode's
+    /// `source_module` field; reading it back here makes the emitted definition
+    /// symbol a function of the template module rather than of whichever module
+    /// emits the body, so callers (who derive the same canonical name via the
+    /// DeclarationIndex) link to it regardless of placement.  Non-spec
+    /// functions have an empty `source_module` and fall back to the ambient
+    /// module namespace.  Must stay in lockstep with the DI registration in
+    /// `TypeResolutionPasses::register_decl_in_index` (FunctionDeclaration).
+    fn_qualified_name(&this, node: FunctionDeclNode*) -> SymbolStr {
+        if (node.source_module != "") {
+            const i: InternTable* = this.get_intern();
+            return i.intern(node.source_module + "::" + i.resolve(node.name));
+        }
+        const c: CompilationContext* = this.ctx;
+        return c.qualify_symbol_sym(node.name);
+    }
+
     resolve(&this, sym: SymbolStr) -> string {
         const i: InternTable* = this.get_intern();
         return i.resolve(sym);
@@ -301,7 +324,7 @@ type struct DeclarationEmitter {
         // (name, func_type_ref).
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
-        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        const qualified: SymbolStr = this.fn_qualified_name(node);
         const di: DeclarationIndex* = ctx_ptr.decl_index;
         const arena: TypeArena* = this.get_arena();
 
@@ -1484,7 +1507,10 @@ type struct DeclarationEmitter {
     codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
-        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        // Same canonical-namespace resolution as `declare_function` so the
+        // body attaches to the exact LLVM function the signature pass declared
+        // (template-derived for injected free-fn / static-method-generic specs).
+        const qualified: SymbolStr = this.fn_qualified_name(node);
         const di: DeclarationIndex* = ctx_ptr.decl_index;
         const arena: TypeArena* = this.get_arena();
 
