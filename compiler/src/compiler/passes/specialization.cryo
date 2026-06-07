@@ -200,11 +200,15 @@ function register_inherent_owner(
 /// Register a newly injected specialized declaration into the DeclarationIndex
 /// so that sema can look it up without rescanning the AST.
 /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
-function register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> void {
+function register_injected_decl(stmt: ASTNode*, owner_mod: SymbolStr,
+                                ctx: CompilationContext*) -> void {
     // Injected spec clones, not source decls: pass is_source_decl=false so
     // they are skipped by the cross-module coherence check (their canonical
     // targets recur across every module that instantiates the template).
-    TypeResolutionPasses::register_decl_in_index(stmt, ctx, false);
+    // `owner_mod` sets the spec's DeclarationIndex module ownership to its
+    // template's defining module (where Phase 6a-iii places its AST), so
+    // codegen's define-vs-extern decision agrees with where it is emitted.
+    TypeResolutionPasses::register_decl_in_index(stmt, ctx, false, owner_mod);
 }
 
 /// Tag an AST node's source_module field with the template's module name.
@@ -249,15 +253,16 @@ type struct SpecInjector {
     /// same bare name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32)
     /// from overwriting each other's methods in the DI.
     static register(node: ASTNode*, spec_name: SymbolStr,
-                    spec_type: TypeRef, ctx: CompilationContext*) -> void {
+                    spec_type: TypeRef, owner_mod: SymbolStr,
+                    ctx: CompilationContext*) -> void {
         if (node == null) { return; }
         // For function declarations, use the standard path (no naming conflict)
         if (node.kind == NodeKind::FunctionDeclaration) {
-            register_injected_decl(node, ctx);
+            register_injected_decl(node, owner_mod, ctx);
             return;
         }
         if (!spec_type.is_valid()) {
-            register_injected_decl(node, ctx);
+            register_injected_decl(node, owner_mod, ctx);
             return;
         }
 
@@ -266,11 +271,15 @@ type struct SpecInjector {
         const arena: TypeArena* = ctx.type_arena;
         const arena_qname: SymbolStr = arena.get_qualified_name(spec_type);
         if (!arena_qname.is_valid()) {
-            register_injected_decl(node, ctx);
+            register_injected_decl(node, owner_mod, ctx);
             return;
         }
 
-        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+        // Owner module for DI ownership: the template's defining module for
+        // relocated type specs (so codegen's define-vs-extern decision matches
+        // where the AST is placed), else the demanding module.  Supplied by the
+        // caller; see `register_spec`.
+        const module_sym: SymbolStr = owner_mod;
         const local_sym: SymbolStr = ctx.qualify_symbol_sym(spec_name);
 
         // Register type under BOTH local and arena qualified names.
@@ -318,7 +327,7 @@ type struct SpecInjector {
             // Enum methods come from implement blocks, not inline.
             // Type registration above already covers the enum itself.
         } else {
-            register_injected_decl(node, ctx);
+            register_injected_decl(node, owner_mod, ctx);
         }
     }
 }
@@ -586,161 +595,230 @@ type struct SpecializationPasses {
 
 
     // Pass 3: Generic Expression Resolution
-
-    /// Injects specialized ASTs into the ProgramNode and marks generic templates
-    /// for codegen to skip.
+    //
+    // This pass REGISTERS each new specialization into the DeclarationIndex
+    // (under the demanding module, exactly as before) so that monomorphization
+    // discovery for later modules in the same Phase 6a-ii loop can resolve
+    // calls against already-created specs.  It deliberately does NOT place the
+    // spec's AST into a ProgramNode root — physical placement is deferred to
+    // Phase 6a-iii (`route_specializations_to_owners`), which injects each spec
+    // into its DETERMINISTIC owner module (the template's defining module),
+    // independent of demand order.  Splitting registration (here, per demander)
+    // from placement (there, per owner) keeps discovery byte-identical while
+    // making a spec's object-file home a function of its template.
     static run_generic_expression_resolution(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
-        LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] Injecting specialized ASTs");
-
         mut mono: Monomorphizer* = ctx.monomorphizer;
         if (mono == null) {
-            // No monomorphizer means no generics were used; that's OK
+            // No monomorphizer means no generics were used; that's OK.
             return PassResult::ok();
         }
 
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
         mono.set_current_module(module_sym);
 
-        const inject_start: i64 = mono.injection_cursor;
-        const inject_end: i64 = mono.spec_entries.length;
-
-        if (inject_start >= inject_end) {
-            LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] No specialized ASTs to inject");
-            mono.injection_cursor = inject_end;
+        const reg_start: i64 = mono.injection_cursor;
+        const reg_end: i64 = mono.spec_entries.length;
+        if (reg_start >= reg_end) {
+            mono.injection_cursor = reg_end;
             return PassResult::ok();
         }
 
-        const root: ProgramNode* = ctx.artifacts.ast.root;
-        if (root == null) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                           "GenericExpressionResolution: no AST root");
-            return PassResult::failure(1);
+        for (mut i: i64 = reg_start; i < reg_end; i++) {
+            const entry: SpecializationEntry* = &mono.spec_entries[i];
+            SpecializationPasses::register_spec(ctx, mono, entry, i);
+        }
+        mono.injection_cursor = reg_end;
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Register a single specialization into the DeclarationIndex, scope-tag its
+    /// AST nodes, and re-register its impl methods.  Runs under the DEMANDING
+    /// module's `ctx` (same as the pre-refactor inline loop) so discovery and
+    /// DI state are byte-identical to baseline.  Does NOT place the AST into any
+    /// root — that is Phase 6a-iii's job.  `entry_index` is the spec's slot in
+    /// `mono.spec_entries`.
+    static register_spec(ctx: CompilationContext*, mono: Monomorphizer*,
+                         entry: SpecializationEntry*, entry_index: i64) -> void {
+        const arena: TypeArena* = ctx.type_arena;
+        const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+
+        // Resolve this spec's OWNER module.  Both DI ownership (here) and AST
+        // placement (Phase 6a-iii) key off `owner_source`, so they always
+        // agree: codegen's `owned_by_current_module` matches the module whose
+        // root holds the definition.
+        //
+        // Only TYPE specs (struct/enum/class) relocate to their template's
+        // defining module (the deterministic, demand-order-independent owner).
+        // Their symbols are the type's arena qualified name — LOCATION-
+        // INDEPENDENT — so the definition and all callers agree regardless of
+        // which object file emits it.
+        //
+        // FUNCTION / static-method / method-generic specs keep their creating
+        // module: codegen derives their definition symbol from the CONTAINING
+        // module's scope (e.g. `<consuming-module>::swap<u32[]>`) while callers
+        // pin the same consuming-scoped name, so the two only agree when the
+        // definition stays where it was created.  Relocating them yields
+        // undefined-symbol link errors (e.g. `CompileMode::Layout_of<...>`).
+        // Making them relocatable needs placement-independent (template-folded)
+        // spec symbol names across codegen + the resolved_callee pin + the
+        // GenericRegistry disambiguation — a mangling-scheme change, tracked
+        // separately.  Until then their ownership stays demand-ordered.
+        mut owner_module_sym: SymbolStr = module_sym;
+        if (entry.specialized_type.is_valid()
+                && entry.template_module.is_valid()
+                && ctx.module_graph != null) {
+            const owner_path: SymbolStr = ctx.module_graph.source_file_for_owner_key(
+                entry.template_module, ctx.intern_table);
+            if (owner_path.is_valid()) { owner_module_sym = owner_path; }
+        }
+        entry.owner_source = owner_module_sym;
+
+        // Scope-tag the main AST with its template module origin in the
+        // CompilationContext's side table (not on the AST node itself, to
+        // avoid vtable field-write miscompiles).  Physical placement into the
+        // owner module's root happens later in Phase 6a-iii.
+        if (entry.ast_node != null) {
+            if (entry.template_module.is_valid()) {
+                ctx.register_injected_origin(
+                    entry.ast_node as u64, entry.template_module);
+            }
+        }
+        // Scope-tag impl blocks
+        for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+            if (entry.template_module.is_valid()) {
+                ctx.register_injected_origin(
+                    entry.impl_nodes[j] as u64, entry.template_module);
+            }
         }
 
-        const arena: TypeArena* = ctx.type_arena;
-        mut inject_count: i64 = 0;
+        // Register in DeclarationIndex using the arena type's ACTUAL
+        // qualified name for method keys.  This prevents two specs with
+        // the same bare name (e.g. BattleTest::Pair_i32 and
+        // Collections::Pair::Pair_i32) from overwriting each other.
+        if (entry.ast_node != null) {
+            SpecInjector::register(entry.ast_node, entry.specialized_name,
+                                   entry.specialized_type, owner_module_sym, ctx);
+        }
+        // Register the InstantiatedType's TypeRef in type_reverse so
+        // that codegen can look up the concrete type's qualified name
+        // directly from the expression's resolved_type (which may be
+        // the InstantiatedType, not the concrete struct).
+        if (entry.instantiated_type.is_valid() && entry.specialized_type.is_valid()) {
+            const conc_qname: SymbolStr = arena.get_qualified_name(entry.specialized_type);
+            if (conc_qname.is_valid()) {
+                ctx.decl_index.register_type_reverse_only(conc_qname, entry.instantiated_type);
 
-        for (mut i: i64 = inject_start; i < inject_end; i++) {
-            const entry: SpecializationEntry* = &mono.spec_entries[i];
-
-            // Tag injected ASTs with the template's module name so that
-            // sema can switch to the correct scope when type-checking
-            // method bodies (which may reference types imported by the
-            // template's module, not the consuming module).
-            // Uses template_module from the SpecializationEntry (set from
-            // the TemplateEntry's module_name), which works for ALL template
-            // kinds including function templates that have no arena type.
-            mut template_module_str: string = "";
-            if (entry.template_module.is_valid()) {
-                template_module_str = ctx.intern_table.resolve(entry.template_module);
-            }
-
-            // Inject main AST and register its template module origin
-            // in the CompilationContext's side table (not on the AST node
-            // itself, to avoid vtable field-write miscompiles).
-            if (entry.ast_node != null) {
-                if (entry.template_module.is_valid()) {
-                    ctx.register_injected_origin(
-                        entry.ast_node as u64, entry.template_module);
-                }
-                root.add_statement(entry.ast_node);
-            }
-            // Inject impl blocks
-            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                if (entry.template_module.is_valid()) {
-                    ctx.register_injected_origin(
-                        entry.impl_nodes[j] as u64, entry.template_module);
-                }
-                root.add_statement(entry.impl_nodes[j]);
-            }
-
-            // Register in DeclarationIndex using the arena type's ACTUAL
-            // qualified name for method keys.  This prevents two specs with
-            // the same bare name (e.g. BattleTest::Pair_i32 and
-            // Collections::Pair::Pair_i32) from overwriting each other.
-            if (entry.ast_node != null) {
-                SpecInjector::register(entry.ast_node, entry.specialized_name,
-                                       entry.specialized_type, ctx);
-            }
-            // Register the InstantiatedType's TypeRef in type_reverse so
-            // that codegen can look up the concrete type's qualified name
-            // directly from the expression's resolved_type (which may be
-            // the InstantiatedType, not the concrete struct).
-            if (entry.instantiated_type.is_valid() && entry.specialized_type.is_valid()) {
-                const conc_qname: SymbolStr = arena.get_qualified_name(entry.specialized_type);
-                if (conc_qname.is_valid()) {
-                    ctx.decl_index.register_type_reverse_only(conc_qname, entry.instantiated_type);
-
-                    // For Array specializations, register a mapping from
-                    // element TypeRef -> concrete Array_<T> struct name.
-                    // Sema sets expression types to ArrayType (T[]), not
-                    // InstantiatedType, so codegen needs this to find methods.
-                    // The element type is always type_args[0]; subsequent args
-                    // (e.g. the allocator in stdlib-next's `Array<T, A = GlobalAlloc>`)
-                    // are part of the Array spec but not part of the element key.
-                    const inst_t: Type* = arena.lookup(entry.instantiated_type.id);
-                    if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
-                        const inst: InstantiatedType* = inst_t as InstantiatedType*;
-                        if (inst.type_args.length >= 1) {
-                            const base_qn: SymbolStr = arena.get_qualified_name(inst.generic_base);
-                            if (base_qn.is_valid()) {
-                                const base_str: string = ctx.intern_table.resolve(base_qn);
-                                if (strcmp(base_str, "std::collections::array::Array") == 0) {
-                                    ctx.decl_index.register_array_element_type(
-                                        inst.type_args[0], conc_qname);
-                                }
+                // For Array specializations, register a mapping from
+                // element TypeRef -> concrete Array_<T> struct name.
+                // Sema sets expression types to ArrayType (T[]), not
+                // InstantiatedType, so codegen needs this to find methods.
+                // The element type is always type_args[0]; subsequent args
+                // (e.g. the allocator in stdlib-next's `Array<T, A = GlobalAlloc>`)
+                // are part of the Array spec but not part of the element key.
+                const inst_t: Type* = arena.lookup(entry.instantiated_type.id);
+                if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
+                    const inst: InstantiatedType* = inst_t as InstantiatedType*;
+                    if (inst.type_args.length >= 1) {
+                        const base_qn: SymbolStr = arena.get_qualified_name(inst.generic_base);
+                        if (base_qn.is_valid()) {
+                            const base_str: string = ctx.intern_table.resolve(base_qn);
+                            if (strcmp(base_str, "std::collections::array::Array") == 0) {
+                                ctx.decl_index.register_array_element_type(
+                                    inst.type_args[0], conc_qname);
                             }
                         }
                     }
                 }
             }
-            // Register impl block methods under the SAME qualified name as
-            // the type itself (from the arena), not ctx.qualify_symbol_sym
-            // which would use the consuming module's namespace.
-            const impl_qname: SymbolStr = if (entry.specialized_type.is_valid()) {
-                arena.get_qualified_name(entry.specialized_type)
-            } else {
-                SymbolStr::empty()
-            };
-            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                // Bounds-violating impls were dropped pre-clone by
-                // `Monomorphizer::filter_bounds_violating_impls`; any
-                // impl reaching here is fully applicable to this spec.
-                if (impl_qname.is_valid() && impl_node != null) {
-                    impl_node.set_target_type(impl_qname);
-                    const impl_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
-                    ctx.decl_index.register_methods_with_module(
-                        impl_qname, impl_node.methods, impl_mod_sym, ctx.intern_table, ctx.type_arena);
-                    // Re-register trait-impl entries against the *specialized*
-                    // target so `traits_implemented_by(spec_name)` finds them.
-                    // The original impl was `implement trait Hash for struct
-                    // String`, registered under bare `String` at template-
-                    // registration time; without this re-register, sema's
-                    // method-via-trait lookup for `String<GlobalAlloc>::hash`
-                    // bottoms out and emits E0091.
-                    if (impl_node.is_trait_impl()) {
-                        const trait_nm: SymbolStr = extract_root_name(impl_node.trait_annotation);
-                        if (trait_nm.is_valid()) {
-                            ctx.generic_registry.register_trait_impl(
-                                trait_nm, impl_qname, impl_node);
-                        }
+        }
+        // Register impl block methods under the SAME qualified name as
+        // the type itself (from the arena), not ctx.qualify_symbol_sym
+        // which would use the consuming module's namespace.
+        const impl_qname: SymbolStr = if (entry.specialized_type.is_valid()) {
+            arena.get_qualified_name(entry.specialized_type)
+        } else {
+            SymbolStr::empty()
+        };
+        for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+            const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+            // Bounds-violating impls were dropped pre-clone by
+            // `Monomorphizer::filter_bounds_violating_impls`; any
+            // impl reaching here is fully applicable to this spec.
+            if (impl_qname.is_valid() && impl_node != null) {
+                impl_node.set_target_type(impl_qname);
+                ctx.decl_index.register_methods_with_module(
+                    impl_qname, impl_node.methods, owner_module_sym, ctx.intern_table, ctx.type_arena);
+                // Re-register trait-impl entries against the *specialized*
+                // target so `traits_implemented_by(spec_name)` finds them.
+                // The original impl was `implement trait Hash for struct
+                // String`, registered under bare `String` at template-
+                // registration time; without this re-register, sema's
+                // method-via-trait lookup for `String<GlobalAlloc>::hash`
+                // bottoms out and emits E0091.
+                if (impl_node.is_trait_impl()) {
+                    const trait_nm: SymbolStr = extract_root_name(impl_node.trait_annotation);
+                    if (trait_nm.is_valid()) {
+                        ctx.generic_registry.register_trait_impl(
+                            trait_nm, impl_qname, impl_node);
                     }
-                } else {
-                    register_injected_decl(entry.impl_nodes[j], ctx);
                 }
+            } else {
+                register_injected_decl(entry.impl_nodes[j], owner_module_sym, ctx);
             }
-
-            mono.record_consuming_module(i, module_sym);
-            inject_count += 1;
         }
 
-        mono.injection_cursor = inject_end;
+        mono.record_consuming_module(entry_index, module_sym);
+    }
 
-        LOG_DEBUG(LogComponent::General, "[GenericExpressionResolution] Injected %lld specialized declarations",
-            inject_count);
+    /// Phase 6a-iii: place specializations OWNED by the currently-loaded module
+    /// into its AST root.  `ctx` must already be loaded to a candidate owner
+    /// module.  DeclarationIndex registration already happened in `register_spec`
+    /// (Phase 6a-ii); this pass only performs the physical `add_statement`, which
+    /// determines which object file emits the spec's definition.
+    ///
+    /// Placement keys off `entry.owner_source` — the resolved owner module's
+    /// source-file path that `register_spec` ALSO used for DI ownership — so AST
+    /// placement and DI ownership always agree.  The owner is the template's
+    /// defining module (deterministic, demand-order independent) for every spec
+    /// whose template module resolves to a module in the build; specs with no
+    /// template module fall back to their creating module.  This is sound for
+    /// type specs (named by location-independent arena qname) AND function /
+    /// method-generic specs (named by `spec_base_name`, which folds the template
+    /// module).  Each spec is placed exactly once, guarded by `entry.injected`.
+    static route_specializations_to_owners(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        mut mono: Monomorphizer* = ctx.monomorphizer;
+        if (mono == null) { return PassResult::ok(); }
+
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return PassResult::ok(); }
+
+        const my_src: SymbolStr = ctx.intern(ctx.source_file);
+
+        const total: i64 = mono.spec_entries.length;
+        mut place_count: i64 = 0;
+        for (mut i: i64 = 0; i < total; i++) {
+            mut entry: SpecializationEntry* = &mono.spec_entries[i];
+            if (entry.injected) { continue; }
+            if (!entry.owner_source.is_valid()) { continue; }
+            if (!entry.owner_source.equals(my_src)) { continue; }
+            entry.injected = true;
+            if (entry.ast_node != null) {
+                root.add_statement(entry.ast_node);
+            }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                root.add_statement(entry.impl_nodes[j]);
+            }
+            place_count += 1;
+        }
+
+        LOG_DEBUG(LogComponent::General,
+            "[SpecRouting] Placed %lld specializations into owner '%s'",
+            place_count, ctx.source_file);
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
