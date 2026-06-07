@@ -156,6 +156,22 @@ type struct DeclarationIndex {
     // Populated by `register_name_mapping`.
     bare_alts:           Pair<u32, u32>[];    // .first = bare SymbolStr.id, .second = qualified SymbolStr.id
 
+    // --- O(1) indices over the flat arrays above ---------------------------
+    // These map a SymbolStr.id key to the position(s) it occupies in the
+    // parallel arrays, so registration de-dup and per-name lookups no longer
+    // linear-scan every function/overload in the whole program.  Maintained
+    // in lockstep with each array push.
+
+    // Function name SymbolStr.id -> positions in the `overload_func_*` arrays.
+    overload_index:      HashMap<u32, u32[]>;
+    // Bare name SymbolStr.id -> positions in `bare_alts`.
+    bare_alts_index:     HashMap<u32, u32[]>;
+    // Function SymbolStr.id -> first defining module id (get_function_module
+    // is first-wins) plus a packed (func.id, module.id) membership set used by
+    // is_function_in_module and the per-module registration de-dup.
+    module_func_first:   HashMap<u32, u32>;
+    module_func_pairs:   HashMap<u64, boolean>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -177,6 +193,10 @@ type struct DeclarationIndex {
             overload_func_types:   [],
             overload_func_mangled: [],
             bare_alts:      [],
+            overload_index:     HashMap<u32, u32[]>::new(),
+            bare_alts_index:    HashMap<u32, u32[]>::new(),
+            module_func_first:  HashMap<u32, u32>::new(),
+            module_func_pairs:  HashMap<u64, boolean>::new(),
         };
     }
 
@@ -199,16 +219,27 @@ type struct DeclarationIndex {
         // Also append to the overload list so cross-module extern
         // declaration can enumerate every overload's signature.
         // De-dup by exact (name, TypeRef.id) so re-registration doesn't
-        // produce duplicates.
-        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
-            if (this.overload_func_keys[i] == name.id &&
-                this.overload_func_types[i].id == func_type_ref.id) {
-                return;
+        // produce duplicates -- scoped to this name's positions via the
+        // overload_index instead of scanning every overload in the program.
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    const pos: u32 = (*positions)[k];
+                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
+                        return;
+                    }
+                    k = k + 1;
+                }
             }
+            Option::None => { }
         }
+        const new_pos: u32 = this.overload_func_keys.length as u32;
         this.overload_func_keys.push(name.id);
         this.overload_func_types.push(func_type_ref);
         this.overload_func_mangled.push(0);
+        const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
+        (*slot).push(new_pos);
     }
 
     /// Associate an overload-specific mangled LLVM name with a registered
@@ -217,12 +248,19 @@ type struct DeclarationIndex {
     /// single mangled name stored in `mangled_names`.
     register_overload_mangled(mut &this, name: SymbolStr, func_type_ref: TypeRef,
                                mangled: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
-            if (this.overload_func_keys[i] == name.id &&
-                this.overload_func_types[i].id == func_type_ref.id) {
-                this.overload_func_mangled[i] = mangled.id;
-                return;
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    const pos: u32 = (*positions)[k];
+                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
+                        this.overload_func_mangled[pos as i64] = mangled.id;
+                        return;
+                    }
+                    k = k + 1;
+                }
             }
+            Option::None => { }
         }
     }
 
@@ -232,24 +270,36 @@ type struct DeclarationIndex {
     /// was registered; callers should fall back to `lookup_mangled_name`.
     lookup_func_type_overloads(&this, name: SymbolStr) -> TypeRef[] {
         mut result: TypeRef[] = [];
-        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
-            if (this.overload_func_keys[i] == name.id) {
-                result.push(this.overload_func_types[i]);
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    result.push(this.overload_func_types[(*positions)[k] as i64]);
+                    k = k + 1;
+                }
             }
+            Option::None => { }
         }
         return result;
     }
 
     lookup_overload_mangled(&this, name: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.overload_func_keys.length; i++) {
-            if (this.overload_func_keys[i] == name.id &&
-                this.overload_func_types[i].id == func_type_ref.id) {
-                const mid: u32 = this.overload_func_mangled[i];
-                if (mid != 0) {
-                    return SymbolStr::from_id(mid);
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    const pos: u32 = (*positions)[k];
+                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
+                        const mid: u32 = this.overload_func_mangled[pos as i64];
+                        if (mid != 0) {
+                            return SymbolStr::from_id(mid);
+                        }
+                        return SymbolStr::empty();
+                    }
+                    k = k + 1;
                 }
-                return SymbolStr::empty();
             }
+            Option::None => { }
         }
         return SymbolStr::empty();
     }
@@ -499,17 +549,12 @@ type struct DeclarationIndex {
             // Add to per-module list.  Skip if this (combined_sym, module)
             // pair was already added by a prior overload; multiple
             // overloads of the same method share one per-module entry.
-            mut already_listed: boolean = false;
-            for (mut mi: i64 = 0; mi < this.module_funcs.length; mi++) {
-                if (this.module_funcs[mi].first == combined_sym.id &&
-                    this.module_funcs[mi].second == module.id) {
-                    already_listed = true;
-                    break;
-                }
-            }
-            if (!already_listed) {
+            const pair_key: u64 =
+                ((combined_sym.id as u64) << 32) | (module.id as u64);
+            if (!this.module_func_pairs.contains_key(&pair_key)) {
                 this.module_funcs.push(Pair<u32, u32>::new(combined_sym.id, module.id));
             }
+            this.note_module_func(combined_sym.id, module.id);
         }
     }
 
@@ -574,11 +619,23 @@ type struct DeclarationIndex {
 
     // Per-module registration (called alongside global registration)
 
+    /// Maintain the O(1) module-func indices alongside a `module_funcs`
+    /// push: record first-wins module ownership and (func, module)
+    /// membership.  Idempotent, so it is safe to call on every push.
+    note_module_func(mut &this, name_id: u32, module_id: u32) -> void {
+        if (!this.module_func_first.contains_key(&name_id)) {
+            this.module_func_first.insert(name_id, module_id);
+        }
+        const pk: u64 = ((name_id as u64) << 32) | (module_id as u64);
+        this.module_func_pairs.insert(pk, true);
+    }
+
     /// Register a function with its defining module for per-module enumeration.
     register_function_with_module(mut &this, name: SymbolStr, return_type: TypeRef,
                                   module: SymbolStr) -> void {
         this.register_function(name, return_type);
         this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
+        this.note_module_func(name.id, module.id);
     }
 
     /// Register a function type with its defining module for per-module enumeration.
@@ -618,6 +675,7 @@ type struct DeclarationIndex {
         this.register_overload_mangled(name, func_type_ref, mangled.value);
 
         this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
+        this.note_module_func(name.id, module.id);
     }
 
     /// Register a type with its defining module for per-module enumeration.
@@ -652,14 +710,24 @@ type struct DeclarationIndex {
         const h: u64 = hash_int(bare.id as u64);
         this.bare_to_qualified.insert(bare.id, qualified.id);
 
-        // Append to alternatives list, deduped by (bare, qualified) pair.
-        for (mut i: i64 = 0; i < this.bare_alts.length; i++) {
-            if (this.bare_alts[i].first == bare.id &&
-                this.bare_alts[i].second == qualified.id) {
-                return;
+        // Append to alternatives list, deduped by (bare, qualified) pair --
+        // scoped to this bare name's positions via bare_alts_index.
+        match (this.bare_alts_index.get_ref(&bare.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    if (this.bare_alts[(*positions)[k] as i64].second == qualified.id) {
+                        return;
+                    }
+                    k = k + 1;
+                }
             }
+            Option::None => { }
         }
+        const new_pos: u32 = this.bare_alts.length as u32;
         this.bare_alts.push(Pair<u32, u32>::new(bare.id, qualified.id));
+        const slot: u32[]* = this.bare_alts_index.get_or_insert(bare.id, []);
+        (*slot).push(new_pos);
     }
 
     /// Resolve a bare name to its qualified form.
@@ -680,10 +748,15 @@ type struct DeclarationIndex {
     /// (ambiguous call) instead of silently misrouting.
     lookup_qualified_alternatives(&this, bare: SymbolStr) -> SymbolStr[] {
         mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.bare_alts.length; i++) {
-            if (this.bare_alts[i].first == bare.id) {
-                result.push(SymbolStr::from_id(this.bare_alts[i].second));
+        match (this.bare_alts_index.get_ref(&bare.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    result.push(SymbolStr::from_id(this.bare_alts[(*positions)[k] as i64].second));
+                    k = k + 1;
+                }
             }
+            Option::None => { }
         }
         return result;
     }
@@ -725,23 +798,16 @@ type struct DeclarationIndex {
 
     /// Check if a function is defined in a specific module.
     is_function_in_module(&this, name: SymbolStr, module: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
-            if (this.module_funcs[i].first == name.id &&
-                this.module_funcs[i].second == module.id) {
-                return true;
-            }
-        }
-        return false;
+        const pk: u64 = ((name.id as u64) << 32) | (module.id as u64);
+        return this.module_func_pairs.contains_key(&pk);
     }
 
     /// Get the defining module for a function. Returns empty SymbolStr if not found.
     get_function_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
-            if (this.module_funcs[i].first == name.id) {
-                return SymbolStr::from_id(this.module_funcs[i].second);
-            }
-        }
-        return SymbolStr::empty();
+        return match (this.module_func_first.get(&name.id)) {
+            Option::Some(val) => { SymbolStr::from_id(val) }
+            Option::None      => { SymbolStr::empty() }
+        };
     }
 
     /// Get the defining module for a type. Returns empty SymbolStr if not found.
