@@ -7,14 +7,14 @@
 #   stdlib           Build the standard library via bin/cryo
 #   cryo             Build the self-hosted compiler via bin/cryo
 #   selfhost-check   3-round chain (6 stages) + stage-3/stage-4 byte-identity
-#   pin-cryo         Refresh bin/cryo from compiler/build/bin/cryo
+#   pin-cryo         Refresh bin/cryo from compiler/build/cryo
 #   install          Symlink bin/cryo + stdlib system-wide (delegates to install.sh)
 #   uninstall        Remove the install.sh symlinks
 #   clean            Remove compiler + stdlib build outputs
 
 ROOT       := $(CURDIR)
 PIN        := $(ROOT)/bin/cryo
-STAGE2     := $(ROOT)/compiler/build/bin/cryo
+STAGE2     := $(ROOT)/compiler/build/cryo
 LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
 
 # C-side helpers for the ABI tests.  Compiled with the host cc to a
@@ -28,7 +28,7 @@ TEST_HELPERS_A   := $(TEST_HELPERS_DIR)/libabihelpers.a
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 
 LSP_BUILD_DIR := $(ROOT)/tools/CryoLSP/build
-LSP_BIN       := $(LSP_BUILD_DIR)/bin/cryolsp
+LSP_BIN       := $(LSP_BUILD_DIR)/cryolsp
 LSP_PIN       := $(ROOT)/bin/cryolsp
 
 EXT_DIR       := $(ROOT)/tools/CryoAnalyzer
@@ -48,7 +48,7 @@ help:
 	@echo "  make selfhost-check    3-round chain (6 stages) + byte-identity gate"
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
-	@echo "  make pin-cryo          Refresh bin/cryo from compiler/build/bin/cryo"
+	@echo "  make pin-cryo          Refresh bin/cryo from compiler/build/cryo"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
 	@echo "  make clean             Remove compiler + stdlib build outputs"
@@ -63,7 +63,7 @@ $(PIN):
 # ---- stdlib via the pinned self-hosted compiler -----------------------
 stdlib: $(PIN)
 	@echo "==> Building stdlib via bin/cryo"
-	@rm -rf stdlib/.bin && mkdir -p stdlib/.bin/obj
+	@rm -rf stdlib/.bin
 	@cd stdlib && "$(PIN)" build
 
 # ---- self-hosted compiler via the pin ---------------------------------

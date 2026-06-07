@@ -60,11 +60,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 ROOT   = Path(__file__).resolve().parent.parent
 BOOT   = ROOT / "bin" / "cryo"                                       # pinned boot
-STAGE2 = ROOT / "compiler" / "build"           / "bin" / "cryo"      # boot → stage-2
-STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "bin" / "cryo"  # stage-2 → stage-3
-STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "bin" / "cryo"  # stage-3 → stage-4
-S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "bin" / "cryo.ll"
-S4_LL  = ROOT / "compiler" / "build" / "self" / "s4" / "bin" / "cryo.ll"
+STAGE2 = ROOT / "compiler" / "build"                 / "cryo"      # boot → stage-2
+STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "cryo"      # stage-2 → stage-3
+STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "cryo"      # stage-3 → stage-4
+S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "cryo.ll"
+S4_LL  = ROOT / "compiler" / "build" / "self" / "s4" / "cryo.ll"
 LOG_DIR = ROOT / "build-logs" / "selfhost-check"
 
 # Top-level dirs we wipe before the chain runs. Recursive — covers the
@@ -114,12 +114,12 @@ def make_stages():
         Stage(
             src="stdlib", via="pinned", to=".bin",
             cwd=ROOT / "stdlib",
-            cmd=[str(BOOT), "build"],
+            cmd=[str(BOOT), "build", "--no-incremental"],
         ),
         Stage(
             src="compiler", via="pinned", to="build",
             cwd=ROOT / "compiler",
-            cmd=[str(BOOT), "build"],
+            cmd=[str(BOOT), "build", "--no-incremental"],
         ),
         # ------------------------------------------------------------------
         # Round 2: stage-2 → stage-3  (nested under self/)
@@ -127,12 +127,12 @@ def make_stages():
         Stage(
             src="stdlib", via="stage-2", to=".bin/self/s2",
             cwd=ROOT / "stdlib",
-            cmd=[str(STAGE2), "build", "--build-dir=.bin/self/s2"],
+            cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=.bin/self/s2"],
         ),
         Stage(
             src="compiler", via="stage-2", to="build/self/s3",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE2), "build", "--build-dir=build/self/s3"],
+            cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=build/self/s3"],
         ),
         # ------------------------------------------------------------------
         # Round 3: stage-3 → stage-4  (byte-identity gate)
@@ -140,12 +140,12 @@ def make_stages():
         Stage(
             src="stdlib", via="stage-3", to=".bin/self/s3",
             cwd=ROOT / "stdlib",
-            cmd=[str(STAGE3), "build", "--build-dir=.bin/self/s3"],
+            cmd=[str(STAGE3), "build", "--no-incremental", "--build-dir=.bin/self/s3"],
         ),
         Stage(
             src="compiler", via="stage-3", to="build/self/s4",
             cwd=ROOT / "compiler",
-            cmd=[str(STAGE3), "build", "--build-dir=build/self/s4"],
+            cmd=[str(STAGE3), "build", "--no-incremental", "--build-dir=build/self/s4"],
         ),
     ]
 

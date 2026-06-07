@@ -62,7 +62,6 @@ function shell_quote(s: string) -> string {
     return buf as string;
 }
 
-
 // Cascade-strip helper
 
 /// Returns true if `name` is in the stripped-functions set.
@@ -386,14 +385,14 @@ type struct CodegenPasses {
                 if (mn_bytes[si] == 58) { mn_bytes[si] = 95; }
             }
             mn_bytes[mn_len] = 0;
-            // Honour project_config.output_dir so `--build-dir=...` lands
-            // here too; hardcoded "build/obj/" would otherwise spill .ll
-            // dumps into the default path even when the rest of codegen
-            // is writing under a different directory.
-            mut ll_dir: string = "build/obj";
+            // Per-module IR lands under the hidden per-profile cache
+            // (`<output_dir>/.cryo/<profile>/ir`); honour project_config so
+            // `--build-dir=...` and the active profile both flow through.
+            mut ll_dir: string = "build/.cryo/release/ir";
             if (ctx.project_config != null) {
-                ll_dir = format("%s/obj", ctx.project_config.output_dir);
+                ll_dir = ctx.project_config.ir_dir();
             }
+            ProjectConfig::mkdir_p(ll_dir);
             const ll_path: string = format("%s/%s.ll", ll_dir, mn_buf as string);
             mut ll_err: i8* = null;
             llvm::LLVMPrintModuleToFile(cg.llvm_module.raw, ll_path, &ll_err as void*);
@@ -655,20 +654,20 @@ type struct CodegenPasses {
         return PassResult::ok();
     }
 
-    /// Build the legacy object path: `<output_dir>/obj/<safe_module>.o`.
+    /// Build the per-module object path:
+    /// `<output_dir>/.cryo/<profile>/deps/<safe_module>.o`.
     /// Used when no `-o PATH` override is in effect, and for the per-module
     /// object that feeds the Exe link step in single-file mode.
     static legacy_obj_path(ctx: CompilationContext*) -> string {
-        mut output_dir: string = "build/obj";
+        mut output_dir: string = "build/.cryo/release/deps";
         if (ctx.project_config != null) {
-            // mkdir() doesn't create parent dirs; ensure the parent
-            // exists first.  Custom `--build-dir=...` paths often don't
-            // pre-exist; the bare `mkdir` then fails silently and the
-            // object emission errors with "No such file or directory".
-            mkdir(ctx.project_config.output_dir, 493);
-            output_dir = format("%s/obj", ctx.project_config.output_dir);
+            output_dir = ctx.project_config.deps_dir();
         }
-        mkdir(output_dir, 493);
+        // mkdir_p creates every missing level (`.cryo`, `<profile>`, `deps`,
+        // and any custom `--build-dir=...` prefix); a bare `mkdir` would fail
+        // on the nested path and object emission would error with
+        // "No such file or directory".
+        ProjectConfig::mkdir_p(output_dir);
 
         // Mangle module name: replace "::" with "_" for filesystem safety.
         mut safe_name: string = ctx.artifacts.ir.module_name;
@@ -708,7 +707,7 @@ type struct CodegenPasses {
 
     /// Linking pass.  Invokes the system linker (`cc`) to combine all
     /// per-module object files emitted during Phase 7 into the final
-    /// executable at `{output_dir}/bin/{project_name}`.  Pulls link
+    /// executable at `{output_dir}/{project_name}` (build root).  Pulls link
     /// libs/paths from the parsed cryoconfig, and tacks on the stdlib
     /// archive whenever `no_std` is not set.
     static run_linking(ctx: CompilationContext*) -> PassResult {
@@ -747,7 +746,7 @@ type struct CodegenPasses {
         // normally.
         if (intrinsics::strlen(ctx.target_triple) > 0
                 && intrinsics::strcmp(ctx.target_triple, get_default_triple()) != 0) {
-            const obj_only_dir: string = format("%s/obj", output_dir);
+            const obj_only_dir: string = cfg.deps_dir();
             intrinsics::printf("Cross-compile: produced %lld object file(s) for target '%s' in %s\n",
                 ctx.artifacts.object_files.length, ctx.target_triple, obj_only_dir);
             intrinsics::printf("  (host linker skipped; link with a %s-aware toolchain, e.g.:\n",
@@ -756,18 +755,13 @@ type struct CodegenPasses {
                 ctx.target_triple, obj_only_dir);
             return PassResult::ok();
         }
-        // Ensure parent dir exists for custom `--build-dir=...` paths
-        // that haven't been pre-created.
-        mkdir(output_dir, 493);
-        const bin_dir: string = format("%s/bin", output_dir);
-        mkdir(bin_dir, 493);  // 0755
+        // The final executable lands at the ROOT of the build dir
+        // (`<output_dir>/<name>`); ensure that dir exists for custom
+        // `--build-dir=...` paths that haven't been pre-created.
+        ProjectConfig::mkdir_p(output_dir);
         // Test-mode builds use a `-test` suffix so the test executable
         // coexists with a normal `cryo run` build of the same project.
-        const exe_path: string = if (ctx.mode.skip_user_main()) {
-            format("%s/%s-test", bin_dir, cfg.project_name)
-        } else {
-            format("%s/%s", bin_dir, cfg.project_name)
-        };
+        const exe_path: string = cfg.bin_artifact_path(ctx.mode.skip_user_main());
 
         // Build the link command.  libc's system(3) runs `sh -c`, so
         // every interpolated path must be shell-quoted; without it, a
@@ -833,13 +827,13 @@ type struct CodegenPasses {
         // write any .ll files because --emit-llvm wasn't set) doesn't
         // pollute the user's terminal in the silent default mode.
         const ll_path: string = format("%s.ll", exe_path);
-        const obj_dir: string = format("%s/obj", output_dir);
-        // Shell-quote obj_dir but leave `/*.ll` unquoted so the glob still
+        const ir_dir: string = cfg.ir_dir();
+        // Shell-quote ir_dir but leave `/*.ll` unquoted so the glob still
         // expands.  Adjacent shell tokens concatenate, so the result of
         // `'<dir>'/*.ll` is exactly the expansion the linker needs.
         const ll_cmd: string = format(
             "llvm-link-20 -S %s/*.ll -o %s 2>/dev/null",
-            shell_quote(obj_dir), shell_quote(ll_path));
+            shell_quote(ir_dir), shell_quote(ll_path));
         const ll_rc: i32 = system(ll_cmd);
         if (ll_rc == 0) {
             cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
@@ -913,7 +907,9 @@ type struct CodegenPasses {
             TargetType::Stdlib => { "libcryo.a" }
             _                  => { format("lib%s.a", cfg.project_name) }
         };
-        const archive_path: string = format("%s/%s", cfg.output_dir, archive_name);
+        // Archive lands at the build root (`<output_dir>/lib<name>.a`).
+        ProjectConfig::mkdir_p(cfg.output_dir);
+        const archive_path: string = cfg.lib_archive_path(archive_name);
 
         // Build `ar rcs <archive> <obj0> <obj1> ...` in one command so we
         // pay only one process spawn.  `r` replaces stale members on

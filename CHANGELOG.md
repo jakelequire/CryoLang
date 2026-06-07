@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Build system
+
+- **New build-directory layout.** The final artifact now sits at the **root**
+  of the build directory — `build/<name>` for an executable, `build/lib<name>.a`
+  for a library — instead of `build/bin/<name>`. All intermediates moved under a
+  hidden, per-profile cache tree: per-module objects in
+  `build/.cryo/<profile>/deps/`, per-module IR in `build/.cryo/<profile>/ir/`.
+  The combined IR dump is `build/<name>.ll`. *(Breaking for tooling that
+  hardcoded `build/bin/` or `build/obj/`.)*
+- **Build manifest.** A successful build writes `build/build-manifest.json`
+  recording the profile, target type/triple, optimization level, debug-info
+  and emit-llvm flags, the linked stdlib archive, the `[link]` lists, every
+  source module (namespace + path + object), and the input fingerprint.
+- **Build profiles.** `release` (O2, no debug info; the default) and `debug`
+  (O0 + DWARF), selectable with `--release` / `--dev` / `--profile=NAME`, or
+  `[profile] default = "..."` in cryoconfig. Each profile keeps its own
+  `build/.cryo/<profile>/` cache. An explicit `[compiler] optimize` or
+  `--opt-level=N` still overrides the profile's level; `-g` forces debug info.
+- **Incremental builds.** `cryo build` now skips the entire compile+link when
+  no input changed (sources, resolved knobs, the compiler binary, or the
+  linked stdlib) and the artifact still exists, printing `<name> is up to date`.
+  The fingerprint is content-based and keyed per target. `--no-incremental`
+  forces a full rebuild. (Whole-build granularity is sound under Cryo's
+  whole-program monomorphization; per-module reuse is future work, and the
+  manifest already carries per-module hashes for it.)
+
 ## [1.0.0] - 2026-05-25
 
 The first stable release. The compiler is self-hosted, the standard library

@@ -21,6 +21,7 @@ import Compiler::Passes::PassRegistry;
 import Compiler::ModuleGraph;
 import Compiler::ModuleLoader;
 import Compiler::ProjectConfig;
+import Compiler::BuildManifest;
 import Compiler::DepsResolver;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
@@ -86,6 +87,19 @@ type struct CompilerConfig {
     /// Opt-in; default off. Independent of the optimization level (a
     /// `-g -O2` build still carries line info, just with optimized code).
     emit_debug_info:     boolean;
+    /// CLI override for the build profile (`--release` / `--dev` /
+    /// `--profile=NAME`). Empty string ("") means "use the cryoconfig
+    /// `[profile] default`, then the built-in `release`". The selected
+    /// profile names the per-profile cache subtree and supplies the default
+    /// optimization level / debug-info state.
+    profile_override:    string;
+    /// Incremental build short-circuit. When true (default), a build whose
+    /// inputs fingerprint matches the saved one and whose artifacts still
+    /// exist is skipped, and a build manifest + fingerprint sidecar are
+    /// written on success. `--no-incremental` turns this off for a full,
+    /// reproducible build; selfhost-check passes it so every stage rebuilds
+    /// and the stage-3/stage-4 IR comparison stays meaningful.
+    incremental:         boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -101,6 +115,8 @@ type struct CompilerConfig {
             output_kind:         OutputKind::None,
             opt_level_override:  -1,
             emit_debug_info:     false,
+            profile_override:    "",
+            incremental:         true,
         };
     }
 
@@ -118,6 +134,8 @@ type struct CompilerConfig {
             output_kind:         OutputKind::None,
             opt_level_override:  -1,
             emit_debug_info:     false,
+            profile_override:    "",
+            incremental:         true,
         };
     }
 }
@@ -821,7 +839,7 @@ type struct CompilerInstance {
     ///     before this call when the editor buffer should win over
     ///     the on-disk version of one of the discovered modules.
     compile_project_with_ctx(&this, ctx: CompilationContext*,
-                             config: ProjectConfig) -> CompilationResult {
+                             mut config: ProjectConfig) -> CompilationResult {
         // Drop any cached (TypeRef.id -> LLVMTypeRef) entries from a prior
         // compile in this process.  TypeArena.next_id resets to 1 every
         // compile, so without this every fresh TypeRef would alias a
@@ -830,15 +848,33 @@ type struct CompilerInstance {
 
         const root_path: string = config.discovery_root_path();
         ctx.debug_mode = this.config.debug;
-        // Optimization level: cryoconfig `[compiler] optimize = O0..O3`,
-        // overridden by `--opt-level=N` when the CLI set it.
-        ctx.opt_level = config.opt_level;
+
+        // Resolve the build profile. Precedence: CLI `--release`/`--dev`/
+        // `--profile=NAME` > cryoconfig `[profile] default` > built-in
+        // `release`. The selected name flows into `config.profile` BEFORE the
+        // clone below, so the per-profile cache subtree
+        // (`<output_dir>/.cryo/<profile>/`) is consistent across codegen,
+        // linking, and the manifest.
+        if (intrinsics::strlen(this.config.profile_override) > 0) {
+            config.profile = this.config.profile_override;
+        }
+
+        // Optimization level. Base comes from the profile (debug => O0,
+        // release => O2); an explicit `[compiler] optimize` wins over the
+        // profile, and `--opt-level=N` wins over everything.
+        ctx.opt_level = ProjectConfig::profile_base_opt_level(config.profile);
+        if (config.opt_level_explicit) {
+            ctx.opt_level = config.opt_level;
+        }
         if (this.config.opt_level_override >= 0) {
             mut lvl: i32 = this.config.opt_level_override;
             if (lvl > 3) { lvl = 3; }
             ctx.opt_level = lvl as u32;
         }
-        ctx.emit_debug_info = this.config.emit_debug_info;
+        // Debug info: base from the profile (debug => on), forced on by
+        // `-g` / `--debug-info` regardless of profile.
+        ctx.emit_debug_info = ProjectConfig::profile_base_debug_info(config.profile)
+            || this.config.emit_debug_info;
         ctx.project_no_std = config.no_std;
         ctx.target_triple = config.target_triple;
 
@@ -1061,6 +1097,67 @@ type struct CompilerInstance {
             const info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
             cdebug("  [%u] %s (%s)\n", i,
                 ctx.intern_table.resolve(info.name), info.file_path);
+        }
+
+        // Incremental whole-build fingerprint + short-circuit.
+        //
+        // Build the input set (every discovered module, in topo order) and a
+        // fingerprint over it + the resolved knobs + the compiler and stdlib
+        // binaries. The locals persist to the manifest write at the end of a
+        // successful build, so everything is computed once here.
+        //
+        // Gated on `incremental` (off via `--no-incremental`, which selfhost
+        // passes so every stage does a full, comparable rebuild) and on
+        // `codegen_enabled()` (LSP mode needs the full AST and produces no
+        // artifact, so it always falls through).
+        const do_incremental: boolean =
+            this.config.incremental && ctx.mode.codegen_enabled();
+        mut mod_entries: BuildManifest::ModuleEntry[] = [];
+        mut manifest_artifacts: string[] = [];
+        mut manifest_stdlib_archive: string = "";
+        mut build_fp_hex: string = "";
+        if (do_incremental) {
+            for (mut i: u32 = 0; i < n; i++) {
+                const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
+                mod_entries.push(BuildManifest::ModuleEntry {
+                    namespace_name: ctx.intern_table.resolve(minfo.name),
+                    source_path:    minfo.file_path,
+                });
+            }
+            if (!config.no_std && intrinsics::strlen(stdlib_root) > 0) {
+                manifest_stdlib_archive = format("%s/.bin/libcryo.a", stdlib_root);
+            }
+            // Final artifact path(s) this build will produce.
+            if (config.requires_entry_point()) {
+                manifest_artifacts.push(
+                    ctx.project_config.bin_artifact_path(ctx.mode.skip_user_main()));
+            } else {
+                const archive_name: string = match (config.target_type) {
+                    TargetType::Stdlib => { "libcryo.a" }
+                    _                  => { format("lib%s.a", config.project_name) }
+                };
+                manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
+            }
+            const build_fp: u64 = BuildManifest::compute_fingerprint(
+                ctx.project_config, &mod_entries, ctx.opt_level,
+                ctx.emit_debug_info, manifest_stdlib_archive);
+            build_fp_hex = BuildManifest::u64_to_hex(build_fp);
+
+            if (BuildManifest::is_up_to_date(ctx.project_config, build_fp_hex,
+                                             &manifest_artifacts)) {
+                // Nothing changed and the artifact still exists: skip
+                // frontend, codegen, and linking entirely.
+                const up_to_date_out: string = if (config.requires_entry_point()) {
+                    manifest_artifacts[0]
+                } else {
+                    ""
+                };
+                intrinsics::printf("%s is up to date (%s)\n",
+                    config.project_name, config.profile);
+                mut utd_result: CompilationResult = CompilationResult::ok(up_to_date_out);
+                utd_result.stdlib_root = ctx.stdlib_root;
+                return utd_result;
+            }
         }
 
         // Allocate local buffers for per-module ASTs and scopes.
@@ -1474,10 +1571,15 @@ type struct CompilerInstance {
         if (!phase6_failed && ctx.mode.codegen_enabled()) {
             cdebug("[Compiler] Phase 7: Codegen (%u modules)\n", n);
 
-            // Determine output directory from project config.
-            mut obj_dir: string = "build/obj";
+            // Per-module LLVM IR (`.ll`) output dir. Lives under the hidden
+            // per-profile cache (`<output_dir>/.cryo/<profile>/ir`); the
+            // linker's combined-IR dump (`run_linking`) globs this same dir,
+            // and selfhost-check's stage-3/stage-4 byte-identity gate reads
+            // the resulting `<name>.ll`. Keep this path in lockstep with
+            // `ProjectConfig::ir_dir()`.
+            mut ir_dir: string = "build/.cryo/release/ir";
             if (ctx.project_config != null) {
-                obj_dir = format("%s/obj", ctx.project_config.output_dir);
+                ir_dir = ctx.project_config.ir_dir();
             }
 
             pipeline.set_passes([
@@ -1538,8 +1640,8 @@ type struct CompilerInstance {
                         for (mut k: u64 = 0; k < mn_len; k++) {
                             if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
                         }
-                        mkdir(obj_dir, 493);
-                        const ll_path: string = format("%s/%s.ll", obj_dir, mn_buf as string);
+                        ProjectConfig::mkdir_p(ir_dir);
+                        const ll_path: string = format("%s/%s.ll", ir_dir, mn_buf as string);
                         mut ll_err: i8* = null;
                         const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                             ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
@@ -1631,25 +1733,30 @@ type struct CompilerInstance {
                 ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
         // Construct the executable path the linker just produced
-        // (`<output_dir>/bin/<project_name>`, same shape as
-        // CodegenPasses::run_linking) so `cryo run` knows where to
-        // exec.  Library / stdlib targets have no entry point, so
-        // we leave output_path empty for those.  Test-mode builds add
-        // a `-test` suffix to coexist with a regular build of the same
-        // project; `run_linking` applies the same suffix.
+        // (`<output_dir>/<project_name>`, at the build root — same shape as
+        // `ProjectConfig::bin_artifact_path` / CodegenPasses::run_linking) so
+        // `cryo run` knows where to exec.  Library / stdlib targets have no
+        // entry point, so we leave output_path empty for those.  Test-mode
+        // builds add a `-test` suffix to coexist with a regular build of the
+        // same project; `run_linking` applies the same suffix.
         mut exe_path: string = "";
         if (ctx.project_config != null
                 && ctx.project_config.requires_entry_point()) {
-            if (ctx.mode.skip_user_main()) {
-                exe_path = format("%s/bin/%s-test",
-                    ctx.project_config.output_dir,
-                    ctx.project_config.project_name);
-            } else {
-                exe_path = format("%s/bin/%s",
-                    ctx.project_config.output_dir,
-                    ctx.project_config.project_name);
-            }
+            exe_path = ctx.project_config.bin_artifact_path(ctx.mode.skip_user_main());
         }
+
+        // Build succeeded: record the fingerprint sidecar (consulted by the
+        // next build's short-circuit) and the human/tooling-facing manifest.
+        // Gated on `do_incremental`; the fingerprint locals were computed
+        // before the frontend ran. Side files only; no effect on the IR.
+        if (do_incremental && ctx.project_config != null) {
+            BuildManifest::write_fingerprint(ctx.project_config, build_fp_hex);
+            BuildManifest::write_manifest(
+                ctx.project_config, &mod_entries, ctx.opt_level,
+                ctx.emit_debug_info, build_fp_hex, &manifest_artifacts,
+                manifest_stdlib_archive);
+        }
+
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
         ok_result.stdlib_root = ctx.stdlib_root;
         intrinsics::free(ast_buf);
