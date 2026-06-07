@@ -18,6 +18,8 @@ import Compiler::Resolver::Scope;
 import Compiler::Resolver::ResolutionMap;
 import Compiler::Diag;
 import std::collections::pair;
+import std::collections::hashmap;
+import std::core::option;
 import Utils::Logger;
 
 type struct Resolver {
@@ -49,6 +51,14 @@ type struct Resolver {
     // Current context
     current_module:     SymbolStr;
 
+    // Index: interned owner_name id -> ids of Module-kind scopes with that
+    // name.  find_module_scope previously linear-scanned every scope with a
+    // per-scope strcmp (~3% frontend self-time combined).  The resolver may
+    // create several same-named Module scopes across pipeline stages, so this
+    // is a multimap; find_module_scope iterates only the candidates and still
+    // picks the most-populated live scope (symbol counts read live).
+    module_scope_index: HashMap<u32, u64[]>;
+
     /// Create a new Resolver with a global scope.
     /// The InternTable pointer must outlive the Resolver (owned by CompilationContext).
     static new(table: InternTable*) -> Resolver {
@@ -70,6 +80,7 @@ type struct Resolver {
             exports:              [],
             import_aliases:       [],
             current_module:       SymbolStr::empty(),
+            module_scope_index:   HashMap<u32, u64[]>::new(),
         };
     }
 
@@ -84,6 +95,14 @@ type struct Resolver {
 
         const scope: Scope = Scope::new(id, kind, parent, module, owner, span);
         this.scopes.push(scope);
+
+        // Index Module-kind scopes by their interned owner name so
+        // find_module_scope skips the full scope scan.
+        if (kind == ScopeKind::Module) {
+            const oid: u32 = this.intern_table.intern(owner).id;
+            const bucket: u64[]* = this.module_scope_index.get_or_insert(oid, []);
+            (*bucket).push(id.id);
+        }
 
         // Register as child of parent (O(1) direct index)
         if (parent.is_valid()) {
@@ -585,16 +604,20 @@ type struct Resolver {
     find_module_scope(&this, module_name: string) -> u64 {
         mut best_id: u64 = 0;
         mut best_count: i64 = -1;
-        for (mut i: i64 = 0; i < this.scopes.length; i++) {
-            if (this.scopes[i].kind == ScopeKind::Module) {
-                if (strcmp(this.scopes[i].owner_name, module_name) == 0) {
-                    const count: i64 = this.scopes[i].symbols.length;
+        const oid: u32 = this.intern_table.lookup(module_name).id;
+        match (this.module_scope_index.get_ref(&oid)) {
+            Option::Some(plist) => {
+                for (mut k: i64 = 0; k < (*plist).length; k++) {
+                    const sid: u64 = (*plist)[k];
+                    const idx: i64 = (sid - 1) as i64;
+                    const count: i64 = this.scopes[idx].symbols.length;
                     if (count > best_count) {
                         best_count = count;
-                        best_id = this.scopes[i].id.id;
+                        best_id = sid;
                     }
                 }
             }
+            Option::None => { }
         }
         return best_id;
     }

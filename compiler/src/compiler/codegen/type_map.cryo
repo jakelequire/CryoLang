@@ -21,6 +21,8 @@ import Compiler::Resolver::InternTable;
 import Compiler::Resolver::MangledName;
 import Compiler::Resolver::QualifiedName;
 import std::collections::pair;
+import std::collections::hashmap;
+import std::core::option;
 
 
 // Cross-module shared type cache
@@ -46,29 +48,26 @@ import std::collections::pair;
 // initialize reliably (a known historical wart).
 
 type struct TypeMapperCache {
-    cache: Pair<u64, void*>[];
+    // O(1) (TypeRef.id -> LLVMTypeRef) map.  Previously a flat
+    // `Pair<u64, void*>[]` linear-scanned on every lookup/store, which
+    // grew into one of the hottest frontend functions (~5% self-time)
+    // because every `map_type` call scanned the whole cache.  Hashed
+    // lookup removes the scan; same idea as `FunctionRegistry`.
+    cache: HashMap<u64, void*>;
 
     static new() -> TypeMapperCache {
-        return TypeMapperCache { cache: [] };
+        return TypeMapperCache { cache: HashMap<u64, void*>::new() };
     }
 
     lookup(&this, id: u64) -> LType {
-        for (mut i: i64 = 0; i < this.cache.length; i++) {
-            if (this.cache[i].first == id) {
-                return LType { raw: this.cache[i].second };
-            }
-        }
-        return LType::null();
+        return match (this.cache.get(&id)) {
+            Option::Some(raw) => { LType { raw: raw } }
+            Option::None      => { LType::null() }
+        };
     }
 
     store(mut &this, id: u64, ty: LType) -> void {
-        for (mut i: i64 = 0; i < this.cache.length; i++) {
-            if (this.cache[i].first == id) {
-                this.cache[i].second = ty.raw;
-                return;
-            }
-        }
-        this.cache.push(Pair::new(id, ty.raw));
+        this.cache.insert(id, ty.raw);
     }
 }
 

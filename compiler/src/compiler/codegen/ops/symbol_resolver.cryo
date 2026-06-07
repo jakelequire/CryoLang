@@ -262,22 +262,34 @@ type struct SymbolResolver {
         if (v.is_valid()) { return v; }
 
         const di: DeclarationIndex* = this.ctx.decl_index;
-        for (mut i: i64 = 0; i < di.overload_func_keys.length; i++) {
-            if (di.overload_func_mangled[i] != pinned.id) { continue; }
-            const qual: SymbolStr = SymbolStr::from_id(di.overload_func_keys[i]);
-            // Normally a current-module-owned symbol is resolved above by
-            // `get_named_function`. If that missed it, the definition was
-            // emitted in a DIFFERENT module than the one DI records as its
-            // owner — this happens for a monomorphized self-returning
-            // combinator spec (`it.copied()`), which is injected onto a
-            // specialized impl block emitted during module 0's codegen
-            // while DI ownership stays with the consuming module. The local
-            // lookup having already failed proves no in-module definition
-            // exists, so declaring a cross-module extern is sound: it links
-            // to the out-of-module definition instead of failing with a
-            // spurious "no method" at the call site.
-            v = this.declare_extern_function_overload(qual, di.overload_func_types[i]);
-            if (v.is_valid()) { return v; }
+        // Reverse index (mangled id -> overload position) replaces a linear
+        // scan of every registered overload.  Normally a current-module-owned
+        // symbol is resolved above by `get_named_function`. If that missed it,
+        // the definition was emitted in a DIFFERENT module than the one DI
+        // records as its owner — this happens for a monomorphized self-
+        // returning combinator spec (`it.copied()`), which is injected onto a
+        // specialized impl block emitted during module 0's codegen while DI
+        // ownership stays with the consuming module. The local lookup having
+        // already failed proves no in-module definition exists, so declaring a
+        // cross-module extern is sound: it links to the out-of-module
+        // definition instead of failing with a spurious "no method" at the
+        // call site.
+        // Reverse index (mangled id -> overload positions, in registration
+        // order) replaces a linear scan of every registered overload.  Several
+        // positions can share one mangled id (a trait-impl method registered
+        // under both its qualified and bare combined names); try each in order
+        // and return the first that yields a valid extern, exactly as the
+        // former scan did.
+        match (di.mangled_to_overload_pos.get_ref(&pinned.id)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    const pos: u32 = (*positions)[k];
+                    const qual: SymbolStr = SymbolStr::from_id(di.overload_func_keys[pos as i64]);
+                    v = this.declare_extern_function_overload(qual, di.overload_func_types[pos as i64]);
+                    if (v.is_valid()) { return v; }
+                }
+            }
+            Option::None => { }
         }
 
         return this.resolve_function(pinned);
