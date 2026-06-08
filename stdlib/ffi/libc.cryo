@@ -152,23 +152,45 @@ const ECANCELED:       i32 = 125;
 const EOWNERDEAD:      i32 = 130;
 const ENOTRECOVERABLE: i32 = 131;
 
+// errno accessor: thread-local int* indirection.  glibc exposes it as
+// `__errno_location`; msvcrt exposes the same shape as `_errno`.  Gated
+// per-OS so neither symbol leaks into the wrong link line.
+![target(unix)]
 extern "C" {
     function __errno_location() -> i32*;
+    function perror(prefix: u8*) -> void;
+}
+
+![target(windows)]
+extern "C" {
+    function _errno() -> i32*;
     function perror(prefix: u8*) -> void;
 }
 
 /// Current thread's `errno`. Thin convenience over the platform's
 /// thread-local indirection; every `IoError::from_errno(...)` in the
 /// stdlib funnels through here.
+![target(unix)]
 function errno() -> i32 {
     return *__errno_location();
+}
+
+![target(windows)]
+function errno() -> i32 {
+    return *_errno();
 }
 
 /// Overwrite the current thread's `errno`. Useful when the only way
 /// to detect failure from a libc routine is to clear `errno` first
 /// and inspect it on return (e.g. `strtol`, `readdir`).
+![target(unix)]
 function set_errno(value: i32) -> void {
     *__errno_location() = value;
+}
+
+![target(windows)]
+function set_errno(value: i32) -> void {
+    *_errno() = value;
 }
 
 // signal.h: signal numbers + raw operations
@@ -758,6 +780,18 @@ extern "C" {
     function wcstombs(dest: u8*, src: u32*, n: u64) -> u64;
 
     function realpath(path: u8*, resolved: u8*) -> u8*;
+}
+
+// Windows-only msvcrt env helper.  mingw doesn't ship POSIX
+// `setenv`/`unsetenv`; the equivalent is `_putenv_s(name, value)`
+// (empty value deletes the binding).  The other msvcrt-underscored
+// CRT aliases (`_popen` / `_pclose` / `_isatty` / `GetModuleFileNameA`)
+// are declared inline in `core::intrinsics` next to the Cryo shims
+// that call them, since `core::intrinsics` is the leaf module and
+// can't import `ffi::libc` without back-edging the module graph.
+![target(windows)]
+extern "C" {
+    function _putenv_s(name: u8*, value: u8*) -> i32;
 }
 
 // string.h: string and memory routines
@@ -2023,12 +2057,28 @@ extern "C" {
     function y1(x: f64)     -> f64;
     function yn(n: i32, x: f64) -> f64;
 
-    // Classification: glibc primitives behind the FP_* macros.
+}
+
+// FP classification: glibc exports the primitives behind the FP_*
+// macros as `__isnan` / `__isinf` / `__finite` / `__signbit` /
+// `__fpclassify`.  msvcrt exports a different (smaller) set with
+// leading-underscore names; `_isinf` and `_signbit` and `_fpclassify`
+// don't exist as msvcrt exports - derive `isinf` from `_finite` and
+// `_isnan` at the call site.
+
+![target(unix)]
+extern "C" {
     function __isnan(value: f64)        -> i32;
     function __isinf(value: f64)        -> i32;
     function __finite(value: f64)       -> i32;
     function __signbit(value: f64)      -> i32;
     function __fpclassify(value: f64)   -> i32;
+}
+
+![target(windows)]
+extern "C" {
+    function _isnan(value: f64)         -> i32;
+    function _finite(value: f64)        -> i32;
 }
 
 // FP classification macros' integer returns (glibc).

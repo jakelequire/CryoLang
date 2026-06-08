@@ -580,9 +580,36 @@ type struct ProjectConfig {
     //   <output_dir>/target/<profile>/local/incremental/<name>.fp
     //   <output_dir>/target/<profile>/<depname>/deps/*.o  <depname>/ir/*.ll
 
-    /// Visible per-profile cache root: `<output_dir>/target/<profile>`.
+    /// Visible per-profile cache root:
+    /// `<output_dir>/target/<profile>/<target_subdir>`.
+    ///
+    /// `target_subdir` is the cross-compile triple (e.g.
+    /// "x86_64-pc-windows-gnu") when one is in effect, or the literal
+    /// "host" when building for the host.  The per-target subdir keeps
+    /// host and cross intermediates from colliding: switching between
+    /// `cryo build` (host) and `cryo build --target=...` (cross) used
+    /// to overwrite each other's `.o` / `.ll` / incremental fingerprint
+    /// files; now they live in disjoint trees and either can be
+    /// rebuilt without disturbing the other.
+    ///
+    /// Hoisted artifacts (`bin_artifact_path` / `lib_archive_path`)
+    /// remain at the build root - the `.exe` suffix already
+    /// distinguishes them for Windows targets, and ordinary users only
+    /// build one target at a time.
     profile_dir(&this) -> string {
-        return format("%s/target/%s", this.output_dir, this.profile);
+        return format("%s/target/%s/%s",
+            this.output_dir, this.profile, this.target_subdir());
+    }
+
+    /// Returns the active cross-compile triple if set, otherwise "host".
+    /// Threaded into `profile_dir` so every per-build path (deps, IR,
+    /// incremental, per-profile bin) carries the per-target separation.
+    target_subdir(&this) -> string {
+        if (this.target_triple == null
+                || intrinsics::strlen(this.target_triple) == 0) {
+            return "host";
+        }
+        return this.target_triple;
     }
 
     /// Per-origin object output dir: `<profile_dir>/<origin_subdir>/deps`.

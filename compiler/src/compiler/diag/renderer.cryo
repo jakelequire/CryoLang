@@ -645,36 +645,34 @@ type struct DiagRenderer {
     ///
     /// No leading rule and no ANSI escapes: callers construct the
     /// renderer with `RenderConfig::plain()`.  Falls back to the
-    /// one-line `Diagnostic::to_string()` form if the in-memory stream
+    /// one-line `Diagnostic::to_string()` form if the rendering stream
     /// cannot be opened.
+    ///
+    /// The stream-open and stream-drain steps live in per-OS free
+    /// helpers below (`open_render_stream` / `drain_render_stream`);
+    /// the method itself is OS-agnostic, which matters because
+    /// ConfigGating doesn't currently recurse into struct method
+    /// bodies to apply `![target(...)]`.  POSIX uses `open_memstream`
+    /// for an in-memory buffer; Windows uses `tmpfile()` + seek/read
+    /// since msvcrt has no equivalent.
     render_to_string(mut &this, diag: Diagnostic) -> String {
         mut buf: i8* = null;
         mut size: u64 = 0;
-        const stream: void* = intrinsics::open_memstream(&buf, &size);
+        const stream: void* = open_render_stream(&buf, &size);
         if (stream == null) {
             mut fallback: String = String::new();
             fallback.push_cstr(diag.to_string());
             return fallback;
         }
 
-        // Redirect the body render at the in-memory stream, then put
+        // Redirect the body render at the rendering stream, then put
         // `out` back so the renderer stays reusable for terminal output.
         const saved: void* = this.out;
         this.out = stream;
         this.render_body(diag);
         this.out = saved;
 
-        // fclose finalises `buf` / `size`; the buffer is then ours to
-        // own and free.
-        intrinsics::fflush(stream);
-        intrinsics::fclose(stream);
-
-        mut result: String = String::new();
-        if (buf != null) {
-            result.push_cstr(buf as string);
-            intrinsics::free(buf as void*);
-        }
-        return result;
+        return drain_render_stream(stream, buf, size);
     }
 
     /// Render the diagnostic itself - header, snippet(s), secondary
@@ -1723,4 +1721,68 @@ type struct DiagRenderer {
                 reset);
         }
     }
+}
+
+
+// Per-OS render-stream helpers
+//
+// `render_to_string` writes the diagnostic into a stream and then
+// recovers the bytes as a `String`.  POSIX has `open_memstream`, which
+// hands the buffer back through output pointers and updates them on
+// `fflush`/`fclose`.  msvcrt has nothing equivalent; the Windows side
+// uses `tmpfile()` instead (a FILE* tied to an auto-deleted temp
+// file) and reads the contents back at the end.
+//
+// These live as free functions, not methods, because ConfigGating
+// doesn't currently recurse into struct method bodies to apply
+// `![target(...)]` - so the per-OS divergence has to sit one level
+// out, where the pass can see it.
+
+/// Open a stream that buffers writes for later recovery.  Populates
+/// `*buf_out` / `*size_out` on POSIX (the open_memstream contract);
+/// leaves them untouched on Windows.  Returns null on failure.
+![target(unix)]
+private function open_render_stream(buf_out: i8**, size_out: u64*) -> void* {
+    return intrinsics::open_memstream(buf_out, size_out);
+}
+
+![target(windows)]
+private function open_render_stream(buf_out: i8**, size_out: u64*) -> void* {
+    return intrinsics::tmpfile();
+}
+
+/// Drain the rendering stream into a `String`, closing it and
+/// releasing any heap buffer the OS path allocated for us.
+///
+///   POSIX: `fflush` finalises the open_memstream-owned buffer;
+///   `*buf` then points at NUL-terminated bytes we copy and `free`.
+///
+///   Windows: rewind the tmpfile and read its contents back through
+///   `fread`.  No external buffer; `buf` / `size` are unused.
+![target(unix)]
+private function drain_render_stream(stream: void*, buf: i8*, size: u64) -> String {
+    intrinsics::fflush(stream);
+    intrinsics::fclose(stream);
+    mut result: String = String::new();
+    if (buf != null) {
+        result.push_cstr(buf as string);
+        intrinsics::free(buf as void*);
+    }
+    return result;
+}
+
+![target(windows)]
+private function drain_render_stream(stream: void*, buf: i8*, size: u64) -> String {
+    intrinsics::fflush(stream);
+    // SEEK_SET = 0; rewind to the start to read what we just wrote.
+    intrinsics::fseek(stream, 0i64, 0);
+    mut result: String = String::new();
+    mut chunk: u8[4096];
+    loop {
+        const n: u64 = intrinsics::fread(&chunk[0] as void*, 1u64, 4096u64, stream);
+        if (n == 0u64) { break; }
+        result.push(Str::from_raw(&chunk[0], n));
+    }
+    intrinsics::fclose(stream);
+    return result;
 }

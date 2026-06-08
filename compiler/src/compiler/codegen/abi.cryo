@@ -491,6 +491,9 @@ type struct AbiClassifier {
 
         if (is_aggregate) {
             const sz: u64 = concrete.size_bytes();
+            if (this.is_win64()) {
+                return this.classify_win64_param(t, sz);
+            }
             if (sz > 16) {
                 // Phase 2: large aggregate -> byval.
                 const pointee: LType = tm.map_type(t);
@@ -568,6 +571,96 @@ type struct AbiClassifier {
     /// naming symmetry with `classify_signature_extern_c`.
     classify_param_extern_c(mut &this, t: TypeRef) -> ParamPlan {
         return this.classify_param(t);
+    }
+
+
+    // Win64 (Microsoft x64) aggregate classification
+
+    /// Microsoft x64 parameter classification for an aggregate of size
+    /// `sz`.  Markedly simpler than SysV:
+    ///   - sizes 1 / 2 / 4 / 8 -> Direct, coerced to an integer of that
+    ///     exact size (a `byte`, `i16`, `i32`, or `i64` GP register).
+    ///   - 0                   -> fall through to the non-aggregate
+    ///     plain-Direct path so empty aggregates lower identically to
+    ///     SysV.  Cryo shouldn't produce these in practice.
+    ///   - everything else (3, 5, 6, 7, > 8) -> Indirect + ByVal: the
+    ///     caller spills the value to its stack and passes a pointer.
+    ///
+    /// There is no SSE / HFA / DirectPair branch.  Win64 passes every
+    /// aggregate in GP registers, even float-bearing ones - so an
+    /// 8-byte `struct { double x; }` rides through RAX, not XMM0.  See
+    /// https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
+    /// "Parameter Passing".
+    classify_win64_param(mut &this, t: TypeRef, sz: u64) -> ParamPlan {
+        const tm: TypeMapper* = this.type_mapper;
+        if (sz == 1u64 || sz == 2u64 || sz == 4u64 || sz == 8u64) {
+            return this.classify_small_aggregate_int(t, sz);
+        }
+        if (sz == 0u64) {
+            // Empty aggregate: same fall-through as the SysV path; the
+            // caller's loop emits a plain Direct of the mapped LLVM
+            // type, which on an empty struct is a no-op slot list.
+            mut slots: LType[] = [];
+            const lty: LType = tm.map_type(t);
+            if (lty.is_valid()) { slots.push(lty); }
+            return ParamPlan {
+                cryo_type:  t,
+                cls:        ArgClass::Direct,
+                llvm_slots: slots,
+                attr:       AbiAttr::None,
+                pointee_ty: LType::null(),
+            };
+        }
+        // 3, 5, 6, 7, or > 8: ByVal pointer.
+        const pointee: LType = tm.map_type(t);
+        mut slots: LType[] = [];
+        slots.push(LType::pointer_to(LType::i8()));
+        return ParamPlan {
+            cryo_type:  t,
+            cls:        ArgClass::Indirect,
+            llvm_slots: slots,
+            attr:       AbiAttr::ByVal,
+            pointee_ty: pointee,
+        };
+    }
+
+    /// Microsoft x64 return classification for an aggregate of size
+    /// `sz`.  Mirror of `classify_win64_param`:
+    ///   - sizes 1 / 2 / 4 / 8 -> Direct, returned in RAX coerced to an
+    ///     integer of that size.
+    ///   - 0                   -> fall through to plain Direct of the
+    ///     mapped LLVM type, same as SysV.
+    ///   - everything else     -> Indirect + SRet: callee writes the
+    ///     return value through a hidden pointer the caller supplies
+    ///     as the first argument (Win64: in RCX).
+    classify_win64_return(mut &this, t: TypeRef, sz: u64) -> ParamPlan {
+        const tm: TypeMapper* = this.type_mapper;
+        if (sz == 1u64 || sz == 2u64 || sz == 4u64 || sz == 8u64) {
+            return this.classify_small_aggregate_int(t, sz);
+        }
+        if (sz == 0u64) {
+            mut slots: LType[] = [];
+            const lty: LType = tm.map_type(t);
+            if (lty.is_valid()) { slots.push(lty); }
+            return ParamPlan {
+                cryo_type:  t,
+                cls:        ArgClass::Direct,
+                llvm_slots: slots,
+                attr:       AbiAttr::None,
+                pointee_ty: LType::null(),
+            };
+        }
+        // 3, 5, 6, 7, or > 8: SRet pointer.
+        const pointee: LType = tm.map_type(t);
+        mut slots: LType[] = [];
+        slots.push(LType::pointer_to(LType::i8()));
+        return ParamPlan {
+            cryo_type:  t,
+            cls:        ArgClass::Indirect,
+            llvm_slots: slots,
+            attr:       AbiAttr::SRet,
+            pointee_ty: pointee,
+        };
     }
 
     /// Classify a single eightbyte bucket of an aggregate type into its
@@ -846,6 +939,9 @@ type struct AbiClassifier {
 
         if (is_aggregate) {
             const sz: u64 = concrete.size_bytes();
+            if (this.is_win64()) {
+                return this.classify_win64_return(t, sz);
+            }
             if (sz > 16) {
                 // Phase 1: large aggregate -> sret.
                 const pointee: LType = tm.map_type(t);

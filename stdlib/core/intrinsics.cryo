@@ -6,6 +6,21 @@
 
 namespace std::core::intrinsics;
 
+// Windows-only msvcrt aliases for the few CRT functions POSIX names
+// differently.  Declared inline (rather than via `import ffi::libc`)
+// because intrinsics is a leaf module - libc and syscall already
+// import the prelude (which itself re-exports intrinsics), so a
+// cross-import here would back-edge the module graph.  Multiple
+// extern declarations of the same C symbol are equivalent at link
+// time, so the duplication with `ffi::libc` is harmless.
+![target(windows)]
+extern "C" {
+    function _popen(command: string, mode: string) -> void*;
+    function _pclose(stream: void*) -> i32;
+    function _isatty(fd: i32) -> i32;
+    function GetModuleFileNameA(hModule: void*, lpFilename: i8*, nSize: u32) -> u32;
+}
+
 // Allocation.
 intrinsic function malloc(size: u64) -> void*;
 intrinsic function calloc(count: u64, size: u64) -> void*;
@@ -181,13 +196,42 @@ intrinsic function fputc(c: i32, file: void*) -> i32;
 intrinsic function feof(file: void*) -> i32;
 intrinsic function ferror(file: void*) -> i32;
 intrinsic function fileno(file: void*) -> i32;
+// Tempfile-backed FILE*: auto-deleted on `fclose`.  Available on both
+// glibc and msvcrt, so no per-target gating needed.  Used by
+// `render_to_string`'s Windows path as the buffer-the-output substitute
+// for POSIX `open_memstream`.
+intrinsic function tmpfile() -> void*;
+// Pipe-backed subprocess.  POSIX `popen`/`pclose` are spelled
+// `_popen`/`_pclose` on msvcrt.  The Windows shims forward through the
+// gated extern decls in `ffi::libc`; the public surface
+// (`intrinsics::popen`/`pclose`) stays the same.
+![target(unix)]
 intrinsic function popen(command: string, mode: string) -> void*;
+
+![target(unix)]
 intrinsic function pclose(pipe: void*) -> i32;
+
+![target(windows)]
+function popen(command: string, mode: string) -> void* {
+    return _popen(command, mode);
+}
+
+![target(windows)]
+function pclose(pipe: void*) -> i32 {
+    return _pclose(pipe);
+}
+
 // In-memory output stream: open_memstream(char **bufp, size_t *sizep).
 // fprintf into the returned FILE*, then fflush/fclose; *bufp then holds
 // the accumulated bytes as a NUL-terminated buffer the caller must free.
 // Backs the diagnostic renderer's "render to a string" path so the
 // language server can ship a fully rendered report to the editor.
+//
+// POSIX-only.  Windows has no msvcrt equivalent; callers that need
+// "render to a string" on Windows should branch via `![target(...)]`
+// to a tmpfile-based path (see `compiler/src/compiler/diag/renderer.cryo
+// ::render_to_string`).
+![target(unix)]
 intrinsic function open_memstream(bufp: i8**, sizep: u64*) -> void*;
 
 // fd-level I/O
@@ -212,7 +256,24 @@ intrinsic function unlink(path: string) -> i32;
 intrinsic function rename(oldpath: string, newpath: string) -> i32;
 intrinsic function symlink(target: string, linkpath: string) -> i32;
 intrinsic function link(oldpath: string, newpath: string) -> i32;
+// readlink: POSIX symlink-target reader.  The only path Cryo callers
+// pass through it is "/proc/self/exe" (compiler self-discovery), so
+// the Windows shim handles that single case via `GetModuleFileNameA`
+// (kernel32) and returns -1 for any other path.  A future
+// `env::current_exe_path()` helper should subsume both call sites and
+// retire this special case.
+![target(unix)]
 intrinsic function readlink(path: string, buf: i8*, size: u64) -> i64;
+
+![target(windows)]
+function readlink(path: string, buf: i8*, size: u64) -> i64 {
+    if (strcmp(path, "/proc/self/exe") != 0) {
+        return -1i64;
+    }
+    const n: u32 = GetModuleFileNameA(null, buf, size as u32);
+    if (n == 0u32) { return -1i64; }
+    return n as i64;
+}
 intrinsic function realpath(path: string, resolved: i8*) -> i8*;
 intrinsic function chmod(path: string, mode: i32) -> i32;
 intrinsic function getcwd(buf: i8*, size: u64) -> i8*;
@@ -235,7 +296,14 @@ intrinsic function getpid() -> i32;
 intrinsic function kill(pid: i32, sig: i32) -> i32;
 intrinsic function getenv(name: string) -> i8*;
 intrinsic function setenv(name: string, value: string, overwrite: i32) -> i32;
+// TTY detection.  POSIX `isatty(fd)` is spelled `_isatty(fd)` on msvcrt.
+![target(unix)]
 intrinsic function isatty(fd: i32) -> i32;
+
+![target(windows)]
+function isatty(fd: i32) -> i32 {
+    return _isatty(fd);
+}
 
 // va_arg pluck helpers used by codegen for variadic dispatch.
 intrinsic function va_arg_i32(args: void*) -> i32;
