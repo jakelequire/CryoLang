@@ -17,6 +17,15 @@ import Compiler::DeclIndex;
 import Utils::Logger;
 import std::collections::hashmap;
 
+/// Where a module's source originates, driving which per-package subtree
+/// (`std/`, `local/`, or `<depname>/`) its object/IR output lands in.
+/// `Dep` carries the dependency name in `ModuleInfo.origin_name`.
+type enum ModuleOrigin {
+    Local;
+    Stdlib;
+    Dep;
+}
+
 /// Metadata about a single compilation module (source file).
 type struct ModuleInfo {
     name:           SymbolStr;
@@ -24,6 +33,12 @@ type struct ModuleInfo {
     namespace_name: SymbolStr;
     dependencies:   SymbolStr[];
     processed:      boolean;
+
+    // Source origin, classified by the orchestrator after discovery from the
+    // module's `file_path` (under stdlib_root => Stdlib, under a dependency
+    // root => Dep, else Local).  Defaults to Local at construction.
+    origin:         ModuleOrigin;
+    origin_name:    string;       // dependency name when origin == Dep, else ""
 
     // Per-module export tracking (populated during Declaration Collection).
     // Used by codegen to enumerate what a module defines.
@@ -41,6 +56,8 @@ type struct ModuleInfo {
             namespace_name:     SymbolStr::empty(),
             dependencies:       [],
             processed:          false,
+            origin:             ModuleOrigin::Local,
+            origin_name:        "",
             exports_functions:  [],
             exports_types:      [],
             specializations:    [],
@@ -54,9 +71,34 @@ type struct ModuleInfo {
             namespace_name:     ns,
             dependencies:       [],
             processed:          false,
+            origin:             ModuleOrigin::Local,
+            origin_name:        "",
             exports_functions:  [],
             exports_types:      [],
             specializations:    [],
+        };
+    }
+
+    /// Output subdirectory name for an origin: `"std"`, `"local"`, or the
+    /// dependency name.  Single source of truth shared by codegen
+    /// (`legacy_obj_path`) and the build manifest so their per-package paths
+    /// can never drift.  Static (not an instance method) so callers holding
+    /// only the enum + name can reach it, and to side-step the "unsized enum
+    /// return in impl block" codegen wart that bites instance methods.
+    static origin_subdir(origin: ModuleOrigin, origin_name: string) -> string {
+        return match (origin) {
+            ModuleOrigin::Stdlib => { "std" }
+            ModuleOrigin::Dep    => { origin_name }
+            ModuleOrigin::Local  => { "local" }
+        };
+    }
+
+    /// Short label for an origin kind, recorded in the build manifest.
+    static origin_kind_label(origin: ModuleOrigin) -> string {
+        return match (origin) {
+            ModuleOrigin::Stdlib => { "stdlib" }
+            ModuleOrigin::Dep    => { "dep" }
+            ModuleOrigin::Local  => { "local" }
         };
     }
 

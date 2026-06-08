@@ -45,12 +45,25 @@ type enum ResolveMode {
 }
 
 
+/// A single harvested dependency source root, tagged with the owning
+/// dependency's name so the orchestrator can classify each loaded module's
+/// origin and route its object/IR output into a `<depname>/` subtree.
+type struct DepRoot {
+    /// Path in the form the module loader expects: relative-to-consumer
+    /// for path deps (the loader prefixes `project_root`), absolute for
+    /// git deps.  This is what gets pushed into the loader's scan list.
+    path:  string;
+    /// The dependency's name (the `[dependencies]` table key) — used as
+    /// the per-package output folder name.
+    name:  string;
+}
+
 type struct ResolveOutcome {
-    /// Source roots the module loader should add to its scan list.
-    /// Always populated even when `failed` is true (so debug builds
-    /// can see partial progress); the caller MUST check `failed`
-    /// before proceeding.
-    roots:  string[];
+    /// Source roots the module loader should add to its scan list, each
+    /// tagged with its owning dependency name.  Always populated even when
+    /// `failed` is true (so debug builds can see partial progress); the
+    /// caller MUST check `failed` before proceeding.
+    roots:  DepRoot[];
     /// True <=> at least one dep failed to resolve.
     failed: boolean;
     /// The lockfile produced by Fetch/Update.  In Build mode this is
@@ -198,7 +211,7 @@ function resolve_path_dep(cfg: ProjectConfig*,
         outcome.failed = true;
         return;
     }
-    harvest_roots(&dep_cfg, dep_root, dep.path, outcome);
+    harvest_roots(&dep_cfg, dep_root, dep.path, dep.name, outcome);
     walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
 }
 
@@ -308,7 +321,7 @@ function resolve_git_dep(cfg: ProjectConfig*,
     // Harvest using the absolute checkout path so source roots are
     // self-contained; the consumer's project_root is irrelevant for
     // git deps.
-    harvest_roots_abs(&dep_cfg, dep_root, outcome);
+    harvest_roots_abs(&dep_cfg, dep_root, dep.name, outcome);
     walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
 }
 
@@ -385,12 +398,19 @@ function ref_kind_label(k: GitRefKind) -> string {
 function harvest_roots(dep_cfg: ProjectConfig*,
                        dep_root: string,
                        path_for_loader: string,
+                       dep_name: string,
                        outcome: ResolveOutcome*) -> void {
     if (dep_cfg.lib.is_present() && intrinsics::strlen(dep_cfg.lib.source_dir) > 0) {
-        outcome.roots.push(format("%s/%s", path_for_loader, dep_cfg.lib.source_dir));
+        outcome.roots.push(DepRoot {
+            path: format("%s/%s", path_for_loader, dep_cfg.lib.source_dir),
+            name: dep_name,
+        });
     }
     for (mut j: int = 0; j < dep_cfg.source_paths.length; j++) {
-        outcome.roots.push(format("%s/%s", path_for_loader, dep_cfg.source_paths[j]));
+        outcome.roots.push(DepRoot {
+            path: format("%s/%s", path_for_loader, dep_cfg.source_paths[j]),
+            name: dep_name,
+        });
     }
 }
 
@@ -398,12 +418,19 @@ function harvest_roots(dep_cfg: ProjectConfig*,
 /// live outside the consumer's project tree.
 function harvest_roots_abs(dep_cfg: ProjectConfig*,
                            dep_root: string,
+                           dep_name: string,
                            outcome: ResolveOutcome*) -> void {
     if (dep_cfg.lib.is_present() && intrinsics::strlen(dep_cfg.lib.source_dir) > 0) {
-        outcome.roots.push(format("%s/%s", dep_root, dep_cfg.lib.source_dir));
+        outcome.roots.push(DepRoot {
+            path: format("%s/%s", dep_root, dep_cfg.lib.source_dir),
+            name: dep_name,
+        });
     }
     for (mut j: int = 0; j < dep_cfg.source_paths.length; j++) {
-        outcome.roots.push(format("%s/%s", dep_root, dep_cfg.source_paths[j]));
+        outcome.roots.push(DepRoot {
+            path: format("%s/%s", dep_root, dep_cfg.source_paths[j]),
+            name: dep_name,
+        });
     }
 }
 

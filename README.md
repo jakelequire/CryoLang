@@ -123,8 +123,9 @@ Build and run:
 cryo run
 ```
 
-`cryo build` compiles to `build/hello` (the final binary sits at the build
-root; intermediates live under `build/.cryo/<profile>/`). `cryo run` builds
+`cryo build` compiles to `build/hello` (the final binary is hoisted to the
+build root; intermediates live under `build/target/<profile>/`, grouped per
+package: `std/`, `local/`, and one subtree per dependency). `cryo run` builds
 and executes.
 
 ---

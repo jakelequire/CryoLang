@@ -2353,19 +2353,31 @@ default = "release"                 # release | debug
 An explicit `[compiler] optimize` overrides the profile's level; `--opt-level=N`
 overrides everything; `-g` forces debug info on regardless of profile.
 
-**Build directory layout.** The final artifact lands at the **root** of
-`output_dir`; everything else is internal:
+**Build directory layout.** The final artifact is **hoisted** to the root of
+`output_dir` so it runs as `build/<name>` regardless of profile; everything
+else lives under a visible, per-profile cache (`target/<profile>/`) grouped by
+**package origin** — the standard library (`std/`), the local project
+(`local/`), and one subtree per third-party dependency (`<depname>/`):
 
 ```
 build/
-├── <name>                  # final executable           (cryo run / [[bin]])
-├── lib<name>.a             # final library archive       ([lib] target)
-├── <name>.ll               # combined LLVM IR            (when emit_llvm)
-├── build-manifest.json     # build metadata + fingerprint
-└── .cryo/<profile>/        # hidden per-profile cache
-    ├── deps/   *.o          # per-module objects
-    ├── ir/     *.ll         # per-module IR (when emit_llvm)
-    └── incremental/         # rebuild fingerprint
+├── <name>                          # hoisted final executable  (cryo run / [[bin]])
+├── lib<name>.a                     # hoisted final library     ([lib] target)
+└── target/
+    └── <profile>/                  # release | debug
+        ├── <name>                  # per-profile build (the hoist source)
+        ├── <name>.ll               # combined LLVM IR          (when emit_llvm)
+        ├── build-manifest.json     # per-profile metadata + fingerprint
+        ├── std/                    # standard library package
+        │   ├── deps/  *.o          #   per-module objects
+        │   └── ir/    *.ll         #   per-module IR (when emit_llvm)
+        ├── local/                  # the local project package
+        │   ├── deps/  *.o
+        │   ├── ir/    *.ll
+        │   └── incremental/        #   rebuild fingerprint
+        └── <depname>/              # one subtree per dependency
+            ├── deps/  *.o
+            └── ir/    *.ll
 ```
 
 `cryo build` is incremental: if no input changed (sources, the resolved knobs,
@@ -2467,7 +2479,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `-g`, `--debug-info` | Emit DWARF debug info. |
 | `--release` | Build with the `release` profile (O2, no debug info). |
 | `--dev` | Build with the `debug` profile (O0 + DWARF). |
-| `--profile=NAME` | Build with a named profile (cache under `build/.cryo/NAME/`). |
+| `--profile=NAME` | Build with a named profile (cache under `build/target/NAME/`). |
 | `--no-incremental` | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable). |
 

@@ -68,7 +68,8 @@ type struct CompilerConfig {
     /// to multiple targets without editing the file.
     target_triple_override: string;
     /// Single-file `-o PATH` / `--output PATH` override.  Empty string
-    /// ("") keeps the legacy `build/obj/<module>.o` layout.  Output
+    /// ("") keeps the per-origin `target/<profile>/<origin>/deps/<module>.o`
+    /// layout.  Output
     /// kind is inferred from the path extension into `output_kind`
     /// so codegen can branch without re-parsing.
     output_path_override: string;
@@ -339,6 +340,17 @@ function lock_path_for(consumer_root: string) -> string {
         return "cryoconfig.lock";
     }
     return format("%s/cryoconfig.lock", consumer_root);
+}
+
+/// True when `path` lies under directory `dir` (i.e. begins with `dir`
+/// followed by a `/` boundary).  Used by module-origin classification to
+/// avoid sibling-prefix false matches (e.g. `stdlibfoo` vs `stdlib`).
+function origin_path_under(path: string, dir: string) -> boolean {
+    const dlen: u64 = intrinsics::strlen(dir);
+    if (dlen == 0) { return false; }
+    if (intrinsics::strlen(path) <= dlen) { return false; }
+    if (intrinsics::strncmp(path, dir, dlen) != 0) { return false; }
+    return path[dlen] == '/';
 }
 
 /// Build a ProjectConfig view that compiles the `[lib]` half of a
@@ -854,7 +866,7 @@ type struct CompilerInstance {
         // `--profile=NAME` > cryoconfig `[profile] default` > built-in
         // `release`. The selected name flows into `config.profile` BEFORE the
         // clone below, so the per-profile cache subtree
-        // (`<output_dir>/.cryo/<profile>/`) is consistent across codegen,
+        // (`<output_dir>/target/<profile>/`) is consistent across codegen,
         // linking, and the manifest.
         if (intrinsics::strlen(this.config.profile_override) > 0) {
             config.profile = this.config.profile_override;
@@ -948,8 +960,9 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
         for (mut dr: int = 0; dr < dep_outcome.roots.length; dr++) {
-            effective_roots.push(dep_outcome.roots[dr]);
-            cdebug("[Compiler] Dependency scan root: %s\n", dep_outcome.roots[dr]);
+            effective_roots.push(dep_outcome.roots[dr].path);
+            cdebug("[Compiler] Dependency scan root: %s (%s)\n",
+                dep_outcome.roots[dr].path, dep_outcome.roots[dr].name);
         }
 
         mut loader: ModuleLoader = ModuleLoader::new(
@@ -1077,6 +1090,45 @@ type struct CompilerInstance {
             ctx.module_graph.module_count(), ctx.module_graph.modules.length);
         cdebug("[Compiler] name_index.length=%u\n", ctx.module_graph.name_index.length());
 
+        // Classify each discovered module's origin from its file_path so
+        // codegen and the build manifest route object/IR output into the
+        // matching per-package subtree (`std/`, `local/`, `<depname>/`).
+        // Done after ALL discovery so late-discovered stdlib modules
+        // (prelude, test runner, fmt::interp) are tagged Stdlib too.  The
+        // dep-root prefix mirrors ModuleLoader's scan-root form: relative
+        // dep roots are prefixed with project_root before scanning.
+        for (mut mci: u32 = 0; mci < ctx.module_graph.modules.length; mci++) {
+            const mci_info: ModuleInfo* = &ctx.module_graph.modules[mci];
+            const fpath: string = mci_info.file_path;
+            if (!config.no_std && intrinsics::strlen(stdlib_root) > 0
+                    && origin_path_under(fpath, stdlib_root)) {
+                mci_info.origin = ModuleOrigin::Stdlib;
+                mci_info.origin_name = "";
+                continue;
+            }
+            mut matched_dep: boolean = false;
+            for (mut drc: int = 0; drc < dep_outcome.roots.length; drc++) {
+                const dr_path: string = dep_outcome.roots[drc].path;
+                const dr_base: string =
+                    if (intrinsics::strlen(config.project_root) == 0
+                        || intrinsics::strcmp(config.project_root, ".") == 0) {
+                        dr_path
+                    } else {
+                        format("%s/%s", config.project_root, dr_path)
+                    };
+                if (origin_path_under(fpath, dr_base)) {
+                    mci_info.origin = ModuleOrigin::Dep;
+                    mci_info.origin_name = dep_outcome.roots[drc].name;
+                    matched_dep = true;
+                    break;
+                }
+            }
+            if (!matched_dep) {
+                mci_info.origin = ModuleOrigin::Local;
+                mci_info.origin_name = "";
+            }
+        }
+
         if (ctx.module_graph.module_count() == 0) {
             intrinsics::fprintf(g_stderr, "error: no modules discovered\n");
             return CompilationResult::failed(1, 0);
@@ -1123,15 +1175,24 @@ type struct CompilerInstance {
                 mod_entries.push(BuildManifest::ModuleEntry {
                     namespace_name: ctx.intern_table.resolve(minfo.name),
                     source_path:    minfo.file_path,
+                    origin_subdir:  ModuleInfo::origin_subdir(minfo.origin, minfo.origin_name),
+                    origin_kind:    ModuleInfo::origin_kind_label(minfo.origin),
                 });
             }
             if (!config.no_std && intrinsics::strlen(stdlib_root) > 0) {
                 manifest_stdlib_archive = format("%s/.bin/libcryo.a", stdlib_root);
             }
-            // Final artifact path(s) this build will produce.
+            // Final artifact path(s) this build will produce.  For
+            // executables, require BOTH the hoisted build-root binary (index
+            // 0, the runnable path) AND the per-profile link target: if either
+            // is missing the short-circuit is skipped, so a deleted
+            // `build/<name>` forces a re-hoist and a deleted per-profile
+            // artifact forces a relink.
             if (config.requires_entry_point()) {
                 manifest_artifacts.push(
                     ctx.project_config.bin_artifact_path(ctx.mode.skip_user_main()));
+                manifest_artifacts.push(
+                    ctx.project_config.profile_bin_path(ctx.mode.skip_user_main()));
             } else {
                 const archive_name: string = match (config.target_type) {
                     TargetType::Stdlib => { "libcryo.a" }
@@ -1603,16 +1664,37 @@ type struct CompilerInstance {
         if (!phase6_failed && ctx.mode.codegen_enabled()) {
             cdebug("[Compiler] Phase 7: Codegen (%u modules)\n", n);
 
-            // Per-module LLVM IR (`.ll`) output dir. Lives under the hidden
-            // per-profile cache (`<output_dir>/.cryo/<profile>/ir`); the
-            // linker's combined-IR dump (`run_linking`) globs this same dir,
-            // and selfhost-check's stage-3/stage-4 byte-identity gate reads
-            // the resulting `<name>.ll`. Keep this path in lockstep with
-            // `ProjectConfig::ir_dir()`.
-            mut ir_dir: string = "build/.cryo/release/ir";
-            if (ctx.project_config != null) {
-                ir_dir = ctx.project_config.ir_dir();
+            // Concise per-package build summary.  Phase 7 only runs on a real
+            // (non-short-circuited) build and never under LSP, so this is safe
+            // to print to stdout.  Test mode owns its own runner output, so
+            // skip the summary there to keep `cryo test` output clean.
+            if (!ctx.mode.skip_user_main()) {
+                mut n_std: u32 = 0;
+                mut n_local: u32 = 0;
+                mut n_dep: u32 = 0;
+                for (mut si: u32 = 0; si < n; si++) {
+                    const sinfo: ModuleInfo* = &ctx.module_graph.modules[order[si]];
+                    match (sinfo.origin) {
+                        ModuleOrigin::Stdlib => { n_std += 1; }
+                        ModuleOrigin::Dep    => { n_dep += 1; }
+                        ModuleOrigin::Local  => { n_local += 1; }
+                    }
+                }
+                intrinsics::printf(
+                    "Building %s [%s]: %u local",
+                    config.project_name, config.profile, n_local);
+                if (n_std > 0) { intrinsics::printf(", %u std", n_std); }
+                if (n_dep > 0) { intrinsics::printf(", %u dep", n_dep); }
+                intrinsics::printf(" module(s)\n");
             }
+
+            // Per-module LLVM IR (`.ll`) output dir is computed PER MODULE at
+            // the write site below, grouped by origin under the per-profile
+            // cache (`<output_dir>/target/<profile>/<origin>/ir`). The linker's
+            // combined-IR dump (`run_linking`) globs `<profile>/*/ir/*.ll`
+            // across all origins, and selfhost-check's stage-3/stage-4
+            // byte-identity gate reads the resulting `<name>.ll`. Keep these
+            // paths in lockstep with `ProjectConfig::ir_dir_for()`.
 
             pipeline.set_passes([
                 PassID::IRGeneration,
@@ -1671,6 +1753,12 @@ type struct CompilerInstance {
                         mn_buf[mn_len] = 0;
                         for (mut k: u64 = 0; k < mn_len; k++) {
                             if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
+                        }
+                        mut ir_dir: string = "build/target/release/local/ir";
+                        if (ctx.project_config != null) {
+                            ir_dir = ctx.project_config.ir_dir_for(
+                                ModuleInfo::origin_subdir(
+                                    mod_info.origin, mod_info.origin_name));
                         }
                         ProjectConfig::mkdir_p(ir_dir);
                         const ll_path: string = format("%s/%s.ll", ir_dir, mn_buf as string);
