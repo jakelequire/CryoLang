@@ -78,10 +78,13 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def strip_binary(path: Path) -> bool:
-    if not shutil.which("strip"):
+def strip_binary(path: Path, tool: str = "strip") -> bool:
+    # A PE/.exe must be stripped with a PE-aware strip (the mingw cross
+    # binutils `x86_64-w64-mingw32-strip`); the host GNU `strip` may refuse
+    # or corrupt it.  Callers pin `bin/cryo.exe` with --strip-tool.
+    if not shutil.which(tool):
         return False
-    r = subprocess.run(["strip", str(path)], capture_output=True)
+    r = subprocess.run([tool, str(path)], capture_output=True)
     return r.returncode == 0
 
 
@@ -138,6 +141,9 @@ def main() -> int:
                     help=f"pinned binary path (default: {DEFAULT_PIN})")
     ap.add_argument("--no-strip", action="store_true",
                     help="skip the strip step")
+    ap.add_argument("--strip-tool", default="strip",
+                    help="strip executable to use (default: strip; for a "
+                         "Windows .exe pass x86_64-w64-mingw32-strip)")
     args = ap.parse_args()
 
     source: Path = args.source
@@ -154,10 +160,10 @@ def main() -> int:
 
     stripped = False
     if not args.no_strip:
-        stripped = strip_binary(pin)
+        stripped = strip_binary(pin, args.strip_tool)
         if not stripped:
-            print("    (warning: strip unavailable or failed; binary not stripped)",
-                  file=sys.stderr)
+            print(f"    (warning: '{args.strip_tool}' unavailable or failed; "
+                  f"binary not stripped)", file=sys.stderr)
 
     sidecar = write_sidecar(pin, source, stripped)
 

@@ -44,6 +44,43 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import ffi::libc;
+import ffi::syscall;
+
+
+// Per-OS thread-local storage primitives.  POSIX pthread keys vs Win32 TLS
+// slots; both index the per-thread slot with a `u32`, so the `ThreadLocal`
+// struct is platform-agnostic and only these gated free functions differ.
+// ConfigGating only evaluates file-scope declarations, so the methods
+// delegate here.  (Like the POSIX path, the Windows path runs no per-thread
+// destructor at thread exit - the v1 leak note in the module doc applies to
+// both; call `clear()` from each worker thread.)
+
+![target(unix)]
+private function os_tls_create(key: u32*) -> i32 {
+    return pthread_key_create(key, null);   // null destructor (see module doc)
+}
+![target(windows)]
+private function os_tls_create(key: u32*) -> i32 {
+    const idx: u32 = syscall::TlsAlloc();
+    if (idx == 0xFFFFFFFFu32) { return 1; }   // TLS_OUT_OF_INDEXES
+    *key = idx;
+    return 0;
+}
+
+![target(unix)]
+private function os_tls_get(key: u32) -> u8* { return pthread_getspecific(key); }
+![target(windows)]
+private function os_tls_get(key: u32) -> u8* { return syscall::TlsGetValue(key); }
+
+![target(unix)]
+private function os_tls_set(key: u32, val: u8*) -> void { pthread_setspecific(key, val); }
+![target(windows)]
+private function os_tls_set(key: u32, val: u8*) -> void { syscall::TlsSetValue(key, val); }
+
+![target(unix)]
+private function os_tls_delete(key: u32) -> void { pthread_key_delete(key); }
+![target(windows)]
+private function os_tls_delete(key: u32) -> void { syscall::TlsFree(key); }
 
 
 type struct ThreadLocal<T> {
@@ -57,9 +94,9 @@ type struct ThreadLocal<T> {
     static new(init: () -> T) -> ThreadLocal<T> {
         mut key: u32 = 0u32;
         // Null destructor: see the leak note in the module doc.
-        const rc: i32 = pthread_key_create(&key, null);
+        const rc: i32 = os_tls_create(&key);
         if (rc != 0) {
-            intrinsics::panic("ThreadLocal::new: pthread_key_create failed",
+            intrinsics::panic("ThreadLocal::new: os_tls_create failed",
                               FILE, LINE);
         }
         return ThreadLocal<T> { key: key, init: init };
@@ -70,7 +107,7 @@ type struct ThreadLocal<T> {
     /// lifetime of the thread (or until `clear()` is called by the
     /// same thread).
     get(&this) -> T* {
-        const raw: u8* = pthread_getspecific(this.key);
+        const raw: u8* = os_tls_get(this.key);
         if (raw != null) {
             return raw as T*;
         }
@@ -81,7 +118,7 @@ type struct ThreadLocal<T> {
             Result::Ok(buf) => {
                 const tp: T* = buf.cast<T>().as_ptr();
                 *tp = (this.init)();
-                pthread_setspecific(this.key, tp as u8*);
+                os_tls_set(this.key, tp as u8*);
                 return tp;
             }
             Result::Err(_) => {
@@ -96,7 +133,7 @@ type struct ThreadLocal<T> {
     /// threads' values are untouched.
     clear(&this) -> void
     where T: Drop {
-        const raw: u8* = pthread_getspecific(this.key);
+        const raw: u8* = os_tls_get(this.key);
         if (raw == null) { return; }
         // Run T's destructor on the stored value before reclaiming its
         // storage, so owning fields (String, Box, ...) inside T are released
@@ -107,7 +144,7 @@ type struct ThreadLocal<T> {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const layout: Layout = Layout::of<T>();
         alloc.deallocate(NonNull::new(raw), layout);
-        pthread_setspecific(this.key, null);
+        os_tls_set(this.key, null);
     }
 }
 
@@ -116,6 +153,6 @@ type struct ThreadLocal<T> {
 /// via `clear()` from each thread before dropping the ThreadLocal.
 implement<T> trait Drop for struct ThreadLocal<T> {
     drop(mut &this) -> void {
-        pthread_key_delete(this.key);
+        os_tls_delete(this.key);
     }
 }

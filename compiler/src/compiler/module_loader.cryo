@@ -157,13 +157,12 @@ type struct ModuleLoader {
         mut entry: void* = readdir(dp);
         while (entry != null) {
             const name: string = dirent_name(entry);
-            const dtype: i32 = dirent_type(entry);
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
                 entry = readdir(dp);
                 continue;
             }
             const full_path: string = format("%s/%s", dir, name);
-            if (dtype == 1) {
+            if (this.is_dir_path(full_path)) {
                 // `tests/negative/` holds compile-fail cases: files that are
                 // intentionally malformed so the compiler rejects them. They
                 // must NOT be compiled into the shared test binary (one bad
@@ -179,7 +178,7 @@ type struct ModuleLoader {
                         intern, graph, sink, full_path, debug)) {
                     overall_ok = false;
                 }
-            } else if (dtype == 0) {
+            } else {
                 const name_len: u64 = strlen(name);
                 if (name_len > 5) {
                     const ext: string = ptr_add(name as void*,
@@ -198,6 +197,18 @@ type struct ModuleLoader {
         return overall_ok;
     }
 
+    /// Portable directory test.  `opendir` succeeds only on directories, so
+    /// it tells files from subdirectories without relying on dirent's
+    /// `d_type` field - which glibc populates but mingw-w64's `struct dirent`
+    /// omits entirely (`dirent_type` is therefore meaningless on Windows).
+    /// Keyed on the full path so it is independent of the dirent layout.
+    is_dir_path(&this, path: string) -> boolean {
+        const d: void* = opendir(path);
+        if (d == null) { return false; }
+        closedir(d);
+        return true;
+    }
+
     /// Recursively walk a directory, lex every .cryo file to extract its
     /// namespace declaration, and register namespace -> file_path in ns_map.
     scan_all_project_files(mut &this, dir: string, debug: boolean) -> void {
@@ -207,7 +218,6 @@ type struct ModuleLoader {
         mut entry: void* = readdir(dp);
         while (entry != null) {
             const name: string = dirent_name(entry);
-            const dtype: i32 = dirent_type(entry);
 
             // Skip . and ..
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
@@ -217,11 +227,11 @@ type struct ModuleLoader {
 
             const full_path: string = format("%s/%s", dir, name);
 
-            if (dtype == 1) {
-                // FileType::Directory: recurse into subdirectory
+            if (this.is_dir_path(full_path)) {
+                // Recurse into subdirectory.
                 this.scan_all_project_files(full_path, debug);
-            } else if (dtype == 0) {
-                // FileType::File: regular file; check for .cryo extension
+            } else {
+                // Regular file; check for .cryo extension.
                 const name_len: u64 = strlen(name);
                 if (name_len > 5) {
                     const ext: string = ptr_add(name as void*, (name_len - 5) as i64) as string;

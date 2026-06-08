@@ -35,7 +35,47 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import ffi::libc;
+import ffi::syscall;
 import sync::mutex;
+
+
+// Per-OS condition-variable primitive.  pthread_cond_t (48 bytes on Linux
+// x86_64) vs Win32 CONDITION_VARIABLE (8 bytes) both fit; a zero buffer is
+// the valid init state for both.  The OS divergence lives in gated free
+// functions (ConfigGating never sees method bodies) and the methods delegate.
+//
+// `wait` pairs the condvar with the Mutex's lock buffer.  On Windows that
+// buffer holds the mutex's SRWLOCK, so the wait uses SleepConditionVariableSRW
+// with Flags=0 (the mutex acquires it exclusively).  INFINITE = 0xFFFFFFFF.
+// Return convention follows pthread (0 == success).
+
+![target(unix)]
+private function cond_init_raw(buf: u8*) -> i32 { return pthread_cond_init(buf, null); }
+![target(windows)]
+private function cond_init_raw(buf: u8*) -> i32 { syscall::InitializeConditionVariable(buf); return 0; }
+
+![target(unix)]
+private function cond_wait_raw(cond: u8*, mtx: u8*) -> i32 { return pthread_cond_wait(cond, mtx); }
+![target(windows)]
+private function cond_wait_raw(cond: u8*, mtx: u8*) -> i32 {
+    if (syscall::SleepConditionVariableSRW(cond, mtx, 0xFFFFFFFFu32, 0u32) != 0) { return 0; }
+    return 1;
+}
+
+![target(unix)]
+private function cond_signal_raw(buf: u8*) -> void { pthread_cond_signal(buf); }
+![target(windows)]
+private function cond_signal_raw(buf: u8*) -> void { syscall::WakeConditionVariable(buf); }
+
+![target(unix)]
+private function cond_broadcast_raw(buf: u8*) -> void { pthread_cond_broadcast(buf); }
+![target(windows)]
+private function cond_broadcast_raw(buf: u8*) -> void { syscall::WakeAllConditionVariable(buf); }
+
+![target(unix)]
+private function cond_destroy_raw(buf: u8*) -> void { pthread_cond_destroy(buf); }
+![target(windows)]
+private function cond_destroy_raw(buf: u8*) -> void { }
 
 
 // 48-byte opaque pthread_cond_t buffer, heap-pinned for address
@@ -67,7 +107,7 @@ type struct CondVar {
         const typed: NonNull<CondVarInner> = raw.cast<CondVarInner>();
         const inner_ptr: CondVarInner* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        const rc: i32 = pthread_cond_init(buf_ptr, null);
+        const rc: i32 = cond_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
@@ -88,9 +128,9 @@ type struct CondVar {
     wait<T, A>(&this, mutex: &Mutex<T, A>, guard: mut &MutexGuard<T, A>) -> void {
         const cond_buf:  u8* = &this.inner.pthread_buf[0];
         const mutex_buf: u8* = mutex.raw_pthread_buf();
-        const rc: i32 = pthread_cond_wait(cond_buf, mutex_buf);
+        const rc: i32 = cond_wait_raw(cond_buf, mutex_buf);
         if (rc != 0) {
-            intrinsics::panic("CondVar::wait: pthread_cond_wait failed", FILE, LINE);
+            intrinsics::panic("CondVar::wait: cond_wait_raw failed", FILE, LINE);
         }
     }
 
@@ -100,7 +140,7 @@ type struct CondVar {
     /// the consumer to check the predicate before sleeping).
     notify_one(&this) -> void {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        pthread_cond_signal(buf_ptr);
+        cond_signal_raw(buf_ptr);
     }
 
     /// Wake up every thread currently waiting on this condition
@@ -108,7 +148,7 @@ type struct CondVar {
     /// consumer must re-check the predicate after waking.
     notify_all(&this) -> void {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        pthread_cond_broadcast(buf_ptr);
+        cond_broadcast_raw(buf_ptr);
     }
 }
 
@@ -117,7 +157,7 @@ implement trait Drop for struct CondVar {
         if (this.inner == null) { return; }
         const inner_ptr: CondVarInner* = this.inner;
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        pthread_cond_destroy(buf_ptr);
+        cond_destroy_raw(buf_ptr);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const header: Layout = Layout::of<CondVarInner>();
         alloc.deallocate(NonNull::new(this.inner as u8*), header);

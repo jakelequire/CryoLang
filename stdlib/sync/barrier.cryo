@@ -21,6 +21,42 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import ffi::libc;
+import ffi::syscall;
+
+
+// Per-OS barrier primitive.  pthread_barrier_t (32 bytes on Linux x86_64) vs
+// Win32 SYNCHRONIZATION_BARRIER (also 32 bytes) both fit the buffer.
+// ConfigGating only sees file-scope declarations, so the OS calls live in
+// these gated free functions and the methods delegate.
+//
+// `barrier_wait_raw` returns a leader sentinel that the caller tests with
+// "non-zero and not an errno": pthread returns PTHREAD_BARRIER_SERIAL_THREAD
+// to the leader and 0 to the rest; EnterSynchronizationBarrier returns TRUE
+// (1) to exactly one thread and FALSE (0) to the others - both fit that test.
+
+![target(unix)]
+private function barrier_init_raw(buf: u8*, count: u32) -> i32 {
+    return pthread_barrier_init(buf, null, count);
+}
+![target(windows)]
+private function barrier_init_raw(buf: u8*, count: u32) -> i32 {
+    // lSpinCount = -1 -> default spin.  Returns TRUE on success; map to the
+    // pthread convention (0 == success).
+    if (syscall::InitializeSynchronizationBarrier(buf, count as i32, -1i32) != 0) { return 0; }
+    return 1;
+}
+
+![target(unix)]
+private function barrier_wait_raw(buf: u8*) -> i32 { return pthread_barrier_wait(buf); }
+![target(windows)]
+private function barrier_wait_raw(buf: u8*) -> i32 {
+    return syscall::EnterSynchronizationBarrier(buf, 0u32);
+}
+
+![target(unix)]
+private function barrier_destroy_raw(buf: u8*) -> void { pthread_barrier_destroy(buf); }
+![target(windows)]
+private function barrier_destroy_raw(buf: u8*) -> void { syscall::DeleteSynchronizationBarrier(buf); }
 
 
 type struct BarrierInner {
@@ -54,9 +90,9 @@ type struct Barrier {
                 const typed: NonNull<BarrierInner> = raw.cast<BarrierInner>();
                 const inner_ptr: BarrierInner* = typed.as_ptr();
                 const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-                const rc: i32 = pthread_barrier_init(buf_ptr, null, count);
+                const rc: i32 = barrier_init_raw(buf_ptr, count);
                 if (rc != 0) {
-                    intrinsics::panic("Barrier::new: pthread_barrier_init failed", FILE, LINE);
+                    intrinsics::panic("Barrier::new: barrier_init_raw failed", FILE, LINE);
                 }
                 return Barrier { inner: inner_ptr };
             }
@@ -73,7 +109,7 @@ type struct Barrier {
     /// cycle once all waiters resume.
     wait(&this) -> BarrierWaitResult {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_barrier_wait(buf_ptr);
+        const rc: i32 = barrier_wait_raw(buf_ptr);
         // POSIX returns PTHREAD_BARRIER_SERIAL_THREAD (-1, but a
         // positive sentinel on glibc) for the leader; 0 for the
         // others; an errno on failure.  glibc's value is constant
@@ -89,7 +125,7 @@ implement trait Drop for struct Barrier {
         if (this.inner == null) { return; }
         const inner_ptr: BarrierInner* = this.inner;
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        pthread_barrier_destroy(buf_ptr);
+        barrier_destroy_raw(buf_ptr);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         const header: Layout = Layout::of<BarrierInner>();
         alloc.deallocate(NonNull::new(this.inner as u8*), header);
