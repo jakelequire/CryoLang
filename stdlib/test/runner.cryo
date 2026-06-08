@@ -45,6 +45,7 @@ import io::error;
 import io::stdio;
 import fmt::display;
 import ffi::libc;
+import ffi::syscall;
 import process::child;
 import test::descriptor;
 import test::error;
@@ -114,6 +115,12 @@ type struct RunOptions {
     /// True iff `--timeout=` was passed explicitly (suppresses the
     /// `CRYO_TEST_TIMEOUT` env default).
     timeout_explicit: boolean;
+    /// Re-exec child selector: `>= 0` means "run only descriptors[child_idx]
+    /// and exit 0/1, no header/loop".  Set by the internal
+    /// `--test-runner-child=<n>` flag the Windows runner passes when it
+    /// CreateProcess-re-execs the test binary once per test (Windows has no
+    /// `fork`, so each test runs in a fresh process selected by index).
+    child_idx: i64;
 
     static default() -> RunOptions {
         return RunOptions {
@@ -129,6 +136,7 @@ type struct RunOptions {
             color_active:    false,
             timeout_secs:    60,
             timeout_explicit: false,
+            child_idx:       -1,
         };
     }
 
@@ -215,6 +223,11 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
             if (apply_timeout(&opts, v)) {
                 opts.timeout_explicit = true;
             }
+        } else if (arg_starts_with(arg, "--test-runner-child=")) {
+            // Internal: the Windows runner re-execs itself with this flag to
+            // run a single test (by index) in a fresh process.
+            const v: Str = arg.sub_bytes(20, arg.length());
+            opts.child_idx = parse_index(v);
         } else if (arg.length() >= 1 && arg.as_ptr()[0] == 0x2D) { // '-'
             // Unknown flag: warn but keep going.
             intrinsics::printf("warning: unknown flag: %.*s\n",
@@ -232,6 +245,22 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
     }
     apply_env_defaults(&opts);
     return opts;
+}
+
+/// Parse a non-negative decimal index from `v`, or `-1` if empty or
+/// non-numeric.  Used for the internal `--test-runner-child=<n>` selector.
+function parse_index(v: Str) -> i64 {
+    if (v.length() == 0) { return -1; }
+    mut n: i64 = 0;
+    mut i: u64 = 0;
+    const p: u8* = v.as_ptr();
+    while (i < v.length()) {
+        const c: u8 = p[i];
+        if (c < 0x30 || c > 0x39) { return -1; }   // not a digit
+        n = n * 10 + ((c - 0x30) as i64);
+        i = i + 1;
+    }
+    return n;
 }
 
 /// True iff `arg` begins with `prefix` (byte-wise). Used for matching
@@ -487,7 +516,12 @@ function contains_substring(haystack: Str, needle: Str) -> boolean {
 /// always actually runs the test.  When `--ignored` is passed the
 /// runner deliberately wants to execute `![ignore]`-marked tests and
 /// see their real outcome.
-function run_one(d: TestDescriptor, timeout_secs: u32) -> TestOutcome {
+///
+/// `idx` is the test's position in `descriptors`; POSIX ignores it (the
+/// forked child holds `d.func()` directly), but the Windows variant needs it
+/// to tell the re-exec'd child process which test to run.
+![target(unix)]
+function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome {
     // Drain libc-buffered stdio in the parent before fork so the child
     // doesn't inherit a half-full FILE buffer and re-emit it on flush.
     intrinsics::fflush(null);
@@ -523,7 +557,9 @@ function run_one(d: TestDescriptor, timeout_secs: u32) -> TestOutcome {
 
 /// Child-side test invocation. Calls the user function, prints any
 /// `Err` payload to stderr, and exits with a code the parent can
-/// classify. Never returns.
+/// classify. Never returns.  (POSIX fork child; the Windows re-exec child
+/// uses `run_child_single` instead.)
+![target(unix)]
 function run_test_in_child(d: TestDescriptor, timeout_secs: u32) -> void {
     // Arm the per-test watchdog. SIGALRM's default disposition
     // terminates the process; the parent sees the signal and classifies
@@ -557,6 +593,110 @@ function run_test_in_child(d: TestDescriptor, timeout_secs: u32) -> void {
             libc::_exit(1);
         }
     }
+}
+
+/// Re-exec child entry: run exactly one test by index and return its 0/1
+/// exit code (127 for a bad index).  Used on Windows, where each test runs
+/// in a fresh CreateProcess'd copy of the test binary (no fork) selected via
+/// `--test-runner-child=<idx>`.  No watchdog here - the parent enforces the
+/// timeout with WaitForSingleObject (Windows has no in-child SIGALRM).
+function run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64) -> i32 {
+    if (idx >= count) { return 127; }
+    const d: TestDescriptor = descriptors[idx];
+    match (d.func()) {
+        Result::Ok(_) => { return 0; }
+        Result::Err(e) => {
+            mut err: TestError = e;
+            const view: Str = err.message_str();
+            mut stderr_h: Stderr = stderr();
+            match (stderr_h.write_all(view.as_bytes())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+            match (stderr_h.write_all(Slice::from_raw("\n", 1))) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+            return 1;
+        }
+    }
+}
+
+/// Append a `u64` as decimal digits to a `String`.  Used to build the
+/// `--test-runner-child=<idx>` argument for the Windows re-exec.
+function append_u64(out: mut &String, x: u64) -> void {
+    if (x == 0u64) { out.push(0x30u8); return; }
+    mut tmp: u8[24];
+    mut ti: u64 = 0;
+    mut v: u64 = x;
+    while (v > 0u64) {
+        tmp[ti] = ((v % 10u64) + 0x30u64) as u8;
+        ti = ti + 1;
+        v = v / 10u64;
+    }
+    while (ti > 0u64) {
+        ti = ti - 1;
+        out.push(tmp[ti]);
+    }
+}
+
+/// Windows: run one test in a fresh process.  No `fork`, so re-exec the test
+/// binary (GetModuleFileNameA) with `--test-runner-child=<idx>`, wait with the
+/// per-test timeout, and classify the exit code.  Stdio is inherited so the
+/// child's failure output reaches the console; the timeout is enforced here
+/// in the parent (WaitForSingleObject) rather than by an in-child watchdog.
+![target(windows)]
+function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome {
+    intrinsics::fflush(null);
+
+    mut exe_buf: u8[1024];
+    const n: u32 = syscall::GetModuleFileNameA(null, &exe_buf[0], 1024u32);
+    if (n == 0u32 || n >= 1024u32) { return TestOutcome::RunnerError(0); }
+    exe_buf[n as u64] = 0u8;
+
+    // Command line:  "<exe>" --test-runner-child=<idx>\0   (CreateProcessA may
+    // modify the buffer, so it's an owned String).
+    mut cmd: String = String::new();
+    cmd.push(34u8);
+    mut k: u64 = 0;
+    while (k < n as u64) { cmd.push(exe_buf[k]); k = k + 1; }
+    cmd.push(34u8);
+    cmd.push(Str::new(" --test-runner-child="));
+    append_u64(&cmd, idx);
+    cmd.push(0u8);
+
+    mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
+        cb: 104u32, lpReserved: null, lpDesktop: null, lpTitle: null,
+        dwX: 0u32, dwY: 0u32, dwXSize: 0u32, dwYSize: 0u32,
+        dwXCountChars: 0u32, dwYCountChars: 0u32, dwFillAttribute: 0u32,
+        dwFlags: 0u32, wShowWindow: 0u16, cbReserved2: 0u16,
+        lpReserved2: null, hStdInput: null, hStdOutput: null, hStdError: null
+    };
+    mut pi: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
+        hProcess: null, hThread: null, dwProcessId: 0u32, dwThreadId: 0u32
+    };
+    const ok: i32 = syscall::CreateProcessA(null, cmd.as_ptr(), null, null,
+                                            1, 0u32, null, null, &si, &pi);
+    cmd.drop();
+    if (ok == 0) { return TestOutcome::RunnerError(0); }
+    syscall::CloseHandle(pi.hThread);
+
+    const ms: u32 = if (timeout_secs > 0u32) { timeout_secs * 1000u32 } else { 0xFFFFFFFFu32 };
+    const w: u32 = syscall::WaitForSingleObject(pi.hProcess, ms);
+    if (w == 0x102u32) {   // WAIT_TIMEOUT
+        syscall::TerminateProcess(pi.hProcess, 1u32);
+        syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFFu32);
+        syscall::CloseHandle(pi.hProcess);
+        return TestOutcome::Timeout(timeout_secs);
+    }
+    mut code: u32 = 0u32;
+    syscall::GetExitCodeProcess(pi.hProcess, &code);
+    syscall::CloseHandle(pi.hProcess);
+
+    // No signals on Windows: a plain normal-exit ExitStatus drives the same
+    // classifier the POSIX path uses.
+    const st: ExitStatus = ExitStatus { code: code as i32, signal: 0, signaled: false };
+    return classify_outcome(st, d.should_panic, timeout_secs);
 }
 
 /// Translate a child's exit status into a `TestOutcome`, applying the
@@ -933,6 +1073,13 @@ function run_all(argc: i32, argv: u8**,
     // Pin color decision now so reporters don't re-evaluate per test.
     opts.color_active = resolve_color_active(&opts);
 
+    // Re-exec child path (Windows runs one test per CreateProcess): run only
+    // the selected test and exit 0/1, with no header or driver loop.  The
+    // parent process classifies the exit code.
+    if (opts.child_idx >= 0) {
+        return run_child_single(opts.child_idx as u64, descriptors, count);
+    }
+
     // Pre-pass: count how many descriptors actually match the filter so
     // the `running N tests` header is honest.
     mut to_run: u64 = 0;
@@ -1000,7 +1147,7 @@ function run_all(argc: i32, argv: u8**,
         // Always emit a prefix for runs we actually execute so the
         // user can see which test is in flight (helps debug a hang).
         reporter_begin_test(&opts, &rstate, d.name);
-        const outcome: TestOutcome = run_one(d, opts.timeout_secs);
+        const outcome: TestOutcome = run_one(d, i, opts.timeout_secs);
         const failed: boolean = is_failure(outcome);
         reporter_end_test(&opts, &rstate, outcome, d.should_panic);
 
