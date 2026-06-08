@@ -273,6 +273,151 @@ def print_summary(times, total):
 
 
 # ---------------------------------------------------------------------------
+# Windows cross-build verification (optional stage)
+#
+# cryo.exe cannot fully self-host under wine: it can emit objects/IR but there
+# is no linker inside wine, and the compiler's own source imports a C header
+# (llvm_bindings.h) that needs a Windows clang to preprocess.  What IS
+# verifiable, and what this stage does:
+#
+#   1. the self-hosted compiler cross-links a real cryo.exe (mingw + windows
+#      libLLVM-C),
+#   2. that cryo.exe loads + runs under wine (`--version`),
+#   3. CROSS-SELFHOST: cryo.exe run under wine reproduces, byte-for-byte, the
+#      windows IR the Linux compiler emits for the whole stdlib (131 modules).
+#      Both target the MSVC triple - cryo.exe's native default - which lands
+#      the two builds in disjoint cache buckets (host-windows vs the explicit
+#      triple), so they coexist with no --build-dir juggling.
+#
+# Skipped (not failed) when the mingw toolchain, wine, llvm-link, or the
+# fetched .toolchains/llvm-win import lib are absent, so Linux-only checkouts
+# and CI without the Windows bits still pass.
+# ---------------------------------------------------------------------------
+WIN_TRIPLE      = "x86_64-pc-windows-gnu"
+WIN_MSVC_TRIPLE = "x86_64-pc-windows-msvc"
+WIN_LLVM_LIB    = ROOT / ".toolchains" / "llvm-win" / "lib" / "libLLVM-C.dll.a"
+WIN_LLVM_DLL    = ROOT / ".toolchains" / "llvm-win" / "bin" / "LLVM-C.dll"
+MINGW_GCC       = "x86_64-w64-mingw32-gcc"
+LLVM_LINK       = "llvm-link-20"
+
+
+def _win_prereqs_missing():
+    missing = []
+    if not shutil.which(MINGW_GCC):
+        missing.append(f"{MINGW_GCC} (install gcc-mingw-w64-x86-64)")
+    if not shutil.which("wine"):
+        missing.append("wine")
+    if not shutil.which(LLVM_LINK):
+        missing.append(LLVM_LINK)
+    if not WIN_LLVM_LIB.exists():
+        missing.append("windows libLLVM-C (run scripts/fetch-windows-llvm.sh)")
+    return missing
+
+
+def _run(cmd, cwd, log, env=None, allow_fail=False):
+    """Run a subprocess, tee to a log file. Returns (rc, combined_output)."""
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
+    with open(log, "w") as f:
+        p = subprocess.run(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, env=full_env)
+        f.write(p.stdout or "")
+    if p.returncode != 0 and not allow_fail:
+        return p.returncode, p.stdout or ""
+    return p.returncode, p.stdout or ""
+
+
+def _llvm_link(ir_dir_glob_root: Path, out: Path) -> bool:
+    """llvm-link every <root>/*/ir/*.ll into a single -S module text."""
+    ll_files = sorted(str(p) for p in ir_dir_glob_root.glob("*/ir/*.ll"))
+    if not ll_files:
+        return False
+    r = subprocess.run([LLVM_LINK, "-S", *ll_files, "-o", str(out)],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and out.exists()
+
+
+def run_windows_stage(total_start) -> str:
+    """Returns 'ok', 'skip', or 'fail'."""
+    print()
+    print(f"{C.BOLD}==> Windows cross-build verification{C.RESET}")
+    missing = _win_prereqs_missing()
+    if missing:
+        print(f"  {C.YELLOW}↷ skipped{C.RESET} (prerequisites absent):")
+        for m in missing:
+            print(f"      {C.DIM}- {m}{C.RESET}")
+        return "skip"
+
+    wlog = LOG_DIR / "windows"
+    ensure_dir(wlog)
+    cryo_exe = ROOT / "compiler" / "build" / "cryo.exe"
+    # wine: forward-slash Z: path maps to the unix root; the DLL sits next to
+    # the exe so the loader resolves it; silence wine's debug chatter.
+    stdlib_unix = ROOT / "stdlib"
+    wine_env = {"WINEDEBUG": "-all",
+                "CRYO_STDLIB": "Z:" + str(stdlib_unix).replace("\\", "/")}
+
+    # 1. Cross-build cryo.exe via stage-3 (the first pure-source compiler).
+    sys.stdout.write(f"  {C.CYAN}[w1]{C.RESET} cross-build cryo.exe ({WIN_TRIPLE})  ")
+    sys.stdout.flush()
+    rc, _ = _run([str(STAGE3), "build", f"--target={WIN_TRIPLE}", "--no-incremental"],
+                 ROOT / "compiler", wlog / "01-cross-build.log")
+    if rc != 0 or not cryo_exe.exists():
+        print(f"{C.RED}✗ exit {rc}{C.RESET}")
+        print(f"     {C.DIM}log:{C.RESET} {(wlog / '01-cross-build.log').relative_to(ROOT)}")
+        return "fail"
+    shutil.copy2(WIN_LLVM_DLL, cryo_exe.parent / "LLVM-C.dll")
+    print(f"{C.GREEN}✓{C.RESET}")
+
+    # 2. Smoke-run under wine.
+    sys.stdout.write(f"  {C.CYAN}[w2]{C.RESET} wine cryo.exe --version  ")
+    sys.stdout.flush()
+    rc, out = _run(["wine", str(cryo_exe), "--version"], ROOT / "compiler",
+                   wlog / "02-version.log", env=wine_env, allow_fail=True)
+    if "cryo" not in out.lower():
+        print(f"{C.RED}✗ (no version output){C.RESET}")
+        print(f"     {C.DIM}log:{C.RESET} {(wlog / '02-version.log').relative_to(ROOT)}")
+        return "fail"
+    print(f"{C.GREEN}✓{C.RESET}  {C.DIM}{out.strip().splitlines()[0] if out.strip() else ''}{C.RESET}")
+
+    # 3. Cross-selfhost: Linux vs wine windows IR for the stdlib must match.
+    sys.stdout.write(f"  {C.CYAN}[w3]{C.RESET} stdlib cross-selfhost (linux == wine windows IR)  ")
+    sys.stdout.flush()
+    sl = ROOT / "stdlib"
+    bin_root = sl / ".bin" / "target" / "release"
+    # IR_linux: Linux stage-3 emits MSVC-target IR (link bails on the
+    # unsupported triple, but --emit-llvm writes the per-module .ll first).
+    _run([str(STAGE3), "build", f"--target={WIN_MSVC_TRIPLE}", "--emit-llvm",
+          "--no-incremental"], sl, wlog / "03-linux-stdlib.log", allow_fail=True)
+    ir_linux = wlog / "ir_linux.ll"
+    if not _llvm_link(bin_root / WIN_MSVC_TRIPLE, ir_linux):
+        print(f"{C.RED}✗ (no linux windows IR){C.RESET}")
+        return "fail"
+    # IR_wine: cryo.exe under wine compiles the stdlib for its native target
+    # (MSVC) into the host-windows bucket; link fails (no toolchain), IR is
+    # written first.
+    _run(["wine", str(cryo_exe), "build", "--emit-llvm", "--no-incremental"],
+         sl, wlog / "03-wine-stdlib.log", env=wine_env, allow_fail=True)
+    ir_wine = wlog / "ir_wine.ll"
+    if not _llvm_link(bin_root / "host-windows", ir_wine):
+        print(f"{C.RED}✗ (no wine windows IR){C.RESET}")
+        print(f"     {C.DIM}log:{C.RESET} {(wlog / '03-wine-stdlib.log').relative_to(ROOT)}")
+        return "fail"
+    a, b = ir_linux.read_bytes(), ir_wine.read_bytes()
+    if a == b:
+        md5 = hashlib.md5(a).hexdigest()
+        print(f"{C.GREEN}✓{C.RESET}  {C.DIM}IR md5 {md5} ({len(a):,} B){C.RESET}")
+        return "ok"
+    print(f"{C.RED}✗ windows IR differs{C.RESET}")
+    diff = subprocess.run(["diff", "-u", str(ir_linux), str(ir_wine)],
+                          capture_output=True, text=True)
+    for line in diff.stdout.splitlines()[:30]:
+        print(f"     {C.DIM}│{C.RESET} {line}")
+    return "fail"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def ensure_boot():
@@ -294,6 +439,8 @@ def main():
                         help="stream subprocess output to stdout in addition to logs")
     parser.add_argument("--keep-logs", action="store_true",
                         help="keep build-logs/selfhost-check/ from previous runs")
+    parser.add_argument("--no-windows", action="store_true",
+                        help="skip the optional Windows cross-build verification stage")
     args = parser.parse_args()
 
     if not ensure_boot():
@@ -389,6 +536,15 @@ def main():
 
     total = time.perf_counter() - total_start
     print_summary(times, total)
+
+    # Optional Windows cross-build verification.  Only runs once the Linux
+    # fixed point holds (it builds on stage-3); skips cleanly when the
+    # Windows toolchain isn't present, so it never breaks a Linux-only run.
+    if result_ok and not args.no_windows:
+        win = run_windows_stage(total_start)
+        if win == "fail":
+            return 1
+
     return 0 if result_ok else 1
 
 

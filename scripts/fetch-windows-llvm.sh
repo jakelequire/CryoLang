@@ -37,7 +37,12 @@ LLVM_VERSION="20.1.8"
 ASSET="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz"
 URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${ASSET}"
 
-PREFIX="${CRYO_WIN_LLVM_PREFIX:-$HOME/.local/llvm-20-mingw}"
+# Default install lives under the repo's gitignored .toolchains/ so the
+# committed [link.windows] block can reference it with a stable repo-relative
+# path (`../.toolchains/llvm-win/lib`, resolved from the compiler/ project
+# dir).  Override with CRYO_WIN_LLVM_PREFIX for a custom location.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREFIX="${CRYO_WIN_LLVM_PREFIX:-$ROOT/.toolchains/llvm-win}"
 READOBJ="${LLVM_READOBJ:-llvm-readobj-20}"
 DLLTOOL="${DLLTOOL:-x86_64-w64-mingw32-dlltool}"
 

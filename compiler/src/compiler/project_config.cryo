@@ -8,6 +8,19 @@ namespace Compiler::ProjectConfig;
 import Utils::File;
 import Utils::Logger;
 
+
+// Native-build cache bucket, stamped at compile time per the OS this compiler
+// runs on.  Used by `ProjectConfig::target_subdir` when no `--target` is set,
+// so a Linux `cryo` and a Windows `cryo.exe` (run under wine) keep their
+// native intermediates in disjoint `target/release/<bucket>/` trees instead
+// of both claiming `host/` and clobbering each other's `.o`/`.ll`.  Linux
+// keeps the historical `host` name so existing caches/paths are unchanged.
+![target(unix)]
+private function native_target_subdir() -> string { return "host"; }
+![target(windows)]
+private function native_target_subdir() -> string { return "host-windows"; }
+
+
 /// What kind of output the project produces.
 type enum TargetType {
     /// Produces an executable with a main() entry point.
@@ -659,13 +672,22 @@ type struct ProjectConfig {
             this.output_dir, this.profile, this.target_subdir());
     }
 
-    /// Returns the active cross-compile triple if set, otherwise "host".
-    /// Threaded into `profile_dir` so every per-build path (deps, IR,
-    /// incremental, per-profile bin) carries the per-target separation.
+    /// Returns the active cross-compile triple if set, otherwise the native
+    /// build bucket for the platform this compiler runs on.  Threaded into
+    /// `profile_dir` so every per-build path (deps, IR, incremental,
+    /// per-profile bin) carries the per-target separation.
+    ///
+    /// The native bucket is OS-specific (`native_target_subdir`) so a
+    /// cross-built-and-run binary - e.g. a Windows `cryo.exe` invoked under
+    /// wine, which builds for its own host with no explicit `--target` - does
+    /// NOT collide with the Linux host build's `target/release/host/` tree.
+    /// Without this, the Windows-native COFF intermediates would overwrite
+    /// the Linux-native ELF ones (and vice-versa), forcing callers to pass
+    /// `--build-dir` to keep them apart.
     target_subdir(&this) -> string {
         if (this.target_triple == null
                 || intrinsics::strlen(this.target_triple) == 0) {
-            return "host";
+            return native_target_subdir();
         }
         return this.target_triple;
     }

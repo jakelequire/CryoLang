@@ -34,6 +34,67 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import ffi::libc;
+import ffi::syscall;
+
+
+// Per-OS reader/writer primitive.  pthread_rwlock_t (56 bytes on Linux
+// x86_64) vs Win32 SRWLOCK (8 bytes) both fit the buffer; a zero buffer is
+// the valid initial state for both.  ConfigGating only sees file-scope
+// declarations, so the OS divergence lives in gated free functions and the
+// guard/methods delegate.
+//
+// GOTCHA: pthread has ONE `pthread_rwlock_unlock` that releases whichever
+// mode is held, but SRWLOCK splits release into `ReleaseSRWLockShared`
+// (readers) and `ReleaseSRWLockExclusive` (writer).  The read guard and the
+// write guard therefore call DIFFERENT unlock helpers - they each know which
+// mode they acquired.  Return convention follows pthread (0 == success).
+
+![target(unix)]
+private function rwlock_init_raw(buf: u8*) -> i32 { return pthread_rwlock_init(buf, null); }
+![target(windows)]
+private function rwlock_init_raw(buf: u8*) -> i32 { syscall::InitializeSRWLock(buf); return 0; }
+
+![target(unix)]
+private function rwlock_rdlock_raw(buf: u8*) -> i32 { return pthread_rwlock_rdlock(buf); }
+![target(windows)]
+private function rwlock_rdlock_raw(buf: u8*) -> i32 { syscall::AcquireSRWLockShared(buf); return 0; }
+
+![target(unix)]
+private function rwlock_tryrdlock_raw(buf: u8*) -> i32 { return pthread_rwlock_tryrdlock(buf); }
+![target(windows)]
+private function rwlock_tryrdlock_raw(buf: u8*) -> i32 {
+    if (syscall::TryAcquireSRWLockShared(buf) != 0) { return 0; }
+    return 16;
+}
+
+![target(unix)]
+private function rwlock_wrlock_raw(buf: u8*) -> i32 { return pthread_rwlock_wrlock(buf); }
+![target(windows)]
+private function rwlock_wrlock_raw(buf: u8*) -> i32 { syscall::AcquireSRWLockExclusive(buf); return 0; }
+
+![target(unix)]
+private function rwlock_trywrlock_raw(buf: u8*) -> i32 { return pthread_rwlock_trywrlock(buf); }
+![target(windows)]
+private function rwlock_trywrlock_raw(buf: u8*) -> i32 {
+    if (syscall::TryAcquireSRWLockExclusive(buf) != 0) { return 0; }
+    return 16;
+}
+
+// Two distinct release paths on Windows; one on POSIX.
+![target(unix)]
+private function rwlock_unlock_shared_raw(buf: u8*) -> void { pthread_rwlock_unlock(buf); }
+![target(windows)]
+private function rwlock_unlock_shared_raw(buf: u8*) -> void { syscall::ReleaseSRWLockShared(buf); }
+
+![target(unix)]
+private function rwlock_unlock_exclusive_raw(buf: u8*) -> void { pthread_rwlock_unlock(buf); }
+![target(windows)]
+private function rwlock_unlock_exclusive_raw(buf: u8*) -> void { syscall::ReleaseSRWLockExclusive(buf); }
+
+![target(unix)]
+private function rwlock_destroy_raw(buf: u8*) -> void { pthread_rwlock_destroy(buf); }
+![target(windows)]
+private function rwlock_destroy_raw(buf: u8*) -> void { }
 
 
 // 56-byte opaque rwlock buffer + value + allocator.  Heap-pinned.
@@ -60,7 +121,7 @@ implement<T, A> trait Drop for struct RwLockReadGuard<T, A> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        pthread_rwlock_unlock(buf_ptr);
+        rwlock_unlock_shared_raw(buf_ptr);
         this.inner = null;
     }
 }
@@ -79,7 +140,7 @@ implement<T, A> trait Drop for struct RwLockWriteGuard<T, A> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        pthread_rwlock_unlock(buf_ptr);
+        rwlock_unlock_exclusive_raw(buf_ptr);
         this.inner = null;
     }
 }
@@ -114,7 +175,7 @@ type struct RwLock<T, A = GlobalAlloc> {
             raw.cast<RwLockInner<T, GlobalAlloc>>();
         const inner_ptr: RwLockInner<T, GlobalAlloc>* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        const rc: i32 = pthread_rwlock_init(buf_ptr, null);
+        const rc: i32 = rwlock_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
@@ -131,7 +192,7 @@ type struct RwLock<T, A = GlobalAlloc> {
         const typed: NonNull<RwLockInner<T, A>> = raw.cast<RwLockInner<T, A>>();
         const inner_ptr: RwLockInner<T, A>* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        const rc: i32 = pthread_rwlock_init(buf_ptr, null);
+        const rc: i32 = rwlock_init_raw(buf_ptr);
         if (rc != 0) {
             a.deallocate(raw, header);
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
@@ -144,16 +205,16 @@ type struct RwLock<T, A = GlobalAlloc> {
     /// Acquire a shared read lock, blocking until available.
     read(&this) -> RwLockReadGuard<T, A> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_rwlock_rdlock(buf_ptr);
+        const rc: i32 = rwlock_rdlock_raw(buf_ptr);
         if (rc != 0) {
-            intrinsics::panic("RwLock::read: pthread_rwlock_rdlock failed", FILE, LINE);
+            intrinsics::panic("RwLock::read: rwlock_rdlock_raw failed", FILE, LINE);
         }
         return RwLockReadGuard<T, A> { inner: this.inner };
     }
 
     try_read(&this) -> Option<RwLockReadGuard<T, A>> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_rwlock_tryrdlock(buf_ptr);
+        const rc: i32 = rwlock_tryrdlock_raw(buf_ptr);
         if (rc == 0) {
             return Option::Some(RwLockReadGuard<T, A> { inner: this.inner });
         }
@@ -164,16 +225,16 @@ type struct RwLock<T, A = GlobalAlloc> {
     /// readers or writers hold it.
     write(&this) -> RwLockWriteGuard<T, A> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_rwlock_wrlock(buf_ptr);
+        const rc: i32 = rwlock_wrlock_raw(buf_ptr);
         if (rc != 0) {
-            intrinsics::panic("RwLock::write: pthread_rwlock_wrlock failed", FILE, LINE);
+            intrinsics::panic("RwLock::write: rwlock_wrlock_raw failed", FILE, LINE);
         }
         return RwLockWriteGuard<T, A> { inner: this.inner };
     }
 
     try_write(&this) -> Option<RwLockWriteGuard<T, A>> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_rwlock_trywrlock(buf_ptr);
+        const rc: i32 = rwlock_trywrlock_raw(buf_ptr);
         if (rc == 0) {
             return Option::Some(RwLockWriteGuard<T, A> { inner: this.inner });
         }
@@ -187,7 +248,7 @@ where T: Drop, A: Allocator {
         if (this.inner == null) { return; }
         const inner_ptr: RwLockInner<T, A>* = this.inner;
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        pthread_rwlock_destroy(buf_ptr);
+        rwlock_destroy_raw(buf_ptr);
         inner_ptr.value.drop();
         mut alloc: A = inner_ptr.alloc;
         const header: Layout = Layout::of<RwLockInner<T, A>>();

@@ -57,9 +57,83 @@ import alloc::allocator;
 import collections::array;
 import collections::str;
 import ffi::libc;
+import ffi::syscall;
 import sync::atomic;
 
 public module thread::local;
+
+
+// ---------------------------------------------------------------------------
+// Per-OS thread primitives.  ConfigGating only evaluates file-scope
+// declarations (never struct method bodies or generic instantiations), so
+// every pthread/Win32 call lives in one of these gated free functions and the
+// rest of the module is platform-agnostic.
+//
+// `JoinHandle`/`Scope` store `tid: u64`.  On POSIX that holds a `pthread_t`;
+// on Windows it holds the thread HANDLE returned by `CreateThread` (a pointer
+// widened to u64).  `os_join`/`os_detach` reinterpret it per platform.  Note
+// `thread::current()` returns the Win32 thread *id* (GetCurrentThreadId),
+// which is a different namespace from a HANDLE - comparing a `current()` id
+// against a `JoinHandle::id()` is not meaningful on Windows (a known v1 gap).
+// ---------------------------------------------------------------------------
+
+![target(unix)]
+private function os_join(tid: u64) -> void {
+    mut ret: u8* = null;
+    pthread_join(tid, &ret);
+}
+![target(windows)]
+private function os_join(tid: u64) -> void {
+    const h: u8* = tid as u8*;
+    syscall::WaitForSingleObject(h, 0xFFFFFFFFu32);   // INFINITE
+    syscall::CloseHandle(h);
+}
+
+![target(unix)]
+private function os_detach(tid: u64) -> void { pthread_detach(tid); }
+![target(windows)]
+private function os_detach(tid: u64) -> void { syscall::CloseHandle(tid as u8*); }
+
+![target(unix)]
+private function os_thread_equal(a: u64, b: u64) -> boolean { return pthread_equal(a, b) != 0; }
+![target(windows)]
+private function os_thread_equal(a: u64, b: u64) -> boolean { return a == b; }
+
+![target(unix)]
+private function os_thread_self() -> u64 { return pthread_self(); }
+![target(windows)]
+private function os_thread_self() -> u64 { return syscall::GetCurrentThreadId() as u64; }
+
+![target(unix)]
+private function os_yield() -> void { sched_yield(); }
+![target(windows)]
+private function os_yield() -> void { syscall::SwitchToThread(); }
+
+![target(unix)]
+private function os_sleep_nanos(nanos: u64) -> void {
+    mut req: timespec = timespec { tv_sec: (nanos / 1000000000u64) as i64,
+                                   tv_nsec: (nanos % 1000000000u64) as i64 };
+    mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    while (nanosleep(&req, &rem) != 0) {
+        req = rem;   // EINTR: resume with the kernel's remaining time.
+    }
+}
+![target(windows)]
+private function os_sleep_nanos(nanos: u64) -> void {
+    // Sleep takes whole milliseconds; round up so a sub-ms request still
+    // yields a non-zero sleep (>= 1ms) rather than busy-returning.
+    mut ms: u64 = (nanos + 999999u64) / 1000000u64;
+    if (ms == 0u64 && nanos > 0u64) { ms = 1u64; }
+    syscall::Sleep(ms as u32);
+}
+
+// Best-effort OS-visible thread name.  POSIX has pthread_setname_np; the
+// Windows equivalent (SetThreadDescription) needs a wide string and is not
+// wired up, so naming is a no-op there (it never affects correctness).
+![target(unix)]
+private function os_set_thread_name(tid: u64, name: u8*) -> void { pthread_setname_np(tid, name); }
+![target(windows)]
+private function os_set_thread_name(tid: u64, name: u8*) -> void { }
 
 
 // ---------------------------------------------------------------------------
@@ -96,10 +170,12 @@ type struct Payload<C, T> {
 }
 
 
-/// The C entry point handed to `pthread_create`. A real named generic
-/// function (one monomorphization per `(C,T)`), addressable thanks to the
-/// generic function-reference fix. Runs entirely on the new thread.
-function thread_trampoline<C, T>(arg: u8*) -> u8* {
+/// The thread body: moves `ctx` out, runs `body`, publishes the result, and
+/// performs the completion half of the join/detach handshake. Platform-
+/// agnostic; the gated `thread_trampoline` wrappers below adapt the C entry
+/// ABI (pthread returns `void*`, Win32's LPTHREAD_START_ROUTINE returns
+/// `DWORD`/`u32`) around this shared logic.
+function thread_body<C, T>(arg: u8*) -> void {
     const p: Payload<C, T>* = arg as Payload<C, T>*;
     const body:   (C) -> T  = (*p).body;
     const shared: Shared<T>* = (*p).shared;
@@ -121,7 +197,46 @@ function thread_trampoline<C, T>(arg: u8*) -> u8* {
         (*rptr).drop();
         alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
     }
-    return null;
+}
+
+/// The C entry point handed to the OS thread creator. One monomorphization
+/// per `(C,T)`, addressable thanks to the generic function-reference fix.
+![target(unix)]
+function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body<C, T>(arg); return null; }
+![target(windows)]
+function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body<C, T>(arg); return 0u32; }
+
+/// Create an OS thread running `thread_trampoline<C,T>(arg)`, writing the
+/// joinable id/handle into `tbuf` (8 bytes).  `stack_bytes == 0` requests
+/// the OS default stack.  Returns 0 on success, non-zero on failure.
+![target(unix)]
+private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
+    const tramp_fn: (u8*) -> u8* = thread_trampoline<C, T>;
+    if (stack_bytes == 0u64) {
+        return pthread_create(tbuf, null, tramp_fn as void*, arg);
+    }
+    mut attr: u8[56];
+    mut i: u64 = 0u64;
+    while (i < 56u64) { attr[i] = 0u8; i = i + 1u64; }
+    if (pthread_attr_init(&attr[0]) != 0) { return 11; }   // EAGAIN
+    if (pthread_attr_setstacksize(&attr[0], stack_bytes) != 0) {
+        pthread_attr_destroy(&attr[0]);
+        return 22;   // EINVAL (out-of-range stack)
+    }
+    const rc: i32 = pthread_create(tbuf, &attr[0], tramp_fn as void*, arg);
+    pthread_attr_destroy(&attr[0]);
+    return rc;
+}
+![target(windows)]
+private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
+    const tramp_fn: (u8*) -> u32 = thread_trampoline<C, T>;
+    // dwStackSize = 0 means "default"; CreateThread takes the size directly,
+    // so no attribute object is needed.
+    const h: u8* = syscall::CreateThread(null, stack_bytes, tramp_fn as void*,
+                                         arg, 0u32, null);
+    if (h == null) { return 11; }   // surface as a resource-limit error
+    *(tbuf as u64*) = h as u64;     // store the HANDLE as the joinable id
+    return 0;
 }
 
 
@@ -130,7 +245,7 @@ function thread_trampoline<C, T>(arg: u8*) -> u8* {
 /// thread has already finished, reclaim the result and the block here.
 function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
     // Let the OS reclaim the thread's own resources when it exits.
-    pthread_detach(tid);
+    os_detach(tid);
     const prev: u8 = (*shared).state.swap(STATE_DETACHED, MemoryOrder::AcqRel);
     if (prev == STATE_THREAD_DONE) {
         // Thread already finished and left the result for us; drop it.
@@ -155,8 +270,7 @@ type struct JoinHandle<T> {
     /// the handle; the control block is freed here.
     join(mut this) -> T {
         const { tid, shared }: JoinHandle<T> = this;
-        mut ret: u8* = null;
-        pthread_join(tid, &ret);
+        os_join(tid);
         // Thread has exited and left the result (it observed STATE_LIVE,
         // so it did not tear down). Move the result out, then free the
         // block without dropping the (now-moved-from) result storage.
@@ -219,7 +333,7 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// "move a non-thread-safe value into a thread" hole.
 function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
 where C: Send, T: Send {
-    match (spawn_with_attr<C, T>(ctx, body, null)) {
+    match (spawn_with_attr<C, T>(ctx, body, 0u64)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
             intrinsics::panic("thread::spawn: failed to create thread", FILE, LINE);
@@ -227,11 +341,11 @@ where C: Send, T: Send {
     }
 }
 
-/// Fallible spawn with an optional pthread attribute buffer. `attr` may
-/// be null for default attributes (the only path exercised today; a
-/// future `Builder` will pass a configured `pthread_attr_t`).
+/// Fallible spawn with an optional stack size (`0` == OS default). The
+/// per-OS thread creator (`os_create_thread`) applies it - via a
+/// `pthread_attr_t` on POSIX, or `CreateThread`'s `dwStackSize` on Windows.
 function spawn_with_attr<C, T>(ctx: C, body: (C) -> T,
-                               attr: u8*) -> Result<JoinHandle<T>, SpawnError>
+                               stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
 where C: Send, T: Send {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
@@ -254,9 +368,8 @@ where C: Send, T: Send {
     (*p).ctx    = ctx;
     (*p).shared = shared;
 
-    const tramp_fn: (u8*) -> u8* = thread_trampoline<C, T>;
     mut tbuf: u8[8] = [0u8; 8];
-    const rc: i32 = pthread_create(&tbuf[0], attr, tramp_fn as void*, p as u8*);
+    const rc: i32 = os_create_thread<C, T>(&tbuf[0], p as u8*, stack_bytes);
     if (rc != 0) {
         // The thread never started, so we still own both boxes. The
         // payload's `ctx` was moved in; reclaim it so owned state inside
@@ -305,18 +418,17 @@ implement enum SpawnError {
 ///   ```
 function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
 where C: Send, T: Send {
-    return spawn_with_attr<C, T>(ctx, body, null);
+    return spawn_with_attr<C, T>(ctx, body, 0u64);
 }
 
 // ---------------------------------------------------------------------------
 // Builder: configurable spawning (stack size + OS thread name)
 // ---------------------------------------------------------------------------
 
-// pthread_attr_t storage. Linux x86_64 lays it out in 56 bytes (see
-// `libc::SIZEOF_PTHREAD_ATTR_T`); `pthread_attr_init` only touches what
-// it needs, so a fixed local buffer is enough. The OS thread name is
-// capped at 15 bytes plus a NUL by `pthread_setname_np`.
-const ATTR_BUF_LEN:    u64 = 56;
+// The OS thread name is capped at 15 bytes plus a NUL by
+// `pthread_setname_np` (POSIX); the stack size is applied by
+// `os_create_thread`.  The name limit is shared by both platforms (Windows
+// ignores the name today).
 const MAX_THREAD_NAME: u64 = 15;
 
 /// A configurable thread spawn: set a stack size and/or an OS-visible
@@ -390,32 +502,19 @@ type struct Builder {
     /// size) or cannot create the thread.
     try_spawn<C, T>(this, ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
     where C: Send, T: Send {
-        mut attr: u8[56];
-        mut i: u64 = 0u64;
-        while (i < ATTR_BUF_LEN) { attr[i] = 0u8; i = i + 1u64; }
-        if (pthread_attr_init(&attr[0]) != 0) {
-            return Result::Err(SpawnError::Other);
-        }
-        if (this.stack_bytes > 0u64) {
-            if (pthread_attr_setstacksize(&attr[0], this.stack_bytes) != 0) {
-                pthread_attr_destroy(&attr[0]);
-                return Result::Err(SpawnError::Other);
-            }
-        }
-
-        // `pthread_create` (inside `spawn_with_attr`) copies what it needs
-        // from `attr`, so the buffer can be torn down as soon as it
-        // returns - on both the success and failure paths.
+        // The stack size is applied inside `os_create_thread` (a
+        // `pthread_attr_t` on POSIX, `dwStackSize` on Windows), so the
+        // builder just forwards the configured size.
         mut result: Result<JoinHandle<T>, SpawnError> =
-            spawn_with_attr<C, T>(ctx, body, &attr[0]);
-        pthread_attr_destroy(&attr[0]);
+            spawn_with_attr<C, T>(ctx, body, this.stack_bytes);
 
         match (result) {
             Result::Ok(h) => {
                 if (this.name_len > 0u64) {
-                    // Best-effort: a naming failure (e.g. an unsupported
-                    // platform) does not invalidate the live thread.
-                    pthread_setname_np(h.tid, &this.name_buf[0]);
+                    // Best-effort: a naming failure (or an unsupported
+                    // platform, e.g. Windows) does not invalidate the live
+                    // thread.
+                    os_set_thread_name(h.tid, &this.name_buf[0]);
                 }
                 return Result::Ok(h);
             }
@@ -434,7 +533,7 @@ type struct ThreadId {
     raw: u64;
 
     equals(&this, other: &ThreadId) -> boolean {
-        return pthread_equal(this.raw, other.raw) != 0;
+        return os_thread_equal(this.raw, other.raw);
     }
 }
 
@@ -450,25 +549,19 @@ type struct Thread {
 
 /// The thread invoking this call.
 function current() -> Thread {
-    return Thread { id_: ThreadId { raw: pthread_self() } };
+    return Thread { id_: ThreadId { raw: os_thread_self() } };
 }
 
 /// Yield the remainder of the current timeslice to the scheduler.
 function yield_now() -> void {
-    sched_yield();
+    os_yield();
 }
 
-/// Sleep the current thread for at least `nanos` nanoseconds. Restarts
-/// across signal interruptions (EINTR) using the kernel's remaining-time
-/// readout so the full duration elapses.
+/// Sleep the current thread for at least `nanos` nanoseconds. On POSIX this
+/// restarts across signal interruptions (EINTR) so the full duration
+/// elapses; on Windows it rounds up to whole milliseconds.
 function sleep(nanos: u64) -> void {
-    mut req: timespec = timespec { tv_sec: (nanos / 1000000000u64) as i64,
-                                   tv_nsec: (nanos % 1000000000u64) as i64 };
-    mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
-    while (nanosleep(&req, &rem) != 0) {
-        // EINTR: resume with the time the kernel says is left.
-        req = rem;
-    }
+    os_sleep_nanos(nanos);
 }
 
 /// Sleep for at least `millis` milliseconds.
@@ -488,17 +581,37 @@ type struct ScopePayload<C> {
     ctx:  C;
 }
 
-/// C entry point for scoped threads. Moves the context out, frees the
-/// payload, then runs the body. Scoped bodies return no value, so there
-/// is no result/handshake machinery.
-function scope_trampoline<C>(arg: u8*) -> u8* {
+/// Scoped-thread body: moves the context out, frees the payload, runs the
+/// body. Scoped bodies return no value, so there is no result/handshake
+/// machinery. The gated `scope_trampoline` wrappers adapt the C entry ABI.
+function scope_body<C>(arg: u8*) -> void {
     const p: ScopePayload<C>* = arg as ScopePayload<C>*;
     const body: (C) -> void = (*p).body;
     const c: C = (*p).ctx;
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     alloc.deallocate(NonNull::new(arg), Layout::of<ScopePayload<C>>());
     body(c);
-    return null;
+}
+
+![target(unix)]
+function scope_trampoline<C>(arg: u8*) -> u8* { scope_body<C>(arg); return null; }
+![target(windows)]
+function scope_trampoline<C>(arg: u8*) -> u32 { scope_body<C>(arg); return 0u32; }
+
+/// Create an OS thread running `scope_trampoline<C>(arg)`, writing the
+/// joinable id/handle into `tbuf`. Returns 0 on success.
+![target(unix)]
+private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*) -> i32 {
+    const t: (u8*) -> u8* = scope_trampoline<C>;
+    return pthread_create(tbuf, null, t as void*, arg);
+}
+![target(windows)]
+private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*) -> i32 {
+    const t: (u8*) -> u32 = scope_trampoline<C>;
+    const h: u8* = syscall::CreateThread(null, 0u64, t as void*, arg, 0u32, null);
+    if (h == null) { return 11; }
+    *(tbuf as u64*) = h as u64;
+    return 0;
 }
 
 /// A thread scope. Every thread spawned through it is guaranteed to be
@@ -542,10 +655,9 @@ type struct Scope {
         }
         (*p).body = body;
         (*p).ctx  = ctx;
-        const tramp_fn: (u8*) -> u8* = scope_trampoline<C>;
         mut tbuf: u8[8] = [0u8; 8];
-        const rc: i32 = pthread_create(&tbuf[0], null, tramp_fn as void*, p as u8*);
-        if (rc != 0) { intrinsics::panic("Scope::spawn: pthread_create failed", FILE, LINE); }
+        const rc: i32 = os_create_scope_thread<C>(&tbuf[0], p as u8*);
+        if (rc != 0) { intrinsics::panic("Scope::spawn: thread creation failed", FILE, LINE); }
         this.tids.push(*(&tbuf[0] as u64*));
     }
 
@@ -555,8 +667,7 @@ type struct Scope {
     join_all(mut &this) -> void {
         const n: i64 = this.tids.length() as i64;
         for (mut i: i64 = 0; i < n; i = i + 1) {
-            mut ret: u8* = null;
-            pthread_join(this.tids[i], &ret);
+            os_join(this.tids[i]);
         }
         this.tids.clear();
     }

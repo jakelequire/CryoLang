@@ -40,7 +40,54 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import ffi::libc;
+import ffi::syscall;
 import sync::error;
+
+
+// Per-OS lock primitives.  The backing object differs between platforms
+// (pthread_mutex_t vs Win32 SRWLOCK) and ConfigGating only evaluates
+// file-scope declarations - never struct method bodies - so every
+// OS-specific call lives in a gated free function and the methods just
+// delegate.  The 40-byte buffer holds either: it is `sizeof(pthread_mutex_t)`
+// on Linux x86_64, and an SRWLOCK is one pointer (8 bytes) with room to
+// spare.  A zero buffer is the valid initial state for both
+// (`PTHREAD_MUTEX_INITIALIZER` and `SRWLOCK_INIT` are all-zero), but the
+// inner is `malloc`-backed (not zeroed), so the init helper must run.
+//
+// Return convention follows pthread: 0 == success, non-zero == failure.
+// SRWLOCK operations cannot fail, so the Windows shims return 0 (and map
+// "lock busy" to EBUSY=16 for `try_lock`).
+
+![target(unix)]
+private function mutex_init_raw(buf: u8*) -> i32 { return pthread_mutex_init(buf, null); }
+![target(windows)]
+private function mutex_init_raw(buf: u8*) -> i32 { syscall::InitializeSRWLock(buf); return 0; }
+
+![target(unix)]
+private function mutex_lock_raw(buf: u8*) -> i32 { return pthread_mutex_lock(buf); }
+![target(windows)]
+private function mutex_lock_raw(buf: u8*) -> i32 { syscall::AcquireSRWLockExclusive(buf); return 0; }
+
+![target(unix)]
+private function mutex_trylock_raw(buf: u8*) -> i32 { return pthread_mutex_trylock(buf); }
+![target(windows)]
+private function mutex_trylock_raw(buf: u8*) -> i32 {
+    // TryAcquireSRWLockExclusive returns nonzero on success; pthread returns
+    // 0 on success and EBUSY (16) when the lock is already held.
+    if (syscall::TryAcquireSRWLockExclusive(buf) != 0) { return 0; }
+    return 16;
+}
+
+![target(unix)]
+private function mutex_unlock_raw(buf: u8*) -> void { pthread_mutex_unlock(buf); }
+![target(windows)]
+private function mutex_unlock_raw(buf: u8*) -> void { syscall::ReleaseSRWLockExclusive(buf); }
+
+// SRWLOCK has no teardown; pthread mutexes do.
+![target(unix)]
+private function mutex_destroy_raw(buf: u8*) -> void { pthread_mutex_destroy(buf); }
+![target(windows)]
+private function mutex_destroy_raw(buf: u8*) -> void { }
 
 
 // Heap-pinned mutex backing: holds the pthread buffer plus the
@@ -74,7 +121,7 @@ implement<T, A> trait Drop for struct MutexGuard<T, A> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        pthread_mutex_unlock(buf_ptr);
+        mutex_unlock_raw(buf_ptr);
         this.inner = null;
     }
 }
@@ -119,7 +166,7 @@ type struct Mutex<T, A = GlobalAlloc> {
             raw.cast<MutexInner<T, GlobalAlloc>>();
         const inner_ptr: MutexInner<T, GlobalAlloc>* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        const rc: i32 = pthread_mutex_init(buf_ptr, null);
+        const rc: i32 = mutex_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
@@ -136,7 +183,7 @@ type struct Mutex<T, A = GlobalAlloc> {
         const typed: NonNull<MutexInner<T, A>> = raw.cast<MutexInner<T, A>>();
         const inner_ptr: MutexInner<T, A>* = typed.as_ptr();
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        const rc: i32 = pthread_mutex_init(buf_ptr, null);
+        const rc: i32 = mutex_init_raw(buf_ptr);
         if (rc != 0) {
             a.deallocate(raw, header);
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
@@ -153,9 +200,9 @@ type struct Mutex<T, A = GlobalAlloc> {
     /// non-recursive mutex or a destroyed mutex).
     lock(&this) -> MutexGuard<T, A> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_mutex_lock(buf_ptr);
+        const rc: i32 = mutex_lock_raw(buf_ptr);
         if (rc != 0) {
-            intrinsics::panic("Mutex::lock: pthread_mutex_lock failed", FILE, LINE);
+            intrinsics::panic("Mutex::lock: mutex_lock_raw failed", FILE, LINE);
         }
         return MutexGuard<T, A> { inner: this.inner };
     }
@@ -165,7 +212,7 @@ type struct Mutex<T, A = GlobalAlloc> {
     /// another thread.
     try_lock(&this) -> Option<MutexGuard<T, A>> {
         const buf_ptr: u8* = &this.inner.pthread_buf[0];
-        const rc: i32 = pthread_mutex_trylock(buf_ptr);
+        const rc: i32 = mutex_trylock_raw(buf_ptr);
         if (rc == 0) {
             return Option::Some(MutexGuard<T, A> { inner: this.inner });
         }
@@ -190,7 +237,7 @@ where T: Drop, A: Allocator {
         if (this.inner == null) { return; }
         const inner_ptr: MutexInner<T, A>* = this.inner;
         const buf_ptr: u8* = &inner_ptr.pthread_buf[0];
-        pthread_mutex_destroy(buf_ptr);
+        mutex_destroy_raw(buf_ptr);
         inner_ptr.value.drop();
         mut alloc: A = inner_ptr.alloc;
         const header: Layout = Layout::of<MutexInner<T, A>>();

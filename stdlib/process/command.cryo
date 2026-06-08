@@ -31,6 +31,8 @@ import collections::str;
 import collections::string;
 import alloc::allocator;
 import ffi::libc;
+import ffi::syscall;
+import alloc::layout;
 import process::child;
 
 // ArgvBuf: owned grow-on-push buffer of `u8*` for execvp's argv.
@@ -218,6 +220,7 @@ function make_pipe_pair() -> PipePair {
 }
 
 /// Call pipe(2) and populate `pair`. Returns an IoError on failure.
+![target(unix)]
 function create_pipe() -> Result<PipePair, IoError> {
     mut fds: i32[2];
     if (libc::pipe(&fds[0]) < 0) {
@@ -228,6 +231,7 @@ function create_pipe() -> Result<PipePair, IoError> {
 
 /// Build the pipe pair for a given Stdio setting. No-op for
 /// Inherit/Null/Fd.
+![target(unix)]
 function prepare_stdio(setting: Stdio) -> Result<PipePair, IoError> {
     return match (setting) {
         Stdio::Piped => { create_pipe() }
@@ -237,6 +241,7 @@ function prepare_stdio(setting: Stdio) -> Result<PipePair, IoError> {
 
 /// After fork, in the child: replace `target_fd` (0/1/2) according
 /// to `setting`. Returns false if the remap failed.
+![target(unix)]
 function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
                      is_input: boolean) -> boolean {
     match (setting) {
@@ -315,6 +320,7 @@ function build_argv(program: &String,
 
 /// Apply env overrides inside the child. `clear_env` wipes the
 /// inherited environment first. Called after fork, before exec.
+![target(unix)]
 function apply_env(clear_env: boolean,
                    envs: &Array<EnvEntry>) -> boolean {
     if (clear_env) {
@@ -340,6 +346,7 @@ function apply_env(clear_env: boolean,
     return true;
 }
 
+![target(unix)]
 function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // 1. Prepare pipes in the parent.
     mut stdin_pipe: PipePair = make_pipe_pair();
@@ -479,7 +486,7 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // The argument strings + pointer array fall out of scope at function
     // exit; the synthesized drops release them.  The child has its own COW
     // copies, which are either replaced by exec or abandoned on _exit.
-    return Result::Ok(Child::new(pid, stdin_handle, stdout_handle, stderr_handle));
+    return Result::Ok(Child::new(pid, 0u64, stdin_handle, stdout_handle, stderr_handle));
 }
 
 function close_pipe(pair: &PipePair) -> void {
@@ -576,6 +583,7 @@ function clone_command(cmd: &Command) -> Command {
 /// before its stdout was fully consumed (kernel blocks the child's
 /// write, child never exits, parent never finishes reading stdout,
 /// parent never reaches the stderr read).
+![target(unix)]
 function collect_output(c: mut &Child) -> Result<Output, IoError> {
     mut stdout_buffer: Array<u8> = Array::new();
     mut stderr_buffer: Array<u8> = Array::new();
@@ -677,6 +685,7 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
 /// Best-effort: switch `fd` to non-blocking by OR'ing `O_NONBLOCK`
 /// into its file-status flags. Failure is ignored - if the kernel
 /// won't take the flag we fall back to whatever poll(2) decides.
+![target(unix)]
 function set_nonblock(fd: i32) -> void {
     const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
     if (cur < 0) { return; }
@@ -694,6 +703,7 @@ type enum DrainOutcome {
 
 /// Read every available byte from `fd` into `buf`, returning the
 /// stopping reason. `fd` must already be in non-blocking mode.
+![target(unix)]
 function drain_nonblock(fd: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) -> DrainOutcome {
     loop {
         const n: i64 = libc::read(fd, chunk, chunk_len);
@@ -709,5 +719,245 @@ function drain_nonblock(fd: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>
             IoErrorKind::WouldBlock  => { return DrainOutcome::Again; }
             _ => { return DrainOutcome::Failed(err); }
         }
+    }
+}
+
+
+// ===========================================================================
+// Windows (CreateProcess) implementation.
+//
+// Windows has no fork+exec: a process is created in one CreateProcessA call
+// that takes a single mutable command-line STRING (not an argv array) plus a
+// STARTUPINFO carrying inheritable std handles.  Pipe ends created with
+// CreatePipe are bridged into CRT file descriptors via `_open_osfhandle`, so
+// the existing fd-based ChildStdin/Stdout/Stderr + io::fd read/write/close
+// machinery is reused unchanged.
+//
+// v1 scope: Inherit and Piped stdio (covers `output()` and the common
+// inherit-spawn).  `Stdio::Null` and `Stdio::Fd` fall back to Inherit on
+// Windows; `clear_env`/per-var env overrides and `cwd` beyond a plain path
+// are not yet applied here.  `collect_output` drains stdout then stderr
+// sequentially (blocking) rather than via poll, so a child that fills the
+// stderr pipe buffer before its stdout is consumed could stall - fine for the
+// typical bounded-output case.
+// ===========================================================================
+
+// Per-stream Windows stdio wiring produced by `win_setup_stdio`.
+![target(windows)]
+type struct WinStdio {
+    child_handle: u8*;   // handle handed to the child via STARTUPINFO
+    parent_fd:    i32;   // parent pipe end as a CRT fd, or -1
+    extra_close:  u8*;   // child pipe end the parent must close post-spawn, or null
+    ok:           boolean;
+
+    drop(mut &this) -> void { }
+}
+
+// Append `arg` to `out` applying the standard CommandLineToArgvW quoting:
+// wrap in double quotes when empty or containing space/tab/quote, doubling
+// backslashes that precede a quote (or the closing quote) and escaping
+// embedded quotes.
+![target(windows)]
+function win_append_quoted(out: mut &String, arg: &String) -> void {
+    const p: u8* = arg.as_ptr();
+    const n: u64 = arg.length();
+    mut need: boolean = (n == 0u64);
+    mut s: u64 = 0u64;
+    while (s < n) {
+        const c: u8 = p[s];
+        if (c == 32u8 || c == 9u8 || c == 34u8) { need = true; }
+        s = s + 1u64;
+    }
+    if (!need) {
+        mut k: u64 = 0u64;
+        while (k < n) { out.push(p[k]); k = k + 1u64; }
+        return;
+    }
+    out.push(34u8);   // opening quote
+    mut j: u64 = 0u64;
+    while (j < n) {
+        mut bs: u64 = 0u64;
+        while (j < n && p[j] == 92u8) { bs = bs + 1u64; j = j + 1u64; }
+        if (j == n) {
+            mut d: u64 = 0u64;
+            while (d < bs * 2u64) { out.push(92u8); d = d + 1u64; }
+        } else if (p[j] == 34u8) {
+            mut d: u64 = 0u64;
+            while (d < bs * 2u64 + 1u64) { out.push(92u8); d = d + 1u64; }
+            out.push(34u8);
+            j = j + 1u64;
+        } else {
+            mut d: u64 = 0u64;
+            while (d < bs) { out.push(92u8); d = d + 1u64; }
+            out.push(p[j]);
+            j = j + 1u64;
+        }
+    }
+    out.push(34u8);   // closing quote
+}
+
+// Build the NUL-terminated command line "program arg1 arg2 ..." for
+// CreateProcessA (which may modify the buffer in place).
+![target(windows)]
+function build_cmdline(cmd: &Command) -> String {
+    mut cl: String = String::new();
+    win_append_quoted(&cl, &cmd.program);
+    mut i: u64 = 0u64;
+    while (i < cmd.args.length()) {
+        match (cmd.args.get_ref(i)) {
+            Option::Some(a) => { cl.push(32u8); win_append_quoted(&cl, a); }
+            Option::None    => { break; }
+        }
+        i = i + 1u64;
+    }
+    cl.push(0u8);   // NUL terminator (kept in the buffer)
+    return cl;
+}
+
+// Wire one std stream for the child.  Piped creates an inheritable pipe and
+// bridges the parent end to a CRT fd; everything else inherits the parent's
+// corresponding std handle.
+![target(windows)]
+function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinStdio {
+    match (setting) {
+        Stdio::Piped => {
+            mut rd: u8* = null;
+            mut wr: u8* = null;
+            mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
+                nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
+            };
+            if (syscall::CreatePipe(&rd, &wr, &sa as u8*, 0u32) == 0) {
+                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, ok: false };
+            }
+            if (is_input) {
+                // child reads `rd` (inheritable); parent writes `wr`.
+                syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0u32);
+                const f: i32 = _open_osfhandle(wr as i64, 0);
+                return WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, ok: true };
+            }
+            // child writes `wr` (inheritable); parent reads `rd`.
+            syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0u32);
+            const f: i32 = _open_osfhandle(rd as i64, 0);
+            return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, ok: true };
+        }
+        _ => {
+            // Inherit (and the v1 Null/Fd fallback): hand the child our own
+            // std handle; nothing for the parent to close or wrap.
+            return WinStdio { child_handle: syscall::GetStdHandle(std_id),
+                              parent_fd: -1, extra_close: null, ok: true };
+        }
+    }
+}
+
+![target(windows)]
+function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
+    const sin:  WinStdio = win_setup_stdio(cmd.stdin_cfg,  syscall::STD_INPUT_HANDLE,  true);
+    if (!sin.ok)  { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
+    const sout: WinStdio = win_setup_stdio(cmd.stdout_cfg, syscall::STD_OUTPUT_HANDLE, false);
+    if (!sout.ok) { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
+    const serr: WinStdio = win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE,  false);
+    if (!serr.ok) { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
+
+    mut cmdline: String = build_cmdline(cmd);
+
+    mut cwd_cstr: String = String::new();
+    mut cwd_ptr:  u8* = null;
+    match (cmd.cwd) {
+        Option::Some(path) => {
+            cwd_cstr = String::from_str_c(path.as_str());
+            cwd_ptr  = cwd_cstr.as_ptr();
+        }
+        Option::None => { }
+    }
+
+    mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
+        cb: 104u32, lpReserved: null, lpDesktop: null, lpTitle: null,
+        dwX: 0u32, dwY: 0u32, dwXSize: 0u32, dwYSize: 0u32,
+        dwXCountChars: 0u32, dwYCountChars: 0u32, dwFillAttribute: 0u32,
+        dwFlags: syscall::STARTF_USESTDHANDLES, wShowWindow: 0u16, cbReserved2: 0u16,
+        lpReserved2: null,
+        hStdInput: sin.child_handle, hStdOutput: sout.child_handle, hStdError: serr.child_handle
+    };
+    mut pi: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
+        hProcess: null, hThread: null, dwProcessId: 0u32, dwThreadId: 0u32
+    };
+
+    const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
+                                            1, 0u32, null, cwd_ptr, &si, &pi);
+
+    // Parent closes the child's pipe ends now that they have been inherited.
+    if (sin.extra_close  != null) { syscall::CloseHandle(sin.extra_close); }
+    if (sout.extra_close != null) { syscall::CloseHandle(sout.extra_close); }
+    if (serr.extra_close != null) { syscall::CloseHandle(serr.extra_close); }
+
+    if (ok == 0) {
+        if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
+        if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
+        if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
+        return Result::Err(IoError::new(IoErrorKind::Other, 0));
+    }
+    syscall::CloseHandle(pi.hThread);
+
+    mut stdin_handle:  Option<ChildStdin>  = Option::None;
+    mut stdout_handle: Option<ChildStdout> = Option::None;
+    mut stderr_handle: Option<ChildStderr> = Option::None;
+    if (sin.parent_fd  >= 0) { stdin_handle  = Option::Some(ChildStdin::from_fd(sin.parent_fd)); }
+    if (sout.parent_fd >= 0) { stdout_handle = Option::Some(ChildStdout::from_fd(sout.parent_fd)); }
+    if (serr.parent_fd >= 0) { stderr_handle = Option::Some(ChildStderr::from_fd(serr.parent_fd)); }
+
+    return Result::Ok(Child::new(pi.dwProcessId as i32, pi.hProcess as u64,
+                                 stdin_handle, stdout_handle, stderr_handle));
+}
+
+// Blocking drain of a CRT fd to EOF.
+![target(windows)]
+function win_drain(fd_no: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) -> Result<(), IoError> {
+    loop {
+        match (fd::read_fd(fd_no, chunk, chunk_len)) {
+            Result::Ok(n) => {
+                if (n == 0u64) { return Result::Ok(()); }
+                mut i: u64 = 0u64;
+                while (i < n) { buf.push(chunk[i]); i = i + 1u64; }
+            }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+}
+
+![target(windows)]
+function collect_output(c: mut &Child) -> Result<Output, IoError> {
+    mut stdout_buffer: Array<u8> = Array::new();
+    mut stderr_buffer: Array<u8> = Array::new();
+    mut chunk: u8[4096];
+
+    mut so_fd: i32 = -1;
+    match (c.stdout) {
+        Option::Some(mut h) => { so_fd = h.fd; c.stdout = Option::Some(h); }
+        Option::None => { }
+    }
+    mut se_fd: i32 = -1;
+    match (c.stderr) {
+        Option::Some(mut h) => { se_fd = h.fd; c.stderr = Option::Some(h); }
+        Option::None => { }
+    }
+
+    if (so_fd >= 0) {
+        match (win_drain(so_fd, &chunk[0], 4096, &stdout_buffer)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    if (se_fd >= 0) {
+        match (win_drain(se_fd, &chunk[0], 4096, &stderr_buffer)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+
+    match (c.wait()) {
+        Result::Ok(status) => {
+            return Result::Ok(Output { status: status, stdout: stdout_buffer, stderr: stderr_buffer });
+        }
+        Result::Err(err) => { return Result::Err(err); }
     }
 }

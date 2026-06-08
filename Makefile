@@ -17,6 +17,19 @@ PIN        := $(ROOT)/bin/cryo
 STAGE2     := $(ROOT)/compiler/build/cryo
 LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
 
+# ---- Windows cross-build/pin ------------------------------------------
+# cryo.exe is cross-built with the mingw-w64 toolchain and linked against
+# the windows libLLVM-C import lib fetched into .toolchains/llvm-win by
+# scripts/fetch-windows-llvm.sh.  The link is dynamic (LLVM-C.dll), mirroring
+# how bin/cryo expects a system libLLVM-20.so.
+WIN_TRIPLE   := x86_64-pc-windows-gnu
+STAGE2_EXE   := $(ROOT)/compiler/build/cryo.exe
+PIN_EXE      := $(ROOT)/bin/cryo.exe
+MINGW_GCC    := x86_64-w64-mingw32-gcc
+MINGW_STRIP  := x86_64-w64-mingw32-strip
+WIN_LLVM_LIB := $(ROOT)/.toolchains/llvm-win/lib/libLLVM-C.dll.a
+WIN_LLVM_DLL := $(ROOT)/.toolchains/llvm-win/bin/LLVM-C.dll
+
 # C-side helpers for the ABI tests.  Compiled with the host cc to a
 # static archive that `tests/cryoconfig` links via -L./helpers
 # -labihelpers — see tests/helpers/abi_helpers.c for the contract.
@@ -36,8 +49,8 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo selfhost-check test test-list pin-cryo install uninstall \
-        clean lsp install-lsp
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list pin-cryo \
+        pin-windows pin-all install uninstall clean lsp install-lsp
 
 help:
 	@echo "Cryo build targets:"
@@ -46,9 +59,14 @@ help:
 	@echo "  make lsp               Build the Cryo-language LSP server (bin/cryolsp)"
 	@echo "  make install-lsp       Package + install the CryoAnalyzer VS Code extension"
 	@echo "  make selfhost-check    3-round chain (6 stages) + byte-identity gate"
+	@echo "                         (+ a Windows cross-build/wine stage when the"
+	@echo "                          mingw toolchain + wine + .toolchains are present)"
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make pin-cryo          Refresh bin/cryo from compiler/build/cryo"
+	@echo "  make cryo-exe          Cross-build cryo.exe (x86_64-pc-windows-gnu)"
+	@echo "  make pin-windows       Refresh bin/cryo.exe from the cross-build"
+	@echo "  make pin-all           Refresh both pins (Linux + Windows)"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
 	@echo "  make clean             Remove compiler + stdlib build outputs"
@@ -90,6 +108,28 @@ $(LIBCRYO_A):
 # so a fresh clone can reproduce this state.
 pin-cryo:
 	@python3 scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
+
+# ---- windows cross-build + pin ----------------------------------------
+# Cross-compile the self-hosted compiler to cryo.exe (mingw-w64 + the
+# .toolchains/llvm-win import lib) and, for pin-windows, drop it next to
+# bin/cryo with a sidecar.  Both require the cross toolchain + the fetched
+# windows libLLVM-C; they print an actionable hint and fail if absent.
+cryo-exe: cryo
+	@command -v $(MINGW_GCC) >/dev/null 2>&1 || { echo "ERROR: $(MINGW_GCC) not found (install gcc-mingw-w64-x86-64)."; exit 1; }
+	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
+	@echo "==> Cross-building cryo.exe ($(WIN_TRIPLE)) via the self-hosted compiler"
+	@cd compiler && "$(STAGE2)" build --target=$(WIN_TRIPLE) --no-incremental
+	@echo "==> cryo.exe: $(STAGE2_EXE)"
+
+# Refresh bin/cryo.exe from the cross-built compiler.  Copies the runtime
+# LLVM-C.dll next to it (gitignored) so `wine bin/cryo.exe` works in place.
+pin-windows: cryo-exe
+	@python3 scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP)
+	@cp -f "$(WIN_LLVM_DLL)" "$(ROOT)/bin/LLVM-C.dll" 2>/dev/null \
+		&& echo "==> Runtime LLVM-C.dll copied to bin/ (gitignored)" || true
+
+# Refresh both pins (Linux bin/cryo + Windows bin/cryo.exe).
+pin-all: pin-cryo pin-windows
 
 # ---- Cryo-language LSP server -----------------------------------------
 # Builds tools/CryoLSP/ (entirely Cryo source) into bin/cryolsp.

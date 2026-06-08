@@ -23,7 +23,110 @@ import io::error;
 import io::fd;
 import io::traits;
 import ffi::libc;
+import ffi::syscall;
 import process::signal;
+
+
+// ---------------------------------------------------------------------------
+// Per-OS process control.  POSIX uses waitpid/kill on a pid; Windows uses
+// WaitForSingleObject/GetExitCodeProcess/TerminateProcess on a process HANDLE.
+// `Child` carries both `pid` (the OS pid on POSIX, dwProcessId on Windows -
+// what `id()` returns) and `handle` (0 on POSIX, the HANDLE on Windows).
+// ConfigGating only sees file-scope declarations, so the OS calls live here.
+//
+// Windows has no signals and no zombie table: there is nothing to "reap", but
+// the process HANDLE must be closed exactly once - done in `Child::drop` via
+// `os_proc_reap`, regardless of whether `wait` already read the exit code.
+// ---------------------------------------------------------------------------
+
+![target(unix)]
+private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
+    mut status: i32 = 0;
+    loop {
+        const rc: i32 = libc::waitpid(pid, &status, 0);
+        if (rc >= 0) { return Result::Ok(decode_wstatus(status)); }
+        const err: IoError = IoError::from_errno(libc::errno());
+        match (err.kind) {
+            IoErrorKind::Interrupted => { }
+            _ => { return Result::Err(err); }
+        }
+    }
+}
+![target(windows)]
+private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
+    const h: u8* = handle as u8*;
+    syscall::WaitForSingleObject(h, 0xFFFFFFFFu32);   // INFINITE
+    mut code: u32 = 0u32;
+    syscall::GetExitCodeProcess(h, &code);
+    return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false });
+}
+
+![target(unix)]
+private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
+    mut status: i32 = 0;
+    loop {
+        const rc: i32 = libc::waitpid(pid, &status, libc::WNOHANG);
+        if (rc > 0) { return Result::Ok(Option::Some(decode_wstatus(status))); }
+        if (rc == 0) { return Result::Ok(Option::None); }
+        const err: IoError = IoError::from_errno(libc::errno());
+        match (err.kind) {
+            IoErrorKind::Interrupted => { }
+            _ => { return Result::Err(err); }
+        }
+    }
+}
+![target(windows)]
+private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
+    const h: u8* = handle as u8*;
+    if (syscall::WaitForSingleObject(h, 0u32) == 0x102u32) {   // WAIT_TIMEOUT
+        return Result::Ok(Option::None);
+    }
+    mut code: u32 = 0u32;
+    syscall::GetExitCodeProcess(h, &code);
+    return Result::Ok(Option::Some(ExitStatus { code: code as i32, signal: 0, signaled: false }));
+}
+
+![target(unix)]
+private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), IoError> {
+    if (libc::kill(pid, sig) < 0) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+    return Result::Ok(());
+}
+![target(windows)]
+private function os_proc_signal(pid: i32, handle: u64, sig: i32) -> Result<(), IoError> {
+    // No POSIX signals on Windows; any kill/send_signal terminates the
+    // process (the specific signal number is not representable).
+    if (syscall::TerminateProcess(handle as u8*, 1u32) == 0) {
+        return Result::Err(IoError::new(IoErrorKind::Other, 0));
+    }
+    return Result::Ok(());
+}
+
+// Best-effort cleanup at `Child` drop.  POSIX: a non-blocking reap so an
+// already-exited child's zombie is released.  Windows: close the process
+// HANDLE (nothing to reap).
+![target(unix)]
+private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
+    if (waited) { return; }
+    mut status: i32 = 0;
+    loop {
+        const rc: i32 = libc::waitpid(pid, &status, libc::WNOHANG);
+        if (rc < 0) {
+            const err: IoError = IoError::from_errno(libc::errno());
+            match (err.kind) {
+                IoErrorKind::Interrupted => { }
+                _ => { return; }
+            }
+        } else {
+            return;
+        }
+    }
+}
+![target(windows)]
+private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
+    if (handle != 0u64) { syscall::CloseHandle(handle as u8*); }
+}
 
 /// Result of a child's termination. Either it exited normally with
 /// a code, or it was killed by a signal. POSIX encodes both into a
@@ -133,6 +236,9 @@ implement trait Read for struct ChildStderr {
 type struct Child {
 private:
     pid: i32;
+    // OS process HANDLE on Windows (for wait/kill/close); 0 on POSIX, where
+    // `pid` is the joinable identity.
+    handle: u64;
     waited: boolean;
 public:
     stdin: Option<ChildStdin>;
@@ -140,13 +246,16 @@ public:
     stderr: Option<ChildStderr>;
 
     /// Low-level constructor used by `Command::spawn`. Application
-    /// code should not call this directly.
+    /// code should not call this directly. `handle` is 0 on POSIX and the
+    /// Win32 process HANDLE on Windows.
     static new(pid: i32,
+               handle: u64,
                stdin: Option<ChildStdin>,
                stdout: Option<ChildStdout>,
                stderr: Option<ChildStderr>) -> Child {
         return Child {
             pid: pid,
+            handle: handle,
             stdin: stdin,
             stdout: stdout,
             stderr: stderr,
@@ -169,53 +278,38 @@ public:
             }
             Option::None => { }
         }
-        mut status: i32 = 0;
-        loop {
-            const rc: i32 = libc::waitpid(this.pid, &status, 0);
-            if (rc >= 0) {
-                this.waited = true;
-                return Result::Ok(decode_wstatus(status));
-            }
-            const err: IoError = IoError::from_errno(libc::errno());
-            match (err.kind) {
-                IoErrorKind::Interrupted => { }
-                _ => { return Result::Err(err); }
-            }
+        const r: Result<ExitStatus, IoError> = os_proc_wait(this.pid, this.handle);
+        match (r) {
+            Result::Ok(_)  => { this.waited = true; }
+            Result::Err(_) => { }
         }
+        return r;
     }
 
     /// Non-blocking check. `Ok(Some(status))` means the child has
     /// exited; `Ok(None)` means it's still running.
     try_wait(mut &this) -> Result<Option<ExitStatus>, IoError> {
-        mut status: i32 = 0;
-        loop {
-            const rc: i32 = libc::waitpid(this.pid, &status, libc::WNOHANG);
-            if (rc > 0) {
-                this.waited = true;
-                return Result::Ok(Option::Some(decode_wstatus(status)));
+        const r: Result<Option<ExitStatus>, IoError> = os_proc_try_wait(this.pid, this.handle);
+        match (r) {
+            Result::Ok(opt) => {
+                match (opt) {
+                    Option::Some(_) => { this.waited = true; }
+                    Option::None    => { }
+                }
             }
-            if (rc == 0) {
-                return Result::Ok(Option::None);
-            }
-            const err: IoError = IoError::from_errno(libc::errno());
-            match (err.kind) {
-                IoErrorKind::Interrupted => { }
-                _ => { return Result::Err(err); }
-            }
+            Result::Err(_) => { }
         }
+        return r;
     }
 
-    /// Send SIGKILL. Does not wait; call `wait` afterwards to reap
-    /// the zombie.
+    /// Send SIGKILL (POSIX) / terminate the process (Windows). Does not
+    /// wait; call `wait` afterwards to reap the zombie on POSIX.
     kill(&this) -> Result<(), IoError> {
         return this.send_signal(Signal::kill());
     }
 
     send_signal(&this, sig: Signal) -> Result<(), IoError> {
-        if (libc::kill(this.pid, sig.as_i32()) < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
-        }
-        return Result::Ok(());
+        return os_proc_signal(this.pid, this.handle, sig.as_i32());
     }
 
 }
@@ -278,26 +372,12 @@ implement trait Drop for struct Child {
         }
         this.stderr = Option::None;
 
-        // Non-blocking reap. Skips a child already reaped via
-        // `wait`/`try_wait`. A WNOHANG `waitpid` never blocks: it
-        // returns the pid (zombie reaped), 0 (still running — left
-        // detached), or -1 (already reaped / no such child). EINTR is
-        // retried once; any other error is ignored in a destructor.
-        if (!this.waited) {
-            mut status: i32 = 0;
-            loop {
-                const rc: i32 = libc::waitpid(this.pid, &status, libc::WNOHANG);
-                if (rc < 0) {
-                    const err: IoError = IoError::from_errno(libc::errno());
-                    match (err.kind) {
-                        IoErrorKind::Interrupted => { }
-                        _ => { return; }
-                    }
-                } else {
-                    if (rc > 0) { this.waited = true; }
-                    return;
-                }
-            }
-        }
+        // POSIX: non-blocking reap of an already-exited child (skipped if
+        // `wait`/`try_wait` already reaped it). Windows: close the process
+        // HANDLE exactly once (always, even after `wait`, which does not
+        // close it). `os_proc_reap` encapsulates both; null the handle after
+        // so a second drop is a no-op.
+        os_proc_reap(this.pid, this.handle, this.waited);
+        this.handle = 0u64;
     }
 }
