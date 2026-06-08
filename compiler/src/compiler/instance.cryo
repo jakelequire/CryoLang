@@ -26,6 +26,7 @@ import Compiler::BuildManifest;
 import Compiler::DepsResolver;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Passes;
 import Compiler::Codegen::TestMainCodegen;
 import Compiler::Codegen::TypeMap;
 import Compiler::Lex;
@@ -1288,10 +1289,16 @@ type struct CompilerInstance {
             // `build/<name>` forces a re-hoist and a deleted per-profile
             // artifact forces a relink.
             if (config.requires_entry_point()) {
+                // Route through the target-aware helpers so a windows-gnu
+                // cross-build looks for `build/<name>.exe` and
+                // `build/.../release/<name>.exe`, not the suffix-less path
+                // run_linking writes nothing to.  Without this the
+                // incremental short-circuit always sees the artifact as
+                // missing on Windows and re-links every build.
                 manifest_artifacts.push(
-                    ctx.project_config.bin_artifact_path(ctx.mode.skip_user_main()));
+                    bin_artifact_path_for_target(ctx.project_config, ctx));
                 manifest_artifacts.push(
-                    ctx.project_config.profile_bin_path(ctx.mode.skip_user_main()));
+                    profile_bin_path_for_target(ctx.project_config, ctx));
             } else {
                 const archive_name: string = match (config.target_type) {
                     TargetType::Stdlib => { "libcryo.a" }
@@ -2098,16 +2105,18 @@ type struct CompilerInstance {
                 ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
         // Construct the executable path the linker just produced
-        // (`<output_dir>/<project_name>`, at the build root — same shape as
-        // `ProjectConfig::bin_artifact_path` / CodegenPasses::run_linking) so
-        // `cryo run` knows where to exec.  Library / stdlib targets have no
-        // entry point, so we leave output_path empty for those.  Test-mode
+        // (`<output_dir>/<project_name>[.exe]`, at the build root — same
+        // shape as `bin_artifact_path_for_target` / CodegenPasses::run_linking)
+        // so `cryo run` knows where to exec.  Library / stdlib targets have
+        // no entry point, so we leave output_path empty for those.  Test-mode
         // builds add a `-test` suffix to coexist with a regular build of the
-        // same project; `run_linking` applies the same suffix.
+        // same project; `run_linking` applies the same suffix.  On Windows
+        // targets the helper appends `.exe` so the reported path matches
+        // what the linker actually wrote.
         mut exe_path: string = "";
         if (ctx.project_config != null
                 && ctx.project_config.requires_entry_point()) {
-            exe_path = ctx.project_config.bin_artifact_path(ctx.mode.skip_user_main());
+            exe_path = bin_artifact_path_for_target(ctx.project_config, ctx);
         }
 
         // Build succeeded: record the fingerprint sidecar (consulted by the

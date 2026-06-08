@@ -181,6 +181,22 @@ char          *LLVMPrintValueToString(LLVMValueRef Val);
 void           LLVMSetLinkage(LLVMValueRef Global, int Linkage);
 int            LLVMGetLinkage(LLVMValueRef Global);
 
+/* COMDAT - required for linkonce_odr / weak_odr to dedupe on COFF.
+ * On ELF the linker auto-dedupes by section group; COFF requires an
+ * explicit comdat group per symbol.  LLVM does NOT auto-attach a
+ * comdat for linkonce_odr on COFF - callers must call
+ * LLVMSetComdat(fn, LLVMGetOrInsertComdat(mod, name)).
+ *
+ * Selection kind defaults to LLVMAnyComdatSelectionKind (0), which is
+ * the right pick for linkonce_odr: "pick any, all definitions are
+ * equivalent". */
+typedef void *LLVMComdatRef;
+LLVMComdatRef  LLVMGetOrInsertComdat(LLVMModuleRef M, const char *Name);
+void           LLVMSetComdat(LLVMValueRef V, LLVMComdatRef C);
+LLVMComdatRef  LLVMGetComdat(LLVMValueRef V);
+int            LLVMGetComdatSelectionKind(LLVMComdatRef C);
+void           LLVMSetComdatSelectionKind(LLVMComdatRef C, int Kind);
+
 
 /* ===================================================================
  * Constants

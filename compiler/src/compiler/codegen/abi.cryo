@@ -76,6 +76,28 @@ type enum AbiAttr {
     SRet;      // attached to the hidden return-pointer parameter
 }
 
+/// Active per-process ABI lowering target.  Selects between target-
+/// specific rules inside `AbiClassifier` without subclassing.  Picked at
+/// `AbiClassifier::for_triple` construction time from the resolved target
+/// triple (CLI `--target` / cryoconfig `target_triple` / host fallback).
+///
+/// Today only the va_list shape + forwarding form actually branch on
+/// `kind`; the eightbyte / sret / byval / DirectPair rules in
+/// `classify_param` / `classify_return` are still SysV-only.  When the
+/// Win64 branches land in those bodies the seam will not move - the
+/// same `kind` field will pick which rule body runs.
+type enum AbiKind {
+    /// System V AMD64 (x86-64).  Linux, macOS, BSDs.  Eightbyte
+    /// classification with SSE/INTEGER/`<2 x float>` slots; aggregates
+    /// >16 bytes by reference; 9-16 byte aggregates DirectPair.
+    /// va_list is `__va_list_tag[1]` (24 bytes) and passes by address.
+    SysVAmd64;
+    /// Microsoft x64.  Windows.  Aggregates >8 bytes by reference (no
+    /// DirectPair); va_list is `char*` (8 bytes) and passes by value
+    /// (load from the va_list slot before forwarding).
+    Win64;
+}
+
 type struct ParamPlan {
     /// The Cryo source-language type this plan was derived from.  Kept
     /// around so call sites can re-lower / inspect the value's
@@ -162,6 +184,12 @@ type struct AbiLeaf {
 // the seam carries no module-scope mutable state.
 
 type struct AbiClassifier {
+    /// Active ABI rule set.  Picked at construction from the target
+    /// triple; selects between SysV-amd64 (default, host on this repo)
+    /// and Win64 rules inside the per-method branches.  Currently only
+    /// the va_list-related methods consult `kind`; the eightbyte / sret /
+    /// byval / DirectPair rules are still SysV-only.
+    kind:        AbiKind;
     /// Back-pointer to the owning context's `TypeMapper`.  Threaded
     /// into every classify_* method so call sites no longer pass it
     /// explicitly.  Null between `null()` construction and `wire()`.
@@ -180,9 +208,12 @@ type struct AbiClassifier {
 
     /// Stage 1 of two-phase init.  Produces an AbiClassifier with a
     /// null back-pointer; the parent calls `wire()` once it is at its
-    /// stable (heap) address.
+    /// stable (heap) address.  Defaults to SysV-amd64; cross-compile
+    /// builds should use `for_triple` instead so `kind` reflects the
+    /// target.
     static null() -> AbiClassifier {
         return AbiClassifier {
+            kind:          AbiKind::SysVAmd64,
             type_mapper:   null,
             sret_kind:     0,
             byval_kind:    0,
@@ -191,11 +222,95 @@ type struct AbiClassifier {
         };
     }
 
+    /// Construct an AbiClassifier with `kind` selected from the resolved
+    /// target triple.  `triple` should be the post-`resolve_effective_triple`
+    /// value: an empty string falls back to SysV-amd64 (host default on this
+    /// repo).  Substring-matches on the OS field so the gnu/msvc/cygnus
+    /// environment suffix is irrelevant.  Same back-pointer state as
+    /// `null()`; the parent still calls `wire()` to fill in `type_mapper`.
+    static for_triple(triple: string) -> AbiClassifier {
+        return AbiClassifier {
+            kind:          AbiClassifier::kind_for_triple(triple),
+            type_mapper:   null,
+            sret_kind:     0,
+            byval_kind:    0,
+            inline_kind:   0,
+            noinline_kind: 0,
+        };
+    }
+
+    /// Map an LLVM target triple to the right `AbiKind`.  Substring-match
+    /// on the OS field; mirrors `Compiler::Passes::ConfigGating::classify_triple`
+    /// but produces an ABI atom rather than an OS atom.  Unknown triples
+    /// fall back to SysV-amd64 (the host on this repo).
+    static kind_for_triple(triple: string) -> AbiKind {
+        if (triple == null) { return AbiKind::SysVAmd64; }
+        if (intrinsics::strlen(triple) == 0) { return AbiKind::SysVAmd64; }
+        if (strstr(triple, "windows") != null) { return AbiKind::Win64; }
+        return AbiKind::SysVAmd64;
+    }
+
     /// Stage 2 of two-phase init.  Stores the TypeMapper back-pointer.
     /// Must be called from `CodegenContext::wire()` after the context
     /// is at its stable address.
     wire(mut &this, type_mapper: TypeMapper*) -> void {
         this.type_mapper = type_mapper;
+    }
+
+    /// True iff the active ABI is Microsoft x64 (Windows).
+    is_win64(&this) -> boolean {
+        return match (this.kind) {
+            AbiKind::Win64 => { true }
+            _              => { false }
+        };
+    }
+
+
+    // va_list shape + forwarding
+
+    /// LLVM type for the per-callee va_list alloca created in
+    /// `emit_va_start_for_variadic` and `emit_format_runtime`.
+    ///
+    ///   SysV-amd64: `[24 x i8]` - storage for `__va_list_tag[1]`
+    ///               (gp_offset + fp_offset + overflow_arg_area* +
+    ///                reg_save_area*).
+    ///   Win64:      `i8*`       - storage for a single `char*`
+    ///                              (Win64 va_list is just a pointer to
+    ///                              the next variadic arg).
+    ///
+    /// Both alloca sizes are exactly what `@llvm.va_start.p0` expects
+    /// to initialize, so the backend writes the right number of bytes
+    /// for each target.  No over-allocation; the buffer carries the
+    /// exact target va_list type.
+    va_list_alloca_type(&this) -> LType {
+        return match (this.kind) {
+            AbiKind::SysVAmd64 => { LType::array_of(LType::i8(), 24) }
+            AbiKind::Win64     => { LType::pointer_to(LType::i8()) }
+        };
+    }
+
+    /// Build the value passed to a C variadic consumer whose signature
+    /// takes `va_list` BY VALUE (the third arg of `vasprintf` /
+    /// `vsnprintf` / `vfprintf` and friends).  llvm.va_start / va_end
+    /// always take the alloca address itself, so they bypass this seam.
+    ///
+    ///   SysV-amd64: `va_list` is `__va_list_tag[1]`, which decays to
+    ///               `__va_list_tag*`.  Passing the alloca pointer
+    ///               directly is the correct forwarding form.
+    ///   Win64:      `va_list` is `char*`.  The alloca holds a single
+    ///               `char*` value (written by `@llvm.va_start.p0`); we
+    ///               must LOAD that pointer out before forwarding.
+    ///               Passing the alloca address itself would give the
+    ///               callee a `char**` and crash on the first variadic
+    ///               read.
+    forward_va_list(&this, builder: LBuilder*, va_alloca: LValue) -> LValue {
+        return match (this.kind) {
+            AbiKind::SysVAmd64 => { va_alloca }
+            AbiKind::Win64     => {
+                builder.build_load(
+                    LType::pointer_to(LType::i8()), va_alloca, "va_fwd")
+            }
+        };
     }
 
 
