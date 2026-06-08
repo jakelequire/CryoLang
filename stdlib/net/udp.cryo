@@ -22,6 +22,7 @@ import ffi::libc;
 import net::ip;
 import net::socket_addr;
 import net::sockaddr;
+import net::sys;
 
 type struct UdpSocket {
     fd: i32;
@@ -38,9 +39,9 @@ type struct UdpSocket {
         const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &local)?;
 
         const sock: i32 = open_dgram()?;
-        if (libc::bind(sock, &sockaddr_buf[0], len) < 0) {
-            const err: IoError = IoError::from_errno(libc::errno());
-            fd::close_fd(sock);
+        if (sys::os_bind(sock, &sockaddr_buf[0], len) < 0) {
+            const err: IoError = sys::last_io_error();
+            sys::os_close_sock(sock);
             return Result::Err(err);
         }
         return Result::Ok(UdpSocket { fd: sock });
@@ -60,8 +61,8 @@ type struct UdpSocket {
     connect(mut &this, remote: SocketAddr) -> Result<(), IoError> {
         mut sockaddr_buf: u8[16];
         const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &remote)?;
-        if (libc::connect(this.fd, &sockaddr_buf[0], len) < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
+        if (sys::os_connect(this.fd, &sockaddr_buf[0], len) < 0) {
+            return Result::Err(sys::last_io_error());
         }
         return Result::Ok(());
     }
@@ -73,10 +74,9 @@ type struct UdpSocket {
         mut sockaddr_buf: u8[16];
         const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &dest)?;
         loop {
-            const n: i64 = libc::sendto(this.fd, bytes.as_ptr(), bytes.length(),
-                                        0, &sockaddr_buf[0], len);
+            const n: i64 = sys::os_sendto(this.fd, bytes.as_ptr(), bytes.length(), &sockaddr_buf[0], len);
             if (n >= 0) { return Result::Ok(n as u64); }
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = sys::last_io_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return Result::Err(err); }
@@ -91,13 +91,12 @@ type struct UdpSocket {
         mut sockaddr_buf: u8[16];
         mut addrlen: u32 = 16;
         loop {
-            const n: i64 = libc::recvfrom(this.fd, buffer, length, 0,
-                                          &sockaddr_buf[0], &addrlen);
+            const n: i64 = sys::os_recvfrom(this.fd, buffer, length, &sockaddr_buf[0], &addrlen);
             if (n >= 0) {
                 const peer: SocketAddr = sockaddr::unpack_sockaddr_in(&sockaddr_buf[0]);
                 return Result::Ok((n as u64, peer));
             }
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = sys::last_io_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return Result::Err(err); }
@@ -109,9 +108,9 @@ type struct UdpSocket {
     /// default peer was set.
     send(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         loop {
-            const n: i64 = libc::send(this.fd, bytes.as_ptr(), bytes.length(), 0);
+            const n: i64 = sys::os_send(this.fd, bytes.as_ptr(), bytes.length());
             if (n >= 0) { return Result::Ok(n as u64); }
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = sys::last_io_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return Result::Err(err); }
@@ -123,9 +122,9 @@ type struct UdpSocket {
     /// only be the connected peer). Truncates an oversized datagram.
     recv(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
         loop {
-            const n: i64 = libc::recv(this.fd, buffer, length, 0);
+            const n: i64 = sys::os_recv(this.fd, buffer, length);
             if (n >= 0) { return Result::Ok(n as u64); }
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = sys::last_io_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return Result::Err(err); }
@@ -139,8 +138,8 @@ type struct UdpSocket {
     local_addr(&this) -> Result<SocketAddr, IoError> {
         mut sockaddr_buf: u8[16];
         mut addrlen: u32 = 16;
-        if (libc::getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
+        if (sys::os_getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
+            return Result::Err(sys::last_io_error());
         }
         return Result::Ok(sockaddr::unpack_sockaddr_in(&sockaddr_buf[0]));
     }
@@ -149,16 +148,14 @@ type struct UdpSocket {
     /// datagram the next receive returns `WouldBlock`. Pass 0/0 to
     /// clear an existing timeout.
     set_read_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
-        return sockaddr::apply_so_timeout(this.fd, libc::SO_RCVTIMEO, secs, usecs);
+        return sys::set_timeout(this.fd, true, secs, usecs);
     }
 
     /// Allow sending to the broadcast address. Off by default; the
     /// kernel rejects broadcast sends without it (`EACCES`).
     set_broadcast(mut &this, on: boolean) -> Result<(), IoError> {
-        mut v: i32 = if (on) { 1 } else { 0 };
-        if (libc::setsockopt(this.fd, libc::SocketLevel::SOL_SOCKET,
-                             libc::SO_BROADCAST, &v as u8*, 4) < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
+        if (sys::os_set_broadcast(this.fd, on) < 0) {
+            return Result::Err(sys::last_io_error());
         }
         return Result::Ok(());
     }
@@ -167,7 +164,7 @@ type struct UdpSocket {
     /// have `drop` called before going out of scope.
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            sys::os_close_sock(this.fd);
             this.fd = -1;
         }
     }
@@ -176,12 +173,9 @@ type struct UdpSocket {
 /// Open a `SOCK_DGRAM` IPv4 socket with close-on-exec set atomically so
 /// a concurrent `fork`+`exec` does not leak it into the child.
 function open_dgram() -> Result<i32, IoError> {
-    const sock: i32 = libc::socket(
-        libc::AddressFamily::AF_INET,
-        libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-        libc::Protocol::IPPROTO_UDP);
+    const sock: i32 = sys::os_socket_udp();
     if (sock < 0) {
-        return Result::Err(IoError::from_errno(libc::errno()));
+        return Result::Err(sys::last_io_error());
     }
     return Result::Ok(sock);
 }

@@ -22,6 +22,7 @@ import ffi::libc;
 import net::ip;
 import net::socket_addr;
 import net::sockaddr;
+import net::sys;
 
 // Socket-domain / type / level / option / shutdown constants and
 // the `ShutdownHow` enum live in `ffi::libc`. `sockaddr_in` packing
@@ -45,17 +46,14 @@ type struct TcpStream {
 
         // `SOCK_CLOEXEC` opens the socket close-on-exec so a concurrent
         // `fork`+`exec` does not leak it into the child.
-        const sock: i32 = libc::socket(
-            libc::AddressFamily::AF_INET,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            libc::Protocol::IPPROTO_IP);
+        const sock: i32 = sys::os_socket_tcp();
         if (sock < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
+            return Result::Err(sys::last_io_error());
         }
-        const rc: i32 = libc::connect(sock, &sockaddr_buf[0], len);
+        const rc: i32 = sys::os_connect(sock, &sockaddr_buf[0], len);
         if (rc < 0) {
-            const err: IoError = IoError::from_errno(libc::errno());
-            fd::close_fd(sock);
+            const err: IoError = sys::last_io_error();
+            sys::os_close_sock(sock);
             return Result::Err(err);
         }
         return Result::Ok(TcpStream { fd: sock });
@@ -79,8 +77,8 @@ type struct TcpStream {
     /// down the read path. Useful for protocols where the client
     /// sends then reads to EOF.
     shutdown_write(mut &this) -> Result<(), IoError> {
-        if (libc::shutdown(this.fd, libc::ShutdownHow::SHUT_WR) < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
+        if (sys::os_shutdown(this.fd, 1) < 0) {
+            return Result::Err(sys::last_io_error());
         }
         return Result::Ok(());
     }
@@ -90,21 +88,21 @@ type struct TcpStream {
     /// 0/0 to clear an existing timeout.  Pairs with
     /// `set_write_timeout` for full slow-loris coverage.
     set_read_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
-        return sockaddr::apply_so_timeout(this.fd, libc::SO_RCVTIMEO, secs, usecs);
+        return sys::set_timeout(this.fd, true, secs, usecs);
     }
 
     /// Cap blocking-`write` latency.  After `secs` + `usecs` of no
     /// progress the next `write()` returns `WouldBlock` (errno
     /// `EAGAIN`).  Pass 0/0 to clear.
     set_write_timeout(mut &this, secs: i64, usecs: i64) -> Result<(), IoError> {
-        return sockaddr::apply_so_timeout(this.fd, libc::SO_SNDTIMEO, secs, usecs);
+        return sys::set_timeout(this.fd, false, secs, usecs);
     }
 
     /// Close both halves. Ownership obligation: every TcpStream must
     /// have `drop` called before going out of scope.
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            sys::os_close_sock(this.fd);
             this.fd = -1;
         }
     }
@@ -112,13 +110,13 @@ type struct TcpStream {
 
 implement trait Read for struct TcpStream {
     read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
-        return fd::read_fd(this.fd, buffer, length);
+        return sys::sock_read(this.fd, buffer, length);
     }
 }
 
 implement trait Write for struct TcpStream {
     write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
-        return fd::write_fd(this.fd, bytes);
+        return sys::sock_write(this.fd, bytes.as_ptr(), bytes.length());
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -144,28 +142,21 @@ type struct TcpListener {
 
         // `SOCK_CLOEXEC` opens the listening socket close-on-exec so a
         // concurrent `fork`+`exec` does not leak it into the child.
-        const sock: i32 = libc::socket(
-            libc::AddressFamily::AF_INET,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            libc::Protocol::IPPROTO_IP);
+        const sock: i32 = sys::os_socket_tcp();
         if (sock < 0) {
-            return Result::Err(IoError::from_errno(libc::errno()));
+            return Result::Err(sys::last_io_error());
         }
 
-        mut reuse: i32 = 1;
-        libc::setsockopt(sock,
-                         libc::SocketLevel::SOL_SOCKET,
-                         libc::SO_REUSEADDR,
-                         &reuse as u8*, 4);
+        sys::os_set_reuseaddr(sock);
 
-        if (libc::bind(sock, &sockaddr_buf[0], len) < 0) {
-            const err: IoError = IoError::from_errno(libc::errno());
-            fd::close_fd(sock);
+        if (sys::os_bind(sock, &sockaddr_buf[0], len) < 0) {
+            const err: IoError = sys::last_io_error();
+            sys::os_close_sock(sock);
             return Result::Err(err);
         }
-        if (libc::listen(sock, 128) < 0) {
-            const err: IoError = IoError::from_errno(libc::errno());
-            fd::close_fd(sock);
+        if (sys::os_listen(sock, 128) < 0) {
+            const err: IoError = sys::last_io_error();
+            sys::os_close_sock(sock);
             return Result::Err(err);
         }
         return Result::Ok(TcpListener { fd: sock });
@@ -182,12 +173,11 @@ type struct TcpListener {
             // `accept4` with `SOCK_CLOEXEC`: an accepted fd does NOT
             // inherit the listener's close-on-exec, so set it atomically
             // here to avoid leaking the connection into a forked child.
-            const client_fd: i32 = libc::accept4(this.fd, &sockaddr_buf[0],
-                                                 &addrlen, libc::SOCK_CLOEXEC);
+            const client_fd: i32 = sys::os_accept(this.fd, &sockaddr_buf[0], &addrlen);
             if (client_fd >= 0) {
                 return Result::Ok(TcpStream::from_fd(client_fd));
             }
-            const err: IoError = IoError::from_errno(libc::errno());
+            const err: IoError = sys::last_io_error();
             match (err.kind) {
                 IoErrorKind::Interrupted => { }
                 _ => { return Result::Err(err); }
@@ -199,7 +189,7 @@ type struct TcpListener {
     /// TcpListener must have `drop` called before going out of scope.
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            sys::os_close_sock(this.fd);
             this.fd = -1;
         }
     }

@@ -1951,3 +1951,82 @@ extern "C" {
     function RtlNtStatusToDosError(Status: i32) -> u32;
     function RtlGetVersion(VersionInformation: u8*) -> i32;
 }
+
+
+// ---------------------------------------------------------------------------
+// ws2_32.dll: Winsock 2.  The BSD-socket surface used by std::net.
+//
+// SOCKET is an opaque UINT_PTR (u64), not an int fd; INVALID_SOCKET is
+// (SOCKET)(~0).  Lengths are `int` (i32) here, not POSIX socklen_t/ssize_t,
+// and errors come from WSAGetLastError() rather than errno.  net::sys wraps
+// all of this behind a uniform i32-fd interface (SOCKET values fit i32 in
+// practice; net::sys casts at the boundary).  WSAStartup must run once before
+// any other call.  ws2_32 is NOT auto-linked by mingw - the windows-gnu
+// link line adds -lws2_32 (see codegen/passes.cryo).
+// ---------------------------------------------------------------------------
+![target(windows)]
+const INVALID_SOCKET: u64 = 18446744073709551615;   // (SOCKET)(~0)
+![target(windows)]
+const SOCKET_ERROR:   i32 = -1;
+// WSAGetLastError codes that net::sys maps (the rest fold to Other).
+![target(windows)]
+const WSAEINTR:        i32 = 10004;
+![target(windows)]
+const WSAEWOULDBLOCK:  i32 = 10035;
+![target(windows)]
+const WSAEADDRINUSE:   i32 = 10048;
+![target(windows)]
+const WSAECONNRESET:   i32 = 10054;
+![target(windows)]
+const WSAECONNREFUSED: i32 = 10061;
+![target(windows)]
+const WSAETIMEDOUT:    i32 = 10060;
+![target(windows)]
+const WSAECONNABORTED: i32 = 10053;
+![target(windows)]
+const WSAENOTCONN:     i32 = 10057;
+// FIONBIO for ioctlsocket (non-blocking toggle).
+![target(windows)]
+const FIONBIO: i32 = -2147195266;   // 0x8004667E
+
+![target(windows)]
+![link("ws2_32")]
+extern "C" {
+    // Lifecycle.  lpWSAData points at a >=408-byte WSADATA buffer.
+    function WSAStartup(wVersionRequested: u16, lpWSAData: u8*) -> i32;
+    function WSACleanup() -> i32;
+    function WSAGetLastError() -> i32;
+
+    // Socket lifecycle.  Returns a SOCKET (u64); INVALID_SOCKET on failure.
+    function socket(af: i32, sock_type: i32, protocol: i32) -> u64;
+    function closesocket(s: u64) -> i32;
+    function ioctlsocket(s: u64, cmd: i32, argp: u32*) -> i32;
+
+    // Connection setup.  `namelen`/`addrlen` are `int`, not socklen_t.
+    function bind(s: u64, addr: u8*, namelen: i32) -> i32;
+    function listen(s: u64, backlog: i32) -> i32;
+    function accept(s: u64, addr: u8*, addrlen: i32*) -> u64;
+    function connect(s: u64, name: u8*, namelen: i32) -> i32;
+    function getsockname(s: u64, name: u8*, namelen: i32*) -> i32;
+    function shutdown(s: u64, how: i32) -> i32;
+
+    // Data transfer.  `len` is `int`; the return is `int` (bytes or -1).
+    function send(s: u64, buf: u8*, len: i32, flags: i32) -> i32;
+    function recv(s: u64, buf: u8*, len: i32, flags: i32) -> i32;
+    function sendto(s: u64, buf: u8*, len: i32, flags: i32,
+                    to: u8*, tolen: i32) -> i32;
+    function recvfrom(s: u64, buf: u8*, len: i32, flags: i32,
+                      from: u8*, fromlen: i32*) -> i32;
+
+    // Options.  optval/optlen as bytes; level/optname numeric.
+    function setsockopt(s: u64, level: i32, optname: i32,
+                        optval: u8*, optlen: i32) -> i32;
+    function getsockopt(s: u64, level: i32, optname: i32,
+                        optval: u8*, optlen: i32*) -> i32;
+
+    // Name resolution (Winsock getaddrinfo mirrors the POSIX shape; the
+    // addrinfo struct's ai_addr/ai_canonname fields are swapped vs glibc -
+    // net::dns reads ai_addr at the per-OS offset).
+    function getaddrinfo(node: u8*, service: u8*, hints: u8*, res: u8**) -> i32;
+    function freeaddrinfo(res: u8*) -> void;
+}
