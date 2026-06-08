@@ -1,13 +1,25 @@
 ///! std::time::clock: `Instant`, `SystemTime`, and `sleep`.
 ///!
-///!   - `Instant` reads the monotonic clock (`CLOCK_MONOTONIC`): it only
-///!     goes forward and is the right tool for measuring elapsed time.
-///!   - `SystemTime` reads the wall clock (`CLOCK_REALTIME`): it tracks
-///!     calendar time but can jump (NTP, manual changes), so it must NOT
-///!     be used to measure elapsed time.
+///!   - `Instant` reads the monotonic clock: POSIX `CLOCK_MONOTONIC`
+///!     via `clock_gettime`, or Windows `QueryPerformanceCounter`
+///!     scaled by `QueryPerformanceFrequency`.  It only goes forward
+///!     and is the right tool for measuring elapsed time.
+///!   - `SystemTime` reads the wall clock: POSIX `CLOCK_REALTIME` or
+///!     Windows `GetSystemTimePreciseAsFileTime` (FILETIME ticks
+///!     since 1601-01-01, converted to Unix epoch).  Subject to NTP
+///!     steps and manual changes, so NOT for elapsed-time measurement.
 ///!
-///! `sleep(dur)` parks the current thread for at least `dur`. All
-///! differences saturate at zero rather than wrapping.
+///! `sleep(dur)` parks the current thread for at least `dur`.  POSIX
+///! uses `nanosleep` with EINTR-restart; Windows uses `Sleep`
+///! (millisecond resolution).  All differences saturate at zero
+///! rather than wrapping.
+///!
+///! The OS-divergent readings (`read_monotonic` / `read_realtime` /
+///! `sleep_for`) live as free helpers below; the public `Instant::now`
+///! / `SystemTime::now` / `sleep` simply delegate.  ConfigGating
+///! currently strips at the free-function level, not inside struct
+///! method bodies, so this is the cleanest way to keep one public
+///! surface across platforms.
 
 namespace std::time::clock;
 
@@ -15,10 +27,19 @@ import core::cmp;
 import core::option;
 import core::intrinsics;
 import ffi::libc;
+import ffi::syscall;
 import time::duration;
 
 const NSEC_PER_SEC: i64 = 1000000000;
 const I64_MAX:       i64 = 0x7FFFFFFFFFFFFFFF;
+
+// Windows FILETIME epoch is 1601-01-01 UTC; Unix epoch is 1970-01-01.
+// The difference is exactly 11644473600 seconds (134774 days * 86400)
+// = 116444736000000000 100-ns ticks.  Subtract on every wall-clock read
+// so SystemTime carries Unix-epoch-relative seconds on both platforms.
+const FILETIME_TO_UNIX_TICKS: i64 = 116444736000000000;
+const FILETIME_TICKS_PER_SEC: i64 = 10000000;       // 100-ns intervals
+const FILETIME_NS_PER_TICK:   i64 = 100;            // ns per 100-ns tick
 
 /// Compute `(a_sec.a_nsec) - (b_sec.b_nsec)` as a `Duration`, borrowing
 /// from the seconds when the nanoseconds underflow and clamping the whole
@@ -47,9 +68,7 @@ type struct Instant {
 
     /// Read the monotonic clock now.
     static now() -> Instant {
-        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
-        clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
-        return Instant { secs: ts.tv_sec, nanos: ts.tv_nsec };
+        return read_monotonic();
     }
 
     /// The time elapsed from `earlier` to `this` (saturating at zero).
@@ -125,9 +144,7 @@ type struct SystemTime {
 
     /// Read the wall clock now.
     static now() -> SystemTime {
-        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
-        clock_gettime(ClockId::CLOCK_REALTIME, &ts);
-        return SystemTime { secs: ts.tv_sec, nanos: ts.tv_nsec };
+        return read_realtime();
     }
 
     /// The Unix epoch (1970-01-01 00:00:00 UTC).
@@ -172,14 +189,125 @@ type struct SystemTime {
 
 // sleep.
 
-/// Park the current thread for at least `dur`. Restarts across signal
-/// interruptions (EINTR) using the kernel's remaining-time readout so the
-/// full span elapses.
+/// Park the current thread for at least `dur`.  POSIX path restarts
+/// across EINTR using the kernel's remaining-time readout; Windows
+/// `Sleep` is uninterruptible at the millisecond granularity it
+/// accepts.  Sub-millisecond `dur` rounds UP to 1 ms on Windows so a
+/// non-zero request always blocks.
 function sleep(dur: Duration) -> void {
+    sleep_for(dur);
+}
+
+
+// Per-OS clock + sleep helpers
+
+/// Read the monotonic clock into the shape `Instant` carries.
+![target(unix)]
+private function read_monotonic() -> Instant {
+    mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
+    return Instant { secs: ts.tv_sec, nanos: ts.tv_nsec };
+}
+
+![target(windows)]
+private function read_monotonic() -> Instant {
+    // QueryPerformanceCounter returns ticks; QueryPerformanceFrequency
+    // gives ticks-per-second.  Both write a LARGE_INTEGER (a single
+    // i64 in QuadPart).  Convert to (secs, ns_within_second) without
+    // overflowing i64: split the tick count into quotient + remainder
+    // by the frequency before multiplying the remainder up to nanos.
+    mut counter: LARGE_INTEGER = LARGE_INTEGER { QuadPart: 0i64 };
+    mut freq:    LARGE_INTEGER = LARGE_INTEGER { QuadPart: 0i64 };
+    syscall::QueryPerformanceCounter(&counter);
+    syscall::QueryPerformanceFrequency(&freq);
+    if (freq.QuadPart <= 0i64) {
+        return Instant { secs: 0i64, nanos: 0i64 };
+    }
+    const secs: i64 = counter.QuadPart / freq.QuadPart;
+    const rem:  i64 = counter.QuadPart % freq.QuadPart;
+    const nanos: i64 = (rem * NSEC_PER_SEC) / freq.QuadPart;
+    return Instant { secs: secs, nanos: nanos };
+}
+
+/// Read the wall clock into the shape `SystemTime` carries
+/// (Unix-epoch-relative `secs` + sub-second `nanos`).
+![target(unix)]
+private function read_realtime() -> SystemTime {
+    mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    clock_gettime(ClockId::CLOCK_REALTIME, &ts);
+    return SystemTime { secs: ts.tv_sec, nanos: ts.tv_nsec };
+}
+
+![target(windows)]
+private function read_realtime() -> SystemTime {
+    mut ft: FILETIME = FILETIME { dwLowDateTime: 0u32, dwHighDateTime: 0u32 };
+    syscall::GetSystemTimePreciseAsFileTime(&ft);
+    // Reassemble FILETIME's split halves into a single 64-bit count
+    // of 100-ns intervals since 1601-01-01.  The cast widens through
+    // u64 first so the high half doesn't sign-extend if its MSB is
+    // set somewhere far in the future.
+    const ft_ticks: i64 = ((ft.dwHighDateTime as u64) << 32u64
+                         | (ft.dwLowDateTime  as u64)) as i64;
+    const unix_ticks: i64 = ft_ticks - FILETIME_TO_UNIX_TICKS;
+    const secs:  i64 = unix_ticks / FILETIME_TICKS_PER_SEC;
+    const nanos: i64 = (unix_ticks % FILETIME_TICKS_PER_SEC) * FILETIME_NS_PER_TICK;
+    return SystemTime { secs: secs, nanos: nanos };
+}
+
+/// Block the current thread for at least `dur`.
+![target(unix)]
+private function sleep_for(dur: Duration) -> void {
     mut req: timespec = timespec { tv_sec:  dur.secs as i64,
                                    tv_nsec: dur.nanos as i64 };
     mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
     while (nanosleep(&req, &rem) != 0) {
         req = rem;
+    }
+}
+
+![target(windows)]
+private function sleep_for(dur: Duration) -> void {
+    // Sleep takes milliseconds as u32; the `+ 999999` rounds sub-ms
+    // sub-second remainders UP so a small non-zero `dur` always blocks
+    // for at least one tick.  Whole seconds get the full millisecond
+    // budget before clamping to u32::MAX (the longest single Sleep,
+    // which the loop repeats until the full span elapses).
+    mut remaining_secs: u64 = dur.secs;
+    mut remaining_ns:   u32 = dur.nanos;
+    if (remaining_secs == 0u64 && remaining_ns == 0u32) {
+        return;
+    }
+    const ms_max: u64 = 0xFFFFFFFEu64;  // leave room for the round-up
+    loop {
+        mut chunk: u64 = remaining_secs * 1000u64
+                       + ((remaining_ns as u64) + 999999u64) / 1000000u64;
+        if (chunk == 0u64) {
+            chunk = 1u64;  // any non-zero residual blocks for >= 1 ms
+        }
+        if (chunk > ms_max) { chunk = ms_max; }
+        syscall::Sleep(chunk as u32);
+        // Subtract what we just slept off the remaining budget.
+        const slept_secs: u64 = chunk / 1000u64;
+        const slept_ms:   u64 = chunk - slept_secs * 1000u64;
+        if (remaining_secs >= slept_secs) {
+            remaining_secs = remaining_secs - slept_secs;
+        } else {
+            remaining_secs = 0u64;
+        }
+        const slept_ns: u64 = slept_ms * 1000000u64;
+        if ((remaining_ns as u64) >= slept_ns) {
+            remaining_ns = (remaining_ns as u64 - slept_ns) as u32;
+        } else if (remaining_secs > 0u64) {
+            // Borrow one second to cover the nanos underflow.
+            remaining_secs = remaining_secs - 1u64;
+            const borrowed_ns: u64 = (remaining_ns as u64)
+                                   + (NSEC_PER_SEC as u64) - slept_ns;
+            remaining_ns = borrowed_ns as u32;
+        } else {
+            remaining_ns = 0u32;
+        }
+        if (remaining_secs == 0u64 && remaining_ns == 0u32) {
+            break;
+        }
     }
 }

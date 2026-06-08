@@ -71,6 +71,7 @@ import io::error;
 import io::fd;
 import io::traits;
 import ffi::libc;
+import ffi::syscall;
 
 // FD constants
 
@@ -80,19 +81,48 @@ const STDERR_FD: i32 = 2;
 
 // Process-global locks for the three standard streams.
 //
-// A zero-filled `pthread_mutex_t` is byte-for-byte equivalent to
-// `PTHREAD_MUTEX_INITIALIZER` on Linux/glibc, so these BSS-zeroed
-// buffers are ready to `pthread_mutex_lock` without an explicit
-// `pthread_mutex_init`. 40 bytes is `sizeof(pthread_mutex_t)` on Linux
-// x86_64 (matches `sync::mutex::MutexInner.pthread_buf`).
+// 40-byte buffer is `sizeof(pthread_mutex_t)` on Linux x86_64 (also
+// matches `sync::mutex::MutexInner.pthread_buf`).  On Windows a
+// `SRWLOCK` is one pointer (8 bytes), so the same buffer holds it
+// with room to spare.  A zero-filled buffer is the valid initial
+// state on BOTH platforms - `PTHREAD_MUTEX_INITIALIZER` and
+// `SRWLOCK_INIT` are both all-zero - so the BSS-zeroed globals are
+// ready to use without an explicit init call.
 //
 // Each stream has its own lock so that a thread blocked in a `Stdin`
 // read does not stall `Stdout` writers. The locks guard only the
 // `lock()`-based API; the bare handles still issue one unsynchronized
-// `write(2)`/`read(2)` per call (see the module doc).
+// `write(2)`/`WriteFile` per call (see the module doc).
 mut g_stdin_lock:  u8[40];
 mut g_stdout_lock: u8[40];
 mut g_stderr_lock: u8[40];
+
+// Per-OS lock/unlock helpers - the lock primitives differ between
+// platforms and ConfigGating only handles file-scope declarations
+// (not struct method bodies), so the divergence sits in free
+// functions and the public `lock()` methods just delegate.
+
+![target(unix)]
+private function stream_lock(slot: u8*) -> void {
+    if (libc::pthread_mutex_lock(slot) != 0) {
+        intrinsics::panic("stdio: pthread_mutex_lock failed", FILE, LINE);
+    }
+}
+
+![target(unix)]
+private function stream_unlock(slot: u8*) -> void {
+    libc::pthread_mutex_unlock(slot);
+}
+
+![target(windows)]
+private function stream_lock(slot: u8*) -> void {
+    syscall::AcquireSRWLockExclusive(slot);
+}
+
+![target(windows)]
+private function stream_unlock(slot: u8*) -> void {
+    syscall::ReleaseSRWLockExclusive(slot);
+}
 
 // Line-ending primitives
 
@@ -138,10 +168,7 @@ type struct Stdin {
     /// free. The returned `StdinLock` reads through fd 0 and releases
     /// the lock on `drop`. See the module doc for the ownership rules.
     lock(&this) -> StdinLock {
-        const rc: i32 = libc::pthread_mutex_lock(&g_stdin_lock[0]);
-        if (rc != 0) {
-            intrinsics::panic("Stdin::lock: pthread_mutex_lock failed", FILE, LINE);
-        }
+        stream_lock(&g_stdin_lock[0]);
         return StdinLock { };
     }
 
@@ -227,10 +254,7 @@ type struct Stdout {
     /// free. The returned `StdoutLock` writes through fd 1 and releases
     /// the lock on `drop`. See the module doc for the ownership rules.
     lock(&this) -> StdoutLock {
-        const rc: i32 = libc::pthread_mutex_lock(&g_stdout_lock[0]);
-        if (rc != 0) {
-            intrinsics::panic("Stdout::lock: pthread_mutex_lock failed", FILE, LINE);
-        }
+        stream_lock(&g_stdout_lock[0]);
         return StdoutLock { };
     }
 }
@@ -268,10 +292,7 @@ type struct Stderr {
     /// free. The returned `StderrLock` writes through fd 2 and releases
     /// the lock on `drop`. See the module doc for the ownership rules.
     lock(&this) -> StderrLock {
-        const rc: i32 = libc::pthread_mutex_lock(&g_stderr_lock[0]);
-        if (rc != 0) {
-            intrinsics::panic("Stderr::lock: pthread_mutex_lock failed", FILE, LINE);
-        }
+        stream_lock(&g_stderr_lock[0]);
         return StderrLock { };
     }
 }
@@ -311,7 +332,7 @@ implement trait Read for struct StdinLock {
 
 implement trait Drop for struct StdinLock {
     drop(mut &this) -> void {
-        libc::pthread_mutex_unlock(&g_stdin_lock[0]);
+        stream_unlock(&g_stdin_lock[0]);
     }
 }
 
@@ -332,7 +353,7 @@ implement trait Write for struct StdoutLock {
 
 implement trait Drop for struct StdoutLock {
     drop(mut &this) -> void {
-        libc::pthread_mutex_unlock(&g_stdout_lock[0]);
+        stream_unlock(&g_stdout_lock[0]);
     }
 }
 
@@ -352,6 +373,6 @@ implement trait Write for struct StderrLock {
 
 implement trait Drop for struct StderrLock {
     drop(mut &this) -> void {
-        libc::pthread_mutex_unlock(&g_stderr_lock[0]);
+        stream_unlock(&g_stderr_lock[0]);
     }
 }

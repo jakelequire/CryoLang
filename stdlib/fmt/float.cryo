@@ -26,6 +26,23 @@ import core::primitives;
 import core::slice;
 import ffi::libc;
 
+
+// Per-OS classifications.  glibc exports `__isnan` / `__isinf`;
+// msvcrt exports `_isnan` / `_finite` (no `_isinf` - derive).  Kept as
+// file-local helpers so fmt doesn't take a dependency on std::math.
+
+![target(unix)]
+private function fp_is_nan(v: f64) -> boolean { return libc::__isnan(v) != 0; }
+![target(unix)]
+private function fp_is_inf(v: f64) -> boolean { return libc::__isinf(v) != 0; }
+
+![target(windows)]
+private function fp_is_nan(v: f64) -> boolean { return libc::_isnan(v) != 0; }
+![target(windows)]
+private function fp_is_inf(v: f64) -> boolean {
+    return libc::_isnan(v) == 0 && libc::_finite(v) == 0;
+}
+
 /// Default fractional digits for fixed-point output.
 const DEFAULT_DECIMALS: u64 = 6;
 
@@ -87,10 +104,10 @@ implement f64 {
     /// fixed-point form and to the mantissa of the scientific form.
     to_buf_with(&this, buffer: u8*, decimals: u64) -> u64 {
         const value: f64 = this;
-        if (libc::__isnan(value) != 0) {
+        if (fp_is_nan(value)) {
             return write_literal(buffer, "NaN", 3);
         }
-        if (libc::__isinf(value) != 0) {
+        if (fp_is_inf(value)) {
             if (value < 0.0) {
                 return write_literal(buffer, "-inf", 4);
             }
@@ -132,7 +149,7 @@ implement f64 {
     /// fall back to the debug spelling.
     to_buf_roundtrip(&this, buffer: u8*) -> u64 {
         const value: f64 = this;
-        if (libc::__isnan(value) != 0 || libc::__isinf(value) != 0) {
+        if (fp_is_nan(value) || fp_is_inf(value)) {
             return this.to_buf_with(buffer, DEFAULT_DECIMALS);
         }
         mut n: i32 = libc::snprintf(buffer, 32, "%.15g" as u8*, value);
