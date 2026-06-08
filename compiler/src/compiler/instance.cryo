@@ -356,16 +356,44 @@ type struct TimingTs {
     nanos: i64;
 }
 
+![target(unix)]
 extern "C" {
     function clock_gettime(clk: i32, tp: TimingTs*) -> i32;
 }
 
+// Windows has no `clock_gettime`; the monotonic counter is
+// `QueryPerformanceCounter` (ticks) scaled by `QueryPerformanceFrequency`
+// (ticks/second).  Both live in kernel32, which mingw-w64 auto-links.
+![target(windows)]
+extern "C" {
+    function QueryPerformanceCounter(count: i64*) -> i32;
+    function QueryPerformanceFrequency(freq: i64*) -> i32;
+}
+
 /// Monotonic nanoseconds.  Only meaningful as a difference between two
 /// readings; used solely for the `CRYO_TIMINGS` phase report.
+![target(unix)]
 function timing_now_ns() -> i64 {
     mut ts: TimingTs = TimingTs { secs: 0i64, nanos: 0i64 };
     clock_gettime(1, &ts);
     return ts.secs * 1000000000i64 + ts.nanos;
+}
+
+/// Windows monotonic nanoseconds via QPC.  `count / freq` gives whole
+/// seconds and `count % freq` the sub-second remainder; scaling the
+/// remainder (always < freq) by 1e9 before the divide keeps full
+/// nanosecond resolution without overflowing i64 the way `count * 1e9`
+/// would on a long-running counter.
+![target(windows)]
+function timing_now_ns() -> i64 {
+    mut count: i64 = 0i64;
+    mut freq:  i64 = 0i64;
+    QueryPerformanceCounter(&count);
+    QueryPerformanceFrequency(&freq);
+    if (freq == 0i64) { return 0i64; }
+    const secs: i64 = count / freq;
+    const rem:  i64 = count % freq;
+    return secs * 1000000000i64 + (rem * 1000000000i64) / freq;
 }
 
 /// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
