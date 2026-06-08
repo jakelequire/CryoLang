@@ -57,8 +57,16 @@ done
 
 LIB="${PREFIX}/lib/libLLVM-C.dll.a"
 DLL="${PREFIX}/bin/LLVM-C.dll"
+# clang.exe + llvm-ar.exe come from the SAME msvc tarball.  cryo.exe (run
+# under wine) needs them to *compile the compiler itself*: clang.exe is the
+# C preprocessor for the `extern "C" { #include "llvm_bindings.h" }` site
+# (point CRYO_CC at it), and llvm-ar.exe is an archiver wine can launch in
+# place of the host's ELF `ar` (point CRYO_AR at it).  Both are MSVC-built
+# but run under wine (static CRT, like LLVM-C.dll).  ~100 MB + ~17 MB.
+CLANG="${PREFIX}/bin/clang.exe"
+LLVMAR="${PREFIX}/bin/llvm-ar.exe"
 
-if [[ -f "$LIB" && -f "$DLL" && "$force" -eq 0 ]]; then
+if [[ -f "$LIB" && -f "$DLL" && -f "$CLANG" && -f "$LLVMAR" && "$force" -eq 0 ]]; then
     echo "[fetch-windows-llvm] already present under $PREFIX (pass --force to rebuild)"
 else
     for tool in curl tar "$READOBJ" "$DLLTOOL"; do
@@ -72,10 +80,13 @@ else
     echo "[fetch-windows-llvm] downloading ${ASSET} (~896 MB)…"
     curl -L --fail --progress-bar -o "${work}/llvm.tar.xz" "$URL"
 
-    echo "[fetch-windows-llvm] extracting LLVM-C.dll…"
+    echo "[fetch-windows-llvm] extracting LLVM-C.dll, clang.exe, llvm-ar.exe…"
+    base="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc"
     tar xJf "${work}/llvm.tar.xz" -C "$work" --strip-components=2 --wildcards \
-        "clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc/bin/LLVM-C.dll"
-    cp "${work}/LLVM-C.dll" "$DLL"
+        "${base}/bin/LLVM-C.dll" "${base}/bin/clang.exe" "${base}/bin/llvm-ar.exe"
+    cp "${work}/LLVM-C.dll"   "$DLL"
+    cp "${work}/clang.exe"    "$CLANG"
+    cp "${work}/llvm-ar.exe"  "$LLVMAR"
 
     echo "[fetch-windows-llvm] synthesizing mingw import lib…"
     "$READOBJ" --coff-exports "$DLL" \
@@ -84,8 +95,10 @@ else
     "$DLLTOOL" --input-def "${work}/LLVM-C.def" --dllname LLVM-C.dll --output-lib "$LIB"
 
     echo "[fetch-windows-llvm] done:"
-    echo "  import lib: $LIB  ($(grep -c . "${work}/exports.txt") exports)"
-    echo "  runtime:    $DLL"
+    echo "  import lib:   $LIB  ($(grep -c . "${work}/exports.txt") exports)"
+    echo "  runtime:      $DLL"
+    echo "  preprocessor: $CLANG  (set CRYO_CC for compiler cross-selfhost under wine)"
+    echo "  archiver:     $LLVMAR  (set CRYO_AR for compiler cross-selfhost under wine)"
 fi
 
 cat <<EOF
