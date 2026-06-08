@@ -1870,20 +1870,26 @@ type struct ExprOps {
     }
 
     /// Emit va_start for a variadic function's vararg bucket.
-    /// Allocates a `[24 x i8]` (System V x86-64 va_list layout; larger
-    /// than Win64's 8-byte char* so both platforms fit in the same
-    /// storage) and calls `@llvm.va_start` on the pointer.  Binds
+    /// Allocates the per-target va_list storage (selected by
+    /// `AbiClassifier::va_list_alloca_type`: `[24 x i8]` for SysV-amd64,
+    /// `i8*` for Win64) and calls `@llvm.va_start` on the pointer.  Binds
     /// `args_name` to the alloca so that references in the body resolve
-    /// to the va_list pointer (a `void*`).  The body wraps it in a safe
-    /// `VaArgs` via `VaArgs::new(args)` to read typed values, or forwards
-    /// it directly to a C `v*printf` callee.  Stashes the args name on
-    /// `this` so `codegen_return` can emit `va_end` before every `ret`.
+    /// to the va_list pointer.  The body wraps it in a safe `VaArgs` via
+    /// `VaArgs::new(args)` to read typed values, or forwards it directly
+    /// to a C `v*printf` callee.  Stashes the args name on `this` so
+    /// `codegen_return` can emit `va_end` before every `ret`.
+    ///
+    /// Forwarding the bucket to a `v*printf`-style callee that takes
+    /// `va_list` by value still needs an ABI-aware load on Win64; see
+    /// `AbiClassifier::forward_va_list`.  The format runtime helper
+    /// (`emit_format_runtime`) is the only built-in forwarder today;
+    /// user-code forwarding would need to consult the same seam.
     emit_va_start_for_variadic(mut &this, fn_val: LValue, args_name: SymbolStr) -> void {
         if (!args_name.is_valid()) {
             this.current_variadic_arg_id = 0;
             return;
         }
-        const va_list_ty: LType = LType::array_of(LType::i8(), 24);
+        const va_list_ty: LType = this.abi.va_list_alloca_type();
         const va_list_alloca: LValue = this.flow.create_entry_alloca(
             fn_val, this.resolve(args_name), va_list_ty);
         const va_start_fn: LValue = this.declare_va_start();

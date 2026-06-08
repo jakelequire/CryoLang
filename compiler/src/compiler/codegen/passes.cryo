@@ -63,6 +63,132 @@ function shell_quote(s: string) -> string {
     return buf as string;
 }
 
+// Linker configuration per target
+
+/// What the link pass needs to know about the active target's
+/// toolchain: which driver binary to invoke, what to put on the system
+/// library line, and whether the executable filename grows an `.exe`
+/// suffix.  Built by `linker_config_for_triple` from the resolved
+/// target triple so both `run_linking` and `run_linking_singlefile`
+/// share one source of truth.
+///
+/// `use_stdlib_archive`:
+///   - true  (host build): the stdlib was pre-built by `make stdlib`
+///                         into `<stdlib_root>/.bin/libcryo.a` and we
+///                         append it to the link line.
+///   - false (cross-compile today): the host's `libcryo.a` was built
+///                         for the host ABI and is incompatible with
+///                         the target.  The per-build per-target stdlib
+///                         object files are already in
+///                         `ctx.artifacts.object_files` (cryo
+///                         re-compiles every reachable std module
+///                         when target != host), so no archive is
+///                         needed.  Per-triple `libcryo.a` caching is
+///                         future work.
+///
+/// `supported`:
+///   - true  for triples we know how to drive end-to-end.
+///   - false for triples where we still want the historic bailout
+///           (object files only; user finishes the link manually).
+type struct LinkerConfig {
+    driver:              string;
+    exe_suffix:          string;
+    extra_system_libs:   string;
+    use_stdlib_archive:  boolean;
+    supported:           boolean;
+}
+
+/// Pick the right toolchain for `triple`.  `triple` is the post-
+/// `resolve_effective_triple` value (empty falls back to host).  Today:
+///
+///   - SysV-amd64 host (linux/macos): `cc -lm -lstdc++`, no suffix,
+///     archive yes.  `-lstdc++` drags in LLVM-20's C++ runtime, which
+///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
+///     cryo programs don't reference it but the symbol set is a no-op
+///     so keeping it on the host line costs nothing.
+///   - x86_64 windows-gnu: `x86_64-w64-mingw32-gcc -lm`, `.exe` suffix,
+///     archive no.  mingw-w64 ships its own libc/libm equivalents; no
+///     C++ runtime to pull in for cross-compiled cryo programs (the
+///     compiler binary itself isn't cross-compilable yet - it links
+///     libLLVM, which has no Windows-gnu shim in this checkout).
+///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
+///     `run_linking` falls back to the object-files-only bailout that
+///     prints a manual-link hint.
+function linker_config_for_triple(triple: string) -> LinkerConfig {
+    // Host build: the historic line.  Includes -lstdc++ because the
+    // self-hosted compiler binary pulls in libLLVM-20 (C++); ordinary
+    // cryo programs never reference C++ symbols so the flag is inert
+    // for them.  A null/empty triple is treated as the host.
+    if (triple == null
+            || intrinsics::strlen(triple) == 0
+            || intrinsics::strcmp(triple, get_default_triple()) == 0) {
+        return LinkerConfig {
+            driver:             "cc",
+            exe_suffix:         "",
+            extra_system_libs:  "-lm -lstdc++",
+            use_stdlib_archive: true,
+            supported:          true,
+        };
+    }
+    // x86_64 windows-gnu (mingw-w64).  Substring-match the OS field so
+    // every reasonable spelling (`x86_64-pc-windows-gnu`,
+    // `x86_64-w64-windows-gnu`, `x86_64-windows-gnu`) routes here.
+    if (strstr(triple, "windows") != null
+            && strstr(triple, "gnu") != null
+            && strstr(triple, "x86_64") != null) {
+        return LinkerConfig {
+            driver:             "x86_64-w64-mingw32-gcc",
+            exe_suffix:         ".exe",
+            extra_system_libs:  "-lm",
+            use_stdlib_archive: false,
+            supported:          true,
+        };
+    }
+    // Unknown triple - keep the existing object-files-only behaviour.
+    return LinkerConfig {
+        driver:             "",
+        exe_suffix:         "",
+        extra_system_libs:  "",
+        use_stdlib_archive: false,
+        supported:          false,
+    };
+}
+
+/// Append the linker config's `.exe` suffix to a path if non-empty.
+/// Keeps `ProjectConfig::profile_bin_path` / `bin_artifact_path`
+/// target-agnostic; the suffix lives at the link site where the
+/// LinkerConfig is in scope.
+function with_exe_suffix(path: string, suffix: string) -> string {
+    if (suffix == null) { return path; }
+    if (intrinsics::strlen(suffix) == 0) { return path; }
+    return format("%s%s", path, suffix);
+}
+
+/// Per-profile link-target path for the active target, with `.exe`
+/// applied on Windows.  Wraps `ProjectConfig::profile_bin_path` so the
+/// suffix logic lives in one place; `run_linking` writes to this path
+/// and the incremental-build manifest in instance.cryo stats it.
+function profile_bin_path_for_target(cfg: ProjectConfig*,
+                                     ctx: CompilationContext*) -> string {
+    const tri: string = resolve_effective_triple(ctx.target_triple);
+    const lc:  LinkerConfig = linker_config_for_triple(tri);
+    return with_exe_suffix(
+        cfg.profile_bin_path(ctx.mode.skip_user_main()), lc.exe_suffix);
+}
+
+/// Hoisted (build-root) executable path for the active target, with
+/// `.exe` applied on Windows.  Same shape as
+/// `profile_bin_path_for_target` but lands the file at the user-facing
+/// `<output_dir>/<name>[.exe]` instead of the per-profile cache.
+function bin_artifact_path_for_target(cfg: ProjectConfig*,
+                                      ctx: CompilationContext*) -> string {
+    const tri: string = resolve_effective_triple(ctx.target_triple);
+    const lc:  LinkerConfig = linker_config_for_triple(tri);
+    return with_exe_suffix(
+        cfg.bin_artifact_path(ctx.mode.skip_user_main()), lc.exe_suffix);
+}
+
+
 // Cascade-strip helper
 
 /// Returns true if `name` is in the stripped-functions set.
@@ -753,15 +879,21 @@ type struct CodegenPasses {
 
         const cfg: ProjectConfig* = ctx.project_config;
         const output_dir: string = cfg.output_dir;
-        // Cross-compilation: when the target triple differs from the
-        // host, the per-module .o files were emitted for that target's
-        // ABI/object format and the host's `cc` cannot link them.  Skip
-        // the link step, leave the artifacts under the per-profile cache,
-        // and tell the user how to finish the link with a target-aware
-        // toolchain.  Empty `ctx.target_triple` => host build, link
-        // normally.
-        if (intrinsics::strlen(ctx.target_triple) > 0
-                && intrinsics::strcmp(ctx.target_triple, get_default_triple()) != 0) {
+
+        // Resolve the toolchain for the effective triple.  For host
+        // builds (empty triple, or triple == host) this picks `cc` plus
+        // the historic `-lm -lstdc++` line and tells us to append
+        // `libcryo.a`.  For x86_64 windows-gnu it picks the mingw-w64
+        // driver and tells us NOT to append `libcryo.a` (the per-build
+        // stdlib .o files are already on the link line; the host
+        // archive would be ABI-incompatible).  For triples we don't
+        // know how to drive end-to-end (aarch64, riscv, windows-msvc,
+        // ...) `supported` is false and we keep the historic
+        // object-files-only bailout below.
+        const effective_triple: string = resolve_effective_triple(ctx.target_triple);
+        const link_cfg: LinkerConfig = linker_config_for_triple(effective_triple);
+
+        if (!link_cfg.supported) {
             const obj_only_dir: string = cfg.profile_dir();
             intrinsics::printf("Cross-compile: produced %lld object file(s) for target '%s' in %s\n",
                 ctx.artifacts.object_files.length, ctx.target_triple, obj_only_dir);
@@ -771,21 +903,27 @@ type struct CodegenPasses {
                 ctx.target_triple, obj_only_dir);
             return PassResult::ok();
         }
+
         // The executable is linked under the per-profile cache
-        // (`<output_dir>/target/<profile>/<name>`) and HOISTED to the build
-        // root afterwards; ensure the per-profile dir exists for custom
-        // `--build-dir=...` paths that haven't been pre-created.
+        // (`<output_dir>/target/<profile>/<name>[.exe]`) and HOISTED to
+        // the build root afterwards; ensure the per-profile dir exists
+        // for custom `--build-dir=...` paths that haven't been
+        // pre-created.
         const profile_dir: string = cfg.profile_dir();
         ProjectConfig::mkdir_p(profile_dir);
         // Test-mode builds use a `-test` suffix so the test executable
         // coexists with a normal `cryo run` build of the same project.
-        const exe_path: string = cfg.profile_bin_path(ctx.mode.skip_user_main());
+        // The `.exe` suffix (Windows targets) goes on top of `-test` so
+        // a windows test binary is `<name>-test.exe`.  Routed through
+        // `profile_bin_path_for_target` so the same suffix logic the
+        // incremental-build manifest uses applies here.
+        const exe_path: string = profile_bin_path_for_target(cfg, ctx);
 
         // Build the link command.  libc's system(3) runs `sh -c`, so
         // every interpolated path must be shell-quoted; without it, a
         // working directory with a space breaks the link, and a path
         // containing shell metacharacters is a command-injection hazard.
-        mut cmd: string = format("cc -o %s", shell_quote(exe_path));
+        mut cmd: string = format("%s -o %s", link_cfg.driver, shell_quote(exe_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
             cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
         }
@@ -804,12 +942,14 @@ type struct CodegenPasses {
             cmd = format("%s %s", cmd, shell_quote(cfg.link_static[i]));
         }
         // Stdlib archive: the stdlib build emits `<stdlib_root>/.bin/libcryo.a`
-        // (see bundle_archive); pull it in unless the project opted out
-        // via `no_std`.  Read the resolved stdlib_root off the context
-        // so installed cryo (where stdlib lives at <prefix>/share/cryo/stdlib)
-        // and in-repo cryo (where it lives at <repo>/stdlib) both link
-        // against the right archive.
-        if (!cfg.no_std && intrinsics::strlen(ctx.stdlib_root) > 0) {
+        // (see bundle_archive); pull it in for host builds unless the
+        // project opted out via `no_std`.  Cross-compile builds don't
+        // append the archive - it's ABI-incompatible with the target
+        // and the per-target stdlib .o files are already in the link
+        // line (cryo re-compiles every reachable std module when
+        // target != host).
+        if (link_cfg.use_stdlib_archive && !cfg.no_std
+                && intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
@@ -817,10 +957,9 @@ type struct CodegenPasses {
         // Cryo runtime support is fully inline-lowered: every bare-name
         // intrinsic (i32_to_i64, ptr_add, format, bswap*, clz*, isfinite,
         // atomic_fence, dirent_*) is emitted directly into LLVM IR by
-        // IntrinsicsCodegen.  No C runtime to link.
-        // System libs every cryo binary needs: libm for math intrinsics,
-        // libstdc++ for LLVM's C++ internals (dragged in through -lLLVM-*).
-        cmd = format("%s -lm -lstdc++", cmd);
+        // IntrinsicsCodegen.  No C runtime to link beyond what the
+        // active target's system library line provides.
+        cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
 
         if (ctx.debug_mode) {
             cdebug("[Codegen] Linking %lld objects -> %s\n",
@@ -831,17 +970,19 @@ type struct CodegenPasses {
         const rc: i32 = system(cmd);
         if (rc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("linker invocation failed (cc exited with %d): %s", rc, cmd));
+                format("linker invocation failed (%s exited with %d): %s",
+                    link_cfg.driver, rc, cmd));
             return PassResult::failure(1);
         }
 
         cdebug("[Codegen] Linked executable: %s\n", exe_path);
 
         // Hoist the freshly-linked binary from the per-profile cache up to
-        // the build root (`<output_dir>/<name>`) so it can be run as
-        // `build/<name>` regardless of which profile produced it.  libc's
-        // system(3) runs `sh -c`, so both paths are shell-quoted.
-        const hoisted_exe: string = cfg.bin_artifact_path(ctx.mode.skip_user_main());
+        // the build root (`<output_dir>/<name>[.exe]`) so it can be run
+        // as `build/<name>[.exe]` regardless of which profile produced
+        // it.  libc's system(3) runs `sh -c`, so both paths are
+        // shell-quoted.
+        const hoisted_exe: string = bin_artifact_path_for_target(cfg, ctx);
         ProjectConfig::mkdir_p(output_dir);
         const hoist_cmd: string = format("cp -f %s %s",
             shell_quote(exe_path), shell_quote(hoisted_exe));
@@ -885,8 +1026,12 @@ type struct CodegenPasses {
     /// Single-file `-o PATH` Exe link.  Mirrors the project link path
     /// minus the cryoconfig-driven extras: there are no `[link]` paths,
     /// no test-suffix logic, and no llvm-link IR dump.  The stdlib
-    /// archive is still pulled in when `ctx.stdlib_root` was resolved
-    /// Without it most non-trivial programs would fail to link.
+    /// archive is still pulled in for host builds when `ctx.stdlib_root`
+    /// was resolved - without it most non-trivial programs would fail to
+    /// link.  Cross-compile builds skip the archive (same reasoning as
+    /// the project link path).  The user-supplied `exe_path` is taken
+    /// verbatim: we do NOT auto-append `.exe` for Windows targets,
+    /// since `-o` is explicit user intent.
     static run_linking_singlefile(ctx: CompilationContext*) -> PassResult {
         const exe_path: string = ctx.output_path_override;
         if (intrinsics::strlen(exe_path) == 0) {
@@ -895,21 +1040,32 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        mut cmd: string = format("cc -o %s", shell_quote(exe_path));
+        const effective_triple: string = resolve_effective_triple(ctx.target_triple);
+        const link_cfg: LinkerConfig = linker_config_for_triple(effective_triple);
+        if (!link_cfg.supported) {
+            // Unknown triple - same fallback as the project path.
+            intrinsics::printf("Cross-compile: produced %lld object file(s) for target '%s'\n",
+                ctx.artifacts.object_files.length, ctx.target_triple);
+            intrinsics::printf("  (host linker skipped; link with a %s-aware toolchain)\n",
+                ctx.target_triple);
+            return PassResult::ok();
+        }
+
+        mut cmd: string = format("%s -o %s", link_cfg.driver, shell_quote(exe_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
             cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
         }
-        // Stdlib archive: same lookup as the project link path.  Empty
-        // stdlib_root means single-file mode never resolved one (e.g.
-        // user passed `--no-std` semantically by stripping prelude
-        // resolution); skip the archive in that case and let the
-        // linker error if the program needs stdlib symbols.
-        if (intrinsics::strlen(ctx.stdlib_root) > 0) {
+        // Stdlib archive: same lookup as the project link path, and same
+        // host-vs-cross gating.  Empty stdlib_root means single-file mode
+        // never resolved one (e.g. user passed `--no-std` semantically by
+        // stripping prelude resolution); skip the archive in that case
+        // and let the linker error if the program needs stdlib symbols.
+        if (link_cfg.use_stdlib_archive && intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
         }
-        cmd = format("%s -lm -lstdc++", cmd);
+        cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
 
         if (ctx.debug_mode) {
             cdebug("[Codegen] Single-file link -> %s\n", exe_path);
@@ -919,7 +1075,8 @@ type struct CodegenPasses {
         const rc: i32 = system(cmd);
         if (rc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("linker invocation failed (cc exited with %d): %s", rc, cmd));
+                format("linker invocation failed (%s exited with %d): %s",
+                    link_cfg.driver, rc, cmd));
             return PassResult::failure(1);
         }
 

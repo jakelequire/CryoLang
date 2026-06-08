@@ -23,23 +23,32 @@ namespace Compiler::Codegen::Ops::IntrinsicEmitter;
 
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
+import Compiler::Codegen::Abi;
 import Compiler::Codegen::Ops::IntrinsicsCodegen;
 
 
 type struct IntrinsicEmitter {
     llvm_module: LModule*;
     builder:     LBuilder*;
+    /// Back-pointer to the per-context ABI classifier.  Read by
+    /// `emit_format_runtime` to pick the va_list alloca shape and
+    /// forwarding form for the active target (SysV-amd64 vs Win64).
+    /// Null between `null()` and `wire()`.
+    abi:         AbiClassifier*;
 
     static null() -> IntrinsicEmitter {
         return IntrinsicEmitter {
             llvm_module: null,
             builder:     null,
+            abi:         null,
         };
     }
 
-    wire(mut &this, llvm_module: LModule*, builder: LBuilder*) -> void {
+    wire(mut &this, llvm_module: LModule*, builder: LBuilder*,
+         abi: AbiClassifier*) -> void {
         this.llvm_module = llvm_module;
         this.builder     = builder;
+        this.abi         = abi;
     }
 
 
@@ -54,6 +63,23 @@ type struct IntrinsicEmitter {
             return this.builder.build_load(expected, val, "deref");
         }
         return val;
+    }
+
+    /// Attach an `any`-selection comdat keyed on `name` to a runtime
+    /// helper function so the COFF linker dedupes the per-module copies
+    /// of `linkonce_odr` definitions.  On ELF this is also valid (the
+    /// section group folds silently); on COFF without the comdat the
+    /// mingw-w64 linker rejects the second module's copy as a
+    /// "multiple definition" error.  Selection kind is the LLVM-C
+    /// default `LLVMAnyComdatSelectionKind` (0) - "pick any, all
+    /// definitions are equivalent" - which is the right pick for
+    /// linkonce_odr.
+    attach_runtime_comdat(mut &this, fn_val: LValue, name: string) -> void {
+        if (!fn_val.is_valid()) { return; }
+        const comdat: void* = llvm::LLVMGetOrInsertComdat(
+            this.llvm_module.raw, name);
+        if (comdat == null) { return; }
+        llvm::LLVMSetComdat(fn_val.raw, comdat);
     }
 
 
@@ -744,6 +770,7 @@ type struct IntrinsicEmitter {
 
         // linkonce_odr: every module gets a copy; linker collapses them.
         panic_fn.set_linkage(LLinkage::LinkOnceODR);
+        this.attach_runtime_comdat(panic_fn, "panic");
 
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
         const entry_bb: LBasicBlock = LBasicBlock::append(panic_fn, "entry");
@@ -789,6 +816,7 @@ type struct IntrinsicEmitter {
 
         // linkonce_odr: all copies emitted across modules merge to one.
         fmt_fn.set_linkage(LLinkage::LinkOnceODR);
+        this.attach_runtime_comdat(fmt_fn, "format");
 
         // Save & restore the builder's insertion position so we don't
         // disturb whatever else is being generated for this module.
@@ -797,15 +825,17 @@ type struct IntrinsicEmitter {
         const entry_bb: LBasicBlock = LBasicBlock::append(fmt_fn, "entry");
         this.builder.position_at_end(entry_bb);
 
-        // Allocate va_list (24 bytes, System V x86-64 layout) and the
-        // string out-pointer.
-        const va_list_ty: LType = LType::array_of(LType::i8(), 24);
+        // Allocate va_list (shape selected by the active ABI -
+        // `[24 x i8]` for SysV-amd64, `i8*` for Win64) and the string
+        // out-pointer.
+        const va_list_ty: LType = this.abi.va_list_alloca_type();
         const va_alloca: LValue = this.builder.build_alloca(va_list_ty, "va");
         const strp_alloca: LValue = this.builder.build_alloca(ptr_ty, "strp");
         this.builder.build_store(LType::const_pointer_null(ptr_ty), strp_alloca);
 
         // va_start(&va) - direct LLVM call; the runtime helpers are
-        // fixed-signature so we don't need codegen_call.
+        // fixed-signature so we don't need codegen_call.  va_start /
+        // va_end always take the alloca address, regardless of ABI.
         const va_start_fn: LValue = this.get_or_decl_va_start();
         const va_start_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(va_start_fn.raw) };
         const vs_buf: void* = intrinsics::malloc(8);
@@ -814,7 +844,14 @@ type struct IntrinsicEmitter {
         this.builder.build_call(va_start_ty, va_start_fn, vs_buf, 1, "");
         intrinsics::free(vs_buf);
 
-        // n = vasprintf(strp, fmt, &va)
+        // n = vasprintf(strp, fmt, va)
+        //   - SysV passes the va_list (= __va_list_tag[1]) by address
+        //     => third arg is the alloca pointer.
+        //   - Win64 passes the va_list (= char*) by value => third arg
+        //     is the loaded i8* out of the alloca.
+        // The forwarding form lives on AbiClassifier so the seam
+        // dispatches without re-classifying the triple here.
+        const va_fwd: LValue = this.abi.forward_va_list(this.builder, va_alloca);
         const vasprintf_fn: LValue = this.get_or_decl_vasprintf();
         const vasprintf_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(vasprintf_fn.raw) };
         const fmt_param: LValue = LValue { raw: llvm::LLVMGetParam(fmt_fn.raw, 0) };
@@ -822,7 +859,7 @@ type struct IntrinsicEmitter {
         const va_slots: void** = va_buf as void**;
         va_slots[0] = strp_alloca.raw;
         va_slots[1] = fmt_param.raw;
-        va_slots[2] = va_alloca.raw;
+        va_slots[2] = va_fwd.raw;
         const n_result: LValue = this.builder.build_call(vasprintf_ty, vasprintf_fn, va_buf, 3, "n");
         intrinsics::free(va_buf);
 

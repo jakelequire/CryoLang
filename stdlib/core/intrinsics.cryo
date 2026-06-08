@@ -11,7 +11,31 @@ intrinsic function malloc(size: u64) -> void*;
 intrinsic function calloc(count: u64, size: u64) -> void*;
 intrinsic function realloc(ptr: void*, new_size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
+
+// `aligned_alloc(align, size)` is POSIX C11 - present on glibc/musl
+// but NOT on mingw-w64's msvcrt.  Cryo callers always pair it with
+// `free()`, which works for POSIX `aligned_alloc` but UB for Windows
+// `_aligned_malloc` (the latter requires `_aligned_free`).
+//
+// On UNIX we extern through to the libc symbol.  On Windows we
+// substitute a thin shim that returns `malloc(size)` and discards the
+// alignment argument: mingw-w64's malloc is guaranteed 16-byte aligned
+// on x64, which covers every Cryo type that doesn't use `![align(N)]`
+// with N > 16.  Callers wanting stronger alignment than 16 on Windows
+// will need a paired `_aligned_malloc`/`_aligned_free` API in a future
+// session; until then the shim panics so the limitation surfaces
+// immediately instead of silently misaligning.
+![target(unix)]
 intrinsic function aligned_alloc(alignment: u64, size: u64) -> void*;
+
+![target(windows)]
+function aligned_alloc(alignment: u64, size: u64) -> void* {
+    if (alignment > 16u64) {
+        panic("aligned_alloc with alignment > 16 not yet supported on Windows",
+              FILE, LINE as u32);
+    }
+    return malloc(size);
+}
 
 // Bulk memory.
 intrinsic function memcpy(dest: void*, src: void*, count: u64) -> void*;
