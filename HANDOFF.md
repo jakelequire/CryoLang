@@ -1,261 +1,163 @@
-# Windows Cross-Compile Handoff
+# HANDOFF — two pre-existing Win64 (Windows) runtime bugs
 
-This doc captures the state of the Windows cross-compilation work as of
-end-of-session 2026-06-07.  Pick up here tomorrow.
+Two real, independent bugs that break basic functionality of cross-compiled
+Windows (`x86_64-pc-windows-gnu`) binaries under wine. Both are **pre-existing**
+(not introduced by recent work) and surfaced while testing the `fs::read_dir`
+Windows fix. Neither affects Linux. Listed in priority order.
 
-## TL;DR
-
-Cryo programs that don't use `process` / `thread` / `sync` / `net` now
-cross-compile to runnable Windows `.exe`s.  **12 of 14 stock examples
-build for x86_64-pc-windows-gnu and run correctly under wine.**
-
-The self-hosted compiler itself cross-compiles to valid Windows COFF
-objects.  The only thing stopping `cryo.exe` from existing is the
-linker can't find `LLVM-20` for Windows.
-
-## Verify in one command
-
-After a fresh shell:
-
-```sh
-# Sanity: host build still byte-identical to before today's work.
-make selfhost-check
-
-# Pick any of the working examples to confirm cross-compile path:
-cd examples/04-calculator && rm -rf build
-CRYO_STDLIB=$PWD/../../stdlib ../../bin/cryo build --target=x86_64-pc-windows-gnu --no-incremental
-wine build/04-calculator.exe
-```
-
-Working cross-compile examples: `01-hello 02-fizzbuzz 03-fibonacci
-04-calculator 05-todo-cli 06-word-count 07-shapes 08-game-of-life
-09-json-config 10-expr-interpreter 12-guessing-game 13-closures`.
-
-Not yet working: `11-http-server` (needs Winsock), `14-threads` (needs
-CreateThread).
-
-## What's committed before today
-
-Jake committed an earlier batch with: Phase 1 (smoke test), Phase 2a
-(va_list virtualization), Phase 3 (Windows-gnu linker driver).
-
-## What's NOT yet committed (today's work, waiting on your commit)
-
-```
-compiler/llvm_bindings.h
-compiler/src/compiler/codegen/abi.cryo                      (Phase 2b: Win64 classifier)
-compiler/src/compiler/codegen/context.cryo
-compiler/src/compiler/codegen/llvm_types.cryo
-compiler/src/compiler/codegen/ops/expr_ops.cryo
-compiler/src/compiler/codegen/ops/intrinsic_emitter.cryo
-compiler/src/compiler/codegen/passes.cryo
-compiler/src/compiler/codegen/visit/expr_dispatch.cryo
-compiler/src/compiler/diag/renderer.cryo                    (Phase 4d: render_to_string per-OS)
-compiler/src/compiler/instance.cryo
-compiler/src/compiler/project_config.cryo                   (Phase 5: per-triple cache)
-stdlib/core/intrinsics.cryo                                 (Phase 4d: popen/pclose/isatty/readlink/tmpfile gates)
-stdlib/env/_module.cryo                                     (Phase 4a: set_var/remove_var)
-stdlib/ffi/libc.cryo                                        (errno + isnan/finite + _putenv_s gates)
-stdlib/fmt/float.cryo                                       (fp_is_nan/fp_is_inf locals)
-stdlib/fs/file.cryo                                         (mirror_permissions gate)
-stdlib/fs/metadata.cryo                                     (symlink_metadata gate)
-stdlib/io/stdio.cryo                                        (Phase 4b: stream_lock/stream_unlock SRWLOCK)
-stdlib/math/_module.cryo                                    (is_nan/is_infinite/is_finite gates)
-stdlib/random/secure.cryo                                   (fill_secure_bytes gate)
-stdlib/time/clock.cryo                                      (Phase 4c.time: read_monotonic/realtime/sleep_for)
-bin/cryo, bin/cryo.pin.txt                                  (re-pinned)
-```
-
-`git diff` will show all of these.  `make selfhost-check` passes; the
-IR is byte-identical between stage-3 and stage-4 on the host side, so
-none of these edits change host-build behaviour.
-
-## Phases done today
-
-| # | Phase | Notes |
-|---|---|---|
-| 2b | Win64 ABI classifier | `AbiClassifier.classify_param`/`classify_return` branch on `is_win64()`; sizes 1/2/4/8 → Direct coerced; others → ByVal/SRet.  No DirectPair, no HFA. |
-| 4a | POSIX-only stdlib gating | Per-function gating, NOT per-module (per your call).  See pattern below. |
-| 4b | Windows backends for fs/env/io::stdio | env::set_var/remove_var via `_putenv_s`; fs::file::mirror_permissions no-op on Windows; fs::metadata::symlink_metadata falls back to stat; io::stdio uses SRWLOCK in place of pthread_mutex |
-| 4c.time | time::clock cross-platform | Instant→QueryPerformanceCounter; SystemTime→GetSystemTimePreciseAsFileTime+epoch shift; sleep→Sleep with sub-ms round-up |
-| 4d | Compiler-touched intrinsics | popen/pclose/isatty/readlink/open_memstream all gated; render_to_string uses tmpfile-based path on Windows |
-| 5 | Per-triple build cache | `build/target/<profile>/<triple-or-host>/<origin>/...` so host and Windows builds coexist |
-
-## Big landmine you'll re-discover otherwise: per-function gating pattern
-
-**ConfigGating does NOT recurse into struct method bodies.**  This is
-called out in `compiler/src/compiler/passes/config_gating.cryo:370`.
-
-The "two methods with `![target(...)]`" pattern silently fails — both
-bodies coexist post-gating, the one with unresolved symbols fails
-name resolution.
-
-**Don't:**
-```cryo
-type struct Foo {
-    ![target(unix)]
-    do_thing(&this) -> i32 { ... uses linux symbol ... }
-    ![target(windows)]
-    do_thing(&this) -> i32 { ... uses win32 symbol ... }
-}
-```
-
-**Do:**
-```cryo
-type struct Foo {
-    do_thing(&this) -> i32 { return do_thing_impl(this); }
-}
-
-![target(unix)]
-private function do_thing_impl(f: &Foo) -> i32 { ... }
-![target(windows)]
-private function do_thing_impl(f: &Foo) -> i32 { ... }
-```
-
-Free functions ARE gated correctly.  Examples in the wild:
-`Renderer::render_to_string` (renderer.cryo), `Instant::now` /
-`SystemTime::now` / `sleep` (time/clock.cryo), `Stdin/Stdout/Stderr::lock`
-+ `Drop` impls (io/stdio.cryo).
-
-A future cleanup is to re-enable method recursion in
-`config_gating.cryo` — would let the simpler form work.  Out of scope
-for the port.
-
-## What's left (priority order for `cryo.exe`)
-
-### 1. `compiler/cryoconfig` per-target `[link]`
-
-Today the project's `[link]` section hardcodes Linux paths:
-```toml
-[link]
-system = ["LLVM-20"]
-search = ["/usr/lib/llvm-20/lib"]
-```
-
-For windows-gnu cross we need either:
-- Extend the cryoconfig parser to support `[link.unix]` / `[link.windows]`
-  sections (modify `ProjectConfig` parser around the existing `[link]` handler).
-- Or accept CLI `--link-search=PATH` / `--link-lib=NAME` overrides
-  (simpler; less elegant).
-
-Either way: when the user cross-compiles, the `[link]` line in
-`run_linking` (`passes.cryo`) should use the target-specific libs and
-search paths, not the Linux ones.
-
-### 2. libLLVM-20 for windows-gnu  (external dependency)
-
-Cryo's compiler binary links against libLLVM-20.  For `cryo.exe` we need
-the windows-gnu equivalent.  Options:
-
-  (a) Build LLVM 20 from source for `x86_64-pc-windows-gnu` — multi-hour
-      compile; produces `LLVM-C.dll` + import lib.
-
-  (b) Grab the official LLVM Windows distribution and use its
-      `LLVM-C.dll` (mingw can link against MSVC-built DLLs given an
-      import library; LLVM distributes one).
-
-  (c) Statically link a small LLVM subset — most complex.
-
-`cryo.exe` users will need `LLVM-C.dll` installed alongside (or
-LD_LIBRARY_PATH/PATH set), unless we go fully static.
-
-Once (1) and (2) are in place:
-
-```sh
-cd compiler && rm -rf build
-CRYO_STDLIB=$PWD/../stdlib ../bin/cryo build --target=x86_64-pc-windows-gnu --no-incremental
-# Should produce: build/cryo.exe
-wine build/cryo.exe --version
-```
-
-Should work, because the front-end already produces valid Windows COFF
-for all 127 local + 28 std modules (already verified).
-
-### 3. Remaining stdlib OS-bound modules
-
-End-user programs that use these don't cross-compile yet:
-
-  - `sync::Mutex` / `RwLock` / `CondVar` / `Once` / `Barrier` / `mpsc`
-    — port `pthread_*` → Win32 `SRWLOCK` + `CONDITION_VARIABLE`.
-    The Win32 surface is already declared in `ffi/syscall.cryo`.
-  - `thread::spawn` / `JoinHandle` / `scope` / `local` — pthread_create
-    → `CreateThread`; pthread_key → TLS slots.
-  - `process::Command` — fork+execve → `CreateProcess` + `CreatePipe`.
-    Substantial work because the model is different (CreateProcess
-    bundles the spawn+exec as one call; the pre-exec fd-massage hooks
-    map differently).
-  - `net::TcpStream` / `TcpListener` / `UdpSocket` / `dns` / `tls` / `ws`
-    / `http2` — BSD sockets → Winsock with `WSAStartup`/`WSACleanup`,
-    `SOCKET` handle (not int fd), `WSAGetLastError` instead of errno.
-  - `random::Rng` (the non-secure xoshiro256**) — only `from_os`
-    seeding is OS-specific, and that already routes through
-    `random::secure::fill_secure_bytes` which IS ported.
-  - `test::runner` — fork-per-test → CreateProcess re-exec.  Will
-    require designing an argv flag like `--test-runner-child=<idx>`.
-
-None of these block `cryo.exe` itself.  The compiler's only OS-specific
-needs (env, io::stdio, fs::file, libc::system, intrinsics::popen) are
-already ported.
-
-### 4. Release-artifact pinning (Phase 8 — design work)
-
-Per your no-clutter constraint, `bin/cryo.exe` should NOT live in the
-repo.  Sketch: CI on tag cross-builds `cryo.exe` + windows-targeted
-`libcryo.a` (+ possibly `LLVM-C.dll`) and uploads them as GitHub
-release artifacts.  `install.ps1` (or similar) on Windows fetches by
-version.  `scripts/cryo-pin.py` may need a per-OS pin-map mode.
-
-This is mostly design + scripting; no compiler/stdlib changes.
-
-## Key context files for tomorrow-you
-
-- **`~/.claude/projects/-home-kiji-Programming-apps-CryoLang/memory/project_cryo_windows_port.md`**
-  — full state-of-the-port notes including all gated symbols, the
-  per-function-gating pattern, and conventions.  My memory loads this
-  on every Claude session so I have continuity.
-
-- `docs/abi.md` §7 — original "Multi-target plug-in" design that
-  Phase 2a/2b implements.
-
-- `compiler/src/compiler/passes/config_gating.cryo` — the pass that
-  evaluates `![target(...)]` gates.  The comment at line 370 is the
-  source of truth on why method-level gating doesn't work today.
-
-- `compiler/src/compiler/codegen/abi.cryo` — AbiClassifier with the
-  Win64 branches.  Header comment block has a phased-rollout history.
-
-- `compiler/src/compiler/codegen/passes.cryo` —
-  `linker_config_for_triple` + `profile_bin_path_for_target` +
-  `bin_artifact_path_for_target` + `with_exe_suffix`.  Run_linking
-  and run_linking_singlefile both consult them.
-
-- `stdlib/ffi/syscall.cryo` — Win32 API surface (kernel32, user32,
-  advapi32, ntdll).  Use this for ANY native Windows function.  For
-  msvcrt C-runtime aliases (`_popen`, `_isatty`, `_putenv_s`,
-  `_aligned_malloc`) use `stdlib/ffi/libc.cryo` instead.
-
-## How to resume
-
-```sh
-git status                          # see uncommitted work
-git diff --stat                     # quick file-by-file summary
-make selfhost-check                 # ~2 min; confirms no host regression
-```
-
-For continued porting, the established pattern is in
-`stdlib/time/clock.cryo` and `stdlib/io/stdio.cryo` — copy that shape
-when handling sync / thread / process.
-
-Re-pin after compiler changes:
-```sh
-make cryo && make pin-cryo
-```
-
-You enabled re-pinning for this session; the pin is already up to date.
+> Context: the compiler already cross-builds to `cryo.exe` and the stdlib's
+> sync/thread/process/net/test::runner and (now) `fs::read_dir` are Windows-ported
+> and wine-verified. These two bugs are the next blockers for general Windows use.
 
 ---
 
-Good night.  Tomorrow's biggest wins: (1) cryoconfig per-target `[link]`
-(small change, unblocks Phase 6), (2) one of sync/thread (start with
-`sync::Mutex` — small, demonstrates the SRWLOCK pattern that thread can
-then build on).
+## How to reproduce / verify (read this first)
+
+A plain Cryo program cross-builds to Windows with **no** special env (only the
+*compiler* needs `CRYO_CC`/`CRYO_AR`):
+
+```sh
+cd /tmp/win && mkdir -p /tmp/win   # any scratch dir with a cryoconfig + main.cryo
+CRYO_STDLIB=/workspaces/CryoLang/stdlib /workspaces/CryoLang/bin/cryo build \
+    --target=x86_64-pc-windows-gnu --no-incremental
+WINEDEBUG=-all wine build/.../<name>.exe       # find the .exe under build/
+```
+
+Minimal `cryoconfig`:
+```
+[project]
+project_name = "win"
+output_dir = "build"
+[[bin]]
+name = "win"
+entry_point = "main.cryo"
+[compiler]
+optimize = O2
+```
+
+**CRITICAL verification gotcha:** because **Bug 1 makes `fmt::println` with args
+print garbage on Windows, you cannot use `fmt` output to debug anything under
+wine** (including Bug 2). Verify behaviour through **process exit codes** instead
+(`return` a code from `main`, read `echo $?` after `wine`). That is exactly how
+the `fs::read_dir` fix was validated. Plain `fmt::println("no args")` *does* work
+(only the variadic path is broken), so it's fine for coarse "got here" markers.
+
+---
+
+## BUG 1 — `fmt::println` (any printf-style call with arguments) is broken on Win64
+
+### Symptom
+On Windows under wine, every formatted print produces garbage; on Linux it's
+correct. Plain (no-arg) prints are fine.
+
+```
+fmt::println("one int = %d", 42);      // wine: "one int = -30409112"   linux: "one int = 42"
+fmt::println("two = %d %d", 7, 9);     // wine: "two = -30409112 1073851030"
+fmt::println("str = [%s]", cstr);      // wine: "str = [<the format string itself>]"
+```
+The `%s` printing the format string back is the tell: **the varargs are read
+from the wrong slots** — a va_list setup/forwarding error, not a formatting bug.
+
+### Impact
+HIGH. *All* formatted output is unusable on Windows (`print`/`println`/`eprint`/
+`eprintln`, and almost certainly `format`/`sprintf`/`fprintf` too — verify). This
+is bigger than it looks; most programs print.
+
+### Root cause (where to look)
+The chain: `stdlib/fmt/_module.cryo::println(fmt, args...)` →
+`intrinsics::vprintf(fmt, args)`. A Cryo `args...` function lowers its bucket to a
+**va_list whose shape is ABI-specific**; `vprintf`/`vfprintf` forward that va_list
+to C. The Win64 path of that machinery is the suspect — it appears to have been
+*written but never exercised with real args under wine until now* (see the
+"the seam will not move" comment in `abi.cryo`).
+
+Key files:
+- `compiler/src/compiler/codegen/abi.cryo` — `AbiKind::Win64`, `is_win64()`,
+  `va_list_alloca_type()` (returns `i8*` for Win64 vs `[24 x i8]` for SysV),
+  and `forward_va_list()` (Win64 loads the `i8*` and passes **by value**; SysV
+  passes the alloca **by address**). **Start here** — a wrong shape or wrong
+  forwarding form here corrupts every va_arg.
+- `compiler/src/compiler/codegen/llvm_types.cryo:~478` —
+  `emit_va_start_for_variadic` (sets up the va_list in a variadic fn's prologue).
+- `compiler/src/compiler/codegen/ops/intrinsic_emitter.cryo:802` —
+  `emit_format_runtime` (the `format`/`vasprintf` wrapper; same `forward_va_list`
+  seam — a good, self-contained place to study/print the emitted IR).
+- `intrinsics::vprintf` is declared in `stdlib/core/intrinsics.cryo:182`
+  (`vprintf(format: string, va: void*)`); find where the compiler lowers the
+  `Vprintf` intrinsic (it forwards the Cryo va_list pointer to C `vprintf`).
+
+### Suggested approach
+1. Cross-build a tiny `fmt::println("%d %d", 1, 2)` program, build with
+   `--emit-llvm`, and read the emitted IR for `println` + the `format`/`vprintf`
+   wrapper on the **msvc/win64** target vs the linux target. Diff the va_list
+   alloca type, `llvm.va_start`, and the `vasprintf`/`vprintf` call's third arg.
+2. Compare against what clang emits for the equivalent C
+   (`int f(const char*f,...){ va_list v; va_start(v,f); return vprintf(f,v);}`)
+   targeting `x86_64-pc-windows-gnu`. On Win64 the va_list is a plain `char*`
+   and `va_start` just points it at the first stack vararg; mismatches there are
+   the likely bug.
+3. Verify via exit code: have the Win64 program compute something from the args
+   it printed (e.g. sum two `%d` args via a non-fmt path) and `return` it.
+
+---
+
+## BUG 2 — `File::write` / `File::create` silently fail on Windows (wrong `O_*` flag values)
+
+### Symptom
+`File::create(p)` / `fs::write(p, bytes)` do not create the file on Windows; the
+open fails (or the file is created delete-on-close). Reproduced: a program that
+`fs::write("td/f.txt", ...)` under wine left `td/f.txt` **absent**.
+
+### Impact
+MEDIUM-HIGH. File creation/writing via `std::fs::File` is broken on Windows.
+
+### Root cause (CONFIRMED — same class as the dirent-offset bug)
+`stdlib/ffi/libc.cryo` defines the open flags as **glibc** values:
+```
+O_WRONLY=1  O_RDWR=2  O_CREAT=64 (0o100)  O_TRUNC=512  O_APPEND=1024
+```
+MSVCRT/mingw `_open` uses **different** values:
+```
+_O_WRONLY=0x01  _O_RDWR=0x02  _O_APPEND=0x08  _O_CREAT=0x100  _O_TRUNC=0x200
+_O_EXCL=0x400   _O_TEMPORARY=0x40   _O_TEXT=0x4000   _O_BINARY=0x8000
+```
+So glibc `O_CREAT = 64 = 0x40` is **`_O_TEMPORARY`** on MSVCRT — `File::create`'s
+`O_WRONLY|O_TRUNC|O_CREAT` (`stdlib/fs/file.cryo::to_flags`, line ~90) sets
+*temporary*, not *create*, so `_open` never creates the file. (Also `O_APPEND
+=1024=0x400` collides with `_O_EXCL`.) Two coincidental matches mask it
+partially: `O_WRONLY`/`O_RDWR`/`O_TRUNC` happen to agree.
+
+### Suggested approach (mirror the `fs::read_dir` Windows fix)
+Gate the `O_*` constants per-OS, the same way `stdlib/fs/dir.cryo` now gates the
+dirent offsets and `canonicalize`:
+- Provide MSVCRT flag values on Windows (`![target(windows)]`) and glibc on unix.
+  Either gate the constants in `ffi/libc.cryo`, or compute the flag word in a
+  gated helper that `OpenOptions::to_flags()` calls.
+- **Also OR in `_O_BINARY` (0x8000) on Windows** or `_open` defaults to text mode
+  (CRLF translation) and corrupts binary writes.
+- `DEFAULT_CREATE_MODE` (the 3rd `open` arg) is the umask-style mode; MSVCRT
+  `_open` interprets it as `_S_IREAD|_S_IWRITE` — sanity-check it too.
+
+### Verify
+Pre-create nothing; have the Win64 program `fs::write("out.bin", bytes)` then
+`File::open` + read it back and `return 0` only if the bytes round-trip. Check
+`wine ...; echo $?`, and confirm `out.bin` exists on disk afterward.
+
+---
+
+## What's already in place to help
+- `make selfhost-check` `[w1]`–`[w4]` exercises the Windows cross + wine path
+  (stdlib + compiler cross-selfhost are byte-identical).
+- `scripts/fetch-windows-llvm.sh` provisions `.toolchains/llvm-win/` (LLVM-C.dll,
+  import lib, `clang.exe`, `llvm-ar.exe`) — gitignored.
+- The per-OS gating pattern: `![target(unix)]` / `![target(windows)]` on
+  **free functions and constants** (ConfigGating only sees file-scope decls; it
+  can't gate struct fields or method bodies). See `stdlib/net/sys.cryo` and the
+  recently-fixed `stdlib/fs/dir.cryo` for worked examples.
+- The Win64 ABI seam lives entirely in `compiler/src/compiler/codegen/abi.cryo`
+  (`AbiClassifier`) — Bug 1's fix almost certainly belongs there.
+
+## Not in scope here (separately tracked)
+`net::tls` on Windows — the code is portable OpenSSL FFI; it needs an
+OpenSSL-for-mingw build + DLLs + a live-handshake test (a vendoring/infra task,
+not a code bug).

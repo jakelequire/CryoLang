@@ -17,18 +17,56 @@ import collections::string;
 import collections::str;
 import io::error;
 import ffi::libc;
+import ffi::syscall;
 import fs::path;
 import fs::metadata;
 
-// `struct dirent` field offsets on Linux x86_64 / glibc: d_type @ 18
-// (u8), d_name @ 19 (NUL-terminated).
-const DIRENT_OFF_TYPE: u64 = 18;
-const DIRENT_OFF_NAME: u64 = 19;
-
 // `d_type` values we classify (others fall through to FileType::Other).
+// We normalise both platforms onto these so `DirEntry` stays uniform.
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
+
+// `struct dirent` field offset for `d_type` on Linux x86_64 / glibc.
+const DIRENT_OFF_TYPE_LINUX: u64 = 18;
+
+// Win32 `GetFileAttributes` result bits used to classify entries; mingw's
+// `struct dirent` has no `d_type`, so on Windows we stat each entry instead.
+const FILE_ATTRIBUTE_DIRECTORY:    u32 = 0x10;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const INVALID_FILE_ATTRIBUTES:     u32 = 0xFFFFFFFF;
+
+// `d_name` byte-offset within `struct dirent`: glibc lays it after the 8-byte
+// d_ino, 8-byte d_off, 2-byte d_reclen and 1-byte d_type (offset 19); mingw's
+// shorter layout (4-byte d_ino, two u16s) puts it at offset 8.
+![target(unix)]
+function dirent_name_offset() -> u64 { return 19; }
+![target(windows)]
+function dirent_name_offset() -> u64 { return 8; }
+
+// Classify an entry. On Linux the kernel fills `d_type` in the dirent, so we
+// read it directly (some filesystems report DT_UNKNOWN -> FileType::Other).
+// mingw provides no `d_type`, so on Windows we resolve via the entry's Win32
+// file attributes (`<base>/<name>`); `base` is the directory `read_dir` opened.
+![target(unix)]
+function dirent_dtype(ent: u8*, base: Str, name: Str) -> u8 {
+    return *((ent + DIRENT_OFF_TYPE_LINUX) as u8*);
+}
+![target(windows)]
+function dirent_dtype(ent: u8*, base: Str, name: Str) -> u8 {
+    // Build a NUL-terminated `<base>/<name>` (GetFileAttributesA accepts
+    // forward slashes) and read its attributes.
+    mut full: String = String::from_str(base);
+    full.push('/' as u8);
+    full.push(name);
+    full.push(0 as u8);
+    const attrs: u32 = syscall::GetFileAttributesA(full.as_ptr());
+    full.drop();
+    if (attrs == INVALID_FILE_ATTRIBUTES)       { return 0; }      // DT_UNKNOWN
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { return DT_LNK; }
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)     { return DT_DIR; }
+    return DT_REG;
+}
 
 // Default mode for a newly created directory: 0755.
 const DEFAULT_DIR_MODE: u32 = 493;
@@ -69,6 +107,9 @@ implement trait Drop for struct DirEntry {
 /// `DIR*` on drop. Order is filesystem-defined.
 type struct ReadDir {
     dirp: void*;
+    // Directory path this iterator was opened on; needed to resolve an
+    // entry's type on Windows (where the dirent carries no `d_type`).
+    base: String;
 }
 
 implement trait Iterator<DirEntry> for struct ReadDir {
@@ -77,12 +118,13 @@ implement trait Iterator<DirEntry> for struct ReadDir {
         loop {
             const ent: u8* = libc::readdir(this.dirp);
             if (ent == null) { return Option::None; }
-            const dtype: u8 = *((ent + DIRENT_OFF_TYPE) as u8*);
-            const name_ptr: u8* = ent + DIRENT_OFF_NAME;
+            const name_ptr: u8* = ent + dirent_name_offset();
             const name_view: Str = Str::from_raw(name_ptr, libc::strlen(name_ptr));
             if (is_dot_or_dotdot(name_view)) {
                 continue;
             }
+            // Resolve the type after the name (Windows needs the name to stat).
+            const dtype: u8 = dirent_dtype(ent, this.base.as_str(), name_view);
             return Option::Some(DirEntry {
                 entry_name: String::from_str(name_view),
                 dtype: dtype
@@ -97,6 +139,7 @@ implement trait Drop for struct ReadDir {
             libc::closedir(this.dirp);
             this.dirp = null;
         }
+        this.base.drop();
     }
 }
 
@@ -121,7 +164,7 @@ function read_dir(p: Path) -> Result<ReadDir, IoError> {
     if (dirp == null) {
         return Result::Err(IoError::from_errno(err));
     }
-    return Result::Ok(ReadDir { dirp: dirp });
+    return Result::Ok(ReadDir { dirp: dirp, base: String::from_str(p.as_str()) });
 }
 
 /// Create a single directory (mode 0755). Fails if it already exists or
@@ -234,6 +277,13 @@ function rename(from: Path, to: Path) -> Result<(), IoError> {
 
 /// Resolve `p` to an absolute, symlink-free canonical path
 /// (`realpath(3)`). The result fits in `PATH_MAX` (4096) bytes.
+///
+/// Windows has no `realpath`; it uses `GetFullPathNameA`, which makes the
+/// path absolute and lexically normalises `.`/`..` but does NOT resolve
+/// symlinks or require the target to exist (close enough for path work, and
+/// it keeps `fs::dir` linkable on Windows — the POSIX `realpath` symbol does
+/// not exist in the mingw CRT).
+![target(unix)]
 function canonicalize(p: Path) -> Result<PathBuf, IoError> {
     mut c_path: String = String::from_str_c(p.as_str());
     mut buf: u8[4096];
@@ -244,5 +294,17 @@ function canonicalize(p: Path) -> Result<PathBuf, IoError> {
         return Result::Err(IoError::from_errno(err));
     }
     const view: Str = Str::from_raw(&buf[0], libc::strlen(&buf[0]));
+    return Result::Ok(PathBuf::from_str(view));
+}
+![target(windows)]
+function canonicalize(p: Path) -> Result<PathBuf, IoError> {
+    mut c_path: String = String::from_str_c(p.as_str());
+    mut buf: u8[4096];
+    const n: u32 = syscall::GetFullPathNameA(c_path.as_ptr(), 4096, &buf[0], null);
+    c_path.drop();
+    if (n == 0 || n >= 4096) {
+        return Result::Err(IoError::new(IoErrorKind::Other, 0));
+    }
+    const view: Str = Str::from_raw(&buf[0], n as u64);
     return Result::Ok(PathBuf::from_str(view));
 }

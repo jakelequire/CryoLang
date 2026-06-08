@@ -63,6 +63,21 @@ function shell_quote(s: string) -> string {
     return buf as string;
 }
 
+/// Pick the static archiver binary.  `CRYO_AR` overrides the default
+/// `ar`, mirroring `pick_c_preprocessor`'s `CRYO_CC` knob.  Returned
+/// pointer is the env value (caller must NOT free) when set, otherwise
+/// the static default literal.  A Windows-hosted compiler (cryo.exe
+/// under wine) sets this to an `llvm-ar.exe` it can launch, since the
+/// host's ELF `ar` cannot run under wine.
+function pick_archiver() -> string {
+    const env_raw: i8* = intrinsics::getenv("CRYO_AR") as i8*;
+    if (env_raw != null) {
+        const env_val: string = env_raw as string;
+        if (intrinsics::strlen(env_val) > 0) { return env_val; }
+    }
+    return "ar";
+}
+
 // Linker configuration per target
 
 /// What the link pass needs to know about the active target's
@@ -1139,19 +1154,53 @@ type struct CodegenPasses {
         ProjectConfig::mkdir_p(cfg.output_dir);
         const archive_path: string = cfg.lib_archive_path(archive_name);
 
-        // Build `ar rcs <archive> <obj0> <obj1> ...` in one command so we
-        // pay only one process spawn.  `r` replaces stale members on
-        // re-bundle, `c` suppresses the empty-archive warning, `s` writes
-        // the symbol index that `ld` consults to satisfy references.
-        // Every interpolated path is shell-quoted; `system(3)` runs `sh -c`.
-        mut cmd: string = format("ar rcs %s", shell_quote(archive_path));
-        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
+        // Invoke `<ar> rcs <archive> @<response-file>`.  `r` replaces stale
+        // members on re-bundle, `c` suppresses the empty-archive warning,
+        // `s` writes the symbol index that `ld` consults to satisfy
+        // references.
+        //
+        // Archiver selection mirrors `pick_c_preprocessor`'s `CRYO_CC` knob:
+        // `CRYO_AR` overrides the default `ar`.  This is what lets a
+        // Windows-hosted `cryo.exe` (e.g. run under wine) point at an
+        // `llvm-ar.exe` it can actually launch, since the host's ELF `ar`
+        // can't run there.
+        //
+        // The object list goes in an @response-file rather than on the
+        // command line for TWO reasons: (1) a real compiler easily exceeds
+        // the shell's argv limit on a large project — and under wine
+        // `system(3)` routes through `cmd /c`, whose command line caps at
+        // ~8191 chars (155 object paths blow straight past it, and cmd
+        // truncates rather than erroring, crashing the archiver); (2) it
+        // keeps the spawned command short and identical on every host.  Both
+        // GNU `ar` and `llvm-ar` accept `@file` with one whitespace- or
+        // newline-separated, optionally-quoted entry per object.
+        //
+        // Paths are wrapped in DOUBLE quotes (not `shell_quote`'s single
+        // quotes), matching the cross-platform `c_header_import` precedent:
+        // `system(3)` runs `sh -c` on POSIX but `cmd /c` on Windows, and
+        // `cmd` treats single quotes as literal characters while honouring
+        // double quotes; the archiver's own response-file parser likewise
+        // honours double quotes.  The tool token is left unquoted (as
+        // `c_header_import` leaves `cc`) so a quoted-path first token can't
+        // trip cmd's outer-quote-stripping rule.
+        const ar: string = pick_archiver();
+        const rsp_path: string = format("%s.rsp", archive_path);
+        const rf: void* = intrinsics::fopen(rsp_path, "w");
+        if (rf == null) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("could not open archiver response file for writing: %s", rsp_path));
+            return PassResult::failure(1);
         }
+        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
+            intrinsics::fprintf(rf, "\"%s\"\n", ctx.artifacts.object_files[i]);
+        }
+        intrinsics::fclose(rf);
+
+        const cmd: string = format("%s rcs \"%s\" @\"%s\"", ar, archive_path, rsp_path);
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Bundling %lld objects -> %s\n",
-                ctx.artifacts.object_files.length, archive_path);
+            cdebug("[Codegen] Bundling %lld objects -> %s (via %s)\n",
+                ctx.artifacts.object_files.length, archive_path, rsp_path);
             cdebug("[Codegen] Bundle command: %s\n", cmd);
         }
 
