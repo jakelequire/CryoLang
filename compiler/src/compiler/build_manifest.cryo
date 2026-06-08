@@ -11,14 +11,29 @@
 ///   - the stdlib archive's bytes (when linked), and
 ///   - the full content of every discovered source module.
 ///
-/// Whole-build granularity is deliberate: Cryo monomorphizes across ALL
-/// modules before per-module codegen (Phase 6a), so a single module's `.o`
-/// is NOT a pure function of its own source — a sound per-module cache would
-/// need a cross-module instantiation graph. The whole-build short-circuit is
-/// the sound, high-value form of "skip-unchanged": if nothing changed and
-/// the artifacts still exist, the entire compile+link is skipped. The
-/// per-module `source_hash` entries in the manifest are groundwork for a
-/// future per-module engine.
+/// The whole-build fingerprint is the OUTER fast path: if nothing changed
+/// and the artifacts still exist, the entire compile+link is skipped before
+/// the frontend even runs.
+///
+/// When the whole-build fingerprint DOES differ, a per-module cache (the
+/// `*.modkeys` sidecar) decides which modules' objects can be reused so the
+/// backend (Phase 6b sema + Phase 7 codegen, which measurement puts at ~90%
+/// of build time) only re-runs for modules that actually changed. Because
+/// Cryo monomorphizes across ALL modules before per-module codegen (Phase
+/// 6a), a module's `.o` is not a pure function of its own source — so the
+/// per-module key is computed two ways (see `module_source_hash` /
+/// `toolchain_fingerprint` here and the key derivation in
+/// `instance.cryo::compile_project_with_ctx`):
+///   - a module that OWNS specializations (its `.o` embeds monomorphized
+///     instances whose type-args can come from any consumer) folds a GLOBAL
+///     digest of every module's source hash — it rebuilds whenever any
+///     source changes (conservative but always sound);
+///   - a module that owns NO specializations folds only the source hashes of
+///     its transitive import closure — every type whose layout its `.o`
+///     depends on is reachable through that closure, so a leaf edit leaves
+///     unrelated modules cached.
+/// Bias is always toward rebuilding: a false cache miss is merely slow, a
+/// false hit is a miscompile.
 
 namespace Compiler::BuildManifest;
 
@@ -158,6 +173,140 @@ function compute_fingerprint(cfg: ProjectConfig*, modules: &ModuleEntry[],
         h = fnv_file(h, modules[i].source_path);
     }
     return h;
+}
+
+
+// Per-module cache key components
+
+/// The FNV-1a seed, exposed so the orchestrator can fold module keys with
+/// the same hash family used everywhere else in this module.
+function fnv_seed() -> u64 {
+    return FNV_OFFSET;
+}
+
+/// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
+/// the per-module folding `compute_fingerprint` does (namespace + output
+/// subtree + full file bytes). Used as the atom of every per-module cache
+/// key; folding `origin_subdir` means relocating a module between packages
+/// (which changes where its `.o` lands) invalidates its key.
+function module_source_hash(namespace_name: string, origin_subdir: string,
+                            source_path: string) -> u64 {
+    mut h: u64 = FNV_OFFSET;
+    h = fnv_str(h, namespace_name);
+    h = fnv_str(h, origin_subdir);
+    h = fnv_file(h, source_path);
+    return h;
+}
+
+/// FNV-1a digest of the toolchain inputs that affect EVERY object file: the
+/// compiler's own bytes plus the resolved codegen knobs. Deliberately
+/// excludes the source modules, the stdlib archive, and the `[link]` lists —
+/// those are folded per-module (sources) or only affect the final link
+/// (archive / link lists), not an individual `.o`. Every per-module key
+/// folds this, so a changed compiler or a `--dev`/`--release` switch
+/// invalidates the whole per-module cache.
+function toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
+                               debug_info: boolean) -> u64 {
+    mut h: u64 = FNV_OFFSET;
+    h = fnv_u64(h, compiler_fingerprint());
+    h = fnv_u64(h, opt_level as u64);
+    const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
+    const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
+    const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
+    h = fnv_byte(h, dbg_b);
+    h = fnv_byte(h, ell_b);
+    h = fnv_byte(h, nstd_b);
+    h = fnv_str(h, cfg.target_triple);
+    h = fnv_str(h, cfg.profile);
+    return h;
+}
+
+
+// Per-module key sidecar (*.modkeys): `namespace<TAB>keyhex` per line
+
+/// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
+/// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
+/// or "" when absent (a never-before-seen module always rebuilds).
+type struct ModuleKeyTable {
+    names: string[];
+    keys:  string[];
+
+    static empty() -> ModuleKeyTable {
+        return ModuleKeyTable { names: [], keys: [] };
+    }
+
+    lookup(&this, name: string) -> string {
+        for (mut i: i64 = 0; i < this.names.length; i++) {
+            if (intrinsics::strcmp(this.names[i], name) == 0) {
+                return this.keys[i];
+            }
+        }
+        return "";
+    }
+}
+
+/// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
+function modkeys_slice(data: i8*, start: u64, len: u64) -> string {
+    const out: i8* = intrinsics::malloc(len + 1) as i8*;
+    if (len > 0) {
+        intrinsics::memcpy(out as void*, intrinsics::ptr_add(data as void*, start) as void*, len);
+    }
+    out[len] = 0;
+    return out as string;
+}
+
+/// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
+/// unreadable file yields an empty table (every module then rebuilds, which
+/// is the safe default). Lines without a TAB separator are skipped.
+function read_module_keys(path: string) -> ModuleKeyTable {
+    mut t: ModuleKeyTable = ModuleKeyTable::empty();
+    if (!File::exists(path)) { return t; }
+    mut f: File = File::new(path);
+    f.load();
+    if (!f.is_loaded()) { return t; }
+    const data: i8* = f.data();
+    const n: u64 = f.size();
+    mut i: u64 = 0;
+    while (i < n) {
+        const name_start: u64 = i;
+        while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
+        mut name: string = "";
+        mut keyh: string = "";
+        if (i < n && data[i] == 9) {
+            name = modkeys_slice(data, name_start, i - name_start);
+            i = i + 1;                       // skip TAB
+            const key_start: u64 = i;
+            while (i < n && data[i] != 10) { i = i + 1; }
+            keyh = modkeys_slice(data, key_start, i - key_start);
+        } else {
+            // No TAB before end-of-line: skip the rest of this line.
+            while (i < n && data[i] != 10) { i = i + 1; }
+        }
+        if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
+        if (intrinsics::strlen(name) > 0 && intrinsics::strlen(keyh) > 0) {
+            t.names.push(name);
+            t.keys.push(keyh);
+        }
+    }
+    f.close();
+    return t;
+}
+
+/// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The
+/// caller must have created the incremental dir (e.g. via `write_fingerprint`,
+/// which always runs alongside this on the success path).
+function write_module_keys(path: string, names: &string[],
+                           keys: &string[]) -> void {
+    const f: void* = intrinsics::fopen(path, "w");
+    if (f == null) {
+        intrinsics::fprintf(g_stderr,
+            "warning: cannot write per-module cache keys to %s\n", path);
+        return;
+    }
+    for (mut i: i64 = 0; i < names.length; i++) {
+        intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
+    }
+    intrinsics::fclose(f);
 }
 
 

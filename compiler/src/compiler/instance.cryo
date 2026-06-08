@@ -342,6 +342,51 @@ function lock_path_for(consumer_root: string) -> string {
     return format("%s/cryoconfig.lock", consumer_root);
 }
 
+// Self-contained monotonic clock for `CRYO_TIMINGS` phase profiling.
+//
+// Declared locally rather than importing `ffi::libc` / `std::time`: the
+// compiler imports neither, and pulling `ffi::libc` into the compiler's
+// module graph re-introduces the `strstr`/`realpath` `u8*`-vs-`i8*` shim
+// collision that breaks the self-build (see the f-string discovery note in
+// `compile_project_with_ctx`).  A bare `clock_gettime` extern + a two-word
+// struct sidesteps all of that.  CLOCK_MONOTONIC == 1 on Linux.
+type struct TimingTs {
+    secs:  i64;
+    nanos: i64;
+}
+
+extern "C" {
+    function clock_gettime(clk: i32, tp: TimingTs*) -> i32;
+}
+
+/// Monotonic nanoseconds.  Only meaningful as a difference between two
+/// readings; used solely for the `CRYO_TIMINGS` phase report.
+function timing_now_ns() -> i64 {
+    mut ts: TimingTs = TimingTs { secs: 0i64, nanos: 0i64 };
+    clock_gettime(1, &ts);
+    return ts.secs * 1000000000i64 + ts.nanos;
+}
+
+/// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
+/// the per-phase wall-time report printed at the end of a successful build.
+function timing_enabled() -> boolean {
+    const raw: i8* = intrinsics::getenv("CRYO_TIMINGS") as i8*;
+    if (raw == null) { return false; }
+    return intrinsics::strlen(raw as string) > 0;
+}
+
+/// Render a nanosecond span as milliseconds with one decimal place, plus
+/// its share of `total_ns`.  Pure formatting helper for the timing report.
+function timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
+    const ms_x10: i64 = (span_ns + 50000i64) / 100000i64;
+    mut pct: i64 = 0i64;
+    if (total_ns > 0i64) {
+        pct = (span_ns * 100i64 + total_ns / 2i64) / total_ns;
+    }
+    intrinsics::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
+        label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
+}
+
 /// True when `path` lies under directory `dir` (i.e. begins with `dir`
 /// followed by a `/` boundary).  Used by module-origin classification to
 /// avoid sibling-prefix false matches (e.g. `stdlibfoo` vs `stdlib`).
@@ -351,6 +396,36 @@ function origin_path_under(path: string, dir: string) -> boolean {
     if (intrinsics::strlen(path) <= dlen) { return false; }
     if (intrinsics::strncmp(path, dir, dlen) != 0) { return false; }
     return path[dlen] == '/';
+}
+
+/// Transitive import closure of module `root` (including `root` itself),
+/// returned as a per-module-index boolean set of length `n`.  Follows
+/// `ModuleInfo.dependencies` edges via the name index; dependencies that
+/// resolve to no module (external / unresolved) are simply skipped.  Used by
+/// the per-module incremental cache to fold exactly the source hashes whose
+/// type layouts a non-spec-owning module's object file can depend on.
+function compute_import_closure(mg: ModuleGraph*, root: u32, n: u32) -> boolean[] {
+    mut visited: boolean[] = [];
+    for (mut i: u32 = 0; i < n; i++) { visited.push(false); }
+    if (root >= n) { return visited; }
+    // BFS over a queue with a cursor (no pop needed).
+    mut queue: u32[] = [];
+    queue.push(root);
+    visited[root as i64] = true;
+    mut head: i64 = 0;
+    while (head < queue.length) {
+        const cur: u32 = queue[head];
+        head = head + 1;
+        const info: ModuleInfo* = &mg.modules[cur];
+        for (mut d: i64 = 0; d < info.dependencies.length; d++) {
+            const didx: i64 = mg.find_module_index(info.dependencies[d]);
+            if (didx >= 0 && didx < n as i64 && !visited[didx]) {
+                visited[didx] = true;
+                queue.push(didx as u32);
+            }
+        }
+    }
+    return visited;
 }
 
 /// Build a ProjectConfig view that compiles the `[lib]` half of a
@@ -859,6 +934,18 @@ type struct CompilerInstance {
         // stale cache entry from the previous run.
         Compiler::Codegen::TypeMap::reset_shared_type_cache();
 
+        // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
+        // the report only prints (success path) when the env var is set, so
+        // the overhead on a normal build is a handful of `clock_gettime`s.
+        const tm_on: boolean = timing_enabled();
+        const tm_entry:        i64 = timing_now_ns();
+        mut tm_discovery_end:  i64 = 0i64;
+        mut tm_frontend_end:   i64 = 0i64;
+        mut tm_mono_end:       i64 = 0i64;
+        mut tm_sema_end:       i64 = 0i64;
+        mut tm_codegen_end:    i64 = 0i64;
+        mut tm_link_end:       i64 = 0i64;
+
         const root_path: string = config.discovery_root_path();
         ctx.debug_mode = this.config.debug;
 
@@ -1144,6 +1231,7 @@ type struct CompilerInstance {
 
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        tm_discovery_end = timing_now_ns();
 
         cdebug("[Compiler] Discovered %u modules, compilation order:\n", n);
         for (mut i: u32 = 0; i < n; i++) {
@@ -1169,6 +1257,17 @@ type struct CompilerInstance {
         mut manifest_artifacts: string[] = [];
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
+
+        // Per-module incremental cache.  Computed after Phase 6a (§ below),
+        // consumed by the Phase 6b/7 skip and the success-path sidecar write.
+        //   pm_cached[m]   : module index m may reuse its on-disk .o
+        //   pm_key_names[m]: namespace of module m (parallel to pm_key_hex)
+        //   pm_key_hex[m]  : current cache key of module m
+        //   pm_active      : the per-module cache is in effect this build
+        mut pm_cached:    boolean[] = [];
+        mut pm_key_names: string[]  = [];
+        mut pm_key_hex:   string[]  = [];
+        mut pm_active:    boolean    = false;
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
                 const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
@@ -1443,6 +1542,8 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
+        tm_frontend_end = timing_now_ns();
+
         // Phase 6a: Specialization: monomorphize ALL modules before validation.
         // GenericValidation walks the shared TypeArena which contains
         // InstantiatedTypes from every module.  If we ran validation
@@ -1580,6 +1681,110 @@ type struct CompilerInstance {
             return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
+        tm_mono_end = timing_now_ns();
+
+        // ====================================================================
+        // Per-module incremental cache: decide which modules can reuse their
+        // on-disk object file instead of re-running Phase 6b + Phase 7.
+        // Whole-program monomorphization (Phases 1-6a) has just finished, so
+        // spec ownership and every module's source are final.  Two key
+        // formulas (see build_manifest.cryo for the soundness argument):
+        //   - a module that OWNS specializations folds a GLOBAL digest of all
+        //     source hashes (its .o embeds instances whose type-args can come
+        //     from any consumer) => rebuild on any source change;
+        //   - a module that owns none folds only its transitive import
+        //     closure's source hashes (every layout its .o can depend on is
+        //     reachable there) => unaffected by unrelated edits.
+        // Bias is toward rebuilding: anything unprovable disables the cache.
+        // ====================================================================
+        if (do_incremental && ctx.project_config != null) {
+            pm_active = true;
+
+            // Per-module source hashes (indexed by module index).
+            mut pm_src_h: u64[] = [];
+            for (mut m: u32 = 0; m < n; m++) {
+                const mi: ModuleInfo* = &ctx.module_graph.modules[m];
+                pm_src_h.push(BuildManifest::module_source_hash(
+                    ctx.intern_table.resolve(mi.name),
+                    ModuleInfo::origin_subdir(mi.origin, mi.origin_name),
+                    mi.file_path));
+            }
+
+            const pm_tool_fp: u64 = BuildManifest::toolchain_fingerprint(
+                ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
+
+            // Spec ownership.  A spec whose owner can't be attributed to a
+            // module would let a stale .o win, so disable the cache (full
+            // rebuild) rather than risk a miscompile.
+            mut pm_owns_spec: boolean[] = [];
+            for (mut m: u32 = 0; m < n; m++) { pm_owns_spec.push(false); }
+            if (ctx.monomorphizer != null) {
+                const sc: i64 = ctx.monomorphizer.spec_count();
+                for (mut s: i64 = 0; s < sc; s++) {
+                    const os: SymbolStr = ctx.monomorphizer.spec_owner_source_at(s);
+                    if (!os.is_valid()) { pm_active = false; continue; }
+                    const oidx: i64 = ctx.module_graph.find_module_by_path(
+                        ctx.intern_table.resolve(os));
+                    if (oidx >= 0 && oidx < n as i64) {
+                        pm_owns_spec[oidx] = true;
+                    } else {
+                        pm_active = false;
+                    }
+                }
+            }
+
+            // Global digest over every module's source hash, in topo order.
+            mut pm_global: u64 = BuildManifest::fnv_seed();
+            pm_global = BuildManifest::fnv_u64(pm_global, pm_tool_fp);
+            for (mut i: u32 = 0; i < n; i++) {
+                pm_global = BuildManifest::fnv_u64(pm_global, pm_src_h[order[i] as i64]);
+            }
+
+            const pm_prior: BuildManifest::ModuleKeyTable =
+                BuildManifest::read_module_keys(ctx.project_config.module_keys_path());
+
+            // Per-module key (indexed by module index, parallel arrays).
+            for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); }
+            for (mut m: u32 = 0; m < n; m++) {
+                const mi: ModuleInfo* = &ctx.module_graph.modules[m];
+                const ns: string = ctx.intern_table.resolve(mi.name);
+                mut k: u64 = BuildManifest::fnv_seed();
+                k = BuildManifest::fnv_u64(k, pm_tool_fp);
+                if (pm_owns_spec[m as i64]) {
+                    k = BuildManifest::fnv_str(k, "owner");
+                    k = BuildManifest::fnv_u64(k, pm_global);
+                } else {
+                    k = BuildManifest::fnv_str(k, "leaf");
+                    const clos: boolean[] =
+                        compute_import_closure(ctx.module_graph, m, n);
+                    for (mut i: u32 = 0; i < n; i++) {
+                        if (clos[order[i] as i64]) {
+                            k = BuildManifest::fnv_u64(k, pm_src_h[order[i] as i64]);
+                        }
+                    }
+                }
+                pm_key_names.push(ns);
+                pm_key_hex.push(BuildManifest::u64_to_hex(k));
+            }
+
+            // Cached iff the prior key matches AND the .o is still on disk.
+            if (pm_active) {
+                for (mut m: u32 = 0; m < n; m++) {
+                    const mi: ModuleInfo* = &ctx.module_graph.modules[m];
+                    const prior_k: string = pm_prior.lookup(pm_key_names[m as i64]);
+                    if (intrinsics::strlen(prior_k) == 0) { continue; }
+                    if (intrinsics::strcmp(prior_k, pm_key_hex[m as i64]) != 0) { continue; }
+                    const objp: string = format("%s/%s.o",
+                        ctx.project_config.deps_dir_for(
+                            ModuleInfo::origin_subdir(mi.origin, mi.origin_name)),
+                        BuildManifest::mangle_module(ctx.intern_table.resolve(mi.name)));
+                    if (File::exists(objp)) {
+                        pm_cached[m as i64] = true;
+                    }
+                }
+            }
+        }
+
         // Phase 6b: Validation + Semantic Analysis + Codegen Preparation.
         // Now that every module has been monomorphized and specialized ASTs
         // injected, GenericValidation can safely walk the entire arena
@@ -1604,6 +1809,12 @@ type struct CompilerInstance {
 
         mut phase6_failed: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
+            // Cached module: its source + dependencies are unchanged, so its
+            // bodies already type-/move-checked clean in the build that
+            // produced the reusable .o.  Skip sema/lowering entirely; nothing
+            // downstream (cross-module descriptors, other modules' codegen,
+            // linking) reads a cached module's lowered AST.
+            if (pm_active && pm_cached[order[i] as i64]) { continue; }
             CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
@@ -1622,6 +1833,8 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
+
+        tm_sema_end = timing_now_ns();
 
         // Dump ASTs if requested (even on errors, for debugging)
         if (this.config.show_ast) {
@@ -1686,6 +1899,20 @@ type struct CompilerInstance {
                 if (n_std > 0) { intrinsics::printf(", %u std", n_std); }
                 if (n_dep > 0) { intrinsics::printf(", %u dep", n_dep); }
                 intrinsics::printf(" module(s)\n");
+
+                // Report how many modules' objects are being reused from the
+                // per-module incremental cache vs. recompiled this build.
+                if (pm_active) {
+                    mut n_reused: u32 = 0;
+                    for (mut si: u32 = 0; si < n; si++) {
+                        if (pm_cached[order[si] as i64]) { n_reused += 1; }
+                    }
+                    if (n_reused > 0) {
+                        intrinsics::printf(
+                            "  reusing %u cached object(s), recompiling %u\n",
+                            n_reused, n - n_reused);
+                    }
+                }
             }
 
             // Per-module LLVM IR (`.ll`) output dir is computed PER MODULE at
@@ -1719,6 +1946,21 @@ type struct CompilerInstance {
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.resolve(_mi.name);
                 cdebug("[Compiler] Phase 7: module %u/%u (%s)\n", i, n, _mn);
+                // Cached module: reuse the on-disk object instead of
+                // regenerating IR + emitting it.  The object path is the same
+                // deterministic location ObjectEmission would have written
+                // (`deps_dir_for(origin)/<mangled-namespace>.o`), and pushing
+                // it here — at this module's topo position — keeps the linker's
+                // object order byte-identical to a clean build.
+                if (pm_active && pm_cached[order[i] as i64]) {
+                    const cobj: string = format("%s/%s.o",
+                        ctx.project_config.deps_dir_for(
+                            ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
+                        BuildManifest::mangle_module(_mn));
+                    ctx.artifacts.register_object_file(cobj);
+                    cdebug("[Compiler] Phase 7: reused cached object %s\n", cobj);
+                    continue;
+                }
                 CompilerInstance::load_module_with_scope(
                     ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
                 ctx.provisions.clear();
@@ -1795,6 +2037,8 @@ type struct CompilerInstance {
                 pipeline.reset();
             }
 
+            tm_codegen_end = timing_now_ns();
+
             // Phase 7b: synthesize the test-runner main when in test mode.
             // Walks the directive registry for `![test]` records, builds
             // a fresh LLVM module containing the descriptor table + main,
@@ -1820,6 +2064,7 @@ type struct CompilerInstance {
                         "error: linking failed\n");
                 }
             }
+            tm_link_end = timing_now_ns();
         }
 
         // Print diagnostic summary on errors, warnings, or debug mode.
@@ -1875,6 +2120,44 @@ type struct CompilerInstance {
                 ctx.project_config, &mod_entries, ctx.opt_level,
                 ctx.emit_debug_info, build_fp_hex, &manifest_artifacts,
                 manifest_stdlib_archive);
+            // Per-module cache keys for the NEXT build to consult.  Written
+            // whenever they were computed: every module not marked cached was
+            // just recompiled, so its key now matches its on-disk .o.
+            if (pm_key_names.length > 0) {
+                BuildManifest::write_module_keys(
+                    ctx.project_config.module_keys_path(),
+                    &pm_key_names, &pm_key_hex);
+            }
+        }
+
+        // CRYO_TIMINGS report: per-phase wall time + the frontend/backend
+        // split that gates the per-module-incremental design (only the
+        // backend — Phase 6b + Phase 7 + link — is cacheable per module; the
+        // frontend and whole-program monomorphization must always run).
+        if (tm_on) {
+            // Use the last mark that actually fired as the build end, so the
+            // report is sane for library/codegen-disabled builds too.
+            mut tm_end: i64 = tm_sema_end;
+            if (tm_codegen_end > tm_end) { tm_end = tm_codegen_end; }
+            if (tm_link_end > tm_end)    { tm_end = tm_link_end; }
+            const total: i64 = tm_end - tm_entry;
+            const fe: i64 = tm_mono_end - tm_entry;
+            const be: i64 = tm_end - tm_mono_end;
+            intrinsics::printf("\n=== cryo build timings (%s) ===\n", config.project_name);
+            timing_fmt("discovery (phase 1)", tm_discovery_end - tm_entry, total);
+            timing_fmt("frontend (phase 2-5)", tm_frontend_end - tm_discovery_end, total);
+            timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
+            timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
+            if (tm_codegen_end > 0i64) {
+                timing_fmt("codegen+objects (7)", tm_codegen_end - tm_sema_end, total);
+            }
+            if (tm_link_end > 0i64) {
+                timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
+            }
+            intrinsics::printf("  %-28s\n", "----");
+            timing_fmt("FRONTEND (1-6a, uncacheable)", fe, total);
+            timing_fmt("BACKEND  (6b+7+link, cacheable)", be, total);
+            timing_fmt("TOTAL", total, total);
         }
 
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
