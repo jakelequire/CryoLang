@@ -176,7 +176,7 @@ type struct ProjectConfig {
     /// always-O2 historical default.
     opt_level_explicit: boolean;
     /// Selected build profile name. Drives the per-profile cache subtree
-    /// (`<output_dir>/.cryo/<profile>/`) and the default optimization /
+    /// (`<output_dir>/target/<profile>/`) and the default optimization /
     /// debug-info level. `"release"` (O2, no debug info) by default;
     /// `"debug"` is O0 + DWARF. Set by `[profile] default = "..."` and
     /// overridden by the CLI `--release` / `--dev` / `--profile=NAME` flags.
@@ -565,39 +565,61 @@ type struct ProjectConfig {
 
     // Build-directory layout
     //
-    // Final artifacts live at the ROOT of `output_dir`:
+    // Final artifacts are HOISTED to the ROOT of `output_dir` so they can be
+    // run as `build/<name>` regardless of which profile produced them:
     //   <output_dir>/<name>          executable        (cryo run / [[bin]])
     //   <output_dir>/<name>-test     test binary       (cryo test)
     //   <output_dir>/lib<name>.a     library archive   ([lib] target)
-    //   <output_dir>/<name>.ll       combined IR dump  (when emit_llvm)
-    //   <output_dir>/build-manifest.json
-    // Everything internal lives under a hidden, per-profile cache subtree:
-    //   <output_dir>/.cryo/<profile>/deps/*.o
-    //   <output_dir>/.cryo/<profile>/ir/*.ll
-    //   <output_dir>/.cryo/<profile>/incremental/inputs.fp
+    // Everything internal lives under a VISIBLE, per-profile cache subtree at
+    // `<output_dir>/target/<profile>/`, grouped per ORIGIN (stdlib / the local
+    // project / each third-party dependency) so packages stay isolated:
+    //   <output_dir>/target/<profile>/<name>             pre-hoist artifact
+    //   <output_dir>/target/<profile>/build-manifest.json
+    //   <output_dir>/target/<profile>/std/deps/*.o    std/ir/*.ll
+    //   <output_dir>/target/<profile>/local/deps/*.o  local/ir/*.ll
+    //   <output_dir>/target/<profile>/local/incremental/<name>.fp
+    //   <output_dir>/target/<profile>/<depname>/deps/*.o  <depname>/ir/*.ll
 
-    /// Hidden per-profile cache root: `<output_dir>/.cryo/<profile>`.
-    cache_dir(&this) -> string {
-        return format("%s/.cryo/%s", this.output_dir, this.profile);
+    /// Visible per-profile cache root: `<output_dir>/target/<profile>`.
+    profile_dir(&this) -> string {
+        return format("%s/target/%s", this.output_dir, this.profile);
     }
 
-    /// Per-module object output dir: `<cache_dir>/deps`.
-    deps_dir(&this) -> string {
-        return format("%s/deps", this.cache_dir());
+    /// Per-origin object output dir: `<profile_dir>/<origin_subdir>/deps`.
+    /// `origin_subdir` is `"std"`, `"local"`, or a dependency name.
+    deps_dir_for(&this, origin_subdir: string) -> string {
+        return format("%s/%s/deps", this.profile_dir(), origin_subdir);
     }
 
-    /// Per-module LLVM IR (`.ll`) output dir: `<cache_dir>/ir`.
-    ir_dir(&this) -> string {
-        return format("%s/ir", this.cache_dir());
+    /// Per-origin LLVM IR (`.ll`) output dir: `<profile_dir>/<origin_subdir>/ir`.
+    ir_dir_for(&this, origin_subdir: string) -> string {
+        return format("%s/%s/ir", this.profile_dir(), origin_subdir);
     }
 
-    /// Incremental-build state dir: `<cache_dir>/incremental`.
+    /// Incremental-build state dir (whole-build, owned by the local project):
+    /// `<profile_dir>/local/incremental`.
     incremental_dir(&this) -> string {
-        return format("%s/incremental", this.cache_dir());
+        return format("%s/local/incremental", this.profile_dir());
     }
 
-    /// Final executable path at the build root.  `test_suffix` appends
+    /// Per-profile executable, the link target BEFORE hoisting:
+    /// `<profile_dir>/<name>[-test]`.
+    profile_bin_path(&this, test_suffix: boolean) -> string {
+        if (test_suffix) {
+            return format("%s/%s-test", this.profile_dir(), this.project_name);
+        }
+        return format("%s/%s", this.profile_dir(), this.project_name);
+    }
+
+    /// Per-profile library archive, the bundle target BEFORE hoisting:
+    /// `<profile_dir>/lib<name>.a`.
+    profile_lib_path(&this, archive_name: string) -> string {
+        return format("%s/%s", this.profile_dir(), archive_name);
+    }
+
+    /// Hoisted final executable at the build root.  `test_suffix` appends
     /// `-test` so a `cryo test` binary coexists with a `cryo run` build.
+    /// This is the stable, profile-agnostic path `cryo run` execs.
     bin_artifact_path(&this, test_suffix: boolean) -> string {
         if (test_suffix) {
             return format("%s/%s-test", this.output_dir, this.project_name);
@@ -605,26 +627,26 @@ type struct ProjectConfig {
         return format("%s/%s", this.output_dir, this.project_name);
     }
 
-    /// Final library-archive path at the build root: `<output_dir>/lib<name>.a`.
+    /// Hoisted final library-archive at the build root: `<output_dir>/lib<name>.a`.
     lib_archive_path(&this, archive_name: string) -> string {
         return format("%s/%s", this.output_dir, archive_name);
     }
 
-    /// JSON build manifest path: `<output_dir>/build-manifest.json`.
+    /// JSON build manifest path (per-profile): `<profile_dir>/build-manifest.json`.
     manifest_path(&this) -> string {
-        return format("%s/build-manifest.json", this.output_dir);
+        return format("%s/build-manifest.json", this.profile_dir());
     }
 
     /// Incremental fingerprint sidecar, keyed by target name so a
     /// multi-target project's `[lib]` and each `[[bin]]` track their inputs
-    /// independently: `<cache_dir>/incremental/<project_name>.fp`.
+    /// independently: `<profile_dir>/local/incremental/<project_name>.fp`.
     fingerprint_path(&this) -> string {
         return format("%s/%s.fp", this.incremental_dir(), this.project_name);
     }
 
     /// Recursively create `path` and any missing parent directories, like
     /// `mkdir -p`.  The `mkdir` intrinsic only creates the final component,
-    /// so a nested `<build>/.cryo/<profile>/deps` tree (or a custom
+    /// so a nested `<build>/target/<profile>/local/deps` tree (or a custom
     /// `--build-dir=a/b/c`) needs each level made in turn.  `mkdir` returning
     /// EEXIST for an existing prefix is harmless and ignored.  Static so the
     /// codegen / manifest passes can reach it without a free-function symbol

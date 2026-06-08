@@ -13,6 +13,7 @@ import Compiler::Codegen::Ops::IntrinsicsCodegen;
 import Compiler::Codegen::Visit::IRGenerator;
 import Compiler::CompilationContext;
 import Compiler::ProjectConfig;
+import Compiler::ModuleGraph;
 import Compiler::Artifacts;
 import Compiler::Diag;
 import Compiler::Diag::Diagnostic;
@@ -385,12 +386,14 @@ type struct CodegenPasses {
                 if (mn_bytes[si] == 58) { mn_bytes[si] = 95; }
             }
             mn_bytes[mn_len] = 0;
-            // Per-module IR lands under the hidden per-profile cache
-            // (`<output_dir>/.cryo/<profile>/ir`); honour project_config so
-            // `--build-dir=...` and the active profile both flow through.
-            mut ll_dir: string = "build/.cryo/release/ir";
+            // Per-module IR lands under the per-profile cache, grouped by
+            // origin (`<output_dir>/target/<profile>/<origin>/ir`); honour
+            // project_config so `--build-dir=...` and the active profile both
+            // flow through.
+            mut ll_dir: string = "build/target/release/local/ir";
             if (ctx.project_config != null) {
-                ll_dir = ctx.project_config.ir_dir();
+                ll_dir = ctx.project_config.ir_dir_for(
+                    CodegenPasses::current_origin_subdir(ctx));
             }
             ProjectConfig::mkdir_p(ll_dir);
             const ll_path: string = format("%s/%s.ll", ll_dir, mn_buf as string);
@@ -544,7 +547,7 @@ type struct CodegenPasses {
 
     /// ObjectEmission pass.  Emits a per-module artifact from the LLVM
     /// module.  Kind selection:
-    ///   - No `-o` override        -> legacy `<output_dir>/obj/<mod>.o`
+    ///   - No `-o` override        -> per-origin `target/<profile>/<origin>/deps/<mod>.o`
     ///   - `-o foo.o`  / Object    -> emit object to the override path
     ///   - `-o foo.s`  / Asm       -> emit assembly to the override path
     ///   - `-o foo.ll` / IRText    -> dump module text to the override path
@@ -584,9 +587,9 @@ type struct CodegenPasses {
         }
 
         // Decide the emit path + LLVM file_type.  Asm and Object kinds
-        // route directly to the user's override.  Exe and the legacy
-        // (no-override) case keep the `build/obj/<mod>.o` layout so
-        // the Linking pass has a stable per-module input set.
+        // route directly to the user's override.  Exe and the no-override
+        // case route to the per-origin `target/<profile>/<origin>/deps/<mod>.o`
+        // layout so the Linking pass has a stable per-module input set.
         mut emit_path: string = "";
         mut emit_type: LFileType = LFileType::Object;
         match (kind) {
@@ -654,19 +657,32 @@ type struct CodegenPasses {
         return PassResult::ok();
     }
 
+    /// Origin output subdir (`"std"`, `"local"`, or `<depname>`) for the
+    /// module currently being codegen'd, looked up by its source path.
+    /// Falls back to `"local"` for single-file builds / when the module
+    /// isn't in the graph.
+    static current_origin_subdir(ctx: CompilationContext*) -> string {
+        if (ctx.module_graph == null) { return "local"; }
+        const idx: i64 = ctx.module_graph.find_module_by_path(ctx.source_file);
+        if (idx < 0) { return "local"; }
+        const mi: ModuleInfo* = &ctx.module_graph.modules[idx];
+        return ModuleInfo::origin_subdir(mi.origin, mi.origin_name);
+    }
+
     /// Build the per-module object path:
-    /// `<output_dir>/.cryo/<profile>/deps/<safe_module>.o`.
+    /// `<output_dir>/target/<profile>/<origin>/deps/<safe_module>.o`.
     /// Used when no `-o PATH` override is in effect, and for the per-module
     /// object that feeds the Exe link step in single-file mode.
     static legacy_obj_path(ctx: CompilationContext*) -> string {
-        mut output_dir: string = "build/.cryo/release/deps";
+        mut output_dir: string = "build/target/release/local/deps";
         if (ctx.project_config != null) {
-            output_dir = ctx.project_config.deps_dir();
+            output_dir = ctx.project_config.deps_dir_for(
+                CodegenPasses::current_origin_subdir(ctx));
         }
-        // mkdir_p creates every missing level (`.cryo`, `<profile>`, `deps`,
-        // and any custom `--build-dir=...` prefix); a bare `mkdir` would fail
-        // on the nested path and object emission would error with
-        // "No such file or directory".
+        // mkdir_p creates every missing level (`target`, `<profile>`,
+        // `<origin>`, `deps`, and any custom `--build-dir=...` prefix); a bare
+        // `mkdir` would fail on the nested path and object emission would
+        // error with "No such file or directory".
         ProjectConfig::mkdir_p(output_dir);
 
         // Mangle module name: replace "::" with "_" for filesystem safety.
@@ -740,28 +756,30 @@ type struct CodegenPasses {
         // Cross-compilation: when the target triple differs from the
         // host, the per-module .o files were emitted for that target's
         // ABI/object format and the host's `cc` cannot link them.  Skip
-        // the link step, leave the artifacts in `<output_dir>/obj/`,
+        // the link step, leave the artifacts under the per-profile cache,
         // and tell the user how to finish the link with a target-aware
         // toolchain.  Empty `ctx.target_triple` => host build, link
         // normally.
         if (intrinsics::strlen(ctx.target_triple) > 0
                 && intrinsics::strcmp(ctx.target_triple, get_default_triple()) != 0) {
-            const obj_only_dir: string = cfg.deps_dir();
+            const obj_only_dir: string = cfg.profile_dir();
             intrinsics::printf("Cross-compile: produced %lld object file(s) for target '%s' in %s\n",
                 ctx.artifacts.object_files.length, ctx.target_triple, obj_only_dir);
             intrinsics::printf("  (host linker skipped; link with a %s-aware toolchain, e.g.:\n",
                 ctx.target_triple);
-            intrinsics::printf("     clang --target=%s %s/*.o -o <output>)\n",
+            intrinsics::printf("     clang --target=%s %s/*/deps/*.o -o <output>)\n",
                 ctx.target_triple, obj_only_dir);
             return PassResult::ok();
         }
-        // The final executable lands at the ROOT of the build dir
-        // (`<output_dir>/<name>`); ensure that dir exists for custom
+        // The executable is linked under the per-profile cache
+        // (`<output_dir>/target/<profile>/<name>`) and HOISTED to the build
+        // root afterwards; ensure the per-profile dir exists for custom
         // `--build-dir=...` paths that haven't been pre-created.
-        ProjectConfig::mkdir_p(output_dir);
+        const profile_dir: string = cfg.profile_dir();
+        ProjectConfig::mkdir_p(profile_dir);
         // Test-mode builds use a `-test` suffix so the test executable
         // coexists with a normal `cryo run` build of the same project.
-        const exe_path: string = cfg.bin_artifact_path(ctx.mode.skip_user_main());
+        const exe_path: string = cfg.profile_bin_path(ctx.mode.skip_user_main());
 
         // Build the link command.  libc's system(3) runs `sh -c`, so
         // every interpolated path must be shell-quoted; without it, a
@@ -819,21 +837,40 @@ type struct CodegenPasses {
 
         cdebug("[Codegen] Linked executable: %s\n", exe_path);
 
+        // Hoist the freshly-linked binary from the per-profile cache up to
+        // the build root (`<output_dir>/<name>`) so it can be run as
+        // `build/<name>` regardless of which profile produced it.  libc's
+        // system(3) runs `sh -c`, so both paths are shell-quoted.
+        const hoisted_exe: string = cfg.bin_artifact_path(ctx.mode.skip_user_main());
+        ProjectConfig::mkdir_p(output_dir);
+        const hoist_cmd: string = format("cp -f %s %s",
+            shell_quote(exe_path), shell_quote(hoisted_exe));
+        const hrc: i32 = system(hoist_cmd);
+        if (hrc != 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("failed to hoist executable to %s (cp exited with %d)",
+                    hoisted_exe, hrc));
+            return PassResult::failure(1);
+        }
+        cdebug("[Codegen] Hoisted executable: %s\n", hoisted_exe);
+
         // Emit a combined `.ll` text dump of the project's per-module IR
-        // (written during Phase 7) alongside the executable.  Used by
-        // selfhost-check for stage-4/stage-5 byte-identity verification.
-        // Stderr is redirected to /dev/null so `llvm-link-20`'s "No such
-        // file or directory: build/obj/*.ll" complaint (when Phase 7 didn't
-        // write any .ll files because --emit-llvm wasn't set) doesn't
-        // pollute the user's terminal in the silent default mode.
-        const ll_path: string = format("%s.ll", exe_path);
-        const ir_dir: string = cfg.ir_dir();
-        // Shell-quote ir_dir but leave `/*.ll` unquoted so the glob still
-        // expands.  Adjacent shell tokens concatenate, so the result of
-        // `'<dir>'/*.ll` is exactly the expansion the linker needs.
+        // (written during Phase 7) next to the HOISTED executable
+        // (`<output_dir>/<name>.ll`).  Used by selfhost-check for
+        // stage-3/stage-4 byte-identity verification.  Per-module IR is split
+        // across per-origin subtrees, so the glob spans every origin's `ir/`
+        // dir; the shell sorts the full expansion deterministically, so the
+        // concatenation order is stable across builds.  Stderr is redirected
+        // to /dev/null so `llvm-link-20`'s "No such file or directory"
+        // complaint (when no .ll files were written because emit_llvm was
+        // unset) doesn't pollute the user's terminal in the silent default.
+        const ll_path: string = format("%s.ll", hoisted_exe);
+        // Shell-quote the profile dir but leave `/*/ir/*.ll` unquoted so the
+        // glob still expands.  Adjacent shell tokens concatenate, so the
+        // result of `'<dir>'/*/ir/*.ll` is exactly the expansion needed.
         const ll_cmd: string = format(
-            "llvm-link-20 -S %s/*.ll -o %s 2>/dev/null",
-            shell_quote(ir_dir), shell_quote(ll_path));
+            "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
+            shell_quote(profile_dir), shell_quote(ll_path));
         const ll_rc: i32 = system(ll_cmd);
         if (ll_rc == 0) {
             cdebug("[Codegen] Linked IR dump: %s\n", ll_path);

@@ -86,21 +86,24 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 
 ### Build system
 
-- **New build-directory layout.** The final artifact now sits at the **root**
-  of the build directory — `build/<name>` for an executable, `build/lib<name>.a`
-  for a library — instead of `build/bin/<name>`. All intermediates moved under a
-  hidden, per-profile cache tree: per-module objects in
-  `build/.cryo/<profile>/deps/`, per-module IR in `build/.cryo/<profile>/ir/`.
-  The combined IR dump is `build/<name>.ll`. *(Breaking for tooling that
-  hardcoded `build/bin/` or `build/obj/`.)*
-- **Build manifest.** A successful build writes `build/build-manifest.json`
-  recording the profile, target type/triple, optimization level, debug-info
-  and emit-llvm flags, the linked stdlib archive, the `[link]` lists, every
-  source module (namespace + path + object), and the input fingerprint.
+- **New build-directory layout.** The final artifact is **hoisted** to the
+  **root** of the build directory — `build/<name>` for an executable,
+  `build/lib<name>.a` for a library — so it runs as `build/<name>` regardless of
+  profile. All intermediates live under a visible, per-profile cache tree
+  (`build/target/<profile>/`) grouped by **package origin**: the standard
+  library (`std/`), the local project (`local/`), and one subtree per
+  third-party dependency (`<depname>/`), each holding its own `deps/*.o` and
+  `ir/*.ll`. The combined IR dump is `build/<name>.ll`. *(Breaking for tooling
+  that hardcoded `build/bin/`, `build/obj/`, or `build/.cryo/`.)*
+- **Build manifest.** A successful build writes a per-profile
+  `build/target/<profile>/build-manifest.json` (schema v2) recording the
+  profile, target type/triple, optimization level, debug-info and emit-llvm
+  flags, the linked stdlib archive, the `[link]` lists, every source module
+  (namespace + path + origin/kind + object + size), and the input fingerprint.
 - **Build profiles.** `release` (O2, no debug info; the default) and `debug`
   (O0 + DWARF), selectable with `--release` / `--dev` / `--profile=NAME`, or
   `[profile] default = "..."` in cryoconfig. Each profile keeps its own
-  `build/.cryo/<profile>/` cache. An explicit `[compiler] optimize` or
+  `build/target/<profile>/` cache. An explicit `[compiler] optimize` or
   `--opt-level=N` still overrides the profile's level; `-g` forces debug info.
 - **Incremental builds.** `cryo build` now skips the entire compile+link when
   no input changed (sources, resolved knobs, the compiler binary, or the

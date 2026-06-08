@@ -1,8 +1,8 @@
 /// Build Manifest + Incremental Fingerprint
 ///
-/// Emits a self-describing `build-manifest.json` at the build root and a
-/// machine-readable fingerprint sidecar under
-/// `<output_dir>/.cryo/<profile>/incremental/inputs.fp`.
+/// Emits a self-describing per-profile `build-manifest.json` under
+/// `<output_dir>/target/<profile>/` and a machine-readable fingerprint
+/// sidecar under `<output_dir>/target/<profile>/local/incremental/<name>.fp`.
 ///
 /// The fingerprint is a 64-bit FNV-1a digest over EVERY build input:
 ///   - the compiler binary's own bytes (so a changed compiler rebuilds),
@@ -33,6 +33,8 @@ const FNV_PRIME:  u64 = 1099511628211;
 type struct ModuleEntry {
     namespace_name: string;   // e.g. "std::core::primitives"
     source_path:    string;   // path on disk
+    origin_subdir:  string;   // output package subtree: "std" | "local" | <depname>
+    origin_kind:    string;   // "stdlib" | "local" | "dep"
 }
 
 
@@ -146,9 +148,13 @@ function compute_fingerprint(cfg: ProjectConfig*, modules: &ModuleEntry[],
     if (intrinsics::strlen(stdlib_archive) > 0) {
         h = fnv_file(h, stdlib_archive);
     }
-    // Every source module, in topo order: namespace + full content.
+    // Every source module, in topo order: namespace + origin (output
+    // location) + full content.  Folding origin_subdir means moving a module
+    // between packages (which changes where its .o lands) invalidates the
+    // cache even when its source bytes are unchanged.
     for (mut i: i64 = 0; i < modules.length; i++) {
         h = fnv_str(h, modules[i].namespace_name);
+        h = fnv_str(h, modules[i].origin_subdir);
         h = fnv_file(h, modules[i].source_path);
     }
     return h;
@@ -254,12 +260,24 @@ function write_fingerprint(cfg: ProjectConfig*, fp_hex: string) -> void {
     intrinsics::fclose(f);
 }
 
-/// Write the human/tooling-facing `build-manifest.json` at the build root.
+/// File size in bytes via `fseek`/`ftell`, without reading the contents.
+/// Returns -1 when the file can't be opened.
+function file_size_bytes(path: string) -> i64 {
+    const h: void* = intrinsics::fopen(path, "rb");
+    if (h == null) { return -1 as i64; }
+    intrinsics::fseek(h, 0 as i64, 2);   // SEEK_END
+    const n: i64 = intrinsics::ftell(h);
+    intrinsics::fclose(h);
+    return n;
+}
+
+/// Write the human/tooling-facing per-profile `build-manifest.json` at
+/// `<output_dir>/target/<profile>/build-manifest.json`.
 function write_manifest(cfg: ProjectConfig*, modules: &ModuleEntry[],
                         opt_level: u32, debug_info: boolean,
                         fp_hex: string, artifacts: &string[],
                         stdlib_archive: string) -> void {
-    ProjectConfig::mkdir_p(cfg.output_dir);
+    ProjectConfig::mkdir_p(cfg.profile_dir());
     const path: string = cfg.manifest_path();
     const f: void* = intrinsics::fopen(path, "w");
     if (f == null) {
@@ -272,10 +290,9 @@ function write_manifest(cfg: ProjectConfig*, modules: &ModuleEntry[],
     const dbg: string = if (debug_info) { "true" } else { "false" };
     const ell: string = if (cfg.emit_llvm) { "true" } else { "false" };
     const nstd: string = if (cfg.no_std) { "true" } else { "false" };
-    const deps_dir: string = cfg.deps_dir();
 
     intrinsics::fputs("{\n", f);
-    intrinsics::fputs("  \"schema_version\": 1,\n", f);
+    intrinsics::fputs("  \"schema_version\": 2,\n", f);
     intrinsics::fputs("  \"generated_by\": \"cryo\",\n", f);
     intrinsics::fprintf(f, "  \"compiler_fingerprint\": \"%s\",\n", compiler_fp);
     intrinsics::fprintf(f, "  \"project\": \"%s\",\n", json_escape(cfg.project_name));
@@ -308,18 +325,27 @@ function write_manifest(cfg: ProjectConfig*, modules: &ModuleEntry[],
     write_str_array(f, "static", &cfg.link_static, "    ");
     intrinsics::fputs("\n  },\n", f);
 
-    // modules: namespace + source + object path.
+    // modules: namespace + source + origin + object path + size.
     intrinsics::fputs("  \"modules\": [", f);
     for (mut i: i64 = 0; i < modules.length; i++) {
         if (i > 0) { intrinsics::fputs(",", f); }
-        const obj: string = format("%s/%s.o", deps_dir,
+        const obj: string = format("%s/%s.o",
+            cfg.deps_dir_for(modules[i].origin_subdir),
             mangle_module(modules[i].namespace_name));
+        const obj_size: i64 = file_size_bytes(obj);
         intrinsics::fputs("\n    {\n", f);
         intrinsics::fprintf(f, "      \"namespace\": \"%s\",\n",
             json_escape(modules[i].namespace_name));
         intrinsics::fprintf(f, "      \"source\": \"%s\",\n",
             json_escape(modules[i].source_path));
-        intrinsics::fprintf(f, "      \"object\": \"%s\"\n", json_escape(obj));
+        intrinsics::fprintf(f, "      \"origin\": \"%s\",\n",
+            json_escape(modules[i].origin_subdir));
+        intrinsics::fprintf(f, "      \"kind\": \"%s\",\n",
+            json_escape(modules[i].origin_kind));
+        intrinsics::fprintf(f, "      \"opt_level\": %u,\n", opt_level);
+        intrinsics::fprintf(f, "      \"debug_info\": %s,\n", dbg);
+        intrinsics::fprintf(f, "      \"object\": \"%s\",\n", json_escape(obj));
+        intrinsics::fprintf(f, "      \"object_size\": %lld\n", obj_size);
         intrinsics::fputs("    }", f);
     }
     if (modules.length > 0) { intrinsics::fputs("\n  ", f); }
