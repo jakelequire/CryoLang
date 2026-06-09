@@ -39,6 +39,7 @@ import Compiler::Resolver::MangledName;
 import Utils;
 import Utils::File;
 import Utils::Logger;
+import std::fmt;
 import std::env;
 import std::collections::string;
 
@@ -418,7 +419,7 @@ function timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
     if (total_ns > 0i64) {
         pct = (span_ns * 100i64 + total_ns / 2i64) / total_ns;
     }
-    intrinsics::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
+    fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
         label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
 }
 
@@ -520,12 +521,9 @@ type struct CompilerInstance {
             const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                 ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
             if (ll_ok == 0) {
-                intrinsics::fprintf(g_stderr,
-                    "[Compiler] LLVM IR emitted: %s\n", ll_path);
+                fmt::eprintln(f"[Compiler] LLVM IR emitted: {ll_path}");
             } else if (ll_err != null) {
-                intrinsics::fprintf(g_stderr,
-                    "warning: failed to write %s: %s\n",
-                    ll_path, ll_err as string);
+                fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
                 llvm::LLVMDisposeMessage(ll_err as void*);
             }
         }
@@ -648,8 +646,7 @@ type struct CompilerInstance {
     /// every warning including the unknown-directive warning.
     compile_for_check(&this, source: string) -> CompilationResult {
         if (!File::exists(source)) {
-            intrinsics::fprintf(g_stderr,
-                "error: file not found: %s\n", source);
+            fmt::eprintln(f"error: file not found: {source}");
             return CompilationResult::failed(1, 0);
         }
 
@@ -907,13 +904,10 @@ type struct CompilerInstance {
             // fire before a CompilationContext exists, so we can't route
             // through ctx.diagnostics yet.
             if (config.requires_entry_point()) {
-                intrinsics::fprintf(g_stderr,
-                    "error: entry point not found: %s\n", root_path);
+                fmt::eprintln(f"error: entry point not found: {root_path}");
             } else {
-                intrinsics::fprintf(g_stderr,
-                    "error: library root not found: %s\n", root_path);
-                intrinsics::fprintf(g_stderr,
-                    "  expected lib.cryo in source_dir '%s'\n", config.source_dir);
+                fmt::eprintln(f"error: library root not found: {root_path}");
+                fmt::eprintln(f"  expected lib.cryo in source_dir '{config.source_dir}'");
             }
             return CompilationResult::failed(1, 0);
         }
@@ -1037,25 +1031,17 @@ type struct CompilerInstance {
                 // compile a project that can't see `Result`, `String`,
                 // etc.  Pass `--no-std` (or set `no_std = true` in
                 // cryoconfig) for genuinely freestanding builds.
-                intrinsics::fprintf(g_stderr,
-                    "error: cannot locate the Cryo standard library\n");
-                intrinsics::fprintf(g_stderr,
-                    "  none of the candidate paths contained a 'lib.cryo':\n");
+                fmt::eprintf("error: cannot locate the Cryo standard library\n");
+                fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
                 for (mut ti: i64 = 0; ti < tried.length; ti++) {
-                    intrinsics::fprintf(g_stderr, "    %s\n", tried[ti]);
+                    fmt::eprintln(f"    {tried[ti]}");
                 }
-                intrinsics::fprintf(g_stderr,
-                    "  fix one of:\n");
-                intrinsics::fprintf(g_stderr,
-                    "    --stdlib=PATH                            (one-off override)\n");
-                intrinsics::fprintf(g_stderr,
-                    "    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
-                intrinsics::fprintf(g_stderr,
-                    "    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
-                intrinsics::fprintf(g_stderr,
-                    "    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
-                intrinsics::fprintf(g_stderr,
-                    "    --no-std                                 (build without the standard library)\n");
+                fmt::eprintf("  fix one of:\n");
+                fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
+                fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
+                fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
+                fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
+                fmt::eprintf("    --no-std                                 (build without the standard library)\n");
                 return CompilationResult::failed(1, 0);
             }
         }
@@ -1131,7 +1117,7 @@ type struct CompilerInstance {
             // flushed above (gated on non-LSP mode).  This trailing marker
             // goes to stderr (never stdout) to avoid corrupting the
             // LSP JSON-RPC stream when the daemon embeds the compiler.
-            intrinsics::fprintf(g_stderr, "error: module discovery failed\n");
+            fmt::eprintf("error: module discovery failed\n");
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
@@ -1252,7 +1238,7 @@ type struct CompilerInstance {
         }
 
         if (ctx.module_graph.module_count() == 0) {
-            intrinsics::fprintf(g_stderr, "error: no modules discovered\n");
+            fmt::eprintf("error: no modules discovered\n");
             return CompilationResult::failed(1, 0);
         }
 
@@ -1354,8 +1340,7 @@ type struct CompilerInstance {
                 } else {
                     ""
                 };
-                intrinsics::printf("%s is up to date (%s)\n",
-                    config.project_name, config.profile);
+                fmt::println(f"{config.project_name} is up to date ({config.profile})");
                 mut utd_result: CompilationResult = CompilationResult::ok(up_to_date_out);
                 utd_result.stdlib_root = ctx.stdlib_root;
                 return utd_result;
@@ -1390,8 +1375,7 @@ type struct CompilerInstance {
             cdebug("[Compiler] Phase 2: Module %u path='%s'\n", i, ctx.source_file);
             cdebug("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
             if (!pipeline.run_all(ctx)) {
-                intrinsics::fprintf(g_stderr,
-                    "error: frontend pipeline failed for module %u\n", i);
+                fmt::eprintln(f"error: frontend pipeline failed for module {i}");
                 return this.project_failure_release(ctx, ast_buf, scope_buf);
             }
             cdebug("[Compiler] Phase 2: Module %u succeeded\n", i);
@@ -1886,7 +1870,7 @@ type struct CompilerInstance {
                     const dump_ast: ProgramNode* = *dump_slot as ProgramNode*;
                     if (dump_ast != null) {
                         const mod_info: ModuleInfo* = &ctx.module_graph.modules[mi];
-                        intrinsics::printf("\n=== AST: %s ===\n", mod_info.file_path);
+                        fmt::println(f"\n=== AST: {mod_info.file_path} ===");
                         ASTDumper::dump(dump_ast, ctx.intern_table);
                     }
                 }
@@ -1934,12 +1918,12 @@ type struct CompilerInstance {
                         ModuleOrigin::Local  => { n_local += 1; }
                     }
                 }
-                intrinsics::printf(
+                fmt::printf(
                     "Building %s [%s]: %u local",
                     config.project_name, config.profile, n_local);
-                if (n_std > 0) { intrinsics::printf(", %u std", n_std); }
-                if (n_dep > 0) { intrinsics::printf(", %u dep", n_dep); }
-                intrinsics::printf(" module(s)\n");
+                if (n_std > 0) { fmt::printf(", %u std", n_std); }
+                if (n_dep > 0) { fmt::printf(", %u dep", n_dep); }
+                fmt::printf(" module(s)\n");
 
                 // Report how many modules' objects are being reused from the
                 // per-module incremental cache vs. recompiled this build.
@@ -1949,9 +1933,7 @@ type struct CompilerInstance {
                         if (pm_cached[order[si] as i64]) { n_reused += 1; }
                     }
                     if (n_reused > 0) {
-                        intrinsics::printf(
-                            "  reusing %u cached object(s), recompiling %u\n",
-                            n_reused, n - n_reused);
+                        fmt::println(f"  reusing {n_reused} cached object(s), recompiling {n - n_reused}");
                     }
                 }
             }
@@ -2049,9 +2031,7 @@ type struct CompilerInstance {
                         const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                             ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
                         if (ll_ok != 0 && ll_err != null) {
-                            intrinsics::fprintf(g_stderr,
-                                "warning: failed to write %s: %s\n",
-                                ll_path, ll_err as string);
+                            fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
                             llvm::LLVMDisposeMessage(ll_err as void*);
                         }
                         intrinsics::free(mn_buf as void*);
@@ -2063,8 +2043,7 @@ type struct CompilerInstance {
                         cdebug("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
                     }
                 } else if (!pipeline_ok) {
-                    intrinsics::fprintf(g_stderr,
-                        "error: codegen failed for module %u\n", i);
+                    fmt::eprintln(f"error: codegen failed for module {i}");
                 }
 
                 // Dispose the LLVM module to free LLVM global context memory.
@@ -2088,8 +2067,7 @@ type struct CompilerInstance {
                 cdebug("[Compiler] Phase 7b: Synthesizing test main\n");
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
-                    intrinsics::fprintf(g_stderr,
-                        "error: test-main synthesis failed\n");
+                    fmt::eprintf("error: test-main synthesis failed\n");
                 }
             }
 
@@ -2101,8 +2079,7 @@ type struct CompilerInstance {
                     ctx.artifacts.object_files.length);
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
-                    intrinsics::fprintf(g_stderr,
-                        "error: linking failed\n");
+                    fmt::eprintf("error: linking failed\n");
                 }
             }
             tm_link_end = timing_now_ns();
@@ -2186,7 +2163,7 @@ type struct CompilerInstance {
             const total: i64 = tm_end - tm_entry;
             const fe: i64 = tm_mono_end - tm_entry;
             const be: i64 = tm_end - tm_mono_end;
-            intrinsics::printf("\n=== cryo build timings (%s) ===\n", config.project_name);
+            fmt::println(f"\n=== cryo build timings ({config.project_name}) ===");
             timing_fmt("discovery (phase 1)", tm_discovery_end - tm_entry, total);
             timing_fmt("frontend (phase 2-5)", tm_frontend_end - tm_discovery_end, total);
             timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
@@ -2197,7 +2174,7 @@ type struct CompilerInstance {
             if (tm_link_end > 0i64) {
                 timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
             }
-            intrinsics::printf("  %-28s\n", "----");
+            fmt::printf("  %-28s\n", "----");
             timing_fmt("FRONTEND (1-6a, uncacheable)", fe, total);
             timing_fmt("BACKEND  (6b+7+link, cacheable)", be, total);
             timing_fmt("TOTAL", total, total);
