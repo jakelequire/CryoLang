@@ -2980,6 +2980,21 @@ type struct Monomorphizer {
                     return this.scope_types[si];
                 }
             }
+            // An identifier naming a module-level global/const (e.g. a
+            // top-level `const SCHEMA: i64 = ...` interpolated in an f-string
+            // hole, `f"v={SCHEMA}"`) isn't in the local names/types worklist
+            // nor a match-arm binding.  Recover its declared type from the
+            // declaration index so the unifier can still bind a generic param
+            // that can ONLY be pinned from this argument - without it the
+            // f-string desugar's `fmt_append_display<T>(acc, &SCHEMA)` leaves
+            // T unset and codegen emits an unspecialized template the linker
+            // can't resolve.  Globals and functions live in separate maps, so
+            // a function-valued identifier still falls through to the lookup
+            // below (lookup_global returns invalid for it).
+            if (this.decl_index != null) {
+                const gty: TypeRef = this.decl_index.lookup_global(id.name);
+                if (gty.is_valid()) { return gty; }
+            }
             // An identifier naming a global function passed as a
             // function-typed argument (`opt.map(tentimes)`): recover its
             // signature from the declaration index so the unifier can bind a
@@ -3240,6 +3255,16 @@ type struct Monomorphizer {
                     break;
                 }
                 depth += 1;
+            }
+            // `arr.length` on a native array exposes an implicit `i64` field
+            // (see Checker::check_field_access).  The struct-field walk below
+            // only knows real struct fields, so resolve the array-length
+            // pseudo-field here - without it the unifier can't bind a generic
+            // from an f-string hole like `f"{xs.length} items"` and codegen
+            // emits an unspecialized `fmt_append_display<T>` template.
+            if (t != null && t.kind == TypeKind::Array
+                    && ma.member.equals(this.intern_table.intern("length"))) {
+                return this.arena.get_i64();
             }
             if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
             const st: StructType* = t as StructType*;

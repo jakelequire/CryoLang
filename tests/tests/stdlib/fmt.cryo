@@ -441,31 +441,73 @@ function format_to_string_negative_i32() -> Result<(), TestError> {
 // isn't available to the harness; the printed bytes themselves are incidental.
 
 ![test]
-function println_returns_byte_count() -> Result<(), TestError> {
-    // "42" (2) + newline = 3
-    return expect_eq(println("%d", 42), 3);
+function printf_returns_byte_count() -> Result<(), TestError> {
+    // "42\n" = 3 bytes
+    return expect_eq(printf("%d\n", 42), 3);
 }
 
 ![test]
-function println_two_heterogeneous_args() -> Result<(), TestError> {
-    // "ab=7" (4) + newline = 5 -- a string and an int through one va_list
-    return expect_eq(println("%s=%d", "ab", 7), 5);
+function printf_two_heterogeneous_args() -> Result<(), TestError> {
+    // "ab=7\n" = 5 -- a string and an int through one va_list
+    return expect_eq(printf("%s=%d\n", "ab", 7), 5);
 }
 
 ![test]
-function println_empty_is_just_newline() -> Result<(), TestError> {
-    return expect_eq(println(""), 1);
+function printf_empty_is_just_newline() -> Result<(), TestError> {
+    return expect_eq(printf("\n"), 1);
 }
 
 ![test]
-function println_percent_escape() -> Result<(), TestError> {
-    // "%%" -> single literal '%', so "100%" (4) + newline = 5
-    return expect_eq(println("100%%"), 5);
+function printf_percent_escape() -> Result<(), TestError> {
+    // "%%" -> single literal '%', so "100%\n" = 5
+    return expect_eq(printf("100%%\n"), 5);
 }
 
 ![test]
-function print_returns_byte_count_no_newline() -> Result<(), TestError> {
-    return expect_eq(print("abc"), 3);
+function printf_returns_byte_count_no_newline() -> Result<(), TestError> {
+    return expect_eq(printf("abc"), 3);
+}
+
+// ============================================================================
+// Display-based print family: print/println/eprint/eprintln take an owned
+// `String` (typically an f-string) and drop it.  They return void, so this is
+// a compile+run smoke test of the idiom rather than a return-value contract.
+// ============================================================================
+
+![test]
+function println_display_fstring_smoke() -> Result<(), TestError> {
+    const n: i32 = 7;
+    println(f"value = {n}");   // builds a String via Display, prints, drops it
+    print(f"no-newline");
+    return Result::Ok(());
+}
+
+// Regression: a module-level `const` interpolated in an f-string hole must
+// specialize `fmt_append_display<T>` for the const's type.  The mono arg-type
+// resolver previously only knew locals/params/match-bindings, so a top-level
+// const left T unbound and codegen emitted an unspecialized template the
+// linker couldn't resolve.  Mono now recovers the type via decl_index.
+const FSTRING_REGRESSION_CONST: i64 = 4242;
+
+![test]
+function fstring_interpolates_module_const() -> Result<(), TestError> {
+    mut s: String = f"c={FSTRING_REGRESSION_CONST}";
+    const eq: boolean = s.as_str().equals(&Str::new("c=4242"));
+    s.drop();
+    return expect(eq, Str::new("f-string with a module const should be 'c=4242'"));
+}
+
+// Regression: array `.length` (an implicit i64 pseudo-field, not a struct
+// field) interpolated in an f-string hole must specialize fmt_append_display.
+// The mono arg-type resolver's MemberAccess walk only knew real struct fields,
+// so `f"{xs.length}"` left T unbound -> unspecialized template -> link error.
+![test]
+function fstring_interpolates_array_length() -> Result<(), TestError> {
+    mut xs: i64[] = [10, 20, 30];
+    mut s: String = f"n={xs.length}";
+    const eq: boolean = s.as_str().equals(&Str::new("n=3"));
+    s.drop();
+    return expect(eq, Str::new("f-string with array .length should be 'n=3'"));
 }
 
 // ============================================================================
