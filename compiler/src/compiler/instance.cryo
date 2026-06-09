@@ -23,7 +23,7 @@ import Compiler::ModuleGraph;
 import Compiler::ModuleLoader;
 import Compiler::ProjectConfig;
 import Compiler::BuildManifest;
-import Compiler::DepsResolver;
+import Compiler::Deps::DepResolver;
 import Compiler::Codegen;
 import Compiler::Codegen::LLVMTypes;
 import Compiler::Codegen::Passes;
@@ -1076,7 +1076,7 @@ type struct CompilerInstance {
         // dep roots and reporting confusing "namespace not found"
         // diagnostics later.
         const lock_path: string = lock_path_for(config.project_root);
-        const dep_outcome: ResolveOutcome = DepsResolver::resolve(
+        const dep_outcome: ResolveOutcome = DepResolver::resolve(
             &config, ResolveMode::Build, lock_path);
         if (dep_outcome.failed) {
             return CompilationResult::failed(1, 0);
@@ -1340,13 +1340,13 @@ type struct CompilerInstance {
                 };
                 manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
             }
-            const build_fp: u64 = BuildManifest::compute_fingerprint(
-                ctx.project_config, &mod_entries, ctx.opt_level,
-                ctx.emit_debug_info, manifest_stdlib_archive);
+            const manifest: BuildManifest::Manifest = BuildManifest::Manifest::new(
+                ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
+                manifest_stdlib_archive);
+            const build_fp: u64 = manifest.compute_fingerprint(&mod_entries);
             build_fp_hex = BuildManifest::u64_to_hex(build_fp);
 
-            if (BuildManifest::is_up_to_date(ctx.project_config, build_fp_hex,
-                                             &manifest_artifacts)) {
+            if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
                 // frontend, codegen, and linking entirely.
                 const up_to_date_out: string = if (config.requires_entry_point()) {
@@ -2158,11 +2158,11 @@ type struct CompilerInstance {
         // Gated on `do_incremental`; the fingerprint locals were computed
         // before the frontend ran. Side files only; no effect on the IR.
         if (do_incremental && ctx.project_config != null) {
-            BuildManifest::write_fingerprint(ctx.project_config, build_fp_hex);
-            BuildManifest::write_manifest(
-                ctx.project_config, &mod_entries, ctx.opt_level,
-                ctx.emit_debug_info, build_fp_hex, &manifest_artifacts,
+            const manifest: BuildManifest::Manifest = BuildManifest::Manifest::new(
+                ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
+            manifest.write_fingerprint(build_fp_hex);
+            manifest.write_manifest(&mod_entries, build_fp_hex, &manifest_artifacts);
             // Per-module cache keys for the NEXT build to consult.  Written
             // whenever they were computed: every module not marked cached was
             // just recompiled, so its key now matches its on-disk .o.
