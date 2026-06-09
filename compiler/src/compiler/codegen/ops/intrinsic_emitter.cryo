@@ -347,6 +347,9 @@ type struct IntrinsicEmitter {
             IntrinsicKind::AtomicCmpxchgU8  => { 6 }
             IntrinsicKind::AtomicCmpxchgU32 => { 6 }
             IntrinsicKind::AtomicCmpxchgU64 => { 6 }
+            // vprintf(fmt, va) - 2 args; vfprintf(file, fmt, va) - 3 args.
+            IntrinsicKind::Vprintf  => { 2 }
+            IntrinsicKind::Vfprintf => { 3 }
             // atomic_fence(order: i32): single arg.  isfinite, dirent_*
             // also single arg, so they fall through to the default below.
             _                           => { 1 }
@@ -516,6 +519,15 @@ type struct IntrinsicEmitter {
             IntrinsicKind::VaArgF64    => { this.builder.build_va_arg(args[0], LType::f64(), "va.arg") }
             IntrinsicKind::VaArgPtr    => { this.builder.build_va_arg(args[0], LType::pointer_to(LType::i8()), "va.arg") }
             IntrinsicKind::VaArgString => { this.builder.build_va_arg(args[0], LType::pointer_to(LType::i8()), "va.arg") }
+
+            // -- vprintf(fmt, va) / vfprintf(file, fmt, va): forward the
+            //    va_list bucket through the ABI seam (by address on SysV,
+            //    loaded char* by value on Win64) and call the libc routine.
+            //    `args[..]` come in raw (intrinsic_src_type returns null,
+            //    so no auto-deref): fmt/file are already pointers and the
+            //    va arg is the prologue's va_list alloca. --
+            IntrinsicKind::Vprintf  => { this.emit_vprintf(args[0], args[1]) }
+            IntrinsicKind::Vfprintf => { this.emit_vfprintf(args[0], args[1], args[2]) }
 
             // -- Atomic load: (ptr, order). Width fixed by suffix; alignment
             //    matches the operand's natural alignment (REQUIRED by LLVM
@@ -707,6 +719,78 @@ type struct IntrinsicEmitter {
         const fty: LType = LType::function_type(LType::i32(), buf, 3, false);
         intrinsics::free(buf);
         return this.llvm_module.add_function("vasprintf", fty);
+    }
+
+    /// Declare libc `int vprintf(const char* fmt, va_list)` if absent.
+    /// The intrinsic-declaration pass usually emits this already (from the
+    /// `intrinsic function vprintf` decl); we re-derive the identical
+    /// `i32 (ptr, ptr)` type as a fallback so the lowering is self-sufficient
+    /// even if the call is the first reference.  The second `ptr` is the
+    /// forwarded va_list (the alloca address on SysV, a loaded `char*` on
+    /// Win64 - both are pointer-shaped at the LLVM boundary).
+    get_or_decl_vprintf(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("vprintf");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = intrinsics::malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = ptr_ty.raw;   // const char* fmt
+        slots[1] = ptr_ty.raw;   // va_list
+        const fty: LType = LType::function_type(LType::i32(), buf, 2, false);
+        intrinsics::free(buf);
+        return this.llvm_module.add_function("vprintf", fty);
+    }
+
+    /// Declare libc `int vfprintf(FILE* stream, const char* fmt, va_list)`
+    /// if absent.  Mirror of `get_or_decl_vprintf` with the leading stream
+    /// pointer.
+    get_or_decl_vfprintf(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("vfprintf");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = intrinsics::malloc(24);
+        const slots: void** = buf as void**;
+        slots[0] = ptr_ty.raw;   // FILE* stream
+        slots[1] = ptr_ty.raw;   // const char* fmt
+        slots[2] = ptr_ty.raw;   // va_list
+        const fty: LType = LType::function_type(LType::i32(), buf, 3, false);
+        intrinsics::free(buf);
+        return this.llvm_module.add_function("vfprintf", fty);
+    }
+
+    /// Emit `call i32 @vprintf(fmt, forward_va_list(va))`.  The va_list
+    /// `va_alloca` is the enclosing variadic function's prologue alloca;
+    /// `forward_va_list` selects the per-ABI forwarding form so Win64 loads
+    /// the `char*` before the call instead of passing the alloca pointer
+    /// (which the callee would see as `char**`, the root cause of garbage
+    /// formatted output on Windows).
+    emit_vprintf(mut &this, fmt: LValue, va_alloca: LValue) -> LValue {
+        const fn_val: LValue = this.get_or_decl_vprintf();
+        const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn_val.raw) };
+        const va_fwd: LValue = this.abi.forward_va_list(this.builder, va_alloca);
+        const buf: void* = intrinsics::malloc(16);
+        const slots: void** = buf as void**;
+        slots[0] = fmt.raw;
+        slots[1] = va_fwd.raw;
+        const r: LValue = this.builder.build_call(fn_ty, fn_val, buf, 2, "vprintf");
+        intrinsics::free(buf);
+        return r;
+    }
+
+    /// Emit `call i32 @vfprintf(file, fmt, forward_va_list(va))`.  Mirror of
+    /// `emit_vprintf` with the leading stream argument.
+    emit_vfprintf(mut &this, file: LValue, fmt: LValue, va_alloca: LValue) -> LValue {
+        const fn_val: LValue = this.get_or_decl_vfprintf();
+        const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn_val.raw) };
+        const va_fwd: LValue = this.abi.forward_va_list(this.builder, va_alloca);
+        const buf: void* = intrinsics::malloc(24);
+        const slots: void** = buf as void**;
+        slots[0] = file.raw;
+        slots[1] = fmt.raw;
+        slots[2] = va_fwd.raw;
+        const r: LValue = this.builder.build_call(fn_ty, fn_val, buf, 3, "vfprintf");
+        intrinsics::free(buf);
+        return r;
     }
 
     get_or_decl_va_start(mut &this) -> LValue {
