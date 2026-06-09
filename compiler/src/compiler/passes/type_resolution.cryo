@@ -2053,11 +2053,27 @@ type struct TypeResolutionPasses {
                                 fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
 
                             const ext_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
-                            ctx.decl_index.register_function_with_module(
-                                fn_node.name, fn_node.resolved_return_type, ext_mod_sym);
-                            ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
-                            // Extern C functions use bare name as LLVM symbol.
-                            ctx.decl_index.register_mangled_name(fn_node.name, fn_node.name);
+                            // Claim the BARE name only if nothing else owns it yet.
+                            // An `intrinsic function` (or a regular function) of the
+                            // same name must win unqualified resolution: a bare
+                            // `malloc` has to bind to the compiler-backed intrinsic,
+                            // never to an `extern "C"` twin (e.g. `ffi::libc::malloc`)
+                            // whose Cryo signature differs (u8* vs i8*) and would
+                            // otherwise shadow the intrinsic the moment any module
+                            // drags `ffi::libc` into the graph. The qualified
+                            // `libc::malloc` form registered below stays available
+                            // regardless, and libc-only names (e.g. `pthread_join`)
+                            // have no twin, so they still claim the bare slot and keep
+                            // resolving unqualified.
+                            const ext_bare_taken: boolean =
+                                ctx.decl_index.lookup_func_type(fn_node.name).is_valid();
+                            if (!ext_bare_taken) {
+                                ctx.decl_index.register_function_with_module(
+                                    fn_node.name, fn_node.resolved_return_type, ext_mod_sym);
+                                ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
+                                // Extern C functions use bare name as LLVM symbol.
+                                ctx.decl_index.register_mangled_name(fn_node.name, fn_node.name);
+                            }
                             // Also register under the enclosing namespace's
                             // qualified form so `libc::read` resolves the
                             // same way `intrinsics::frexp` does; sema's
