@@ -34,6 +34,12 @@
 ///!     unrelated modules cached.
 ///! Bias is always toward rebuilding: a false cache miss is merely slow, a
 ///! false hit is a miscompile.
+///!
+///! The whole-build fingerprint, up-to-date check, and `build-manifest.json`
+///! write are bundled on the `Manifest` object, which captures the build's
+///! config + resolved knobs once so the per-build inputs aren't threaded
+///! through every call. The pure FNV/hex folding helpers stay free because
+///! the per-module-key loop in `instance.cryo` folds them directly.
 
 namespace Compiler::BuildManifest;
 
@@ -137,48 +143,6 @@ function compiler_fingerprint() -> u64 {
 }
 
 
-// Whole-build fingerprint
-
-/// Combined fingerprint over every build input. `opt_level` / `debug_info`
-/// are the RESOLVED values (after profile + CLI overrides), so a `--dev`
-/// vs `--release` switch produces distinct fingerprints. `stdlib_archive`
-/// is "" for `--no-std` builds.
-function compute_fingerprint(cfg: ProjectConfig*, modules: &ModuleEntry[],
-                             opt_level: u32, debug_info: boolean,
-                             stdlib_archive: string) -> u64 {
-    mut h: u64 = DefaultHasher::offset_basis();
-    h = fnv_u64(h, compiler_fingerprint());
-    // Resolved knobs.
-    h = fnv_u64(h, opt_level as u64);
-    const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
-    const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
-    const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
-    h = fnv_byte(h, dbg_b);
-    h = fnv_byte(h, ell_b);
-    h = fnv_byte(h, nstd_b);
-    h = fnv_str(h, cfg.target_triple);
-    h = fnv_str(h, cfg.profile);
-    // [link] lists affect the final binary but not the .o files.
-    for (mut i: i64 = 0; i < cfg.link_system.length; i++) { h = fnv_str(h, cfg.link_system[i]); }
-    for (mut i: i64 = 0; i < cfg.link_search.length; i++) { h = fnv_str(h, cfg.link_search[i]); }
-    for (mut i: i64 = 0; i < cfg.link_static.length; i++) { h = fnv_str(h, cfg.link_static[i]); }
-    // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
-    if (intrinsics::strlen(stdlib_archive) > 0) {
-        h = fnv_file(h, stdlib_archive);
-    }
-    // Every source module, in topo order: namespace + origin (output
-    // location) + full content.  Folding origin_subdir means moving a module
-    // between packages (which changes where its .o lands) invalidates the
-    // cache even when its source bytes are unchanged.
-    for (mut i: i64 = 0; i < modules.length; i++) {
-        h = fnv_str(h, modules[i].namespace_name);
-        h = fnv_str(h, modules[i].origin_subdir);
-        h = fnv_file(h, modules[i].source_path);
-    }
-    return h;
-}
-
-
 // Per-module cache key components
 
 /// The FNV-1a seed, exposed so the orchestrator can fold module keys with
@@ -188,10 +152,10 @@ function fnv_seed() -> u64 {
 }
 
 /// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
-/// the per-module folding `compute_fingerprint` does (namespace + output
-/// subtree + full file bytes). Used as the atom of every per-module cache
-/// key; folding `origin_subdir` means relocating a module between packages
-/// (which changes where its `.o` lands) invalidates its key.
+/// the per-module folding `Manifest::compute_fingerprint` does (namespace +
+/// output subtree + full file bytes). Used as the atom of every per-module
+/// cache key; folding `origin_subdir` means relocating a module between
+/// packages (which changes where its `.o` lands) invalidates its key.
 function module_source_hash(namespace_name: string, origin_subdir: string,
                             source_path: string) -> u64 {
     mut h: u64 = DefaultHasher::offset_basis();
@@ -222,94 +186,6 @@ function toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
     h = fnv_str(h, cfg.target_triple);
     h = fnv_str(h, cfg.profile);
     return h;
-}
-
-
-// Per-module key sidecar (*.modkeys): `namespace<TAB>keyhex` per line
-
-/// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
-/// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
-/// or "" when absent (a never-before-seen module always rebuilds).
-type struct ModuleKeyTable {
-    names: string[];
-    keys:  string[];
-
-    static empty() -> ModuleKeyTable {
-        return ModuleKeyTable { names: [], keys: [] };
-    }
-
-    lookup(&this, name: string) -> string {
-        for (mut i: i64 = 0; i < this.names.length; i++) {
-            if (intrinsics::strcmp(this.names[i], name) == 0) {
-                return this.keys[i];
-            }
-        }
-        return "";
-    }
-}
-
-/// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
-function modkeys_slice(data: i8*, start: u64, len: u64) -> string {
-    const out: i8* = intrinsics::malloc(len + 1) as i8*;
-    if (len > 0) {
-        intrinsics::memcpy(out as void*, intrinsics::ptr_add(data as void*, start) as void*, len);
-    }
-    out[len] = 0;
-    return out as string;
-}
-
-/// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
-/// unreadable file yields an empty table (every module then rebuilds, which
-/// is the safe default). Lines without a TAB separator are skipped.
-function read_module_keys(path: string) -> ModuleKeyTable {
-    mut t: ModuleKeyTable = ModuleKeyTable::empty();
-    if (!File::exists(path)) { return t; }
-    mut f: File = File::new(path);
-    f.load();
-    if (!f.is_loaded()) { return t; }
-    const data: i8* = f.data();
-    const n: u64 = f.size();
-    mut i: u64 = 0;
-    while (i < n) {
-        const name_start: u64 = i;
-        while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
-        mut name: string = "";
-        mut keyh: string = "";
-        if (i < n && data[i] == 9) {
-            name = modkeys_slice(data, name_start, i - name_start);
-            i = i + 1;                       // skip TAB
-            const key_start: u64 = i;
-            while (i < n && data[i] != 10) { i = i + 1; }
-            keyh = modkeys_slice(data, key_start, i - key_start);
-        } else {
-            // No TAB before end-of-line: skip the rest of this line.
-            while (i < n && data[i] != 10) { i = i + 1; }
-        }
-        if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
-        if (intrinsics::strlen(name) > 0 && intrinsics::strlen(keyh) > 0) {
-            t.names.push(name);
-            t.keys.push(keyh);
-        }
-    }
-    f.close();
-    return t;
-}
-
-/// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The
-/// caller must have created the incremental dir (e.g. via `write_fingerprint`,
-/// which always runs alongside this on the success path).
-function write_module_keys(path: string, names: &string[],
-                           keys: &string[]) -> void {
-    const f: void* = intrinsics::fopen(path, "w");
-    if (f == null) {
-        intrinsics::fprintf(g_stderr,
-            "warning: cannot write per-module cache keys to %s\n", path);
-        return;
-    }
-    for (mut i: i64 = 0; i < names.length; i++) {
-        intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
-    }
-    intrinsics::fclose(f);
 }
 
 
@@ -357,37 +233,6 @@ function mangle_module(ns: string) -> string {
     return buf as string;
 }
 
-
-// Up-to-date check + writing
-
-/// True when the saved fingerprint matches `fp_hex` AND every artifact still
-/// exists on disk. A missing sidecar or any missing artifact forces a build.
-function is_up_to_date(cfg: ProjectConfig*, fp_hex: string,
-                       artifacts: &string[]) -> boolean {
-    const saved: string = read_file_trimmed(cfg.fingerprint_path());
-    if (intrinsics::strlen(saved) == 0) { return false; }
-    if (intrinsics::strcmp(saved, fp_hex) != 0) { return false; }
-    for (mut i: i64 = 0; i < artifacts.length; i++) {
-        if (!File::exists(artifacts[i])) { return false; }
-    }
-    return true;
-}
-
-/// Write the fingerprint sidecar (`incremental/inputs.fp`), creating the
-/// incremental dir first.
-function write_fingerprint(cfg: ProjectConfig*, fp_hex: string) -> void {
-    ProjectConfig::mkdir_p(cfg.incremental_dir());
-    const path: string = cfg.fingerprint_path();
-    const f: void* = intrinsics::fopen(path, "w");
-    if (f == null) {
-        intrinsics::fprintf(g_stderr,
-            "warning: cannot write build fingerprint to %s\n", path);
-        return;
-    }
-    intrinsics::fprintf(f, "%s\n", fp_hex);
-    intrinsics::fclose(f);
-}
-
 /// File size in bytes via `fseek`/`ftell`, without reading the contents.
 /// Returns -1 when the file can't be opened.
 function file_size_bytes(path: string) -> i64 {
@@ -399,74 +244,255 @@ function file_size_bytes(path: string) -> i64 {
     return n;
 }
 
-/// Write the human/tooling-facing per-profile `build-manifest.json` at
-/// `<output_dir>/target/<profile>/build-manifest.json`.
-function write_manifest(cfg: ProjectConfig*, modules: &ModuleEntry[],
-                        opt_level: u32, debug_info: boolean,
-                        fp_hex: string, artifacts: &string[],
-                        stdlib_archive: string) -> void {
-    ProjectConfig::mkdir_p(cfg.profile_dir());
-    const path: string = cfg.manifest_path();
+/// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
+function modkeys_slice(data: i8*, start: u64, len: u64) -> string {
+    const out: i8* = intrinsics::malloc(len + 1) as i8*;
+    if (len > 0) {
+        intrinsics::memcpy(out as void*, intrinsics::ptr_add(data as void*, start) as void*, len);
+    }
+    out[len] = 0;
+    return out as string;
+}
+
+
+// Per-module key sidecar (*.modkeys): `namespace<TAB>keyhex` per line
+
+/// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
+/// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
+/// or "" when absent (a never-before-seen module always rebuilds).
+type struct ModuleKeyTable {
+    names: string[];
+    keys:  string[];
+
+    static empty() -> ModuleKeyTable {
+        return ModuleKeyTable { names: [], keys: [] };
+    }
+
+    lookup(&this, name: string) -> string {
+        for (mut i: i64 = 0; i < this.names.length; i++) {
+            if (intrinsics::strcmp(this.names[i], name) == 0) {
+                return this.keys[i];
+            }
+        }
+        return "";
+    }
+}
+
+/// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
+/// unreadable file yields an empty table (every module then rebuilds, which
+/// is the safe default). Lines without a TAB separator are skipped.
+///
+/// Kept a free function (not a `ModuleKeyTable` static): a static method here
+/// resolves through the leaf-name dispatcher, where `read`/`write` collide
+/// with the same-arity `read`/`write` intrinsics and a reference-array static
+/// fails codegen resolution outright (E0636). The distinctly-named free
+/// function sidesteps both.
+function read_module_keys(path: string) -> ModuleKeyTable {
+    mut t: ModuleKeyTable = ModuleKeyTable::empty();
+    if (!File::exists(path)) { return t; }
+    mut f: File = File::new(path);
+    f.load();
+    if (!f.is_loaded()) { return t; }
+    const data: i8* = f.data();
+    const n: u64 = f.size();
+    mut i: u64 = 0;
+    while (i < n) {
+        const name_start: u64 = i;
+        while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
+        mut name: string = "";
+        mut keyh: string = "";
+        if (i < n && data[i] == 9) {
+            name = modkeys_slice(data, name_start, i - name_start);
+            i = i + 1;                       // skip TAB
+            const key_start: u64 = i;
+            while (i < n && data[i] != 10) { i = i + 1; }
+            keyh = modkeys_slice(data, key_start, i - key_start);
+        } else {
+            // No TAB before end-of-line: skip the rest of this line.
+            while (i < n && data[i] != 10) { i = i + 1; }
+        }
+        if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
+        if (intrinsics::strlen(name) > 0 && intrinsics::strlen(keyh) > 0) {
+            t.names.push(name);
+            t.keys.push(keyh);
+        }
+    }
+    f.close();
+    return t;
+}
+
+/// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The caller
+/// must have created the incremental dir (e.g. via `Manifest::write_fingerprint`,
+/// which always runs alongside this on the success path).
+function write_module_keys(path: string, names: &string[],
+                           keys: &string[]) -> void {
     const f: void* = intrinsics::fopen(path, "w");
     if (f == null) {
         intrinsics::fprintf(g_stderr,
-            "warning: cannot write build manifest to %s\n", path);
+            "warning: cannot write per-module cache keys to %s\n", path);
         return;
     }
-
-    const compiler_fp: string = u64_to_hex(compiler_fingerprint());
-
-    mut root: JsonObject = JsonObject::new();
-    root.put("schema_version",       JsonValue::uint_value(2));
-    root.put("generated_by",         JsonValue::from_cstr("cryo"));
-    root.put("compiler_fingerprint", JsonValue::from_cstr(compiler_fp));
-    root.put("project",              JsonValue::from_cstr(cfg.project_name));
-    root.put("profile",              JsonValue::from_cstr(cfg.profile));
-    root.put("target_type",          JsonValue::from_cstr(cfg.target_type.label()));
-    root.put("target_triple",        JsonValue::from_cstr(cfg.target_triple));
-    root.put("opt_level",            JsonValue::uint_value(opt_level as u64));
-    root.put("debug_info",           JsonValue::bool_value(debug_info));
-    root.put("emit_llvm",            JsonValue::bool_value(cfg.emit_llvm));
-    root.put("no_std",               JsonValue::bool_value(cfg.no_std));
-    root.put("stdlib_archive",       JsonValue::from_cstr(stdlib_archive));
-    root.put("inputs_fingerprint",   JsonValue::from_cstr(fp_hex));
-
-    // artifacts: absolute/cwd-relative paths, matching what `cryo run` execs.
-    root.put("artifacts", JsonValue::string_array(artifacts));
-
-    // [link] section snapshot.
-    mut link: JsonObject = JsonObject::new();
-    link.put("system", JsonValue::string_array(&cfg.link_system));
-    link.put("search", JsonValue::string_array(&cfg.link_search));
-    link.put("static", JsonValue::string_array(&cfg.link_static));
-    root.put("link", JsonValue::Object(link));
-
-    // modules: namespace + source + origin + object path + size.
-    mut mods: Array<JsonValue> = Array<JsonValue>::new();
-    for (mut i: i64 = 0; i < modules.length; i++) {
-        const obj: string = format("%s/%s.o",
-            cfg.deps_dir_for(modules[i].origin_subdir),
-            mangle_module(modules[i].namespace_name));
-        const obj_size: i64 = file_size_bytes(obj);
-        mut m: JsonObject = JsonObject::new();
-        m.put("namespace",   JsonValue::from_cstr(modules[i].namespace_name));
-        m.put("source",      JsonValue::from_cstr(modules[i].source_path));
-        m.put("origin",      JsonValue::from_cstr(modules[i].origin_subdir));
-        m.put("kind",        JsonValue::from_cstr(modules[i].origin_kind));
-        m.put("opt_level",   JsonValue::uint_value(opt_level as u64));
-        m.put("debug_info",  JsonValue::bool_value(debug_info));
-        m.put("object",      JsonValue::from_cstr(obj));
-        m.put("object_size", JsonValue::int_value(obj_size));
-        mods.push(JsonValue::Object(m));
+    for (mut i: i64 = 0; i < names.length; i++) {
+        intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
     }
-    root.put("modules", JsonValue::Array(mods));
-
-    mut doc: JsonValue = JsonValue::Object(root);
-    mut text: String = serializer::stringify_pretty(&doc);
-    doc.drop();
-
-    intrinsics::fwrite(text.as_ptr() as void*, 1, text.length(), f);
-    intrinsics::fputs("\n", f);
-    text.drop();
     intrinsics::fclose(f);
+}
+
+
+// Build manifest object
+
+/// Captures one build's config + resolved knobs so the whole-build
+/// fingerprint, up-to-date short-circuit, and `build-manifest.json` write
+/// share a single source of truth. `opt_level` / `debug_info` are the
+/// RESOLVED values (after profile + CLI overrides), so a `--dev` vs
+/// `--release` switch produces distinct fingerprints. `stdlib_archive` is ""
+/// for `--no-std` builds. The varying per-build inputs (the source module
+/// list and the artifact paths) are passed to the methods that need them.
+type struct Manifest {
+    cfg:            ProjectConfig*;
+    opt_level:      u32;
+    debug_info:     boolean;
+    stdlib_archive: string;
+
+    static new(cfg: ProjectConfig*, opt_level: u32, debug_info: boolean,
+               stdlib_archive: string) -> Manifest {
+        return Manifest {
+            cfg:            cfg,
+            opt_level:      opt_level,
+            debug_info:     debug_info,
+            stdlib_archive: stdlib_archive,
+        };
+    }
+
+    /// Combined fingerprint over every build input.
+    compute_fingerprint(&this, modules: &ModuleEntry[]) -> u64 {
+        mut h: u64 = DefaultHasher::offset_basis();
+        h = fnv_u64(h, compiler_fingerprint());
+        // Resolved knobs.
+        h = fnv_u64(h, this.opt_level as u64);
+        const dbg_b:  u8 = if (this.debug_info)    { 1 } else { 0 };
+        const ell_b:  u8 = if (this.cfg.emit_llvm) { 1 } else { 0 };
+        const nstd_b: u8 = if (this.cfg.no_std)    { 1 } else { 0 };
+        h = fnv_byte(h, dbg_b);
+        h = fnv_byte(h, ell_b);
+        h = fnv_byte(h, nstd_b);
+        h = fnv_str(h, this.cfg.target_triple);
+        h = fnv_str(h, this.cfg.profile);
+        // [link] lists affect the final binary but not the .o files.
+        for (mut i: i64 = 0; i < this.cfg.link_system.length; i++) { h = fnv_str(h, this.cfg.link_system[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_search.length; i++) { h = fnv_str(h, this.cfg.link_search[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h = fnv_str(h, this.cfg.link_static[i]); }
+        // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
+        if (intrinsics::strlen(this.stdlib_archive) > 0) {
+            h = fnv_file(h, this.stdlib_archive);
+        }
+        // Every source module, in topo order: namespace + origin (output
+        // location) + full content.  Folding origin_subdir means moving a
+        // module between packages (which changes where its .o lands)
+        // invalidates the cache even when its source bytes are unchanged.
+        for (mut i: i64 = 0; i < modules.length; i++) {
+            h = fnv_str(h, modules[i].namespace_name);
+            h = fnv_str(h, modules[i].origin_subdir);
+            h = fnv_file(h, modules[i].source_path);
+        }
+        return h;
+    }
+
+    /// True when the saved fingerprint matches `fp_hex` AND every artifact
+    /// still exists on disk. A missing sidecar or any missing artifact forces
+    /// a build.
+    is_up_to_date(&this, fp_hex: string, artifacts: &string[]) -> boolean {
+        const saved: string = read_file_trimmed(this.cfg.fingerprint_path());
+        if (intrinsics::strlen(saved) == 0) { return false; }
+        if (intrinsics::strcmp(saved, fp_hex) != 0) { return false; }
+        for (mut i: i64 = 0; i < artifacts.length; i++) {
+            if (!File::exists(artifacts[i])) { return false; }
+        }
+        return true;
+    }
+
+    /// Write the fingerprint sidecar (`incremental/inputs.fp`), creating the
+    /// incremental dir first.
+    write_fingerprint(&this, fp_hex: string) -> void {
+        ProjectConfig::mkdir_p(this.cfg.incremental_dir());
+        const path: string = this.cfg.fingerprint_path();
+        const f: void* = intrinsics::fopen(path, "w");
+        if (f == null) {
+            intrinsics::fprintf(g_stderr,
+                "warning: cannot write build fingerprint to %s\n", path);
+            return;
+        }
+        intrinsics::fprintf(f, "%s\n", fp_hex);
+        intrinsics::fclose(f);
+    }
+
+    /// Write the human/tooling-facing per-profile `build-manifest.json` at
+    /// `<output_dir>/target/<profile>/build-manifest.json`.
+    write_manifest(&this, modules: &ModuleEntry[], fp_hex: string,
+                   artifacts: &string[]) -> void {
+        ProjectConfig::mkdir_p(this.cfg.profile_dir());
+        const path: string = this.cfg.manifest_path();
+        const f: void* = intrinsics::fopen(path, "w");
+        if (f == null) {
+            intrinsics::fprintf(g_stderr,
+                "warning: cannot write build manifest to %s\n", path);
+            return;
+        }
+
+        const compiler_fp: string = u64_to_hex(compiler_fingerprint());
+
+        mut root: JsonObject = JsonObject::new();
+        root.put("schema_version",       JsonValue::uint_value(2));
+        root.put("generated_by",         JsonValue::from_cstr("cryo"));
+        root.put("compiler_fingerprint", JsonValue::from_cstr(compiler_fp));
+        root.put("project",              JsonValue::from_cstr(this.cfg.project_name));
+        root.put("profile",              JsonValue::from_cstr(this.cfg.profile));
+        root.put("target_type",          JsonValue::from_cstr(this.cfg.target_type.label()));
+        root.put("target_triple",        JsonValue::from_cstr(this.cfg.target_triple));
+        root.put("opt_level",            JsonValue::uint_value(this.opt_level as u64));
+        root.put("debug_info",           JsonValue::bool_value(this.debug_info));
+        root.put("emit_llvm",            JsonValue::bool_value(this.cfg.emit_llvm));
+        root.put("no_std",               JsonValue::bool_value(this.cfg.no_std));
+        root.put("stdlib_archive",       JsonValue::from_cstr(this.stdlib_archive));
+        root.put("inputs_fingerprint",   JsonValue::from_cstr(fp_hex));
+
+        // artifacts: absolute/cwd-relative paths, matching what `cryo run` execs.
+        root.put("artifacts", JsonValue::string_array(artifacts));
+
+        // [link] section snapshot.
+        mut link: JsonObject = JsonObject::new();
+        link.put("system", JsonValue::string_array(&this.cfg.link_system));
+        link.put("search", JsonValue::string_array(&this.cfg.link_search));
+        link.put("static", JsonValue::string_array(&this.cfg.link_static));
+        root.put("link", JsonValue::Object(link));
+
+        // modules: namespace + source + origin + object path + size.
+        mut mods: Array<JsonValue> = Array<JsonValue>::new();
+        for (mut i: i64 = 0; i < modules.length; i++) {
+            const obj: string = format("%s/%s.o",
+                this.cfg.deps_dir_for(modules[i].origin_subdir),
+                mangle_module(modules[i].namespace_name));
+            const obj_size: i64 = file_size_bytes(obj);
+            mut m: JsonObject = JsonObject::new();
+            m.put("namespace",   JsonValue::from_cstr(modules[i].namespace_name));
+            m.put("source",      JsonValue::from_cstr(modules[i].source_path));
+            m.put("origin",      JsonValue::from_cstr(modules[i].origin_subdir));
+            m.put("kind",        JsonValue::from_cstr(modules[i].origin_kind));
+            m.put("opt_level",   JsonValue::uint_value(this.opt_level as u64));
+            m.put("debug_info",  JsonValue::bool_value(this.debug_info));
+            m.put("object",      JsonValue::from_cstr(obj));
+            m.put("object_size", JsonValue::int_value(obj_size));
+            mods.push(JsonValue::Object(m));
+        }
+        root.put("modules", JsonValue::Array(mods));
+
+        mut doc: JsonValue = JsonValue::Object(root);
+        mut text: String = serializer::stringify_pretty(&doc);
+        doc.drop();
+
+        intrinsics::fwrite(text.as_ptr() as void*, 1, text.length(), f);
+        intrinsics::fputs("\n", f);
+        text.drop();
+        intrinsics::fclose(f);
+    }
 }

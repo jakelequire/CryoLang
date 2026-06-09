@@ -21,15 +21,15 @@
 ///! dep it visits.  Cycles are broken by tracking visited project
 ///! roots; a duplicate is a no-op rather than an error.
 
-namespace Compiler::DepsResolver;
+namespace Compiler::Deps::DepResolver;
 
 import Utils::File;
 import Utils::Logger;
 import Compiler::ProjectConfig;
-import Compiler::DepsCache;
-import Compiler::DepsGit;
-import Compiler::DepsSemver;
-import Compiler::DepsLockfile;
+import Compiler::Deps::Cache;
+import Compiler::Deps::Git;
+import Compiler::Deps::Semver;
+import Compiler::Deps::Lockfile;
 
 
 /// What the resolver is asked to do.
@@ -93,7 +93,7 @@ type struct DepKey {
         return DepKey { val: format("path:%s", abs_path) };
     }
     static for_git(url: string, sha: string) -> DepKey {
-        return DepKey { val: format("git:%s@%s", DepsCache::sanitize_url(url), sha) };
+        return DepKey { val: format("git:%s@%s", Cache::sanitize_url(url), sha) };
     }
 }
 
@@ -114,7 +114,7 @@ function resolve(top_config: ProjectConfig*,
     // ignores it entirely.
     mut existing: Lockfile = match (mode) {
         ResolveMode::Update => { Lockfile::empty() }
-        _ => { DepsLockfile::read(lock_path) }
+        _ => { Lockfile::read(lock_path) }
     };
     mut new_lock: Lockfile = Lockfile::empty();
 
@@ -126,7 +126,7 @@ function resolve(top_config: ProjectConfig*,
     const should_write: boolean = !outcome.failed
         && (mode == ResolveMode::Fetch || mode == ResolveMode::Update);
     if (should_write) {
-        DepsLockfile::write(lock_path, &new_lock);
+        Lockfile::write(lock_path, &new_lock);
     }
 
     // Each arm consumes BOTH lockfiles: one is moved into the outcome,
@@ -246,8 +246,8 @@ function resolve_git_dep(cfg: ProjectConfig*,
                 return;
             }
             sha = locked.sha;
-            if (!DepsGit::is_checkout_present(dep.git_url, sha)) {
-                if (!DepsGit::materialize_checkout(dep.git_url, sha)) {
+            if (!Git::is_checkout_present(dep.git_url, sha)) {
+                if (!Git::materialize_checkout(dep.git_url, sha)) {
                     outcome.failed = true;
                     return;
                 }
@@ -265,7 +265,7 @@ function resolve_git_dep(cfg: ProjectConfig*,
                 }
             }
             if (!reused) {
-                if (!DepsGit::ensure_bare_clone(dep.git_url, true)) {
+                if (!Git::ensure_bare_clone(dep.git_url, true)) {
                     outcome.failed = true;
                     return;
                 }
@@ -275,7 +275,7 @@ function resolve_git_dep(cfg: ProjectConfig*,
                     return;
                 }
             }
-            if (!DepsGit::materialize_checkout(dep.git_url, sha)) {
+            if (!Git::materialize_checkout(dep.git_url, sha)) {
                 outcome.failed = true;
                 return;
             }
@@ -295,7 +295,7 @@ function resolve_git_dep(cfg: ProjectConfig*,
     if (already_visited(visited, key.val)) { return; }
     push_visited(visited, key.val);
 
-    const co_dir: string = DepsGit::checkout_path(dep.git_url, sha);
+    const co_dir: string = Git::checkout_path(dep.git_url, sha);
     const dep_root: string = if (intrinsics::strlen(dep.subdir) > 0) {
         format("%s/%s", co_dir, dep.subdir)
     } else {
@@ -331,34 +331,34 @@ function resolve_git_dep(cfg: ProjectConfig*,
 function resolve_to_sha(dep: Dependency) -> string {
     match (dep.ref_kind) {
         GitRefKind::Version => {
-            const c: Constraint = DepsSemver::parse_constraint(dep.ref_val);
+            const c: Constraint = Semver::parse_constraint(dep.ref_val);
             if (!c.valid) {
                 intrinsics::fprintf(g_stderr,
                     "error: dependency '%s' has invalid version constraint '%s'\n",
                     dep.name, dep.ref_val);
                 return "";
             }
-            const tags: string[] = DepsGit::list_tags(dep.git_url);
-            const best: string = DepsSemver::select_best_tag(c, tags);
+            const tags: string[] = Git::list_tags(dep.git_url);
+            const best: string = Semver::select_best_tag(c, tags);
             if (intrinsics::strlen(best) == 0) {
                 intrinsics::fprintf(g_stderr,
                     "error: no tag in %s satisfies version '%s'\n",
                     dep.git_url, dep.ref_val);
                 return "";
             }
-            return DepsGit::resolve_ref_to_sha(
+            return Git::resolve_ref_to_sha(
                 dep.git_url, GitRefKind::Tag, best);
         }
         GitRefKind::Tag => {
-            return DepsGit::resolve_ref_to_sha(
+            return Git::resolve_ref_to_sha(
                 dep.git_url, GitRefKind::Tag, dep.ref_val);
         }
         GitRefKind::Branch => {
-            return DepsGit::resolve_ref_to_sha(
+            return Git::resolve_ref_to_sha(
                 dep.git_url, GitRefKind::Branch, dep.ref_val);
         }
         GitRefKind::Rev => {
-            return DepsGit::resolve_ref_to_sha(
+            return Git::resolve_ref_to_sha(
                 dep.git_url, GitRefKind::Rev, dep.ref_val);
         }
         GitRefKind::None => {
