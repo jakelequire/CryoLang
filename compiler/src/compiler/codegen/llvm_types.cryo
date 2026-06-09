@@ -995,7 +995,11 @@ function create_target_machine_with_opt(triple: string, opt_level: i32) -> LTarg
 
     mut effective: string = triple;
     if (triple == "" || intrinsics::strlen(triple) == 0) {
-        effective = llvm::LLVMGetDefaultTargetTriple() as string;
+        // Go through `get_default_triple`, not the raw LLVM API, so the
+        // Windows msvc→gnu coercion applies here too (otherwise a caller
+        // passing "" on Windows would get the raw `windows-msvc` triple
+        // and emit MSVC-style code the mingw linker can't resolve).
+        effective = get_default_triple();
     }
     mut target: void* = null;
     mut err_msg: i8* = null;
@@ -1019,9 +1023,36 @@ function create_target_machine_with_opt(triple: string, opt_level: i32) -> LTarg
     return LTargetMachine { raw: tm };
 }
 
-/// Get the default target triple string.
+/// Get the default target triple string for the host build.
+///
+/// On Linux/macOS this is whatever `LLVMGetDefaultTargetTriple` reports
+/// (the triple the linked libLLVM was built for).
+///
+/// On Windows the answer needs a small twist.  The Windows `LLVM-C.dll`
+/// the compiler links against is from the official `clang+llvm-*-x86_64-
+/// pc-windows-msvc` release (see `scripts/fetch-windows-llvm.sh`), so
+/// `LLVMGetDefaultTargetTriple` returns `x86_64-pc-windows-msvc`.  But
+/// our linker driver is mingw (`cc` → MSYS2 gcc), and code emitted for
+/// the MSVC ABI cannot be linked by mingw — the most visible mismatch is
+/// the stack-probe symbol: MSVC emits `__chkstk` while mingw provides
+/// `___chkstk_ms`, so a default `cryo build` fails with `undefined
+/// reference to __chkstk`.  Coerce `windows-msvc` → `x86_64-pc-windows-
+/// gnu` here so the rest of the pipeline (LLVM codegen, the linker
+/// config's host-detection compare, the target machine fallback) all
+/// agree on the gnu spelling.  Users targeting native MSVC would set
+/// `--target=` explicitly, which bypasses this coercion.
+![target(unix)]
 function get_default_triple() -> string {
     return llvm::LLVMGetDefaultTargetTriple() as string;
+}
+
+![target(windows)]
+function get_default_triple() -> string {
+    const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
+    if (raw != null && intrinsics::strstr(raw, "windows-msvc") != null) {
+        return "x86_64-pc-windows-gnu";
+    }
+    return raw;
 }
 
 /// Resolve the effective triple for codegen: returns `requested` when it
