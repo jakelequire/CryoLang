@@ -12,8 +12,11 @@
 ///!   - `display` - `Display`, `Debug`, `Formatter<W>`,
 ///!                 `format_to_string`, `format_debug_to_string`
 ///!
-///! The printf-style `print` / `println` / `eprint` / `eprintln` family
-///! lives directly in this module, so `import std::fmt;` brings them in.
+///! The print family lives directly in this module, so `import std::fmt;`
+///! brings it in.  Two flavours:
+///!   - `printf` / `eprintf` - C-style variadic (`%s`/`%d`) to stdout/stderr.
+///!   - `print` / `println` / `eprint` / `eprintln` - Display-based: take an
+///!     owned `String` (typically an f-string `f"{x}"`), write it, and drop it.
 ///!   - `interp`  - f-string (`f"...{expr}..."`) desugar runtime
 ///!
 ///! Integer formatting (`to_decimal_buf`, `to_hex_buf`, `to_oct_buf`,
@@ -25,12 +28,13 @@
 ///! Format-string interpolation is written `f"{x} + {y}"` (an f-string):
 ///! the parser desugars each `{expr}` hole through `Display` and each
 ///! `{expr:?}` hole through `Debug`, building an owned `String`. The
-///! desugar targets live in `interp`. The old printf-style `print`/
-///! `println` (C `%d`/`%s` specifiers) remain for raw formatted output.
+///! desugar targets live in `interp`. The printf-style `printf`/`eprintf`
+///! (C `%d`/`%s` specifiers) remain for raw variadic formatted output.
 
 namespace std::fmt;
 
 import core::intrinsics;
+import collections::string;
 
 public module fmt::error;
 public module fmt::write;
@@ -52,16 +56,26 @@ public module fmt::interp;
 
 /// Write a printf-style formatted string to stdout.  Returns the number of
 /// bytes written, or a negative value on error (libc `printf` convention).
-function print(fmt: string, args...) -> i32 {
+/// Use this for genuinely variadic `%s`/`%d` output; for value formatting
+/// prefer an f-string through `println` (Display-based) below.
+function printf(fmt: string, args...) -> i32 {
     return intrinsics::vprintf(fmt, args);
 }
 
+/// Write an already-formatted `String` (typically an f-string `f"{x}"`) to
+/// stdout, then drop it.  Display-based counterpart to `printf`: the f-string
+/// desugar already ran each `{expr}` through `Display`/`Debug`, so there is no
+/// format string to interpret here (a `%` in the text is data, not a
+/// directive).  We go through the real stdout (`printf "%.*s"`) so output
+/// stays interleaved with `printf` rather than landing on a second FILE*.
+function print(text: String) -> void {
+    intrinsics::printf("%.*s", text.length() as i32, text.as_ptr());
+}
+
 /// Like `print`, followed by a newline.
-function println(fmt: string, args...) -> i32 {
-    const n: i32 = intrinsics::vprintf(fmt, args);
-    if (n < 0) { return n; }
+function println(text: String) -> void {
+    intrinsics::printf("%.*s", text.length() as i32, text.as_ptr());
     intrinsics::putchar(0x0A);
-    return n + 1;
 }
 
 // Lazily-opened stderr stream for the `eprint` family.  libc's `stderr`
@@ -79,19 +93,26 @@ private function fmt_stderr_stream() -> void* {
 }
 
 /// Write a printf-style formatted string to stderr.  Same specifier rules as
-/// `print` (see above).  Returns the number of bytes `vfprintf` reported.
-function eprint(fmt: string, args...) -> i32 {
+/// `printf` (see above).  Returns the number of bytes `vfprintf` reported.
+function eprintf(fmt: string, args...) -> i32 {
     const stream: void* = fmt_stderr_stream();
     const n: i32 = intrinsics::vfprintf(stream, fmt, args);
     intrinsics::fflush(stream);
     return n;
 }
 
-/// Like `eprint`, followed by a newline.
-function eprintln(fmt: string, args...) -> i32 {
+/// Write an already-formatted `String` (typically an f-string) to stderr,
+/// then drop it.  Display-based counterpart to `eprintf`.
+function eprint(text: String) -> void {
     const stream: void* = fmt_stderr_stream();
-    const n: i32 = intrinsics::vfprintf(stream, fmt, args);
+    intrinsics::fprintf(stream, "%.*s", text.length() as i32, text.as_ptr());
+    intrinsics::fflush(stream);
+}
+
+/// Like `eprint`, followed by a newline.
+function eprintln(text: String) -> void {
+    const stream: void* = fmt_stderr_stream();
+    intrinsics::fprintf(stream, "%.*s", text.length() as i32, text.as_ptr());
     intrinsics::fputc(0x0A, stream);
     intrinsics::fflush(stream);
-    return n;
 }
