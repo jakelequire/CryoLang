@@ -78,6 +78,111 @@ function pick_archiver() -> string {
     return "ar";
 }
 
+/// Pick the link driver (the `cc`/`gcc`/`clang` binary the link command
+/// invokes).  `CRYO_CC` overrides the per-target default, mirroring
+/// `pick_c_preprocessor` (which already reads `CRYO_CC` for `#include`
+/// preprocessing) and `pick_archiver`'s `CRYO_AR`.  The same C-toolchain
+/// driver works for both jobs, so one knob covers them.
+///
+/// This is the seam that makes a NATIVE Windows self-host work: the
+/// per-target default for windows-gnu is the *cross* name
+/// `x86_64-w64-mingw32-gcc`, which exists on a Linux cross-host but NOT on
+/// a native MSYS2 / mingw-w64 box (there the driver is plain `gcc` /
+/// `clang`).  Setting `CRYO_CC=gcc` (or `clang`) on Windows points the link
+/// at the locally-installed driver.  Unset (every `make` build, host or
+/// cross) -> the historic per-target default, so existing flows and the
+/// selfhost byte-identity are unchanged.
+function pick_link_driver(default_driver: string) -> string {
+    const env_raw: i8* = intrinsics::getenv("CRYO_CC") as i8*;
+    if (env_raw != null) {
+        const env_val: string = env_raw as string;
+        if (intrinsics::strlen(env_val) > 0) { return env_val; }
+    }
+    return default_driver;
+}
+
+// Host-shell-aware command construction
+//
+// The compiler shells out through libc `system(3)`, which runs `sh -c` on
+// a POSIX-hosted compiler and `cmd /c` on a Windows-hosted one.  These
+// helpers are gated on the COMPILER's OWN target (ConfigGating strips one
+// side at build time): a Linux `cryo` keeps the POSIX forms, a native
+// `cryo.exe` gets the `cmd`-compatible forms.  Without this, an executable
+// link/hoist run on native Windows fails - `cmd` treats `shell_quote`'s
+// single quotes as literal filename characters, has no `cp`, and does no
+// glob/`2>/dev/null`.  (Cross-building a Windows target FROM Linux is
+// unaffected: that link runs in `sh` on the Linux host, so the POSIX forms
+// are correct there.)
+
+/// Quote one path/argument for the active build host's shell.  POSIX:
+/// `shell_quote`'s secure single-quote form.  Windows: a plain double-quote
+/// wrap - `cmd` honours only double quotes, and build paths never contain
+/// an embedded `"` (same assumption the archiver's response-file paths make).
+![target(unix)]
+function link_quote(s: string) -> string {
+    return shell_quote(s);
+}
+
+![target(windows)]
+function link_quote(s: string) -> string {
+    return format("\"%s\"", s);
+}
+
+/// Rewrite `/` to `\` for a path handed to a `cmd` builtin (`copy`), which
+/// parses a leading `/` on a token as a switch.  Drivers invoked as real
+/// programs (gcc/clang) accept `/` fine, so only the `cmd`-builtin hoist
+/// needs this.  Windows-only; never referenced on the POSIX side.
+![target(windows)]
+function to_windows_path(s: string) -> string {
+    const len: u64 = intrinsics::strlen(s);
+    const buf: i8* = intrinsics::malloc(len + 1) as i8*;
+    const sb: i8* = s as i8*;
+    for (mut i: u64 = 0; i < len; i++) {
+        const ch: i8 = sb[i];
+        if (ch == '/') { buf[i] = '\\' as i8; } else { buf[i] = ch; }
+    }
+    buf[len] = 0;
+    return buf as string;
+}
+
+/// Copy the freshly-linked binary from the per-profile cache to the build
+/// root.  POSIX: `cp -f`.  Windows: the `copy /Y` builtin (backslash paths,
+/// stdout silenced via `>NUL`).  Returns the spawned command's exit code.
+![target(unix)]
+function hoist_binary(src: string, dst: string) -> i32 {
+    return system(format("cp -f %s %s", shell_quote(src), shell_quote(dst)));
+}
+
+![target(windows)]
+function hoist_binary(src: string, dst: string) -> i32 {
+    return system(format("copy /Y \"%s\" \"%s\" >NUL",
+        to_windows_path(src), to_windows_path(dst)));
+}
+
+/// Emit the combined `.ll` IR dump next to the hoisted exe (selfhost-check's
+/// byte-identity input).  POSIX-only: it relies on shell glob expansion
+/// (`/*/ir/*.ll`) and `2>/dev/null`, neither of which `cmd` provides.  On a
+/// Windows-hosted compiler this is a no-op - the dump is a Linux CI aid, not
+/// part of a normal build's output.
+![target(unix)]
+function emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
+    const ll_cmd: string = format(
+        "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
+        shell_quote(profile_dir), shell_quote(ll_path));
+    const ll_rc: i32 = system(ll_cmd);
+    if (ll_rc == 0) {
+        cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
+    } else {
+        cdebug("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
+    }
+}
+
+![target(windows)]
+function emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
+    // cmd has no glob / `2>/dev/null`; the IR dump is a POSIX selfhost-check
+    // aid and is not produced on a native Windows build.
+}
+
 // Linker configuration per target
 
 /// What the link pass needs to know about the active target's
@@ -138,7 +243,7 @@ function linker_config_for_triple(triple: string) -> LinkerConfig {
             || intrinsics::strlen(triple) == 0
             || intrinsics::strcmp(triple, get_default_triple()) == 0) {
         return LinkerConfig {
-            driver:             "cc",
+            driver:             pick_link_driver("cc"),
             exe_suffix:         "",
             extra_system_libs:  "-lm -lstdc++",
             use_stdlib_archive: true,
@@ -152,7 +257,7 @@ function linker_config_for_triple(triple: string) -> LinkerConfig {
             && strstr(triple, "gnu") != null
             && strstr(triple, "x86_64") != null) {
         return LinkerConfig {
-            driver:             "x86_64-w64-mingw32-gcc",
+            driver:             pick_link_driver("x86_64-w64-mingw32-gcc"),
             // `-lws2_32` for std::net (Winsock); mingw does NOT auto-link it
             // the way it does kernel32/advapi32.  It's always present on
             // Windows and tiny, so linking it unconditionally (like `-lm`)
@@ -942,9 +1047,9 @@ type struct CodegenPasses {
         // every interpolated path must be shell-quoted; without it, a
         // working directory with a space breaks the link, and a path
         // containing shell metacharacters is a command-injection hazard.
-        mut cmd: string = format("%s -o %s", link_cfg.driver, shell_quote(exe_path));
+        mut cmd: string = format("%s -o %s", link_cfg.driver, link_quote(exe_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
+            cmd = format("%s %s", cmd, link_quote(ctx.artifacts.object_files[i]));
         }
         // Project-configured linking ([link] in cryoconfig).  -L and -l are
         // single-token args with the value glued to the flag, so the
@@ -952,13 +1057,13 @@ type struct CodegenPasses {
         // resolving `system` libs), `system` -> -l, `static` -> the archive
         // path passed to the linker verbatim.
         for (mut i: i64 = 0; i < cfg.link_search.length; i++) {
-            cmd = format("%s -L%s", cmd, shell_quote(cfg.link_search[i]));
+            cmd = format("%s -L%s", cmd, link_quote(cfg.link_search[i]));
         }
         for (mut i: i64 = 0; i < cfg.link_system.length; i++) {
-            cmd = format("%s -l%s", cmd, shell_quote(cfg.link_system[i]));
+            cmd = format("%s -l%s", cmd, link_quote(cfg.link_system[i]));
         }
         for (mut i: i64 = 0; i < cfg.link_static.length; i++) {
-            cmd = format("%s %s", cmd, shell_quote(cfg.link_static[i]));
+            cmd = format("%s %s", cmd, link_quote(cfg.link_static[i]));
         }
         // Per-OS overlay ([link.unix] / [link.windows]).  Appended after
         // the common set, so a project can carry platform-divergent libs
@@ -971,23 +1076,23 @@ type struct CodegenPasses {
         // -> verbatim path.
         if (strstr(effective_triple, "windows") != null) {
             for (mut i: i64 = 0; i < cfg.link_search_windows.length; i++) {
-                cmd = format("%s -L%s", cmd, shell_quote(cfg.link_search_windows[i]));
+                cmd = format("%s -L%s", cmd, link_quote(cfg.link_search_windows[i]));
             }
             for (mut i: i64 = 0; i < cfg.link_system_windows.length; i++) {
-                cmd = format("%s -l%s", cmd, shell_quote(cfg.link_system_windows[i]));
+                cmd = format("%s -l%s", cmd, link_quote(cfg.link_system_windows[i]));
             }
             for (mut i: i64 = 0; i < cfg.link_static_windows.length; i++) {
-                cmd = format("%s %s", cmd, shell_quote(cfg.link_static_windows[i]));
+                cmd = format("%s %s", cmd, link_quote(cfg.link_static_windows[i]));
             }
         } else {
             for (mut i: i64 = 0; i < cfg.link_search_unix.length; i++) {
-                cmd = format("%s -L%s", cmd, shell_quote(cfg.link_search_unix[i]));
+                cmd = format("%s -L%s", cmd, link_quote(cfg.link_search_unix[i]));
             }
             for (mut i: i64 = 0; i < cfg.link_system_unix.length; i++) {
-                cmd = format("%s -l%s", cmd, shell_quote(cfg.link_system_unix[i]));
+                cmd = format("%s -l%s", cmd, link_quote(cfg.link_system_unix[i]));
             }
             for (mut i: i64 = 0; i < cfg.link_static_unix.length; i++) {
-                cmd = format("%s %s", cmd, shell_quote(cfg.link_static_unix[i]));
+                cmd = format("%s %s", cmd, link_quote(cfg.link_static_unix[i]));
             }
         }
         // Stdlib archive: the stdlib build emits `<stdlib_root>/.bin/libcryo.a`
@@ -1001,7 +1106,7 @@ type struct CodegenPasses {
                 && intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
-            cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
+            cmd = format("%s %s", cmd, link_quote(stdlib_archive));
         }
         // Cryo runtime support is fully inline-lowered: every bare-name
         // intrinsic (i32_to_i64, ptr_add, format, bswap*, clz*, isfinite,
@@ -1033,12 +1138,12 @@ type struct CodegenPasses {
         // shell-quoted.
         const hoisted_exe: string = bin_artifact_path_for_target(cfg, ctx);
         ProjectConfig::mkdir_p(output_dir);
-        const hoist_cmd: string = format("cp -f %s %s",
-            shell_quote(exe_path), shell_quote(hoisted_exe));
-        const hrc: i32 = system(hoist_cmd);
+        // `hoist_binary` is host-shell-aware: `cp -f` on a POSIX-hosted
+        // compiler, `copy /Y` (backslash paths) on a native Windows one.
+        const hrc: i32 = hoist_binary(exe_path, hoisted_exe);
         if (hrc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("failed to hoist executable to %s (cp exited with %d)",
+                format("failed to hoist executable to %s (copy exited with %d)",
                     hoisted_exe, hrc));
             return PassResult::failure(1);
         }
@@ -1055,18 +1160,9 @@ type struct CodegenPasses {
         // complaint (when no .ll files were written because emit_llvm was
         // unset) doesn't pollute the user's terminal in the silent default.
         const ll_path: string = format("%s.ll", hoisted_exe);
-        // Shell-quote the profile dir but leave `/*/ir/*.ll` unquoted so the
-        // glob still expands.  Adjacent shell tokens concatenate, so the
-        // result of `'<dir>'/*/ir/*.ll` is exactly the expansion needed.
-        const ll_cmd: string = format(
-            "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
-            shell_quote(profile_dir), shell_quote(ll_path));
-        const ll_rc: i32 = system(ll_cmd);
-        if (ll_rc == 0) {
-            cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
-        } else {
-            cdebug("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
-        }
+        // POSIX-only (shell glob + `2>/dev/null`); a no-op on a native
+        // Windows-hosted compiler, where `cmd` provides neither.
+        emit_linked_ir_dump(profile_dir, ll_path);
 
         return PassResult::ok();
     }
@@ -1100,9 +1196,9 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        mut cmd: string = format("%s -o %s", link_cfg.driver, shell_quote(exe_path));
+        mut cmd: string = format("%s -o %s", link_cfg.driver, link_quote(exe_path));
         for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, shell_quote(ctx.artifacts.object_files[i]));
+            cmd = format("%s %s", cmd, link_quote(ctx.artifacts.object_files[i]));
         }
         // Stdlib archive: same lookup as the project link path, and same
         // host-vs-cross gating.  Empty stdlib_root means single-file mode
@@ -1112,7 +1208,7 @@ type struct CodegenPasses {
         if (link_cfg.use_stdlib_archive && intrinsics::strlen(ctx.stdlib_root) > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
-            cmd = format("%s %s", cmd, shell_quote(stdlib_archive));
+            cmd = format("%s %s", cmd, link_quote(stdlib_archive));
         }
         cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
 
