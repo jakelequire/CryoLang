@@ -20,9 +20,17 @@
 /// `![config(testing)]` is left untouched; its existing namespace-marker
 /// semantics in DirectiveProcessing are independent of platform gating.
 ///
-/// Block-level inline gates (`![config(windows)] { stmt; ... }` inside
-/// function bodies) are NOT handled here; that requires a parser/AST
-/// extension and lives in a follow-up pass.
+/// Scope of stripping:
+///   * top-level declarations (functions, structs, classes, enums,
+///     traits, type aliases, impl/extern blocks, ...) via their attached
+///     directives;
+///   * whole `![target(...)]`-gated METHODS inside struct/class/impl
+///     bodies (filtered out of the owning node's `methods` list);
+///   * inline `![dir] { stmt; ... }` blocks inside function AND method
+///     bodies (see `process_block`).
+/// Struct/class FIELDS and enum VARIANTS are intentionally NOT gated:
+/// gating a data member would diverge a type's layout per platform.  Gate
+/// the whole type instead (write two same-named decls, one per OS).
 
 namespace Compiler::Passes::ConfigGating;
 
@@ -291,11 +299,13 @@ function process_block(block: BlockStmtNode*, os: HostOS, ctx: CompilationContex
 }
 
 
-/// Walk every method body in `methods`, processing cfg-gated blocks.
-/// Hoisted out of `run()` so a single call site invokes process_block
-/// with `m.body`; the same pattern repeated inside a `match` expression's
-/// arms has historically miscompiled.
-function walk_method_bodies(methods: MethodNode*[], os: HostOS, ctx: CompilationContext*) -> void {
+/// Walk every method body in `methods`, processing cfg-gated inline
+/// `![dir] { ... }` blocks.  Hoisted out of `run()` so a single call site
+/// invokes process_block with `m.body`; the same pattern repeated inside a
+/// `match` expression's arms has historically miscompiled.  Borrows the
+/// list (read-only) so the caller keeps ownership of the owning node's
+/// `methods` field.
+function walk_method_bodies(methods: &MethodNode*[], os: HostOS, ctx: CompilationContext*) -> void {
     for (mut i: i64 = 0; i < methods.length; i++) {
         const m: MethodNode* = methods[i];
         if (m != null && m.func != null) {
@@ -303,6 +313,44 @@ function walk_method_bodies(methods: MethodNode*[], os: HostOS, ctx: Compilation
             process_block(body, os, ctx);
         }
     }
+}
+
+/// True iff any method in `methods` carries a platform gate that evaluates
+/// Inactive for `os` - i.e. the list needs to be rebuilt.  Scans without
+/// allocating so the overwhelmingly-common no-gate case stays cheap and
+/// never rewrites the owning node's `methods` field (a class-field array
+/// write is a heavier codegen path; mirrors `process_block`'s fast-path).
+function methods_need_filter(methods: &MethodNode*[], os: HostOS) -> boolean {
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null) { continue; }
+        if (!decl_is_active(m as DeclarationNode*, os)) { return true; }
+    }
+    return false;
+}
+
+/// Build a fresh method list keeping only the methods active for `os`.
+/// The caller assigns the result back onto the owning struct/class/impl
+/// node; only invoked after `methods_need_filter` confirms a rebuild is
+/// needed.  A method survives unless one of its attached gates evaluates
+/// Inactive - the same predicate (`decl_is_active`) used for top-level
+/// declarations, so `![target(windows)]` / `![target(unix)]` on a method
+/// behaves exactly like it does on a free function.
+function active_methods(methods: &MethodNode*[], os: HostOS,
+                        ctx: CompilationContext*) -> MethodNode*[] {
+    mut kept: MethodNode*[] = [];
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null) { continue; }
+        if (!decl_is_active(m as DeclarationNode*, os)) {
+            if (ctx.debug_mode) {
+                cdebug("[ConfigGating] stripped gated method for target os\n");
+            }
+            continue;
+        }
+        kept.push(m);
+    }
+    return kept;
 }
 
 
@@ -364,12 +412,14 @@ function run(ctx: CompilationContext*) -> PassResult {
             continue;
         }
 
-        // Phase 2b: recurse into function/method bodies for inline
-        // `![dir] { ... }` gates.  Method/Impl/Class/Struct recursion
-        // is currently disabled; the pin's match codegen miscompiles
-        // consecutive class-cast-and-call arms.  After this binary is
-        // pinned, the next session can re-enable those branches with
-        // a clean pin that handles the pattern correctly.
+        // Recurse into function/method bodies for inline `![dir] { ... }`
+        // gates, and strip whole `![target(...)]`-gated methods inside
+        // struct / class / impl bodies.  Method-list filtering uses the
+        // same `decl_is_active` predicate as top-level decls, so a
+        // platform gate on a method behaves identically to one on a free
+        // function - no more delegate-to-free-helper workaround needed.
+        // Each cast sits in its own straight-line `if` (never in `match`
+        // arms) to dodge the historic consecutive-cast-and-call miscompile.
         if (k == NodeKind::FunctionDeclaration) {
             const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
             const body: BlockStmtNode* = fd.body;
@@ -385,6 +435,27 @@ function run(ctx: CompilationContext*) -> PassResult {
                     process_block(mbody, os, ctx);
                 }
             }
+        }
+        if (k == NodeKind::StructDeclaration) {
+            const sd: StructDeclNode* = stmt as StructDeclNode*;
+            if (methods_need_filter(&sd.methods, os)) {
+                sd.methods = active_methods(&sd.methods, os, ctx);
+            }
+            walk_method_bodies(&sd.methods, os, ctx);
+        }
+        if (k == NodeKind::ClassDeclaration) {
+            const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+            if (methods_need_filter(&cd.methods, os)) {
+                cd.methods = active_methods(&cd.methods, os, ctx);
+            }
+            walk_method_bodies(&cd.methods, os, ctx);
+        }
+        if (k == NodeKind::ImplementationBlock) {
+            const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+            if (methods_need_filter(&ib.methods, os)) {
+                ib.methods = active_methods(&ib.methods, os, ctx);
+            }
+            walk_method_bodies(&ib.methods, os, ctx);
         }
         kept.push(stmt);
     }
