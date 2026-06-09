@@ -47,12 +47,25 @@ type struct DefaultHasher {
     state: u64;
 
     static new() -> DefaultHasher {
-        // FNV offset basis.
-        return DefaultHasher { state: 14695981039346656037 };
+        return DefaultHasher { state: FNV_OFFSET_BASIS };
+    }
+
+    /// Resume hashing from a previously-`finish`ed `u64` state. Lets an
+    /// incremental fold thread a running digest through several steps
+    /// (e.g. build fingerprinting) without re-deriving the FNV-1a
+    /// update inline.
+    static from_state(state: u64) -> DefaultHasher {
+        return DefaultHasher { state: state };
+    }
+
+    /// The FNV-1a offset basis: the initial state of a fresh hasher.
+    static offset_basis() -> u64 {
+        return FNV_OFFSET_BASIS;
     }
 }
 
-const FNV_PRIME: u64 = 1099511628211;
+const FNV_PRIME:        u64 = 1099511628211;
+const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
 
 implement trait Hasher for struct DefaultHasher {
     write_u8(mut &this, value: u8) -> void {
@@ -63,6 +76,38 @@ implement trait Hasher for struct DefaultHasher {
     finish(&this) -> u64 {
         return this.state;
     }
+}
+
+// FNV-1a convenience digests
+//
+// The single canonical FNV-over-bytes entry points, so callers that only
+// need a `u64` digest (HashMap's precomputed-hash bridge, the LSP's
+// diagnostic ids, the compiler's build fingerprint) don't re-derive the
+// offset basis + prime inline.
+
+/// FNV-1a digest of a NUL-terminated raw `string` (Cryo's C-string view).
+/// Stops at the first NUL, matching `string`'s equality and length
+/// semantics and the `Hash for string` impl below.
+function fnv1a_str(s: string) -> u64 {
+    mut h: DefaultHasher = DefaultHasher::new();
+    const bytes: u8* = s as u8*;
+    mut i: u64 = 0;
+    while (bytes[i] != 0 as u8) {
+        h.write_u8(bytes[i]);
+        i = i + 1;
+    }
+    return h.finish();
+}
+
+/// FNV-1a digest of an explicit byte range (NUL bytes included).
+function fnv1a_bytes(ptr: u8*, len: u64) -> u64 {
+    mut h: DefaultHasher = DefaultHasher::new();
+    mut i: u64 = 0;
+    while (i < len) {
+        h.write_u8(ptr[i]);
+        i = i + 1;
+    }
+    return h.finish();
 }
 
 // Primitive Hash impls
