@@ -2534,12 +2534,40 @@ type struct Monomorphizer {
             }
             NodeKind::ForStatement => {
                 const fs: ForStmtNode* = stmt as ForStmtNode*;
+                // Register the C-style loop variable (`for (mut i: T = ..)`)
+                // in the inference scope so generic-arg sites in the
+                // condition/body can resolve its type.  The discovery walk
+                // otherwise only knows params + match-arm bindings, so an
+                // f-string hole `f"{i}"` left `fmt_append_display<T>`
+                // unspecialised -> link error (masked for `string`/`i64`,
+                // whose specs exist anyway, but fatal for e.g. `u32`).
+                // The parser stores the C-style init clause as a bare
+                // VariableDeclaration node (not wrapped in a statement).
+                mut for_pushed: i64 = 0;
+                if (fs.init != null
+                        && fs.init.kind == NodeKind::VariableDeclaration) {
+                    const fvd: VarDeclNode* = fs.init as VarDeclNode*;
+                    mut lv_ty: TypeRef = fvd.resolved_type;
+                    if (!lv_ty.is_valid() && fvd.type_annotation != null
+                            && this.type_resolver != null && res_ctx != null) {
+                        lv_ty = this.type_resolver.resolve(fvd.type_annotation, res_ctx);
+                    }
+                    if (lv_ty.is_valid() && subst != null) {
+                        lv_ty = subst.apply(lv_ty, this.arena);
+                    }
+                    if (lv_ty.is_valid()) {
+                        this.scope_names.push(fvd.name);
+                        this.scope_types.push(lv_ty);
+                        for_pushed = 1;
+                    }
+                }
                 if (fs.condition != null) {
                     this.discover_inferred_calls_in_expr(fs.condition, res_ctx, subst, names, types);
                 }
                 if (fs.body != null) {
                     this.discover_inferred_calls_in_stmt(fs.body, res_ctx, subst, names, types);
                 }
+                this.pop_scope_bindings(for_pushed);
             }
             NodeKind::LoopStatement => {
                 const ls: LoopStmtNode* = stmt as LoopStmtNode*;
