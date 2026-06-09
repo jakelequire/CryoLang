@@ -8,7 +8,7 @@ legacy C++ bootstrap. That binary is the canonical entry point for the
 new chain (the C++ bootstrap at `legacy/bootstrap/bin/cryo` is retained
 for archaeology only, and is no longer required by this script).
 Whenever `compiler/src/` adopts new syntax that `bin/cryo` can't parse,
-refresh the pin via `make pin-cryo` after a clean selfhost-check.
+refresh the pin via `make pin` after a clean selfhost-check.
 
 Why 3 rounds and not 4: stage-2 was built by the (potentially older) pin,
 so its codegen behavior may differ from the new source's intent. Stage-3
@@ -52,6 +52,18 @@ import subprocess
 import sys
 import threading
 import time
+
+# The status glyphs (✓ ✗ ↷) are above cp1252's range, so on a Windows
+# console with a legacy code page (PowerShell / cmd defaults to cp1252)
+# the very first print explodes with UnicodeEncodeError.  Reconfigure
+# stdout/stderr to UTF-8 before anything prints.  No-op on POSIX where
+# the streams are already UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -553,6 +565,221 @@ def run_windows_stage(total_start) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Windows-host pre-check (cryo.exe + WSL delegation)
+#
+# When invoked on a Windows host, selfhost-check runs three things in order:
+#
+#   1. A native cryo.exe smoke (--version) — proves the binary loads and
+#      LLVM-C.dll resolves.
+#   2. A native cryo.exe stdlib build (default triple) — proves the
+#      windows-msvc → windows-gnu coercion fix actually links end-to-end.
+#   3. A native cryo.exe single-file hello build + run with fmt::println
+#      varargs — proves codegen + link + the Win64 va_list path work.
+#   4. The full 6-stage Linux byte-identity chain via WSL.  Wine-based
+#      Windows verification (the original [w1]-[w4]) is skipped because we
+#      already verified cryo.exe natively above.
+#
+# WSL is required (the Linux chain doesn't run natively on Windows).
+# ---------------------------------------------------------------------------
+WIN_BOOT = ROOT / "bin" / "cryo.exe"
+
+
+def is_windows_host() -> bool:
+    """True when this Python is running on a Windows host (native or MSYS2/cygwin)."""
+    if os.name == "nt":
+        return True
+    if sys.platform.startswith(("msys", "cygwin")):
+        return True
+    return False
+
+
+def _wsl_path(p: Path) -> str | None:
+    """Translate a Windows-native path to its WSL view (e.g. C:\\... -> /mnt/c/...).
+    Returns None on failure (wsl.exe absent, WSL distro problem, etc.).
+
+    Backslashes are normalized to forward slashes before the call: wsl.exe
+    reassembles its arguments via a Windows-style command line so embedded
+    `\\` collapses ('C:\\Programming\\...' arrives as 'C:Programming...');
+    forward slashes survive intact and wslpath accepts them."""
+    try:
+        normalized = str(p).replace("\\", "/")
+        r = subprocess.run(["wsl.exe", "--", "wslpath", "-a", normalized],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        out = r.stdout.strip()
+        return out or None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def _quick_stage(label: str, log_name: str, cmd, cwd, env=None,
+                 allow_fail: bool = False, timeout=None,
+                 expect_substring: str | None = None,
+                 wlog: Path | None = None) -> tuple[bool, str]:
+    """Run a single stage, render its row, return (ok, captured_output).
+
+    `expect_substring` (case-insensitive) lets a "smoke" call assert that the
+    child's stdout/stderr contains something specific (e.g. "cryo" for --version)."""
+    assert wlog is not None
+    sys.stdout.write(label)
+    sys.stdout.flush()
+    rc, out = _run(cmd, cwd, wlog / log_name, env=env,
+                   allow_fail=True, timeout=timeout)
+    if rc != 0:
+        sys.stdout.write(f"{C.RED}✗ exit {rc}{C.RESET}\n")
+        print(f"     {C.DIM}log:{C.RESET} {(wlog / log_name).relative_to(ROOT)}")
+        return False, out
+    if expect_substring and expect_substring.lower() not in (out or "").lower():
+        sys.stdout.write(f"{C.RED}✗ unexpected output{C.RESET}\n")
+        print(f"     {C.DIM}log:{C.RESET} {(wlog / log_name).relative_to(ROOT)}")
+        return False, out
+    sys.stdout.write(f"{C.GREEN}✓{C.RESET}\n")
+    return True, out
+
+
+def main_windows(args) -> int:
+    """Windows-host entry point: native cryo.exe pre-check + WSL Linux chain."""
+    print()
+    print(f"{C.BOLD}selfhost-check{C.RESET}  "
+          f"{C.DIM}— Windows host (cryo.exe pre-check + Linux chain via WSL){C.RESET}")
+    print(f"  {C.DIM}root:{C.RESET} {ROOT}")
+    print(f"  {C.DIM}logs:{C.RESET} {LOG_DIR.relative_to(ROOT)}/")
+    print()
+
+    # Prereqs.
+    if not WIN_BOOT.exists():
+        print(f"{C.RED}✗ pinned cryo.exe not found:{C.RESET} {WIN_BOOT.relative_to(ROOT)}")
+        print(f"  {C.DIM}Refresh with `make pin`, or check out a revision that has bin/cryo.exe committed.{C.RESET}")
+        return 2
+    if not shutil.which("wsl.exe"):
+        print(f"{C.RED}✗ wsl.exe not on PATH{C.RESET}")
+        print(f"  {C.DIM}The Windows host flow needs WSL for the Linux 6-stage chain.{C.RESET}")
+        print(f"  {C.DIM}Install with 'wsl --install' and a Linux distro that has cryo's toolchain.{C.RESET}")
+        return 2
+    wsl_root = _wsl_path(ROOT)
+    if not wsl_root:
+        print(f"{C.RED}✗ could not resolve a WSL path for {ROOT}{C.RESET}")
+        print(f"  {C.DIM}Is the repo visible inside your default WSL distro?{C.RESET}")
+        return 2
+
+    if not args.keep_logs and LOG_DIR.exists():
+        shutil.rmtree(LOG_DIR)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    wlog = LOG_DIR / "windows-host"
+    wlog.mkdir(parents=True, exist_ok=True)
+
+    overall_start = time.perf_counter()
+
+    # Phase 1: Windows-native pre-check.
+    print(f"{C.BOLD}==> Windows-native pre-check (bin/cryo.exe){C.RESET}")
+
+    # [W1] cryo.exe --version smoke.
+    label = f"  {C.CYAN}[W1]{C.RESET} cryo.exe --version  "
+    ok, out = _quick_stage(label, "01-version.log",
+                           [str(WIN_BOOT), "--version"], ROOT,
+                           expect_substring="cryo", wlog=wlog)
+    if not ok:
+        return 1
+    version_line = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+    print(f"     {C.DIM}{version_line}{C.RESET}")
+
+    # Wipe stdlib/.bin/ so we measure a clean Windows-native build.  We don't
+    # need an archive from this run (the cryo.exe link path through the Win
+    # cross-toolchain uses host-windows/ bucket objects, not the stdlib
+    # archive — handy because the Linux chain rebuilds libcryo.a anyway).
+    wipe_paths([ROOT / "stdlib" / ".bin"])
+
+    # [W2] cryo.exe builds the stdlib at the default (gnu-coerced) triple.
+    # This exercises the windows-msvc → windows-gnu fix end-to-end: link
+    # produces an archive without unresolved __chkstk references.
+    label = f"  {C.CYAN}[W2]{C.RESET} cryo.exe build stdlib (native, no --target)  "
+    ok, _ = _quick_stage(label, "02-stdlib.log",
+                         [str(WIN_BOOT), "build", "--no-incremental"],
+                         ROOT / "stdlib", wlog=wlog)
+    if not ok:
+        return 1
+    if not (ROOT / "stdlib" / ".bin" / "libcryo.a").exists():
+        print(f"  {C.RED}✗ stdlib build produced no libcryo.a{C.RESET}")
+        return 1
+
+    # [W3] cryo.exe builds + runs a fmt::println program: verifies codegen,
+    # link, the Win64 va_list seam, and the new gnu-default linker config.
+    smoke_dir = ROOT / "build-logs" / "selfhost-check" / "windows-host" / "smoke"
+    smoke_dir.mkdir(parents=True, exist_ok=True)
+    (smoke_dir / "main.cryo").write_text(
+        'namespace WinSmoke;\n'
+        'import std::fmt;\n'
+        'function main() -> int {\n'
+        '    fmt::println("smoke ok: %d %d %s", 1, 2, "yes");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    (smoke_dir / "cryoconfig").write_text(
+        '[project]\n'
+        'project_name = "winsmoke"\n'
+        'output_dir = "build"\n'
+        '[[bin]]\n'
+        'name = "winsmoke"\n'
+        'entry_point = "main.cryo"\n'
+        '[compiler]\n'
+        'optimize = O2\n'
+    )
+    shutil.rmtree(smoke_dir / "build", ignore_errors=True)
+    # The smoke project sits under build-logs/, far from the repo's stdlib/,
+    # so neither the project-relative nor cwd-relative fallback in
+    # ProjectConfig::resolve_stdlib_root would find it.  Pin it explicitly.
+    smoke_env = {"CRYO_STDLIB": str(ROOT / "stdlib")}
+    label = f"  {C.CYAN}[W3]{C.RESET} cryo.exe build + run hello (fmt varargs)  "
+    ok, _ = _quick_stage(label, "03-smoke-build.log",
+                         [str(WIN_BOOT), "build", "--no-incremental"],
+                         smoke_dir, env=smoke_env, wlog=wlog)
+    if not ok:
+        return 1
+    smoke_exe = smoke_dir / "build" / "winsmoke.exe"
+    if not smoke_exe.exists():
+        print(f"  {C.RED}✗ build produced no {smoke_exe.relative_to(ROOT)}{C.RESET}")
+        return 1
+    rc, out = _run([str(smoke_exe)], smoke_dir, wlog / "03-smoke-run.log",
+                   allow_fail=True)
+    if rc != 0 or "smoke ok: 1 2 yes" not in (out or ""):
+        print(f"  {C.RED}✗ smoke binary exit {rc}, output:{C.RESET} "
+              f"{(out or '').strip()!r}")
+        return 1
+    print(f"     {C.DIM}{(out or '').strip()}{C.RESET}")
+
+    win_elapsed = time.perf_counter() - overall_start
+    print(f"  {C.GREEN}✓ Windows pre-check OK{C.RESET}  {C.DIM}({fmt_dur(win_elapsed)}){C.RESET}")
+
+    # Phase 2: Linux 6-stage chain via WSL.
+    # --no-windows skips the wine-based Windows verification — we already
+    # verified cryo.exe natively above.
+    print()
+    print(f"{C.BOLD}==> Linux 6-stage chain (via WSL){C.RESET}")
+    print(f"  {C.DIM}wsl.exe -- bash -lc 'cd {wsl_root} && python3 scripts/selfhost-check.py --no-windows'{C.RESET}")
+    print()
+    # Flush before handing stdout to the child — Python's stdout is line/
+    # block-buffered while the WSL child writes directly to the underlying
+    # fd, so without an explicit flush the child's output starts appearing
+    # in the middle of our buffered prints above.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    wsl_cmd = ["wsl.exe", "--", "bash", "-lc",
+               f"cd '{wsl_root}' && python3 scripts/selfhost-check.py --no-windows"
+               + (" -v" if args.verbose else "")
+               + (" --keep-logs" if args.keep_logs else "")]
+    # Stream WSL stdout/stderr live so the user sees the per-stage rows.
+    proc = subprocess.run(wsl_cmd)
+    if proc.returncode != 0:
+        return proc.returncode
+
+    total = time.perf_counter() - overall_start
+    print()
+    print(f"{C.GREEN}{C.BOLD}✓ ALL CHECKS PASSED{C.RESET}  {C.DIM}(total {fmt_dur(total)}){C.RESET}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def ensure_boot():
@@ -560,7 +787,7 @@ def ensure_boot():
     if BOOT.exists():
         return True
     print(f"{C.RED}✗ pinned boot not found:{C.RESET} {BOOT.relative_to(ROOT)}")
-    print(f"  {C.DIM}Build a fresh self-hosted compiler and run `make pin-cryo`,")
+    print(f"  {C.DIM}Build a fresh self-hosted compiler and run `make pin`,")
     print(f"  or check out a revision that has bin/cryo committed.{C.RESET}")
     return False
 
@@ -577,6 +804,12 @@ def main():
     parser.add_argument("--no-windows", action="store_true",
                         help="skip the optional Windows cross-build verification stage")
     args = parser.parse_args()
+
+    # Windows host: native pre-check + WSL Linux chain.  This branch never
+    # touches BOOT (bin/cryo, the Linux ELF) directly — it routes the Linux
+    # work through WSL, which sees the same repo via /mnt/c/...
+    if is_windows_host():
+        return main_windows(args)
 
     if not ensure_boot():
         return 2

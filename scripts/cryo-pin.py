@@ -8,7 +8,7 @@ the git state of the worktree at pin time. Committing it alongside the
 pinned binary turns each pin refresh into a reviewable diff.
 
 Usage:
-    python3 scripts/cryo-pin.py            # (or `make pin-cryo`)
+    python3 scripts/cryo-pin.py            # (or `make pin`)
     python3 scripts/cryo-pin.py --no-strip
     python3 scripts/cryo-pin.py --source path/to/cryo
     python3 scripts/cryo-pin.py --pin     path/to/bin/cryo
@@ -46,7 +46,7 @@ def git(*args: str) -> str:
         return "unknown"
 
 
-# Files that pin-cryo itself writes during a refresh.  Excluded from the
+# Files that `make pin` itself writes during a refresh.  Excluded from the
 # dirty check below so the pin doesn't record itself as dirty just by
 # running.
 _PIN_OUTPUTS = (

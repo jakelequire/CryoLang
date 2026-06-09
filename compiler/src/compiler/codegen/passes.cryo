@@ -218,6 +218,45 @@ type struct LinkerConfig {
     supported:           boolean;
 }
 
+/// The host-build `LinkerConfig`: what to run when the user did NOT pass
+/// `--target=...` (or passed one that matches the host).  Gated on the
+/// compiler's OWN target because the differences between Linux and
+/// Windows host builds are not derivable from the runtime triple alone:
+///
+///   - exe suffix: empty on POSIX, `.exe` on Windows so the hoisted
+///     binary opens correctly under cmd / Explorer.
+///   - extra system libs: `-lstdc++` on POSIX (the self-hosted compiler
+///     links libLLVM-20, which is C++; user programs never reference
+///     C++ symbols so the flag is inert for them).  On Windows we need
+///     `-lws2_32` instead: mingw does NOT auto-link Winsock the way it
+///     auto-links kernel32/advapi32, so any program using `std::net`
+///     would otherwise fail to link.  `-lstdc++` is omitted on Windows
+///     because the compiler binary itself isn't relinked here (the
+///     committed `cryo.exe` is already linked) and ordinary cryo
+///     programs don't need it.
+///   - the rest (`cc` driver, archive yes, supported) is identical.
+![target(unix)]
+function host_linker_config() -> LinkerConfig {
+    return LinkerConfig {
+        driver:             pick_link_driver("cc"),
+        exe_suffix:         "",
+        extra_system_libs:  "-lm -lstdc++",
+        use_stdlib_archive: true,
+        supported:          true,
+    };
+}
+
+![target(windows)]
+function host_linker_config() -> LinkerConfig {
+    return LinkerConfig {
+        driver:             pick_link_driver("cc"),
+        exe_suffix:         ".exe",
+        extra_system_libs:  "-lm -lws2_32",
+        use_stdlib_archive: true,
+        supported:          true,
+    };
+}
+
 /// Pick the right toolchain for `triple`.  `triple` is the post-
 /// `resolve_effective_triple` value (empty falls back to host).  Today:
 ///
@@ -235,20 +274,14 @@ type struct LinkerConfig {
 ///     `run_linking` falls back to the object-files-only bailout that
 ///     prints a manual-link hint.
 function linker_config_for_triple(triple: string) -> LinkerConfig {
-    // Host build: the historic line.  Includes -lstdc++ because the
-    // self-hosted compiler binary pulls in libLLVM-20 (C++); ordinary
-    // cryo programs never reference C++ symbols so the flag is inert
-    // for them.  A null/empty triple is treated as the host.
+    // Host build: a null/empty triple, or one that matches the (coerced)
+    // host triple, takes the per-host config below.  The split is
+    // platform-gated because the host config diverges by OS - exe suffix
+    // and which extra libs ship by default.
     if (triple == null
             || intrinsics::strlen(triple) == 0
             || intrinsics::strcmp(triple, get_default_triple()) == 0) {
-        return LinkerConfig {
-            driver:             pick_link_driver("cc"),
-            exe_suffix:         "",
-            extra_system_libs:  "-lm -lstdc++",
-            use_stdlib_archive: true,
-            supported:          true,
-        };
+        return host_linker_config();
     }
     // x86_64 windows-gnu (mingw-w64).  Substring-match the OS field so
     // every reasonable spelling (`x86_64-pc-windows-gnu`,

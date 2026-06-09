@@ -419,7 +419,7 @@ make stdlib            # rebuild the standard library
 make selfhost-check    # 3-round / 6-stage byte-identity gate
 make test              # run the repo-level test suite
 make lsp               # build the Cryo-language LSP (bin/cryolsp)
-make pin-cryo          # refresh bin/cryo from compiler/build/cryo
+make pin               # refresh bin/cryo and bin/cryo.exe (host-aware)
 make clean             # remove compiler + stdlib build outputs
 ```
 

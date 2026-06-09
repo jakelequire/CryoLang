@@ -41,9 +41,9 @@ To refresh the pin:
 
 ```bash
 make cryo                # build the next-generation compiler via the current pin
-make pin-cryo            # copy compiler/build/bin/cryo to bin/cryo, stripped
-git add bin/cryo
-git commit -m "build: refresh pinned cryo binary"
+make pin                 # refresh both pins (bin/cryo + bin/cryo.exe), host-aware
+git add bin/cryo bin/cryo.exe bin/*.pin.txt
+git commit -m "build: refresh pinned cryo binaries"
 ```
 
 Refresh **only** when `compiler/src/` has actually adopted something the

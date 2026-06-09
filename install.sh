@@ -183,7 +183,7 @@ run() {
 print_banner
 
 if [ "$ACTION" = "install" ]; then
-    [ -x "$SRC_BIN" ] || die "$SRC_BIN is missing or not executable. Run 'make pin-cryo' to refresh the pinned binary, or check out a revision that has bin/cryo committed."
+    [ -x "$SRC_BIN" ] || die "$SRC_BIN is missing or not executable. Run 'make pin' to refresh the pinned binary, or check out a revision that has bin/cryo committed."
     [ -f "$SRC_STDLIB/lib.cryo" ] || die "$SRC_STDLIB/lib.cryo not found - is the stdlib in place?"
 
     NEED_STDLIB_BUILD=0

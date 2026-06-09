@@ -17,8 +17,7 @@
 #     cd compiler && cryo build --target=x86_64-pc-windows-gnu
 #     <link the resulting COFF objects against Windows libLLVM-20>
 #
-# Then `make pin-cryo` (with --pin bin/cryo.exe override) seals the
-# Windows-side pin.
+# Then `make pin` seals both pins in one shot (host-aware).
 #
 # Pinning the version: this script targets a *specific* llvm-mingw
 # release so reproducible builds don't drift when upstream cuts a new
