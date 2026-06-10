@@ -139,15 +139,50 @@ function resolve_include_path(source_dir: string, include_path: string) -> strin
 
 // Preprocessor Invocation
 
-/// Pick the C preprocessor binary.  `CRYO_CC` overrides the default
-/// `clang-20`.  Returned pointer is the env value (caller must NOT
-/// free) when set, otherwise the static default literal.
+/// Shell redirect that discards stdout+stderr while probing a compiler.
+/// `cmd` (Windows host) uses `>NUL`; POSIX `sh` uses `>/dev/null`.  Both
+/// honour `2>&1`.  Host-gated because ConfigGating strips one side at
+/// build time, so the running compiler emits the form its own shell
+/// understands.
+![target(unix)]
+function cc_silence() -> string { return ">/dev/null 2>&1"; }
+
+![target(windows)]
+function cc_silence() -> string { return ">NUL 2>&1"; }
+
+/// True iff the C driver `cc` can be launched, probed via `cc --version`.
+/// A missing binary makes the shell exit non-zero (`sh`: 127; `cmd`:
+/// 9009), and `system(3)` reports that, so exit 0 means it's usable.
+function cc_available(cc: string) -> boolean {
+    return system(format("%s --version %s", cc, cc_silence())) == 0;
+}
+
+/// Pick the C preprocessor binary for `#include` lowering.  `CRYO_CC`
+/// wins outright; otherwise AUTO-DETECT by probing a candidate list and
+/// returning the first that launches.
+///
+/// `clang-20` stays first so a Linux dev/CI host (where that exact name
+/// exists) keeps its historic choice - preserving selfhost byte-identity -
+/// while macOS and native Windows / msys2 (which have no `clang-20` by
+/// that name, only `clang` / `gcc` / `cc`) fall through and Just Work
+/// without anyone setting `CRYO_CC`.  This is what lets `make
+/// selfhost-check` and a native compiler self-build run on a stock
+/// mingw64 box.  The imported header the compiler itself cares about
+/// (`llvm_bindings.h`) is self-contained - no `#include`s - so every
+/// candidate produces identical `-E -P` output and thus identical parsed
+/// externs regardless of which one is chosen.  Falls back to `clang-20`
+/// when nothing is found so the existing "set $CRYO_CC" diagnostic still
+/// fires with an actionable message.
 function pick_c_preprocessor() -> string {
     const env_raw: i8* = intrinsics::getenv("CRYO_CC") as i8*;
     if (env_raw != null) {
         const env_val: string = env_raw as string;
         if (intrinsics::strlen(env_val) > 0) { return env_val; }
     }
+    if (cc_available("clang-20")) { return "clang-20"; }
+    if (cc_available("clang"))    { return "clang"; }
+    if (cc_available("gcc"))      { return "gcc"; }
+    if (cc_available("cc"))       { return "cc"; }
     return "clang-20";
 }
 

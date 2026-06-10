@@ -205,10 +205,12 @@ type struct CompilationResult {
 // (2)/(3) are the recommended cross-platform mechanism: `install.sh`
 // writes `CRYO_HOME` into the user's shell rc, and every install (Linux,
 // macOS, other) finds the stdlib without needing `/proc/self/exe`.
-// (4)/(5) read /proc/self/exe so an existing in-tree or symlink install
-// (`/usr/local/bin/cryo` -> `<repo>/bin/cryo`) resolves to the repo's
-// stdlib without any env var (Linux only; on non-Linux the readlink
-// fails and we fall through to the cryoconfig / legacy candidates).
+// (4)/(5) resolve the running binary's own location so an in-tree or
+// symlink install (`/usr/local/bin/cryo` -> `<repo>/bin/cryo`, or a
+// `bin/cryo.exe` sitting beside `stdlib/`) finds the repo's stdlib with
+// no env var.  `env::current_exe()` reads `/proc/self/exe` on Unix and
+// `GetModuleFileNameA` on Windows, so the dirname scan must accept BOTH
+// `/` and `\` separators (the Windows path is backslash-delimited).
 // (6) is for projects that vendor a custom stdlib or pin a version.
 //
 // Relative `cryoconfig stdlib_root` values are resolved against the
@@ -280,10 +282,16 @@ function resolve_stdlib_root(cli_override: string,
     if (exe_len > 0) {
         mut exe_buf: i8* = self_exe as i8*;
         const exe_path: string = self_exe;
-        // dirname: walk back to the final '/'.
+        // dirname: walk back to the final path separator.  `current_exe()`
+        // yields a forward-slash path on Unix (`/proc/self/exe`) but a
+        // BACKSLASH path on Windows (`GetModuleFileNameA` returns
+        // `C:\...\bin\cryo.exe`), so both separators must terminate the
+        // scan - otherwise the Windows path has no `/`, `dir_end` walks to
+        // 0, the whole binary-relative block is skipped, and auto-detection
+        // silently fails.
         mut dir_end: u64 = (exe_len - 1) as u64;
         while (dir_end > 0) {
-            if (exe_path[dir_end] == '/') { break; }
+            if (exe_path[dir_end] == '/' || exe_path[dir_end] == '\\') { break; }
             dir_end -= 1;
         }
         if (dir_end > 0) {

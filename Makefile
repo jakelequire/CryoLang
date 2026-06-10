@@ -76,9 +76,17 @@ else
     NPROC := $(shell nproc 2>/dev/null || echo 4)
 endif
 
+# The LSP binary grows a `.exe` suffix on a Windows host (the self-hosted
+# compiler appends it for windows targets), so the build output and its pin
+# both carry it there; empty elsewhere.
+ifeq ($(HOST_OS),windows)
+    EXE_SUFFIX := .exe
+else
+    EXE_SUFFIX :=
+endif
 LSP_BUILD_DIR := $(ROOT)/tools/CryoLSP/build
-LSP_BIN       := $(LSP_BUILD_DIR)/cryolsp
-LSP_PIN       := $(ROOT)/bin/cryolsp
+LSP_BIN       := $(LSP_BUILD_DIR)/cryolsp$(EXE_SUFFIX)
+LSP_PIN       := $(ROOT)/bin/cryolsp$(EXE_SUFFIX)
 
 EXT_DIR       := $(ROOT)/tools/CryoAnalyzer
 EXT_ID        := cryolang.cryo-analyzer
@@ -216,16 +224,38 @@ endif
 # Builds tools/CryoLSP/ (entirely Cryo source) into bin/cryolsp.
 # Depends on the stage-2 binary as a file so an existing compiler build
 # is reused. Run `make cryo` first if you want to pick up compiler changes.
+ifeq ($(HOST_OS),windows)
+# Windows host: recipes run under cmd, which has no `cp`.  `$(PIN)` (bin/cryo,
+# no extension) launches via PATHEXT -> bin/cryo.exe.  The built binary is
+# `cryolsp.exe`; copy it to the pin with the `copy` builtin (backslash paths,
+# stdout silenced).  `$(STAGE2)` is the Linux ELF and isn't a real
+# prerequisite here, so this target stands alone.
+lsp:
+	@echo "==> Building CryoLSP via bin/cryo.exe"
+	cd tools/CryoLSP && "$(PIN)" build
+	copy /Y "$(subst /,\,$(LSP_BIN))" "$(subst /,\,$(LSP_PIN))" >NUL
+	@echo "==> bin/cryolsp.exe ready"
+else
 lsp: $(STAGE2)
 	@echo "==> Building CryoLSP via bin/cryo"
 	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN)"
 	@echo "==> bin/cryolsp ready"
+endif
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
 # Packages tools/CryoAnalyzer/ into a .vsix and installs it into VS Code,
 # evicting any previously installed copy and any stale .vsix artifacts so
 # the install always reflects the current source.
+ifeq ($(HOST_OS),windows)
+# Windows host: the POSIX recipe below (`command -v`, `{ ... }`, `[ -d ]`,
+# `rm`, `./node_modules/.bin/...`) is unparseable by cmd, so the whole job
+# lives in a batch wrapper - same single-line shape as `pin`.  It uses
+# `where`/`if exist`/`del` and the `.cmd` shims (`code.cmd`, `npm.cmd`,
+# `vsce.cmd`) that npm installs on Windows.
+install-lsp:
+	scripts\install-lsp-windows.cmd
+else
 install-lsp:
 	@command -v code >/dev/null 2>&1 || { echo "ERROR: 'code' CLI not found on PATH"; exit 1; }
 	@echo "==> Ensuring CryoAnalyzer node_modules are present"
@@ -239,6 +269,7 @@ install-lsp:
 	@echo "==> Installing $(EXT_VSIX)"
 	@code --install-extension "$(EXT_VSIX)" --force
 	@echo "==> CryoAnalyzer extension installed"
+endif
 
 # ---- selfhost byte-identity check -------------------------------------
 # Implementation lives in scripts/selfhost-check.py — that gives us

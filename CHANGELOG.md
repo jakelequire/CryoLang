@@ -215,6 +215,21 @@ I/O and `HashMap`, traits with `where` bounds, 2D simulation,
 stdin-driven interactive I/O, capturing closures, and OS threads with
 `thread::spawn` / `JoinHandle` / `mpsc` channels.
 
+### Target triples
+
+Verified end-to-end — compile, link, run, and a self-host byte-identity gate
+(`make selfhost-check`) — on x86_64:
+
+- **`x86_64-*-linux-gnu`** — native host builds; the canonical dev/CI host.
+- **`x86_64-pc-windows-gnu`** — native Windows host builds *and*
+  Linux→Windows cross-compilation via the mingw-w64 toolchain: Win64 ABI,
+  COFF objects, `.exe` linking, and a native 6-stage self-host fixed point.
+
+The host C toolchain (header preprocessor + linker) is auto-detected
+(`clang-20` → `clang` → `gcc` → `cc`) and the standard library is auto-located
+relative to the `cryo` binary, so a stock toolchain needs neither `CRYO_CC`
+nor `CRYO_STDLIB`.
+
 ### Known limitations (deferred to post-1.0)
 
 These are not bugs against 1.0 - the language deliberately ships
@@ -245,6 +260,7 @@ authoritative list.
   Compiler above) ship in 1.0 and work against any of these.
 - Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
-- Cross-compilation.
+- macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See
+  **Target triples** above for the supported set.
 
 [1.0.0]: https://github.com/jakelequire/CryoLang/releases/tag/v1.0.0
