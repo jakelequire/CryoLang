@@ -58,7 +58,7 @@ _PIN_OUTPUTS = (
 
 
 def worktree_dirty() -> bool:
-    """True iff anything outside the pin outputs differs from HEAD."""
+    """True if anything outside the pin outputs differs from HEAD."""
     try:
         r = subprocess.run(
             ["git", "-C", str(ROOT), "diff-index", "--quiet", "HEAD", "--",
