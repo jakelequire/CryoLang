@@ -297,16 +297,18 @@ def print_summary(times, total):
 #   2. that cryo.exe loads + runs under wine (`--version`),
 #   3. CROSS-SELFHOST: cryo.exe run under wine reproduces, byte-for-byte, the
 #      windows IR the Linux compiler emits for the whole stdlib (131 modules).
-#      Both target the MSVC triple - cryo.exe's native default - which lands
-#      the two builds in disjoint cache buckets (host-windows vs the explicit
-#      triple), so they coexist with no --build-dir juggling.
+#      Both target the GNU triple - cryo.exe's native default (its
+#      get_default_triple() coerces LLVM's msvc default to the mingw ABI the
+#      port links against).  The Linux side names it explicitly (its own
+#      `x86_64-pc-windows-gnu` bucket); the wine side gets it by default (the
+#      `host-windows` bucket).  Disjoint buckets, identical triples, so they
+#      coexist with no --build-dir juggling.
 #
 # Skipped (not failed) when the mingw toolchain, wine, llvm-link, or the
 # fetched .toolchains/llvm-win import lib are absent, so Linux-only checkouts
 # and CI without the Windows bits still pass.
 # ---------------------------------------------------------------------------
 WIN_TRIPLE      = "x86_64-pc-windows-gnu"
-WIN_MSVC_TRIPLE = "x86_64-pc-windows-msvc"
 WIN_LLVM_LIB    = ROOT / ".toolchains" / "llvm-win" / "lib" / "libLLVM-C.dll.a"
 WIN_LLVM_DLL    = ROOT / ".toolchains" / "llvm-win" / "bin" / "LLVM-C.dll"
 # clang.exe + llvm-ar.exe (same msvc tarball, fetched by fetch-windows-llvm.sh)
@@ -405,8 +407,64 @@ def _config_without_bin(text: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def run_win_phase(tag: str, title: str, fn) -> tuple:
+    """Run one Windows phase as a live-ticking, Linux-style status row.
+
+    `fn` does its work silently and returns `(status, detail, extra)` where
+    `status` is 'ok' | 'skip' | 'fail', `detail` is a short trailing note (an
+    IR md5, a version string, a failure reason), and `extra` is a list of
+    already-formatted lines to print under the row (log paths, diff snippets).
+    Mirrors `run_stage`: a 0.5 s ticker on a TTY, then the verdict + duration.
+    Returns `(status, elapsed, label)`."""
+    prefix = f"  {C.CYAN}[{tag}]{C.RESET} {title}  "
+    sys.stdout.write(prefix)
+    sys.stdout.flush()
+    is_tty = sys.stdout.isatty()
+    start = time.perf_counter()
+    stop = threading.Event()
+
+    def ticker():
+        while not stop.wait(0.5):
+            el = time.perf_counter() - start
+            sys.stdout.write(f"\r{prefix}{C.DIM}{fmt_dur(el)}{C.RESET}")
+            sys.stdout.flush()
+
+    t = threading.Thread(target=ticker, daemon=True) if is_tty else None
+    if t:
+        t.start()
+    try:
+        status, detail, extra = fn()
+    except Exception as e:                       # one phase must never abort the rest
+        status, detail, extra = "fail", f"exception: {e}", []
+    stop.set()
+    if t:
+        t.join(timeout=1.0)
+    el = time.perf_counter() - start
+
+    mark = {"ok":   f"{C.GREEN}✓{C.RESET}",
+            "skip": f"{C.YELLOW}↷ skipped{C.RESET}",
+            "fail": f"{C.RED}✗{C.RESET}"}.get(status, status)
+    line_start = f"\r{prefix}" if is_tty else ""
+    note = f"  {C.DIM}{detail}{C.RESET}" if detail else ""
+    sys.stdout.write(f"{line_start}{mark}  {C.DIM}{fmt_dur(el):>7s}{C.RESET}{note}{' ' * 4}\n")
+    sys.stdout.flush()
+    for ln in (extra or []):
+        print(ln)
+    return status, el, f"[{tag}] {title}"
+
+
 def run_windows_stage(total_start) -> str:
-    """Returns 'ok', 'skip', or 'fail'."""
+    """Cross-build verification, rendered as timed [wN] rows like the Linux
+    stages.  Every phase reports its own verdict (a failing phase no longer
+    aborts the rest); phases that need cryo.exe are skipped if [w1] fails.
+    Returns 'ok', 'skip', or 'fail'.
+
+    Triple note: cryo.exe's own default target is windows-GNU (its
+    `get_default_triple()` coerces LLVM's msvc default to the mingw ABI the
+    port links against).  So BOTH sides build for GNU here — the Linux side
+    explicitly (`--target`, landing in its own `x86_64-pc-windows-gnu`
+    bucket), the wine side by default (the `host-windows` bucket).  Disjoint
+    buckets, identical triples — the IR matches byte-for-byte."""
     print()
     print(f"{C.BOLD}==> Windows cross-build verification{C.RESET}")
     missing = _win_prereqs_missing()
@@ -425,143 +483,142 @@ def run_windows_stage(total_start) -> str:
     wine_env = {"WINEDEBUG": "-all",
                 "CRYO_STDLIB": "Z:" + str(stdlib_unix).replace("\\", "/")}
 
-    # 1. Cross-build cryo.exe via stage-3 (the first pure-source compiler).
-    sys.stdout.write(f"  {C.CYAN}[w1]{C.RESET} cross-build cryo.exe ({WIN_TRIPLE})  ")
-    sys.stdout.flush()
-    rc, _ = _run([str(STAGE3), "build", f"--target={WIN_TRIPLE}", "--no-incremental"],
-                 ROOT / "compiler", wlog / "01-cross-build.log")
-    if rc != 0 or not cryo_exe.exists():
-        print(f"{C.RED}✗ exit {rc}{C.RESET}")
-        print(f"     {C.DIM}log:{C.RESET} {(wlog / '01-cross-build.log').relative_to(ROOT)}")
-        return "fail"
-    shutil.copy2(WIN_LLVM_DLL, cryo_exe.parent / "LLVM-C.dll")
-    print(f"{C.GREEN}✓{C.RESET}")
+    results: list = []                           # (label, elapsed, status)
+    _skip_no_exe = lambda: ("skip", "no cryo.exe (w1 failed)", [])
 
-    # 2. Smoke-run under wine.
-    sys.stdout.write(f"  {C.CYAN}[w2]{C.RESET} wine cryo.exe --version  ")
-    sys.stdout.flush()
-    rc, out = _run(["wine", str(cryo_exe), "--version"], ROOT / "compiler",
-                   wlog / "02-version.log", env=wine_env, allow_fail=True)
-    if "cryo" not in out.lower():
-        print(f"{C.RED}✗ (no version output){C.RESET}")
-        print(f"     {C.DIM}log:{C.RESET} {(wlog / '02-version.log').relative_to(ROOT)}")
-        return "fail"
-    print(f"{C.GREEN}✓{C.RESET}  {C.DIM}{out.strip().splitlines()[0] if out.strip() else ''}{C.RESET}")
+    def _log(name):
+        return f"     {C.DIM}log:{C.RESET} {(wlog / name).relative_to(ROOT)}"
 
-    # 3. Cross-selfhost: Linux vs wine windows IR for the stdlib must match.
-    sys.stdout.write(f"  {C.CYAN}[w3]{C.RESET} stdlib cross-selfhost (linux == wine windows IR)  ")
-    sys.stdout.flush()
-    sl = ROOT / "stdlib"
-    bin_root = sl / ".bin" / "target" / "release"
-    # IR_linux: Linux stage-3 emits MSVC-target IR (link bails on the
-    # unsupported triple, but --emit-llvm writes the per-module .ll first).
-    _run([str(STAGE3), "build", f"--target={WIN_MSVC_TRIPLE}", "--emit-llvm",
-          "--no-incremental"], sl, wlog / "03-linux-stdlib.log", allow_fail=True)
-    ir_linux = wlog / "ir_linux.ll"
-    if not _llvm_link(bin_root / WIN_MSVC_TRIPLE, ir_linux):
-        print(f"{C.RED}✗ (no linux windows IR){C.RESET}")
-        return "fail"
-    # IR_wine: cryo.exe under wine compiles the stdlib for its native target
-    # (MSVC) into the host-windows bucket; link fails (no toolchain), IR is
-    # written first.
-    _run(["wine", str(cryo_exe), "build", "--emit-llvm", "--no-incremental"],
-         sl, wlog / "03-wine-stdlib.log", env=wine_env, allow_fail=True)
-    ir_wine = wlog / "ir_wine.ll"
-    if not _llvm_link(bin_root / "host-windows", ir_wine):
-        print(f"{C.RED}✗ (no wine windows IR){C.RESET}")
-        print(f"     {C.DIM}log:{C.RESET} {(wlog / '03-wine-stdlib.log').relative_to(ROOT)}")
-        return "fail"
-    a, b = ir_linux.read_bytes(), ir_wine.read_bytes()
-    if a != b:
-        print(f"{C.RED}✗ windows IR differs{C.RESET}")
-        diff = subprocess.run(["diff", "-u", str(ir_linux), str(ir_wine)],
-                              capture_output=True, text=True)
-        for line in diff.stdout.splitlines()[:30]:
-            print(f"     {C.DIM}│{C.RESET} {line}")
-        return "fail"
-    md5 = hashlib.md5(a).hexdigest()
-    print(f"{C.GREEN}✓{C.RESET}  {C.DIM}IR md5 {md5} ({len(a):,} B){C.RESET}")
+    # ---- [w1] cross-build cryo.exe via stage-3 (first pure-source compiler).
+    def phase_w1():
+        rc, _ = _run([str(STAGE3), "build", f"--target={WIN_TRIPLE}", "--no-incremental"],
+                     ROOT / "compiler", wlog / "01-cross-build.log")
+        if rc != 0 or not cryo_exe.exists():
+            return "fail", f"exit {rc}", [_log("01-cross-build.log")]
+        shutil.copy2(WIN_LLVM_DLL, cryo_exe.parent / "LLVM-C.dll")
+        return "ok", "", []
+    st, el, lab = run_win_phase("w1", f"cross-build cryo.exe ({WIN_TRIPLE})", phase_w1)
+    results.append((lab, el, st))
+    have_exe = st == "ok"
 
-    # 4. Compiler cross-selfhost (LIBRARY): cryo.exe under wine reproduces the
-    #    Linux compiler's windows IR for the compiler itself.  Unlike the
-    #    stdlib, the compiler imports `llvm_bindings.h` via a C-header import,
-    #    so cryo.exe under wine needs a C preprocessor (CRYO_CC -> the fetched
-    #    clang.exe) and an archiver it can launch (CRYO_AR -> llvm-ar.exe); the
-    #    host's clang-20 / ELF ar can't run under wine.  An identical
-    #    CRYO_STDLIB *string* on both sides keeps the embedded @FILE.str source
-    #    paths matching (wine resolves a /-rooted path against drive Z:).  Both
-    #    sides build the LIBRARY only (see _config_without_bin): comparing the
-    #    library is what proves the compiler reproduces, and it dodges the
-    #    [[bin]] unit's shared-module re-emission (and its slow wine codegen).
-    sys.stdout.write(f"  {C.CYAN}[w4]{C.RESET} compiler cross-selfhost (linux == wine windows lib IR)  ")
-    sys.stdout.flush()
-    if not (WIN_CLANG.exists() and WIN_AR.exists()):
-        print(f"{C.YELLOW}↷ skipped{C.RESET} "
-              f"{C.DIM}(clang.exe/llvm-ar.exe absent; rerun scripts/fetch-windows-llvm.sh){C.RESET}")
-        return "ok"
-    cdir = ROOT / "compiler"
-    stdlib_same = str(ROOT / "stdlib")          # identical spelling -> matching @FILE.str
-    win = lambda p: "Z:" + str(p).replace("/", "\\")
-    cfg_path = cdir / "cryoconfig"
-    cfg_orig = cfg_path.read_text()
-    lin_root = cdir / "build" / "w4-linux" / "target" / "release" / WIN_MSVC_TRIPLE
-    win_bdir = cdir / "build" / "w4-wine"
-    win_root = win_bdir / "target" / "release" / "host-windows"
-    try:
-        # Build the LIBRARY only (see _config_without_bin) so neither side is
-        # bin-contaminated and both emit identical, clean lib IR.
-        cfg_path.write_text(_config_without_bin(cfg_orig))
-        # IR_linux: stage-3 emits the lib's windows-msvc IR (link bails on the
-        # unsupported triple; .ll written first).  Isolated build-dir so it
-        # never clobbers compiler/build/cryo.exe.
-        shutil.rmtree(cdir / "build" / "w4-linux", ignore_errors=True)
-        _run([str(STAGE3), "build", f"--target={WIN_MSVC_TRIPLE}", "--emit-llvm",
-              "--no-incremental", "--build-dir=build/w4-linux"],
-             cdir, wlog / "04-linux-compiler.log",
-             env={"CRYO_STDLIB": stdlib_same}, allow_fail=True,
-             timeout=W4_BUILD_TIMEOUT)
-        # IR_wine: cryo.exe under wine, native (msvc) bucket, with the fetched
-        # clang.exe (CRYO_CC) + llvm-ar.exe (CRYO_AR).  A lib-only build
-        # completes on its own; the timeout is just a safety net.
-        shutil.rmtree(win_bdir, ignore_errors=True)
-        _run(["wine", str(cryo_exe), "build", "--emit-llvm", "--no-incremental",
-              "--build-dir=build/w4-wine"],
-             cdir, wlog / "04-wine-compiler.log",
-             env={"WINEDEBUG": "-all", "CRYO_STDLIB": stdlib_same,
-                  "CRYO_CC": win(WIN_CLANG), "CRYO_AR": win(WIN_AR)},
-             allow_fail=True, timeout=W4_BUILD_TIMEOUT)
-    finally:
-        cfg_path.write_text(cfg_orig)           # always restore cryoconfig
-    # The wine archive doubles as proof the CRYO_AR/llvm-ar.exe path works.
-    if not (win_bdir / "libcompiler.a").exists():
-        print(f"{C.RED}✗ (wine produced no libcompiler.a — CRYO_CC/CRYO_AR path){C.RESET}")
-        print(f"     {C.DIM}log:{C.RESET} {(wlog / '04-wine-compiler.log').relative_to(ROOT)}")
-        return "fail"
-    lin_names = {p.name for p in lin_root.glob("*/ir/*.ll")}
-    win_names = {p.name for p in win_root.glob("*/ir/*.ll")}
-    if lin_names != win_names or len(win_names) < 100:   # lib is ~155 modules
-        print(f"{C.RED}✗ (module sets differ: linux {len(lin_names)}, wine {len(win_names)}){C.RESET}")
-        print(f"     {C.DIM}log:{C.RESET} {(wlog / '04-wine-compiler.log').relative_to(ROOT)}")
-        return "fail"
-    names = sorted(win_names)
-    ir_lin_c = wlog / "ir_compiler_linux.ll"
-    ir_win_c = wlog / "ir_compiler_wine.ll"
-    if not (_llvm_link_named(lin_root, names, ir_lin_c)
-            and _llvm_link_named(win_root, names, ir_win_c)):
-        print(f"{C.RED}✗ (llvm-link of compiler IR failed){C.RESET}")
-        return "fail"
-    ca, cb = ir_lin_c.read_bytes(), ir_win_c.read_bytes()
-    if ca == cb:
+    # ---- [w2] smoke-run under wine.
+    def phase_w2():
+        rc, out = _run(["wine", str(cryo_exe), "--version"], ROOT / "compiler",
+                       wlog / "02-version.log", env=wine_env, allow_fail=True)
+        if "cryo" not in out.lower():
+            return "fail", "no version output", [_log("02-version.log")]
+        first = out.strip().splitlines()[0] if out.strip() else ""
+        return "ok", first, []
+    st, el, lab = run_win_phase("w2", "wine cryo.exe --version",
+                                phase_w2 if have_exe else _skip_no_exe)
+    results.append((lab, el, st))
+
+    # ---- [w3] stdlib cross-selfhost: linux GNU IR == wine GNU IR.
+    def phase_w3():
+        sl = ROOT / "stdlib"
+        bin_root = sl / ".bin" / "target" / "release"
+        # Linux stage-3 emits the stdlib's windows-GNU IR into its own
+        # `x86_64-pc-windows-gnu` bucket (link bails on the cross triple, but
+        # --emit-llvm writes the per-module .ll first).
+        _run([str(STAGE3), "build", f"--target={WIN_TRIPLE}", "--emit-llvm",
+              "--no-incremental"], sl, wlog / "03-linux-stdlib.log", allow_fail=True)
+        ir_linux = wlog / "ir_linux.ll"
+        if not _llvm_link(bin_root / WIN_TRIPLE, ir_linux):
+            return "fail", "no linux windows IR", [_log("03-linux-stdlib.log")]
+        # cryo.exe under wine compiles the stdlib for its default (GNU) target
+        # into the host-windows bucket; link fails (no toolchain), IR first.
+        _run(["wine", str(cryo_exe), "build", "--emit-llvm", "--no-incremental"],
+             sl, wlog / "03-wine-stdlib.log", env=wine_env, allow_fail=True)
+        ir_wine = wlog / "ir_wine.ll"
+        if not _llvm_link(bin_root / "host-windows", ir_wine):
+            return "fail", "no wine windows IR", [_log("03-wine-stdlib.log")]
+        a, b = ir_linux.read_bytes(), ir_wine.read_bytes()
+        if a != b:
+            diff = subprocess.run(["diff", "-u", str(ir_linux), str(ir_wine)],
+                                  capture_output=True, text=True)
+            extra = [f"     {C.DIM}│{C.RESET} {ln}" for ln in diff.stdout.splitlines()[:30]]
+            return "fail", "windows IR differs", extra
+        md5 = hashlib.md5(a).hexdigest()
+        return "ok", f"IR md5 {md5} ({len(a):,} B)", []
+    st, el, lab = run_win_phase("w3", "stdlib cross-selfhost (linux == wine windows IR)",
+                                phase_w3 if have_exe else _skip_no_exe)
+    results.append((lab, el, st))
+
+    # ---- [w4] compiler-LIBRARY cross-selfhost (needs clang.exe + llvm-ar.exe).
+    def phase_w4():
+        if not (WIN_CLANG.exists() and WIN_AR.exists()):
+            return ("skip",
+                    "clang.exe/llvm-ar.exe absent (rerun scripts/fetch-windows-llvm.sh)", [])
+        cdir = ROOT / "compiler"
+        stdlib_same = str(ROOT / "stdlib")          # identical spelling -> matching @FILE.str
+        win = lambda p: "Z:" + str(p).replace("/", "\\")
+        cfg_path = cdir / "cryoconfig"
+        cfg_orig = cfg_path.read_text()
+        lin_root = cdir / "build" / "w4-linux" / "target" / "release" / WIN_TRIPLE
+        win_bdir = cdir / "build" / "w4-wine"
+        win_root = win_bdir / "target" / "release" / "host-windows"
+        try:
+            # Library only (see _config_without_bin) so neither side is
+            # bin-contaminated and both emit identical, clean lib IR.
+            cfg_path.write_text(_config_without_bin(cfg_orig))
+            shutil.rmtree(cdir / "build" / "w4-linux", ignore_errors=True)
+            _run([str(STAGE3), "build", f"--target={WIN_TRIPLE}", "--emit-llvm",
+                  "--no-incremental", "--build-dir=build/w4-linux"],
+                 cdir, wlog / "04-linux-compiler.log",
+                 env={"CRYO_STDLIB": stdlib_same}, allow_fail=True,
+                 timeout=W4_BUILD_TIMEOUT)
+            shutil.rmtree(win_bdir, ignore_errors=True)
+            _run(["wine", str(cryo_exe), "build", "--emit-llvm", "--no-incremental",
+                  "--build-dir=build/w4-wine"],
+                 cdir, wlog / "04-wine-compiler.log",
+                 env={"WINEDEBUG": "-all", "CRYO_STDLIB": stdlib_same,
+                      "CRYO_CC": win(WIN_CLANG), "CRYO_AR": win(WIN_AR)},
+                 allow_fail=True, timeout=W4_BUILD_TIMEOUT)
+        finally:
+            cfg_path.write_text(cfg_orig)           # always restore cryoconfig
+        # The wine archive doubles as proof the CRYO_AR/llvm-ar.exe path works.
+        if not (win_bdir / "libcompiler.a").exists():
+            return ("fail", "wine produced no libcompiler.a (CRYO_CC/CRYO_AR path)",
+                    [_log("04-wine-compiler.log")])
+        lin_names = {p.name for p in lin_root.glob("*/ir/*.ll")}
+        win_names = {p.name for p in win_root.glob("*/ir/*.ll")}
+        if lin_names != win_names or len(win_names) < 100:   # lib is ~155 modules
+            return ("fail", f"module sets differ: linux {len(lin_names)}, wine {len(win_names)}",
+                    [_log("04-wine-compiler.log")])
+        names = sorted(win_names)
+        ir_lin_c = wlog / "ir_compiler_linux.ll"
+        ir_win_c = wlog / "ir_compiler_wine.ll"
+        if not (_llvm_link_named(lin_root, names, ir_lin_c)
+                and _llvm_link_named(win_root, names, ir_win_c)):
+            return "fail", "llvm-link of compiler IR failed", []
+        ca, cb = ir_lin_c.read_bytes(), ir_win_c.read_bytes()
+        if ca != cb:
+            diff = subprocess.run(["diff", "-u", str(ir_lin_c), str(ir_win_c)],
+                                  capture_output=True, text=True)
+            extra = [f"     {C.DIM}│{C.RESET} {ln}" for ln in diff.stdout.splitlines()[:30]]
+            return "fail", "compiler windows IR differs", extra
         cmd5 = hashlib.md5(ca).hexdigest()
-        print(f"{C.GREEN}✓{C.RESET}  "
-              f"{C.DIM}{len(names)} lib modules, IR md5 {cmd5} ({len(ca):,} B){C.RESET}")
-        return "ok"
-    print(f"{C.RED}✗ compiler windows IR differs{C.RESET}")
-    diff = subprocess.run(["diff", "-u", str(ir_lin_c), str(ir_win_c)],
-                          capture_output=True, text=True)
-    for line in diff.stdout.splitlines()[:30]:
-        print(f"     {C.DIM}│{C.RESET} {line}")
-    return "fail"
+        return "ok", f"{len(names)} lib modules, IR md5 {cmd5} ({len(ca):,} B)", []
+    st, el, lab = run_win_phase("w4", "compiler cross-selfhost (linux == wine windows lib IR)",
+                                phase_w4 if have_exe else _skip_no_exe)
+    results.append((lab, el, st))
+
+    # ---- Windows phase summary (mirrors the Linux Stage-timings panel). -----
+    print()
+    print(f"{C.BOLD}Windows phase timings{C.RESET}")
+    print(f"  {C.DIM}{hr(72)}{C.RESET}")
+    for lab, el, stt in results:
+        m = {"ok": f"{C.GREEN}✓{C.RESET}", "skip": f"{C.YELLOW}↷{C.RESET}",
+             "fail": f"{C.RED}✗{C.RESET}"}.get(stt, "?")
+        pad = max(0, 56 - len(lab))
+        print(f"  {m}  {lab}{' ' * pad}{C.DIM}{fmt_dur(el):>10s}{C.RESET}")
+    print(f"  {C.DIM}{hr(72)}{C.RESET}")
+
+    if any(s == "fail" for _, _, s in results):
+        return "fail"
+    if all(s == "skip" for _, _, s in results):
+        return "skip"
+    return "ok"
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 namespace Compiler::Codegen::LLVMTypes;
 
 import Compiler::Codegen;
+import Utils::File;
 import std::fmt;
 
 
@@ -1028,19 +1029,28 @@ function create_target_machine_with_opt(triple: string, opt_level: i32) -> LTarg
 /// On Linux/macOS this is whatever `LLVMGetDefaultTargetTriple` reports
 /// (the triple the linked libLLVM was built for).
 ///
-/// On Windows the answer needs a small twist.  The Windows `LLVM-C.dll`
-/// the compiler links against is from the official `clang+llvm-*-x86_64-
-/// pc-windows-msvc` release (see `scripts/fetch-windows-llvm.sh`), so
-/// `LLVMGetDefaultTargetTriple` returns `x86_64-pc-windows-msvc`.  But
-/// our linker driver is mingw (`cc` → MSYS2 gcc), and code emitted for
-/// the MSVC ABI cannot be linked by mingw — the most visible mismatch is
-/// the stack-probe symbol: MSVC emits `__chkstk` while mingw provides
-/// `___chkstk_ms`, so a default `cryo build` fails with `undefined
-/// reference to __chkstk`.  Coerce `windows-msvc` → `x86_64-pc-windows-
-/// gnu` here so the rest of the pipeline (LLVM codegen, the linker
-/// config's host-detection compare, the target machine fallback) all
-/// agree on the gnu spelling.  Users targeting native MSVC would set
-/// `--target=` explicitly, which bypasses this coercion.
+/// On Windows the answer depends on which toolchain is installed.  The
+/// Windows `LLVM-C.dll` the compiler links against is from the official
+/// `clang+llvm-*-x86_64-pc-windows-msvc` release (see
+/// `scripts/fetch-windows-llvm.sh`), so `LLVMGetDefaultTargetTriple`
+/// reports `x86_64-pc-windows-msvc`.  But code emitted for the MSVC ABI
+/// cannot be linked by mingw — the most visible mismatch is the stack-probe
+/// symbol: MSVC emits `__chkstk` while mingw provides `___chkstk_ms`, so a
+/// mingw `cryo build` of MSVC-ABI code fails with `undefined reference to
+/// __chkstk`.  So when LLVM reports msvc we pick the ABI from the linker
+/// that is actually on `PATH`, rather than assuming one:
+///   - an mingw `gcc` present → `x86_64-pc-windows-gnu` (the only link path
+///     the port supports today; preferred when both are installed);
+///   - else an MSVC linker (`lld-link`/`link.exe`) present → keep the
+///     `windows-msvc` triple, so codegen emits MSVC-ABI objects for the
+///     user's own toolchain to link;
+///   - else → `x86_64-pc-windows-gnu` (mingw is the default we ship for).
+/// The probe runs once per process and is cached.  An explicit `--target=`
+/// bypasses all of this (see `resolve_effective_triple`).
+/// Cached result of the windows default-triple toolchain probe ("" until
+/// computed).  Only the windows `get_default_triple` reads or writes it.
+mut g_win_default_triple: string = "";
+
 ![target(unix)]
 function get_default_triple() -> string {
     return llvm::LLVMGetDefaultTargetTriple() as string;
@@ -1048,11 +1058,57 @@ function get_default_triple() -> string {
 
 ![target(windows)]
 function get_default_triple() -> string {
+    if (intrinsics::strlen(g_win_default_triple) > 0) {
+        return g_win_default_triple;
+    }
     const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
-    if (raw != null && raw.contains("windows-msvc")) {
+    g_win_default_triple = pick_windows_default_triple(raw);
+    return g_win_default_triple;
+}
+
+/// Choose the windows ABI from the linker that is actually installed (see
+/// `get_default_triple`).  A non-msvc LLVM default is returned unchanged.
+![target(windows)]
+function pick_windows_default_triple(raw: string) -> string {
+    // Never return null: the result is cached and re-measured via strlen.
+    if (raw == null) { return "x86_64-pc-windows-gnu"; }
+    if (!raw.contains("windows-msvc")) { return raw; }
+    // Prefer mingw (the only link path the port supports) when present.
+    if (exe_on_path("x86_64-w64-mingw32-gcc.exe")) {
         return "x86_64-pc-windows-gnu";
     }
-    return raw;
+    // Otherwise honour an installed MSVC linker so codegen emits MSVC-ABI
+    // objects (the user links them with their own toolchain).
+    if (exe_on_path("lld-link.exe") || exe_on_path("link.exe")) {
+        return raw;
+    }
+    return "x86_64-pc-windows-gnu";
+}
+
+/// True when `exe` exists in one of the `;`-separated entries of `%PATH%`.
+![target(windows)]
+function exe_on_path(exe: string) -> boolean {
+    const path_raw: i8* = intrinsics::getenv("PATH") as i8*;
+    if (path_raw == null) { return false; }
+    const path: string = path_raw as string;
+    const len: i64 = intrinsics::strlen(path) as i64;
+    mut start: i64 = 0;
+    for (mut i: i64 = 0; i <= len; i++) {
+        if (i == len || path[i] == 59) {            // 59 = ';'
+            const dlen: i64 = i - start;
+            if (dlen > 0) {
+                const dir: string = path.substr(start, dlen);
+                mut candidate: string = dir;
+                if (dir[dlen - 1] != 92) {           // 92 = '\'
+                    candidate += "\\";
+                }
+                candidate += exe;
+                if (File::exists(candidate)) { return true; }
+            }
+            start = i + 1;
+        }
+    }
+    return false;
 }
 
 /// Resolve the effective triple for codegen: returns `requested` when it
