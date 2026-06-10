@@ -29,9 +29,9 @@ namespace Cryo
     {
         std::string name;
         TypeRef type;
-        size_t offset;           // Byte offset within the struct
-        bool is_public = true;   // Visibility
-        bool is_mutable = true;  // Can be modified (const fields are immutable)
+        size_t offset;          // Byte offset within the struct
+        bool is_public = true;  // Visibility
+        bool is_mutable = true; // Can be modified (const fields are immutable)
 
         FieldInfo(std::string n, TypeRef t, size_t off = 0, bool pub = true, bool mut = true)
             : name(std::move(n)), type(t), offset(off), is_public(pub), is_mutable(mut) {}
@@ -44,7 +44,7 @@ namespace Cryo
     {
         std::string name;
         std::string overload_suffix; // For overloaded methods: "(ParamType*)" etc.
-        TypeRef function_type;   // FunctionType
+        TypeRef function_type;       // FunctionType
         bool is_public = true;
         bool is_static = false;
         bool is_virtual = false; // For class inheritance
@@ -54,7 +54,7 @@ namespace Cryo
             : name(std::move(n)), function_type(ft), is_public(pub), is_static(stat) {}
 
         /// Unique key for vtable matching: name + overload_suffix.
-        /// Two methods match in the vtable iff their keys are equal.
+        /// Two methods match in the vtable if their keys are equal.
         std::string vtable_key() const { return overload_suffix.empty() ? name : name + overload_suffix; }
     };
 
@@ -73,7 +73,7 @@ namespace Cryo
         QualifiedTypeName _qualified_name;
         std::vector<FieldInfo> _fields;
         std::vector<MethodInfo> _methods;
-        bool _is_complete = false;  // True once fields have been set
+        bool _is_complete = false; // True once fields have been set
         size_t _computed_size = 0;
         size_t _computed_alignment = 1;
 
@@ -165,7 +165,7 @@ namespace Cryo
     {
     private:
         QualifiedTypeName _qualified_name;
-        TypeRef _base_class;    // Optional base class (invalid if no inheritance)
+        TypeRef _base_class; // Optional base class (invalid if no inheritance)
         std::vector<FieldInfo> _fields;
         std::vector<MethodInfo> _methods;
         bool _is_complete = false;
@@ -220,7 +220,11 @@ namespace Cryo
         // Build the ordered vtable method list (base class methods first, overrides replace).
         // Result is cached; invalidated when methods change.
         std::vector<MethodInfo> build_vtable() const;
-        void invalidate_vtable_cache() const { _vtable_cached = false; _cached_vtable.clear(); }
+        void invalidate_vtable_cache() const
+        {
+            _vtable_cached = false;
+            _cached_vtable.clear();
+        }
         // Get the vtable index for a given method name + overload suffix, or -1 if not found
         int vtable_index(const std::string &method_name,
                          const std::string &overload_suffix = "") const;
@@ -245,7 +249,7 @@ namespace Cryo
     struct EnumVariant
     {
         std::string name;
-        std::vector<TypeRef> payload_types;  // Empty for unit variants
+        std::vector<TypeRef> payload_types; // Empty for unit variants
         size_t tag_value;
 
         EnumVariant(std::string n, std::vector<TypeRef> payload = {}, size_t tag = 0)
@@ -336,7 +340,7 @@ namespace Cryo
 
     private:
         void compute_layout();
-        size_t tag_size() const;  // Size needed for discriminant
+        size_t tag_size() const; // Size needed for discriminant
     };
 
     /**************************************************************************
@@ -350,7 +354,7 @@ namespace Cryo
     private:
         QualifiedTypeName _qualified_name;
         std::vector<MethodInfo> _required_methods;
-        std::vector<TypeRef> _super_traits;  // Traits this trait extends
+        std::vector<TypeRef> _super_traits; // Traits this trait extends
 
     public:
         TraitType(TypeID id, QualifiedTypeName name)

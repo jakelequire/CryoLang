@@ -143,7 +143,7 @@ DEST_STDLIB="${DEST_SHARE}/stdlib"
 # Helpers
 # ----------------------------------------------------------------------------
 need_sudo_for() {
-    # Returns 0 (true) iff the install prefix isn't writable by the current
+    # Returns 0 (true) if the install prefix isn't writable by the current
     # user - in which case we'll prefix mutating commands with sudo.
     local target_dir
     target_dir="$(dirname "$1")"
