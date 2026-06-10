@@ -32,6 +32,58 @@ type struct NegSuiteResult {
     failures: i32;
 }
 
+// Host-shell-aware binary launch
+//
+// `cryo run` / `cryo test` execute the freshly-built binary through libc
+// `system(3)`, which runs `sh -c` on a POSIX-hosted compiler and `cmd /c`
+// on a native Windows one.  Two things differ by host and so are gated on
+// the COMPILER's OWN target (ConfigGating strips one side at build time),
+// mirroring the link/hoist helpers in `Compiler::Codegen` (`passes.cryo`):
+//
+//   * Path form: a built binary path like `build/app.exe` carries forward
+//     slashes.  `cmd` will not execute a forward-slash relative path - it
+//     parses the leading `/`-bearing token as a switch and reports
+//     `'build' is not recognized` - so the leading binary path must be
+//     rewritten to backslashes.  `sh` runs the path as-is.
+//   * Exit status: POSIX `system` returns a wait-status whose exit code
+//     lives in bits 8-15 (`(s >> 8) & 0xff`); Windows msvcrt `system`
+//     returns the child's exit code directly.  Decoding the Windows value
+//     with the POSIX shift turns every small exit code into 0.
+
+/// Rewrite a path's `/` to `\` so a `cmd`-executed command resolves it.
+/// Windows-host only; never referenced on the POSIX side.
+![target(windows)]
+function exec_path(path: string) -> string {
+    const len: u64 = strlen(path);
+    const buf: i8* = malloc(len + 1) as i8*;
+    const pb: i8* = path as i8*;
+    for (mut i: u64 = 0; i < len; i++) {
+        const ch: i8 = pb[i];
+        if (ch == '/') { buf[i] = '\\' as i8; } else { buf[i] = ch; }
+    }
+    buf[len] = 0;
+    return buf as string;
+}
+
+/// POSIX shells execute forward-slash paths fine; pass through unchanged.
+![target(unix)]
+function exec_path(path: string) -> string {
+    return path;
+}
+
+/// Decode a libc `system(3)` return value into a process exit code.
+/// Windows: msvcrt returns the child exit code directly.
+![target(windows)]
+function exit_code_of(status: i32) -> int {
+    return (status & 0xff) as int;
+}
+
+/// POSIX: the exit code lives in bits 8-15 of the wait-status.
+![target(unix)]
+function exit_code_of(status: i32) -> int {
+    return ((status >> 8) & 0xff) as int;
+}
+
 type enum CommandKind {
     Help;
     Version;
@@ -958,12 +1010,12 @@ type struct Executor {
         // bits 8-15 hold the exit code on a normal exit.  Surface the
         // exit code so the caller's $? matches what the inner binary
         // returned.
-        const status: i32 = system(result.output_path);
+        const status: i32 = system(exec_path(result.output_path));
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
         }
-        return ((status >> 8) & 0xff) as int;
+        return exit_code_of(status);
     }
 
     /// `cryo test [pattern] [flags]`: build the project's tests and
@@ -1018,8 +1070,10 @@ type struct Executor {
         }
 
         // Build the command for the produced test binary, forwarding the
-        // pattern (first positional) and the runner-side flags.
-        mut cmd: string = result.output_path;
+        // pattern (first positional) and the runner-side flags.  The leading
+        // binary path is host-normalized (`/`->`\` on Windows) so `cmd` can
+        // execute it; the appended flags carry no path separators.
+        mut cmd: string = exec_path(result.output_path);
         if (args.positional_count() > 0) {
             cmd = format("%s %s", cmd, args.input_file());
         }
@@ -1087,7 +1141,7 @@ type struct Executor {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
         }
-        mut exit_code: int = ((status >> 8) & 0xff) as int;
+        mut exit_code: int = exit_code_of(status);
         const unit_ok: boolean = exit_code == 0;
 
         // Compile-fail suite: run each tests/negative/*.cryo file through

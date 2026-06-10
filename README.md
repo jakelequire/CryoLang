@@ -520,7 +520,7 @@ for the full 1.0 release notes.
 - TLS, UDP, HTTP/2, and WebSocket for `net::http`.
 - Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, `metadata`, …).
 - `time` (`Instant`, `Duration`, `sleep`) and `random` modules.
-- Cross-compilation; Windows / macOS targets.
+- macOS / Darwin targets. x86_64 Linux and x86_64 Windows (native builds plus Linux→Windows cross via mingw-w64) both ship in 1.0.
 
 A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax).
 

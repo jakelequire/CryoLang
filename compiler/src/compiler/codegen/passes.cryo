@@ -1078,10 +1078,34 @@ type struct CodegenPasses {
         // every interpolated path must be shell-quoted; without it, a
         // working directory with a space breaks the link, and a path
         // containing shell metacharacters is a command-injection hazard.
-        mut cmd: string = format("%s -o %s", link_cfg.driver, link_quote(exe_path));
-        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, link_quote(ctx.artifacts.object_files[i]));
+        //
+        // The object list goes in an @response-file rather than inline on
+        // the command line, for the SAME reason `bundle_archive` does it:
+        // a real project (the self-hosted compiler itself is ~520 objects)
+        // blows straight past `cmd /c`'s ~8191-char command-line cap on a
+        // native Windows host, where `system(3)` routes through cmd — the
+        // historic "The command line is too long." native self-host link
+        // failure.  gcc / clang / cc all accept `@file` with one
+        // whitespace- or newline-separated, optionally double-quoted entry
+        // per object; the `@"%s"` spelling (literal double quotes, not
+        // `shell_quote`'s single quotes) matches the archiver precedent so
+        // it parses identically under `sh -c` and `cmd /c`.  Same objects,
+        // same order, same libs => a byte-identical executable on every
+        // host, so selfhost byte-identity is unaffected.
+        const link_rsp_path: string = format("%s.rsp", exe_path);
+        const link_rf: void* = intrinsics::fopen(link_rsp_path, "w");
+        if (link_rf == null) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("could not open linker response file for writing: %s", link_rsp_path));
+            return PassResult::failure(1);
         }
+        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
+            intrinsics::fprintf(link_rf, "\"%s\"\n", ctx.artifacts.object_files[i]);
+        }
+        intrinsics::fclose(link_rf);
+
+        mut cmd: string = format("%s -o %s @\"%s\"",
+            link_cfg.driver, link_quote(exe_path), link_rsp_path);
         // Project-configured linking ([link] in cryoconfig).  -L and -l are
         // single-token args with the value glued to the flag, so the
         // quoting goes around the value only.  `search` -> -L (extra dirs for
