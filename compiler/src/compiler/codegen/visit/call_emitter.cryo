@@ -1024,6 +1024,18 @@ type struct CallEmitter {
                 obj = this.dispatch.codegen_rvalue(visitor,ma.object);
             } else {
                 obj = this.dispatch.codegen_lvalue(visitor,ma.object);
+                // A value-typed receiver that is an rvalue - a literal
+                // (`"x".method()`), a call result, or a method-chain result
+                // (`a.f().g()`) - has no backing storage, so `codegen_lvalue`
+                // hands back the VALUE rather than an address.  Using that as
+                // `&this` is one indirection short and crashes the callee.
+                // Spill it to a fresh slot so `this` points at real memory.
+                if (obj.is_valid() && !this.state.last_is_lvalue) {
+                    const recv_ty: LType = LType { raw: llvm::LLVMTypeOf(obj.raw) };
+                    const recv_slot: LValue = this.cg.builder.build_alloca(recv_ty, "recvtmp");
+                    this.cg.builder.build_store(obj, recv_slot);
+                    obj = recv_slot;
+                }
             }
             args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
         }
