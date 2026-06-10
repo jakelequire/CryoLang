@@ -471,11 +471,7 @@ implement f64 {
 implement string {
     length(&this) -> u32 {
         if (this == null) { return 0; }
-        mut len: u32 = 0;
-        while (this[len] != 0) {
-            len = len + 1;
-        }
-        return len;
+        return strlen(this) as u32;
     }
 
     is_empty(&this) -> boolean {
@@ -496,11 +492,28 @@ implement string {
         if ((buf as void*) == null) {
             intrinsics::panic("string::substring: allocation failed", FILE, LINE);
         }
-        mut i: u32 = 0;
-        while (i < take) {
-            buf[i] = this[start + i];
-            i = i + 1;
+        memcpy(buf as void*, ptr_add(this as void*, start as i64) as void*, take as u64);
+        buf[take] = 0;
+        return buf;
+    }
+
+    /// Signed-offset slice: like `substring` but robust to the computed
+    /// ranges cstring-style code produces.  A non-positive `len` (or an
+    /// out-of-range `start`) yields ""; an over-long `len` is clamped to the
+    /// remaining bytes, so callers never need to bounds-check first.  Walks
+    /// the string once (one `strlen`) so it stays cheap in tokenizer-style
+    /// hot loops.
+    substr(&this, start: i64, len: i64) -> string {
+        if (len <= 0 || start < 0) { return ""; }
+        const total: i64 = strlen(this) as i64;
+        if (start >= total) { return ""; }
+        mut take: i64 = len;
+        if (start + take > total) { take = total - start; }
+        mut buf: string = malloc((take + 1) as u64) as string;
+        if ((buf as void*) == null) {
+            intrinsics::panic("string::substr: allocation failed", FILE, LINE);
         }
+        memcpy(buf as void*, ptr_add(this as void*, start) as void*, take as u64);
         buf[take] = 0;
         return buf;
     }
@@ -520,4 +533,93 @@ implement string {
         buf[len1 + len2] = 0;
         return buf;
     }
+
+    /// Trim leading and trailing ASCII whitespace (space, tab, LF, CR),
+    /// returning a freshly allocated string ("" when all whitespace).
+    trim(&this) -> string {
+        const len: i64 = this.length() as i64;
+        if (len == 0) { return ""; }
+        mut start: i64 = 0;
+        while (start < len && string_is_ascii_ws(this[start])) { start += 1; }
+        mut end: i64 = len - 1;
+        while (end >= start && string_is_ascii_ws(this[end])) { end -= 1; }
+        if (start > end) { return ""; }
+        return this.substr(start, end - start + 1);
+    }
+
+    /// If `this` begins with `prefix`, return the remainder as a fresh
+    /// string; otherwise return `this` unchanged (same buffer).
+    strip_prefix(&this, prefix: string) -> string {
+        const plen: u64 = strlen(prefix);
+        const slen: u64 = strlen(this);
+        if (slen < plen) { return this; }
+        if (strncmp(this, prefix, plen) == 0) {
+            return this.substr(plen as i64, (slen - plen) as i64);
+        }
+        return this;
+    }
+
+    /// Byte index of the first occurrence of `ch`, or -1 if absent.
+    find_char(&this, ch: i8) -> i64 {
+        const len: i64 = this.length() as i64;
+        for (mut i: i64 = 0; i < len; i++) {
+            if (this[i] == ch) { return i; }
+        }
+        return -1;
+    }
+
+    /// Byte index of the last occurrence of `ch`, or -1 if absent.
+    rfind_char(&this, ch: i8) -> i64 {
+        mut i: i64 = this.length() as i64 - 1;
+        while (i >= 0) {
+            if (this[i] == ch) { return i; }
+            i -= 1;
+        }
+        return -1;
+    }
+
+    /// Parse the leading run of ASCII decimal digits as an `i64` (stops at
+    /// the first non-digit; no sign handling).  Non-numeric input yields 0.
+    /// For strict, error-returning parsing use `i64::try_from(Str)`.
+    parse_int(&this) -> i64 {
+        const len: i64 = this.length() as i64;
+        mut acc: i64 = 0;
+        for (mut i: i64 = 0; i < len; i++) {
+            if (this[i] >= 48 && this[i] <= 57) {     // '0'..'9'
+                acc = acc * 10 + (this[i] - 48) as i64;
+            } else {
+                break;
+            }
+        }
+        return acc;
+    }
+
+    /// Strip one pair of surrounding ASCII double quotes if both are
+    /// present; otherwise return `this` unchanged (same buffer).
+    strip_quotes(&this) -> string {
+        const len: i64 = this.length() as i64;
+        if (len >= 2 && this[0] == 34 && this[len - 1] == 34) {   // 34 = '"'
+            return this.substr(1, len - 2);
+        }
+        return this;
+    }
+
+    /// The directory portion of a path: everything before the last `/` or
+    /// `\` separator, or "." when there is no leading directory component.
+    parent_dir(&this) -> string {
+        const len: i64 = this.length() as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i < len; i++) {
+            if (this[i] == 47 || this[i] == 92) {     // '/' or '\'
+                last_sep = i;
+            }
+        }
+        if (last_sep <= 0) { return "."; }
+        return this.substr(0, last_sep);
+    }
+}
+
+/// ASCII whitespace test used by `string::trim`.
+private function string_is_ascii_ws(b: i8) -> boolean {
+    return b == 32 || b == 9 || b == 10 || b == 13;
 }

@@ -428,7 +428,7 @@ type struct ProjectConfig {
         const content: string = file.content();
 
         // Extract project root from the config file path
-        const project_root: string = extract_directory(path);
+        const project_root: string = path.parent_dir();
 
         mut config: ProjectConfig = ProjectConfig::default();
         config.project_root = project_root;
@@ -452,11 +452,11 @@ type struct ProjectConfig {
             while (pos < len && content[pos] != 10) {  // 10 = '\n'
                 pos += 1;
             }
-            const line: string = substr(content, line_start, pos - line_start);
+            const line: string = content.substr(line_start, pos - line_start);
             if (pos < len) { pos += 1; }  // skip '\n'
 
             // Skip empty lines and comments
-            const trimmed: string = trim_whitespace(line);
+            const trimmed: string = line.trim();
             if (intrinsics::strlen(trimmed) == 0) { continue; }
             if (trimmed[0] == 35) { continue; }  // 35 = '#'
 
@@ -469,7 +469,7 @@ type struct ProjectConfig {
                     && trimmed[t_len - 2] == 93;           // ']]'
                 if (is_array) {
                     // [[bin]] -> current_section = "bin", push fresh BinTarget.
-                    current_section = substr(trimmed, 2, t_len - 4);
+                    current_section = trimmed.substr(2, t_len - 4);
                     if (intrinsics::strcmp(current_section, "bin") == 0) {
                         config.bins.push(BinTarget::empty());
                         current_bin_idx = config.bins.length as i64 - 1;
@@ -479,7 +479,7 @@ type struct ProjectConfig {
                 } else {
                     const close: i64 = find_char(trimmed, 93);  // 93 = ']'
                     if (close > 1) {
-                        current_section = substr(trimmed, 1, close - 1);
+                        current_section = trimmed.substr(1, close - 1);
                     }
                     current_bin_idx = -1;
                 }
@@ -490,9 +490,11 @@ type struct ProjectConfig {
             const eq_pos: i64 = find_char(trimmed, 61);  // 61 = '='
             if (eq_pos < 0) { continue; }
 
-            const key: string   = trim_whitespace(substr(trimmed, 0, eq_pos));
-            const raw_val: string = trim_whitespace(substr(trimmed, eq_pos + 1, intrinsics::strlen(trimmed) as i64 - eq_pos - 1));
-            const val: string   = strip_quotes(raw_val);
+            const key_slice: string = trimmed.substr(0, eq_pos);
+            const key: string   = key_slice.trim();
+            const val_slice: string = trimmed.substr(eq_pos + 1, intrinsics::strlen(trimmed) as i64 - eq_pos - 1);
+            const raw_val: string = val_slice.trim();
+            const val: string   = raw_val.strip_quotes();
 
             // Apply to config based on section + key
             match (current_section) {
@@ -815,7 +817,7 @@ function find_cryoconfig(start_dir: string) -> string {
     }
 
     // Walk upward by stripping the last path component
-    const parent: string = extract_directory(start_dir);
+    const parent: string = start_dir.parent_dir();
     if (intrinsics::strlen(parent) == 0 || intrinsics::strcmp(parent, start_dir) == 0) {
         return "";  // reached root, not found
     }
@@ -824,47 +826,6 @@ function find_cryoconfig(start_dir: string) -> string {
 
 
 // String Helpers (internal)
-
-/// Extract directory from a path (everything before last '/').
-function extract_directory(path: string) -> string {
-    const len: i64 = intrinsics::strlen(path) as i64;
-    mut last_sep: i64 = -1;
-    for (mut i: i64 = 0; i < len; i++) {
-        if (path[i] == 47 || path[i] == 92) {  // '/' or '\'
-            last_sep = i;
-        }
-    }
-    if (last_sep <= 0) { return "."; }
-    return substr(path, 0, last_sep);
-}
-
-/// Trim leading and trailing whitespace (spaces and tabs).
-function trim_whitespace(s: string) -> string {
-    const len: i64 = intrinsics::strlen(s) as i64;
-    if (len == 0) { return s; }
-
-    mut start: i64 = 0;
-    while (start < len && (s[start] == 32 || s[start] == 9 || s[start] == 13)) {
-        start += 1;  // 32=space, 9=tab, 13=CR
-    }
-
-    mut end: i64 = len - 1;
-    while (end >= start && (s[end] == 32 || s[end] == 9 || s[end] == 13)) {
-        end -= 1;
-    }
-
-    if (start > end) { return ""; }
-    return substr(s, start, end - start + 1);
-}
-
-/// Strip surrounding double quotes from a string value.
-function strip_quotes(s: string) -> string {
-    const len: i64 = intrinsics::strlen(s) as i64;
-    if (len >= 2 && s[0] == 34 && s[len - 1] == 34) {  // 34 = '"'
-        return substr(s, 1, len - 2);
-    }
-    return s;
-}
 
 /// Parse a boolean value from a string.
 function parse_bool(s: string) -> boolean {
@@ -914,7 +875,7 @@ function parse_string_array(raw: string) -> string[] {
             const start: i64 = i;
             while (i < len && raw[i] != quote) { i += 1; }
             if (i > start) {
-                result.push(substr(raw, start, i - start));
+                result.push(raw.substr(start, i - start));
             }
             if (i < len) { i += 1; }  // skip closing quote
             continue;
@@ -928,7 +889,7 @@ function parse_string_array(raw: string) -> string[] {
             end -= 1;
         }
         if (end > t_start) {
-            result.push(substr(raw, t_start, end - t_start));
+            result.push(raw.substr(t_start, end - t_start));
         }
     }
     return result;
@@ -997,7 +958,7 @@ function parse_inline_table_into_dep(raw: string, dep: Dependency*) -> i64 {
         while (i < len && raw[i] != '=' && raw[i] != ' ' && raw[i] != '\t') {
             i += 1;
         }
-        const key: string = substr(raw, k_start, i - k_start);
+        const key: string = raw.substr(k_start, i - k_start);
 
         // Skip to '='.
         while (i < len && raw[i] != '=') { i += 1; }
@@ -1015,7 +976,7 @@ function parse_inline_table_into_dep(raw: string, dep: Dependency*) -> i64 {
             i += 1;
             const v_start: i64 = i;
             while (i < len && raw[i] != quote) { i += 1; }
-            value = substr(raw, v_start, i - v_start);
+            value = raw.substr(v_start, i - v_start);
             if (i < len) { i += 1; }  // past closing quote
         } else {
             const v_start: i64 = i;
@@ -1024,7 +985,7 @@ function parse_inline_table_into_dep(raw: string, dep: Dependency*) -> i64 {
             while (end > v_start && (raw[end - 1] == ' ' || raw[end - 1] == '\t')) {
                 end -= 1;
             }
-            value = substr(raw, v_start, end - v_start);
+            value = raw.substr(v_start, end - v_start);
         }
 
         if (intrinsics::strcmp(key, "path") == 0) {
@@ -1150,10 +1111,4 @@ function find_char(s: string, ch: i8) -> i64 {
         if (s[i] == ch) { return i; }
     }
     return -1;
-}
-
-/// Extract a substring from start with given length.
-function substr(s: string, start: i64, length: i64) -> string {
-    if (length <= 0) { return ""; }
-    return String::from_str(Str::from_cstr(s).sub_bytes(start as u64, (start + length) as u64)).into_raw();
 }
