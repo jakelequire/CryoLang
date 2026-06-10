@@ -627,8 +627,10 @@ def run_windows_stage(total_start) -> str:
 # The selfhost stages build Linux ELF artifacts rooted at bin/cryo, so they
 # can't run natively on Windows.  On a Windows host we re-invoke this script
 # inside WSL and stream its output verbatim, so `make selfhost-check` looks
-# and behaves exactly like a native Linux run — same header, stage rows, live
-# ticker, fixed-point gate, and Windows cross-verification.  WSL is required.
+# and behaves like a native Linux run — same header, stage rows, live ticker,
+# and fixed-point gate.  The wine-based [w1]-[w4] cross-verify is skipped here
+# (--no-windows): it's redundant on Windows and wine doesn't run under the
+# non-interactive WSL invocation.  WSL is required.
 # ---------------------------------------------------------------------------
 
 
@@ -666,9 +668,9 @@ def main_windows(args) -> int:
 
     The selfhost stages build Linux ELF artifacts rooted at bin/cryo, so they
     can't run natively on Windows.  Re-invoke this script inside WSL and stream
-    its output verbatim — the result looks and behaves exactly like a native
-    Linux `make selfhost-check` (same header, stage rows, ticker, fixed-point
-    gate, and Windows cross-verification)."""
+    its output verbatim — the result looks and behaves like a native Linux
+    `make selfhost-check` (same header, stage rows, ticker, fixed-point gate).
+    The wine-based [w1]-[w4] cross-verify is skipped (--no-windows)."""
     if not shutil.which("wsl.exe"):
         print(f"{C.RED}✗ wsl.exe not on PATH{C.RESET}")
         print(f"  {C.DIM}The Windows host runs the Linux selfhost chain through WSL.{C.RESET}")
@@ -680,13 +682,16 @@ def main_windows(args) -> int:
         print(f"  {C.DIM}Is the repo visible inside your default WSL distro?{C.RESET}")
         return 2
 
-    # No extra chrome on the Windows side: the WSL child prints the full Linux
-    # experience straight to this console.  Flags propagate; the default (no
-    # --no-windows) keeps full parity, including the Windows cross-verify.
-    inner = ("cd '" + wsl_root + "' && python3 scripts/selfhost-check.py"
+    # No extra chrome on the Windows side: the WSL child prints the Linux
+    # experience straight to this console.  Always --no-windows: the [w1]-[w4]
+    # cross-verify tests the Linux->Windows cross-compile via wine, which is
+    # redundant when you're already on Windows AND can't run here anyway (wine
+    # doesn't execute under the non-interactive `wsl.exe -- bash -lc` context,
+    # only an interactive WSL shell).  The 6-stage byte-identity gate is the
+    # selfhost check; run the cross-verify from a WSL shell if you want it.
+    inner = ("cd '" + wsl_root + "' && python3 scripts/selfhost-check.py --no-windows"
              + (" -v" if args.verbose else "")
-             + (" --keep-logs" if args.keep_logs else "")
-             + (" --no-windows" if args.no_windows else ""))
+             + (" --keep-logs" if args.keep_logs else ""))
     # Flush so our (possibly buffered) stdout doesn't interleave with the child
     # writing directly to the underlying console fd.
     sys.stdout.flush()
