@@ -24,11 +24,11 @@
 #
 # Requires (host): curl, tar (xz), llvm-readobj-20, x86_64-w64-mingw32-dlltool.
 #
-# NOTE: a possible cleaner alternative is mstorsjo/llvm-mingw (see
-# scripts/fetch-windows-toolchain.sh), which ships mingw-native LLVM libs in
-# lib/libLLVM* and could allow a fully static link with no runtime DLL.  That
-# path is unverified; this DLL+import-lib route is the one proven end-to-end
-# (cryo.exe runs under wine and emits valid COFF objects).
+# NOTE: a possible cleaner alternative is mstorsjo/llvm-mingw, which ships
+# mingw-native LLVM libs in lib/libLLVM* and could allow a fully static link
+# with no runtime DLL.  That path is unverified; this DLL+import-lib route is
+# the one proven end-to-end (cryo.exe runs under wine and emits valid COFF
+# objects).
 
 set -euo pipefail
 
