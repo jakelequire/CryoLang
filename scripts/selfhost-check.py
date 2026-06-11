@@ -289,37 +289,39 @@ def print_summary(times, total):
 # ---------------------------------------------------------------------------
 # Windows cross-build verification (optional stage)
 #
-# cryo.exe cannot fully self-host under wine: it can emit objects/IR but there
-# is no linker inside wine, and the compiler's own source imports a C header
-# (llvm_bindings.h) that needs a Windows clang to preprocess.  What IS
-# verifiable, and what this stage does:
+# cryo.exe CAN fully self-host under wine, given a wine-runnable Windows
+# toolchain.  Two pieces, both fetched by scripts/fetch-windows-llvm.sh:
 #
-#   1. the self-hosted compiler cross-links a real cryo.exe (mingw + windows
-#      libLLVM-C),
-#   2. that cryo.exe loads + runs under wine (`--version`),
-#   3. CROSS-SELFHOST: cryo.exe run under wine reproduces, byte-for-byte, the
-#      windows IR the Linux compiler emits for the whole stdlib (131 modules).
-#      Both target the GNU triple - cryo.exe's native default (its
-#      get_default_triple() coerces LLVM's msvc default to the mingw ABI the
-#      port links against).  The Linux side names it explicitly (its own
-#      `x86_64-pc-windows-gnu` bucket); the wine side gets it by default (the
-#      `host-windows` bucket).  Disjoint buckets, identical triples, so they
-#      coexist with no --build-dir juggling.
+#   * .toolchains/llvm-win/   — the LLVM-20 C API the compiler calls: the
+#     official msvc `LLVM-C.dll` (runtime dep, ships beside cryo.exe) plus a
+#     synthesized mingw import lib (`libLLVM-C.dll.a`) to link against.
+#   * .toolchains/llvm-mingw/ — mstorsjo's llvm-mingw (a Windows-PE clang +
+#     ld.lld + a full mingw-w64 sysroot).  Its `clang.exe` defaults to the
+#     `x86_64-w64-windows-gnu` target and finds ld.lld + the sysroot on its
+#     own, so — unlike the bare msvc clang.exe, which has no bundled linker —
+#     it LINKS a real cryo.exe under wine with no extra flags.  It serves both
+#     the `#include "llvm_bindings.h"` preprocess (CRYO_CC) and the final link;
+#     `llvm-ar.exe` is the archiver wine can launch (CRYO_AR).
 #
-# Skipped (not failed) when the mingw toolchain, wine, llvm-link, or the
-# fetched .toolchains/llvm-win import lib are absent, so Linux-only checkouts
-# and CI without the Windows bits still pass.
+# So the Windows section runs the SAME 6-stage byte-identity self-host as the
+# Linux chain, booting from bin/cryo.exe: each stage cross-links a runnable
+# cryo.exe (mingw + windows libLLVM-C), runs it under wine to build the next,
+# and the stage-3/stage-4 per-module IR is compared for the fixed point.
+#
+# Skipped (not failed) when wine or either fetched toolchain is absent, so
+# Linux-only checkouts and CI without the Windows bits still pass.
 # ---------------------------------------------------------------------------
 WIN_TRIPLE      = "x86_64-pc-windows-gnu"
 WIN_LLVM_LIB    = ROOT / ".toolchains" / "llvm-win" / "lib" / "libLLVM-C.dll.a"
 WIN_LLVM_DLL    = ROOT / ".toolchains" / "llvm-win" / "bin" / "LLVM-C.dll"
-# clang.exe + llvm-ar.exe (same msvc tarball, fetched by fetch-windows-llvm.sh)
-# let cryo.exe compile the COMPILER itself under wine: clang.exe is the C
-# preprocessor for the one `extern "C" { #include "llvm_bindings.h" }` site
-# (CRYO_CC), llvm-ar.exe is an archiver wine can launch (CRYO_AR).  Optional:
-# [w4] skips cleanly if they're absent.
-WIN_CLANG       = ROOT / ".toolchains" / "llvm-win" / "bin" / "clang.exe"
-WIN_AR          = ROOT / ".toolchains" / "llvm-win" / "bin" / "llvm-ar.exe"
+# llvm-mingw's clang.exe + llvm-ar.exe (fetched by fetch-windows-llvm.sh) let
+# cryo.exe compile AND LINK the compiler itself under wine: clang.exe is both
+# the C preprocessor for the one `extern "C" { #include "llvm_bindings.h" }`
+# site and the link driver (CRYO_CC, defaults to windows-gnu + bundled ld.lld),
+# llvm-ar.exe is an archiver wine can launch (CRYO_AR).
+WIN_MINGW_DIR   = ROOT / ".toolchains" / "llvm-mingw"
+WIN_CLANG       = WIN_MINGW_DIR / "bin" / "clang.exe"
+WIN_AR          = WIN_MINGW_DIR / "bin" / "llvm-ar.exe"
 MINGW_GCC       = "x86_64-w64-mingw32-gcc"
 LLVM_LINK       = "llvm-link-20"
 # [w4] builds the compiler LIBRARY only (no [[bin]]); a lib-only build under
@@ -523,13 +525,13 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
         if not shutil.which("wine"):
             missing.append("wine")
         if not (WIN_CLANG.exists() and WIN_AR.exists() and WIN_LLVM_DLL.exists()):
-            missing.append("windows toolchain (.toolchains/llvm-win — scripts/fetch-windows-llvm.sh)")
+            missing.append("windows toolchain (.toolchains/llvm-mingw + llvm-win — scripts/fetch-windows-llvm.sh)")
         if missing:
             print(f"  {C.YELLOW}↷ skipped{C.RESET} (can't self-host under wine):")
             for m in missing:
                 print(f"      {C.DIM}- {m}{C.RESET}")
-            print(f"      {C.DIM}A self-host links a runnable cryo.exe at stages 2/4/6 and wine has")
-            print(f"      no linker — run this section on a native Windows host.{C.RESET}")
+            print(f"      {C.DIM}A self-host links a runnable cryo.exe at stages 2/4/6; that needs")
+            print(f"      wine + the fetched llvm-mingw (clang/ld.lld) and llvm-win (LLVM-C) bits.{C.RESET}")
             return "skip"
         zwin = lambda p: "Z:" + str(p).replace("/", "\\")
         env = {"WINEDEBUG": "-all",
