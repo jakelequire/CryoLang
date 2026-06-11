@@ -64,40 +64,79 @@ function shell_quote(s: string) -> string {
     return buf as string;
 }
 
-/// Pick the static archiver binary.  `CRYO_AR` overrides the default
-/// `ar`, mirroring `pick_c_preprocessor`'s `CRYO_CC` knob.  Returned
-/// pointer is the env value (caller must NOT free) when set, otherwise
-/// the static default literal.  A Windows-hosted compiler (cryo.exe
-/// under wine) sets this to an `llvm-ar.exe` it can launch, since the
-/// host's ELF `ar` cannot run under wine.
+/// Shell redirect that discards stdout+stderr while probing a tool for
+/// existence.  Host-gated (`cmd` uses `>NUL`, POSIX `sh` uses
+/// `>/dev/null`; both honour `2>&1`) exactly like `c_header_import`'s
+/// `cc_silence` - ConfigGating strips the inactive side at build time, so
+/// the running compiler emits the form its own shell understands.
+![target(unix)]
+function probe_silence() -> string { return ">/dev/null 2>&1"; }
+
+![target(windows)]
+function probe_silence() -> string { return ">NUL 2>&1"; }
+
+/// True iff `tool` can be launched, probed via `<tool> --version`.  A
+/// missing binary makes the shell exit non-zero (`sh`: 127; `cmd`: 9009)
+/// and `system(3)` reports that, so exit 0 means it's usable.  Mirrors
+/// `pick_c_preprocessor`'s `cc_available` probe.  The probe runs after IR
+/// is emitted (link/archive time), so the tool chosen never affects the
+/// `.ll` the selfhost gate compares.
+function tool_available(tool: string) -> boolean {
+    return system(format("%s --version %s", tool, probe_silence())) == 0;
+}
+
+/// Pick the static archiver binary.  `CRYO_AR` overrides everything,
+/// mirroring `pick_c_preprocessor`'s `CRYO_CC` knob - this is what lets a
+/// Windows-hosted `cryo.exe` under wine point at an `llvm-ar.exe` it can
+/// launch, since the host's ELF `ar` cannot run there.  With no override
+/// we AUTO-DETECT: the default `ar` wins whenever it's launchable (true on
+/// every POSIX host and on a mingw box, where binutils ships `ar`), so the
+/// historic choice and selfhost byte-identity are preserved and the probe
+/// only falls through to `llvm-ar` when `ar` is genuinely absent.
 function pick_archiver() -> string {
     const env_raw: i8* = intrinsics::getenv("CRYO_AR") as i8*;
     if (env_raw != null) {
         const env_val: string = env_raw as string;
         if (intrinsics::strlen(env_val) > 0) { return env_val; }
     }
+    if (tool_available("ar"))         { return "ar"; }
+    if (tool_available("llvm-ar"))    { return "llvm-ar"; }
+    if (tool_available("llvm-ar-20")) { return "llvm-ar-20"; }
     return "ar";
 }
 
 /// Pick the link driver (the `cc`/`gcc`/`clang` binary the link command
-/// invokes).  `CRYO_CC` overrides the per-target default, mirroring
-/// `pick_c_preprocessor` (which already reads `CRYO_CC` for `#include`
-/// preprocessing) and `pick_archiver`'s `CRYO_AR`.  The same C-toolchain
-/// driver works for both jobs, so one knob covers them.
+/// invokes).  `CRYO_CC` overrides everything, mirroring `pick_archiver`'s
+/// `CRYO_AR` and `pick_c_preprocessor`'s use of the same knob for
+/// `#include` preprocessing (one C-toolchain driver serves both jobs).
 ///
-/// This is the seam that makes a NATIVE Windows self-host work: the
-/// per-target default for windows-gnu is the *cross* name
-/// `x86_64-w64-mingw32-gcc`, which exists on a Linux cross-host but NOT on
-/// a native MSYS2 / mingw-w64 box (there the driver is plain `gcc` /
-/// `clang`).  Setting `CRYO_CC=gcc` (or `clang`) on Windows points the link
-/// at the locally-installed driver.  Unset (every `make` build, host or
-/// cross) -> the historic per-target default, so existing flows and the
-/// selfhost byte-identity are unchanged.
+/// With no override we AUTO-DETECT, the same way `pick_c_preprocessor`
+/// does, so a NATIVE Windows self-host needs no environment setup:
+///
+///   1. The per-target `default_driver` wins whenever it's launchable.
+///      This is the historic choice on every host where it exists - `cc`
+///      on a POSIX host, `x86_64-w64-mingw32-gcc` on a Linux->windows
+///      cross - so existing flows and selfhost byte-identity are unchanged
+///      (on Linux/CI `cc` is present, so the fallback never fires).
+///   2. Only when `default_driver` is ABSENT do we probe.  This is the
+///      native mingw/MSYS2 case: `host_linker_config` asks for `cc`, but a
+///      stock box ships `gcc`/`clang` instead.  `gcc` is tried before
+///      `clang` because on a mingw host `gcc` links gnu-ABI objects
+///      natively while a bare `clang` may default to the msvc target.
+///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
+///      substitute, so we DON'T fall back for it - the original name is
+///      kept so the link error names the absent cross toolchain.
 function pick_link_driver(default_driver: string) -> string {
     const env_raw: i8* = intrinsics::getenv("CRYO_CC") as i8*;
     if (env_raw != null) {
         const env_val: string = env_raw as string;
         if (intrinsics::strlen(env_val) > 0) { return env_val; }
+    }
+    if (tool_available(default_driver)) { return default_driver; }
+    if (strstr(default_driver, "mingw") == null) {
+        if (tool_available("gcc"))   { return "gcc"; }
+        if (tool_available("clang")) { return "clang"; }
+        if (tool_available("cc"))    { return "cc"; }
     }
     return default_driver;
 }
@@ -1177,6 +1216,10 @@ type struct CodegenPasses {
         }
 
         const rc: i32 = system(cmd);
+        // The response file has served its purpose; remove it so it doesn't
+        // linger in the per-profile dir (best-effort - a failed unlink is
+        // harmless).
+        intrinsics::unlink(link_rsp_path);
         if (rc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("linker invocation failed (%s exited with %d): %s",
@@ -1249,10 +1292,26 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        mut cmd: string = format("%s -o %s", link_cfg.driver, link_quote(exe_path));
-        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            cmd = format("%s %s", cmd, link_quote(ctx.artifacts.object_files[i]));
+        // Object list via an @response-file, same as the project link path
+        // and `bundle_archive`: a large single-file program can still blow
+        // past `cmd /c`'s ~8191-char command-line cap on a native Windows
+        // host (where `system(3)` routes through cmd), and `@file` keeps the
+        // spawned command short and byte-identical on every host.  `@"%s"`
+        // (literal double quotes) parses the same under `sh -c` and `cmd /c`.
+        const link_rsp_path: string = format("%s.rsp", exe_path);
+        const link_rf: void* = intrinsics::fopen(link_rsp_path, "w");
+        if (link_rf == null) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("could not open linker response file for writing: %s", link_rsp_path));
+            return PassResult::failure(1);
         }
+        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
+            intrinsics::fprintf(link_rf, "\"%s\"\n", ctx.artifacts.object_files[i]);
+        }
+        intrinsics::fclose(link_rf);
+
+        mut cmd: string = format("%s -o %s @\"%s\"",
+            link_cfg.driver, link_quote(exe_path), link_rsp_path);
         // Stdlib archive: same lookup as the project link path, and same
         // host-vs-cross gating.  Empty stdlib_root means single-file mode
         // never resolved one (e.g. user passed `--no-std` semantically by
@@ -1271,6 +1330,9 @@ type struct CodegenPasses {
         }
 
         const rc: i32 = system(cmd);
+        // Discard the response file once the link has consumed it
+        // (best-effort - a failed unlink is harmless).
+        intrinsics::unlink(link_rsp_path);
         if (rc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("linker invocation failed (%s exited with %d): %s",
@@ -1354,6 +1416,8 @@ type struct CodegenPasses {
         }
 
         const rc: i32 = system(cmd);
+        // Drop the response file now the archiver has read it (best-effort).
+        intrinsics::unlink(rsp_path);
         if (rc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("ar invocation failed (exited with %d): %s", rc, cmd));
