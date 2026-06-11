@@ -24,7 +24,7 @@ Cryo gives systems programmers explicit control over memory and data layout (man
 The compiler is **self-hosted**: every line of Cryo you compile is compiled by Cryo. The standard library is written in Cryo. The bundled HTTP server, JSON parser, hash maps, and test framework are written in Cryo. Every build target drives off the pinned compiler at `bin/cryo` (committed to the repo).
 
 > **The full language reference lives at [`docs/cryo.md`](./docs/cryo.md).** This README is the thirty-second tour and the install / build instructions.
-    2
+
 ---
 
 ## Table of Contents
