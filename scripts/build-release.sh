@@ -79,9 +79,19 @@ build_linux() {
     cp "$out" "${stage}/bin/cryo"
     strip "${stage}/bin/cryo" 2>/dev/null || true
 
-    # Confirm it really is free of a libLLVM runtime dep.
-    if command -v ldd >/dev/null 2>&1 && ldd "${stage}/bin/cryo" 2>&1 | grep -qi 'LLVM'; then
-        echo "error: shipped cryo still links libLLVM dynamically" >&2; exit 1
+    # Confirm it really is fully static: no libLLVM runtime dep, and no
+    # dynamic loader at all (glibc ldd: "not a dynamic executable";
+    # musl ldd: "not a valid dynamic program").
+    if command -v ldd >/dev/null 2>&1; then
+        local ldd_out
+        ldd_out="$(ldd "${stage}/bin/cryo" 2>&1 || true)"
+        if echo "$ldd_out" | grep -qi 'LLVM'; then
+            echo "error: shipped cryo still links libLLVM dynamically" >&2; exit 1
+        fi
+        if ! echo "$ldd_out" | grep -qiE 'not a dynamic executable|not a valid dynamic program|statically linked'; then
+            echo "error: shipped cryo is not fully static; ldd reports:" >&2
+            echo "$ldd_out" >&2; exit 1
+        fi
     fi
 
     stage_common "$stage"

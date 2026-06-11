@@ -93,6 +93,7 @@ The **quick-install** binary is statically linked — it only needs a C compiler
 | `LLVM` | 20 (runtime + dev) | The pinned `bin/cryo` dynamically links `libLLVM.so.20.1`. The `-dev` package is additionally required to rebuild the compiler from source. |
 | `make` | 4.0+ | Top-level build orchestration. |
 | `python3` | 3.8+ | Drives `make selfhost-check`. |
+| `glibc` | 2.34+ | Floor of the committed pinned `bin/cryo` (Ubuntu 22.04+, Debian 12+, Fedora 35+). The quick-install binary is fully static and has no glibc requirement. |
 
 The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev` for a `--release-static` build). The dev install also runs `make stdlib` to produce `stdlib/.bin/libcryo.a` (which is gitignored), so a clean checkout needs the build toolchain even when using the pinned binary.
 

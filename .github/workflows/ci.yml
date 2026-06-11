@@ -6,20 +6,25 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: make cryo
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install LLVM 20 and clang++-20
-        run: |
-          wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 20
-          sudo apt-get install -y llvm-20-dev clang-20 build-essential
+      - name: Restore the LLVM toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cryo-ci
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
+        run: ./scripts/ci/install-llvm.sh
 
       - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo)
         run: make cryo
@@ -37,8 +42,14 @@ jobs:
 
       - name: Smoke-test the LSP binary
         run: |
-          test -x bin/cryolsp || (echo "bin/cryolsp not built" && exit 1)
-          bin/cryolsp --help >/dev/null 2>&1 || true
+          test -x bin/cryolsp || { echo "bin/cryolsp not built"; exit 1; }
+          # cryolsp is a stdio JSON-RPC server (no --help). Smoke = it starts
+          # and exits on its own when stdin closes, rather than hanging
+          # (timeout -> 124) or dying on a signal (128+N).
+          printf '' | timeout 10 bin/cryolsp >/dev/null 2>&1; code=$?
+          if [ "$code" -ge 124 ]; then
+            echo "cryolsp hung or crashed on EOF (exit $code)"; exit 1
+          fi
 
   selfhost-check:
     name: selfhost-check (stage-3 == stage-4 byte-identity)
@@ -49,21 +60,23 @@ jobs:
     # after merge.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install LLVM 20 and clang++-20
-        run: |
-          wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 20
-          sudo apt-get install -y llvm-20-dev clang-20 build-essential
+      - name: Restore the LLVM toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cryo-ci
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
+        run: ./scripts/ci/install-llvm.sh
 
       - name: Run selfhost-check
         run: make selfhost-check
 
       - name: Upload stage logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: selfhost-check-logs
           path: build-logs/
