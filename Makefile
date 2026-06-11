@@ -95,7 +95,7 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 .DEFAULT_GOAL := help
 .PHONY: help stdlib cryo cryo-exe selfhost-check test test-list pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
-        install uninstall clean lsp install-lsp
+        install uninstall clean lsp install-lsp release release-linux release-windows
 
 help:
 	@echo "Cryo build targets:"
@@ -356,12 +356,28 @@ test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 endif
 
-# ---- system install via symlink ---------------------------------------
+# ---- release packaging -------------------------------------------------
+# Build distributable archives under dist/.  `release` does the host
+# platform (linux here); `release-windows` cross-builds the windows zip.
+# Linux ships a static `cryo` (--release-static); see scripts/build-release.sh
+# for the static-link env knobs (musl under Alpine).
+release: release-linux
+
+release-linux:
+	@./scripts/build-release.sh linux
+
+release-windows:
+	@./scripts/build-release.sh windows
+
+# ---- dev install via symlink (the repo-local toolchain) ----------------
+# `make install` is the DEV install: symlink the committed bin/cryo +
+# stdlib into a prefix.  End users instead run the production downloader:
+#   curl -fsSL https://cryo-lang.org/install.sh | bash
 install:
-	@./install.sh
+	@./install.sh --dev
 
 uninstall:
-	@./install.sh --uninstall
+	@./install.sh --dev --uninstall
 
 # ---- clean ------------------------------------------------------------
 clean:

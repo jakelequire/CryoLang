@@ -141,6 +141,77 @@ function pick_link_driver(default_driver: string) -> string {
     return default_driver;
 }
 
+/// Resolve the `llvm-config` binary used to derive the static-link lib set
+/// for `--release-static`.  `CRYO_LLVM_CONFIG` overrides; default
+/// `llvm-config-20` (matches the LLVM 20 the compiler is built against).
+/// Only consulted on the `--release-static` path, so a normal dev build
+/// never needs it present.  The env override is what lets a musl release
+/// build under Alpine point at its own `llvm-config` (which reports the
+/// musl-built static `.a` set) with no source change.
+function pick_llvm_config() -> string {
+    const env_raw: i8* = intrinsics::getenv("CRYO_LLVM_CONFIG") as i8*;
+    if (env_raw != null) {
+        const env_val: string = env_raw as string;
+        if (intrinsics::strlen(env_val) > 0) { return env_val; }
+    }
+    return "llvm-config-20";
+}
+
+/// Slurp `<llvm-config> --ldflags --libs --system-libs --link-static` and
+/// return it as one space-separated flag string (`-L<libdir> -lLLVMCore ...
+/// -lrt -ldl -lm -lz -lzstd -lxml2`) for splicing into the `--release-static`
+/// link line.  This is how the 200+ component `.a` set AND its search dir are
+/// obtained without hardcoding a list/path that would drift across LLVM
+/// packagings - the `-L` from `--ldflags` is what makes this portable to a
+/// musl/Alpine release where the static libs live elsewhere.  llvm-config
+/// emits the sections in flag order: `-L` first, then the component libs,
+/// then the system libs - the correct single-pass static link order.
+/// Returns "" on popen failure, empty output, or a non-zero exit so the
+/// caller can fail the link with a clear diagnostic.  Mirrors the
+/// popen/fgets/pclose pattern in `c_header_import`'s `run_preproc_pipe`.
+/// Runs at link time (after IR is emitted), so it never touches the `.ll`
+/// the selfhost gate compares.
+function static_llvm_link_flags(llvm_config: string) -> string {
+    const cmd: string = format("%s --ldflags --libs --system-libs --link-static", llvm_config);
+    const pipe: void* = intrinsics::popen(cmd, "r");
+    if (pipe == null) { return ""; }
+
+    mut out_buf: i8* = intrinsics::malloc(65536) as i8*;
+    mut out_len: u64 = 0;
+    mut out_cap: u64 = 65536;
+    mut line_buf: i8[4096];
+
+    while (intrinsics::fgets(&line_buf[0], 4096, pipe) != null) {
+        const llen: u64 = intrinsics::strlen(&line_buf[0] as string);
+        if (out_len + llen >= out_cap) {
+            out_cap *= 2;
+            const nb: i8* = intrinsics::malloc(out_cap) as i8*;
+            intrinsics::memcpy(nb as void*, out_buf as void*, out_len);
+            intrinsics::free(out_buf as void*);
+            out_buf = nb;
+        }
+        intrinsics::memcpy((out_buf + out_len) as void*, &line_buf[0] as void*, llen);
+        out_len += llen;
+    }
+    out_buf[out_len] = 0;
+    const exit_code: i32 = intrinsics::pclose(pipe);
+
+    if (exit_code != 0 || out_len == 0) {
+        intrinsics::free(out_buf as void*);
+        return "";
+    }
+
+    // llvm-config prints `--libs` and `--system-libs` on separate lines;
+    // flatten every newline to a space so the result is one flat argument
+    // string (libs first, then system libs - the correct static link order).
+    for (mut i: u64 = 0; i < out_len; i++) {
+        if (out_buf[i] == '\n' as i8 || out_buf[i] == '\r' as i8) {
+            out_buf[i] = ' ' as i8;
+        }
+    }
+    return out_buf as string;
+}
+
 // Host-shell-aware command construction
 //
 // The compiler shells out through libc `system(3)`, which runs `sh -c` on
@@ -1179,15 +1250,38 @@ type struct CodegenPasses {
                 cmd = format("%s %s", cmd, link_quote(cfg.link_static_windows[i]));
             }
         } else {
-            for (mut i: i64 = 0; i < cfg.link_search_unix.length; i++) {
-                cmd = format("%s -L%s", cmd, link_quote(cfg.link_search_unix[i]));
-            }
-            for (mut i: i64 = 0; i < cfg.link_system_unix.length; i++) {
-                cmd = format("%s -l%s", cmd, link_quote(cfg.link_system_unix[i]));
+            // The `[link.unix]` overlay carries the host libLLVM (`-lLLVM-20`
+            // + its `-L/usr/lib/llvm-20/lib` search dir).  On a
+            // `--release-static` build we replace that dynamic LLVM with the
+            // static `.a` component set from llvm-config (spliced in below),
+            // so skip the overlay's search/system entries here.  `[link.unix]`
+            // is LLVM-only today; if it ever grows non-LLVM libs, switch this
+            // to value-filtering "LLVM-20" rather than skipping the overlay.
+            if (!ctx.release_static) {
+                for (mut i: i64 = 0; i < cfg.link_search_unix.length; i++) {
+                    cmd = format("%s -L%s", cmd, link_quote(cfg.link_search_unix[i]));
+                }
+                for (mut i: i64 = 0; i < cfg.link_system_unix.length; i++) {
+                    cmd = format("%s -l%s", cmd, link_quote(cfg.link_system_unix[i]));
+                }
             }
             for (mut i: i64 = 0; i < cfg.link_static_unix.length; i++) {
                 cmd = format("%s %s", cmd, link_quote(cfg.link_static_unix[i]));
             }
+        }
+        // `--release-static`: splice the static libLLVM component set
+        // (`-L<libdir> -lLLVMCore ... -lrt -ldl -lm -lz -lzstd -lxml2`) from
+        // llvm-config in place of the dynamic `-lLLVM-20` skipped above.
+        // Placed before the stdlib archive + system libs so the single-pass
+        // static link order is objects -> LLVM -> libcryo.a -> libm/libstdc++.
+        if (ctx.release_static) {
+            const llvm_static: string = static_llvm_link_flags(pick_llvm_config());
+            if (intrinsics::strlen(llvm_static) == 0) {
+                ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    "could not obtain static LLVM link flags from llvm-config (is it installed? set CRYO_LLVM_CONFIG)");
+                return PassResult::failure(1);
+            }
+            cmd = format("%s %s", cmd, llvm_static);
         }
         // Stdlib archive: the stdlib build emits `<stdlib_root>/.bin/libcryo.a`
         // (see bundle_archive); pull it in for host builds unless the
@@ -1208,6 +1302,16 @@ type struct CodegenPasses {
         // IntrinsicsCodegen.  No C runtime to link beyond what the
         // active target's system library line provides.
         cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+
+        // `--release-static`: statically link libc (`-static`) and the C++
+        // runtime (`-static-libstdc++ -static-libgcc`) so the produced binary
+        // has no `libLLVM-20.so`/`libstdc++.so` runtime dependency.  These are
+        // position-independent driver flags, so trailing placement is safe;
+        // `-static-libstdc++` makes the earlier `-lstdc++` resolve to the
+        // archive.  Linux host only (this branch is the unix link path).
+        if (ctx.release_static) {
+            cmd = format("%s -static -static-libstdc++ -static-libgcc", cmd);
+        }
 
         if (ctx.debug_mode) {
             cdebug("[Codegen] Linking %lld objects -> %s\n",
