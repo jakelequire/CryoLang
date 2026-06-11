@@ -24,7 +24,7 @@ Cryo gives systems programmers explicit control over memory and data layout (man
 The compiler is **self-hosted**: every line of Cryo you compile is compiled by Cryo. The standard library is written in Cryo. The bundled HTTP server, JSON parser, hash maps, and test framework are written in Cryo. Every build target drives off the pinned compiler at `bin/cryo` (committed to the repo).
 
 > **The full language reference lives at [`docs/cryo.md`](./docs/cryo.md).** This README is the thirty-second tour and the install / build instructions.
-
+    2
 ---
 
 ## Table of Contents
@@ -46,43 +46,55 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
 
 ## Installing
 
-The repo ships a committed self-hosted compiler binary at `bin/cryo` and a stdlib at `stdlib/`. The installer symlinks them into your `$PATH` and builds the stdlib archive (`stdlib/.bin/libcryo.a`, ~1 s on first install). The pinned `bin/cryo` itself does not need to be rebuilt.
+### Quick install (recommended)
+
+One line installs a self-contained `cryo` (the compiler statically links LLVM, so there's no `libLLVM` runtime dependency) into `~/.cryo` and adds it to your `PATH`:
+
+**Linux x86-64:**
+```bash
+curl -fsSL https://cryo-lang.org/install.sh | bash
+```
+
+**Windows x86-64** (PowerShell):
+```powershell
+irm https://cryo-lang.org/install.ps1 | iex
+```
+
+Open a new shell, then `cryo --version`. To pin a version or remove the install:
+
+```bash
+curl -fsSL https://cryo-lang.org/install.sh | bash -s -- --version=1.0.0
+~/.cryo/bin/cryo --version          # or: cryo --uninstall via the script
+```
+
+> **One runtime requirement:** compiling a program shells out to a system C compiler/linker for the final link. Install one if you don't have it — `gcc`/`clang` on Linux, a mingw-w64 `gcc` on Windows. The `cryo` binary itself needs nothing.
+
+### From source / for compiler development
+
+The repo ships a committed self-hosted compiler at `bin/cryo` and a stdlib at `stdlib/`. `./install.sh --dev` symlinks them into your `$PATH` (no download) and builds the stdlib archive on first run:
 
 ```bash
 git clone https://github.com/jakelequire/CryoLang.git
 cd CryoLang
-./install.sh
+./install.sh --dev                 # → /usr/local/bin/cryo, /usr/local/share/cryo/stdlib
+./install.sh --dev --prefix=$HOME/.local
+./install.sh --dev --uninstall
 ```
 
-By default this creates:
-
-```
-/usr/local/bin/cryo                  →  <repo>/bin/cryo
-/usr/local/share/cryo/stdlib         →  <repo>/stdlib
-```
-
-**Custom prefix:**
-```bash
-./install.sh --prefix=$HOME/.local
-```
-
-**Uninstall:**
-```bash
-./install.sh --uninstall
-```
-
-If the pinned binary is missing or you want to rebuild from source, see [Building from Source](#building-from-source).
+`make install` runs `./install.sh --dev` for you. To rebuild the compiler from source, see [Building from Source](#building-from-source).
 
 ### Requirements
+
+The **quick-install** binary is statically linked — it only needs a C compiler on `PATH` to link the programs you compile. The table below applies to the **from-source / dev** flow (the pinned `bin/cryo` is dynamically linked):
 
 | Dependency | Version | Why |
 | --- | --- | --- |
 | `clang` | 20 | Linker driver invoked at compile time. |
-| `LLVM` | 20 (runtime + dev) | `bin/cryo` dynamically links `libLLVM.so.20.1`. The `-dev` package is additionally required to rebuild the compiler from source. |
+| `LLVM` | 20 (runtime + dev) | The pinned `bin/cryo` dynamically links `libLLVM.so.20.1`. The `-dev` package is additionally required to rebuild the compiler from source. |
 | `make` | 4.0+ | Top-level build orchestration. |
 | `python3` | 3.8+ | Drives `make selfhost-check`. |
 
-The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev`. The first install also runs `make stdlib` to produce `stdlib/.bin/libcryo.a` (which is gitignored), so a clean checkout needs the build toolchain even when using the pinned binary.
+The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev` for a `--release-static` build). The dev install also runs `make stdlib` to produce `stdlib/.bin/libcryo.a` (which is gitignored), so a clean checkout needs the build toolchain even when using the pinned binary.
 
 ---
 
@@ -426,6 +438,17 @@ make clean             # remove compiler + stdlib build outputs
 Day-to-day flow: `make cryo`. Pre-tag / pre-merge gate: `make selfhost-check`.
 
 The pinned binary at `bin/cryo` is required - every build target drives off it. If the pin is missing, check out a revision that has it committed.
+
+### Release artifacts
+
+`make release` packages the distributable archives (the same ones the quick-install one-liner downloads) into `dist/`:
+
+```bash
+make release           # dist/cryo-<ver>-linux-x86_64.tar.gz   (static cryo, --release-static)
+make release-windows   # dist/cryo-<ver>-windows-x86_64.zip    (cryo.exe + LLVM-C.dll)
+```
+
+Each archive gets a sibling `.sha256`. The Linux build needs `libpolly-20-dev` alongside `llvm-20-dev` (the static Polly libs `llvm-config --link-static` references); the Windows build needs the mingw-w64 cross-toolchain plus `scripts/fetch-windows-llvm.sh`. Pushing a `v<ver>` tag runs [`.github/workflows/release.yml`](./.github/workflows/release.yml), which builds both and publishes them to a GitHub Release (the tag must match `VERSION` in `compiler/src/main.cryo`).
 
 ---
 
