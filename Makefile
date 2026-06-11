@@ -126,21 +126,46 @@ $(PIN):
 	@exit 1
 
 # ---- stdlib via the pinned self-hosted compiler -----------------------
+# Both branches drive off the committed pin; only the host shell differs.
+# Windows recipes run under cmd (no `rm`, no forward-slash exec), so they
+# use `bin/cryo.exe` with backslash separators and the cmd `rmdir` builtin.
+# The pin auto-detects the stdlib from its own location (it sits beside
+# `stdlib/`), so no CRYO_STDLIB is needed - same as the Linux recipe.
+ifeq ($(HOST_OS),windows)
+stdlib:
+	@echo "==> Building stdlib via bin/cryo.exe"
+	@if exist "stdlib\.bin" rmdir /s /q "stdlib\.bin"
+	@cd stdlib && "$(subst /,\,$(PIN_EXE))" build
+else
 stdlib: $(PIN)
 	@echo "==> Building stdlib via bin/cryo"
 	@rm -rf stdlib/.bin
 	@cd stdlib && "$(PIN)" build
+endif
 
 # ---- self-hosted compiler via the pin ---------------------------------
+ifeq ($(HOST_OS),windows)
+cryo: stdlib
+	@echo "==> Building self-hosted cryo via bin/cryo.exe"
+	@cd compiler && "$(subst /,\,$(PIN_EXE))" build
+	@echo "==> Self-hosted cryo built: $(STAGE2_EXE)"
+else
 cryo: stdlib
 	@echo "==> Building self-hosted cryo via bin/cryo"
 	@cd compiler && "$(PIN)" build
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
+endif
 
 # File-target rule so downstream targets (test, lsp) can depend on the
 # binary itself instead of the phony `cryo` target. If the binary is
 # present, Make treats it as up-to-date and skips the rebuild.
 $(STAGE2):
+	@$(MAKE) --no-print-directory cryo
+
+# Windows counterpart: the native build emits `cryo.exe`, so a Windows-host
+# `test`/`test-list` depends on this path instead of $(STAGE2).  Same
+# delegate-to-`cryo` shape; `cryo` is host-branched so it builds correctly.
+$(STAGE2_EXE):
 	@$(MAKE) --no-print-directory cryo
 
 # File-target rule for the stdlib static library so `test` rebuilds it
@@ -310,11 +335,26 @@ $(TEST_HELPERS_A): $(TEST_HELPERS_C)
 	@cc -O0 -fPIC -c -o $(TEST_HELPERS_O) $<
 	@ar rcs $@ $(TEST_HELPERS_O)
 
+ifeq ($(HOST_OS),windows)
+# Native Windows host: recipes run under cmd, which can't execute a quoted
+# forward-slash path and needs the `.exe` the native build emits — so the
+# stage-2 compiler is `compiler\build\cryo.exe` (backslashes, suffix), built
+# through the host-branched `cryo`/`stdlib` targets above.  $(STAGE2_EXE)
+# and $(LIBCRYO_A) are file targets, so the compiler/stdlib are rebuilt only
+# when missing, matching the Linux semantics.
+STAGE2_EXE_WIN := $(subst /,\,$(STAGE2_EXE))
+test: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
+	@cd tests && "$(STAGE2_EXE_WIN)" test $(ARGS)
+
+test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
+	@cd tests && "$(STAGE2_EXE_WIN)" test --list $(ARGS)
+else
 test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
 test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
+endif
 
 # ---- system install via symlink ---------------------------------------
 install:
