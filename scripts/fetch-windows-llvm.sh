@@ -48,12 +48,14 @@
 set -euo pipefail
 
 # Pin specific releases so cross-builds don't drift with upstream.
-LLVM_VERSION="20.1.8"
+# Versions live in scripts/llvm-version.env (single source of truth, shared
+# with CI): LLVM_WIN_VERSION + LLVM_MINGW_VERSION.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llvm-version.env"
+LLVM_VERSION="${LLVM_WIN_VERSION}"
 ASSET="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz"
 URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${ASSET}"
 
 # llvm-mingw: the Windows-PE (ucrt, x86_64) build, so its tools run under wine.
-LLVM_MINGW_VERSION="20260602"
 MINGW_ASSET="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-x86_64.zip"
 MINGW_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${MINGW_ASSET}"
 

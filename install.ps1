@@ -70,6 +70,10 @@ if ($Uninstall) {
     if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix; Ok "removed $Prefix" }
     else { Info "nothing to remove at $Prefix" }
     Remove-FromUserPath (Join-Path $Prefix "bin")
+    if ([Environment]::GetEnvironmentVariable("CRYO_HOME", "User")) {
+        [Environment]::SetEnvironmentVariable("CRYO_HOME", $null, "User")
+        Ok "removed CRYO_HOME from the User environment"
+    }
     Ok "Done. (uninstall)"
     exit 0
 }
@@ -120,9 +124,19 @@ try {
     # Extract (zip wraps everything in one top dir) then swap into place.
     Info "extracting"
     $stage = Join-Path $tmp "stage"
-    Expand-Archive -Path $zipPath -DestinationPath $stage -Force
-    $top = Get-ChildItem -Directory $stage | Select-Object -First 1
-    if (-not $top) { Die "unexpected archive layout (no top-level directory)." }
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    Expand-Archive -Path $zipPath -DestinationPath $stage
+    $top = @(Get-ChildItem -Directory $stage)
+    if ($top.Count -ne 1) {
+        Die "unexpected archive layout (expected exactly one top-level directory, found $($top.Count))."
+    }
+    $top = $top[0]
+    # Refuse to install a zip that doesn't contain what we expect.
+    foreach ($required in @("bin\cryo.exe", "bin\LLVM-C.dll", "stdlib\lib.cryo", "VERSION")) {
+        if (-not (Test-Path (Join-Path $top.FullName $required))) {
+            Die "archive is missing '$required' - corrupted or unexpected layout, refusing to install."
+        }
+    }
 
     if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix }
     New-Item -ItemType Directory -Path (Split-Path $Prefix) -Force | Out-Null
@@ -151,8 +165,11 @@ if ($NoModifyPath) {
 }
 
 Write-Host ""
-Ok "Done.  cryo v$ver installed."
 & (Join-Path $bindir "cryo.exe") --version
+if ($LASTEXITCODE -ne 0) {
+    Die "post-install verification failed: 'cryo.exe --version' exited with code $LASTEXITCODE. The download may be corrupted - re-run the installer."
+}
+Ok "Done.  cryo v$ver installed."
 Write-Host ""
 Write-Host "Next:" -ForegroundColor Cyan
 Write-Host "  - open a new terminal, then:  cryo --version"

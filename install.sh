@@ -236,6 +236,10 @@ prod_install() {
     mkdir -p "${tmp}/stage"
     tar -xzf "${tmp}/${tarball}" -C "${tmp}/stage" --strip-components=1
 
+    # Refuse to install a tarball that doesn't contain what we expect.
+    [ -f "${tmp}/stage/bin/cryo" ] && [ -f "${tmp}/stage/stdlib/lib.cryo" ] \
+        || die "archive is missing bin/cryo or stdlib/ - corrupted or unexpected layout, refusing to install."
+
     mkdir -p "$(dirname "$INSTALL_ROOT")"
     rm -rf "${INSTALL_ROOT}.old"
     [ -e "$INSTALL_ROOT" ] && mv "$INSTALL_ROOT" "${INSTALL_ROOT}.old"
@@ -244,14 +248,17 @@ prod_install() {
     chmod +x "${INSTALL_ROOT}/bin/cryo" 2>/dev/null || true
     log_ok "installed to ${INSTALL_ROOT}"
 
+    # Post-install verification: the installed binary must actually run.
+    local verstr
+    verstr="$("${INSTALL_ROOT}/bin/cryo" --version 2>/dev/null)" \
+        || die "post-install verification failed: '${INSTALL_ROOT}/bin/cryo --version' did not run. The download may be corrupted - re-run the installer."
+
     prod_add_path "${INSTALL_ROOT}/bin"
 
     echo
     echo "${GREEN}${BOLD}Done.${RESET}  cryo v${ver} installed."
     echo
-    if "${INSTALL_ROOT}/bin/cryo" --version >/dev/null 2>&1; then
-        echo "  $("${INSTALL_ROOT}/bin/cryo" --version)"
-    fi
+    echo "  ${verstr}"
     echo
     echo "Next:"
     echo "  • open a new shell (or source your rc), then:  cryo --version"
