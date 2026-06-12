@@ -270,6 +270,39 @@ function hoist_binary(src: string, dst: string) -> i32 {
         to_windows_path(src), to_windows_path(dst)));
 }
 
+/// Byte-wise path equality that treats `/` and `\` as the same
+/// separator.  `ctx.source_file` and `discovery_root_path()` are built
+/// by different code paths and can disagree on separator style on a
+/// native Windows host even when they name the same file.
+function paths_equal_loose(a: string, b: string) -> boolean {
+    const la: i64 = intrinsics::strlen(a) as i64;
+    const lb: i64 = intrinsics::strlen(b) as i64;
+    if (la != lb) { return false; }
+    const ab: i8* = a as i8*;
+    const bb: i8* = b as i8*;
+    for (mut i: i64 = 0; i < la; i++) {
+        const ca: i8 = ab[i];
+        const cb: i8 = bb[i];
+        if (ca != cb) {
+            const ca_sep: boolean = (ca == '/' || ca == '\\');
+            const cb_sep: boolean = (cb == '/' || cb == '\\');
+            if (!ca_sep || !cb_sep) { return false; }
+        }
+    }
+    return true;
+}
+
+/// True when the module currently being emitted is the project's
+/// discovery root (the executable entry point / library root).  Used to
+/// scope `-o PATH` overrides: a single-file build is a synthesized
+/// one-entry project whose stdlib imports compile as real modules, so
+/// only the ENTRY module's artifact may honor the override.
+function is_entry_module_active(ctx: CompilationContext*) -> boolean {
+    if (ctx.project_config == null) { return false; }
+    return paths_equal_loose(ctx.source_file,
+        ctx.project_config.discovery_root_path());
+}
+
 /// Emit the combined `.ll` IR dump next to the hoisted exe (selfhost-check's
 /// byte-identity input).  POSIX-only: it relies on shell glob expansion
 /// (`/*/ir/*.ll`) and `2>/dev/null`, neither of which `cmd` provides.  On a
@@ -954,7 +987,16 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        const kind: OutputKind = ctx.output_kind;
+        // In project mode the `-o PATH` override applies to the ENTRY
+        // module only.  A single-file build is a synthesized one-entry
+        // project whose stdlib imports compile as real modules; without
+        // this gate every std module would in turn overwrite the user's
+        // `-o foo.o`.  Non-entry modules behave as if no override were
+        // given (per-origin deps layout).
+        mut kind: OutputKind = ctx.output_kind;
+        if (ctx.project_config != null && !is_entry_module_active(ctx)) {
+            kind = OutputKind::None;
+        }
 
         // IRText is the only kind that doesn't go through LLVM's
         // target-machine emit path; it's a pure text dump of the
@@ -1127,14 +1169,23 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
         if (ctx.project_config == null) {
-            // Single-file mode: only Exe needs linking.  Asm / Object /
-            // IRText emit their final artifact straight from object
-            // emission; Default (no `-o`) leaves the .o behind without
-            // linking, matching the historic behaviour.
+            // Raw mode (`cryo raw`): only Exe needs linking.  Asm /
+            // Object / IRText emit their final artifact straight from
+            // object emission; Default (no `-o`) leaves the .o behind
+            // without linking, matching the historic behaviour.
             return match (ctx.output_kind) {
                 OutputKind::Exe => { CodegenPasses::run_linking_singlefile(ctx) }
                 _               => { PassResult::ok() }
             };
+        }
+        // `-o foo.o` / `foo.s` / `foo.ll` on a single-file build: the
+        // entry module's artifact was already written by ObjectEmission
+        // directly to the override path; there is no executable to link.
+        match (ctx.output_kind) {
+            OutputKind::Object => { return PassResult::ok(); }
+            OutputKind::Asm    => { return PassResult::ok(); }
+            OutputKind::IRText => { return PassResult::ok(); }
+            _                  => { /* None / Exe: link normally */ }
         }
         if (!ctx.project_config.requires_entry_point()) {
             // Library / stdlib target: no executable to produce, but
@@ -1350,6 +1401,25 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
         cdebug("[Codegen] Hoisted executable: %s\n", hoisted_exe);
+
+        // Single-file `-o PATH` (Exe): mirror the hoisted binary to the
+        // user's explicit output path.  The path is taken verbatim - no
+        // `.exe` auto-append - since `-o` is explicit user intent.
+        const exe_override: boolean = match (ctx.output_kind) {
+            OutputKind::Exe => { true }
+            _               => { false }
+        };
+        if (exe_override && intrinsics::strlen(ctx.output_path_override) > 0) {
+            const orc: i32 = hoist_binary(hoisted_exe, ctx.output_path_override);
+            if (orc != 0) {
+                ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("failed to copy executable to %s (copy exited with %d)",
+                        ctx.output_path_override, orc));
+                return PassResult::failure(1);
+            }
+            cdebug("[Codegen] Mirrored executable to -o path: %s\n",
+                ctx.output_path_override);
+        }
 
         // Emit a combined `.ll` text dump of the project's per-module IR
         // (written during Phase 7) next to the HOISTED executable

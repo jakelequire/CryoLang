@@ -113,6 +113,12 @@ type struct CompilerConfig {
     /// keeps the fast dynamic link.  Linux host only for v1.  Consumed at link
     /// time in `CodegenPasses::run_linking`; does not affect emitted IR.
     release_static:      boolean;
+    /// `--no-std`: build without the standard library (no prelude, no
+    /// stdlib module discovery, no libcryo.a at link time).  For project
+    /// builds this is OR'd with the cryoconfig `no_std` key (the flag can
+    /// force a freestanding build on, never off); for single-file builds
+    /// it is the only way to opt out of the auto-imported stdlib.
+    no_std:              boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -131,6 +137,7 @@ type struct CompilerConfig {
             profile_override:    "",
             incremental:         true,
             release_static:      false,
+            no_std:              false,
         };
     }
 
@@ -151,6 +158,7 @@ type struct CompilerConfig {
             profile_override:    "",
             incremental:         true,
             release_static:      false,
+            no_std:              false,
         };
     }
 }
@@ -365,6 +373,35 @@ function lock_path_for(consumer_root: string) -> string {
         return "cryoconfig.lock";
     }
     return format("%s/cryoconfig.lock", consumer_root);
+}
+
+/// Final path component of `path` ("src/hello.cryo" -> "hello.cryo").
+/// Both separators are recognized so native Windows paths
+/// ("src\hello.cryo") split the same way.  Used by `compile_file` to
+/// synthesize the entry point of a single-file project.
+function file_basename(path: string) -> string {
+    const len: i64 = intrinsics::strlen(path) as i64;
+    mut last_sep: i64 = -1;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (path[i] == '/' || path[i] == '\\') { last_sep = i; }
+    }
+    if (last_sep < 0) { return path; }
+    return path.substr(last_sep + 1, len - last_sep - 1);
+}
+
+/// `file_basename` minus its extension ("src/hello.cryo" -> "hello").
+/// A leading dot is not treated as an extension separator, so a
+/// ".hidden" file keeps its full name.  Used by `compile_file` to
+/// derive the synthesized project (and therefore artifact) name.
+function file_stem(path: string) -> string {
+    const base: string = file_basename(path);
+    const len: i64 = intrinsics::strlen(base) as i64;
+    mut last_dot: i64 = -1;
+    for (mut i: i64 = 0; i < len; i++) {
+        if (base[i] == '.') { last_dot = i; }
+    }
+    if (last_dot <= 0) { return base; }
+    return base.substr(0, last_dot);
 }
 
 // Self-contained monotonic clock for `CRYO_TIMINGS` phase profiling.
@@ -598,6 +635,25 @@ type struct CompilerInstance {
 
 
     /// Compile a single source file with stdlib linking and prelude.
+    ///
+    /// Implemented as a synthesized one-entry project: the file's
+    /// directory becomes the project root, the file becomes the entry
+    /// point, and the build routes through the same multi-module
+    /// orchestrator real cryoconfig projects use.  That is what makes
+    /// the stdlib visible here: the old one-module pipeline never ran
+    /// module discovery, so the AutoImport-injected `import
+    /// std::prelude` resolved against an empty module graph and every
+    /// stdlib symbol (`printf`, `String`, ...) failed with E0202.
+    /// Project mode compiles the std modules into the graph like any
+    /// other import, so a program behaves identically whether it is
+    /// built as `cryo build hello.cryo` or as a one-file project.
+    ///
+    /// Artifacts follow the project layout (`<dir>/build/<stem>` plus
+    /// the per-profile cache), and a `-o PATH` override is honored on
+    /// top of it: the entry module's Object/Asm/IRText artifact, or a
+    /// mirror of the linked executable, lands at PATH (see
+    /// `run_object_emission` / `run_linking`).  `--no-std` opts out of
+    /// the stdlib entirely for freestanding single files.
     compile_file(&this, source: string) -> CompilationResult {
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
         if (this.config.debug) {
@@ -605,34 +661,43 @@ type struct CompilerInstance {
         }
 
         if (!File::exists(source)) {
-            LOG_DEBUG(LogComponent::General, "[Compiler] Error: File not found: %s", source);
+            fmt::eprintln(f"error: file not found: {source}");
             return CompilationResult::failed(1, 0);
         }
 
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
-        ctx.debug_mode = this.config.debug;
-        // Single-file has no cryoconfig; honor a `--opt-level=N` override
-        // when present, otherwise keep the default O2 (ctx.opt_level == 2).
-        if (this.config.opt_level_override >= 0) {
-            mut lvl: i32 = this.config.opt_level_override;
-            if (lvl > 3) { lvl = 3; }
-            ctx.opt_level = lvl as u32;
+        mut config: ProjectConfig = ProjectConfig::default();
+        config.project_root = source.parent_dir();
+        config.entry_point  = file_basename(source);
+        config.project_name = file_stem(source);
+        config.no_std       = this.config.no_std;
+        config.emit_llvm    = this.config.emit_llvm;
+        // Artifacts land NEXT TO THE SOURCE FILE, not in the invoking
+        // directory: output_dir is consumed as-is by the build-layout
+        // helpers (profile_dir / bin_artifact_path), so a relative
+        // "build" would resolve against the CWD and `cryo build
+        // sub/hello.cryo` would scatter its build tree away from the
+        // file it belongs to.
+        if (intrinsics::strlen(config.project_root) > 0
+                && intrinsics::strcmp(config.project_root, ".") != 0) {
+            config.output_dir = format("%s/build", config.project_root);
         }
-        ctx.emit_debug_info = this.config.emit_debug_info;
-        ctx.target_triple = this.config.target_triple_override;
-        ctx.output_path_override = this.config.output_path_override;
-        ctx.output_kind          = this.config.output_kind;
-        // Resolve stdlib root so the Linking pass can find libcryo.a
-        // when single-file Exe (`-o foo`) shells out to `cc`.  Failure
-        // to resolve isn't fatal here; non-Exe single-file output
-        // (object/asm/IR text) doesn't link at all, and Exe will only
-        // fail at link time if the program actually references stdlib
-        // symbols.
-        mut tried: string[] = [];
-        // Single-file mode: no cryoconfig, so the cryoconfig override is empty.
-        ctx.stdlib_root = resolve_stdlib_root(this.config.stdlib_path_override, "", "", &tried);
-        mut pipeline: PassRegistry = PassRegistry::build_standard_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
+        // CLI `--target=TRIPLE`; `--opt-level` / `-g` / profile flags
+        // flow through `this.config` inside compile_project_with_ctx,
+        // exactly as they do for a cryoconfig build.
+        if (intrinsics::strlen(this.config.target_triple_override) > 0) {
+            config.target_triple = this.config.target_triple_override;
+        }
+        mut result: CompilationResult = this.compile_project_with_config(config);
+        // `-o PATH`: the user's artifact lives at PATH (the mirrored
+        // executable for Exe; the entry module's object/asm/IR dump for
+        // the other kinds).  Report that as the build's output so
+        // `Compiled -> ...` and any caller that consumes the result
+        // point at the user's path, not the internal build layout.
+        if (result.success
+                && intrinsics::strlen(this.config.output_path_override) > 0) {
+            result.output_path = this.config.output_path_override;
+        }
+        return result;
     }
 
     /// Compile a single source file in raw mode (no stdlib, no prelude).
@@ -849,6 +914,13 @@ type struct CompilerInstance {
                 && intrinsics::strlen(this.config.target_triple_override) > 0) {
             config.target_triple = this.config.target_triple_override;
         }
+        // CLI `--no-std` forces a freestanding build on top of whatever
+        // the cryoconfig says.  One-directional: the flag can only turn
+        // no_std ON (there is no `--std` to override a project that
+        // declared itself freestanding).
+        if (this.config.no_std) {
+            config.no_std = true;
+        }
 
         // Mirror cryoconfig `debug = true` into the global compiler debug
         // gate so the [Tag] trace printfs fire.  Only flips it ON; CLI
@@ -994,6 +1066,15 @@ type struct CompilerInstance {
 
         const root_path: string = config.discovery_root_path();
         ctx.debug_mode = this.config.debug;
+
+        // Single-file `-o PATH` redirect.  compile_file sets these on
+        // the CompilerConfig; cryoconfig project builds leave them
+        // empty.  ObjectEmission applies the override to the ENTRY
+        // module's artifact and Linking mirrors the executable to the
+        // override path (Exe) or skips the link entirely (Object /
+        // Asm / IRText).
+        ctx.output_path_override = this.config.output_path_override;
+        ctx.output_kind          = this.config.output_kind;
 
         // Resolve the build profile. Precedence: CLI `--release`/`--dev`/
         // `--profile=NAME` > cryoconfig `[profile] default` > built-in
@@ -1292,8 +1373,13 @@ type struct CompilerInstance {
         // passes so every stage does a full, comparable rebuild) and on
         // `codegen_enabled()` (LSP mode needs the full AST and produces no
         // artifact, so it always falls through).
+        // `-o PATH` builds always run: the override artifact lives
+        // outside the manifest's artifact list, so the short-circuit
+        // could otherwise report "up to date" while the user's deleted
+        // or stale `-o` output is never regenerated.
         const do_incremental: boolean =
-            this.config.incremental && ctx.mode.codegen_enabled();
+            this.config.incremental && ctx.mode.codegen_enabled()
+            && intrinsics::strlen(this.config.output_path_override) == 0;
         mut mod_entries: BuildManifest::ModuleEntry[] = [];
         mut manifest_artifacts: string[] = [];
         mut manifest_stdlib_archive: string = "";
