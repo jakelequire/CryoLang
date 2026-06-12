@@ -186,15 +186,12 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **Language Server (`bin/cryolsp`):** hover, go-to-definition, completion
   (member + scope-resolution with trigger characters `.` and `:`),
   semantic tokens, code actions, code lenses, push diagnostics.
-- **CryoAnalyzer VS Code extension:** custom `cryo-diagnostic:` virtual  A key design decision
-
-  Per-module incremental skip is unsound for Cryo because Phase 6a monomorphizes across all modules before codegen — a module's .o isn't a pure function of
-  its own source. So I implemented the sound, high-value form: a whole-build fingerprint short-circuit, with the manifest carrying per-module hashes as
-  groundwork for a future per-module engine.
+- **CryoAnalyzer VS Code extension:** custom `cryo-diagnostic:` virtual
   document scheme with themed rendering, code-lens/code-action wiring,
   LSP server auto-discovery.
 - **CI:** `make cryo` + smoke-test + `make test` on every PR and push;
-  `make selfhost-check` on push-to-main.
+  `make selfhost-check` (stage-3 == stage-4 byte-identity) on every PR
+  and push as well.
 
 ### Diagnostics
 
