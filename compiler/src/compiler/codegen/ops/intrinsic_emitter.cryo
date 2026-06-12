@@ -511,14 +511,16 @@ type struct IntrinsicEmitter {
             //    width from the va_list `va` points at.  `args[0]` is the
             //    va_list pointer (the prologue's `[24 x i8]` alloca); not
             //    auto-deref'd (intrinsic_src_type returns null).  Pointer and
-            //    string both read an opaque `ptr`. --
-            IntrinsicKind::VaArgI32    => { this.builder.build_va_arg(args[0], LType::i32(), "va.arg") }
-            IntrinsicKind::VaArgU32    => { this.builder.build_va_arg(args[0], LType::i32(), "va.arg") }
-            IntrinsicKind::VaArgI64    => { this.builder.build_va_arg(args[0], LType::i64(), "va.arg") }
-            IntrinsicKind::VaArgU64    => { this.builder.build_va_arg(args[0], LType::i64(), "va.arg") }
-            IntrinsicKind::VaArgF64    => { this.builder.build_va_arg(args[0], LType::f64(), "va.arg") }
-            IntrinsicKind::VaArgPtr    => { this.builder.build_va_arg(args[0], LType::pointer_to(LType::i8()), "va.arg") }
-            IntrinsicKind::VaArgString => { this.builder.build_va_arg(args[0], LType::pointer_to(LType::i8()), "va.arg") }
+            //    string both read an opaque `ptr`.  Lowering is per-ABI; see
+            //    `emit_va_arg` for why SysV must not use the `va_arg`
+            //    instruction. --
+            IntrinsicKind::VaArgI32    => { this.emit_va_arg(args[0], LType::i32(), false) }
+            IntrinsicKind::VaArgU32    => { this.emit_va_arg(args[0], LType::i32(), false) }
+            IntrinsicKind::VaArgI64    => { this.emit_va_arg(args[0], LType::i64(), false) }
+            IntrinsicKind::VaArgU64    => { this.emit_va_arg(args[0], LType::i64(), false) }
+            IntrinsicKind::VaArgF64    => { this.emit_va_arg(args[0], LType::f64(), true) }
+            IntrinsicKind::VaArgPtr    => { this.emit_va_arg(args[0], LType::pointer_to(LType::i8()), false) }
+            IntrinsicKind::VaArgString => { this.emit_va_arg(args[0], LType::pointer_to(LType::i8()), false) }
 
             // -- vprintf(fmt, va) / vfprintf(file, fmt, va): forward the
             //    va_list bucket through the ABI seam (by address on SysV,
@@ -756,6 +758,113 @@ type struct IntrinsicEmitter {
         const fty: LType = LType::function_type(LType::i32(), buf, 3, false);
         intrinsics::free(buf);
         return this.llvm_module.add_function("vfprintf", fty);
+    }
+
+    /// Pluck the next variadic argument of type `ty` from the va_list `va`
+    /// points at.
+    ///
+    /// Win64 lowers through the LLVM `va_arg` INSTRUCTION: its va_list is a
+    /// bare `char*` and the backend's align-and-bump expansion is correct at
+    /// every -O level.  SysV-amd64 must NOT use the instruction: the X86
+    /// backend's -O0 expansion reloads the va_list pointer from a stack slot
+    /// that is never written (reproduced with a bare `va_arg ptr %p, i64`
+    /// through `llc-20 -O0`: the in-register branch does an "8-byte Reload"
+    /// from an unspilled slot and dereferences garbage).  At -O1+ the pointer
+    /// happens to stay in a register, which is why the bug only bites
+    /// unoptimized builds.  clang never emits the instruction for SysV for
+    /// exactly this reason; mirror it with the inline register-save-area
+    /// walk in `emit_va_arg_sysv`.
+    emit_va_arg(mut &this, va: LValue, ty: LType, is_fp: boolean) -> LValue {
+        if (this.abi.is_win64()) {
+            return this.builder.build_va_arg(va, ty, "va.arg");
+        }
+        return this.emit_va_arg_sysv(va, ty, is_fp);
+    }
+
+    /// Inline SysV-amd64 `va_arg` expansion (the same IR clang emits).
+    ///
+    /// `__va_list_tag` layout (24 bytes):
+    ///   +0  gp_offset: u32          next GP slot in reg_save_area (..48)
+    ///   +4  fp_offset: u32          next FP slot (48..176)
+    ///   +8  overflow_arg_area: ptr  stack-passed arguments
+    ///   +16 reg_save_area: ptr      spilled rdi..r9 then xmm0..xmm7
+    ///
+    /// GP class (ints/pointers): 8-byte register slots, the next argument is
+    /// in a register while gp_offset <= 40 (48 - 8).  FP class (f64):
+    /// 16-byte slots starting at +48, in a register while fp_offset <= 160
+    /// (176 - 16).  Either class bumps the overflow (stack) cursor by 8 - an
+    /// f64 occupies a single eightbyte on the stack.
+    emit_va_arg_sysv(mut &this, va: LValue, ty: LType, is_fp: boolean) -> LValue {
+        const i32_ty: LType = LType::i32();
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+
+        mut off_byte: u64 = 0;    // gp_offset lives at +0
+        mut limit:    u64 = 40;   // last gp_offset with a free GP slot
+        mut step:     u64 = 8;    // GP register slot size
+        if (is_fp) { off_byte = 4; limit = 160; step = 16; }
+
+        const fn_val: LValue = this.builder.get_insert_block().get_parent();
+        const in_reg_bb: LBasicBlock = LBasicBlock::append(fn_val, "va.in_reg");
+        const in_mem_bb: LBasicBlock = LBasicBlock::append(fn_val, "va.in_mem");
+        const end_bb:    LBasicBlock = LBasicBlock::append(fn_val, "va.end");
+
+        // off = *(u32*)(va + off_byte); fits = off <= limit
+        const off_p: LValue = this.gep_byte_const(va, off_byte, "va.off_p");
+        const off: LValue = this.builder.build_load(i32_ty, off_p, "va.off");
+        const fits: LValue = this.builder.build_icmp(
+            LIntPredicate::ULE, off,
+            LType::const_int(i32_ty, limit, false), "va.fits");
+        this.builder.build_cond_br(fits, in_reg_bb, in_mem_bb);
+
+        // in_reg: addr = reg_save_area + off; *off_p = off + step
+        this.builder.position_at_end(in_reg_bb);
+        const rsa_p: LValue = this.gep_byte_const(va, 16, "va.rsa_p");
+        const rsa: LValue = this.builder.build_load(ptr_ty, rsa_p, "va.rsa");
+        const reg_addr: LValue = this.gep_byte_value(rsa, off, "va.reg_addr");
+        const bumped: LValue = this.builder.build_add(
+            off, LType::const_int(i32_ty, step, false), "va.off.next");
+        this.builder.build_store(bumped, off_p);
+        this.builder.build_br(end_bb);
+
+        // in_mem: addr = overflow_arg_area; overflow_arg_area += 8
+        this.builder.position_at_end(in_mem_bb);
+        const ovf_p: LValue = this.gep_byte_const(va, 8, "va.ovf_p");
+        const mem_addr: LValue = this.builder.build_load(ptr_ty, ovf_p, "va.ovf");
+        const ovf_next: LValue = this.gep_byte_const(mem_addr, 8, "va.ovf.next");
+        this.builder.build_store(ovf_next, ovf_p);
+        this.builder.build_br(end_bb);
+
+        // end: load the argument through phi(addr)
+        this.builder.position_at_end(end_bb);
+        const addr: LValue = this.builder.build_phi(ptr_ty, "va.addr");
+        const vals_buf: void* = intrinsics::malloc(16);
+        const vals: void** = vals_buf as void**;
+        const blks_buf: void* = intrinsics::malloc(16);
+        const blks: void** = blks_buf as void**;
+        vals[0] = reg_addr.raw;
+        blks[0] = in_reg_bb.raw;
+        vals[1] = mem_addr.raw;
+        blks[1] = in_mem_bb.raw;
+        phi_add_incoming(addr, vals_buf, blks_buf, 2);
+        intrinsics::free(vals_buf);
+        intrinsics::free(blks_buf);
+        return this.builder.build_load(ty, addr, "va.arg");
+    }
+
+    /// `base + byte_off` as an `i8` GEP with a constant offset.
+    gep_byte_const(mut &this, base: LValue, byte_off: u64, name: string) -> LValue {
+        return this.gep_byte_value(
+            base, LType::const_int(LType::i64(), byte_off, false), name);
+    }
+
+    /// `base + off` as an `i8` GEP where `off` is an integer LValue.
+    gep_byte_value(mut &this, base: LValue, off: LValue, name: string) -> LValue {
+        const idx_buf: void* = intrinsics::malloc(8);
+        const idx: void** = idx_buf as void**;
+        idx[0] = off.raw;
+        const out: LValue = this.builder.build_gep(LType::i8(), base, idx_buf, 1, name);
+        intrinsics::free(idx_buf);
+        return out;
     }
 
     /// Emit `call i32 @vprintf(fmt, forward_va_list(va))`.  The va_list

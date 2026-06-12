@@ -262,9 +262,5 @@ authoritative list.
 - Macros / user-defined `![attr]` directives.
 - macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See
   **Target triples** above for the supported set.
-- Known codegen bug: `std::ffi` `VaArgs.next<T>()` (C-style varargs readout)
-  miscompiles at `optimize = O0` (segfault); `mem2reg` masks it at O1 and
-  above. Build code that reads varargs with `O1`/`O2` (the repo test suite
-  pins `O2` for this reason) until the fix lands in a post-1.0 patch.
 
 [1.0.0]: https://github.com/jakelequire/CryoLang/releases/tag/v1.0.0

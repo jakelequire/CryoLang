@@ -6292,6 +6292,22 @@ public:
         // to a clean unresolved-call diagnostic instead of an ICE; the
         // explicit `Adapter::new(...)` construction path is unaffected.
         if (!fn_node.resolved_return_type.is_valid()) { return; }
+        // Never stomp an existing pin with a GENERIC template's mangle.
+        // When the matched method is still a template (`next<T>`), the
+        // mangle below bakes in `1T` generic-param placeholders - a symbol
+        // that is never emitted.  An already-valid `resolved_callee` is the
+        // monomorphizer's exact-spec pin, and for specs that differ ONLY in
+        // their bound generic / return type (`va.next<i64>()` vs
+        // `va.next<f64>()` - same receiver, same arity, no value args) it is
+        // the only thing that disambiguates them: codegen's
+        // `<recv>::<method>` + arity fallback keys them identically and
+        // silently picks one spec for every call site.  Overwriting here is
+        // what turned every `VaArgs::next<T>` readout into the i64 spec.
+        // Re-pinning stays allowed for non-generic methods (sema refining a
+        // stale pin) and first-pass template pins (nothing pinned yet).
+        if (fn_node.generic_params.length > 0 && call.resolved_callee.is_valid()) {
+            return;
+        }
         const type_qn: QualifiedName = QualifiedName::single(
             this.intern, owner_qname_str);
         const recv_kind: ReceiverKind = method_receiver_kind(

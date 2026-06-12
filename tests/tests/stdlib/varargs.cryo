@@ -11,6 +11,7 @@ namespace CryoTests::Tests::Stdlib::VaArgsT;
 
 import std::core::result;
 import std::core::varargs;
+import std::core::intrinsics;
 import std::collections::str;
 import std::test::error;
 import std::test::assert;
@@ -60,4 +61,70 @@ function zero_varargs_is_well_formed() -> Result<(), TestError> {
     // the va_list cleanly.
     const s: i64 = sum_i64(0);
     return expect(s == 0, Str::new("VaArgs zero-arg sum should be 0"));
+}
+
+// --- Register-save-area edge coverage.  SysV-amd64 passes the first 6 GP
+// args in registers (one is `count` here) and the first 8 FP args in
+// xmm0-7; everything past that comes from the stack (the va_list's
+// overflow_arg_area).  These exercise BOTH branches of the inline va_arg
+// expansion the compiler emits (see IntrinsicEmitter::emit_va_arg_sysv).
+
+// Sum `count` f64 varargs (FP class: fp_offset bookkeeping, 16-byte
+// register slots, 8-byte stack slots).
+function sum_f64(count: i32, args...) -> f64 {
+    mut va: VaArgs = VaArgs::new(args);
+    mut total: f64 = 0.0;
+    mut i: i32 = 0;
+    while (i < count) {
+        const v: f64 = va.next();
+        total = total + v;
+        i = i + 1;
+    }
+    return total;
+}
+
+![test]
+function gp_overflow_args_read_from_stack() -> Result<(), TestError> {
+    // 10 i64 varargs: 5 arrive in registers (count takes the first GP
+    // slot), 5 from the stack.
+    const s: i64 = sum_i64(10, 1 as i64, 2 as i64, 3 as i64, 4 as i64,
+                           5 as i64, 6 as i64, 7 as i64, 8 as i64,
+                           9 as i64, 10 as i64);
+    return expect(s == 55, Str::new("VaArgs GP overflow sum mismatch"));
+}
+
+![test]
+function fp_args_read_from_xmm_and_stack() -> Result<(), TestError> {
+    // 10 f64 varargs: 8 arrive in xmm0-7, 2 from the stack.  Small-int
+    // doubles sum exactly, so == is safe.
+    const f: f64 = sum_f64(10, 1.0, 2.0, 3.0, 4.0, 5.0,
+                           6.0, 7.0, 8.0, 9.0, 10.0);
+    return expect(f == 55.0, Str::new("VaArgs FP class sum mismatch"));
+}
+
+// Read an i64, an f64, a string, and an i32 from one va_list.  Each
+// `next<T>()` must dispatch to ITS OWN specialization: the four specs share
+// receiver, name, and arity and differ only in return type, so this is the
+// regression test for the resolved-callee stomp where every call site
+// silently routed to one spec (reading f64s through the GP path and
+// shifting every subsequent read off by a slot).
+function read_mixed(args...) -> i64 {
+    mut va: VaArgs = VaArgs::new(args);
+    const a: i64 = va.next<i64>();
+    const x: f64 = va.next<f64>();
+    const s: string = va.next<string>();
+    const b: i32 = va.next<i32>();
+    mut ok: i64 = 0;
+    if (a == 40) { ok = ok + 1; }
+    if (x == 1.5) { ok = ok + 1; }
+    if (intrinsics::strcmp(s, "hi") == 0) { ok = ok + 1; }
+    if (b == 7) { ok = ok + 1; }
+    return ok;
+}
+
+![test]
+function mixed_types_dispatch_to_distinct_specs() -> Result<(), TestError> {
+    const msg: string = "hi";
+    const ok: i64 = read_mixed(40 as i64, 1.5, msg, 7);
+    return expect(ok == 4, Str::new("VaArgs mixed-type readout mismatch (per-type next<T> dispatch)"));
 }
