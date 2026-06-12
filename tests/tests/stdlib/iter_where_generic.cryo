@@ -1,0 +1,73 @@
+///! Regression: where-bound-derived impl generic used to type a struct
+///! literal in an impl method BODY.
+///!
+///! `DupIter<I>` carries no element parameter of its own; the element type
+///! `A` is introduced by the impl's `where I: Iterator<A>` clause.  The
+///! `next` body constructs `Pair<A, A> { ... }`.  Before the monomorphizer
+///! propagated where-bound-derived generics into impl bodies, that literal's
+///! `generic_args` kept `A` unresolved, the literal collapsed to the bare
+///! `Pair` template (empty field layout), and codegen silently emitted no
+///! field stores - so the pair fields read uninitialized stack (a silent
+///! value-corruption miscompile, no diagnostic).
+///!
+///! This pins the fix: the pair fields hold the duplicated source value.
+///! (The companion codegen guard turns the failure mode into a hard E0638
+///! instead of corrupting silently, exercised via the compile-fail suite.)
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IterWhereGenericT;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::core::ops;
+import std::collections::pair;
+import std::test::error;
+import std::test::assert;
+
+// `A` is NOT a struct parameter - it is derived from the impl where-bound.
+type struct DupIter<I> {
+    inner: I;
+}
+
+implement<I, A> trait Iterator<Pair<A, A>> for struct DupIter<I>
+where I: Iterator<A> {
+    next(mut &this) -> Option<Pair<A, A>> {
+        match (this.inner.next()) {
+            Option::Some(v) => {
+                return Option::Some(Pair<A, A> { first: v, second: v });
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+![test]
+function dup_iter_duplicates_each_element() -> Result<(), TestError> {
+    // Range(5,8) -> DupIter yields (5,5), (6,6), (7,7).
+    mut a: Range<i32> = Range<i32>::new(5, 8);
+    mut z: DupIter<Range<i32>> = DupIter<Range<i32>> { inner: a };
+
+    mut expected: i32 = 5;
+    mut produced: i32 = 0;
+    loop {
+        match (z.next()) {
+            Option::Some(p) => {
+                // Both fields must equal the (duplicated) source value, not
+                // stack garbage.
+                match (expect_eq(p.first, expected)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                match (expect_eq(p.second, expected)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                expected = expected + 1;
+                produced = produced + 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    // Iteration count must still be correct (it always was, even when values
+    // were garbage).
+    return expect_eq(produced, 3);
+}

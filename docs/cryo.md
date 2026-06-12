@@ -451,6 +451,13 @@ declaration* it introduces an implement block — the two never overlap.)
   mut it: implement Iterator<i32> = some_non_iterator;  // E0200
   ```
 
+  Because the binding's *visible* type is the opaque trait, not the concrete
+  cursor, you cannot apply a combinator to such a local — `it.take(2)` has no
+  concrete receiver to specialise the adapter against. Chain the combinator on
+  the producing expression instead (`arr.iter().take(2).count()`), or bind to
+  the concrete adapter type when you need a named local
+  (`mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);`).
+
 To accept *any* iterator as a **parameter**, use a generic with a trait bound
 instead — that is the tool for the input side:
 
