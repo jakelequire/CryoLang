@@ -38,6 +38,13 @@ function pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
     return ((type_sym.id as u64) << 32) | (method_sym.id as u64);
 }
 
+/// Pack an implicit-converter registry key from the argument and return
+/// TypeRef ids.  Mirrors `pack_method_key`'s 32-bit interleave; arena ids
+/// fit comfortably in 32 bits in practice.
+function pack_converter_key(arg_id: u64, ret_id: u64) -> u64 {
+    return (arg_id << 32) | (ret_id & 0xFFFFFFFF);
+}
+
 
 /// Decode the receiver kind for a method given its AST.  This is the
 /// single source of truth used by every mangler call site so the
@@ -140,6 +147,15 @@ type struct DeclarationIndex {
     // to the monomorphized Array_T struct without name reconstruction.
     array_elem_to_type:  HashMap<u64, u32>;
 
+    // Implicit-conversion registry: Packed(arg_type_id, return_type_id) ->
+    // converter function bare-name SymbolStr.id.  Populated in TypeResolution
+    // from `![implicit]` single-param non-generic free functions.  Sema reads
+    // it at a type-incompatible call argument to synthesize a converter call
+    // (e.g. `string` -> `String` via `cstr_to_string`) instead of emitting
+    // E0214.  Keyed on the post-DefaultExpansion canonical arena ids, which
+    // are exactly the ids the call site sees, so no re-canonicalization.
+    implicit_converters: HashMap<u64, u32>;
+
     // Function overload registry: parallel arrays keyed by function
     // name (SymbolStr.id), storing every registered FunctionType TypeRef
     // and its overload-specific mangled name.  `func_type_refs` and
@@ -191,6 +207,7 @@ type struct DeclarationIndex {
             global_vars:         HashMap<u32, TypeRef>::new(),
             type_reverse:        HashMap<u64, u32>::new(),
             array_elem_to_type:  HashMap<u64, u32>::new(),
+            implicit_converters: HashMap<u64, u32>::new(),
             module_funcs:        [],
             module_types:        [],
             module_global_keys:       [],
@@ -217,6 +234,18 @@ type struct DeclarationIndex {
     register_function(mut &this, name: SymbolStr, return_type: TypeRef) -> void {
         const h: u64 = hash_int(name.id as u64);
         this.func_returns.insert(name.id, return_type);
+    }
+
+    /// Register an implicit-conversion converter `(arg_ty) -> ret_ty`.
+    /// `name_id` is the converter function's bare-name SymbolStr.id.
+    /// First-wins so a single converter per (arg, ret) pair is deterministic
+    /// regardless of module load order.
+    register_implicit_converter(mut &this, arg_id: u64, ret_id: u64,
+                                name_id: u32) -> void {
+        const key: u64 = pack_converter_key(arg_id, ret_id);
+        if (!this.implicit_converters.contains_key(&key)) {
+            this.implicit_converters.insert(key, name_id);
+        }
     }
 
     /// Register a function's FunctionType TypeRef (full signature in the arena).
@@ -605,6 +634,17 @@ type struct DeclarationIndex {
         return match (this.method_returns.get(&key)) {
             Option::Some(val) => { val }
             Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// Look up an implicit converter for `(arg_ty) -> ret_ty` by their
+    /// canonical arena ids.  Returns the converter's bare-name SymbolStr,
+    /// or empty if none is registered.
+    lookup_implicit_converter(&this, arg_id: u64, ret_id: u64) -> SymbolStr {
+        const key: u64 = pack_converter_key(arg_id, ret_id);
+        return match (this.implicit_converters.get(&key)) {
+            Option::Some(id) => { SymbolStr::from_id(id) }
+            Option::None     => { SymbolStr::empty() }
         };
     }
 
