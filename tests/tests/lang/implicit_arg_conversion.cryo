@@ -1,0 +1,101 @@
+///! `![implicit]` argument conversions.
+///!
+///! A free function marked `![implicit]` with a single non-generic
+///! parameter is registered as a converter `(param) -> return`.  When a
+///! call argument is otherwise type-incompatible with the parameter, the
+///! compiler synthesizes a call to the matching converter instead of
+///! emitting E0214.  The stdlib ships `string -> String` and
+///! `string -> Str` converters, so a string literal flows into a `String`
+///! or `Str` parameter; user code can register its own converters for any
+///! type, proving the mechanism is attribute-driven, not String-specific.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ImplicitArgConversion;
+
+import std::core::result;
+import std::collections::string;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// -- Free-function argument conversion -----------------------------------
+
+/// Takes an owned `String` by value (the converter materializes one and
+/// moves it in; the callee drops it at return).
+function string_len(s: String) -> i32 {
+    return s.length() as i32;
+}
+
+/// Takes a borrowed `Str` view (no ownership transfer).
+function str_len(s: Str) -> i32 {
+    return s.length() as i32;
+}
+
+![test]
+function string_literal_converts_to_owned_string() -> Result<(), TestError> {
+    // `"hello"` is `string`; the gate sees `string` vs `String`, finds the
+    // stdlib `cstr_to_string` converter, and rewrites the argument.
+    return expect_eq(string_len("hello"), 5);
+}
+
+![test]
+function string_literal_converts_to_str_view() -> Result<(), TestError> {
+    return expect_eq(str_len("abcd"), 4);
+}
+
+/// An exact `Str` argument must resolve WITHOUT going through a converter
+/// (the gate only fires on an incompatible argument).  Built explicitly so
+/// the argument type is already `Str`.
+![test]
+function exact_str_argument_needs_no_conversion() -> Result<(), TestError> {
+    const view: Str = Str::from_cstr("exact");
+    return expect_eq(str_len(view), 5);
+}
+
+// -- User-defined converter for a custom type ----------------------------
+
+type struct Celsius {
+    degrees: i32;
+}
+
+/// User-registered converter `i32 -> Celsius`.  Proves the feature is
+/// attribute-driven and not hard-wired to the string types.
+![implicit]
+function int_to_celsius(x: i32) -> Celsius {
+    return Celsius { degrees: x };
+}
+
+function read_celsius(c: Celsius) -> i32 {
+    return c.degrees;
+}
+
+![test]
+function user_converter_bridges_int_to_struct() -> Result<(), TestError> {
+    // `42` is `i32`; `read_celsius` wants `Celsius`; the user converter
+    // bridges it.
+    return expect_eq(read_celsius(42), 42);
+}
+
+// -- Method-argument conversion ------------------------------------------
+
+type struct Tally {
+    total: i32;
+
+    static new() -> Tally {
+        return Tally { total: 0 };
+    }
+
+    /// Method parameter is `Str`; a `string`-literal argument at the call
+    /// site is bridged by the `cstr_to_str` converter.
+    add(mut &this, label: Str) -> void {
+        this.total = this.total + (label.length() as i32);
+    }
+}
+
+![test]
+function method_argument_converts_from_literal() -> Result<(), TestError> {
+    mut t: Tally = Tally::new();
+    t.add("abc");     // string -> Str
+    t.add("de");      // string -> Str
+    return expect_eq(t.total, 5);
+}
