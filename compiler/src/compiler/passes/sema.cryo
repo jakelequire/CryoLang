@@ -2048,11 +2048,28 @@ public:
             // satisfies the declared trait bounds just below.
             const imp_ann: ImplTraitAnnotation* =
                 this.impl_trait_annotation_of(var_node.type_annotation);
+            // A concrete annotation that the type resolver could not turn into
+            // a TypeRef (`var_node.type_annotation != null` but resolution above
+            // yielded invalid) - while the initializer DID resolve to a concrete
+            // type - is recovered from the initializer, exactly as the opaque
+            // `implement Trait` / lambda / for-in cases are.  This is NOT type
+            // inference: the user wrote the type, but the resolver can't
+            // currently instantiate every well-formed nested generic annotation
+            // (e.g. `MapIter<TakeIter<Range<i32>>, i32, i32>`, whose first arg is
+            // itself a where-bound adapter).  A genuinely undefined annotation is
+            // already rejected upstream by E0203 in name resolution, so this only
+            // fires for names that exist but the resolver couldn't fully build.
+            // Without it the binding's AST `resolved_type` stays invalid, codegen
+            // skips its alloca, and a later method call reads a null receiver.
+            // Sema's own scope table already falls back to `init_type` here (see
+            // the registration block below); this keeps the AST node consistent
+            // with that so codegen agrees.
             if (!var_node.has_resolved_type() && init_type.is_valid()
                     && var_node.initializer != null
                     && ((var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression
                         || var_node.is_auto
-                        || imp_ann != null)) {
+                        || imp_ann != null
+                        || var_node.type_annotation != null)) {
                 var_node.resolved_type = init_type;
             }
             if (imp_ann != null && init_type.is_valid()) {
@@ -5013,7 +5030,32 @@ public:
             // foundation for precise direct-call overload selection.
             this.resolve_method_overload(call, callee as MemberAccessNode*);
             this.check_method_call_arg_types(call, callee as MemberAccessNode*);
-            return this.resolve_method_call(callee as MemberAccessNode*);
+            const mret: TypeRef = this.resolve_method_call(callee as MemberAccessNode*);
+            // `resolve_method_call` types this call by a receiver+name lookup
+            // that cannot distinguish two specializations of the same generic
+            // method on the same receiver type - e.g. `zip<J>` with
+            // J=Range<i32> and J=Range<u64> both register a concrete sibling
+            // under `Range<i32>::zip`, and the lookup returns whichever it
+            // finds first.  `resolve_method_overload` already selected the
+            // arg-correct spec into `call.resolved_method`; when that spec is
+            // concrete (its generics fully bound) and its return type disagrees
+            // with the name lookup, it is the authoritative answer.  Without
+            // this, a chained consumer (`a.zip(b).count()`) reads the wrong
+            // sibling's return type for its receiver and dispatches `count` on
+            // the wrong concrete adapter - a silent miscompile.  Gated on a
+            // genuine disagreement so non-ambiguous calls are untouched.
+            if (mret.is_valid() && call.resolved_method != null) {
+                const ovl_rm: MethodNode* = call.resolved_method as MethodNode*;
+                if (ovl_rm != null && ovl_rm.func != null
+                        && ovl_rm.func.generic_params.length == 0
+                        && ovl_rm.func.resolved_return_type.is_valid()
+                        && ovl_rm.func.resolved_return_type.id != mret.id) {
+                    const ovl_mem: MemberAccessNode* = callee as MemberAccessNode*;
+                    ovl_mem.set_resolved_type(ovl_rm.func.resolved_return_type);
+                    return ovl_rm.func.resolved_return_type;
+                }
+            }
+            return mret;
         }
         if (callee_node.kind == NodeKind::ScopeResolution) {
             // Phase 5 scope-guard, mirroring the MemberAccess branch:

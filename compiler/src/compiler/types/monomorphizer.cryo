@@ -1336,6 +1336,20 @@ type struct Monomorphizer {
                 // NOT re-enter the resolver, avoiding the re-entrancy that the
                 // where-clause derivation machinery is not safe for here.
                 this.cache_derived_trait_params(decl, &res_ctx);
+                // Rewrite where-bound-derived generics (`A`) inside the impl's
+                // method BODIES.  The clone-time substitution
+                // (`specializer.specialize`) only knew the struct's own params
+                // (`I`), so a body expression typed by a derived generic - a
+                // struct literal `Pair<A, A> { ... }` in a `next` body - still
+                // carries `A` in its `generic_args`.  Its `resolved_type` is
+                // then re-resolved from those args during body resolution
+                // below; with `A` unresolved it collapses to the bare `Pair`
+                // template (empty fields), and codegen silently dropped the
+                // field stores (a value-corruption miscompile - now also
+                // caught by the E0638 guard in codegen_struct_literal).  Run
+                // before `resolve_methods` so the rewritten, now-concrete
+                // `Pair<i32,i32>` args drive body resolution.
+                this.substitute_derived_params_in_method_bodies(decl);
                 this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
             }
             _ => {}
@@ -1605,6 +1619,81 @@ type struct Monomorphizer {
             if (this.type_contains_generic_param(ty)) { continue; }
             if (impl_node.lookup_derived_param(name).is_valid()) { continue; }
             impl_node.add_derived_param(name, ty);
+        }
+    }
+
+    /// Rewrite the impl's where-bound-derived generics (cached on the spec'd
+    /// impl by `cache_derived_trait_params`) inside its method BODIES, by
+    /// re-running `ASTTypeSubstituter` over each body with a `name -> concrete`
+    /// substitution.  The clone-time substitution
+    /// (`specializer.specialize`) is built only from the struct's OWN params
+    /// (`I` in `DupIter<I>`), so a body expression typed by a generic the
+    /// where-clause introduced (`A` in `where I: Iterator<A>`) - e.g. a struct
+    /// literal `Pair<A, A> { ... }` - keeps `A` in its `generic_args`.  When
+    /// body resolution later re-resolves that literal's type, `A` is unbound
+    /// and it collapses to the bare `Pair` template (no concrete layout), so
+    /// codegen can't emit field stores.  Rewriting the body's `A -> i32` here
+    /// makes the literal's args concrete so resolution yields `Pair<i32,i32>`.
+    ///
+    /// Signatures are deliberately NOT touched: they already resolve
+    /// concretely through `res_ctx` in `resolve_methods` (the existing
+    /// machinery).  Self-returning defaults are skipped too - they are
+    /// specialized lazily per call site (`specialize_method`), which re-seeds
+    /// these bindings; rewriting their cloned bodies here would interfere.
+    substitute_derived_params_in_method_bodies(mut &this, decl: ImplBlockNode*) -> void {
+        if (decl == null) { return; }
+        if (decl.derived_param_names.length == 0) { return; }
+        // Build display names + a param-id -> concrete substitution aligned
+        // with `derived_param_names` (same recipe as `specialize_method`).
+        mut arg_displays: SymbolStr[] = [];
+        mut param_ids: u64[] = [];
+        for (mut i: i64 = 0; i < decl.derived_param_names.length; i++) {
+            const ty: TypeRef = decl.derived_param_types[i];
+            mut display: string = "";
+            const arg_t: Type* = this.arena.lookup(ty.id);
+            if (arg_t != null) {
+                const qname: SymbolStr = this.arena.get_qualified_name(ty);
+                if (qname.is_valid()) {
+                    display = this.intern_table.resolve(qname);
+                } else {
+                    display = this.arena.format_display(arg_t);
+                }
+            } else {
+                display = format("unknown_%llu", ty.id);
+            }
+            arg_displays.push(this.intern_table.intern(display));
+            const gp_ref: TypeRef = this.arena.create_generic_param(
+                decl.derived_param_names[i], i as u64);
+            param_ids.push(gp_ref.id);
+        }
+        const subst_val: TypeSubstitution = TypeSubstitution::from_params(
+            &param_ids, &decl.derived_param_types);
+        // Heap-allocate the subst: ASTTypeSubstituter holds the pointer and
+        // attaches `pre_resolved` TypeRefs onto rewritten annotations that
+        // outlive this call.  Mirrors `specialize_method`'s intentional leak.
+        const subst_ptr: TypeSubstitution* =
+            malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
+        *subst_ptr = subst_val;
+        const empty_sym: SymbolStr = SymbolStr::empty();
+        // Copy the node's derived names: the substituter constructor takes
+        // `param_names` by value (moves it), and the node keeps owning its
+        // `derived_param_names` for later self-returning-default specialization.
+        mut pnames: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < decl.derived_param_names.length; i++) {
+            pnames.push(decl.derived_param_names[i]);
+        }
+        // One reusable substituter over every applicable body (its fields are
+        // pure config; `accept` carries no per-run state).
+        mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
+            subst_ptr, this.arena, this.intern_table,
+            empty_sym, empty_sym,
+            pnames, arg_displays);
+        for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
+            const method: MethodNode* = decl.methods[mi];
+            if (method == null || method.func == null) { continue; }
+            if (method.func.is_self_returning_default) { continue; }
+            if (method.func.body == null) { continue; }
+            (method.func.body as ASTNode*).accept(substituter);
         }
     }
 

@@ -23,6 +23,7 @@ import std::core::result;
 import std::core::option;
 import std::core::iter;
 import std::core::ops;
+import std::collections::pair;
 import std::test::error;
 import std::test::assert;
 
@@ -672,4 +673,189 @@ function map_then_chain_concatenates() -> Result<(), TestError> {
     mut r: Range<i32> = Range::new(0, 3);
     mut b: Range<i32> = Range::new(0, 2);
     return expect_eq(r.map(iter_double_i32).chain(b).fold(0, iter_add_i32), 7);
+}
+
+// ============================================================================
+// enumerate - (index, value) pairs as Pair<u64, Item>
+// ============================================================================
+
+![test]
+function enumerate_pairs_index_with_value() -> Result<(), TestError> {
+    // Range(10,13) -> (0,10), (1,11), (2,12).  Assert both halves of each
+    // pair, walking the index and the value in lockstep.
+    mut r: Range<i32> = Range::new(10, 13);
+    mut e: EnumerateIter<Range<i32>, i32> = r.enumerate();
+    mut want_idx: u64 = 0;
+    mut want_val: i32 = 10;
+    mut seen: i32 = 0;
+    loop {
+        match (e.next()) {
+            Option::Some(p) => {
+                match (expect_eq(p.first, want_idx)) {
+                    Result::Ok(_) => { } Result::Err(er) => { return Result::Err(er); }
+                }
+                match (expect_eq(p.second, want_val)) {
+                    Result::Ok(_) => { } Result::Err(er) => { return Result::Err(er); }
+                }
+                want_idx = want_idx + 1;
+                want_val = want_val + 1;
+                seen = seen + 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    return expect_eq(seen, 3);
+}
+
+![test]
+function enumerate_empty_yields_nothing() -> Result<(), TestError> {
+    mut r: Range<i32> = Range::new(5, 5);
+    mut e: EnumerateIter<Range<i32>, i32> = r.enumerate();
+    const first: Option<Pair<u64, i32>> = e.next();
+    return expect_none(&first,
+        Str::new("enumerate over empty range should be immediately empty"));
+}
+
+![test]
+function enumerate_count_matches_length() -> Result<(), TestError> {
+    // enumerate doesn't change the element count.
+    mut r: Range<i32> = Range::new(0, 7);
+    return expect_eq(r.enumerate().count(), 7 as u64);
+}
+
+![test]
+function take_then_enumerate_indexes_capped_run() -> Result<(), TestError> {
+    // take(3) of 0..100, then enumerate -> three pairs (0,0),(1,1),(2,2);
+    // sum first+second over all = (0+0)+(1+1)+(2+2) = 6.  Apply enumerate to
+    // the chained call expression directly (the nested adapter bound to a
+    // typed local then iterated is a separate pre-existing codegen gap,
+    // unrelated to enumerate - same failure with `MapIter<TakeIter<..>>`).
+    mut r: Range<i32> = Range::new(0, 100);
+    mut total: i64 = 0;
+    for (p in r.take(3).enumerate()) {
+        total = total + (p.first as i64) + (p.second as i64);
+    }
+    return expect_eq(total, 6 as i64);
+}
+
+// ============================================================================
+// zip - positional Pair<A, O> over two iterators, stopping at the shorter
+// ============================================================================
+
+![test]
+function zip_pairs_two_ranges() -> Result<(), TestError> {
+    // (0,10), (1,11), (2,12): walk both halves of each pair in lockstep.
+    mut a: Range<i32> = Range::new(0, 3);
+    mut b: Range<i32> = Range::new(10, 13);
+    mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);
+    mut want_a: i32 = 0;
+    mut want_b: i32 = 10;
+    mut seen: i32 = 0;
+    loop {
+        match (z.next()) {
+            Option::Some(p) => {
+                match (expect_eq(p.first, want_a)) {
+                    Result::Ok(_) => { } Result::Err(er) => { return Result::Err(er); }
+                }
+                match (expect_eq(p.second, want_b)) {
+                    Result::Ok(_) => { } Result::Err(er) => { return Result::Err(er); }
+                }
+                want_a = want_a + 1;
+                want_b = want_b + 1;
+                seen = seen + 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    return expect_eq(seen, 3);
+}
+
+![test]
+function zip_stops_at_shorter_side() -> Result<(), TestError> {
+    // left has 5 elements, right has 2 -> exactly 2 pairs.
+    mut a: Range<i32> = Range::new(0, 5);
+    mut b: Range<i32> = Range::new(0, 2);
+    return expect_eq(a.zip(b).count(), 2 as u64);
+}
+
+![test]
+function zip_empty_side_yields_nothing() -> Result<(), TestError> {
+    mut a: Range<i32> = Range::new(0, 4);
+    mut b: Range<i32> = Range::new(7, 7);
+    mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);
+    const first: Option<Pair<i32, i32>> = z.next();
+    return expect_none(&first,
+        Str::new("zip with an empty side should be immediately empty"));
+}
+
+![test]
+function zip_mixed_element_types() -> Result<(), TestError> {
+    // i32 zipped with u64: distinct inner element types in one pair.
+    mut a: Range<i32> = Range::new(0, 5);
+    mut b: Range<u64> = Range::new(20 as u64, 22 as u64);
+    return expect_eq(a.zip(b).count(), 2 as u64);
+}
+
+![test]
+function zip_for_in_sums_both_halves() -> Result<(), TestError> {
+    // (1,10)+(2,11)+(3,12) summed across both halves = 39.
+    mut a: Range<i32> = Range::new(1, 4);
+    mut b: Range<i32> = Range::new(10, 13);
+    mut total: i32 = 0;
+    for (p in a.zip(b)) {
+        total = total + p.first + p.second;
+    }
+    return expect_eq(total, 39);
+}
+
+![test]
+function zip_two_coexisting_combos_each_correct() -> Result<(), TestError> {
+    // Regression: two `zip` specializations that SHARE an inner element type
+    // (both derive A=i32 from a `Range<i32>` receiver) but differ in the other
+    // half (`Range<i32>` vs `Range<u64>`) must each dispatch their consumer
+    // (`count`) on the right concrete adapter.  Before the fix, the first of
+    // the two combinations silently miscompiled to 0 because `count`'s receiver
+    // was typed against the wrong sibling's return type.
+    mut a: Range<i32> = Range::new(0, 3);
+    mut b: Range<i32> = Range::new(10, 13);
+    mut c: Range<i32> = Range::new(0, 5);
+    mut d: Range<u64> = Range::new(20 as u64, 22 as u64);
+    match (expect_eq(a.zip(b).count(), 3 as u64)) {
+        Result::Ok(_) => { } Result::Err(er) => { return Result::Err(er); }
+    }
+    return expect_eq(c.zip(d).count(), 2 as u64);
+}
+
+// ============================================================================
+// nested adapter bound to an explicit-typed local, then method-called
+// ============================================================================
+
+![test]
+function nested_adapter_typed_local_consumes() -> Result<(), TestError> {
+    // Regression: a 2-level nested adapter bound to an explicit-typed local,
+    // then iterated.  Before the fix the typed-local annotation
+    // (`MapIter<TakeIter<Range<i32>>, i32, i32>`, whose first arg is itself a
+    // where-bound adapter) failed to resolve in sema, so the binding's alloca
+    // was skipped and `m.next()` read a null receiver.  Single-level adapter
+    // locals always worked; only the nested form was broken.
+    mut r: Range<i32> = Range::new(0, 100);
+    mut m: MapIter<TakeIter<Range<i32>>, i32, i32> = r.take(3).map(iter_double_i32);
+    mut total: i32 = 0;
+    loop {
+        match (m.next()) {
+            Option::Some(v) => { total = total + v; }
+            Option::None => { break; }
+        }
+    }
+    // 0*2 + 1*2 + 2*2 = 6
+    return expect_eq(total, 6);
+}
+
+![test]
+function nested_zip_typed_local_count() -> Result<(), TestError> {
+    // A ZipIter whose first inner is itself an adapter, bound to a typed local.
+    mut r: Range<i32> = Range::new(0, 100);
+    mut s: Range<i32> = Range::new(10, 13);
+    mut z: ZipIter<TakeIter<Range<i32>>, Range<i32>> = r.take(5).zip(s);
+    return expect_eq(z.count(), 3 as u64);
 }

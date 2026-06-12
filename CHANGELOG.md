@@ -122,6 +122,20 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`core`:** `Copy`/`Drop`/`Clone`/`Eq`/`Ord`/`Hash`/`Default`/`From`/`Into`/
   `TryFrom`/`TryInto`/`Display`/`Debug`/`FmtWrite`/`Iterator`/`Error`
   traits; `Option<T>` and `Result<T,E>`.
+- **`core::iter`:** `Iterator<Item>` (one required `next`) with default
+  consumers `count`/`fold`/`for_each`/`any`/`all`/`find` and lazy combinator
+  adapters `.take(n)` / `.map(f)` / `.filter(pred)` / `.chain(other)` /
+  `.enumerate()` / `.zip(other)` (returning `TakeIter` / `MapIter` /
+  `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` are
+  non-capturing functions (E0458). `.enumerate()` yields `Pair<u64, Item>`,
+  `.zip(other)` yields `Pair<Item, B>` and stops at the shorter side (Cryo has
+  no heterogeneous tuple literal, so `Pair` is the element type). Combinators
+  chain freely (`r.take(n).map(f).filter(p)`, `r.chain(b).map(f)`,
+  `a.zip(b).count()`, longer mixed chains) and feed `.count()` / `.fold(..)` /
+  `for (x in ..)`; bind an adapter to a concrete-typed local
+  (`mut z: ZipIter<.., ..> = a.zip(b)`) or chain on the expression directly.
+  `collections::array::from_iter(it)` collects into an `Array<T>` (a free
+  function, fixed by the expected `Array<T>` at the call site).
 - **`io`:** `Read`/`Write` traits with default `read_all`/`read_byte`/
   `read_line`/`read_to_end`/`write_all`; `Stdin`/`Stdout`/`Stderr`/
   `BufReader<R>`/`BufWriter<W>`/`LineWriter<W>`.
@@ -234,27 +248,13 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- Iterator combinators are a partial set. `.take(n)`, `.map(f)`, `.filter(pred)`
-  and `.chain(other)` ship as lazy `Iterator` defaults returning adapters
-  (`TakeIter`, `MapIter`, `FilterIter`, `ChainIter`); `f`/`pred` must be
-  non-capturing functions, and `chain`'s `other` must be a named or
-  explicitly-typed local iterator with the same element type. They work when
-  applied **directly to an iterator** (a named local, an explicitly-typed local
-  bound to the adapter, or a call-expression receiver such as
-  `Range<i32>::new(0,100)`) and consumed by `.count()`, `.fold(...)` or
-  `for (x in ...)` - e.g. `r.take(n).count()`, `r.map(f).fold(..)`,
-  `r.filter(p).count()`, `for (x in r.filter(p))`. They also **chain freely**:
-  any combinator may follow any other (`r.take(n).map(f)`, `r.map(f).map(g)`,
-  `r.take(n).filter(p)`, `r.map(f).filter(p)`, `r.take(a).take(b)`,
-  `r.chain(b).map(f)`, and longer mixed chains), and the chained values flow
-  through `.count()`/`.fold(..)`/`for (x in ...)`. Not yet implemented:
-  `.zip`/`.enumerate` (both pending heterogeneous tuple-literal support in
-  generic impl bodies) and `.collect`. Combinators also do not yet apply to an
-  opaque `implement Iterator` value returned by a method (e.g. an
-  `Array`'s `.iter()`) other than through `next`/`for (x in ...)`. The
-  `Iterator` trait otherwise ships with `next`/`count`/`fold`/`for_each`;
-  `for (x in iter)` iteration and range *expressions* (`a..b` / `a..=b`, see
-  Compiler above) ship in 1.0 and work against any of these.
+- Local type inference. A binding needs an explicit type unless its
+  initializer is a lambda (`mut it = arr.iter()` is E0104; write the type or
+  chain on the expression). One consequence for iterators: an iterator widened
+  to an opaque `implement Iterator<T>` local cannot take further combinators
+  (`mut it: implement Iterator<i32> = arr.iter(); it.take(1)...`), since the
+  concrete adapter type is erased - chain on the call expression instead. A
+  concrete-typed adapter local works (`mut z: ZipIter<.., ..> = a.zip(b)`).
 - Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
 - macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See

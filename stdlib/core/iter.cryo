@@ -12,6 +12,7 @@ namespace std::core::iter;
 
 import core::option;
 import core::clone;
+import collections::pair;
 
 type trait Iterator<Item> {
     /// Advance the sequence and return the next value, or `None` when
@@ -79,6 +80,23 @@ type trait Iterator<Item> {
     /// type is enforced by `ChainIter`'s impl bounds.
     chain<J>(this, other: J) -> ChainIter<This, J> {
         return ChainIter::new(this, other);
+    }
+
+    /// Yield `(index, value)` pairs, the index counting up from 0 as a
+    /// `u64`.  The pair is `Pair<u64, Item>`: `p.first` is the index,
+    /// `p.second` the element.  (Cryo has no heterogeneous tuple literal,
+    /// so `Pair` is the element type.)
+    enumerate(this) -> EnumerateIter<This, Item> {
+        return EnumerateIter::new(this);
+    }
+
+    /// Yield pairs `(a, b)` drawing `a` from `this` and `b` from `other`,
+    /// stopping as soon as either iterator is exhausted.  The pair is
+    /// `Pair<Item, B>` where `B` is `other`'s element type: `p.first` comes
+    /// from `this`, `p.second` from `other`.  (Cryo has no heterogeneous
+    /// tuple literal, so `Pair` is the element type.)
+    zip<J>(this, other: J) -> ZipIter<This, J> {
+        return ZipIter::new(this, other);
     }
 
 
@@ -220,6 +238,64 @@ where I: Iterator<A>, J: Iterator<A> {
             }
         }
         return this.second.next();
+    }
+}
+
+/// Adapter pairing each element of `inner` with its 0-based index.  The
+/// element type `A` is carried as a struct parameter (not a where-clause-only
+/// generic) so the `next` body's `Pair<u64, A>` literal substitutes through
+/// the normal struct-param path.  `A` is also pinned to `inner`'s element by
+/// the `where`-bound, which keeps the impl honest.
+type struct EnumerateIter<I, A> {
+    inner: I;
+    index: u64;
+
+    static new(inner: I) -> EnumerateIter<I, A> {
+        return EnumerateIter<I, A> { inner: inner, index: 0 };
+    }
+}
+
+implement<I, A> trait Iterator<Pair<u64, A>> for struct EnumerateIter<I, A>
+where I: Iterator<A> {
+    next(mut &this) -> Option<Pair<u64, A>> {
+        match (this.inner.next()) {
+            Option::Some(value) => {
+                const i: u64 = this.index;
+                this.index = this.index + 1;
+                return Option::Some(Pair<u64, A> { first: i, second: value });
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+}
+
+/// Adapter pairing two iterators positionally, yielding `Pair<A, O>` until
+/// either side runs out.  Chain-shaped: the element types `A` (from `I`) and
+/// `O` (from `J`) live only in the impl `where`-bounds, not as struct
+/// parameters, so the receiver type only mentions the two inner iterators.
+type struct ZipIter<I, J> {
+    first:  I;
+    second: J;
+
+    static new(first: I, second: J) -> ZipIter<I, J> {
+        return ZipIter<I, J> { first: first, second: second };
+    }
+}
+
+implement<I, J, A, O> trait Iterator<Pair<A, O>> for struct ZipIter<I, J>
+where I: Iterator<A>, J: Iterator<O> {
+    next(mut &this) -> Option<Pair<A, O>> {
+        match (this.first.next()) {
+            Option::Some(a) => {
+                match (this.second.next()) {
+                    Option::Some(b) => {
+                        return Option::Some(Pair<A, O> { first: a, second: b });
+                    }
+                    Option::None => { return Option::None; }
+                }
+            }
+            Option::None => { return Option::None; }
+        }
     }
 }
 

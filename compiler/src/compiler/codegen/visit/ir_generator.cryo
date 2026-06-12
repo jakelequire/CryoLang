@@ -911,7 +911,26 @@ public:
                     break;
                 }
             }
-            if (fidx < 0) { continue; }
+            if (fidx < 0) {
+                // The literal names a field the resolved struct layout
+                // doesn't carry.  In practice this only happens when
+                // `struct_type` failed to monomorphize to a concrete spec
+                // and resolved to the bare generic template instead (whose
+                // arena `fields` list is empty - fields are only populated
+                // on concrete specializations).  Silently `continue`-ing
+                // here emits the alloca with NO field stores, so the caller
+                // reads uninitialized stack as the field values (a silent
+                // value-corruption miscompile).  Sema already validates
+                // every literal field against the struct, so a miss at
+                // codegen is always an upstream resolution/monomorphization
+                // bug - fail loud instead of corrupting silently.
+                this.cg.diag.emit_error_at_span(
+                    ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
+                    format("codegen: struct literal field '%s' has no slot in the resolved struct type (type did not monomorphize to a concrete layout); upstream monomorphization bug",
+                           this.cg.resolve(field_names[i])),
+                    site_span);
+                continue;
+            }
             const slot: u32 = field_slot[fidx] as u32;
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
