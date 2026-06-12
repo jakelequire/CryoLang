@@ -1,12 +1,17 @@
 ///! HTTPS layer - HTTP/1.1 request + response over a TLS loopback.
 ///!
 ///! Drives the full TLS-carries-HTTP path end to end: the client wraps a
-///! `TcpStream` in TLS, sends a GET, and reads the status line; the
-///! server wraps its accepted socket in TLS and parses the request with
-///! the ordinary `http::Request::parse` (a `TlsStream` is just a
-///! `Read + Write`). Mirrors `net_tls`'s thread layout: main is the
-///! server (binds + listens before spawning), the spawned thread is the
+///! `TcpStream` in TLS, sends a GET, and reads the response back; the server
+///! wraps its accepted socket in TLS and parses the request with the ordinary
+///! `http::Request::parse` (a `TlsStream` is just a `Read + Write`), then
+///! writes a fixed 200 response. Mirrors `net_tls`'s thread layout: main is
+///! the server (binds + listens before spawning), the spawned thread is the
 ///! client.
+///!
+///! The client READS the response before closing: that is what makes the
+///! round-trip honest (the bytes actually cross the wire and back) and
+///! race-free (the server's `write_all` never lands on a socket the client
+///! already closed - the original cause of this test's flakiness).
 ///!
 ///! Requires `ssl` + `crypto` in `tests/cryoconfig` link_libs and the
 ///! `fixtures/tls/` cert+key (cwd is the `tests/` project root).
@@ -32,10 +37,35 @@ import std::ffi::libc;
 import std::test::error;
 import std::test::assert;
 
-const RESPONSE: Str = Str::new("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhi over tls");
+/// The fixed 200 response, built fresh at each call.  This is deliberately a
+/// function and not a module-level `const ... : Str`: a const `Str` initialised
+/// from a string literal reads back empty at runtime, which silently made the
+/// server send a zero-byte body (so the round-trip was never actually verified
+/// and the client - which used not to read it - could not catch it).
+function response_text() -> Str {
+    return Str::new("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhi over tls");
+}
 
-/// Client thread: TLS handshake, send a GET, read the response, and
-/// report whether the status line carried "200". Returns 200 on success.
+function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        match (a.get(i)) {
+            Option::Some(av) => {
+                match (b.get(i)) {
+                    Option::Some(bv) => { if (av != bv) { return false; } }
+                    Option::None     => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+/// Client thread: TLS handshake, send a GET, read the full response back, and
+/// report whether it matched. Returns 200 on a verified round-trip.
 function https_client(port: i32) -> i32 {
     mut tcp: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port as u16))) {
         Result::Ok(s)  => { s }
@@ -56,7 +86,22 @@ function https_client(port: i32) -> i32 {
     mut req: Request = Request::new(Method::Get, Str::new("/"));
     req.headers.insert(Str::new("Host"), Str::new("127.0.0.1"));
     match (req.write_to(&tls)) {
-        Result::Ok(_) => { ok = 200; }
+        Result::Ok(_) => {
+            // Read the whole response back before closing.  Blocking here until
+            // the server has written keeps the connection open across the
+            // server's `write_all`, so it can't race our close.
+            const want: u64 = response_text().as_bytes().length();
+            mut buf: u8[64];
+            match (tls.read_all(&buf[0], want)) {
+                Result::Ok(n) => {
+                    if (slices_eq(Slice::from_raw(&buf[0], n),
+                                  response_text().as_bytes())) {
+                        ok = 200;
+                    }
+                }
+                Result::Err(_) => { }
+            }
+        }
         Result::Err(_) => { }
     }
     req.drop();
@@ -65,7 +110,7 @@ function https_client(port: i32) -> i32 {
 }
 
 /// Parse the request with the real HTTP parser over the TLS stream, then
-/// write a fixed 200 response.
+/// write the fixed 200 response.
 function serve_one(tls: TlsStream*) -> boolean {
     mut parsed: boolean = false;
     {
@@ -76,7 +121,7 @@ function serve_one(tls: TlsStream*) -> boolean {
         }
     }
     if (!parsed) { return false; }
-    match (tls.write_all(RESPONSE.as_bytes())) {
+    match (tls.write_all(response_text().as_bytes())) {
         Result::Ok(_)  => { return true; }
         Result::Err(_) => { return false; }
     }
