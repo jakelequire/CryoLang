@@ -1,13 +1,13 @@
-///! `![implicit]` argument conversions.
+///! `![implicit]` conversions driven by a static constructor.
 ///!
-///! A free function marked `![implicit]` with a single non-generic
-///! parameter is registered as a converter `(param) -> return`.  When a
-///! call argument is otherwise type-incompatible with the parameter, the
-///! compiler synthesizes a call to the matching converter instead of
-///! emitting E0214.  The stdlib ships `string -> String` and
-///! `string -> Str` converters, so a string literal flows into a `String`
-///! or `Str` parameter; user code can register its own converters for any
-///! type, proving the mechanism is attribute-driven, not String-specific.
+///! Marking a single-parameter, non-generic static method `![implicit]`
+///! registers it as the constructor the compiler reaches for when a value
+///! of the parameter type must become the owning type.  The stdlib marks
+///! `Str::new(string)` and `String::from_cstr(string)`, so a string
+///! literal flows into a `Str` / `String` slot — a call argument
+///! (`println("text")`) or a typed binding (`mut s: Str = "text"`).  User
+///! code registers its own converters the same way, proving the mechanism
+///! is attribute-driven, not built into the string types.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::ImplicitArgConversion;
@@ -18,23 +18,21 @@ import std::collections::str;
 import std::test::error;
 import std::test::assert;
 
-// -- Free-function argument conversion -----------------------------------
+// -- Free-function argument conversion (via static constructors) ---------
 
-/// Takes an owned `String` by value (the converter materializes one and
-/// moves it in; the callee drops it at return).
+/// Takes an owned `String` by value (the converter materializes one via
+/// `String::from_cstr` and moves it in; the callee drops it at return).
 function string_len(s: String) -> i32 {
     return s.length() as i32;
 }
 
-/// Takes a borrowed `Str` view (no ownership transfer).
+/// Takes a borrowed `Str` view (built by `Str::new`).
 function str_len(s: Str) -> i32 {
     return s.length() as i32;
 }
 
 ![test]
 function string_literal_converts_to_owned_string() -> Result<(), TestError> {
-    // `"hello"` is `string`; the gate sees `string` vs `String`, finds the
-    // stdlib `cstr_to_string` converter, and rewrites the argument.
     return expect_eq(string_len("hello"), 5);
 }
 
@@ -43,26 +41,39 @@ function string_literal_converts_to_str_view() -> Result<(), TestError> {
     return expect_eq(str_len("abcd"), 4);
 }
 
-/// An exact `Str` argument must resolve WITHOUT going through a converter
-/// (the gate only fires on an incompatible argument).  Built explicitly so
-/// the argument type is already `Str`.
+/// An exact `Str` argument resolves WITHOUT a converter (the coercion only
+/// fires on an incompatible argument).
 ![test]
 function exact_str_argument_needs_no_conversion() -> Result<(), TestError> {
     const view: Str = Str::from_cstr("exact");
     return expect_eq(str_len(view), 5);
 }
 
+// -- Typed-binding conversion (`mut foo: Str = "..."`) -------------------
+
+![test]
+function typed_binding_converts_to_str() -> Result<(), TestError> {
+    const greeting: Str = "Hello, world";
+    return expect_eq(greeting.length() as i32, 12);
+}
+
+![test]
+function typed_binding_converts_to_owned_string() -> Result<(), TestError> {
+    const owned: String = "owned";
+    return expect_eq(owned.length() as i32, 5);
+}
+
 // -- User-defined converter for a custom type ----------------------------
 
 type struct Celsius {
     degrees: i32;
-}
 
-/// User-registered converter `i32 -> Celsius`.  Proves the feature is
-/// attribute-driven and not hard-wired to the string types.
-![implicit]
-function int_to_celsius(x: i32) -> Celsius {
-    return Celsius { degrees: x };
+    /// User-registered converter `i32 -> Celsius`, driven by the same
+    /// `![implicit]` static-constructor mechanism the stdlib uses.
+    ![implicit]
+    static from_int(value: i32) -> Celsius {
+        return Celsius { degrees: value };
+    }
 }
 
 function read_celsius(c: Celsius) -> i32 {
@@ -71,9 +82,15 @@ function read_celsius(c: Celsius) -> i32 {
 
 ![test]
 function user_converter_bridges_int_to_struct() -> Result<(), TestError> {
-    // `42` is `i32`; `read_celsius` wants `Celsius`; the user converter
+    // `42` is `i32`; `read_celsius` wants `Celsius`; `Celsius::from_int`
     // bridges it.
     return expect_eq(read_celsius(42), 42);
+}
+
+![test]
+function user_converter_bridges_typed_binding() -> Result<(), TestError> {
+    const temp: Celsius = 21;
+    return expect_eq(read_celsius(temp), 21);
 }
 
 // -- Method-argument conversion ------------------------------------------
@@ -86,7 +103,7 @@ type struct Tally {
     }
 
     /// Method parameter is `Str`; a `string`-literal argument at the call
-    /// site is bridged by the `cstr_to_str` converter.
+    /// site is bridged by `Str::new`.
     add(mut &this, label: Str) -> void {
         this.total = this.total + (label.length() as i32);
     }

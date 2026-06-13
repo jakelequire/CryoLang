@@ -4432,6 +4432,81 @@ type struct Monomorphizer {
         return this.arena.canonical_resolved(ty);
     }
 
+    /// Force-instantiate a generic type's static-method converter for its
+    /// DEFAULT type args, so a sema-synthesized `Owner<defaults>::method(arg)`
+    /// call (created after this pass) has a concrete spec to link against.
+    ///
+    /// The `![implicit]` converter `String::from_cstr` is never called in
+    /// user source — only synthesized in sema, after monomorphization — so
+    /// the monomorphizer would otherwise never specialize it.  We build a
+    /// synthetic `Owner::method(<dummy args>)` call and route it through the
+    /// normal static-method inference, which infers the owner's defaulted
+    /// type args (`A = GlobalAlloc`), instantiates the spec, and enqueues it
+    /// for the worklist drain.  Idempotent across modules via the spec cache;
+    /// a no-op when the type isn't a known generic template or the method
+    /// isn't a matching non-generic static method.
+    force_instantiate_static_converter(mut &this, type_name: SymbolStr,
+                                       method_name: SymbolStr) -> void {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return; }
+        const entry: TemplateEntry* = registry.get_template(type_name);
+        if (entry == null || entry.ast_node == null) { return; }
+        if (entry.node_kind != NodeKind::StructDeclaration
+                && entry.node_kind != NodeKind::ClassDeclaration) { return; }
+        if (entry.param_count == 0) { return; }
+
+        // Locate the matching non-generic static method on the owner's AST.
+        const this_amp: SymbolStr = this.intern_table.intern("&this");
+        const this_val: SymbolStr = this.intern_table.intern("this");
+        mut method_func: FunctionDeclNode* = null;
+        mut is_static: boolean = false;
+        if (entry.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = entry.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.methods.length; i++) {
+                const m: MethodNode* = sn.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length > 0) { continue; }
+                method_func = m.func; is_static = m.is_static; break;
+            }
+        } else {
+            const cn: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.methods.length; i++) {
+                const m: MethodNode* = cn.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length > 0) { continue; }
+                method_func = m.func; is_static = m.is_static; break;
+            }
+        }
+        if (method_func == null || !is_static) { return; }
+
+        // Build `Owner::method(<one dummy per explicit param>)`.  The dummy
+        // arg types are irrelevant to inference (a valid converter's param
+        // is concrete and never references the owner's generic params), but
+        // the arg COUNT must match (see the guard in the inference below).
+        const sp: SourceSpan = SourceSpan::none();
+        mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
+            type_name, method_name, sp);
+        mut call: CallExprNode* = new CallExprNode(sr as ExpressionNode*, sp);
+        for (mut i: i64 = 0; i < method_func.parameters.length; i++) {
+            const p: VarDeclNode* = method_func.parameters[i];
+            if (p == null) { continue; }
+            if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
+            mut dummy: LiteralNode* = new LiteralNode("", LiteralKind::String, sp);
+            dummy.resolved_type = p.resolved_type;
+            call.add_argument(dummy as ExpressionNode*);
+        }
+
+        mut res_ctx: ResolutionContext = ResolutionContext::new("", "");
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        mut names: SymbolStr[] = [];
+        mut types: TypeRef[] = [];
+        this.try_infer_static_method_on_generic_template(
+            call, type_name, type_name, method_name, &res_ctx, &subst,
+            &names, &types);
+    }
+
     try_infer_static_method_on_generic_template(mut &this,
             call: CallExprNode*, qualified_scope: SymbolStr,
             bare_scope: SymbolStr, member_name: SymbolStr,

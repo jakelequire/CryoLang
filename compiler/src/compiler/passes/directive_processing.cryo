@@ -815,24 +815,11 @@ function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
             return;
         }
         if (strcmp(name, "implicit") == 0) {
+            // Converter registration (for single-param `![implicit]`
+            // functions / static methods) happens in a dedicated walk after
+            // all directives are applied, where the owning type name is in
+            // hand; see `register_implicit_converters`.
             fn.is_implicit = true;
-            // A single-parameter, non-generic `![implicit]` free function is
-            // an implicit converter `(param0) -> return`.  This pass runs
-            // after TypeResolution, so the parameter and return types are
-            // resolved to the canonical arena ids the call site also sees.
-            // Registered keyed on those ids; the value is the bare name so
-            // the sema rewrite can spell the synthesized call as a plain
-            // identifier (resolves globally, codegen externs on demand).
-            if (fn.parameters.length == 1
-                    && fn.generic_params.length == 0
-                    && fn.resolved_return_type.is_valid()
-                    && fn.parameters[0] != null
-                    && fn.parameters[0].resolved_type.is_valid()) {
-                ctx.decl_index.register_implicit_converter(
-                    fn.parameters[0].resolved_type.id,
-                    fn.resolved_return_type.id,
-                    fn.name.id);
-            }
             return;
         }
         if (strcmp(name, "link") == 0) {
@@ -1188,12 +1175,107 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
     // layout intent on top.
     propagate_layout_attrs_to_types(ctx);
 
+    // Register implicit converters now that every `![implicit]` flag has
+    // been applied above (and TypeResolution, which ran earlier, has
+    // resolved the parameter / return types).
+    register_implicit_converters(ctx, root);
+
     if (ctx.debug_mode) {
         cdebug("[DirectiveProcessing] Processed %lld directives in this module (%lld cumulative)\n",
             count, registry.count());
     }
 
     return PassResult::from_snapshot(ctx.diagnostics, snap);
+}
+
+/// Scan top-level declarations for `![implicit]` converters and register
+/// each in the DeclarationIndex keyed on `(param_type, return_type)`.
+///
+/// A converter is a single-parameter, non-generic `![implicit]`:
+///   - free function `f(x: T) -> U`              -> `Type::method` = (0, f)
+///   - static method `static M(x: T) -> U` on S  -> (S, M)
+///
+/// Sema synthesizes a call to the recorded converter (`Str::new(arg)` or
+/// `f(arg)`) at any coercion site where a `T` value must become a `U`.
+/// Static-method resolution is global through the DeclarationIndex, so the
+/// synthesized `Type::method` call resolves regardless of imports.
+function register_implicit_converters(ctx: CompilationContext*,
+                                      root: ProgramNode*) -> void {
+    if (root == null) { return; }
+    for (mut i: i64 = 0; i < root.statements.length; i++) {
+        const stmt: ASTNode* = root.statements[i];
+        if (stmt == null) { continue; }
+        match (stmt.kind) {
+            NodeKind::FunctionDeclaration => {
+                register_converter_fn(ctx, stmt as FunctionDeclNode*,
+                    SymbolStr::empty(), false);
+            }
+            NodeKind::StructDeclaration => {
+                const sd: StructDeclNode* = stmt as StructDeclNode*;
+                register_converter_methods(ctx, sd.name, &sd.methods,
+                    sd.generic_params.length > 0);
+            }
+            NodeKind::ClassDeclaration => {
+                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                register_converter_methods(ctx, cd.name, &cd.methods,
+                    cd.generic_params.length > 0);
+            }
+            NodeKind::ImplementationBlock => {
+                // Static methods in `implement` blocks (e.g. enum or
+                // primitive constructors) register under the impl's target
+                // type name.  Generic targets aren't force-instantiated
+                // here (the impl head's generics don't pin the target's);
+                // such converters work for the non-generic case.
+                const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                register_converter_methods(ctx, ib.target_type, &ib.methods,
+                    false);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Register a `![implicit]` static method as a converter under its owning
+/// type's bare name.  Instance methods are skipped: a converter needs no
+/// receiver.
+function register_converter_methods(ctx: CompilationContext*,
+                                    owner: SymbolStr,
+                                    methods: &MethodNode*[],
+                                    owner_is_generic: boolean) -> void {
+    for (mut i: i64 = 0; i < methods.length; i++) {
+        const m: MethodNode* = methods[i];
+        if (m == null || m.func == null) { continue; }
+        if (!m.is_static) { continue; }
+        register_converter_fn(ctx, m.func, owner, owner_is_generic);
+    }
+}
+
+/// Register a single `![implicit]` function/static-method as a converter,
+/// if it qualifies (one resolved parameter, no generic params, resolved
+/// return type).  `owner` is the static method's owning type, or empty for
+/// a free function.
+function register_converter_fn(ctx: CompilationContext*,
+                               fn: FunctionDeclNode*,
+                               owner: SymbolStr,
+                               owner_is_generic: boolean) -> void {
+    if (fn == null || !fn.is_implicit) { return; }
+    if (fn.parameters.length != 1) { return; }
+    if (fn.generic_params.length != 0) { return; }
+    if (!fn.resolved_return_type.is_valid()) { return; }
+    const p: VarDeclNode* = fn.parameters[0];
+    if (p == null || !p.resolved_type.is_valid()) { return; }
+    const type_name_id: u32 = if (owner.is_valid()) { owner.id } else { 0 };
+    ctx.decl_index.register_implicit_converter(
+        p.resolved_type.id,
+        fn.resolved_return_type.id,
+        type_name_id,
+        fn.name.id);
+    // A static-method converter on a generic owner can't be conjured by the
+    // post-mono sema rewrite; record it so the monomorphizer eagerly emits
+    // the default instantiation (`String<GlobalAlloc>::from_cstr`).
+    if (owner.is_valid() && owner_is_generic) {
+        ctx.decl_index.register_generic_converter_method(owner.id, fn.name.id);
+    }
 }
 
 // Layout-attr propagation: AST -> Type
