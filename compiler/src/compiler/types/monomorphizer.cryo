@@ -4909,6 +4909,46 @@ type struct Monomorphizer {
         }
         if (explicit_params.length != call.arguments.length) { return false; }
 
+        // Explicit scope type args (`Atomic<u64>::new`) are AUTHORITATIVE: the
+        // user pinned the owner's generics directly, so seed the bindings from
+        // them and skip the arg/return-type inference below.  Without this, a
+        // literal arg inside a generic body silently loses the explicit <u64>:
+        // Pass A skips the polymorphic literal, an assignment-RHS context (the
+        // LHS being a pointer field) supplies no expected type for Pass B, and
+        // Pass C defaults T to i32 - emitting `Atomic<i32>::new` and a 4-byte
+        // store later reloaded as 8 bytes (selfhost-compiler-bugs bug #3).  The
+        // <T> lives on the ScopeResolution callee's `scope_generic_args` (the
+        // args on the scope), not the call's `generic_args` (method-level args).
+        // Resolve each, apply the enclosing specialization's substitution, and
+        // fill a prefix of the bindings; the default-expansion block below
+        // backfills any trailing owner params that carry declared defaults.
+        mut seeded_from_scope_args: boolean = false;
+        if ((call.callee as ASTNode*).kind == NodeKind::ScopeResolution
+                && res_ctx != null && this.type_resolver != null) {
+            const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            if (sr.scope_generic_args.length > 0
+                    && sr.scope_generic_args.length <= entry.param_type_ids.length) {
+                mut all_resolved: boolean = true;
+                mut seeded: TypeRef[] = [];
+                for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
+                    mut tr: TypeRef = this.type_resolver.resolve(
+                        sr.scope_generic_args[i], res_ctx);
+                    if (!tr.is_valid()) { all_resolved = false; break; }
+                    if (subst != null) { tr = subst.apply(tr, this.arena); }
+                    seeded.push(tr);
+                }
+                // Only commit when every supplied arg resolved; a partial
+                // failure falls through to value-arg inference rather than
+                // pinning a half-bound (and likely wrong) instantiation.
+                if (all_resolved) {
+                    for (mut i: i64 = 0; i < seeded.length; i++) {
+                        this.inference_bindings[i] = seeded[i];
+                    }
+                    seeded_from_scope_args = true;
+                }
+            }
+        }
+
         // Three-pass inference, identical in spirit to the free-function
         // path in `discover_inferred_calls_in_expr` (see the Pass A/B/C
         // comments there). The target params here are the OWNER'S generic
@@ -4918,17 +4958,22 @@ type struct Monomorphizer {
         // float literal is polymorphic and must NOT pin `T` to its i32
         // default: `Box::new(1234567890123)` for `mut b: Box<i64>` would
         // monomorphize `Box<i32>` and truncate the literal to 1912276171.
-        for (mut i: i64 = 0; i < call.arguments.length; i++) {
-            const param: VarDeclNode* = explicit_params[i];
-            if (param == null || !param.resolved_type.is_valid()) { continue; }
-            const arg: ExpressionNode* = call.arguments[i];
-            if (this.arg_is_polymorphic_literal(arg)) { continue; }
-            mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-            if (!actual.is_valid()) { continue; }
-            if (subst != null) {
-                actual = subst.apply(actual, this.arena);
+        // Skipped entirely when explicit scope args already pinned every owner
+        // param: those are authoritative and arg-unification must not override
+        // them (a `T*`<->concrete actual could re-derive a different `T`).
+        if (!seeded_from_scope_args) {
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = explicit_params[i];
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (this.arg_is_polymorphic_literal(arg)) { continue; }
+                mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
+                if (!actual.is_valid()) { continue; }
+                if (subst != null) {
+                    actual = subst.apply(actual, this.arena);
+                }
+                this.unify_for_inference(param.resolved_type, actual);
             }
-            this.unify_for_inference(param.resolved_type, actual);
         }
 
         // PASS B - recover any still-unbound owner param from the expected

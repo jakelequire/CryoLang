@@ -40,17 +40,89 @@ function array_eq_str(arr: &Array<u8>, s: Str) -> boolean {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Platform abstraction.
+//
+// The Unix coreutils (/bin/true, /bin/false, /bin/echo) don't exist on
+// Windows, and a missing image is reported differently: POSIX forks and the
+// child `_exit(127)`s when execvp fails, whereas Windows fails up-front inside
+// CreateProcess so spawn returns Err.  These `![target(...)]` helpers pick the
+// right program per OS and account for cmd.exe's CRLF line endings, keeping
+// the test bodies below platform-neutral.
+// ---------------------------------------------------------------------------
+
+// A command that exits 0.
+![target(unix)]
+function cmd_true() -> Command { return Command::new(Str::new("/bin/true")); }
+![target(windows)]
+function cmd_true() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")); c.arg(Str::new("exit")); c.arg(Str::new("0"));
+    return c;
+}
+
+// A command that exits 1.
+![target(unix)]
+function cmd_false() -> Command { return Command::new(Str::new("/bin/false")); }
+![target(windows)]
+function cmd_false() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")); c.arg(Str::new("exit")); c.arg(Str::new("1"));
+    return c;
+}
+
+// Base `echo` command; callers append the words to print.
+![target(unix)]
+function cmd_echo() -> Command { return Command::new(Str::new("/bin/echo")); }
+![target(windows)]
+function cmd_echo() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")); c.arg(Str::new("echo"));
+    return c;
+}
+
+// Expected `echo` stdout: cmd.exe terminates lines with CRLF, /bin/echo
+// with a bare LF.
+![target(unix)]
+function echo_hello_expect() -> Str { return Str::new("hello\n"); }
+![target(windows)]
+function echo_hello_expect() -> Str { return Str::new("hello\r\n"); }
+
+![target(unix)]
+function echo_foobar_expect() -> Str { return Str::new("foo bar\n"); }
+![target(windows)]
+function echo_foobar_expect() -> Str { return Str::new("foo bar\r\n"); }
+
+// Validate the outcome of running a nonexistent program.  POSIX: the forked
+// child `_exit(127)`s when execvp fails, so `status()` yields Ok(127).
+// Windows: CreateProcess fails for a missing image, so spawn/status returns
+// Err - that Err *is* the "command not found" signal.
+![target(unix)]
+function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError> {
+    match (r) {
+        Result::Ok(st) => { return expect_eq(st.exit_code().unwrap_or(-1), 127); }
+        Result::Err(_) => { return bail(Str::new("spawn of missing program errored")); }
+    }
+}
+![target(windows)]
+function expect_missing(r: Result<ExitStatus, IoError>) -> Result<(), TestError> {
+    match (r) {
+        Result::Ok(_)  => { return bail(Str::new("missing program unexpectedly spawned")); }
+        Result::Err(_) => { return Result::Ok(()); }
+    }
+}
+
 ![test]
 function true_command_succeeds() -> Result<(), TestError> {
-    mut cmd: Command = Command::new(Str::new("/bin/true"));
+    mut cmd: Command = cmd_true();
     mut success: boolean = false;
     mut code: i32 = -1;
     match (cmd.status()) {
         Result::Ok(st) => { success = st.success(); code = st.exit_code().unwrap_or(-1); }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("/bin/true status failed")); }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("true command status failed")); }
     }
     cmd.drop();
-    match (expect(success, Str::new("/bin/true should report success"))) {
+    match (expect(success, Str::new("true command should report success"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
     return expect_eq(code, 0);
@@ -58,15 +130,15 @@ function true_command_succeeds() -> Result<(), TestError> {
 
 ![test]
 function false_command_fails() -> Result<(), TestError> {
-    mut cmd: Command = Command::new(Str::new("/bin/false"));
+    mut cmd: Command = cmd_false();
     mut success: boolean = true;
     mut code: i32 = -1;
     match (cmd.status()) {
         Result::Ok(st) => { success = st.success(); code = st.exit_code().unwrap_or(-1); }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("/bin/false status failed")); }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("false command status failed")); }
     }
     cmd.drop();
-    match (expect_false(success, Str::new("/bin/false should not report success"))) {
+    match (expect_false(success, Str::new("false command should not report success"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
     return expect_eq(code, 1);
@@ -74,22 +146,20 @@ function false_command_fails() -> Result<(), TestError> {
 
 ![test]
 function missing_program_exits_127() -> Result<(), TestError> {
-    // execvp fails in the child, which _exit(127)s - the conventional
-    // "command not found" status.
+    // POSIX: execvp fails in the forked child, which _exit(127)s - the
+    // conventional "command not found" status.  Windows: CreateProcess
+    // fails up-front, so status() returns Err.  `expect_missing` encodes
+    // both per target.
     mut cmd: Command = Command::new(Str::new("/no/such/cryo_program_xyzzy"));
-    mut code: i32 = -1;
-    match (cmd.status()) {
-        Result::Ok(st) => { code = st.exit_code().unwrap_or(-1); }
-        Result::Err(_) => { cmd.drop(); return bail(Str::new("spawn of missing program errored")); }
-    }
+    const r: Result<ExitStatus, IoError> = cmd.status();
     cmd.drop();
-    return expect_eq(code, 127);
+    return expect_missing(r);
 }
 
 ![test]
 function echo_stdout_via_pipe() -> Result<(), TestError> {
     // Capture stdout through the public Child.stdout pipe handle.
-    mut cmd: Command = Command::new(Str::new("/bin/echo"));
+    mut cmd: Command = cmd_echo();
     cmd.arg(Str::new("hello"));
     cmd.stdout(Stdio::Piped);
 
@@ -124,23 +194,23 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
             }
             c.drop();
         }
-        Result::Err(_) => { cmd.drop(); acc.drop(); return bail(Str::new("spawn /bin/echo failed")); }
+        Result::Err(_) => { cmd.drop(); acc.drop(); return bail(Str::new("spawn of echo failed")); }
     }
     cmd.drop();
-    const content_ok: boolean = array_eq_str(&acc, Str::new("hello\n"));
+    const content_ok: boolean = array_eq_str(&acc, echo_hello_expect());
     acc.drop();
 
-    match (expect(success, Str::new("/bin/echo should succeed"))) {
+    match (expect(success, Str::new("echo should succeed"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
-    return expect(content_ok, Str::new("echo hello should print \"hello\\n\""));
+    return expect(content_ok, Str::new("echo hello should print the hello line"));
 }
 
 ![test]
 function output_captures_stdout() -> Result<(), TestError> {
     // The convenience `output()` path: spawn + wait + collect, with the
     // arguments echoed back joined by a space.
-    mut cmd: Command = Command::new(Str::new("/bin/echo"));
+    mut cmd: Command = cmd_echo();
     cmd.arg(Str::new("foo"));
     cmd.arg(Str::new("bar"));
     mut success: boolean = false;
@@ -149,7 +219,7 @@ function output_captures_stdout() -> Result<(), TestError> {
         Result::Ok(out) => {
             mut o: Output = out;
             success = o.status.success();
-            content_ok = array_eq_str(&o.stdout, Str::new("foo bar\n"));
+            content_ok = array_eq_str(&o.stdout, echo_foobar_expect());
             o.drop();
         }
         Result::Err(_) => { cmd.drop(); return bail(Str::new("output() failed")); }
@@ -158,7 +228,7 @@ function output_captures_stdout() -> Result<(), TestError> {
     match (expect(success, Str::new("echo foo bar should succeed"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
-    return expect(content_ok, Str::new("output().stdout should be \"foo bar\\n\""));
+    return expect(content_ok, Str::new("output().stdout should be the \"foo bar\" line"));
 }
 
 // Regression for the H3 stderr-drain deadlock (audit 2026-05-26).
@@ -194,7 +264,12 @@ function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
             o.drop();
         }
         Result::Err(_) => {
-            // /bin/sh missing on this host - skip rather than fail.
+            // /bin/sh missing on this host - skip rather than fail.  This is
+            // the path taken on Windows (no /bin/sh): the regression being
+            // guarded here is the Unix poll(2)-based interleaved drain, and
+            // the Windows collect_output still drains stdout-then-stderr
+            // sequentially, so it must not be handed this >64-KiB-stderr
+            // workload until it grows a concurrent drain of its own.
             cmd.drop();
             return Result::Ok(());
         }
