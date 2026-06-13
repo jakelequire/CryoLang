@@ -2079,27 +2079,37 @@ public:
                     && imp_ann == null) {
                 // Declared type exists; check that the initializer is compatible
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
-                    const var_name: string = this.intern.resolve(var_node.name);
-                    // Primary span: the offending initializer expression.
-                    // Secondary span: the type annotation it doesn't match
-                    // (renders as the "expected because of this" caret
-                    // when both spans live on the same source line).
-                    const value_span: SourceSpan =
-                        if (var_node.initializer != null) {
-                            var_node.initializer.span
-                        } else {
-                            var_node.span
-                        };
-                    const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
-                    this.emit_type_mismatch_with_value(
-                        ErrorCode::E0200_TYPE_MISMATCH,
-                        value_span,
-                        var_node.resolved_type,
-                        init_type,
-                        format("`%s` was declared with this type; the initializer must match",
-                               var_name),
-                        ann_span,
-                        var_node.initializer);
+                    // A typed binding is a coercion site too: `mut s: Str =
+                    // "text"` bridges `string -> Str` through the registered
+                    // `![implicit]` converter before falling back to E0200.
+                    const conv: ExpressionNode* = this.build_implicit_conversion(
+                        var_node.initializer, init_type, var_node.resolved_type);
+                    if (conv != null) {
+                        var_node.set_initializer(conv);
+                        init_type = var_node.resolved_type;
+                    } else {
+                        const var_name: string = this.intern.resolve(var_node.name);
+                        // Primary span: the offending initializer expression.
+                        // Secondary span: the type annotation it doesn't match
+                        // (renders as the "expected because of this" caret
+                        // when both spans live on the same source line).
+                        const value_span: SourceSpan =
+                            if (var_node.initializer != null) {
+                                var_node.initializer.span
+                            } else {
+                                var_node.span
+                            };
+                        const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
+                        this.emit_type_mismatch_with_value(
+                            ErrorCode::E0200_TYPE_MISMATCH,
+                            value_span,
+                            var_node.resolved_type,
+                            init_type,
+                            format("`%s` was declared with this type; the initializer must match",
+                                   var_name),
+                            ann_span,
+                            var_node.initializer);
+                    }
                 }
             }
         }
@@ -5299,56 +5309,136 @@ public:
         return true;
     }
 
-    /// Look up an `![implicit]` converter whose parameter type is `arg_ty`
-    /// and whose return type is `param_ty`.  Returns the converter's bare
-    /// name, or an empty SymbolStr when none is registered.
-    find_implicit_converter(&this, arg_ty: TypeRef, param_ty: TypeRef) -> SymbolStr {
-        if (!arg_ty.is_valid() || !param_ty.is_valid()) {
-            return SymbolStr::empty();
+    /// If `ty` is a default-instantiated generic (e.g. `String<GlobalAlloc>`),
+    /// return its uninstantiated template TypeRef (`String`); otherwise an
+    /// invalid ref.  A converter that returns a generic type's Self
+    /// (`String::from_cstr -> String`) registers under the template id,
+    /// while a use site sees the instantiation; this bridges the two.
+    generic_base_of(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::InstantiatedType) {
+            return TypeRef::invalid();
         }
-        return this.ctx.decl_index.lookup_implicit_converter(arg_ty.id, param_ty.id);
+        return (t as InstantiatedType*).generic_base;
     }
 
-    /// When argument `idx` (`arg`, of type `arg_ty`) is incompatible with a
-    /// parameter of type `param_ty`, look for a registered `![implicit]`
-    /// converter `arg_ty -> param_ty`.  If one exists, synthesize
-    /// `converter(arg)`, re-resolve it, and on success splice the converted
-    /// call into `call.arguments[idx]`.  Returns true iff the argument was
-    /// converted (so the caller suppresses E0214); false leaves the call
-    /// untouched so the normal mismatch diagnostic fires.
-    ///
-    /// The synthesized callee is a plain identifier on the converter's bare
-    /// name: resolution is global (no import needed) and re-resolution pins
-    /// `resolved_callee` for codegen, which externs the converter on demand.
-    try_apply_implicit_conversion(mut &this, call: CallExprNode*, idx: i64,
-            arg: ExpressionNode*, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
-        if (arg == null) { return false; }
-        // An exact match never needs conversion; the method paths call this
-        // defensively over every argument, so guard here too.
+    /// True when a registered `![implicit]` converter bridges
+    /// `arg_ty -> param_ty`.  Used by converter-aware overload selection to
+    /// decide whether a candidate method is reachable through a conversion.
+    has_implicit_converter(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        if (!arg_ty.is_valid() || !param_ty.is_valid()) { return false; }
         if (arg_ty.id == param_ty.id) { return false; }
-        // Don't recurse while re-resolving a converter's own arguments.
-        if (this.in_implicit_conversion) { return false; }
+        if (this.ctx.decl_index.lookup_implicit_converter(
+                arg_ty.id, param_ty.id) != 0) { return true; }
+        const base: TypeRef = this.generic_base_of(param_ty);
+        return base.is_valid()
+            && this.ctx.decl_index.lookup_implicit_converter(
+                arg_ty.id, base.id) != 0;
+    }
 
-        const conv: SymbolStr = this.find_implicit_converter(arg_ty, param_ty);
-        if (!conv.is_valid()) { return false; }
+    /// If a registered `![implicit]` converter bridges `from_ty -> to_ty`,
+    /// synthesize the converter call around `expr`, re-resolve it, and
+    /// return the new (already-resolved) expression node.  Returns null
+    /// when no converter applies or re-resolution didn't yield exactly
+    /// `to_ty`, so the caller falls through to its normal type-mismatch
+    /// diagnostic (preserving the E0214 / E0200 negative suites).
+    ///
+    /// The converter is spelled as the registered static method
+    /// `Type::method` (resolved globally through the DeclarationIndex, so no
+    /// import is needed), or as a plain identifier for a free-function
+    /// converter.  Re-resolution pins `resolved_callee` for codegen, which
+    /// externs the converter on demand.
+    build_implicit_conversion(mut &this, expr: ExpressionNode*,
+            from_ty: TypeRef, to_ty: TypeRef) -> ExpressionNode* {
+        if (expr == null) { return null; }
+        if (!from_ty.is_valid() || !to_ty.is_valid()) { return null; }
+        // An exact match never needs conversion.
+        if (from_ty.id == to_ty.id) { return null; }
+        // Don't recurse while re-resolving a converter's own argument.
+        if (this.in_implicit_conversion) { return null; }
 
-        const sp: SourceSpan = arg.span;
-        mut callee_id: IdentifierNode* = new IdentifierNode(conv, sp);
-        mut conv_call: CallExprNode* = new CallExprNode(
-            callee_id as ExpressionNode*, sp);
-        conv_call.add_argument(arg);
+        mut packed: u64 = this.ctx.decl_index.lookup_implicit_converter(
+            from_ty.id, to_ty.id);
+        if (packed == 0) {
+            // A converter that returns a generic type's Self registers under
+            // the template id; the use site sees the default instantiation.
+            const base: TypeRef = this.generic_base_of(to_ty);
+            if (base.is_valid()) {
+                packed = this.ctx.decl_index.lookup_implicit_converter(
+                    from_ty.id, base.id);
+            }
+        }
+        if (packed == 0) { return null; }
+        const type_name_id:   u32 = (packed >> 32) as u32;
+        const method_name_id: u32 = (packed & 0xFFFFFFFF) as u32;
+
+        const sp: SourceSpan = expr.span;
+        mut callee: ExpressionNode* = null;
+        if (type_name_id == 0) {
+            // Free-function converter: plain identifier callee.
+            mut id: IdentifierNode* = new IdentifierNode(
+                SymbolStr::from_id(method_name_id), sp);
+            callee = id as ExpressionNode*;
+        } else {
+            // Static-method converter: `Type::method` scope resolution.
+            mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
+                SymbolStr::from_id(type_name_id),
+                SymbolStr::from_id(method_name_id), sp);
+            // When the target is a default-instantiated generic
+            // (`String<GlobalAlloc>`), spell the scope WITH its concrete
+            // type args so resolution binds the monomorphized spec method
+            // (force-instantiated in the Monomorphization pass) rather than
+            // the un-emitted template.  Non-generic targets (`Str`) leave
+            // the scope bare.  Mirrors the for-in `Slice::from_raw` synthesis.
+            const tt: Type* = this.arena.lookup(to_ty.id);
+            if (tt != null && tt.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = tt as InstantiatedType*;
+                mut gargs: TypeAnnotation*[] = [];
+                for (mut gi: i64 = 0; gi < it.type_args.length; gi++) {
+                    mut na: NamedAnnotation* = new NamedAnnotation {
+                        name:         SymbolStr::empty(),
+                        span:         sp,
+                        pre_resolved: it.type_args[gi],
+                    };
+                    gargs.push(new TypeAnnotation::Named(na));
+                }
+                sr.set_scope_generic_args(gargs);
+            }
+            callee = sr as ExpressionNode*;
+        }
+
+        mut conv_call: CallExprNode* = new CallExprNode(callee, sp);
+        conv_call.add_argument(expr);
 
         this.in_implicit_conversion = true;
         const result_ty: TypeRef = this.resolve_expr(conv_call as ExpressionNode*);
         this.in_implicit_conversion = false;
 
-        // Accept the rewrite only when it produced exactly the parameter
-        // type; otherwise leave the original argument in place and fall
-        // through to E0214 (preserves the negative-test suite).
-        if (!result_ty.is_valid() || result_ty.id != param_ty.id) {
-            return false;
+        // Accept only when the converter's result is assignable to the
+        // target.  `can_assign` (not exact-id) bridges a converter that
+        // returns a generic type's Self template (`String`) to the
+        // default-instantiated target (`String<GlobalAlloc>`), exactly as
+        // an ordinary `mut s: String = String::from_str(...)` does.  A
+        // wrong-typed converter result is rejected, falling through to the
+        // normal diagnostic.
+        if (!result_ty.is_valid()
+                || !this.checker.can_assign(result_ty, to_ty)) {
+            return null;
         }
-        call.set_argument(idx, conv_call as ExpressionNode*);
+        return conv_call as ExpressionNode*;
+    }
+
+    /// Call-argument coercion: rewrite `call.arguments[idx]` through an
+    /// implicit converter when one bridges `arg_ty -> param_ty`.  Returns
+    /// true (so the caller suppresses E0214) iff the argument was
+    /// converted; false leaves the call untouched.
+    try_apply_implicit_conversion(mut &this, call: CallExprNode*, idx: i64,
+            arg: ExpressionNode*, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        const c: ExpressionNode* = this.build_implicit_conversion(
+            arg, arg_ty, param_ty);
+        if (c == null) { return false; }
+        call.set_argument(idx, c);
         return true;
     }
 
@@ -6763,8 +6853,8 @@ public:
                                 && call.arguments[pi] != null
                                 && this.int_literal_fits_target(
                                     call.arguments[pi], m.param_types[pi])) { continue; }
-                        if (this.find_implicit_converter(
-                                arg_types[pi], m.param_types[pi]).is_valid()) { continue; }
+                        if (this.has_implicit_converter(
+                                arg_types[pi], m.param_types[pi])) { continue; }
                         ok = false;
                         break;
                     }
@@ -6930,8 +7020,8 @@ public:
                             arg_types[pi], params[pi])) {
                         continue;
                     }
-                    if (allow_converter && this.find_implicit_converter(
-                            arg_types[pi], params[pi]).is_valid()) {
+                    if (allow_converter && this.has_implicit_converter(
+                            arg_types[pi], params[pi])) {
                         continue;
                     }
                     compat = false;
