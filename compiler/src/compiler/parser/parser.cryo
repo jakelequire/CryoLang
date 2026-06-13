@@ -61,14 +61,19 @@ public:
                 if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
             }
 
-            if (this.is_declaration_start()) {
+            // `static match` is a statement, not a declaration, even though
+            // `is_declaration_start()` reports `static` (for `static function`).
+            const is_static_match: boolean =
+                this.check(TokenType::KwStatic) &&
+                this.peek_at(1).kind == TokenType::KwMatch;
+            if (this.is_declaration_start() && !is_static_match) {
                 const decl: ASTNode* = this.parse_declaration(false, "");
                 if (decl != null) {
                     const decl_stmt: DeclStmtNode* = new DeclStmtNode(
                         decl as DeclarationNode*, decl.span);
                     block.add_statement(decl_stmt);
                 }
-            } else if (this.is_statement_keyword()) {
+            } else if (is_static_match || this.is_statement_keyword()) {
                 const stmt: StatementNode* = this.parse_statement();
                 if (stmt != null) {
                     block.add_statement(stmt);
@@ -2416,6 +2421,13 @@ public:
             return this.parse_for_statement();
         }
 
+        // `static match (T) { ... }` in statement position (e.g. an
+        // `Atomic<T>::store` body whose arms yield no value). Checked before
+        // the bare-`match` path.
+        if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwMatch) {
+            return this.parse_static_match_statement();
+        }
+
         if (tok.kind == TokenType::KwMatch) {
             return this.parse_match_statement();
         }
@@ -2478,8 +2490,14 @@ public:
             if (this.check(TokenType::RBrace)) { break; }
             const doc: string = this.take_documentation();
 
-            // Inside a block, we can have declarations or statements
-            if (this.is_declaration_start()) {
+            // Inside a block, we can have declarations or statements.
+            // `is_declaration_start()` reports `static` as a declaration start
+            // (for `static function`), but `static match` is a STATEMENT — route
+            // it to parse_statement instead of parse_declaration.
+            const is_static_match: boolean =
+                this.check(TokenType::KwStatic) &&
+                this.peek_at(1).kind == TokenType::KwMatch;
+            if (this.is_declaration_start() && !is_static_match) {
                 const decl: ASTNode* = this.parse_declaration(false, doc);
                 if (decl != null) {
                     // Wrap declaration in a DeclStmtNode if it's a DeclarationNode
@@ -2750,6 +2768,40 @@ public:
         this.consume(TokenType::RBrace, "'}'");
         match_stmt.span = this.span_from(start);
         return match_stmt;
+    }
+
+    /// Parse a static match statement: `static match (Type) { type-arms }`.
+    /// Used when arms yield no value. Reuses parse_static_match_arm (inherited
+    /// from ExprParser); arm blocks parse full statements via the Parser
+    /// override of parse_inner_block.
+    parse_static_match_statement() -> StaticMatchStmtNode* {
+        const start: Token = this.advance(); // consume 'static'
+        this.advance();                      // consume 'match'
+        this.consume(TokenType::LParen, "'('");
+        const scrutinee: TypeAnnotation* = this.parse_type_annotation();
+        this.consume(TokenType::RParen, "')'");
+        this.consume(TokenType::LBrace, "'{'");
+
+        mut sm: StaticMatchStmtNode* = new StaticMatchStmtNode(
+            scrutinee, this.span_from_token(start));
+
+        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
+            const before_pos: int = this.pos;
+            const arm: StaticMatchArmNode* = this.parse_static_match_arm();
+            if (arm != null) {
+                sm.add_arm(arm);
+            }
+            if (this.panic_mode) {
+                this.synchronize();
+            }
+            if (this.pos == before_pos) {
+                this.advance();
+            }
+        }
+
+        this.consume(TokenType::RBrace, "'}'");
+        sm.span = this.span_from(start);
+        return sm;
     }
 
     /// Parse a match arm for statement context: pattern => { body }.

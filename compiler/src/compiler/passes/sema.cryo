@@ -1457,6 +1457,14 @@ public:
                 }
                 return true;
             }
+            NodeKind::StaticMatchStatement => {
+                // Reduced to a single live arm by the monomorphizer: returns
+                // iff that arm's body returns.
+                const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                if (sms.arms.length == 0 || sms.arms[0] == null ||
+                    sms.arms[0].body == null) { return false; }
+                return this.stmt_always_returns(sms.arms[0].body);
+            }
             NodeKind::LoopStatement => {
                 // `loop { ... }` is divergent: control can only escape via
                 // `return`, `panic`, or `break`.  If the body contains no
@@ -1543,6 +1551,11 @@ public:
                     }
                 }
                 return false;
+            }
+            NodeKind::StaticMatchStatement => {
+                const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                if (sms.arms.length == 0 || sms.arms[0] == null) { return false; }
+                return this.stmt_contains_break(sms.arms[0].body);
             }
             // `break` inside a nested loop/while/for breaks that loop, not
             // the outer one, so don't recurse into them.
@@ -2472,6 +2485,15 @@ public:
             }
             return;
         }
+        if (e.kind == NodeKind::StaticMatchExpression) {
+            const sme: StaticMatchExprNode* = e as StaticMatchExprNode*;
+            for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                const arm: StaticMatchArmNode* = sme.arms[i];
+                if (arm == null) { continue; }
+                this.check_return_stack_address(this.arm_tail_expr(arm.body));
+            }
+            return;
+        }
         if (e.kind == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = e as UnaryExprNode*;
             if (u.op.lexeme == "&" && u.operand != null
@@ -2643,6 +2665,15 @@ public:
             }
             return;
         }
+        if (e.kind == NodeKind::StaticMatchExpression) {
+            const sme: StaticMatchExprNode* = e as StaticMatchExprNode*;
+            for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                const arm: StaticMatchArmNode* = sme.arms[i];
+                if (arm == null) { continue; }
+                this.check_return_payload_escape(this.arm_tail_expr(arm.body), ret_ty);
+            }
+            return;
+        }
         if (e.kind == NodeKind::IfExpression) {
             const ie: IfExprNode* = e as IfExprNode*;
             this.check_return_payload_escape(ie.then_expr, ret_ty);
@@ -2762,6 +2793,23 @@ public:
             node.span);
         this.check_duplicate_default_arm(node.arms);
         this.check_range_patterns(node.arms, subject_type);
+    }
+
+    /// Static match statement (`static match (T) { ... }` yielding no value).
+    /// Reduced to a single live arm by the monomorphizer before sema; just
+    /// type-check that arm's body. A residual multi-arm node means a
+    /// non-generic use (unsupported); flag it and check only the first arm.
+    override visit(mut &this, node: StaticMatchStmtNode*) -> void {
+        if (node == null || node.arms.length == 0) { return; }
+        if (node.arms.length > 1) {
+            this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+                "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
+                node.span);
+        }
+        const arm: StaticMatchArmNode* = node.arms[0];
+        if (arm != null && arm.body != null) {
+            this.dispatch_stmt(arm.body);
+        }
     }
 
     /// A match may have at most one wildcard (`_`) arm. A second one is
@@ -3229,6 +3277,7 @@ public:
             NodeKind::IfExpression      => { this.resolve_if_expr(expr as IfExprNode*) }
             NodeKind::TernaryExpression => { this.resolve_ternary(expr as TernaryExprNode*) }
             NodeKind::MatchExpression   => { this.resolve_match_expr(expr as MatchExprNode*) }
+            NodeKind::StaticMatchExpression => { this.resolve_static_match_expr(expr as StaticMatchExprNode*) }
             NodeKind::StructLiteral     => { this.resolve_struct_literal(expr as StructLiteralNode*) }
             NodeKind::ScopeResolution   => { this.resolve_scope_resolution(expr as ScopeResolutionNode*) }
             NodeKind::NewExpression     => { this.resolve_new_expr(expr as NewExprNode*) }
@@ -9227,6 +9276,59 @@ public:
         if (outer_expected.is_valid()) {
             return outer_expected;
         }
+        return result_type;
+    }
+
+    /// Resolve a `static match` used as an expression. By the time sema runs
+    /// (Phase 6b), the monomorphizer has reduced this to a single live arm
+    /// (the dead arms - which would not type-check for the concrete T - are
+    /// gone). We resolve that one arm's block and yield its trailing
+    /// expression's type, reusing the same block-yields-value logic as
+    /// resolve_match_expr. A still-multi-arm node means `static match` was
+    /// used outside a generic context (not yet supported); we resolve only the
+    /// first arm and flag it, rather than type-check provably-dead arms.
+    resolve_static_match_expr(mut &this, sm: StaticMatchExprNode*) -> TypeRef {
+        if (sm == null || sm.arms.length == 0) { return TypeRef::invalid(); }
+        if (sm.arms.length > 1) {
+            this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+                "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
+                sm.span);
+        }
+        const arm: StaticMatchArmNode* = sm.arms[0];
+        if (arm == null || arm.body == null) { return TypeRef::invalid(); }
+
+        const outer_expected: TypeRef = this.expected_type;
+        mut result_type: TypeRef = TypeRef::invalid();
+        const body_node: ASTNode* = arm.body as ASTNode*;
+        if (body_node.kind == NodeKind::BlockStatement) {
+            const block: BlockStmtNode* = arm.body as BlockStmtNode*;
+            const last_idx: i64 = block.statements.length - 1;
+            for (mut j: i64 = 0; j < block.statements.length; j++) {
+                if (j == last_idx && outer_expected.is_valid()) {
+                    this.expected_type = outer_expected;
+                }
+                this.dispatch_stmt(block.statements[j]);
+                if (j == last_idx) {
+                    this.expected_type = outer_expected;
+                }
+            }
+            if (block.statements.length > 0) {
+                const last: StatementNode* =
+                    block.statements[block.statements.length - 1];
+                const last_node: ASTNode* = last as ASTNode*;
+                if (last_node.kind == NodeKind::ExpressionStatement) {
+                    const es: ExprStmtNode* = last as ExprStmtNode*;
+                    if (es.expression != null && es.expression.has_resolved_type()) {
+                        result_type = es.expression.resolved_type;
+                    }
+                }
+            }
+        } else {
+            this.dispatch_stmt(arm.body);
+        }
+
+        this.expected_type = outer_expected;
+        if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
     }
 
