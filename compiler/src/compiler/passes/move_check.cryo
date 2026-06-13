@@ -316,6 +316,13 @@ type struct MoveChecker {
                 }
                 return true;
             }
+            NodeKind::StaticMatchStatement => {
+                // Reduced to a single live arm by the monomorphizer; diverges
+                // iff that arm's body does.
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                if (sm.arms.length == 0 || sm.arms[0] == null) { return false; }
+                return this.always_diverges(sm.arms[0].body);
+            }
             _ => { return false; }
         }
     }
@@ -557,6 +564,14 @@ type struct MoveChecker {
                 }
                 this.merge_branches(arm_bodies);
             }
+            NodeKind::StaticMatchStatement => {
+                // Single live arm post-monomorphization: walk it as a plain
+                // block (no subject value, no branch merge).
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                if (sm.arms.length > 0 && sm.arms[0] != null && sm.arms[0].body != null) {
+                    this.walk_stmt(sm.arms[0].body);
+                }
+            }
             NodeKind::WhileStatement => {
                 const w: WhileStmtNode* = stmt as WhileStmtNode*;
                 if (w.condition != null) { this.walk_expr_read(w.condition); }
@@ -631,6 +646,11 @@ type struct MoveChecker {
                     }
                 }
                 return true;
+            }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                if (sm.arms.length == 0 || sm.arms[0] == null) { return false; }
+                return this.switch_case_diverges(sm.arms[0].body);
             }
             _ => { return false; }
         }
@@ -808,6 +828,13 @@ type struct MoveChecker {
             NodeKind::TernaryExpression  => { this.read_ternary(expr as TernaryExprNode*);           }
             NodeKind::IfExpression       => { this.read_if_expr(expr as IfExprNode*);                }
             NodeKind::MatchExpression    => { this.read_match(expr as MatchExprNode*);               }
+            NodeKind::StaticMatchExpression => {
+                // Reduced to one live arm by the monomorphizer; walk it as a block.
+                const sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+                if (sme.arms.length > 0 && sme.arms[0] != null && sme.arms[0].body != null) {
+                    this.walk_stmt(sme.arms[0].body);
+                }
+            }
             NodeKind::NewExpression      => { this.read_new(expr as NewExprNode*);                   }
             NodeKind::TryExpression      => {
                 // `expr?` is lowered to a `match` by sema; walk the desugar

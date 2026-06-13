@@ -1324,6 +1324,38 @@ public:
     /// Match expression: produces a value via phi node.
     /// Same comparison chain as visit_match_stmt, but each arm evaluates
     /// to a value and the merge block collects them with a phi.
+    /// Static match used as an expression. The monomorphizer reduced it to a
+    /// single live arm, so there is no discriminant, no per-arm basic blocks,
+    /// no phi, and no no-match trap: just emit the one arm's block. Its
+    /// trailing expression statement leaves the produced value in
+    /// `state.last_value` (the same contract a match-expression arm body
+    /// relies on), which we coerce to the node's resolved type for width
+    /// consistency at the use site.
+    override visit(mut &this, node: StaticMatchExprNode*) -> void {
+        if (node.arms.length == 0 || node.arms[0] == null ||
+            node.arms[0].body == null) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+        this.dispatch.generate_statement(this, node.arms[0].body);
+        mut v: LValue = this.state.last_value;
+        const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        if (v.is_valid() && result_ty.is_valid()) {
+            v = coerce_to_phi_type(this.cg, v, result_ty, node.resolved_type);
+        }
+        this.state.last_value = v;
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Static match used as a statement (void arms, e.g. an `Atomic<T>::store`
+    /// body). Emit the single live arm's block for effect; ignore any value.
+    override visit(mut &this, node: StaticMatchStmtNode*) -> void {
+        if (node.arms.length == 0 || node.arms[0] == null ||
+            node.arms[0].body == null) { return; }
+        this.dispatch.generate_statement(this, node.arms[0].body);
+    }
+
     override visit(mut &this, node: MatchExprNode*) -> void {
         if (node.subject == null || node.arms.length == 0) {
             this.state.last_value = LValue::null();

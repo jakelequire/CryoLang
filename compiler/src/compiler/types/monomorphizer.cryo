@@ -695,6 +695,15 @@ type struct Monomorphizer {
                     }
                 }
             }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.annotate_dispatch_stmt(arm.body, func, bounds, enclosing_trait);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1091,6 +1100,15 @@ type struct Monomorphizer {
             this.current_spec_inst_id = request.generic_type.id;
             this.current_spec_struct  = result.specialized_ast as StructDeclNode*;
         }
+        // Compile-time `static match` arm pruning. Runs AFTER substitution
+        // (the scrutinee `T` is now a concrete annotation) but BEFORE
+        // resolve_specialized_ast, so dead arms - which would not type-check
+        // for this concrete T - are removed before any type-checking sees
+        // them. Mirrors the filter_bounds_violating_methods precedent above.
+        this.prune_static_match_arms(result.specialized_ast, entry.node_kind, entry, &subst);
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            this.prune_static_match_arms(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
+        }
         this.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             this.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
@@ -1354,6 +1372,278 @@ type struct Monomorphizer {
             }
             _ => {}
         }
+    }
+
+    // ---- static match arm pruning (compile-time type dispatch) -----------
+
+    /// Entry point: prune `static match` arms throughout a freshly-substituted
+    /// specialized AST. Builds a resolution context from the template's module
+    /// (so primitive and user-defined arm types resolve), then walks method /
+    /// function bodies reducing each static match to its single live arm.
+    prune_static_match_arms(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
+                            entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
+        if (ast_node == null || this.type_resolver == null) { return; }
+        mut module_name: string = "";
+        if (entry != null && entry.module_name.is_valid()) {
+            module_name = this.intern_table.resolve(entry.module_name);
+        }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+
+        match (node_kind) {
+            NodeKind::StructDeclaration => {
+                const decl: StructDeclNode* = ast_node as StructDeclNode*;
+                if (decl == null) { return; }
+                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            }
+            NodeKind::ClassDeclaration => {
+                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
+                if (decl == null) { return; }
+                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            }
+            NodeKind::FunctionDeclaration => {
+                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+                if (decl == null || decl.body == null) { return; }
+                this.prune_static_match_in_block(decl.body, &res_ctx);
+            }
+            NodeKind::ImplementationBlock => {
+                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
+                if (decl == null) { return; }
+                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            }
+            _ => {}
+        }
+    }
+
+    prune_static_match_in_methods(mut &this, methods: &MethodNode*[],
+                                  res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            if (method.func.body != null) {
+                this.prune_static_match_in_block(method.func.body, res_ctx);
+            }
+        }
+    }
+
+    prune_static_match_in_block(mut &this, block: BlockStmtNode*,
+                                res_ctx: ResolutionContext*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            this.prune_static_match_in_stmt(block.statements[i], res_ctx);
+        }
+    }
+
+    prune_static_match_in_stmt(mut &this, stmt: StatementNode*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        match (node.kind) {
+            NodeKind::BlockStatement => {
+                this.prune_static_match_in_block(stmt as BlockStmtNode*, res_ctx);
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                this.prune_static_match_in_block(ub.block, res_ctx);
+            }
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.prune_static_match_in_expr(es.expression, res_ctx);
+            }
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                this.prune_static_match_in_expr(rs.expression, res_ctx);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null &&
+                    ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                    this.prune_static_match_in_expr(vd.initializer, res_ctx);
+                }
+            }
+            NodeKind::VariableDeclaration => {
+                const vd: VarDeclNode* = stmt as VarDeclNode*;
+                this.prune_static_match_in_expr(vd.initializer, res_ctx);
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                this.prune_static_match_in_expr(ifs.condition, res_ctx);
+                this.prune_static_match_in_stmt(ifs.then_stmt, res_ctx);
+                if (ifs.has_else()) {
+                    this.prune_static_match_in_stmt(ifs.else_stmt, res_ctx);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.prune_static_match_in_expr(ws.condition, res_ctx);
+                this.prune_static_match_in_stmt(ws.body, res_ctx);
+            }
+            NodeKind::DoWhileStatement => {
+                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                this.prune_static_match_in_stmt(dw.body, res_ctx);
+                this.prune_static_match_in_expr(dw.condition, res_ctx);
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                if (fs.init != null) { this.prune_static_match_in_stmt(fs.init, res_ctx); }
+                this.prune_static_match_in_expr(fs.condition, res_ctx);
+                this.prune_static_match_in_expr(fs.update, res_ctx);
+                this.prune_static_match_in_stmt(fs.body, res_ctx);
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                this.prune_static_match_in_stmt(ls.body, res_ctx);
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.prune_static_match_in_expr(ms.subject, res_ctx);
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                mut sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                const idx: i64 = this.select_static_match_arm(
+                    sms.scrutinee, sms.arms, sms.span, res_ctx);
+                if (idx >= 0) {
+                    mut reduced: StaticMatchArmNode*[] = [];
+                    reduced.push(sms.arms[idx]);
+                    sms.arms = reduced;
+                }
+                // Recurse into the surviving arm for nested static matches.
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sms.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    prune_static_match_in_expr(mut &this, expr: ExpressionNode*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        match (node.kind) {
+            NodeKind::StaticMatchExpression => {
+                mut sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+                const idx: i64 = this.select_static_match_arm(
+                    sme.scrutinee, sme.arms, sme.span, res_ctx);
+                if (idx >= 0) {
+                    mut reduced: StaticMatchArmNode*[] = [];
+                    reduced.push(sme.arms[idx]);
+                    sme.arms = reduced;
+                }
+                for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sme.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = expr as BinaryExprNode*;
+                this.prune_static_match_in_expr(b.left, res_ctx);
+                this.prune_static_match_in_expr(b.right, res_ctx);
+            }
+            NodeKind::UnaryExpression => {
+                const u: UnaryExprNode* = expr as UnaryExprNode*;
+                this.prune_static_match_in_expr(u.operand, res_ctx);
+            }
+            NodeKind::TernaryExpression => {
+                const t: TernaryExprNode* = expr as TernaryExprNode*;
+                this.prune_static_match_in_expr(t.condition, res_ctx);
+                this.prune_static_match_in_expr(t.true_expr, res_ctx);
+                this.prune_static_match_in_expr(t.false_expr, res_ctx);
+            }
+            NodeKind::IfExpression => {
+                const ie: IfExprNode* = expr as IfExprNode*;
+                this.prune_static_match_in_expr(ie.condition, res_ctx);
+                this.prune_static_match_in_expr(ie.then_expr, res_ctx);
+                this.prune_static_match_in_expr(ie.else_expr, res_ctx);
+            }
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = expr as CallExprNode*;
+                this.prune_static_match_in_expr(c.callee, res_ctx);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                    this.prune_static_match_in_expr(c.arguments[i], res_ctx);
+                }
+            }
+            NodeKind::CastExpression => {
+                const ce: CastExprNode* = expr as CastExprNode*;
+                this.prune_static_match_in_expr(ce.expression, res_ctx);
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                this.prune_static_match_in_expr(ma.object, res_ctx);
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                this.prune_static_match_in_expr(aa.array, res_ctx);
+                this.prune_static_match_in_expr(aa.index, res_ctx);
+            }
+            NodeKind::MatchExpression => {
+                const me: MatchExprNode* = expr as MatchExprNode*;
+                this.prune_static_match_in_expr(me.subject, res_ctx);
+                for (mut i: i64 = 0; i < me.arms.length; i++) {
+                    const arm: MatchArmNode* = me.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the scrutinee and each arm's type pattern, returning the index
+    /// of the single matching arm (first arm whose type equals the scrutinee,
+    /// else the `_` wildcard). Returns -1 when nothing matches: on a hard
+    /// no-match this emits E0645; on an unresolved scrutinee (a substitution
+    /// bug, since the scrutinee is concrete after substitution) it emits an
+    /// internal error. The caller leaves the arms untouched on -1, keeping the
+    /// node well-formed (>= 1 arm). Arm `type_pattern`s are concrete here.
+    select_static_match_arm(mut &this, scrutinee: TypeAnnotation*,
+                            arms: &StaticMatchArmNode*[], span: SourceSpan,
+                            res_ctx: ResolutionContext*) -> i64 {
+        if (arms.length <= 1) { return -1; }  // already reduced or trivial
+        const scrut: TypeRef = this.type_resolver.resolve(scrutinee, res_ctx);
+        if (!scrut.is_valid()) {
+            this.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "static match scrutinee did not resolve to a concrete type after substitution").at(span));
+            this.error_count += 1;
+            return -1;
+        }
+
+        mut wildcard_idx: i64 = -1;
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: StaticMatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            if (arm.type_pattern == null) {
+                if (wildcard_idx < 0) { wildcard_idx = i; }
+                continue;
+            }
+            const arm_ty: TypeRef = this.type_resolver.resolve(arm.type_pattern, res_ctx);
+            if (arm_ty.is_valid() && arm_ty.id == scrut.id) {
+                return i;
+            }
+        }
+        if (wildcard_idx >= 0) { return wildcard_idx; }
+
+        const ty_name: string = this.arena.format_display(this.arena.lookup(scrut.id));
+        this.diagnostics.emit(Diagnostic::error(
+            ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+            format("no `static match` arm matches type `%s`", ty_name))
+            .at(span)
+            .with_note("add an arm for this type or a `_` default arm"));
+        this.error_count += 1;
+        return -1;
     }
 
     /// Resolve signatures on an array of methods; delegates core signature
@@ -2462,6 +2752,15 @@ type struct Monomorphizer {
                     }
                 }
             }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.collect_locals_in_stmt(arm.body, names, types);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2691,6 +2990,17 @@ type struct Monomorphizer {
                         this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
                     }
                     this.pop_scope_bindings(pushed);
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                // Post-prune single live arm (no pattern bindings — the
+                // pattern is a type). Walk the arm body for nested calls.
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
+                    }
                 }
             }
             _ => {}
@@ -2951,6 +3261,16 @@ type struct Monomorphizer {
                         this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
                     }
                     this.pop_scope_bindings(pushed);
+                }
+            }
+            NodeKind::StaticMatchExpression => {
+                // Post-prune single live arm (type pattern, no bindings).
+                const sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+                for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sme.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.discover_inferred_calls_in_stmt(arm.body, res_ctx, subst, names, types);
+                    }
                 }
             }
             NodeKind::MemberAccess => {
@@ -6220,6 +6540,18 @@ type struct Monomorphizer {
                 const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
                 for (mut mi: i64 = 0; mi < match_stmt.arms.length; mi++) {
                     const arm: MatchArmNode* = match_stmt.arms[mi];
+                    if (arm != null && arm.body != null) {
+                        const arm_body: ASTNode* = arm.body as ASTNode*;
+                        if (arm_body.kind == NodeKind::BlockStatement) {
+                            this.resolve_body_locals(arm.body as BlockStmtNode*, res_ctx);
+                        }
+                    }
+                }
+            }
+            if (node.kind == NodeKind::StaticMatchStatement) {
+                const sm_stmt: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut mi: i64 = 0; mi < sm_stmt.arms.length; mi++) {
+                    const arm: StaticMatchArmNode* = sm_stmt.arms[mi];
                     if (arm != null && arm.body != null) {
                         const arm_body: ASTNode* = arm.body as ASTNode*;
                         if (arm_body.kind == NodeKind::BlockStatement) {

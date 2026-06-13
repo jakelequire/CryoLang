@@ -1,0 +1,117 @@
+///! `static match` - compile-time type dispatch inside a generic body.
+///!
+///! Each `static match (T) { <type> => <body> ... }` is resolved at
+///! monomorphization time: the arm whose type equals the concrete `T` is
+///! kept and every other arm is pruned before type-checking, so an arm only
+///! has to type-check for the `T` it serves.  These tests confirm the right
+///! arm is selected for several concrete instantiations, in both expression
+///! and statement position, and that a `_` default arm catches the rest.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::StaticMatch;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+/// Dispatches a per-type integer code via a `static match` expression, plus a
+/// `static match` STATEMENT that writes a per-type byte into a field.
+type struct Tag<T> {
+    value: T;
+    mark:  u8;
+
+    static new(v: T) -> Tag<T> {
+        return Tag<T> { value: v, mark: 0u8 };
+    }
+
+    /// Expression-position static match: yields the arm's value as the return.
+    kind_code(&this) -> i32 {
+        return static match (T) {
+            u8      => { 8 }
+            u32     => { 32 }
+            i64     => { 64 }
+            boolean => { 1 }
+            _       => { 0 }
+        };
+    }
+
+    /// Statement-position static match: no value, just a side effect.
+    set_mark(mut &this) -> void {
+        static match (T) {
+            u8      => { this.mark = 1u8; }
+            u32     => { this.mark = 2u8; }
+            i64     => { this.mark = 3u8; }
+            boolean => { this.mark = 4u8; }
+            _       => { this.mark = 9u8; }
+        }
+    }
+}
+
+![test]
+function static_match_expr_u32() -> Result<(), TestError> {
+    mut t: Tag<u32> = Tag<u32>::new(5u32);
+    const c: i32 = t.kind_code();
+    match (expect_eq(c, 32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function static_match_expr_u8() -> Result<(), TestError> {
+    mut t: Tag<u8> = Tag<u8>::new(3u8);
+    match (expect_eq(t.kind_code(), 8)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function static_match_expr_i64() -> Result<(), TestError> {
+    mut t: Tag<i64> = Tag<i64>::new(9i64);
+    match (expect_eq(t.kind_code(), 64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function static_match_expr_boolean() -> Result<(), TestError> {
+    mut t: Tag<boolean> = Tag<boolean>::new(true);
+    match (expect_eq(t.kind_code(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function static_match_wildcard_default() -> Result<(), TestError> {
+    // f32 matches no explicit arm, so the `_` default (0) is selected.
+    mut t: Tag<f32> = Tag<f32>::new(1.5 as f32);
+    match (expect_eq(t.kind_code(), 0)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function static_match_statement_side_effect() -> Result<(), TestError> {
+    mut a: Tag<u32> = Tag<u32>::new(0u32);
+    a.set_mark();
+    mut b: Tag<i64> = Tag<i64>::new(0i64);
+    b.set_mark();
+    match (expect_eq(a.mark as i32, 2)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b.mark as i32, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

@@ -718,6 +718,20 @@ type struct DropInserter {
                 out.push(stmt);
                 d
             }
+            NodeKind::StaticMatchStatement => {
+                // Reduced to a single live arm by the monomorphizer; instrument
+                // its block body like a plain block (no subject, no per-arm
+                // consumption/drop-flag machinery).
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                mut smd: boolean = false;
+                if (sm.arms.length > 0 && sm.arms[0] != null &&
+                    sm.arms[0].body != null &&
+                    sm.arms[0].body.kind == NodeKind::BlockStatement) {
+                    smd = this.walk_block(sm.arms[0].body as BlockStmtNode*);
+                }
+                out.push(stmt);
+                smd
+            }
             NodeKind::SwitchStatement => {
                 // Walk the case bodies so owned locals inside them are dropped
                 // (they previously leaked) and outer-binding moves are tracked.
@@ -838,6 +852,11 @@ type struct DropInserter {
                     }
                 }
                 return true;
+            }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                if (sm.arms.length == 0 || sm.arms[0] == null) { return false; }
+                return this.switch_case_diverges(sm.arms[0].body);
             }
             _ => { return false; }
         }
@@ -2089,6 +2108,15 @@ type struct DropInserter {
                 mut throwaway_out: StatementNode*[] = [];
                 this.walk_match_arms(null, me.subject, me.arms, true,
                     &throwaway_out);
+            }
+            NodeKind::StaticMatchExpression => {
+                // Single live arm post-monomorphization: instrument its block.
+                const sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+                if (sme.arms.length > 0 && sme.arms[0] != null &&
+                    sme.arms[0].body != null &&
+                    sme.arms[0].body.kind == NodeKind::BlockStatement) {
+                    const _smd: boolean = this.walk_block(sme.arms[0].body as BlockStmtNode*);
+                }
             }
             NodeKind::TryExpression      => {
                 // `expr?` is lowered by sema to a `match` expression;
