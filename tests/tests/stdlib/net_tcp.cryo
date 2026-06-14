@@ -92,6 +92,45 @@ function loopback_round_trip() -> Result<(), TestError> {
     return expect(pong_ok, Str::new("client should receive \"pong\""));
 }
 
+// IPv6 loopback round-trip over [::1] (m2). Exercises the full v6 dial
+// path end-to-end: the sockaddr_in6 packer, the AF_INET6 socket, and
+// connect/accept. Guarded: if the host has no IPv6 loopback, bind fails
+// and the test skips (returns Ok) rather than flaking.
+![test]
+function loopback_round_trip_v6() -> Result<(), TestError> {
+    const port: u16 = (10000 + (libc::getpid() % 9000)) as u16;
+
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v6(port))) {
+        Result::Ok(l)  => { l }
+        Result::Err(_) => { return Result::Ok(()); }   // no v6 loopback -> skip
+    };
+    mut client: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v6(port))) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("v6 connect failed")); }
+    };
+    mut server: TcpStream = match (listener.accept()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { client.drop(); listener.drop(); return bail(Str::new("v6 accept failed")); }
+    };
+
+    match (client.write_all(Str::new("ping").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("v6 client write failed")); }
+    }
+    mut sbuf: u8[16];
+    mut sgot: u64 = 0;
+    match (server.read_all(&sbuf[0], 4)) {
+        Result::Ok(n)  => { sgot = n; }
+        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("v6 server read failed")); }
+    }
+    const ok: boolean = slices_eq(Slice::from_raw(&sbuf[0], sgot), Str::new("ping").as_bytes());
+
+    server.drop();
+    client.drop();
+    listener.drop();
+    return expect(ok, Str::new("v6 server should receive \"ping\" over [::1]"));
+}
+
 ![test]
 function connect_to_unbound_port_fails() -> Result<(), TestError> {
     // A high port with nothing listening should refuse the connection.

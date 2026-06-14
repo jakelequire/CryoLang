@@ -225,3 +225,107 @@ function next_power_of_two_rounds_up() -> Result<(), TestError> {
 function next_power_of_two_exact() -> Result<(), TestError> {
     return expect_eq(math::next_power_of_two(64), 64);
 }
+
+// --- m1: NaN-safe min/max, new consts, f32 variants, new functions ------
+
+![test]
+function min_max_f64_nan_transparent() -> Result<(), TestError> {
+    // libm fmin/fmax ignore a NaN operand (both operand orders); the old
+    // raw `<`/`>` form was asymmetric. Both-NaN yields NaN.
+    const n: f64 = math::nan();
+    match (expect(within(math::min(n, 2.0), 2.0, 0.0001), Str::new("min(nan,2)=2"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::min(2.0, n), 2.0, 0.0001), Str::new("min(2,nan)=2"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::max(n, 2.0), 2.0, 0.0001), Str::new("max(nan,2)=2"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::is_nan(math::min(n, n)), Str::new("min(nan,nan) is nan"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(math::is_nan(math::max(n, n)), Str::new("max(nan,nan) is nan"));
+}
+
+![test]
+function float_min_values() -> Result<(), TestError> {
+    match (expect(math::is_finite(math::f64_min()), Str::new("f64_min() is finite"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::f64_min(), 0.0 - math::F64_MAX, 1.0e292),
+        Str::new("f64_min() == -F64_MAX"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(within(math::f32_min() as f64, 0.0 - (math::F32_MAX as f64), 1.0e32),
+        Str::new("f32_min() == -F32_MAX"));
+}
+
+![test]
+function min_max_clamp_f32() -> Result<(), TestError> {
+    const lo: f32 = 1.5;
+    const hi: f32 = 2.5;
+    match (expect(within(math::min_f32(lo, hi) as f64, 1.5, 0.0001), Str::new("min_f32"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::max_f32(lo, hi) as f64, 2.5, 0.0001), Str::new("max_f32"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const five: f32 = 5.0;
+    const zero: f32 = 0.0;
+    const three: f32 = 3.0;
+    return expect(within(math::clamp_f32(five, zero, three) as f64, 3.0, 0.0001),
+        Str::new("clamp_f32 high"));
+}
+
+![test]
+function min_f32_nan_transparent() -> Result<(), TestError> {
+    const nan32: f32 = math::nan() as f32;
+    const two: f32 = 2.0;
+    match (expect(within(math::min_f32(nan32, two) as f64, 2.0, 0.0001),
+        Str::new("min_f32(nan,2)=2"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(within(math::min_f32(two, nan32) as f64, 2.0, 0.0001),
+        Str::new("min_f32(2,nan)=2"));
+}
+
+![test]
+function powi_cases() -> Result<(), TestError> {
+    match (expect(within(math::powi(2.0, 10), 1024.0, 0.0001), Str::new("2^10"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::powi(2.0, 0), 1.0, 0.0001), Str::new("2^0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::powi(2.0, 0 - 2), 0.25, 0.0001), Str::new("2^-2"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(within(math::powi(0.0, 0), 1.0, 0.0001), Str::new("0^0 == 1"));
+}
+
+![test]
+function mul_add_basic() -> Result<(), TestError> {
+    return expect(within(math::mul_add(2.0, 3.0, 4.0), 10.0, 0.0001),
+        Str::new("2*3+4 == 10"));
+}
+
+![test]
+function log1p_expm1_roundtrip() -> Result<(), TestError> {
+    match (expect(within(math::log1p(0.0), 0.0, 0.0001), Str::new("log1p(0)=0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(within(math::expm1(0.0), 0.0, 0.0001), Str::new("expm1(0)=0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(within(math::log1p(math::expm1(0.5)), 0.5, 0.0001),
+        Str::new("log1p(expm1(0.5)) == 0.5"));
+}
+
+![test]
+function hypot_no_overflow() -> Result<(), TestError> {
+    // The naive sqrt(x*x + y*y) overflows to +inf at this magnitude; libm
+    // hypot scales by the larger operand and returns the right answer.
+    return expect(within(math::hypot(3.0e200, 4.0e200), 5.0e200, 1.0e196),
+        Str::new("hypot(3e200,4e200) ≈ 5e200 without overflow"));
+}

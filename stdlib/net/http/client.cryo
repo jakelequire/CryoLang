@@ -22,6 +22,7 @@ import collections::array;
 import collections::str;
 import collections::string;
 import core::primitives;
+import net::ip;
 import net::socket_addr;
 import net::tcp;
 import net::http::method;
@@ -106,11 +107,10 @@ where S: Read + Write {
     return Response::parse(&br);
 }
 
-/// Write `host: ip:port` into the request headers. Rendered in
-/// `a.b.c.d:port` form because that's what we can produce without a
-/// real display-formatter for IpAddr yet.
+/// Write `host: ip:port` into the request headers. IPv4 renders as
+/// `a.b.c.d:port`; an IPv6 literal is bracketed per RFC 3986: `[h:h:...]:port`.
 function apply_host_header(req: mut &Request, addr: &SocketAddr) -> void {
-    mut buffer: String = String::with_capacity(32);
+    mut buffer: String = String::with_capacity(48);
     match (addr.ip) {
         IpAddr::V4(v4) => {
             push_u8_decimal(&buffer, v4.a);
@@ -120,18 +120,47 @@ function apply_host_header(req: mut &Request, addr: &SocketAddr) -> void {
             push_u8_decimal(&buffer, v4.c);
             buffer.push(0x2E);
             push_u8_decimal(&buffer, v4.d);
+            buffer.push(0x3A);
+            push_u16_decimal(&buffer, addr.port);
         }
-        IpAddr::V6(_) => {
-            // IPv6 display formatting is not yet implemented;
-            // emit a placeholder so the
-            // header is well-formed and the server doesn't reject
-            // the request on missing Host.
-            buffer.push(Str::new("::"));
+        IpAddr::V6(v6) => {
+            // RFC 3986: bracket the literal, with `:port` outside the brackets.
+            buffer.push(0x5B);                  // '['
+            push_v6_hextets(&buffer, &v6);
+            buffer.push(0x5D);                  // ']'
+            buffer.push(0x3A);
+            push_u16_decimal(&buffer, addr.port);
         }
     }
-    buffer.push(0x3A);
-    push_u16_decimal(&buffer, addr.port);
     req.headers.insert(Str::new("Host"), buffer.as_str());
+}
+
+/// Eight colon-separated lowercase hex groups, no `::` compression (the
+/// uncompressed form is valid inside a bracketed Host).
+function push_v6_hextets(buffer: mut &String, v6: &IpV6Addr) -> void {
+    mut g: u64 = 0;
+    while (g < 8) {
+        if (g > 0) { buffer.push(0x3A); }       // ':'
+        push_u16_hex(buffer, v6.group_at(g));
+        g = g + 1;
+    }
+}
+
+/// Lowercase hex of `value`, no leading zeros (at least one digit).
+function push_u16_hex(buffer: mut &String, value: u16) -> void {
+    if (value == 0u16) { buffer.push(0x30); return; }
+    mut tmp: u8[4];
+    mut n: u64 = 0;
+    mut v: u16 = value;
+    while (v > 0u16) {
+        const nib: u8 = (v & 0xF) as u8;
+        if (nib < 10u8) { tmp[n] = 0x30u8 + nib; }
+        else { tmp[n] = 0x61u8 + (nib - 10u8); }
+        n = n + 1;
+        v = v >> 4;
+    }
+    mut i: u64 = n;
+    while (i > 0) { i = i - 1; buffer.push(tmp[i]); }
 }
 
 function push_u8_decimal(buffer: mut &String, value: u8) -> void {
