@@ -798,15 +798,43 @@ type struct ExprOps {
                         // Expected ptr, actual integer.  For the
                         // receiver slot (i==0) this is a primitive
                         // method on an rvalue; spill to a stack temp and
-                        // pass the slot's address.  For non-receiver
-                        // args keep the legitimate inttoptr.
+                        // pass the slot's address.
                         if (i == 0) {
                             const slot_lty: LType = LType { raw: actual_ty };
                             const slot: LValue = this.builder.build_alloca(slot_lty, "recv.slot");
                             this.builder.build_store(arg_val, slot);
                             arg_val = slot;
+                        } else if (llvm::LLVMGetInstructionOpcode(arg_val.raw) == 27) {
+                            // The integer is a Load of an lvalue, not a
+                            // genuine value-as-address.  This is the
+                            // integer twin of the float bug above: a
+                            // reference-typed binding (an integer payload
+                            // bound by `match (&x) { Some(b) => ... }`)
+                            // passed bare to a `&T` parameter; codegen_rvalue
+                            // loaded the referent to an integer.  The old
+                            // code `inttoptr`'d that VALUE - passing e.g.
+                            // address 0x1 for the payload 1 - so the callee's
+                            // `*other` dereferenced garbage and segfaulted at
+                            // runtime (the verifier was happy because
+                            // inttoptr does yield a `ptr`).  Recover the
+                            // address instead, exactly like the `ptr <-
+                            // struct`/`ptr <- float` branches: reuse the
+                            // Load's source pointer (identity-preserving,
+                            // matching the receiver-side autoref).
+                            // LLVMOpcode::Load = 27.  Non-Load integers
+                            // (literal `0`/`null` constants, computed
+                            // address values) keep the legitimate inttoptr
+                            // below.
+                            mut handled_i: boolean = false;
+                            const ptr_operand_i: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                            if (ptr_operand_i != null) {
+                                arg_val = LValue { raw: ptr_operand_i };
+                                handled_i = true;
+                            }
+                            if (!handled_i) {
+                                arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
+                            }
                         } else {
-                            const target: LType = LType { raw: expected_ty };
                             arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
                         }
                     } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer) {
