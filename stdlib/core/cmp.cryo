@@ -8,6 +8,7 @@
 namespace std::core::cmp;
 
 import core::intrinsics;
+import core::mem;
 
 type enum Ordering {
     Less;
@@ -30,10 +31,16 @@ implement enum Ordering {
 // Eq: equality
 
 /// Types that support value equality. `equals(a, b)` must be reflexive,
-/// symmetric, and transitive; floating-point NaN violates reflexivity,
-/// so `f32` and `f64` do **not** implement `Eq`. Use `PartialEq` for
-/// those (which this stdlib does not yet model); float comparison goes
-/// through `==` directly.
+/// symmetric, and transitive.
+///
+/// `f32` and `f64` implement `Eq` as **bitwise** equality (every bit of
+/// the IEEE-754 representation must match), not the IEEE `==` operator.
+/// This keeps `Eq` a true equivalence relation - reflexive even for NaN
+/// (`nan.equals(&nan)` for the *same* bit pattern is `true`) - and
+/// consistent with the total order in `Ord` below. Note the two
+/// consequences: `(0.0).equals(&-0.0)` is `false` (different sign bit),
+/// and two NaNs with different payloads are unequal. If you want IEEE
+/// semantics (`0.0 == -0.0`, `nan != nan`), compare with `==` directly.
 type trait Eq {
     equals(&this, other: &This) -> boolean;
 }
@@ -65,6 +72,22 @@ implement trait Eq for string {
             i = i + 1;
         }
         return true;
+    }
+}
+
+/// Floats use **bitwise** equality (see the `Eq` doc): reinterpret the
+/// IEEE-754 bits as an unsigned integer and compare those. This makes
+/// `equals` reflexive for a fixed NaN bit pattern and consistent with
+/// `Ord` for floats below, at the cost of `0.0 != -0.0` and distinct
+/// NaN payloads comparing unequal.
+implement trait Eq for f32 {
+    equals(&this, other: &f32) -> boolean {
+        return mem::transmute<f32, u32>(this) == mem::transmute<f32, u32>(*other);
+    }
+}
+implement trait Eq for f64 {
+    equals(&this, other: &f64) -> boolean {
+        return mem::transmute<f64, u64>(this) == mem::transmute<f64, u64>(*other);
     }
 }
 
@@ -149,7 +172,37 @@ implement trait Ord for char {
     }
 }
 
-function min<T>(a: T, b: T) -> T 
+/// Total order over floats, matching Rust's `f64::total_cmp`. IEEE `<`
+/// is *not* a total order (NaN is unordered, `-0.0 == 0.0`), so this
+/// orders the raw bits instead: reinterpret as a signed integer, then
+/// flip every bit but the sign for negatives. The result sorts:
+///   -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN
+/// i.e. negative NaNs first, positive NaNs last, the two zeros distinct.
+/// This is consistent with the bitwise `Eq` above (equal bits <=> Equal).
+implement trait Ord for f32 {
+    compare(&this, other: &f32) -> Ordering {
+        mut left: i32 = mem::transmute<f32, i32>(this);
+        mut right: i32 = mem::transmute<f32, i32>(*other);
+        left = left ^ ((((left >> 31) as u32) >> 1) as i32);
+        right = right ^ ((((right >> 31) as u32) >> 1) as i32);
+        if (left < right) { return Ordering::Less; }
+        if (left > right) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+implement trait Ord for f64 {
+    compare(&this, other: &f64) -> Ordering {
+        mut left: i64 = mem::transmute<f64, i64>(this);
+        mut right: i64 = mem::transmute<f64, i64>(*other);
+        left = left ^ ((((left >> 63) as u64) >> 1) as i64);
+        right = right ^ ((((right >> 63) as u64) >> 1) as i64);
+        if (left < right) { return Ordering::Less; }
+        if (left > right) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+}
+
+function min<T>(a: T, b: T) -> T
 where T: Ord {
     return match (a.compare(&b)) {
         Ordering::Greater => { b }

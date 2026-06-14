@@ -751,6 +751,40 @@ type struct ExprOps {
                             this.builder.build_store(arg_val, tmp);
                             arg_val = tmp;
                         }
+                    } else if (ek == LTypeKind::Pointer
+                               && (ak == LTypeKind::Float || ak == LTypeKind::Double)) {
+                        // Expected a pointer (a `&f32`/`&f64` reference
+                        // parameter), but the argument arrived as a loaded
+                        // SSE scalar.  This happens when a reference-typed
+                        // binding - e.g. a float payload bound by
+                        // `match (&opt) { Some(b) => ... }` - is passed bare
+                        // to a `&Self` parameter; the conditional `Eq`/`Ord`
+                        // impls on `Option<f64>` do exactly this via
+                        // `a.equals(b)`.  `codegen_rvalue` loaded the referent
+                        // to a `double`/`float`, so recover the address rather
+                        // than passing the value: there is no float<->pointer
+                        // auto-coercion, and passing the scalar trips the LLVM
+                        // verifier ("Call parameter type does not match
+                        // function signature").  Mirror the `ptr <- struct`
+                        // branch above - reuse the Load's source pointer when
+                        // possible (identity-preserving, matching the
+                        // receiver-side autoref), else spill to a temp slot
+                        // and take its address.  LLVMOpcode::Load = 27.
+                        mut handled_f: boolean = false;
+                        const opcode_f: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
+                        if (opcode_f == 27) {
+                            const ptr_operand_f: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                            if (ptr_operand_f != null) {
+                                arg_val = LValue { raw: ptr_operand_f };
+                                handled_f = true;
+                            }
+                        }
+                        if (!handled_f) {
+                            const fst: LType = LType { raw: actual_ty };
+                            const ftmp: LValue = this.builder.build_alloca(fst, "arg.faddr");
+                            this.builder.build_store(arg_val, ftmp);
+                            arg_val = ftmp;
+                        }
                     } else if (ek == LTypeKind::Struct && ak == LTypeKind::Pointer) {
                         const st: LType = LType { raw: expected_ty };
                         arg_val = this.builder.build_load(st, arg_val, "arg.deref");
