@@ -1005,7 +1005,28 @@ match (ch) {
 }
 ```
 
-### 7.4 Exhaustiveness
+### 7.4 Guard Clauses
+
+An arm may carry a **guard**: a boolean condition written `if (cond)` between the pattern and the `=>`. The guard is evaluated only after the pattern matches; if it is false, matching falls through to the next arm. Any bindings introduced by the pattern are in scope inside the guard.
+
+```cryo
+match (n) {
+    x if (x > 100) => { 3 }
+    x if (x > 10)  => { 2 }
+    x if (x > 0)   => { 1 }
+    _              => { 0 }
+}
+
+match (o) {
+    Option::Some(v) if (v > 5) => { v * 10; }
+    Option::Some(v)            => { v; }
+    Option::None               => { -1; }
+}
+```
+
+The parentheses around the condition are required. A guarded arm does **not** count toward exhaustiveness (the guard could always be false), so a `match` whose only arm for some case is guarded still needs a fall-through arm.
+
+### 7.5 Exhaustiveness
 
 The compiler checks that every possible value of the matched type is covered. Forgetting a variant of an enum is an error. The wildcard `_` is the explicit way to opt in to a default arm.
 
@@ -1848,7 +1869,7 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 
-Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 1.4](#14-types-and-type-safety) and [§ 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
+Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 2](#2-type-system) and [§ 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
 
 ---
 
@@ -2098,8 +2119,13 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::result` | `Result<T, E>` (`Ok` / `Err`) and its methods |
 | `core::primitives` | Methods on built-in types (`i32::max_value`, `char::is_digit`, …) |
 | `core::intrinsics` | Compiler intrinsics including `printf`, `malloc`, `free`, `memcpy` (the `print`/`println` family lives in `std::fmt`) |
+| `core::varargs` | `VaArgs`, the compiler-assigned type of a function's `args...` bucket |
 | `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>` |
+| `core::slice` | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: T[N]`) |
+| `core::ops` | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`) |
+| `core::iter` | `Iterator`, the trait the for-in sugar drives the scrutinee through |
 | `alloc::box` | `Box<T>` |
+| `alloc::rc` | `Rc<T>` |
 
 The prelude is deliberately small. Anything else is an explicit `import` - notably, the `print` / `println` / `eprint` / `eprintln` family lives in `std::fmt` and is **not** auto-imported. Examples in this document that use `println` assume `import std::fmt;` is in scope.
 
@@ -2116,12 +2142,12 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`fs`** | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` / `write(path, bytes)` / `read_to_string(path)` / `copy(from, to)`. Whole-path operations: `remove_file`, `rename`, `create_dir` / `create_dir_all`, `remove_dir` / `remove_dir_all`, `read_dir` (a `ReadDir` iterator of `DirEntry`), `canonicalize`. Metadata: `metadata` / `symlink_metadata` (typed `Metadata` via `stat` / `lstat`), `exists`, `is_file`, `is_dir`. `O_*` and `SEEK_*` constants. |
 | **`ffi`** | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures. |
 | **`env`** | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`. |
-| **`math`** | Thin libm wrappers: `square_root`, `sine`, `cosine`, `power`, `natural_log`, `exponential`, `floor`, `ceil`, `round`, `trunc`, `absolute`, plus `PI`, `TAU`, `E`. |
+| **`math`** | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, …), and the constants `PI`, `TAU`, `E`. |
 | **`time`** | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero. |
 | **`random`** | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic. |
-| **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. TLS, UDP, HTTP/2, and WebSocket are out of scope for 1.0 and are tracked on the post-1.0 roadmap. |
+| **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
 | **`process`** | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported. |
-| **`sync`** | Atomics (`AtomicU8`/`U32`/`U64`/`I32`/`I64`/`Bool`, `MemoryOrder`, `fence`, `compiler_fence`), `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement. |
+| **`sync`** | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement. |
 | **`thread`** | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn. |
 | **`test`** | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing). |
 

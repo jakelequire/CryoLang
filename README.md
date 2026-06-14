@@ -414,7 +414,7 @@ entry_point = "src/tool/main.cryo"
 | `math` | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`. |
 | `net` | TCP sockets and an HTTP/1.1 layer: `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server (`HttpServer::with_router(addr, &router).run()`), `Client::get`/`post`. |
 | `process` | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`. |
-| `sync` | Atomics (`AtomicU8` / `U32` / `U64` / `I32` / `I64` / `Bool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
+| `sync` | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
 | `thread` | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
 | `test` | The built-in unit-test framework. |
 
@@ -490,7 +490,7 @@ CryoLang/
 ├── stdlib/               The standard library, written in Cryo
 ├── tools/
 │   ├── CryoLSP           Language Server (Cryo source); builds via `make lsp`
-│   ├── CryoFormat        Formatter
+│   ├── CryoFormat        Formatter (experimental; not built by default)
 │   └── CryoAnalyzer      Semantic analyser
 ├── legacy/
 │   └── bootstrap/        Retired C++23 bootstrap; kept for historical reference only
@@ -522,14 +522,16 @@ for the full 1.0 release notes.
 - Self-hosted compiler with byte-identical 3-round selfhost check.
 - Trait system with `where`-bound generics, monomorphisation, and trait impls on primitives.
 - Single-inheritance classes with virtual dispatch and destructors.
-- Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, exclusive range, or-patterns).
+- Algebraic enums with exhaustive pattern matching (literal, identifier, wildcard, enum-destructure, exclusive range, or-patterns, and guard clauses `pattern if (cond) =>`).
 - Lambdas and capturing closures (let-bound, inline, multi-capture, nested, closure-as-fn-arg).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`, `Arc`.
-- Synchronization primitives: atomics (`AtomicU{8,32,64}`, `AtomicI{32,64}`, `AtomicBool`, `MemoryOrder`, `fence`), `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with call-site enforcement.
-- `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, scoped threads (`thread::Scope`), and `sync::mpsc` channels.
+- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with call-site enforcement.
+- `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, a named `thread::Builder` (stack size + OS thread name), scoped threads (`thread::Scope`), and `sync::mpsc` channels.
 - I/O over `Read` / `Write` traits with buffered wrappers.
-- HTTP/1.1 server (keep-alive, read timeouts), client, router. JSON parser and serializer.
+- Networking: `TcpStream` / `TcpListener`, `UdpSocket`, and OpenSSL-backed `TlsStream`. HTTP/1.1 server (keep-alive, read timeouts), client, and router; HTTP/2 (HPACK + single-stream framing) and WebSocket (RFC 6455). JSON parser and serializer.
+- Filesystem: `File` / `OpenOptions`, whole-path `read` / `write` / `copy`, `remove_file`, `create_dir` / `create_dir_all`, `read_dir`, `rename`, `canonicalize`, and `metadata` / `symlink_metadata`.
+- `time` (`Duration`, `Instant`, `SystemTime`, `sleep`) and `random` (xoshiro256\*\* `Rng` plus a `getrandom`-backed CSPRNG).
 - POSIX subprocess spawning with `fork + execve`.
 - Git-backed dependencies with a lockfile and content-addressed cache.
 - Built-in test framework with `cryo test`, `![test]`, `![ignore]`, `![should_panic]`.
@@ -537,14 +539,10 @@ for the full 1.0 release notes.
 
 **Beyond 1.0 (post-stable):**
 
-- A named `thread::Builder` configuration API (`thread::spawn` / `try_spawn` / `JoinHandle` / `spawn_with_attr`, scoped threads, and `mpsc` channels ship in 1.0).
 - Async / await / coroutines (currently parser-only).
-- Pattern guard clauses (`x if cond =>`).
-- The remaining iterator adapters (`.collect`, `.zip`, `.chain`, `.enumerate`, …). `.take`, `.map`, `.filter`, `.copied`, and `.cloned` partially ship in 1.0 — they work directly on iterators consumed by `.count` / `.fold` / `for-in`, but own-generic adapters chained after another adapter (e.g. `.take().map()`) are not supported. `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
-- TLS, UDP, HTTP/2, and WebSocket for `net::http`.
-- Filesystem ops beyond read/write/open (`remove_file`, `create_dir`, `read_dir`, `metadata`, …).
-- `time` (`Instant`, `Duration`, `sleep`) and `random` modules.
-- macOS / Darwin targets. x86_64 Linux and x86_64 Windows (native builds plus Linux→Windows cross via mingw-w64) both ship in 1.0.
+- The remaining iterator adapters (`.collect`, `.zip`, `.chain`, `.enumerate`, …). `.take`, `.map`, `.filter`, `.copied`, and `.cloned` ship in 1.0 — they work directly on iterators consumed by `.count` / `.fold` / `for-in`, but own-generic adapters chained after another adapter (e.g. `.take().map()`) are not yet supported. `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
+- Dialable IPv6 (the `IpAddr::V6` representation and DNS resolution exist in 1.0; connecting over v6 does not yet).
+- macOS / Darwin targets. (x86_64 Linux and x86_64 Windows — native builds plus Linux→Windows cross via mingw-w64 — ship in 1.0.)
 
 A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax).
 

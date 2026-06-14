@@ -245,7 +245,8 @@ ForInit            ::= VarDecl | Ident ":" Type ("=" Expr)? ";"
 
 Match              ::= "match" "(" Expr ")" "{" MatchArm* "}"
                        (* the parentheses around the subject are required *)
-MatchArm           ::= Pattern ("|" Pattern)* "=>" (Block | Expr ","?)
+MatchArm           ::= Pattern ("|" Pattern)* Guard? "=>" (Block | Expr ","?)
+Guard              ::= "if" "(" Expr ")"   (* checked after the pattern matches *)
 
 Switch             ::= "switch" "(" Expr ")" "{" CaseClause* "}"
 CaseClause         ::= ("case" Expr | "default") ":" Statement*
