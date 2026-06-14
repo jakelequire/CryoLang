@@ -286,3 +286,66 @@ function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
     }
     return expect(got_stderr, Str::new("stderr must capture ~100 KiB"));
 }
+
+// A command that prints the value of $CRYO_TEST_VAR with no extra output.
+// unix: printf avoids a trailing newline; windows: cmd's echo adds CRLF.
+![target(unix)]
+function cmd_print_var() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c")); c.arg(Str::new("printf %s \"$CRYO_TEST_VAR\""));
+    return c;
+}
+![target(windows)]
+function cmd_print_var() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c")); c.arg(Str::new("echo %CRYO_TEST_VAR%"));
+    return c;
+}
+![target(unix)]
+function print_var_expect() -> Str { return Str::new("cryo_env_works"); }
+![target(windows)]
+function print_var_expect() -> Str { return Str::new("cryo_env_works\r\n"); }
+
+// M5/P1: env() overrides reach the child. On Windows this exercises the new
+// CreateProcessA environment-block builder (the parent process does not have
+// CRYO_TEST_VAR, so the child can only see it via the constructed block); on
+// unix it exercises the existing per-var apply_env path.
+![test]
+function env_override_passed_to_child() -> Result<(), TestError> {
+    mut cmd: Command = cmd_print_var();
+    cmd.env(Str::new("CRYO_TEST_VAR"), Str::new("cryo_env_works"));
+    mut success: boolean = false;
+    mut content_ok: boolean = false;
+    match (cmd.output()) {
+        Result::Ok(out) => {
+            mut o: Output = out;
+            success = o.status.success();
+            content_ok = array_eq_str(&o.stdout, print_var_expect());
+            o.drop();
+        }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("output() of env command failed")); }
+    }
+    cmd.drop();
+    match (expect(success, Str::new("print-var command should succeed"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(content_ok, Str::new("child should see the overridden env var"));
+}
+
+// M5/P2: stdout=Null is honoured (no longer silently inherits the parent's
+// handle on Windows). `output()` forces Piped, so verify via status(): the
+// child must spawn with the NUL handle and exit cleanly.
+![test]
+function stdout_null_spawns_and_succeeds() -> Result<(), TestError> {
+    mut cmd: Command = cmd_echo();
+    cmd.arg(Str::new("hidden"));
+    cmd.stdout(Stdio::Null);
+    cmd.stderr(Stdio::Null);
+    mut success: boolean = false;
+    match (cmd.status()) {
+        Result::Ok(st) => { success = st.success(); }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("status() with stdout=Null failed")); }
+    }
+    cmd.drop();
+    return expect(success, Str::new("echo with stdout/stderr=Null should exit 0"));
+}
