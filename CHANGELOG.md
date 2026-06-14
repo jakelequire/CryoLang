@@ -155,8 +155,9 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`process`:** `Command`/`Child`/`ExitStatus` via `fork + execve`;
   `spawn`/`status`/`output`/`wait`/`try_wait`/`kill`/`send_signal`.
 - **`env`:** `args()`, `var`, `set_var`, `remove_var`, `process_exit`.
-- **`sync`:** atomics (`AtomicU8`/`U32`/`U64`/`I32`/`I64`/`Bool`,
-  `MemoryOrder`, `fence`, `compiler_fence`), `Mutex<T>`, `RwLock<T>`,
+- **`sync`:** a generic `Atomic<T>` (`T` = `u8`/`u32`/`u64`/`i32`/`i64`/`boolean`,
+  dispatched at compile time via `static match`), `MemoryOrder`, `fence`,
+  `compiler_fence`, `Mutex<T>`, `RwLock<T>`,
   `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with
   call-site enforcement.
 - **`thread`:** `ThreadLocal<T>` via `pthread_key`; OS threads via
@@ -209,8 +210,8 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 
 ### Diagnostics
 
-- 102 active error codes (E0001–E0900 range) with source-span underlines,
-  fix suggestions, and machine-applicable quickfixes where applicable.
+- Over 200 defined error codes (in the E0000–E0999 range) with source-span
+  underlines, fix suggestions, and machine-applicable quickfixes where applicable.
 - ANSI color rendering respecting `NO_COLOR`/`FORCE_COLOR`/`CLICOLOR_FORCE`
   with `isatty(2)` fallback.
 - Quickfix system covering literal coercions (E0218/E0200), parser

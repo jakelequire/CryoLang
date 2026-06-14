@@ -88,8 +88,11 @@ A few conventions worth knowing:
 - Async / await / coroutines parse but do not lower.
 - No package registry. Dependencies resolve via git URL with a lockfile
   and content-addressed cache.
-- No cross-compilation; the host toolchain is the target.
-- `process::Command` is POSIX-only.
+- Cross-compilation is limited to Linux → x86_64 Windows via mingw-w64
+  (`--target=x86_64-pc-windows-gnu`); otherwise the host toolchain is the target.
+- `process::Command` is POSIX-first (`fork` + `execve`); a partial Windows
+  (`CreateProcessA`) path exists with known gaps (`Stdio::Null` / `Fd` fall back
+  to inherit, env/cwd not fully applied).
 - `tools/CryoFormat` is exploratory and not built by default. The shipped
   tooling is `tools/CryoLSP` (the LSP server, `make lsp`) and
   `tools/CryoAnalyzer` (the VS Code extension, `make install-lsp`).

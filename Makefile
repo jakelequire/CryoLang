@@ -93,7 +93,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list examples pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -111,6 +111,7 @@ help:
 	@echo "                         Linux 6-stage chain via WSL."
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
+	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
 	@echo "  make cryo-exe          Cross-build cryo.exe (x86_64-pc-windows-gnu)"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
@@ -354,6 +355,31 @@ test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 
 test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
+endif
+
+# ---- examples smoke build ---------------------------------------------
+# Compile every examples/*/ project with the freshly-built stage-2 compiler
+# so a stdlib/compiler change that breaks a shipped "getting started" example
+# fails CI instead of reaching users.  Build-only (no run); the per-example
+# build/ dirs are gitignored.  Run `make cryo` first to pick up compiler
+# changes.  CRYO_STDLIB pins the in-tree stdlib so resolution is independent
+# of which compiler binary builds the examples.
+ifeq ($(HOST_OS),windows)
+examples: $(STAGE2_EXE) $(LIBCRYO_A)
+	@echo "make examples runs under POSIX/WSL; native Windows cmd looping is unsupported."
+	@echo "Run it from WSL or Git Bash instead."
+else
+examples: $(STAGE2) $(LIBCRYO_A)
+	@failed=""; \
+	for cfg in examples/*/cryoconfig; do \
+	    dir=$$(dirname "$$cfg"); \
+	    printf '==> %s\n' "$$dir"; \
+	    if ! ( cd "$$dir" && CRYO_STDLIB="$(ROOT)/stdlib" "$(STAGE2)" build >/dev/null ); then \
+	        failed="$$failed $$dir"; \
+	    fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "==> FAILED examples:$$failed"; exit 1; fi; \
+	echo "==> All examples built"
 endif
 
 # ---- release packaging -------------------------------------------------
