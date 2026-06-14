@@ -1,8 +1,10 @@
 ///! Command / Child - spawn known binaries, check exit status, capture
-///! stdout and stderr.  As of 2026-05-26 the H3 stderr-drain deadlock
-///! is fixed (poll(2) over non-blocking pipes), so large captures are
-///! safe; the `output_with_large_stderr_does_not_deadlock` test
-///! exercises a >64-KiB stderr load specifically as a regression.
+///! stdout and stderr.  The H3 stderr-drain deadlock is fixed on both
+///! platforms (Unix: poll(2) over non-blocking pipes, 2026-05-26;
+///! Windows: a PeekNamedPipe-gated interleaved drain, M5/P3), so large
+///! captures are safe.  `output_with_large_stderr_does_not_deadlock`
+///! (Unix /bin/sh) and `output_large_stderr_no_deadlock_win` (Windows
+///! PowerShell) each force a >64-KiB stderr load as a regression.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::ProcessCommand;
@@ -17,6 +19,9 @@ import std::io::error;
 import std::io::traits;
 import std::process::command;
 import std::process::child;
+import std::fs::path;
+import std::fs::file;
+import std::fs::dir;
 import std::test::error;
 import std::test::assert;
 
@@ -348,4 +353,119 @@ function stdout_null_spawns_and_succeeds() -> Result<(), TestError> {
     }
     cmd.drop();
     return expect(success, Str::new("echo with stdout/stderr=Null should exit 0"));
+}
+
+// M5/P4: `Stdio::Fd` redirects a child stream to a caller-supplied fd.  On
+// Windows the fd's underlying HANDLE is recovered (`_get_osfhandle`) and
+// duplicated inheritable for the child; `Stdio::Fd` transfers ownership, so
+// the spawn closes our fd and we detach the File (fd = -1) before dropping it
+// to avoid the documented double-close.  Verified end-to-end: the child's
+// stdout must land in the file.
+![test]
+function stdout_fd_redirects_to_file() -> Result<(), TestError> {
+    const p: Path = Path::from_str(Str::new("cryo_fd_redirect.tmp"));
+
+    mut raw: i32 = -1;
+    match (File::create(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            raw = f.fd;
+            f.fd = -1;          // ownership goes to the spawn; drop is now a no-op
+            f.drop();
+        }
+        Result::Err(_) => { return bail(Str::new("File::create failed")); }
+    }
+
+    mut cmd: Command = cmd_echo();
+    cmd.arg(Str::new("fdhello"));
+    cmd.stdout(Stdio::Fd(raw));
+    mut success: boolean = false;
+    match (cmd.status()) {
+        Result::Ok(st) => { success = st.success(); }
+        Result::Err(_) => {
+            cmd.drop();
+            match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
+            return bail(Str::new("status() with stdout=Fd failed"));
+        }
+    }
+    cmd.drop();
+
+    // Read the redirect target back: the child's stdout must be in it.
+    mut readbuf: u8[64];
+    mut got: u64 = 0;
+    match (File::open(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.read_all(&readbuf[0], 64)) {
+                Result::Ok(n)  => { got = n; }
+                Result::Err(_) => {
+                    f.drop();
+                    match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
+                    return bail(Str::new("read-back of redirect target failed"));
+                }
+            }
+            f.drop();
+        }
+        Result::Err(_) => {
+            match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
+            return bail(Str::new("File::open of redirect target failed"));
+        }
+    }
+    match (remove_file(p)) { Result::Ok(_) => { } Result::Err(_) => { } }
+
+    match (expect(success, Str::new("echo with stdout=Fd should exit 0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // "fdhello" is 7 bytes; echo adds a newline (LF or CRLF). Confirm the
+    // word itself reached the file rather than just any byte count.
+    const want: Slice<u8> = Str::new("fdhello").as_bytes();
+    mut content_ok: boolean = (got >= 7u64);
+    mut i: u64 = 0;
+    while (content_ok && i < 7u64) {
+        match (want.get(i)) {
+            Option::Some(wv) => { if (readbuf[i] != wv) { content_ok = false; } }
+            Option::None     => { content_ok = false; }
+        }
+        i = i + 1u64;
+    }
+    return expect(content_ok, Str::new("redirected stdout must reach the file"));
+}
+
+// M5/P3: the Windows `collect_output` drain interleaves stdout/stderr via
+// PeekNamedPipe, so a child that floods one pipe before touching the other
+// cannot deadlock us.  The Unix twin uses `/bin/sh` (absent on Windows); this
+// one drives PowerShell to push ~100 KiB onto stderr (well past the 64-KiB
+// pipe buffer) *before* writing stdout, which wedged the old serial drain.
+![target(windows)]
+![test]
+function output_large_stderr_no_deadlock_win() -> Result<(), TestError> {
+    mut cmd: Command = Command::new(Str::new("powershell"));
+    cmd.arg(Str::new("-NoProfile"));
+    cmd.arg(Str::new("-Command"));
+    cmd.arg(Str::new("$s = 'y' * 100000; [Console]::Error.Write($s); [Console]::Out.Write('done')"));
+    mut deadlocked: boolean = true;
+    mut got_stdout: boolean = false;
+    mut got_stderr: boolean = false;
+    match (cmd.output()) {
+        Result::Ok(out) => {
+            mut o: Output = out;
+            deadlocked = false;
+            got_stdout = o.stdout.length() >= 4u64;        // "done"
+            got_stderr = o.stderr.length() >= 100000u64;
+            o.drop();
+        }
+        Result::Err(_) => {
+            // PowerShell missing on this host - skip rather than fail.
+            cmd.drop();
+            return Result::Ok(());
+        }
+    }
+    cmd.drop();
+    match (expect(!deadlocked, Str::new("output() must return; interleaved drain must not deadlock"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(got_stderr, Str::new("stderr must capture ~100 KiB"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(got_stdout, Str::new("stdout 'done' terminator must be captured"));
 }

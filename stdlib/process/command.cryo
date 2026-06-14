@@ -733,13 +733,13 @@ function drain_nonblock(fd: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>
 // the existing fd-based ChildStdin/Stdout/Stderr + io::fd read/write/close
 // machinery is reused unchanged.
 //
-// v1 scope: Inherit and Piped stdio (covers `output()` and the common
-// inherit-spawn).  `Stdio::Null` and `Stdio::Fd` fall back to Inherit on
-// Windows; `clear_env`/per-var env overrides and `cwd` beyond a plain path
-// are not yet applied here.  `collect_output` drains stdout then stderr
-// sequentially (blocking) rather than via poll, so a child that fills the
-// stderr pipe buffer before its stdout is consumed could stall - fine for the
-// typical bounded-output case.
+// Stdio: Inherit, Piped, Null (an inheritable `NUL` handle), and Fd (the
+// caller's CRT fd is recovered to a Win32 HANDLE via `_get_osfhandle` and
+// duplicated inheritable for the child) are all wired.  `clear_env` /
+// per-var env overrides and `cwd` are applied (explicit ANSI env block +
+// `lpCurrentDirectory`).  `collect_output` interleaves the stdout/stderr
+// drains via `PeekNamedPipe` so neither full pipe buffer can deadlock the
+// other (matching the POSIX `poll` path).
 // ===========================================================================
 
 // Per-stream Windows stdio wiring produced by `win_setup_stdio`.
@@ -748,6 +748,7 @@ type struct WinStdio {
     child_handle: u8*;   // handle handed to the child via STARTUPINFO
     parent_fd:    i32;   // parent pipe end as a CRT fd, or -1
     extra_close:  u8*;   // child pipe end the parent must close post-spawn, or null
+    close_fd:     i32;   // caller CRT fd to close post-spawn (Stdio::Fd ownership), or -1
     ok:           boolean;
 
     drop(mut &this) -> void { }
@@ -913,18 +914,18 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
                 nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
             };
             if (syscall::CreatePipe(&rd, &wr, &sa as u8*, 0u32) == 0) {
-                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, ok: false };
+                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
             }
             if (is_input) {
                 // child reads `rd` (inheritable); parent writes `wr`.
                 syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0u32);
                 const f: i32 = _open_osfhandle(wr as i64, 0);
-                return WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, ok: true };
+                return WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_fd: -1, ok: true };
             }
             // child writes `wr` (inheritable); parent reads `rd`.
             syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0u32);
             const f: i32 = _open_osfhandle(rd as i64, 0);
-            return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, ok: true };
+            return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_fd: -1, ok: true };
         }
         Stdio::Null => {
             // Discard the child's stream by handing it an inheritable handle
@@ -944,16 +945,35 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             // against a local -1, not syscall::INVALID_HANDLE_VALUE (a
             // cross-module const i64 that mis-evaluates; selfhost bug #1).
             if ((h as i64) == -1) {
-                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, ok: false };
+                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
             }
             // Parent owns the NUL handle; close it after the child inherits it.
-            return WinStdio { child_handle: h, parent_fd: -1, extra_close: h, ok: true };
+            return WinStdio { child_handle: h, parent_fd: -1, extra_close: h, close_fd: -1, ok: true };
+        }
+        Stdio::Fd(raw) => {
+            // Recover the Win32 HANDLE backing the caller's CRT fd and
+            // duplicate it as an inheritable handle for the child.  We never
+            // mutate the caller's handle flags (DuplicateHandle is the robust
+            // path, matching Rust); the duplicate is closed post-spawn and the
+            // original fd is closed too, since `Stdio::Fd` transfers ownership.
+            const src: i64 = _get_osfhandle(raw);
+            if (src == -1) {
+                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
+            }
+            mut dup: u8* = null;
+            const cur: u8* = syscall::GetCurrentProcess();
+            if (syscall::DuplicateHandle(cur, src as u8*, cur, &dup, 0u32, 1,
+                                         syscall::DUPLICATE_SAME_ACCESS) == 0) {
+                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
+            }
+            // child inherits `dup`; parent closes both `dup` and the caller's fd.
+            return WinStdio { child_handle: dup, parent_fd: -1, extra_close: dup, close_fd: raw, ok: true };
         }
         _ => {
-            // Inherit (and the v1 Fd fallback): hand the child our own
-            // std handle; nothing for the parent to close or wrap.
+            // Inherit: hand the child our own std handle; nothing for the
+            // parent to close or wrap.
             return WinStdio { child_handle: syscall::GetStdHandle(std_id),
-                              parent_fd: -1, extra_close: null, ok: true };
+                              parent_fd: -1, extra_close: null, close_fd: -1, ok: true };
         }
     }
 }
@@ -1010,6 +1030,13 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     if (sout.extra_close != null) { syscall::CloseHandle(sout.extra_close); }
     if (serr.extra_close != null) { syscall::CloseHandle(serr.extra_close); }
 
+    // `Stdio::Fd` transfers ownership: close the caller's fd in the parent
+    // now that the child has inherited a duplicate (runs on success or
+    // failure, mirroring the POSIX `Stdio::Fd` parent-close).
+    if (sin.close_fd  >= 0) { fd::close_fd(sin.close_fd); }
+    if (sout.close_fd >= 0) { fd::close_fd(sout.close_fd); }
+    if (serr.close_fd >= 0) { fd::close_fd(serr.close_fd); }
+
     if (ok == 0) {
         if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
         if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
@@ -1029,7 +1056,8 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
                                  stdin_handle, stdout_handle, stderr_handle));
 }
 
-// Blocking drain of a CRT fd to EOF.
+// Blocking drain of a CRT fd to EOF.  Used for the single-stream case where
+// there is no second pipe to deadlock against.
 ![target(windows)]
 function win_drain(fd_no: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) -> Result<(), IoError> {
     loop {
@@ -1040,6 +1068,83 @@ function win_drain(fd_no: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) 
                 while (i < n) { buf.push(chunk[i]); i = i + 1u64; }
             }
             Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+}
+
+// Bytes immediately readable from a pipe-backed CRT fd without blocking, or
+// -1 when the write end has closed (EOF: PeekNamedPipe fails with
+// ERROR_BROKEN_PIPE) or the fd can't be peeked.  Drives the interleaved drain.
+![target(windows)]
+function win_peek_avail(fd_no: i32) -> i64 {
+    const h: i64 = _get_osfhandle(fd_no);
+    if (h == -1) { return -1; }
+    mut avail: u32 = 0u32;
+    const r: i32 = syscall::PeekNamedPipe(h as u8*, null, 0u32, null, &avail, null);
+    if (r == 0) { return -1; }   // broken pipe => EOF
+    return avail as i64;
+}
+
+// Drain both pipe-backed fds concurrently to EOF.  Each iteration peeks every
+// still-open fd and reads only what's already buffered (so neither read can
+// block), sleeping 1ms when neither has data ready.  This removes the
+// sequential-drain deadlock: the child can keep filling its stderr pipe while
+// we drain stdout, and vice-versa, instead of one full pipe wedging the other.
+![target(windows)]
+function win_drain_interleaved(so_fd0: i32, se_fd0: i32,
+                               chunk: u8*, chunk_len: u64,
+                               so_buf: mut &Array<u8>,
+                               se_buf: mut &Array<u8>) -> Result<(), IoError> {
+    mut so: i32 = so_fd0;
+    mut se: i32 = se_fd0;
+    loop {
+        if (so < 0 && se < 0) { return Result::Ok(()); }
+        mut progressed: boolean = false;
+
+        if (so >= 0) {
+            const av: i64 = win_peek_avail(so);
+            if (av < 0) {
+                so = -1;
+            } else if (av > 0) {
+                mut want: u64 = chunk_len;
+                if ((av as u64) < want) { want = av as u64; }
+                match (fd::read_fd(so, chunk, want)) {
+                    Result::Ok(n) => {
+                        if (n == 0u64) { so = -1; }
+                        else {
+                            mut i: u64 = 0u64;
+                            while (i < n) { so_buf.push(chunk[i]); i = i + 1u64; }
+                            progressed = true;
+                        }
+                    }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+            }
+        }
+
+        if (se >= 0) {
+            const av: i64 = win_peek_avail(se);
+            if (av < 0) {
+                se = -1;
+            } else if (av > 0) {
+                mut want: u64 = chunk_len;
+                if ((av as u64) < want) { want = av as u64; }
+                match (fd::read_fd(se, chunk, want)) {
+                    Result::Ok(n) => {
+                        if (n == 0u64) { se = -1; }
+                        else {
+                            mut i: u64 = 0u64;
+                            while (i < n) { se_buf.push(chunk[i]); i = i + 1u64; }
+                            progressed = true;
+                        }
+                    }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+            }
+        }
+
+        if (!progressed && (so >= 0 || se >= 0)) {
+            syscall::Sleep(1u32);
         }
     }
 }
@@ -1061,13 +1166,20 @@ function collect_output(c: mut &Child) -> Result<Output, IoError> {
         Option::None => { }
     }
 
-    if (so_fd >= 0) {
+    if (so_fd >= 0 && se_fd >= 0) {
+        // Both piped: interleave so neither full pipe buffer can wedge the
+        // other (the sequential-drain deadlock).
+        match (win_drain_interleaved(so_fd, se_fd, &chunk[0], 4096,
+                                     &stdout_buffer, &stderr_buffer)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    } else if (so_fd >= 0) {
         match (win_drain(so_fd, &chunk[0], 4096, &stdout_buffer)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }
         }
-    }
-    if (se_fd >= 0) {
+    } else if (se_fd >= 0) {
         match (win_drain(se_fd, &chunk[0], 4096, &stderr_buffer)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(e); }
