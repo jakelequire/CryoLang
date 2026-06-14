@@ -2,8 +2,9 @@
 ///! name) on top of `spawn_with_attr`.
 ///!
 ///! Exercises the by-value generic builder methods (`spawn` / `try_spawn`
-///! take `this` by value) end-to-end, including the OS thread name set
-///! via `pthread_setname_np` and stack-size validation.
+///! take `this` by value) end-to-end, including the OS thread name (set via
+///! `pthread_setname_np` on POSIX, `SetThreadDescription` on Windows) and
+///! per-platform stack-size handling.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::ThreadBuilder;
@@ -12,6 +13,7 @@ import std::core::result;
 import std::collections::str;
 import std::thread;
 import std::ffi::libc;
+import std::ffi::syscall;
 import std::test::error;
 import std::test::assert;
 
@@ -20,9 +22,12 @@ function double_it(x: i32) -> i32 {
     return x * 2;
 }
 
-/// Worker that checks its OWN OS thread name matches "worker". The name
-/// is applied by the parent right after `pthread_create` returns, so poll
-/// briefly to avoid racing the set. Returns 1 on match, 0 on timeout.
+/// Worker that checks its OWN OS thread name matches "worker". The name is
+/// applied by the parent right after the thread is created, so poll briefly to
+/// avoid racing the set. Returns 1 on match, 0 on timeout. The readback uses
+/// each platform's native API: `pthread_getname_np` on POSIX,
+/// `GetThreadDescription` on Windows.
+![target(unix)]
 function name_is_worker(tag: i32) -> i32 {
     const expected: Str = Str::new("worker");
     mut tries: i32 = 0;
@@ -33,6 +38,36 @@ function name_is_worker(tag: i32) -> i32 {
         libc::pthread_getname_np(libc::pthread_self(), &buf[0], 32u64);
         const got: Str = Str::from_raw(&buf[0], libc::strlen(&buf[0]));
         if (got.equals(&expected)) { return 1; }
+        thread::sleep_ms(1u64);
+        tries = tries + 1;
+    }
+    return 0;
+}
+
+// Compare a NUL-terminated UTF-16 string to the literal "worker".
+![target(windows)]
+function wide_is_worker(w: u16*) -> boolean {
+    // 'w' 'o' 'r' 'k' 'e' 'r' NUL
+    const expected: u16[7] = [119u16, 111u16, 114u16, 107u16, 101u16, 114u16, 0u16];
+    mut i: u64 = 0u64;
+    while (i < 7u64) {
+        if (w[i] != expected[i]) { return false; }
+        i = i + 1u64;
+    }
+    return true;
+}
+
+![target(windows)]
+function name_is_worker(tag: i32) -> i32 {
+    mut tries: i32 = 0;
+    while (tries < 500) {
+        mut pwsz: u16* = null;
+        const hr: i32 = syscall::GetThreadDescription(syscall::GetCurrentThread(), &pwsz);
+        if (hr >= 0 && pwsz != null) {
+            const ok: boolean = wide_is_worker(pwsz);
+            syscall::LocalFree(pwsz as u8*);
+            if (ok) { return 1; }
+        }
         thread::sleep_ms(1u64);
         tries = tries + 1;
     }
@@ -72,18 +107,37 @@ function builder_sets_os_thread_name() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
-![test]
-function builder_try_spawn_rejects_tiny_stack() -> Result<(), TestError> {
-    // A stack size below PTHREAD_STACK_MIN must be rejected by the OS
-    // (EINVAL from pthread_attr_setstacksize), surfacing as an Err rather
-    // than a silent clamp or a crash.
-    const res: Result<thread::JoinHandle<i32>, thread::SpawnError> =
-        thread::Builder::new().stack_size(1u64).try_spawn<i32, i32>(7, double_it);
+// A sub-minimum (1-byte) stack request: the two OSes contract it differently.
+// POSIX rejects it (EINVAL from pthread_attr_setstacksize) and the spawn
+// surfaces an Err.  Windows' CreateThread has no such floor; it silently
+// rounds dwStackSize up to a usable size, so the spawn succeeds and the thread
+// runs correctly.  The guarantee shared by both - and what this regression
+// actually guards - is that a tiny stack is handled safely, never a silent
+// corruption or a crash.
+![target(unix)]
+function check_tiny_stack(res: Result<thread::JoinHandle<i32>, thread::SpawnError>)
+        -> Result<(), TestError> {
     const is_err: boolean = res.is_err();
     match (res) {
         Result::Ok(h)  => { h.join(); }   // shouldn't happen; join to not leak
         Result::Err(_) => { }
     }
-    expect_true(is_err, Str::new("a 1-byte stack must be rejected"))?;
-    return Result::Ok(());
+    return expect_true(is_err, Str::new("a sub-minimum stack must be rejected on POSIX"));
+}
+![target(windows)]
+function check_tiny_stack(res: Result<thread::JoinHandle<i32>, thread::SpawnError>)
+        -> Result<(), TestError> {
+    match (res) {
+        // Windows clamps the stack up and runs the body; confirm it ran
+        // correctly (double_it(7) == 14) rather than corrupting/crashing.
+        Result::Ok(h)  => { return expect_eq(h.join(), 14); }
+        Result::Err(_) => { return bail(Str::new("Windows should clamp a tiny stack, not reject it")); }
+    }
+}
+
+![test]
+function builder_try_spawn_rejects_tiny_stack() -> Result<(), TestError> {
+    const res: Result<thread::JoinHandle<i32>, thread::SpawnError> =
+        thread::Builder::new().stack_size(1u64).try_spawn<i32, i32>(7, double_it);
+    return check_tiny_stack(res);
 }

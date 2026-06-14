@@ -127,13 +127,27 @@ private function os_sleep_nanos(nanos: u64) -> void {
     syscall::Sleep(ms as u32);
 }
 
-// Best-effort OS-visible thread name.  POSIX has pthread_setname_np; the
-// Windows equivalent (SetThreadDescription) needs a wide string and is not
-// wired up, so naming is a no-op there (it never affects correctness).
+// Best-effort OS-visible thread name.  POSIX has pthread_setname_np; Windows
+// has SetThreadDescription, which takes a UTF-16 string applied to a thread
+// HANDLE (`tid` holds the CreateThread HANDLE on Windows).  Naming is
+// best-effort - a failure (or an old Windows without the API) never affects
+// correctness.
 ![target(unix)]
 private function os_set_thread_name(tid: u64, name: u8*) -> void { pthread_setname_np(tid, name); }
 ![target(windows)]
-private function os_set_thread_name(tid: u64, name: u8*) -> void { }
+private function os_set_thread_name(tid: u64, name: u8*) -> void {
+    // The Builder caps names at MAX_THREAD_NAME (15) bytes, so a 16-wchar
+    // buffer (incl. the NUL) always holds the UTF-16 form.  `-1` length tells
+    // MultiByteToWideChar the input is NUL-terminated (and to NUL-terminate
+    // the output).
+    mut wbuf: u16[16];
+    mut i: u64 = 0u64;
+    while (i < 16u64) { wbuf[i] = 0u16; i = i + 1u64; }
+    const n: i32 = syscall::MultiByteToWideChar(syscall::CP_UTF8, 0u32,
+                                                name, -1, &wbuf[0], 16);
+    if (n <= 0) { return; }
+    syscall::SetThreadDescription(tid as u8*, &wbuf[0]);
+}
 
 
 // ---------------------------------------------------------------------------
@@ -427,8 +441,8 @@ where C: Send, T: Send {
 
 // The OS thread name is capped at 15 bytes plus a NUL by
 // `pthread_setname_np` (POSIX); the stack size is applied by
-// `os_create_thread`.  The name limit is shared by both platforms (Windows
-// ignores the name today).
+// `os_create_thread`.  The 15-byte limit is shared by both platforms - it is
+// the POSIX maximum, and well within Windows' SetThreadDescription bound.
 const MAX_THREAD_NAME: u64 = 15;
 
 /// A configurable thread spawn: set a stack size and/or an OS-visible
@@ -511,9 +525,8 @@ type struct Builder {
         match (result) {
             Result::Ok(h) => {
                 if (this.name_len > 0u64) {
-                    // Best-effort: a naming failure (or an unsupported
-                    // platform, e.g. Windows) does not invalidate the live
-                    // thread.
+                    // Best-effort: a naming failure does not invalidate the
+                    // live thread.
                     os_set_thread_name(h.tid, &this.name_buf[0]);
                 }
                 return Result::Ok(h);
