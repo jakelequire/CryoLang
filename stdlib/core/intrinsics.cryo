@@ -24,6 +24,12 @@ extern "C" {
     // resolved)`; the Windows `realpath` shim below swaps them.  Returns
     // `absPath` on success, null on failure (same contract as realpath).
     function _fullpath(absPath: i8*, relPath: string, maxLength: u64) -> i8*;
+    // Over-aligned allocation.  msvcrt has no C11 `aligned_alloc`; its
+    // equivalent is `_aligned_malloc(size, alignment)` (note the arg order is
+    // the reverse of `aligned_alloc`).  Memory from `_aligned_malloc` MUST be
+    // released with `_aligned_free`, never plain `free`.
+    function _aligned_malloc(size: u64, alignment: u64) -> void*;
+    function _aligned_free(memblock: void*) -> void;
 }
 
 // Allocation.
@@ -32,29 +38,44 @@ intrinsic function calloc(count: u64, size: u64) -> void*;
 intrinsic function realloc(ptr: void*, new_size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
 
-// `aligned_alloc(align, size)` is POSIX C11 - present on glibc/musl
-// but NOT on mingw-w64's msvcrt.  Cryo callers always pair it with
-// `free()`, which works for POSIX `aligned_alloc` but UB for Windows
-// `_aligned_malloc` (the latter requires `_aligned_free`).
+// `aligned_alloc(align, size)` is POSIX C11 - present on glibc/musl but NOT
+// on mingw-w64's msvcrt.  Its over-aligned memory may be released with plain
+// `free()` (C11 guarantee), so on UNIX `aligned_free` collapses to `free`.
 //
-// On UNIX we extern through to the libc symbol.  On Windows we
-// substitute a thin shim that returns `malloc(size)` and discards the
-// alignment argument: mingw-w64's malloc is guaranteed 16-byte aligned
-// on x64, which covers every Cryo type that doesn't use `![align(N)]`
-// with N > 16.  Callers wanting stronger alignment than 16 on Windows
-// will need a paired `_aligned_malloc`/`_aligned_free` API in a future
-// session; until then the shim panics so the limitation surfaces
-// immediately instead of silently misaligning.
+// On Windows we route over-aligned requests (alignment > 16) to
+// `_aligned_malloc`, since mingw-w64's `malloc` only guarantees 16-byte
+// alignment on x64.  `_aligned_malloc` memory MUST be freed with
+// `_aligned_free`, so the matching `aligned_free` below selects the correct
+// deallocator from the recorded alignment.  Requests at alignment <= 16 still
+// use plain `malloc`/`free` on both platforms (the common fast path).
 ![target(unix)]
 intrinsic function aligned_alloc(alignment: u64, size: u64) -> void*;
 
 ![target(windows)]
 function aligned_alloc(alignment: u64, size: u64) -> void* {
     if (alignment > 16u64) {
-        panic("aligned_alloc with alignment > 16 not yet supported on Windows",
-              FILE, LINE as u32);
+        return _aligned_malloc(size, alignment);
     }
     return malloc(size);
+}
+
+// Release memory obtained from `aligned_alloc`.  `alignment` is the value the
+// allocation was made with (carried in the type's `Layout`); it selects the
+// deallocator that matches the allocator above.  Callers that pair
+// `aligned_alloc` with a free MUST use this rather than plain `free`, or
+// over-aligned Windows allocations corrupt the heap.
+![target(unix)]
+function aligned_free(ptr: void*, alignment: u64) -> void {
+    free(ptr);
+}
+
+![target(windows)]
+function aligned_free(ptr: void*, alignment: u64) -> void {
+    if (alignment > 16u64) {
+        _aligned_free(ptr);
+        return;
+    }
+    free(ptr);
 }
 
 // Bulk memory.
