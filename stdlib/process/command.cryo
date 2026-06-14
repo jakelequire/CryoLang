@@ -814,6 +814,92 @@ function build_cmdline(cmd: &Command) -> String {
     return cl;
 }
 
+// Append every byte of `s` to `blk` (no terminator).
+![target(windows)]
+function win_append_bytes(blk: &String, s: &String) -> void {
+    const p: u8* = s.as_ptr();
+    const n: u64 = s.length();
+    mut i: u64 = 0u64;
+    while (i < n) { blk.push(p[i]); i = i + 1u64; }
+}
+
+// True if the `KEY=VALUE\0` entry at `entry` has key exactly `key` (i.e. the
+// bytes match and the entry's key ends right at the `=`).  Used to drop an
+// inherited variable that the caller overrides.
+![target(windows)]
+function win_env_key_matches(entry: u8*, key: &String) -> boolean {
+    const klen: u64 = key.length();
+    const kp: u8* = key.as_ptr();
+    mut i: u64 = 0u64;
+    while (i < klen) {
+        if (entry[i] != kp[i]) { return false; }
+        i = i + 1u64;
+    }
+    return entry[klen] == 61u8;  // '='
+}
+
+// Build the ANSI environment block for CreateProcessA: a sequence of
+// `KEY=VALUE\0` entries terminated by an extra `\0`.  Returns an empty
+// String (caller passes null -> inherit verbatim) only when there is
+// nothing to change.  When `clear_env_flag` is set the inherited block is
+// skipped; otherwise inherited entries are copied except those the caller
+// overrides (so overrides win), then the overrides are appended.  We use the
+// ANSI block (no CREATE_UNICODE_ENVIRONMENT), matching CreateProcessA's
+// `lpCommandLine`/`lpCurrentDirectory` ANSI strings.
+![target(windows)]
+function build_env_block(cmd: &Command) -> String {
+    mut blk: String = String::new();
+
+    if (!cmd.clear_env_flag) {
+        const base: u8* = syscall::GetEnvironmentStrings();
+        if (base != null) {
+            mut i: u64 = 0u64;
+            while (base[i] != 0u8) {        // until the block's double-NUL
+                const start: u64 = i;
+                mut overridden: boolean = false;
+                mut e: u64 = 0u64;
+                while (e < cmd.envs.length()) {
+                    match (cmd.envs.get_ref(e)) {
+                        Option::Some(en) => {
+                            if (win_env_key_matches(&base[start], &en.key)) {
+                                overridden = true;
+                            }
+                        }
+                        Option::None => { }
+                    }
+                    e = e + 1u64;
+                }
+                // Copy (or skip) the whole `KEY=VALUE\0` entry.
+                while (base[i] != 0u8) {
+                    if (!overridden) { blk.push(base[i]); }
+                    i = i + 1u64;
+                }
+                if (!overridden) { blk.push(0u8); }
+                i = i + 1u64;              // step past the entry's NUL
+            }
+            syscall::FreeEnvironmentStringsA(base);
+        }
+    }
+
+    // Append the caller's overrides as KEY=VALUE\0.
+    mut e2: u64 = 0u64;
+    while (e2 < cmd.envs.length()) {
+        match (cmd.envs.get_ref(e2)) {
+            Option::Some(en) => {
+                win_append_bytes(&blk, &en.key);
+                blk.push(61u8);           // '='
+                win_append_bytes(&blk, &en.value);
+                blk.push(0u8);
+            }
+            Option::None => { }
+        }
+        e2 = e2 + 1u64;
+    }
+
+    blk.push(0u8);  // block terminator (block ends in `\0\0`)
+    return blk;
+}
+
 // Wire one std stream for the child.  Piped creates an inheritable pipe and
 // bridges the parent end to a CRT fd; everything else inherits the parent's
 // corresponding std handle.
@@ -840,8 +926,31 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             const f: i32 = _open_osfhandle(rd as i64, 0);
             return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, ok: true };
         }
+        Stdio::Null => {
+            // Discard the child's stream by handing it an inheritable handle
+            // on the null device (`NUL`), instead of the v1 behaviour of
+            // inheriting the parent's std handle (which leaked the child's
+            // output onto the parent's console).
+            mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
+                nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
+            };
+            mut nul_path: String = String::from_str_c(Str::new("NUL"));
+            mut access: u32 = syscall::GENERIC_WRITE;
+            if (is_input) { access = syscall::GENERIC_READ; }
+            const h: u8* = syscall::CreateFileA(nul_path.as_ptr(), access,
+                syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE,
+                &sa as u8*, syscall::OPEN_EXISTING, 0u32, null);
+            // CreateFileA returns INVALID_HANDLE_VALUE (-1) on failure. Compare
+            // against a local -1, not syscall::INVALID_HANDLE_VALUE (a
+            // cross-module const i64 that mis-evaluates; selfhost bug #1).
+            if ((h as i64) == -1) {
+                return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, ok: false };
+            }
+            // Parent owns the NUL handle; close it after the child inherits it.
+            return WinStdio { child_handle: h, parent_fd: -1, extra_close: h, ok: true };
+        }
         _ => {
-            // Inherit (and the v1 Null/Fd fallback): hand the child our own
+            // Inherit (and the v1 Fd fallback): hand the child our own
             // std handle; nothing for the parent to close or wrap.
             return WinStdio { child_handle: syscall::GetStdHandle(std_id),
                               parent_fd: -1, extra_close: null, ok: true };
@@ -882,8 +991,19 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         hProcess: null, hThread: null, dwProcessId: 0u32, dwThreadId: 0u32
     };
 
+    // Apply env overrides / env_clear via an explicit ANSI environment block.
+    // When there's nothing to change, pass null so the child inherits the
+    // parent's environment verbatim. `env_block` must outlive CreateProcessA
+    // (which copies it); it drops at function exit.
+    mut env_block: String = String::new();
+    mut env_ptr: u8* = null;
+    if (cmd.clear_env_flag || cmd.envs.length() > 0u64) {
+        env_block = build_env_block(cmd);
+        env_ptr = env_block.as_ptr();
+    }
+
     const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
-                                            1, 0u32, null, cwd_ptr, &si, &pi);
+                                            1, 0u32, env_ptr, cwd_ptr, &si, &pi);
 
     // Parent closes the child's pipe ends now that they have been inherited.
     if (sin.extra_close  != null) { syscall::CloseHandle(sin.extra_close); }

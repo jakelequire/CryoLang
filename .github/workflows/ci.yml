@@ -26,6 +26,9 @@ jobs:
       - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
         run: ./scripts/ci/install-llvm.sh
 
+      - name: Verify the committed pins match their sidecars (sha256)
+        run: make verify-pin
+
       - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo)
         run: make cryo
 
@@ -84,6 +87,32 @@ jobs:
           name: selfhost-check-logs
           path: build-logs/
           if-no-files-found: ignore
+
+  incremental-check:
+    name: incremental-check (per-module rebuild == clean build)
+    runs-on: ubuntu-latest
+    needs: build
+    # Per-module incremental compilation must be byte-identical to a clean
+    # --no-incremental build for any edit; a false cache hit is a silent
+    # miscompile. scripts/incremental-check.py runs the edit matrix that
+    # guards this. Nothing else in CI exercises the incremental path (the
+    # build/selfhost jobs force clean builds), so without this a caching
+    # regression ships unnoticed.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Restore the LLVM toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cryo-ci
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
+        run: ./scripts/ci/install-llvm.sh
+
+      - name: Run the incremental-build soundness matrix
+        run: make incremental-check
 
   windows-smoke:
     name: windows smoke (cross-build + wine)

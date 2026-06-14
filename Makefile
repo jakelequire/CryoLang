@@ -76,6 +76,14 @@ else
     NPROC := $(shell nproc 2>/dev/null || echo 4)
 endif
 
+# Python interpreter for the helper scripts.  Windows ships `python.exe`
+# (no `python3` alias); Linux/macOS use `python3`.
+ifeq ($(HOST_OS),windows)
+    PYTHON := python
+else
+    PYTHON := python3
+endif
+
 # The LSP binary grows a `.exe` suffix on a Windows host (the self-hosted
 # compiler appends it for windows targets), so the build output and its pin
 # both carry it there; empty elsewhere.
@@ -320,6 +328,31 @@ selfhost-check:
 else
 selfhost-check: $(PIN)
 	@python3 scripts/selfhost-check.py
+endif
+
+# ---- pin self-verification (M14 / M12) --------------------------------
+# Assert each committed pin's bytes match its .pin.txt sidecar sha256
+# (catches a binary committed without regenerating its sidecar, corruption,
+# or a hand-edited sidecar).  Pure-python, no build, runs on any host.
+#   verify-pin        integrity only (sha256 == sidecar)
+#   verify-pin-clean  ALSO require a clean-worktree pin — the release gate
+#                     (a pin built from a dirty tree isn't reproducible).
+verify-pin:
+	@$(PYTHON) scripts/verify-pin.py
+
+verify-pin-clean:
+	@$(PYTHON) scripts/verify-pin.py --require-clean
+
+# ---- incremental-build soundness (M13) --------------------------------
+# Run the per-module incremental byte-identity matrix: every incremental
+# build must equal a clean `--no-incremental` build of the same source.
+# Needs the stage-2 compiler (builds it first if absent).
+ifeq ($(HOST_OS),windows)
+incremental-check: $(STAGE2_EXE)
+	@$(PYTHON) scripts/incremental-check.py --cryo "$(STAGE2_EXE)"
+else
+incremental-check: $(STAGE2)
+	@python3 scripts/incremental-check.py --cryo "$(STAGE2)"
 endif
 
 # ---- test suite -------------------------------------------------------

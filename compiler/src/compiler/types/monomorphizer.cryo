@@ -1611,7 +1611,7 @@ type struct Monomorphizer {
     select_static_match_arm(mut &this, scrutinee: TypeAnnotation*,
                             arms: &StaticMatchArmNode*[], span: SourceSpan,
                             res_ctx: ResolutionContext*) -> i64 {
-        if (arms.length <= 1) { return -1; }  // already reduced or trivial
+        if (arms.length == 0) { return -1; }  // nothing to select
         const scrut: TypeRef = this.type_resolver.resolve(scrutinee, res_ctx);
         if (!scrut.is_valid()) {
             this.diagnostics.emit(Diagnostic::error(
@@ -1621,7 +1621,32 @@ type struct Monomorphizer {
             return -1;
         }
 
+        if (arms.length == 1) {
+            // A single arm: a `_` default always applies; a single concrete
+            // type pattern must equal the scrutinee. A prior reduction (the
+            // caller collapses `arms` to the selected one) leaves the
+            // *matching* arm here, so length-1 is normally already-resolved
+            // and returns -1 unchanged. But an *originally* single-arm match
+            // with a non-matching type - e.g. `static match (T) { i32 => ... }`
+            // instantiated with `T = string` - is a genuine no-match that
+            // sema's safety net never catches (sema only emits E0645 for
+            // `arms.length > 1`), i.e. previously silent wrong code (M9).
+            const only: StaticMatchArmNode* = arms[0];
+            if (only == null || only.type_pattern == null) { return -1; } // wildcard: fine
+            const arm0: TypeRef = this.type_resolver.resolve(only.type_pattern, res_ctx);
+            if (arm0.is_valid() && arm0.id == scrut.id) { return -1; }    // matches: leave it
+            const tn0: string = this.arena.format_display(this.arena.lookup(scrut.id));
+            this.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+                format("no `static match` arm matches type `%s`", tn0))
+                .at(span)
+                .with_note("add an arm for this type or a `_` default arm"));
+            this.error_count += 1;
+            return -1;
+        }
+
         mut wildcard_idx: i64 = -1;
+        mut match_idx: i64 = -1;
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: StaticMatchArmNode* = arms[i];
             if (arm == null) { continue; }
@@ -1631,9 +1656,25 @@ type struct Monomorphizer {
             }
             const arm_ty: TypeRef = this.type_resolver.resolve(arm.type_pattern, res_ctx);
             if (arm_ty.is_valid() && arm_ty.id == scrut.id) {
-                return i;
+                if (match_idx < 0) {
+                    match_idx = i;
+                } else {
+                    // A second arm with the same TypeID: ambiguous. Previously
+                    // the loop returned the first match and silently ignored
+                    // the duplicate (M9). Keep that deterministic selection
+                    // (first wins) but surface the ambiguity.
+                    const dn: string = this.arena.format_display(this.arena.lookup(scrut.id));
+                    this.diagnostics.emit(Diagnostic::error(
+                        ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+                        format("ambiguous `static match`: multiple arms match type `%s`", dn))
+                        .at(span)
+                        .with_note("remove the duplicate arm"));
+                    this.error_count += 1;
+                    return match_idx;
+                }
             }
         }
+        if (match_idx >= 0) { return match_idx; }
         if (wildcard_idx >= 0) { return wildcard_idx; }
 
         const ty_name: string = this.arena.format_display(this.arena.lookup(scrut.id));
@@ -2228,7 +2269,24 @@ type struct Monomorphizer {
     /// returns false so an unsatisfiable bound never accidentally enables
     /// body specialization.
     type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
-        if (depth >= 16) { return false; }
+        if (depth >= 16) {
+            // Depth budget exhausted on a deep or cyclic impl/where-clause
+            // chain. Return false (unchanged) so an unsatisfiable bound never
+            // accidentally enables body specialization - but surface a clean
+            // diagnostic. Without this, the `false` propagates into
+            // filter_bounds_violating_methods/impls, which silently *drop* the
+            // method/impl, and the failure resurfaces far away as a baffling
+            // "no method"/undefined-symbol error (M10). No SourceSpan is
+            // available here; the trait name pins it down. error_count is left
+            // untouched because this receiver is `&this`; emit() records the
+            // error in the sink (the same `&this` diagnostics.emit pattern used
+            // elsewhere - e.g. resolver.cryo's resolve()).
+            const tn: string = this.intern_table.resolve(trait_name);
+            this.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("trait-bound resolution exceeded the recursion limit (16) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
+            return false;
+        }
 
         // `Copy` is a structural marker: bound satisfaction is computed
         // by walking the type rather than searching the trait-impl
