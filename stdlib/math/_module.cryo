@@ -26,11 +26,18 @@ const LOG2_E: f64  = 1.4426950408889634;
 const LOG10_E: f64 = 0.4342944819032518;
 
 // IEEE-754 limits. `*_MIN_POSITIVE` is the smallest positive normal.
+// The most-negative finite values (== -F64_MAX / -F32_MAX) are the
+// `f64_min()` / `f32_min()` functions below: a const initializer here
+// can't carry them because const-init drops a leading `-` on a float
+// literal and doesn't fold `0.0 - literal`, so a negated edge value is
+// only expressible at runtime (same reason the non-finite values are
+// functions).
 const F64_EPSILON: f64      = 2.220446049250313e-16;
 const F64_MAX: f64          = 1.7976931348623157e308;
 const F64_MIN_POSITIVE: f64 = 2.2250738585072014e-308;
 const F32_EPSILON: f32      = 1.1920929e-7;
 const F32_MAX: f32          = 3.4028235e38;
+const F32_MIN_POSITIVE: f32 = 1.1754944e-38;
 const F32_MIN_POSITIVE: f32 = 1.1754944e-38;
 
 // --- non-finite values -------------------------------------------------
@@ -44,13 +51,46 @@ function infinity() -> f64 { return F64_MAX * 2.0; }
 function neg_infinity() -> f64 { return 0.0 - infinity(); }
 function nan() -> f64 { const inf: f64 = infinity(); return inf - inf; }
 
+/// Most-negative finite values (== -F64_MAX / -F32_MAX). Functions, not
+/// consts, because const-init can't negate a float edge literal (see the
+/// note in the constants block).
+function f64_min() -> f64 { return 0.0 - F64_MAX; }
+function f32_min() -> f32 { const zero: f32 = 0.0; return zero - F32_MAX; }
+
 // --- roots & powers ----------------------------------------------------
 
 function sqrt(value: f64) -> f64 { return libc::sqrt(value); }
 function sqrt_f32(value: f32) -> f32 { return libc::sqrtf(value); }
 function cbrt(value: f64) -> f64 { return libc::cbrt(value); }
 function pow(base: f64, exponent: f64) -> f64 { return libc::pow(base, exponent); }
-function hypot(x: f64, y: f64) -> f64 { return libc::sqrt(x * x + y * y); }
+
+/// sqrt(x^2 + y^2) without spurious overflow/underflow: libm's `hypot`
+/// scales by the larger operand, so `hypot(3e200, 4e200) == 5e200`
+/// (the naive `sqrt(x*x + y*y)` overflows to +inf there).
+function hypot(x: f64, y: f64) -> f64 { return libc::hypot(x, y); }
+
+/// `base` raised to an integer power via binary exponentiation (libm has
+/// no `powi`). Negative `exp` returns the reciprocal; `powi(_, 0) == 1.0`,
+/// including `powi(0.0, 0) == 1.0`.
+function powi(base: f64, exp: i64) -> f64 {
+    if (exp == 0) { return 1.0; }
+    mut e: i64 = exp;
+    mut neg: boolean = false;
+    if (e < 0) { neg = true; e = 0 - e; }
+    mut result: f64 = 1.0;
+    mut b: f64 = base;
+    while (e > 0) {
+        if ((e & 1) == 1) { result = result * b; }
+        b = b * b;
+        e = e >> 1;
+    }
+    if (neg) { return 1.0 / result; }
+    return result;
+}
+
+/// Fused multiply-add: `a * b + c` computed with a single rounding (IEEE
+/// fma), more accurate than performing the multiply and add separately.
+function mul_add(a: f64, b: f64, c: f64) -> f64 { return libc::fma(a, b, c); }
 
 // --- exponential & logarithm -------------------------------------------
 
@@ -59,6 +99,12 @@ function exp2(value: f64) -> f64 { return libc::exp2(value); }
 function ln(value: f64) -> f64 { return libc::log(value); }
 function log2(value: f64) -> f64 { return libc::log2(value); }
 function log10(value: f64) -> f64 { return libc::log10(value); }
+
+/// `ln(1 + value)`, accurate for `value` near 0 (IEEE log1p).
+function log1p(value: f64) -> f64 { return libc::log1p(value); }
+
+/// `exp(value) - 1`, accurate for `value` near 0 (IEEE expm1).
+function expm1(value: f64) -> f64 { return libc::expm1(value); }
 
 /// Logarithm of `value` in an arbitrary `base`.
 function log(value: f64, base: f64) -> f64 {
@@ -122,10 +168,38 @@ function abs_i32(value: i32) -> i32 { if (value < 0) { return 0 - value; } retur
 // The plain names operate on f64; integer variants carry a type suffix.
 // Free-function overloading is avoided deliberately (it tickles the
 // generic-codegen path), so each width gets its own name.
+//
+// Float `min`/`max` are NaN-transparent (IEEE minNum/maxNum via libm: a
+// NaN operand is ignored and the other returned; both-NaN yields NaN).
+// This differs from `cmp::min`/`cmp::max`, which order NaN under the
+// total bit-order. `clamp` keeps plain comparisons, so a NaN `value`
+// propagates (it is not silently pulled into range).
 
-function min(a: f64, b: f64) -> f64 { if (a < b) { return a; } return b; }
-function max(a: f64, b: f64) -> f64 { if (a > b) { return a; } return b; }
+function min(a: f64, b: f64) -> f64 { return libc::fmin(a, b); }
+function max(a: f64, b: f64) -> f64 { return libc::fmax(a, b); }
 function clamp(value: f64, lo: f64, hi: f64) -> f64 {
+    if (value < lo) { return lo; }
+    if (value > hi) { return hi; }
+    return value;
+}
+
+// f32 min/max/clamp. libm exposes no `fminf`/`fmaxf` binding here, so NaN
+// handling is by hand: `x != x` is true iff x is NaN (the `!=` operator is
+// IEEE, distinct from the bitwise `Eq` trait). min/max are NaN-transparent
+// like the f64 forms; clamp is NaN-propagating like f64 `clamp`.
+function min_f32(a: f32, b: f32) -> f32 {
+    if (a != a) { return b; }
+    if (b != b) { return a; }
+    if (a < b) { return a; }
+    return b;
+}
+function max_f32(a: f32, b: f32) -> f32 {
+    if (a != a) { return b; }
+    if (b != b) { return a; }
+    if (a > b) { return a; }
+    return b;
+}
+function clamp_f32(value: f32, lo: f32, hi: f32) -> f32 {
     if (value < lo) { return lo; }
     if (value > hi) { return hi; }
     return value;

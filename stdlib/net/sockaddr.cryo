@@ -25,10 +25,18 @@ import net::socket_addr;
 // values are platform-specific, so they belong with the other gated socket
 // primitives).
 
-/// Pack a `SocketAddr` into a 16-byte `sockaddr_in` buffer. Returns
-/// the number of bytes written (always 16 for IPv4), or an
-/// `Unsupported` error for IPv6; the v6 path will want a 28-byte
-/// `sockaddr_in6` packer, which isn't implemented yet.
+/// AF_INET6 family value (host byte order): 10 on Linux glibc, 23 on
+/// Win32 Winsock. The `sockaddr_in6` layout is otherwise identical
+/// (28 bytes) on both, so only this value differs per OS.
+![target(unix)]
+function af_inet6() -> u16 { return 10; }
+![target(windows)]
+function af_inet6() -> u16 { return 23; }
+
+/// Pack a `SocketAddr` into a `sockaddr_in` (16 bytes, IPv4) or
+/// `sockaddr_in6` (28 bytes, IPv6) buffer. Returns the number of bytes
+/// written. The caller must supply a buffer of at least 28 bytes so the
+/// v6 path fits.
 function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> Result<u32, IoError> {
     match (addr.ip) {
         IpAddr::V4(v4) => {
@@ -48,8 +56,23 @@ function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> Result<u32, IoError> {
             while (i < 16) { out[i] = 0; i++; }
             return Result::Ok(16);
         }
-        IpAddr::V6(_) => {
-            return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+        IpAddr::V6(v6) => {
+            // sin6_family = AF_INET6, host byte order (low byte first on
+            // our little-endian targets).
+            const fam: u16 = af_inet6();
+            out[0] = (fam & 0xFF) as u8;
+            out[1] = (fam >> 8) as u8;
+            // sin6_port, network byte order
+            out[2] = (addr.port >> 8) as u8;
+            out[3] = (addr.port & 0xFF) as u8;
+            // sin6_flowinfo = 0 (offsets 4..8)
+            out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 0;
+            // sin6_addr: 16 bytes, already network order in `segments`
+            mut j: u64 = 0;
+            while (j < 16) { out[8 + j] = v6.segments[j]; j++; }
+            // sin6_scope_id = 0 (offsets 24..28)
+            out[24] = 0; out[25] = 0; out[26] = 0; out[27] = 0;
+            return Result::Ok(28);
         }
     }
 }

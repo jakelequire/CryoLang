@@ -29,24 +29,32 @@ import net::sys;
 // and the `SO_*TIMEO` helper are shared with `net::udp` in
 // `net::sockaddr`.
 
+// Open a TCP socket of the family matching `addr` (AF_INET vs AF_INET6).
+// Lives here, not in `net::sys`, so `sys` stays free of net::ip imports.
+function tcp_socket_for(addr: &SocketAddr) -> i32 {
+    match (addr.ip) {
+        IpAddr::V4(_) => { return sys::os_socket_tcp(); }
+        IpAddr::V6(_) => { return sys::os_socket_tcp6(); }
+    }
+}
+
 // TcpStream: connected socket
 
 type struct TcpStream {
     fd: i32;
 
-    /// Connect to `remote`. Fails with the mapped `errno` kind on
-    /// refusal, timeout, or an unreachable host. Returns
-    /// `IoErrorKind::Unsupported` for IPv6 addresses until v6
-    /// packing lands.
+    /// Connect to `remote` (IPv4 or IPv6). Fails with the mapped `errno`
+    /// kind on refusal, timeout, or an unreachable host.
     static connect(remote: SocketAddr) -> Result<TcpStream, IoError> {
         // Pack first so an unsupported address family doesn't leak
-        // a freshly-opened socket fd.
-        mut sockaddr_buf: u8[16];
+        // a freshly-opened socket fd. 28 bytes holds a v6 sockaddr_in6.
+        mut sockaddr_buf: u8[28];
         const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &remote)?;
 
         // `SOCK_CLOEXEC` opens the socket close-on-exec so a concurrent
-        // `fork`+`exec` does not leak it into the child.
-        const sock: i32 = sys::os_socket_tcp();
+        // `fork`+`exec` does not leak it into the child. The socket family
+        // matches the address (AF_INET vs AF_INET6).
+        const sock: i32 = tcp_socket_for(&remote);
         if (sock < 0) {
             return Result::Err(sys::last_io_error());
         }
@@ -129,20 +137,20 @@ implement trait Write for struct TcpStream {
 type struct TcpListener {
     fd: i32;
 
-    /// Bind + listen on `local`. Sets `SO_REUSEADDR` so restarts
-    /// don't wait out the TIME_WAIT window. Backlog defaults to 128,
-    /// the same number Linux uses for `/proc/sys/net/core/somaxconn`
-    /// these days. Returns `IoErrorKind::Unsupported` for IPv6
-    /// addresses until v6 packing lands.
+    /// Bind + listen on `local` (IPv4 or IPv6). Sets `SO_REUSEADDR` so
+    /// restarts don't wait out the TIME_WAIT window. Backlog defaults to
+    /// 128, the same number Linux uses for `/proc/sys/net/core/somaxconn`
+    /// these days.
     static bind(local: SocketAddr) -> Result<TcpListener, IoError> {
         // Pack first so an unsupported address family doesn't leak
-        // a freshly-opened socket fd.
-        mut sockaddr_buf: u8[16];
+        // a freshly-opened socket fd. 28 bytes holds a v6 sockaddr_in6.
+        mut sockaddr_buf: u8[28];
         const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf[0], &local)?;
 
         // `SOCK_CLOEXEC` opens the listening socket close-on-exec so a
-        // concurrent `fork`+`exec` does not leak it into the child.
-        const sock: i32 = sys::os_socket_tcp();
+        // concurrent `fork`+`exec` does not leak it into the child. The
+        // socket family matches the address (AF_INET vs AF_INET6).
+        const sock: i32 = tcp_socket_for(&local);
         if (sock < 0) {
             return Result::Err(sys::last_io_error());
         }
@@ -167,8 +175,10 @@ type struct TcpListener {
     /// callers ignore it; a `accept_with_peer` variant can surface it
     /// when a caller needs it.
     accept(mut &this) -> Result<TcpStream, IoError> {
-        mut sockaddr_buf: u8[16];
-        mut addrlen: u32 = 16;
+        // 28 bytes / addrlen 28: a v6 listener's accept fills a 28-byte
+        // sockaddr_in6, which must not truncate into a 16-byte buffer.
+        mut sockaddr_buf: u8[28];
+        mut addrlen: u32 = 28;
         loop {
             // `accept4` with `SOCK_CLOEXEC`: an accepted fd does NOT
             // inherit the listener's close-on-exec, so set it atomically
