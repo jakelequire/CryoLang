@@ -84,6 +84,25 @@ function exit_code_of(status: i32) -> int {
     return ((status >> 8) & 0xff) as int;
 }
 
+/// Per-process scratch path for capturing a negative test's compiler
+/// output.  Windows has no `/tmp`, so use `%TEMP%`/`%TMP%` and fall back
+/// to the current directory; the negative suite ran Linux-only before this.
+![target(windows)]
+function neg_tmp_path() -> string {
+    mut dir: i8* = getenv("TEMP") as i8*;
+    if (dir == null) { dir = getenv("TMP") as i8*; }
+    if (dir == null) { return format("cryo_negtest_%d.out", getpid()); }
+    return format("%s\\cryo_negtest_%d.out", dir as string, getpid());
+}
+
+/// POSIX: honor `$TMPDIR`, else `/tmp`.
+![target(unix)]
+function neg_tmp_path() -> string {
+    const dir: i8* = getenv("TMPDIR") as i8*;
+    if (dir == null) { return format("/tmp/cryo_negtest_%d.out", getpid()); }
+    return format("%s/cryo_negtest_%d.out", dir as string, getpid());
+}
+
 type enum CommandKind {
     Help;
     Version;
@@ -1225,7 +1244,7 @@ type struct Executor {
         mut i: i64 = (n - 1) as i64;
         while (i >= 0) {
             const c: i8 = *(ptr_add(path as void*, i as u64) as i8*);
-            if (c == 47) {                       // '/'
+            if (c == 47 || c == 92) {            // '/' or '\' (Windows)
                 if (i == 0) { return "/"; }
                 const buf: i8* = malloc((i as u64) + 1) as i8*;
                 mut k: u64 = 0;
@@ -1341,8 +1360,12 @@ type struct Executor {
         while (pre_entry != null) {
             const pn: string = dirent_name(pre_entry);
             const pnl: u64 = strlen(pn);
-            if (dirent_type(pre_entry) == 0
-                && strcmp(pn, ".") != 0 && strcmp(pn, "..") != 0
+            // We deliberately do NOT filter on `dirent_type` here: mingw-w64's
+            // `struct dirent` has no `d_type` field, so the `dirent_type`
+            // intrinsic returns garbage on Windows and would reject every
+            // entry (suppressing the whole suite). The ".cryo" extension check
+            // is the real filter and is sufficient — entries here are files.
+            if (strcmp(pn, ".") != 0 && strcmp(pn, "..") != 0
                 && pnl > 5
                 && strcmp(ptr_add(pn as void*, (pnl - 5) as u64) as string, ".cryo") == 0
                 && (strlen(pattern) == 0 || strstr(pn, pattern) != null)) {
@@ -1376,7 +1399,7 @@ type struct Executor {
             fmt::printf("compile-fail                                      ");
         }
 
-        const tmp: string = format("/tmp/cryo_negtest_%d.out", getpid());
+        const tmp: string = neg_tmp_path();
         mut failures: i32 = 0;
         mut ran: i32 = 0;
         mut entry: void* = readdir(dp);
@@ -1385,7 +1408,8 @@ type struct Executor {
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
                 entry = readdir(dp); continue;
             }
-            if (dirent_type(entry) != 0) { entry = readdir(dp); continue; }
+            // No `dirent_type` filter — see the pre-pass note above (mingw has
+            // no d_type); the ".cryo" extension check below is the real filter.
             const nlen: u64 = strlen(name);
             if (nlen <= 5) { entry = readdir(dp); continue; }
             const ext: string = ptr_add(name as void*, (nlen - 5) as u64) as string;

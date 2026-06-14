@@ -84,3 +84,59 @@ jobs:
           name: selfhost-check-logs
           path: build-logs/
           if-no-files-found: ignore
+
+  windows-smoke:
+    name: windows smoke (cross-build + wine)
+    runs-on: ubuntu-latest
+    needs: build
+    # Windows x86_64 is a shipped release target. The binary is cross-built on
+    # Linux (mingw-w64 + a synthesized LLVM-C import lib) exactly as in
+    # release.yml, then executed under wine so a Windows binary that fails to
+    # load or start can never publish unvalidated. wine can run cryo.exe
+    # because the official msvc LLVM-C.dll statically links the MSVC CRT and so
+    # needs only kernel32/advapi32/ntdll (all wine builtins) — see
+    # scripts/fetch-windows-llvm.sh.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Restore the LLVM toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cryo-ci
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
+        run: ./scripts/ci/install-llvm.sh
+
+      - name: Install the mingw-w64 cross toolchain + wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine64
+
+      - name: Restore the windows LLVM bits cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .toolchains/llvm-win
+          key: llvm-win-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Fetch the windows LLVM bits (LLVM-C.dll + mingw import lib)
+        run: ./scripts/fetch-windows-llvm.sh
+
+      - name: Cross-build the windows release zip
+        run: ./scripts/build-release.sh windows
+
+      - name: Smoke-test cryo.exe under wine
+        env:
+          WINEDEBUG: "-all"
+          WINEDLLOVERRIDES: "mscoree,mshtml="
+        run: |
+          set -e
+          out="$(mktemp -d)"
+          unzip -q dist/cryo-*-windows-x86_64.zip -d "$out"
+          exe="$(find "$out" -name cryo.exe | head -1)"
+          if [ -z "$exe" ]; then echo "cryo.exe not found in the windows zip"; exit 1; fi
+          # Run from the binary's own dir so it finds LLVM-C.dll beside it.
+          cd "$(dirname "$exe")"
+          wine64 cryo.exe --version
+          wine64 cryo.exe --help
