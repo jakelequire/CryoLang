@@ -351,9 +351,10 @@ equivalent `t[0]`, `t[1]`) — and the index is checked against the tuple's arit
 at compile time. Chained access like `t.1.0` works (element 1, then element 0 of
 that).
 
-> **Deprecated:** an older bracket spelling, `[T, U]`, is still accepted in type
-> position for now (the bootstrap stdlib has not yet been migrated). It is
-> deprecated and will be removed; write `(T, U)`.
+> **Note:** a pre-1.0 bracket spelling, `[T, U]`, was previously accepted in
+> type position. It has been removed — a leading `[` in a type is now an error.
+> Write `(T, U)`. (The array suffixes `T[]` / `T[N]` are unaffected: they are
+> postfix on an existing type, not a leading bracket.)
 
 ### 2.7 The Unit Type
 
