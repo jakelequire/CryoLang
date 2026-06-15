@@ -1,0 +1,185 @@
+///! Base64 (RFC 4648) encode / decode known-answer vectors.
+///!
+///! `encode(data, len) -> String` (standard alphabet, with padding) and
+///! `decode(src: Str) -> Option<Array<u8>>` (rejects bad length / bad
+///! characters / misplaced padding). The RFC 4648 §10 test vectors:
+///!
+///!   ""       -> ""
+///!   "f"      -> "Zg=="
+///!   "fo"     -> "Zm8="
+///!   "foo"    -> "Zm9v"
+///!   "foob"   -> "Zm9vYg=="
+///!   "fooba"  -> "Zm9vYmE="
+///!   "foobar" -> "Zm9vYmFy"
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Base64T;
+
+import std::core::result;
+import std::core::option;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::encoding::base64;
+import std::test::error;
+import std::test::assert;
+
+/// Encode `input` and assert the resulting String equals `want`.
+function check_encode(input: Str, want: string) -> Result<(), TestError> {
+    mut got: String = base64::encode(input.as_ptr(), input.length());
+    const ok: boolean = got.as_str().equals(&Str::new(want));
+    got.drop();
+    return expect(ok, Str::new(want));
+}
+
+/// Decode `input`, assert it succeeds and the decoded bytes equal the
+/// bytes of the ASCII string `want`.
+function check_decode(input: string, want: string) -> Result<(), TestError> {
+    const want_view: Str = Str::new(want);
+    match (base64::decode(Str::new(input))) {
+        Option::Some(bytes) => {
+            mut decoded: Array<u8> = bytes;
+            mut ok: boolean = decoded.length() == want_view.length();
+            mut i: u64 = 0;
+            while (ok && i < want_view.length()) {
+                match (want_view.byte_at(i)) {
+                    Option::Some(b) => {
+                        match (decoded.get(i)) {
+                            Option::Some(d) => { if (d != b) { ok = false; } }
+                            Option::None    => { ok = false; }
+                        }
+                    }
+                    Option::None    => { ok = false; }
+                }
+                i++;
+            }
+            decoded.drop();
+            return expect(ok, Str::new(input));
+        }
+        Option::None => { return bail(Str::new(input)); }
+    }
+}
+
+/// Assert that `decode(input)` rejects the input (returns None).
+function check_reject(input: string) -> Result<(), TestError> {
+    match (base64::decode(Str::new(input))) {
+        Option::Some(bytes) => {
+            mut b: Array<u8> = bytes;
+            b.drop();
+            return bail(Str::new(input));
+        }
+        Option::None => { return Result::Ok(()); }
+    }
+}
+
+// --- encode: RFC 4648 vectors -----------------------------------------
+
+![test]
+function encode_empty() -> Result<(), TestError> {
+    return check_encode(Str::new(""), "");
+}
+
+![test]
+function encode_f() -> Result<(), TestError> {
+    return check_encode(Str::new("f"), "Zg==");
+}
+
+![test]
+function encode_fo() -> Result<(), TestError> {
+    return check_encode(Str::new("fo"), "Zm8=");
+}
+
+![test]
+function encode_foo() -> Result<(), TestError> {
+    return check_encode(Str::new("foo"), "Zm9v");
+}
+
+![test]
+function encode_foob() -> Result<(), TestError> {
+    return check_encode(Str::new("foob"), "Zm9vYg==");
+}
+
+![test]
+function encode_fooba() -> Result<(), TestError> {
+    return check_encode(Str::new("fooba"), "Zm9vYmE=");
+}
+
+![test]
+function encode_foobar() -> Result<(), TestError> {
+    return check_encode(Str::new("foobar"), "Zm9vYmFy");
+}
+
+// Exercises the '+' and '/' alphabet entries and a full 3-byte group.
+// bytes {0xFB, 0xFF, 0xBF} -> "+/+/"
+![test]
+function encode_plus_slash_alphabet() -> Result<(), TestError> {
+    mut data: u8[3];
+    data[0] = 0xFB; data[1] = 0xFF; data[2] = 0xBF;
+    mut got: String = base64::encode(&data[0], 3);
+    const ok: boolean = got.as_str().equals(&Str::new("+/+/"));
+    got.drop();
+    return expect(ok, Str::new("{0xFB,0xFF,0xBF} should encode to '+/+/'"));
+}
+
+// --- decode: round-trip of the RFC 4648 vectors -----------------------
+
+![test]
+function decode_empty() -> Result<(), TestError> {
+    return check_decode("", "");
+}
+
+![test]
+function decode_f() -> Result<(), TestError> {
+    return check_decode("Zg==", "f");
+}
+
+![test]
+function decode_fo() -> Result<(), TestError> {
+    return check_decode("Zm8=", "fo");
+}
+
+![test]
+function decode_foo() -> Result<(), TestError> {
+    return check_decode("Zm9v", "foo");
+}
+
+![test]
+function decode_foob() -> Result<(), TestError> {
+    return check_decode("Zm9vYg==", "foob");
+}
+
+![test]
+function decode_fooba() -> Result<(), TestError> {
+    return check_decode("Zm9vYmE=", "fooba");
+}
+
+![test]
+function decode_foobar() -> Result<(), TestError> {
+    return check_decode("Zm9vYmFy", "foobar");
+}
+
+// --- decode: rejection cases ------------------------------------------
+
+// Length not a multiple of 4.
+![test]
+function decode_rejects_bad_length() -> Result<(), TestError> {
+    return check_reject("Zg=");
+}
+
+// '!' is outside the base64 alphabet.
+![test]
+function decode_rejects_invalid_char() -> Result<(), TestError> {
+    return check_reject("Zm9!");
+}
+
+// Padding in the middle of a group (a non-pad symbol follows a pad).
+![test]
+function decode_rejects_pad_in_middle() -> Result<(), TestError> {
+    return check_reject("Z=g=");
+}
+
+// Whitespace is explicitly not tolerated by this decoder.
+![test]
+function decode_rejects_whitespace() -> Result<(), TestError> {
+    return check_reject("Zm 9");
+}

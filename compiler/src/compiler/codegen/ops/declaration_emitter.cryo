@@ -1423,6 +1423,22 @@ type struct DeclarationEmitter {
                 init = this.str_cache.get_or_create(lit.value, this.builder);
             }
         }
+        // Fold a constant-expression initializer that isn't a bare literal -
+        // unary minus or simple arithmetic on float literals, e.g.
+        // `const F64_MIN: f64 = -1.79e308;` or `const X: f64 = 0.0 - 1.5;`.
+        // Without this the leading `-` / the operation is dropped and the
+        // global silently lands on the `const_null` (0.0) fallback below.
+        // Only runs when `init` is still invalid (the path that today emits
+        // 0), so no currently-correct const can change.
+        if (!init.is_valid() && init_expr != null) {
+            const tkf: LTypeKind = type_kind_of(ty.raw);
+            if (tkf == LTypeKind::Float || tkf == LTypeKind::Double) {
+                mut folded: f64 = 0.0;
+                if (try_fold_const_real(init_expr, &folded)) {
+                    init = LType::const_real(ty, folded);
+                }
+            }
+        }
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
@@ -2078,4 +2094,53 @@ type struct DeclarationEmitter {
         return val;
     }
 
+}
+
+/// Fold a float-typed const initializer expression to an `f64` constant:
+/// float/integer literals, unary `-`/`+`, and binary `+ - * /`. Returns
+/// false for anything outside that set (identifiers, calls, etc.), which the
+/// caller leaves on the zeroinitializer fallback. Mirrors sema's
+/// `try_fold_const_i64` but in `f64` (IEEE saturates, so no overflow guards).
+/// This is what makes `const F64_MIN: f64 = -1.79e308;` carry its real value
+/// instead of silently becoming 0.0.
+function try_fold_const_real(expr: ExpressionNode*, out: f64*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        if (lit.literal_kind == LiteralKind::Float) {
+            mut v: f64 = 0.0;
+            intrinsics::sscanf(lit.value, "%lf", &v);
+            *out = v;
+            return true;
+        }
+        if (lit.literal_kind == LiteralKind::Integer) {
+            const iv: u64 = parse_int_lexeme(lit.value);
+            *out = iv as f64;
+            return true;
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        mut a: f64 = 0.0;
+        if (!try_fold_const_real(u.operand, &a)) { return false; }
+        if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
+        if (u.op.lexeme == "+") { *out = a; return true; }
+        return false;
+    }
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        mut x: f64 = 0.0;
+        mut y: f64 = 0.0;
+        if (!try_fold_const_real(b.left, &x)) { return false; }
+        if (!try_fold_const_real(b.right, &y)) { return false; }
+        const op: string = b.op.lexeme;
+        if (op == "+") { *out = x + y; return true; }
+        if (op == "-") { *out = x - y; return true; }
+        if (op == "*") { *out = x * y; return true; }
+        if (op == "/") { *out = x / y; return true; }
+        return false;
+    }
+    return false;
 }
