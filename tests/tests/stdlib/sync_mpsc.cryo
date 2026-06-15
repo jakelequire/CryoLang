@@ -1,0 +1,140 @@
+///! mpsc - single-threaded coverage of the multi-producer / single-consumer
+///! channel.
+///!
+///! Cross-thread hand-off depends on std::thread (covered there).  On one
+///! thread we can still pin down the queue contract: FIFO delivery, the
+///! non-blocking `try_recv` Empty/Disconnected distinction, and that a
+///! drained channel with no senders left reports Disconnected.  `recv()`
+///! blocks while senders remain, so every `recv` here is issued only after a
+///! value has been enqueued.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SyncMpsc;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::collections::str;
+import std::sync::mpsc;
+import std::test::error;
+import std::test::assert;
+
+/// Send a value and fail the test if the receiver was already gone.
+function send_ok(tx: &Sender<i32>, v: i32) -> Result<(), TestError> {
+    match (tx.send(v)) {
+        Result::Ok(_)  => { return Result::Ok(()); }
+        Result::Err(_) => { return bail(Str::new("send to an open channel must succeed")); }
+    }
+}
+
+/// Receive (blocking) and assert the value equals `want`.
+function recv_eq(rx: &Receiver<i32>, want: i32) -> Result<(), TestError> {
+    match (rx.recv()) {
+        Result::Ok(v)  => { return expect_eq(v, want); }
+        Result::Err(_) => { return bail(Str::new("recv must return a queued value, not Disconnected")); }
+    }
+}
+
+![test]
+function mpsc_delivers_in_fifo_order() -> Result<(), TestError> {
+    mut rx: Receiver<i32> = mpsc::channel<i32>();
+    mut tx: Sender<i32> = rx.sender();
+
+    send_ok(&tx, 10)?;
+    send_ok(&tx, 20)?;
+    send_ok(&tx, 30)?;
+
+    recv_eq(&rx, 10)?;
+    recv_eq(&rx, 20)?;
+    recv_eq(&rx, 30)?;
+
+    tx.drop();
+    rx.drop();
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_try_recv_empty_then_disconnected() -> Result<(), TestError> {
+    mut rx: Receiver<i32> = mpsc::channel<i32>();
+    mut tx: Sender<i32> = rx.sender();
+
+    // No value queued, but a sender is alive -> Empty.
+    match (rx.try_recv()) {
+        Result::Ok(_)  => { tx.drop(); rx.drop(); return bail(Str::new("try_recv on an empty open channel must be Err(Empty)")); }
+        Result::Err(e) => {
+            match (e) {
+                TryRecvError::Empty        => { }
+                TryRecvError::Disconnected => { tx.drop(); rx.drop(); return bail(Str::new("expected Empty while a sender is alive, got Disconnected")); }
+            }
+        }
+    }
+
+    // Drop the only sender; with the queue drained, the channel is now
+    // disconnected.
+    tx.drop();
+    match (rx.try_recv()) {
+        Result::Ok(_)  => { rx.drop(); return bail(Str::new("try_recv after all senders dropped must be Err(Disconnected)")); }
+        Result::Err(e) => {
+            match (e) {
+                TryRecvError::Disconnected => { }
+                TryRecvError::Empty        => { rx.drop(); return bail(Str::new("expected Disconnected after the last sender dropped")); }
+            }
+        }
+    }
+
+    rx.drop();
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_recv_after_senders_dropped_is_disconnected() -> Result<(), TestError> {
+    mut rx: Receiver<i32> = mpsc::channel<i32>();
+    mut tx: Sender<i32> = rx.sender();
+
+    // Queue one value, drop the sender, then drain. The buffered value comes
+    // out first; the next recv sees no value and no senders -> Disconnected.
+    send_ok(&tx, 7)?;
+    tx.drop();
+
+    recv_eq(&rx, 7)?;
+    match (rx.recv()) {
+        Result::Ok(_)  => { rx.drop(); return bail(Str::new("recv on a drained, sender-less channel must be Err(Disconnected)")); }
+        Result::Err(e) => {
+            match (e) {
+                RecvError::Disconnected => { }
+            }
+        }
+    }
+
+    rx.drop();
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_multiple_producers_via_clone() -> Result<(), TestError> {
+    mut rx: Receiver<i32> = mpsc::channel<i32>();
+    mut tx1: Sender<i32> = rx.sender();
+    mut tx2: Sender<i32> = tx1.clone();
+
+    send_ok(&tx1, 1)?;
+    send_ok(&tx2, 2)?;
+
+    recv_eq(&rx, 1)?;
+    recv_eq(&rx, 2)?;
+
+    // Dropping one of two senders must NOT disconnect the channel.
+    tx1.drop();
+    match (rx.try_recv()) {
+        Result::Ok(_)  => { tx2.drop(); rx.drop(); return bail(Str::new("no value was queued; try_recv should be Empty")); }
+        Result::Err(e) => {
+            match (e) {
+                TryRecvError::Empty        => { }
+                TryRecvError::Disconnected => { tx2.drop(); rx.drop(); return bail(Str::new("one live sender remains; must be Empty not Disconnected")); }
+            }
+        }
+    }
+
+    tx2.drop();
+    rx.drop();
+    return Result::Ok(());
+}

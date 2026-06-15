@@ -882,54 +882,15 @@ type struct SpecializationPasses {
 //   - inst.type_args.length          (array length, no vtable)
 
 /// Recursively check whether a type contains any GenericParam or BoundedParam
-/// at any depth.  Mirrors Monomorphizer::type_contains_generic_param but uses
-/// only non-virtual field access on Type* subclass pointers, so it is safe to
-/// call from the validator free function.
+/// at any depth.  Thin delegator to the single shared implementation
+/// `Monomorphizer::mono_type_contains_generic_param` so the validator and the
+/// monomorphizer can never drift out of sync and silently under-recurse.  The
+/// shared helper is a plain free function using only non-virtual `Type*` field
+/// access, so calling it here keeps the original vtable-offset-SIGSEGV
+/// workaround intact (no virtual method dispatch on `Type*` from this pass's
+/// compilation unit).
 function type_contains_generic_param_v(arena: TypeArena*, ty: TypeRef) -> boolean {
-    if (!ty.is_valid()) { return false; }
-    const t: Type* = arena.lookup(ty.id);
-    if (t == null) { return false; }
-    if (t.kind == TypeKind::GenericParam) { return true; }
-    if (t.kind == TypeKind::BoundedParam) { return true; }
-    if (t.kind == TypeKind::Pointer) {
-        const ptr: PointerType* = t as PointerType*;
-        return type_contains_generic_param_v(arena, ptr.pointee);
-    }
-    if (t.kind == TypeKind::Reference) {
-        const ref: ReferenceType* = t as ReferenceType*;
-        return type_contains_generic_param_v(arena, ref.referent);
-    }
-    if (t.kind == TypeKind::Array) {
-        const arr: ArrayType* = t as ArrayType*;
-        return type_contains_generic_param_v(arena, arr.element);
-    }
-    if (t.kind == TypeKind::Optional) {
-        const opt: OptionalType* = t as OptionalType*;
-        return type_contains_generic_param_v(arena, opt.wrapped);
-    }
-    if (t.kind == TypeKind::Tuple) {
-        const tup: TupleType* = t as TupleType*;
-        for (mut i: i64 = 0; i < tup.elements.length; i++) {
-            if (type_contains_generic_param_v(arena, tup.elements[i])) { return true; }
-        }
-        return false;
-    }
-    if (t.kind == TypeKind::Function) {
-        const func: FunctionType* = t as FunctionType*;
-        if (type_contains_generic_param_v(arena, func.return_type)) { return true; }
-        for (mut i: i64 = 0; i < func.param_types.length; i++) {
-            if (type_contains_generic_param_v(arena, func.param_types[i])) { return true; }
-        }
-        return false;
-    }
-    if (t.kind == TypeKind::InstantiatedType) {
-        const inst: InstantiatedType* = t as InstantiatedType*;
-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-            if (type_contains_generic_param_v(arena, inst.type_args[i])) { return true; }
-        }
-        return false;
-    }
-    return false;
+    return Monomorphizer::mono_type_contains_generic_param(arena, ty);
 }
 
 function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {

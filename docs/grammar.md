@@ -53,6 +53,11 @@ DirectiveArg       ::= StringLit | Ident | NumLit | BoolLit
 (*  Declarations =============================================== *)
 
 VarDecl            ::= ("const" | "mut") Ident ":" Type ("=" Expr)? ";"
+                     | ("const" | "mut") StructDestructure ":" Type "=" Expr ";"
+(*  Struct-destructuring binding: moves each named field of a struct value
+    into a like-named local.  Idiomatic with a by-value `this` receiver to
+    move fields out of a consumed value (see cryo.md S8.3).                *)
+StructDestructure  ::= "{" Ident ("," Ident)* "}"
 
 FunctionDecl       ::= Visibility? "function" Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
@@ -78,7 +83,9 @@ IntrinsicDecl      ::= "intrinsic" "function" Ident
 
 ParamList          ::= Param ("," Param)* ("," VariadicParam)?
                      | VariadicParam
-Param              ::= Ident ":" Type | "&this" | "mut" "&this"
+Param              ::= Ident ":" Type
+                     | "&this" | "mut" "&this"    (* borrowing receiver *)
+                     | "this"  | "mut" "this"     (* by-value (consuming) receiver *)
 VariadicParam      ::= Ident ":" Type "..."
 
 WhereClause        ::= Ident ":" TraitBound ("+" TraitBound)*

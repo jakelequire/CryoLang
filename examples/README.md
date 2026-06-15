@@ -28,12 +28,12 @@ From within an example directory:
 ```sh
 cryo run                  # build + execute
 cryo run -- arg1 arg2     # forward args to the built binary
-cryo build                # build only (artifact lands in build/bin/)
+cryo build                # build only (artifact lands at build/<project-name>)
 ```
 
 The first build pulls in everything the example imports out of the
-standard library. Subsequent runs reuse cached object files in
-`build/obj/`. Delete `build/` to force a clean rebuild.
+standard library. Subsequent runs reuse cached object files under
+`build/target/<profile>/`. Delete `build/` to force a clean rebuild.
 
 ## Language tour, in order
 

@@ -101,7 +101,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list examples pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list examples examples-golden pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -413,6 +413,20 @@ examples: $(STAGE2) $(LIBCRYO_A)
 	done; \
 	if [ -n "$$failed" ]; then echo "==> FAILED examples:$$failed"; exit 1; fi; \
 	echo "==> All examples built"
+endif
+
+# ---- examples golden-output check -------------------------------------
+# Build AND run the deterministic, input-free examples and diff their stdout
+# against committed goldens (examples/<name>/expected.out).  Catches runtime
+# regressions that the build-only `examples` target misses.  POSIX-only, same
+# as `examples` (the script loops + runs binaries).
+ifeq ($(HOST_OS),windows)
+examples-golden: $(STAGE2_EXE) $(LIBCRYO_A)
+	@echo "make examples-golden runs under POSIX/WSL; native Windows cmd looping is unsupported."
+	@echo "Run it from WSL or Git Bash instead."
+else
+examples-golden: $(STAGE2) $(LIBCRYO_A)
+	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/check-examples-output.sh
 endif
 
 # ---- release packaging -------------------------------------------------

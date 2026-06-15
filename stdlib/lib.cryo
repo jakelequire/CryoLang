@@ -40,14 +40,13 @@
 ///!   ffi           the C ABI boundary (NUL-string helpers)
 ///!   env           process environment and arguments
 ///!   math          libm float operations
-///!   net           TCP sockets and HTTP/1.1
+///!   net           IP/TCP/UDP sockets, DNS, TLS, HTTP/1.1, HTTP/2, WebSocket
 ///!     http        HTTP method, status, headers, request/response,
 ///!                 connection-per-request server and client
-///!   process       subprocess spawning (fork + execve, POSIX)
-///!   sync          synchronization primitives: atomics, Mutex,
-///!                 RwLock, CondVar, Once, Barrier
-///!   thread        per-thread storage; `spawn`/`JoinHandle` land
-///!                 alongside the closure-`move` carve-out
+///!   process       subprocess spawning (POSIX fork+execve / Windows CreateProcess)
+///!   sync          synchronization primitives: atomics, Mutex, RwLock,
+///!                 CondVar, Once, Barrier, mpsc channels
+///!   thread        spawn/JoinHandle, scoped threads, per-thread storage
 ///!   test          built-in unit-test framework (see `cryo test`)
 ///! ```
 namespace std;
@@ -243,14 +242,21 @@ public module time;
 /// (`getrandom`).
 public module random;
 
-/// Network primitives (IP addresses, sockets, TCP) and an HTTP/1.1
-/// layer. TLS, UDP, HTTP/2, and WebSocket are explicitly out of scope.
+/// Network stack: IP/TCP/UDP sockets, DNS resolution, TLS, and HTTP/1.1,
+/// HTTP/2, and WebSocket layers on top.
 ///
 /// Sub-modules:
 ///   - `ip`          : `IpV4Addr`, `IpV6Addr`, `IpAddr`
 ///   - `socket_addr` : `SocketAddr { ip, port }`; `parse_v4`
 ///   - `tcp`         : `TcpStream` (`Read + Write`), `TcpListener`
+///   - `udp`         : `UdpSocket` datagram send/recv
+///   - `dns`         : hostname resolution to `IpAddr`
+///   - `tls`         : `tls::context` + `tls::stream` (`Read + Write`)
+///                     over OpenSSL; `https` builds the client on top
 ///   - `http`        : HTTP/1.1 layer (see below)
+///   - `http2`       : HTTP/2 — framing, HPACK + Huffman, settings,
+///                     `connection`, `client`, `server`
+///   - `ws`          : WebSocket — `handshake`, `frame`, `conn`
 ///
 /// `http` sub-modules:
 ///   - `http::method`   : `Method` enum (`Get`, `Post`, `Put`, ...)
@@ -266,7 +272,8 @@ public module random;
 ///   - `http::client`   : `Client::get/post`; `send(addr, req)`
 public module net;
 
-/// POSIX subprocess spawning (`fork + execve`). Windows is not yet supported.
+/// Subprocess spawning. Cross-platform: POSIX `fork + execve` and Windows
+/// `CreateProcess` backends, selected by `![target(...)]`.
 ///
 /// Sub-modules:
 ///   - `signal`  : `Signal { number }`; `hup`, `int`, `quit`, `kill`, `term`
@@ -278,7 +285,9 @@ public module net;
 ///                `Output { status, stdout, stderr }`
 public module process;
 
-/// Per-thread storage.  POSIX-only (pthread).
+/// Threads and per-thread storage. Cross-platform: pthreads on POSIX and
+/// the Win32 thread API on Windows, selected by `![target(...)]`.
+/// (`JoinHandle::id()` identity is a known v1 gap on Windows.)
 ///
 /// Sub-modules:
 ///   - `local` : `ThreadLocal<T>` lazy per-thread storage backed by
@@ -293,7 +302,9 @@ public module process;
 /// primitives back this surface.
 public module thread;
 
-/// Synchronization primitives for concurrent code.  POSIX-only (pthread).
+/// Synchronization primitives for concurrent code. Cross-platform: pthread
+/// primitives on POSIX and the Win32 equivalents (SRWLOCK, condition
+/// variables) on Windows, selected by `![target(...)]`.
 ///
 /// Sub-modules:
 ///   - `atomic`  : `MemoryOrder` enum (`Relaxed`, `Acquire`, `Release`,
@@ -312,6 +323,8 @@ public module thread;
 ///                 `notify_all`.
 ///   - `once`    : `Once` one-shot initializer; `call_once(init)`.
 ///   - `barrier` : `Barrier` N-thread rendezvous.
+///   - `mpsc`    : multi-producer / single-consumer channel;
+///                 `Sender` / `Receiver`.
 public module sync;
 
 /// Cryo's built-in unit-test framework. Tests live in `<project>/tests/`

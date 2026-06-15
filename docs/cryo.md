@@ -1080,10 +1080,11 @@ const c: Config = Config {};
 
 ### 8.3 Methods
 
-Methods are functions inside a struct body whose first parameter declares how the method borrows the receiver:
+Methods are functions inside a struct body whose first parameter declares how the method takes the receiver:
 
 - **`&this`**: shared (read-only) borrow. The body may not modify fields.
 - **`mut &this`**: exclusive (mutating) borrow. The body may modify fields.
+- **`this`** / **`mut this`**: by-value (consuming) receiver. The receiver is *moved* into the method; the caller's value is consumed and may not be used afterward. Use this for a method that dismantles a value — unwrapping it into its parts, or handing its storage off. `mut this` additionally lets the body reassign the receiver binding.
 
 ```cryo
 type struct Rect {
@@ -1101,7 +1102,27 @@ type struct Rect {
 }
 ```
 
-The receiver shape is part of the signature, so a caller knows whether a method mutates without reading the body.
+The receiver shape is part of the signature, so a caller knows whether a method borrows or consumes the receiver without reading the body.
+
+#### Struct-destructuring bindings
+
+A `const`/`mut` binding may use a **destructuring pattern** — `{ field, field, ... }` with a type annotation naming the struct — to move a struct's fields out into individually named locals. Each field is moved into a like-named local (field order need not match the declaration). This is the idiomatic companion to a consuming (`this`) receiver: binding the fields marks the receiver as *fully consumed*, so its automatic drop is suppressed and the fields can be handed off without a double free. Any bound field you don't move onward is dropped normally at the end of scope.
+
+```cryo
+type struct Box<T, A = GlobalAlloc> {
+    ptr:   T*;
+    alloc: A;
+
+    // Consume the Box and return its raw pointer, transferring ownership
+    // to the caller. Destructuring `this` moves both fields out, so the
+    // Box itself is not dropped (that would free `ptr`); `alloc` is dropped
+    // at function end (a no-op for GlobalAlloc).
+    into_raw(mut this) -> T* {
+        const { ptr, alloc }: Box<T, A> = this;
+        return ptr;
+    }
+}
+```
 
 ### 8.4 Static Methods
 
