@@ -198,7 +198,7 @@ Every value in Cryo has a known type at compile time, and the programmer must st
 | `float` | Default float; alias for `f64`. | 8 bytes |
 | `f32` `f64` | IEEE 754 floats. | 4 / 8 bytes |
 | `double` | Alias for `f64`. | 8 bytes |
-| `usize` `isize` | Pointer-width unsigned / signed integers. | 8 bytes on 64-bit |
+| `usize` `isize` | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit |
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 

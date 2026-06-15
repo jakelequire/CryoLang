@@ -1,0 +1,106 @@
+///! Platform-width integers (`usize` / `isize`): distinct first-class types whose
+///! width tracks the target pointer size (64-bit on every current Cryo target).
+///! Exercises literals, arithmetic, passing across a call, generics, formatting,
+///! the range-bound statics, and the width+signedness coercion rules that make
+///! them interoperate with the u64-based stdlib while staying their own type.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::SizedInt;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+import std::collections::string;
+import std::fmt::display;
+
+![test]
+function usize_arithmetic() -> Result<(), TestError> {
+    const a: usize = 40;
+    const b: usize = 2;
+    const sum: usize = a + b;
+    const forty_two: usize = 42;
+    return expect(sum == forty_two, Str::new("usize arithmetic must work"));
+}
+
+![test]
+function isize_is_signed() -> Result<(), TestError> {
+    const a: isize = 5;
+    const neg: isize = 0 - a;        // -5
+    const zero: isize = a + neg;
+    const z: isize = 0;
+    return expect(zero == z && neg < z, Str::new("isize must be signed"));
+}
+
+function add_one_usize(x: usize) -> usize {
+    const one: usize = 1;
+    return x + one;
+}
+
+![test]
+function usize_survives_call() -> Result<(), TestError> {
+    const x: usize = 99;
+    const y: usize = add_one_usize(x);
+    const hundred: usize = 100;
+    return expect(y == hundred, Str::new("usize must survive a call"));
+}
+
+function id_generic<T>(x: T) -> T { return x; }
+
+![test]
+function usize_through_generic() -> Result<(), TestError> {
+    const x: usize = 1234;
+    const back: usize = id_generic<usize>(x);
+    return expect(back == x, Str::new("usize must survive a generic instantiation"));
+}
+
+![test]
+function usize_u64_coerce_same_width() -> Result<(), TestError> {
+    // usize and u64 are the same width+signedness on 64-bit targets, so they
+    // interoperate without a cast (this is what lets usize-typed code use the
+    // u64-based stdlib). They remain distinct types for generics/portability.
+    const u: usize = 7;
+    const q: u64 = u;          // usize -> u64: accepted (equal width)
+    const back: usize = q;     // u64 -> usize: accepted
+    const seven: usize = 7;
+    return expect(back == seven, Str::new("usize<->u64 must round-trip"));
+}
+
+![test]
+function usize_display() -> Result<(), TestError> {
+    const x: usize = 18446744073709551615;   // u64::MAX magnitude, fits usize on 64-bit
+    match (format_to_string(&x)) {
+        Result::Ok(s) => {
+            const got:  Str = s.as_str();
+            const want: Str = Str::new("18446744073709551615");
+            return expect(got.equals(&want), Str::new("usize must Display"));
+        }
+        Result::Err(_) => { return expect(false, Str::new("format_to_string<usize> Err")); }
+    }
+}
+
+![test]
+function isize_display_negative() -> Result<(), TestError> {
+    const x: isize = 0 - 42;
+    match (format_to_string(&x)) {
+        Result::Ok(s) => {
+            const got:  Str = s.as_str();
+            const want: Str = Str::new("-42");
+            return expect(got.equals(&want), Str::new("isize must Display negatives"));
+        }
+        Result::Err(_) => { return expect(false, Str::new("format_to_string<isize> Err")); }
+    }
+}
+
+![test]
+function sized_int_range_bounds() -> Result<(), TestError> {
+    // On 64-bit targets these equal the u64/i64 bounds.
+    const umax: usize = usize::max_value();
+    const umin: usize = usize::min_value();
+    const u64max: usize = 18446744073709551615;
+    match (expect(umax == u64max, Str::new("usize::max_value() must be 2^64-1 on 64-bit"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const uz: usize = 0;
+    return expect(umin == uz, Str::new("usize::min_value() must be 0"));
+}
