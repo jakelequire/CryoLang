@@ -127,6 +127,66 @@ function mono_copy_type_refs(src: &TypeRef[]) -> TypeRef[] {
     return out;
 }
 
+/// Recursively check whether a type contains any GenericParam or BoundedParam
+/// at any depth.  THE single source of truth for this query: both
+/// `Monomorphizer::type_contains_generic_param` (method form) and the
+/// generic-validation pass's `type_contains_generic_param_v` delegate here, so
+/// the two can never drift out of sync and silently under-recurse (the latter
+/// is a free function specifically to avoid a vtable-offset SIGSEGV when
+/// dispatching on `Type*` from the validator's compilation unit; this shared
+/// helper is likewise a plain free function using only non-virtual field
+/// access, so it is safe to call from there).
+///
+/// Uses only non-virtual access on `Type*` subclass pointers: `t.kind` (plain
+/// enum field) and plain compound fields reached via `t as XType*`.  No
+/// virtual method is ever called.
+function mono_type_contains_generic_param(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null) { return false; }
+    if (t.kind == TypeKind::GenericParam) { return true; }
+    if (t.kind == TypeKind::BoundedParam) { return true; }
+    if (t.kind == TypeKind::Pointer) {
+        const ptr: PointerType* = t as PointerType*;
+        return mono_type_contains_generic_param(arena, ptr.pointee);
+    }
+    if (t.kind == TypeKind::Reference) {
+        const ref: ReferenceType* = t as ReferenceType*;
+        return mono_type_contains_generic_param(arena, ref.referent);
+    }
+    if (t.kind == TypeKind::Array) {
+        const arr: ArrayType* = t as ArrayType*;
+        return mono_type_contains_generic_param(arena, arr.element);
+    }
+    if (t.kind == TypeKind::Optional) {
+        const opt: OptionalType* = t as OptionalType*;
+        return mono_type_contains_generic_param(arena, opt.wrapped);
+    }
+    if (t.kind == TypeKind::Tuple) {
+        const tup: TupleType* = t as TupleType*;
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            if (mono_type_contains_generic_param(arena, tup.elements[i])) { return true; }
+        }
+        return false;
+    }
+    if (t.kind == TypeKind::Function) {
+        const func: FunctionType* = t as FunctionType*;
+        if (mono_type_contains_generic_param(arena, func.return_type)) { return true; }
+        for (mut i: i64 = 0; i < func.param_types.length; i++) {
+            if (mono_type_contains_generic_param(arena, func.param_types[i])) { return true; }
+        }
+        return false;
+    }
+    if (t.kind == TypeKind::InstantiatedType) {
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (mono_type_contains_generic_param(arena, inst.type_args[i])) { return true; }
+        }
+        return false;
+    }
+    return false;
+}
+
 // Monomorphizer: worklist engine
 
 type struct Monomorphizer {
@@ -7174,51 +7234,12 @@ type struct Monomorphizer {
     /// Recursively check if a type contains any unresolved GenericParam or
     /// BoundedParam at any depth.  Used to filter partial specs out of
     /// monomorphization (see enqueue_from_type_ref).
+    /// Method form: delegates to the shared `mono_type_contains_generic_param`
+    /// free function so this and the generic-validation pass's
+    /// `type_contains_generic_param_v` share one implementation and cannot
+    /// drift out of sync.
     type_contains_generic_param(&this, ty: TypeRef) -> boolean {
-        if (!ty.is_valid()) { return false; }
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null) { return false; }
-        if (t.kind == TypeKind::GenericParam) { return true; }
-        if (t.kind == TypeKind::BoundedParam) { return true; }
-        if (t.kind == TypeKind::Pointer) {
-            const ptr: PointerType* = t as PointerType*;
-            return this.type_contains_generic_param(ptr.pointee);
-        }
-        if (t.kind == TypeKind::Reference) {
-            const ref: ReferenceType* = t as ReferenceType*;
-            return this.type_contains_generic_param(ref.referent);
-        }
-        if (t.kind == TypeKind::Array) {
-            const arr: ArrayType* = t as ArrayType*;
-            return this.type_contains_generic_param(arr.element);
-        }
-        if (t.kind == TypeKind::Optional) {
-            const opt: OptionalType* = t as OptionalType*;
-            return this.type_contains_generic_param(opt.wrapped);
-        }
-        if (t.kind == TypeKind::Tuple) {
-            const tup: TupleType* = t as TupleType*;
-            for (mut i: i64 = 0; i < tup.elements.length; i++) {
-                if (this.type_contains_generic_param(tup.elements[i])) { return true; }
-            }
-            return false;
-        }
-        if (t.kind == TypeKind::Function) {
-            const func: FunctionType* = t as FunctionType*;
-            if (this.type_contains_generic_param(func.return_type)) { return true; }
-            for (mut i: i64 = 0; i < func.param_types.length; i++) {
-                if (this.type_contains_generic_param(func.param_types[i])) { return true; }
-            }
-            return false;
-        }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
-            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-                if (this.type_contains_generic_param(inst.type_args[i])) { return true; }
-            }
-            return false;
-        }
-        return false;
+        return mono_type_contains_generic_param(this.arena, ty);
     }
 
     enqueue_from_inst(mut &this, ty: TypeRef, inst: InstantiatedType*) -> void {

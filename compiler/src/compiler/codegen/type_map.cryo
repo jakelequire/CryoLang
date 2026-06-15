@@ -20,6 +20,9 @@ import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::MangledName;
 import Compiler::Resolver::QualifiedName;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Sink;
 import std::collections::pair;
 import std::collections::hashmap;
 import std::core::option;
@@ -96,12 +99,35 @@ function reset_shared_type_cache() -> void {
 type struct TypeMapper {
     arena:  TypeArena*;
     intern: InternTable*;
+    // Diagnostic sink for reporting unsound lowerings (e.g. a struct field
+    // whose type cannot be lowered to LLVM).  Nullable: a TypeMapper built
+    // without one degrades to silent placeholder substitution, but every
+    // codegen-path TypeMapper is wired with the CompilationContext's sink so
+    // an unmappable field fails the compile instead of shipping a corrupt
+    // layout.
+    diag:   DiagnosticSink*;
 
-    static new(arena: TypeArena*, intern: InternTable*) -> TypeMapper {
+    static new(arena: TypeArena*, intern: InternTable*, diag: DiagnosticSink*) -> TypeMapper {
         return TypeMapper {
             arena:  arena,
             intern: intern,
+            diag:   diag,
         };
+    }
+
+    /// Report that a user-defined type could not be lowered soundly because
+    /// one or more fields had types that don't map to an LLVM type.  The
+    /// emitted error fails the current codegen pass, so no binary ships with
+    /// the wrong layout.  A reachable hit means an un-substituted generic
+    /// parameter or an unresolved/error type slipped past sema/monomorphization
+    /// into codegen -- i.e. a compiler bug, not user error.
+    report_unmappable_fields(&this, struct_name: string, bad_count: u32, first_bad: u32) -> void {
+        if (this.diag == null) { return; }
+        const msg: string = format(
+            "codegen: type '%s' has %u field(s) whose type could not be lowered to LLVM (first at field index %u); the type was left without a layout. This is a compiler bug -- an un-substituted generic parameter or unresolved type reached codegen. Please report it.",
+            struct_name, bad_count, first_bad);
+        const sink: DiagnosticSink* = this.diag;
+        sink.emit(Diagnostic::error(ErrorCode::E0600_CODEGEN_FAILED, msg));
     }
 
     /// Primary entry point.  Returns the LLVMType for a Cryo TypeRef.
@@ -151,28 +177,6 @@ type struct TypeMapper {
         this.store_cache(type_id, llvm_ty);
         return llvm_ty;
     }
-
-    /// Fill the body of a previously forward-declared struct.
-    fill_struct_body(mut &this, llvm_ty: LType, field_types: TypeRef[], packed: boolean) -> void {
-        const n: u32 = field_types.length as u32;
-        const buf: void* = intrinsics::malloc(n as u64 * 8);
-        const slots: void** = buf as void**;
-
-        for (mut i: u32 = 0; i < n; i++) {
-            const ft: LType = this.map_type(field_types[i]);
-            if (!ft.is_valid()) {
-                // Use i8 as a placeholder for unmappable field types
-                const i8_placeholder: LType = LType::i8();
-                slots[i] = i8_placeholder.raw;
-            } else {
-                slots[i] = ft.raw;
-            }
-        }
-
-        llvm_ty.set_struct_body(buf, n, packed);
-        intrinsics::free(buf);
-    }
-
 
     // Internal dispatch
 
@@ -386,14 +390,27 @@ type struct TypeMapper {
         if (n > 0) {
             const buf: void* = intrinsics::malloc(n as u64 * 8);
             const slots: void** = buf as void**;
+            // A field whose type can't be lowered to LLVM means an
+            // un-substituted generic or unresolved type reached codegen -- a
+            // compiler bug.  We must NOT invent a placeholder layout: that
+            // would silently produce a struct with wrong field offsets.
+            // Report it to the Diag system (fails the pass) and abort the
+            // body without calling set_struct_body, leaving the type opaque.
+            mut bad_fields: u32 = 0;
+            mut first_bad:  u32 = 0;
             for (mut i: u32 = 0; i < n; i++) {
                 const ft: LType = this.map_type(t.fields[i].field_type);
                 if (ft.is_valid()) {
                     slots[i] = ft.raw;
                 } else {
-                    const i8_fb: LType = LType::i8();
-                    slots[i] = i8_fb.raw;
+                    if (bad_fields == 0) { first_bad = i; }
+                    bad_fields += 1;
                 }
+            }
+            if (bad_fields > 0) {
+                intrinsics::free(buf);
+                this.report_unmappable_fields(mangled, bad_fields, first_bad);
+                return LType::null();
             }
             llvm_ty.set_struct_body(buf, n, packed);
             intrinsics::free(buf);
@@ -462,13 +479,6 @@ type struct TypeMapper {
         const buf: void* = intrinsics::malloc(total as u64 * 8);
         const slots: void** = buf as void**;
 
-        // Pre-fill with i8 so no slot is ever null; LLVM's checkBody segfaults
-        // on null body entries.
-        const i8_init: LType = LType::i8();
-        for (mut pi: u32 = 0; pi < total; pi++) {
-            slots[pi] = i8_init.raw;
-        }
-
         mut idx: u32 = 0;
         if (any_virtual) {
             const vptr_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
@@ -477,7 +487,16 @@ type struct TypeMapper {
         }
 
         // Emit fields in root -> derived order so a Derived* shares a prefix
-        // with Base* at the LLVM-struct level.
+        // with Base* at the LLVM-struct level.  A field that can't be lowered
+        // to LLVM means an un-substituted generic or unresolved type reached
+        // codegen -- a compiler bug.  We must NOT invent a placeholder slot:
+        // that would silently give the class wrong field offsets.  Track the
+        // failures and, if any, report to Diag (fails the pass) and abort
+        // without calling set_struct_body, leaving the type opaque.  Because
+        // set_struct_body is skipped on failure, an unfilled `buf` slot never
+        // reaches LLVM (it would otherwise segfault checkBody on a null slot).
+        mut bad_fields: u32 = 0;
+        mut first_bad:  u32 = 0;
         for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
             const link: ClassType* = chain[ci];
             for (mut i: u32 = 0; i < link.fields.length as u32; i++) {
@@ -485,9 +504,18 @@ type struct TypeMapper {
                 const ft: LType = this.map_type(link.fields[i].field_type);
                 if (ft.is_valid()) {
                     slots[idx] = ft.raw;
+                } else {
+                    if (bad_fields == 0) { first_bad = idx; }
+                    bad_fields += 1;
                 }
                 idx += 1;
             }
+        }
+
+        if (bad_fields > 0) {
+            intrinsics::free(buf);
+            this.report_unmappable_fields(mangled, bad_fields, first_bad);
+            return LType::null();
         }
 
         llvm_ty.set_struct_body(buf, total, false);

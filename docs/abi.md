@@ -1,9 +1,7 @@
 # ABI Lowering - As-Built
 
 This document describes how Cryo lowers function signatures and call sites
-to LLVM IR for the SysV x86-64 ABI. It is the as-built companion to
-`abi-lowering-plan.md` (which captured the original design intent before
-any of this shipped).
+to LLVM IR for the SysV x86-64 ABI, as actually implemented in the compiler.
 
 Target scope today: SysV x86-64 only. The seam is designed so that other
 targets (AArch64 AAPCS, Win64) plug in as separate `AbiClassifier`

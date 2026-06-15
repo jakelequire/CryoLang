@@ -58,8 +58,22 @@ _PIN_OUTPUTS = (
 
 
 def worktree_dirty() -> bool:
-    """True if anything outside the pin outputs differs from HEAD."""
+    """True if anything outside the pin outputs differs from HEAD.
+
+    `git diff-index` compares the working tree against HEAD using the index's
+    cached stat info.  A build (and `make pin` runs one) updates the mtimes of
+    tracked source files without changing their contents, which leaves that
+    stat cache stale -- `diff-index` would then report those files as modified
+    even though their bytes are identical, falsely recording the pin as dirty.
+    Refresh the stat cache first (re-hashing only the stat-changed files) so
+    the comparison reflects real content differences.  `update-index --refresh`
+    exits non-zero when it updated entries; that is expected, so ignore it.
+    """
     try:
+        subprocess.run(
+            ["git", "-C", str(ROOT), "update-index", "-q", "--refresh"],
+            capture_output=True,
+        )
         r = subprocess.run(
             ["git", "-C", str(ROOT), "diff-index", "--quiet", "HEAD", "--",
              *_PIN_OUTPUTS],
