@@ -65,6 +65,49 @@ function parse_int_lexeme(s: string) -> u64 {
     return acc;
 }
 
+/// Strip the sign, base prefix (`0x`/`0b`/`0o`), `_` separators, and any type
+/// suffix from an integer-literal lexeme, returning the bare digit string and
+/// writing the detected radix to `*out_radix`. Used to build i128/u128
+/// constants via `LLVMConstIntOfString`, which takes digits + radix rather
+/// than a 64-bit value (so it doesn't truncate literals above `u64::MAX`).
+function int_literal_clean(s: string, out_radix: u8*) -> string {
+    *out_radix = 10u8;
+    if (s == null) { return "0"; }
+    const len: i64 = intrinsics::strlen(s) as i64;
+    mut i: i64 = 0;
+    // A leading sign belongs to the unary operator, not the literal, but
+    // tolerate it defensively.
+    if (len > 0 && (*(s + 0) as char == '-' || *(s + 0) as char == '+')) { i = 1; }
+
+    mut base: u8 = 10u8;
+    if (i + 1 < len && (*(s + i) as char) == '0') {
+        const p: char = *(s + i + 1) as char;
+        if (p == 'x' || p == 'X')      { base = 16u8; i += 2; }
+        else if (p == 'b' || p == 'B') { base = 2u8;  i += 2; }
+        else if (p == 'o' || p == 'O') { base = 8u8;  i += 2; }
+    }
+
+    mut buf: string = intrinsics::malloc(len + 1) as string;
+    mut w: i64 = 0;
+    while (i < len) {
+        const c: char = *(s + i) as char;
+        if (c == '_') { i += 1; continue; }
+        mut digit: i64 = -1;
+        if (c >= '0' && c <= '9')      { digit = (c - '0') as i64; }
+        else if (c >= 'a' && c <= 'f') { digit = (c - 'a' + 10) as i64; }
+        else if (c >= 'A' && c <= 'F') { digit = (c - 'A' + 10) as i64; }
+        else { break; }   // the start of the type suffix (i128/u128) or junk
+        if (digit >= base as i64) { break; }
+        *(buf + w) = c;
+        w += 1;
+        i += 1;
+    }
+    *(buf + w) = '\0';
+    *out_radix = base;
+    if (w == 0) { return "0"; }
+    return buf;
+}
+
 /// Decode a character-literal lexeme: the raw text *between* the quotes,
 /// as the lexer hands it over, to its code-point value.  `'\n'` arrives
 /// as the two-char string "\n" (backslash + n), not 0x0A, so the C-style

@@ -124,7 +124,7 @@ Integer literals support four bases. Underscores are visual separators that the 
 2.5e-3f64         // scientific with explicit type
 ```
 
-**Type suffixes:** `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64` `usize` `isize` `f32` `f64`
+**Type suffixes:** `u8` `u16` `u32` `u64` `u128` `i8` `i16` `i32` `i64` `i128` `usize` `isize` `f32` `f64`
 
 > **Trap.** Integer literals exceeding `i64::MAX` (e.g. `0xFFFF_FFFF_FFFF_FFFF`) wrap to negative when used inline against a `u64` operand. Hoist the literal into a `const u64 NAME = ...` binding to compare correctly.
 
@@ -192,9 +192,9 @@ Every value in Cryo has a known type at compile time, and the programmer must st
 | `char` | 8-bit character (byte). | 1 byte |
 | `string` | NUL-terminated raw string (`*u8`). FFI-shaped. | pointer |
 | `int` | Default signed integer; alias for `i32`. | 4 bytes |
-| `i8` `i16` `i32` `i64` | Signed integers of fixed width. | 1 / 2 / 4 / 8 bytes |
+| `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width. | 1 / 2 / 4 / 8 / 16 bytes |
 | `uint` | Default unsigned integer; alias for `u32`. | 4 bytes |
-| `u8` `u16` `u32` `u64` | Unsigned integers of fixed width. | 1 / 2 / 4 / 8 bytes |
+| `u8` `u16` `u32` `u64` `u128` | Unsigned integers of fixed width. | 1 / 2 / 4 / 8 / 16 bytes |
 | `float` | Default float; alias for `f64`. | 8 bytes |
 | `f32` `f64` | IEEE 754 floats. | 4 / 8 bytes |
 | `double` | Alias for `f64`. | 8 bytes |
@@ -324,27 +324,36 @@ when the type parameter appears *nowhere* the call can infer it from.
 
 ### 2.6 Tuple Types
 
-> **Status: partially reserved — see [§21](#21-reserved-syntax).** The
-> bracketed tuple *type* (`[int, string]`) is accepted in type position, but
-> tuple *literals* and `.N` element access are **not yet lowered**: a
-> `[a, b]` literal currently parses as an array, so constructing or reading a
-> tuple value does not compile (it reports `E0200`). The design below is a
-> roadmap, not a usable 1.0 feature.
-
-A tuple groups a fixed number of heterogeneous values into one compound. **Tuple types and tuple literals are planned to use square brackets.** Round parentheses are reserved for grouping and the unit type.
+A tuple groups a fixed number of values — of possibly different types — into one
+compound value. Tuple types and tuple literals both use parentheses:
 
 ```cryo
-// Planned syntax. The type aliases below compile today; the literal and
-// the `.0` / `.1` element access do NOT yet (see the status note above).
-type Pair        = [int, string];
-type Triple      = [int, int, int];
+type Pair   = (int, string);
+type Triple = (int, int, int);
 
-const p: [int, string] = [42, "answer"];   // not yet: parses as an array
-const x: int    = p.0;                      // not yet
-const s: string = p.1;                      // not yet
+const p: (int, string) = (42, "answer");
+const x: int    = p.0;     // positional element access: .0, .1, ...
+const s: string = p.1;
+const y: int    = p[0];    // `t[N]` indexing is equivalent to `t.N`
 ```
 
-`(int, string)` is **not** a tuple type. The parser will reject it and direct you to the bracketed form.
+Because parentheses are also used for grouping, the unit type, and function
+types, the forms are:
+
+- `()` — the unit type / unit value, which also serves as the empty tuple (§2.7).
+- `(T)` / `(expr)` — **grouping**: just `T` / `expr`, *not* a 1-tuple.
+- `(T,)` / `(x,)` — a **1-tuple**: the trailing comma distinguishes it from grouping.
+- `(T, U)`, `(T, U, V)`, … — 2-, 3-, … element tuples.
+- `(A, B) -> R` — a function type, not a tuple (the `->` disambiguates).
+
+Element access is positional with an integer literal — `t.0`, `t.1`, … (or the
+equivalent `t[0]`, `t[1]`) — and the index is checked against the tuple's arity
+at compile time. Chained access like `t.1.0` works (element 1, then element 0 of
+that).
+
+> **Deprecated:** an older bracket spelling, `[T, U]`, is still accepted in type
+> position for now (the bootstrap stdlib has not yet been migrated). It is
+> deprecated and will be removed; write `(T, U)`.
 
 ### 2.7 The Unit Type
 
@@ -951,7 +960,7 @@ unsafe {
 }
 ```
 
-Future versions may gate raw pointer dereference, raw-to-pointer `as`-casts, and `extern` calls behind an `unsafe` block. Code that already wraps such operations in `unsafe { ... }` will continue to compile when that lands; code that does not will need to.
+This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing — 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
 
 ---
 
@@ -2269,7 +2278,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 
 | Reserved | Status |
 | --- | --- |
-| `i128` / `u128` | Reserved. The lexer and type system accept the `i128` / `u128` type keywords, but 128-bit code generation is incomplete: the SysV ABI lowering truncates a 128-bit value to 64 bits across a call boundary, generic instantiation collapses `i128`/`u128` onto `i64`/`u64`, and there is no `i128`/`u128` integer-literal suffix. Use `i64` / `u64` for now. |
 | Raw strings `r"..."` | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal. |
 | Escapes `\a` `\b` `\f` `\v` | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`. |
 | `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
@@ -2277,7 +2285,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Optional chaining `?.` | Token reserved; not consumed by the parser. |
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
-| Tuple literals `[a, b]` + `.N` access | The tuple *type* `[T, U]` is accepted in type position, but a `[a, b]` literal parses as an array and `.N` element access is not lowered, so constructing or reading a tuple value does not compile (`E0200`). See [§ 2.6](#26-tuple-types). |
 | Struct field defaults (`field: T = expr`) | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
 | Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
 | `![pure]` | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics). |

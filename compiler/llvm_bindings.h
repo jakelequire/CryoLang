@@ -203,6 +203,10 @@ void           LLVMSetComdatSelectionKind(LLVMComdatRef C, int Kind);
  * =================================================================== */
 
 LLVMValueRef LLVMConstInt(LLVMTypeRef IntTy, unsigned long long N, LLVMBool SignExtend);
+/* Build an integer constant from its textual digits in the given radix.
+ * Needed for i128/u128 literals whose value exceeds 64 bits (LLVMConstInt
+ * takes only a 64-bit N). Text must be the bare digits (no sign/prefix). */
+LLVMValueRef LLVMConstIntOfString(LLVMTypeRef IntTy, const char *Text, unsigned char Radix);
 LLVMValueRef LLVMConstReal(LLVMTypeRef RealTy, double N);
 LLVMValueRef LLVMConstNull(LLVMTypeRef Ty);
 LLVMBool LLVMIsNull(LLVMValueRef Val);

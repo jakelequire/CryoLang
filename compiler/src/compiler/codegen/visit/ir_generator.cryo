@@ -661,7 +661,6 @@ public:
 
         if (kind == LiteralKind::Integer) {
             if (!ty.is_valid()) { ty = LType::i32(); }
-            const val: u64 = parse_int_lexeme(node.value);
             // Default to sign-extension (matches signed integer types and the
             // historical fallback when resolved_type is missing).  For unsigned
             // integer types we have to pass false: a u64 literal whose bit
@@ -672,6 +671,7 @@ public:
             // wrappers the same way codegen_binary does at line 246 so generic
             // contexts behave identically to concrete ones.
             mut sign_extend: boolean = true;
+            mut is_128: boolean = false;
             mut sty: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
             mut sbd: i32 = 0;
             while (sty != null && sty.kind == TypeKind::InstantiatedType && sbd < 5) {
@@ -684,8 +684,19 @@ public:
             if (sty != null && sty.kind == TypeKind::Int) {
                 const sint: IntType* = sty as IntType*;
                 if (sint.int_kind.is_unsigned()) { sign_extend = false; }
+                if (sint.int_kind.bit_width() == 128u64) { is_128 = true; }
             }
-            this.state.last_value = LType::const_int(ty, val, sign_extend);
+            if (is_128) {
+                // A 128-bit literal can hold more than 64 bits, so the u64
+                // `const_int` path would truncate. Build the constant from the
+                // literal's digit string instead.
+                mut radix: u8 = 10u8;
+                const digits: string = int_literal_clean(node.value, &radix);
+                this.state.last_value = LType::const_int_of_string(ty, digits, radix);
+            } else {
+                const val: u64 = parse_int_lexeme(node.value);
+                this.state.last_value = LType::const_int(ty, val, sign_extend);
+            }
         } else if (kind == LiteralKind::Float) {
             if (!ty.is_valid()) { ty = LType::f64(); }
             mut val: f64 = 0.0;
