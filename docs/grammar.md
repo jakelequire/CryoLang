@@ -284,9 +284,14 @@ Type               ::= BaseType "*"+                       (* pointer *)
                      | "&" "mut"? Type                     (* reference *)
                      | "mut" "&" Type                      (* mut-ref alt form *)
                      | BaseType ("[" NumLit? "]")+         (* array *)
-                     | "[" Type ("," Type)* "]"            (* tuple *)
-                     | "(" (Type ("," Type)*)? ")" "->" Type  (* fn *)
-                     | "()"                                (* unit *)
+                     | "(" Type ("," Type)* ","? ")"       (* tuple - needs >=2 elements
+                                                              OR a trailing comma; `(T)`
+                                                              is grouping, not a 1-tuple *)
+                     | "[" Type ("," Type)* "]"            (* tuple - DEPRECATED legacy
+                                                              spelling, still accepted;
+                                                              use `(T, U)` *)
+                     | "(" (Type ("," Type)*)? ")" "->" Type  (* fn (the `->` disambiguates) *)
+                     | "()"                                (* unit (also the empty tuple) *)
                      | Type "?"                            (* optional: T? desugars to Option<T> *)
                      | "implement" QualName GenericArgs?   (* opaque: implement Trait (see cryo.md §2.11) *)
                      | BaseType

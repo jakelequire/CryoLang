@@ -1,0 +1,122 @@
+///! 128-bit integers (`i128` / `u128`): literals above `u64::MAX`, arithmetic
+///! that overflows 64 bits, signed/unsigned behavior, and passing/returning
+///! across a function boundary (the SysV two-register ABI).
+///!
+///! Values are chosen so that a silent truncation to 64 bits would give an
+///! obviously wrong answer (e.g. 2^64 truncates to 0), making these real
+///! regression guards rather than tautologies.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::Int128;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// 2^64 = 18446744073709551616 (one past u64::MAX = 18446744073709551615).
+
+// Module-level 128-bit constant (exercises the global-init codegen path,
+// which is separate from in-function literal codegen).
+const GLOBAL_TWO_POW_64: u128 = 18446744073709551616;
+
+![test]
+function u128_module_level_const() -> Result<(), TestError> {
+    const u64_max: u128 = 18446744073709551615;
+    const one:     u128 = 1;
+    const diff:    u128 = GLOBAL_TWO_POW_64 - u64_max;
+    return expect(diff == one, Str::new("module-level u128 const must not truncate"));
+}
+
+![test]
+function u128_literal_above_u64_max() -> Result<(), TestError> {
+    const two_pow_64: u128 = 18446744073709551616;
+    const u64_max:    u128 = 18446744073709551615;
+    const one:        u128 = 1;
+    // If the literal had truncated to 64 bits, two_pow_64 would be 0 and this
+    // subtraction would underflow to a huge number rather than 1.
+    const diff: u128 = two_pow_64 - u64_max;
+    return expect(diff == one, Str::new("2^64 - u64::MAX must equal 1 (no truncation)"));
+}
+
+![test]
+function u128_multiplication_overflows_64_bits() -> Result<(), TestError> {
+    const a: u128 = 4294967296;   // 2^32
+    const b: u128 = 4294967296;   // 2^32
+    const product: u128 = a * b;  // 2^64 - needs the full 128-bit width
+    const expected: u128 = 18446744073709551616;
+    return expect(product == expected, Str::new("2^32 * 2^32 must equal 2^64"));
+}
+
+![test]
+function u128_hex_literal() -> Result<(), TestError> {
+    // 0x1_0000_0000_0000_0000 == 2^64.
+    const hex_val: u128 = 0x10000000000000000;
+    const dec_val: u128 = 18446744073709551616;
+    return expect(hex_val == dec_val, Str::new("hex and decimal 2^64 literals must agree"));
+}
+
+![test]
+function i128_signed_negation_round_trips() -> Result<(), TestError> {
+    const a:    i128 = 18446744073709551616;   // 2^64
+    const neg:  i128 = 0 - a;                   // -(2^64)
+    const sum:  i128 = a + neg;                 // 0
+    const zero: i128 = 0;
+    return expect(sum == zero, Str::new("x + (-x) must be 0 for i128"));
+}
+
+function identity128(x: u128) -> u128 {
+    return x;
+}
+
+function add_one_128(x: u128) -> u128 {
+    const one: u128 = 1;
+    return x + one;
+}
+
+![test]
+function u128_survives_function_call() -> Result<(), TestError> {
+    // Exercises the ABI: a >64-bit value passed in and returned. A truncating
+    // ABI would hand back 0 (the low 64 bits of 2^64), not the original.
+    const big:  u128 = 18446744073709551616;   // 2^64
+    const back: u128 = identity128(big);
+    return expect(back == big, Str::new("u128 must survive a call unchanged"));
+}
+
+![test]
+function u128_call_computes_above_64_bits() -> Result<(), TestError> {
+    const big:      u128 = 18446744073709551616;   // 2^64
+    const result:   u128 = add_one_128(big);       // 2^64 + 1
+    const expected: u128 = 18446744073709551617;
+    return expect(result == expected, Str::new("callee arithmetic must keep 128-bit width"));
+}
+
+![test]
+function u128_division_and_modulo() -> Result<(), TestError> {
+    // 128-bit / and % lower to libgcc/compiler-rt calls (__udivti3, __umodti3);
+    // this also confirms those symbols resolve at link time.
+    const a: u128 = 18446744073709551616;   // 2^64
+    const b: u128 = 4294967296;             // 2^32
+    const q: u128 = a / b;                  // 2^32
+    const expected_q: u128 = 4294967296;
+    match (expect(q == expected_q, Str::new("2^64 / 2^32 must equal 2^32"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const c: u128 = 18446744073709551618;   // 2^64 + 2
+    const r: u128 = c % a;                  // 2
+    const two: u128 = 2;
+    return expect(r == two, Str::new("(2^64 + 2) %% 2^64 must equal 2"));
+}
+
+function generic_id<T>(x: T) -> T {
+    return x;
+}
+
+![test]
+function u128_through_generic() -> Result<(), TestError> {
+    // Guards against the old "generic instantiation collapses u128 -> u64":
+    // a collapsed instantiation would truncate 2^64 to 0.
+    const big:  u128 = 18446744073709551616;   // 2^64
+    const back: u128 = generic_id<u128>(big);
+    return expect(back == big, Str::new("u128 must survive a generic instantiation"));
+}

@@ -2201,16 +2201,19 @@ public:
             return this.parse_reference_type_with_mutability(true);
         }
 
-        // Function types or unit type: `(T, U) -> R` or `()`. Multi-element
-        // non-function `(T, U)` is NOT a tuple any more; tuples moved to
-        // bracket syntax to free `()` for the unit type alone.
+        // Parenthesized types: tuple `(T, U)`, 1-tuple `(T,)`, grouping `(T)`,
+        // unit `()`, or function `(T, U) -> R`. Disambiguated by the trailing
+        // comma (grouping vs 1-tuple) and a following `->` (function type).
         if (this.check(TokenType::LParen)) {
-            return this.parse_function_or_unit_type();
+            return this.parse_paren_type();
         }
 
-        // Bracket tuple types: `[T, U, V]`. The leading `[` is unambiguous
-        // in type position (array suffixes `T[]`/`T[N]` are postfix and run
-        // through `parse_type_suffixes`, not as a type-start).
+        // Bracket tuple types `[T, U]` are the DEPRECATED legacy spelling,
+        // still accepted so the bootstrap (pinned compiler builds the stdlib,
+        // which still uses `[...]`) keeps working until the next re-pin
+        // migrates the stdlib to `(...)`. New code should use `(T, U)`.
+        // A leading `[` is unambiguous in type position (array suffixes
+        // `T[]`/`T[N]` are postfix, handled by parse_type_suffixes).
         if (this.check(TokenType::LSquare)) {
             const tup: TypeAnnotation* = this.parse_bracket_tuple_type();
             if (tup == null) { return null; }
@@ -2516,14 +2519,21 @@ public:
         return new TypeAnnotation::Reference(ref_ann);
     }
 
-    /// Parse function type or unit type: `(T, U) -> R`, `() -> R`, or `()`.
-    /// Multi-element non-function form `(T, U)` is no longer a tuple type
-    /// Tuples now use bracket syntax `[T, U]` so `()` can mean only the
-    /// unit type. Single-element `(T)` is parens grouping (returns T).
-    parse_function_or_unit_type() -> TypeAnnotation* {
+    /// Parse a parenthesized type. One entry point for every `(...)` type:
+    ///   `()`          -> unit type (empty TupleAnnotation; the resolver
+    ///                    canonicalizes it to UnitType). Unit *is* the empty
+    ///                    tuple; there is no separate `(,)` spelling.
+    ///   `(T)`         -> grouping: just `T` (no trailing comma).
+    ///   `(T,)`        -> 1-tuple (trailing comma disambiguates from grouping).
+    ///   `(T, U, ...)` -> tuple type.
+    ///   `(T, U) -> R` -> function type (also `() -> R`).
+    /// The trailing comma (grouping vs 1-tuple) and a following `->` (function
+    /// type) are the two disambiguators.
+    parse_paren_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '('
 
         mut params: TypeAnnotation*[] = [];
+        mut trailing_comma: boolean = false;
         if (!this.check(TokenType::RParen)) {
             while (true) {
                 const param: TypeAnnotation* = this.parse_type_annotation();
@@ -2533,11 +2543,17 @@ public:
                 if (!this.match_tok(TokenType::Comma)) {
                     break;
                 }
+                // A comma was consumed; if `)` follows it was a trailing comma
+                // (`(T,)` 1-tuple) - stop without expecting another element.
+                if (this.check(TokenType::RParen)) {
+                    trailing_comma = true;
+                    break;
+                }
             }
         }
         this.consume(TokenType::RParen, "')'");
 
-        // Function type: (params) -> return_type
+        // Function type: (params) -> return_type   (covers `() -> R` too).
         if (this.check(TokenType::Arrow)) {
             this.advance();
             const ret: TypeAnnotation* = this.parse_type_annotation();
@@ -2549,32 +2565,36 @@ public:
             return new TypeAnnotation::Function(fn_ann);
         }
 
-        // `()` -> unit type. The resolver canonicalizes empty TupleAnnotation
-        // to UnitType; kept as the existing path so unit's representation
-        // stays uniform across the pipeline.
+        // `()` -> unit type (empty TupleAnnotation, canonicalized downstream).
         if (params.length == 0) {
-            const tup_ann: TupleAnnotation* = new TupleAnnotation {
+            const unit_ann: TupleAnnotation* = new TupleAnnotation {
                 elements: params,
                 span:     this.span_from(start),
             };
-            return new TypeAnnotation::Tuple(tup_ann);
+            return new TypeAnnotation::Tuple(unit_ann);
         }
 
-        // `(T)` -> just T (parens grouping).
-        if (params.length == 1) {
+        // `(T)` with no trailing comma -> grouping; the inner type is complete
+        // (it already ran through parse_type_annotation, suffixes included).
+        if (params.length == 1 && !trailing_comma) {
             return params[0];
         }
 
-        // `(T, U, ...)` without `->` is no longer a tuple type.
-        this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-            "tuple types now use bracket syntax: write '[T, U]' instead of '(T, U)'. Parens are reserved for unit '()' and function-parameter lists.");
-        return null;
+        // `(T,)` 1-tuple or `(T, U, ...)` tuple. Allow type suffixes so
+        // `(i32, i32)*`, `(i32, i32)?`, `(i32, i32)[]` all work.
+        const tup_ann: TupleAnnotation* = new TupleAnnotation {
+            elements: params,
+            span:     this.span_from(start),
+        };
+        return this.parse_type_suffixes(new TypeAnnotation::Tuple(tup_ann));
     }
 
-    /// Parse a bracket tuple type: `[T, U, V]`. Empty `[]` is invalid
-    /// (use `()` for unit). Single-element `[T]` is a 1-tuple; uncommon
-    /// but consistent. The resolver lowers TupleAnnotation through the
-    /// existing path; no new AST node needed.
+    /// Parse the DEPRECATED bracket tuple type `[T, U, V]`. Retained only for
+    /// bootstrap compatibility (the pinned compiler builds the stdlib, which
+    /// still uses `[...]`); new code should use the parenthesized form
+    /// `(T, U)`. To be removed once the stdlib is migrated and re-pinned.
+    /// Empty `[]` is invalid (use `()` for unit). Lowers to the same
+    /// TupleAnnotation as `(...)`.
     parse_bracket_tuple_type() -> TypeAnnotation* {
         const start: Token = this.advance(); // consume '['
 
