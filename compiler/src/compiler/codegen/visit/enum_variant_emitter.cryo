@@ -97,7 +97,9 @@ type struct EnumVariantEmitter {
             if (payload_ty.is_valid()) {
                 const typed_ptr: LValue = this.cg.builder.build_bitcast(
                     payload_ptr, LType::pointer_to(payload_ty), "enum.payload.cast");
-                this.cg.builder.build_store(args[0], typed_ptr);
+                const stored_val: LValue = this.coerce_int_payload(
+                    args[0], payload_ty, variant.payload_types[0]);
+                this.cg.builder.build_store(stored_val, typed_ptr);
             }
         } else {
             // Multi-field payload: lay out sequentially using the SAME field
@@ -129,7 +131,9 @@ type struct EnumVariantEmitter {
                 intrinsics::free(obuf);
                 const field_ptr: LValue = this.cg.builder.build_bitcast(
                     field_ptr_raw, LType::pointer_to(field_ty), "enum.field.cast");
-                this.cg.builder.build_store(args[i], field_ptr);
+                const stored_field: LValue = this.coerce_int_payload(
+                    args[i], field_ty, variant.payload_types[i]);
+                this.cg.builder.build_store(stored_field, field_ptr);
                 if (ft != null) {
                     offset += ft.size_bytes();
                 }
@@ -137,6 +141,46 @@ type struct EnumVariantEmitter {
         }
 
         return this.cg.builder.build_load(enum_llvm, alloca, "enum.val");
+    }
+
+    /// Widen / narrow an integer payload value to the variant field's
+    /// declared LLVM width before storing.  Without this an `i32` literal
+    /// (`Some(5)` - and even `Some(5i64)`, which still reaches codegen as an
+    /// `i32` constant) stored into an `i64` payload slot writes only 4 bytes,
+    /// leaving the high word as stack garbage; two `Option<i64>::Some(5)`
+    /// values then compare unequal.  Mirrors the struct-literal field
+    /// coercion in ir_generator and new_delete_emitter.  Non-integer payloads
+    /// (and equal widths) pass through untouched.
+    coerce_int_payload(&this, val: LValue, field_lty: LType, field_ref: TypeRef) -> LValue {
+        if (!field_lty.is_valid()) { return val; }
+        const field_raw: void* = field_lty.raw;
+        const val_raw: void* = llvm::LLVMTypeOf(val.raw);
+        if (field_raw == null || val_raw == null) { return val; }
+        if (type_kind_of(field_raw) != LTypeKind::Integer
+                || type_kind_of(val_raw) != LTypeKind::Integer) {
+            return val;
+        }
+        const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_raw);
+        const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_raw);
+        if (want_bits > got_bits) {
+            // Widen with the field's signedness so a negative narrow literal
+            // (`-1`) keeps its sign in the wider slot rather than becoming a
+            // large positive value.
+            mut signed_target: boolean = false;
+            const ft: Type* = this.resolve_payload_type(field_ref);
+            if (ft != null && ft.kind == TypeKind::Int) {
+                const ft_int: IntType* = ft as IntType*;
+                signed_target = ft_int.int_kind.is_signed();
+            }
+            if (signed_target) {
+                return this.cg.builder.build_sext(val, field_lty, "payload.widen");
+            }
+            return this.cg.builder.build_zext(val, field_lty, "payload.widen");
+        }
+        if (want_bits < got_bits) {
+            return this.cg.builder.build_trunc(val, field_lty, "payload.trunc");
+        }
+        return val;
     }
 
     /// Look up a payload field's `Type`, following an `InstantiatedType`
