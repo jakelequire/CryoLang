@@ -2208,16 +2208,16 @@ public:
             return this.parse_paren_type();
         }
 
-        // Bracket tuple types `[T, U]` are the DEPRECATED legacy spelling,
-        // still accepted so the bootstrap (pinned compiler builds the stdlib,
-        // which still uses `[...]`) keeps working until the next re-pin
-        // migrates the stdlib to `(...)`. New code should use `(T, U)`.
-        // A leading `[` is unambiguous in type position (array suffixes
-        // `T[]`/`T[N]` are postfix, handled by parse_type_suffixes).
+        // Bracket tuple types `[T, U]` were the pre-1.0 spelling; tuples now
+        // use the parenthesized form `(T, U)`. A *leading* `[` in type
+        // position is unambiguously the old tuple form (array suffixes
+        // `T[]`/`T[N]` are postfix, handled by parse_type_suffixes), so emit a
+        // targeted migration diagnostic instead of letting it fall through to
+        // a generic "expected type" error.
         if (this.check(TokenType::LSquare)) {
-            const tup: TypeAnnotation* = this.parse_bracket_tuple_type();
-            if (tup == null) { return null; }
-            return this.parse_type_suffixes(tup);
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "bracket tuple types '[T, U]' are no longer supported; use '(T, U)'");
+            return null;
         }
 
         // `implement Trait + Trait2` opaque type. `implement` is already a
@@ -2595,37 +2595,6 @@ public:
     /// `(T, U)`. To be removed once the stdlib is migrated and re-pinned.
     /// Empty `[]` is invalid (use `()` for unit). Lowers to the same
     /// TupleAnnotation as `(...)`.
-    parse_bracket_tuple_type() -> TypeAnnotation* {
-        const start: Token = this.advance(); // consume '['
-
-        mut elements: TypeAnnotation*[] = [];
-        if (!this.check(TokenType::RSquare)) {
-            while (true) {
-                const elem: TypeAnnotation* = this.parse_type_annotation();
-                if (elem != null) {
-                    elements.push(elem);
-                }
-                if (!this.match_tok(TokenType::Comma)) {
-                    break;
-                }
-            }
-        }
-        this.consume(TokenType::RSquare, "']'");
-
-        if (elements.length == 0) {
-            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                "empty tuple type '[]' is not valid; use '()' for the unit type");
-            return null;
-        }
-
-        const tup_ann: TupleAnnotation* = new TupleAnnotation {
-            elements: elements,
-            span:     this.span_from(start),
-        };
-        return new TypeAnnotation::Tuple(tup_ann);
-    }
-
-
     // Type Helper Predicates
 
     /// Check if the current token starts a type annotation.

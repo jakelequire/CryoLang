@@ -287,9 +287,6 @@ Type               ::= BaseType "*"+                       (* pointer *)
                      | "(" Type ("," Type)* ","? ")"       (* tuple - needs >=2 elements
                                                               OR a trailing comma; `(T)`
                                                               is grouping, not a 1-tuple *)
-                     | "[" Type ("," Type)* "]"            (* tuple - DEPRECATED legacy
-                                                              spelling, still accepted;
-                                                              use `(T, U)` *)
                      | "(" (Type ("," Type)*)? ")" "->" Type  (* fn (the `->` disambiguates) *)
                      | "()"                                (* unit (also the empty tuple) *)
                      | Type "?"                            (* optional: T? desugars to Option<T> *)
