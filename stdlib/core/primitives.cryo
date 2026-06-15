@@ -29,30 +29,35 @@ const U8_MAX_DECIMAL_DIGITS:  u64 = 3;   // "255"
 const U16_MAX_DECIMAL_DIGITS: u64 = 5;   // "65535"
 const U32_MAX_DECIMAL_DIGITS: u64 = 10;  // "4294967295"
 const U64_MAX_DECIMAL_DIGITS: u64 = 20;  // "18446744073709551615"
+const U128_MAX_DECIMAL_DIGITS: u64 = 39; // "340282366920938463463374607431768211455"
 
 // Signed decimal: sign + magnitude digits.
 const I8_MAX_DECIMAL_DIGITS:  u64 = 4;   // "-128"
 const I16_MAX_DECIMAL_DIGITS: u64 = 6;   // "-32768"
 const I32_MAX_DECIMAL_DIGITS: u64 = 11;  // "-2147483648"
 const I64_MAX_DECIMAL_DIGITS: u64 = 20;  // "-9223372036854775808"
+const I128_MAX_DECIMAL_DIGITS: u64 = 40; // "-170141183460469231731687303715884105728"
 
 // Hex: 2 nibbles per byte of the type.
 const U8_MAX_HEX_DIGITS:  u64 = 2;
 const U16_MAX_HEX_DIGITS: u64 = 4;
 const U32_MAX_HEX_DIGITS: u64 = 8;
 const U64_MAX_HEX_DIGITS: u64 = 16;
+const U128_MAX_HEX_DIGITS: u64 = 32;
 
 // Octal: digits to represent the type's max value.
 const U8_MAX_OCT_DIGITS:  u64 = 3;
 const U16_MAX_OCT_DIGITS: u64 = 6;
 const U32_MAX_OCT_DIGITS: u64 = 11;
 const U64_MAX_OCT_DIGITS: u64 = 22;
+const U128_MAX_OCT_DIGITS: u64 = 43;     // ceil(128 / 3)
 
 // Binary: one digit per bit of the type.
 const U8_MAX_BIN_DIGITS:  u64 = 8;
 const U16_MAX_BIN_DIGITS: u64 = 16;
 const U32_MAX_BIN_DIGITS: u64 = 32;
 const U64_MAX_BIN_DIGITS: u64 = 64;
+const U128_MAX_BIN_DIGITS: u64 = 128;
 
 // Character classification. Each of these aggregates a range check
 // readers otherwise have to squint at.
@@ -473,6 +478,182 @@ implement i64 {
         mut buf: string = malloc(24) as string;
         if ((buf as void*) == null) {
             intrinsics::panic("i64::to_decimal_str: allocation failed", FILE, LINE);
+        }
+        const n: u64 = this.to_decimal_buf(buf as u8*);
+        buf[n] = 0;
+        return buf;
+    }
+}
+
+// 128-bit integers. `u128` is the canonical implementation (mirrors `u64`,
+// just wider); `i128` handles the sign and delegates the magnitude to `u128`.
+// Unlike the <=64-bit widths these can't widen-and-delegate to a smaller type,
+// so the digit loop is written out here. 128-bit `/`, `%`, `<<`, `>>` lower to
+// native LLVM ops except `/` and `%`, which lower to libgcc/compiler-rt
+// (`__udivti3` / `__umodti3`); gcc links those by default.
+implement u128 {
+    static min_value() -> u128 { return 0 as u128; }
+    static max_value() -> u128 {
+        // 2^128 - 1, above u64::MAX so it must go through the 128-bit literal
+        // path; bind to a typed const to pin the target width.
+        const m: u128 = 340282366920938463463374607431768211455;
+        return m;
+    }
+
+    /// Write `this` in base 10 into `buffer`. Returns bytes written.
+    /// `buffer` must hold at least `U128_MAX_DECIMAL_DIGITS` bytes.
+    to_decimal_buf(&this, buffer: u8*) -> u64 {
+        if (this == 0) {
+            buffer[0] = 0x30;
+            return 1;
+        }
+        mut scratch: u8[39];
+        mut cursor: u64 = 39;
+        mut v: u128 = this;
+        while (v > 0) {
+            cursor = cursor - 1;
+            scratch[cursor] = ((v % 10) as u8) + 0x30;
+            v = v / 10;
+        }
+        const digits: u64 = 39 - cursor;
+        intrinsics::memcpy(
+            buffer as void*,
+            (&scratch[0] + cursor) as void*,
+            digits
+        );
+        return digits;
+    }
+
+    /// Decimal text on a fresh heap buffer (caller owns).  For a no-alloc
+    /// path, write into your own buffer with `to_decimal_buf`.
+    to_decimal_str(&this) -> string {
+        mut buf: string = malloc(40) as string;   // 39 digits + NUL
+        if ((buf as void*) == null) {
+            intrinsics::panic("u128::to_decimal_str: allocation failed", FILE, LINE);
+        }
+        const n: u64 = this.to_decimal_buf(buf as u8*);
+        buf[n] = 0;
+        return buf;
+    }
+
+    /// Lowercase hex. `buffer` must hold at least `U128_MAX_HEX_DIGITS` bytes.
+    to_hex_buf(&this, buffer: u8*) -> u64 {
+        return u128::to_hex_buf_with_table(this, buffer, "0123456789abcdef" as u8*);
+    }
+
+    /// Uppercase variant.
+    to_hex_upper_buf(&this, buffer: u8*) -> u64 {
+        return u128::to_hex_buf_with_table(this, buffer, "0123456789ABCDEF" as u8*);
+    }
+
+    static to_hex_buf_with_table(value: u128, buffer: u8*, digits_table: u8*) -> u64 {
+        if (value == 0) {
+            buffer[0] = 0x30;
+            return 1;
+        }
+        mut scratch: u8[32];
+        mut cursor: u64 = 32;
+        mut v: u128 = value;
+        while (v > 0) {
+            cursor = cursor - 1;
+            scratch[cursor] = digits_table[(v & 0xF) as u64];
+            v = v >> 4;
+        }
+        const digits: u64 = 32 - cursor;
+        intrinsics::memcpy(
+            buffer as void*,
+            (&scratch[0] + cursor) as void*,
+            digits
+        );
+        return digits;
+    }
+
+    /// Base 8. `buffer` must hold at least `U128_MAX_OCT_DIGITS` bytes.
+    to_oct_buf(&this, buffer: u8*) -> u64 {
+        if (this == 0) {
+            buffer[0] = 0x30;
+            return 1;
+        }
+        mut scratch: u8[43];
+        mut cursor: u64 = 43;
+        mut v: u128 = this;
+        while (v > 0) {
+            cursor = cursor - 1;
+            scratch[cursor] = ((v & 0x7) as u8) + 0x30;
+            v = v >> 3;
+        }
+        const digits: u64 = 43 - cursor;
+        intrinsics::memcpy(
+            buffer as void*,
+            (&scratch[0] + cursor) as void*,
+            digits
+        );
+        return digits;
+    }
+
+    /// Base 2. `buffer` must hold at least `U128_MAX_BIN_DIGITS` bytes.
+    to_bin_buf(&this, buffer: u8*) -> u64 {
+        if (this == 0) {
+            buffer[0] = 0x30;
+            return 1;
+        }
+        mut scratch: u8[128];
+        mut cursor: u64 = 128;
+        mut v: u128 = this;
+        while (v > 0) {
+            cursor = cursor - 1;
+            scratch[cursor] = ((v & 0x1) as u8) + 0x30;
+            v = v >> 1;
+        }
+        const digits: u64 = 128 - cursor;
+        intrinsics::memcpy(
+            buffer as void*,
+            (&scratch[0] + cursor) as void*,
+            digits
+        );
+        return digits;
+    }
+}
+
+implement i128 {
+    static min_value() -> i128 {
+        // -(2^127). Written as the negated magnitude; the magnitude (2^127) is
+        // above u64::MAX so it routes through the 128-bit literal path.
+        const m: i128 = -170141183460469231731687303715884105728;
+        return m;
+    }
+    static max_value() -> i128 {
+        const m: i128 = 170141183460469231731687303715884105727;
+        return m;
+    }
+
+    /// Wraps at `i128::min_value()`: the most-negative value has no positive
+    /// counterpart in two's complement. When checked arithmetic lands, callers
+    /// that care will use `checked_abs`.
+    abs(&this) -> i128 {
+        if (this < 0) { return -this; }
+        return this;
+    }
+
+    /// Write signed `this` in base 10. Returns bytes written.
+    /// `buffer` must hold at least `I128_MAX_DECIMAL_DIGITS` bytes.
+    to_decimal_buf(&this, buffer: u8*) -> u64 {
+        if (this < 0) {
+            buffer[0] = 0x2D; // '-'
+            // `-i128::MIN` overflows in i128 but wraps to the correct u128
+            // magnitude.
+            const magnitude: u128 = (0 - this) as u128;
+            return 1 + magnitude.to_decimal_buf(buffer + 1);
+        }
+        const v: u128 = this as u128;
+        return v.to_decimal_buf(buffer);
+    }
+
+    /// Decimal text on a fresh heap buffer (caller owns).
+    to_decimal_str(&this) -> string {
+        mut buf: string = malloc(41) as string;   // sign + 39 digits + NUL
+        if ((buf as void*) == null) {
+            intrinsics::panic("i128::to_decimal_str: allocation failed", FILE, LINE);
         }
         const n: u64 = this.to_decimal_buf(buf as u8*);
         buf[n] = 0;
