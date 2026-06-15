@@ -12,6 +12,8 @@ namespace CryoTests::Tests::Lang::Int128;
 import std::core::result;
 import std::test::error;
 import std::test::assert;
+import std::collections::string;
+import std::fmt::display;
 
 // 2^64 = 18446744073709551616 (one past u64::MAX = 18446744073709551615).
 
@@ -119,4 +121,74 @@ function u128_through_generic() -> Result<(), TestError> {
     const big:  u128 = 18446744073709551616;   // 2^64
     const back: u128 = generic_id<u128>(big);
     return expect(back == big, Str::new("u128 must survive a generic instantiation"));
+}
+
+// ---- Formatting -----------------------------------------------------------
+// The language has full 128-bit arithmetic; these guard the stdlib's ability
+// to render those values as text. Every expected string is wider than 64 bits,
+// so a digit loop that truncated through a u64 would produce a wrong answer.
+
+![test]
+function u128_to_decimal_str_above_u64_max() -> Result<(), TestError> {
+    const big: u128 = 18446744073709551616;    // 2^64
+    const got:  Str = Str::from_cstr(big.to_decimal_str());
+    const want: Str = Str::new("18446744073709551616");
+    return expect(got.equals(&want), Str::new("u128 2^64 must format as decimal without truncation"));
+}
+
+![test]
+function u128_max_value_formats() -> Result<(), TestError> {
+    const got:  Str = Str::from_cstr(u128::max_value().to_decimal_str());
+    const want: Str = Str::new("340282366920938463463374607431768211455");
+    return expect(got.equals(&want), Str::new("u128::max_value() must format as 2^128 - 1"));
+}
+
+![test]
+function i128_negative_to_decimal_str() -> Result<(), TestError> {
+    const big: i128 = 18446744073709551616;    // 2^64
+    const neg: i128 = 0 - big;                 // -(2^64)
+    const got:  Str = Str::from_cstr(neg.to_decimal_str());
+    const want: Str = Str::new("-18446744073709551616");
+    return expect(got.equals(&want), Str::new("negative i128 must format with a leading '-'"));
+}
+
+![test]
+function i128_min_value_formats() -> Result<(), TestError> {
+    // i128::MIN has no positive counterpart; the formatter negates into u128,
+    // where the magnitude (2^127) is representable. A naive `-this` that stayed
+    // in i128 would overflow back to MIN and misprint.
+    const got:  Str = Str::from_cstr(i128::min_value().to_decimal_str());
+    const want: Str = Str::new("-170141183460469231731687303715884105728");
+    return expect(got.equals(&want), Str::new("i128::min_value() must format as -(2^127)"));
+}
+
+![test]
+function u128_hex_buf_round_trips() -> Result<(), TestError> {
+    // Exercises the `>>` / `&` digit path on u128 (2^64 == 0x1 followed by
+    // sixteen zero nibbles).
+    const big: u128 = 18446744073709551616;    // 2^64
+    mut buf: u8[32];
+    const n: u64 = big.to_hex_buf(&buf[0]);
+    const got:  Str = Str::from_raw(&buf[0], n);
+    const want: Str = Str::new("10000000000000000");
+    return expect(got.equals(&want), Str::new("u128 to_hex_buf must render 2^64 as 0x1<<64"));
+}
+
+![test]
+function u128_display_via_format_to_string() -> Result<(), TestError> {
+    // End-to-end: the Display impl routed through the generic formatter.
+    const big: u128 = 18446744073709551617;    // 2^64 + 1
+    match (format_to_string(&big)) {
+        Result::Ok(s) => {
+            const got:  Str = s.as_str();
+            const want: Str = Str::new("18446744073709551617");
+            // No manual `s.drop()`: the compiler auto-drops `s` on return,
+            // matching the convention in `std::test::assert`. A manual drop
+            // here plus the inserted drop on the early-return path double-frees.
+            return expect(got.equals(&want), Str::new("u128 must Display via format_to_string"));
+        }
+        Result::Err(_) => {
+            return expect(false, Str::new("format_to_string<u128> returned Err"));
+        }
+    }
 }
