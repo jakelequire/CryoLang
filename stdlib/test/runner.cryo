@@ -21,6 +21,13 @@
 ///!                  running anything.
 ///!   -q, --quiet    Suppress per-test "ok" / "ignored" lines; only show
 ///!                  failures and the summary.
+///!   --nocapture    Don't capture per-test output; let each test write its
+///!                  stdout/stderr straight to the terminal (live, the
+///!                  pre-capture behaviour). By default output is captured
+///!                  and replayed only under failing tests. Also set via the
+///!                  `CRYO_TEST_NOCAPTURE` environment variable.
+///!   --show-output  Also print captured output for tests that pass, not
+///!                  just failures. No effect with `--nocapture`.
 ///!   --timeout=N    Per-test wall-clock limit in seconds (default 60).
 ///!                  A test exceeding it is killed (SIGALRM in the child)
 ///!                  and reported as a timeout failure. `--timeout=0`
@@ -37,6 +44,7 @@ import core::option;
 import core::result;
 import core::slice;
 import core::drop;
+import core::mem;
 import core::convert;
 import collections::str;
 import collections::string;
@@ -129,6 +137,16 @@ type struct RunOptions {
     /// True if `--jobs=`/`-j` was passed explicitly (suppresses the
     /// `CRYO_TEST_JOBS` env default).
     jobs_explicit: boolean;
+    /// Capture each test's stdout+stderr into a per-test buffer instead of
+    /// letting it stream to the terminal. On (the default) the buffer is
+    /// replayed only for failing tests (cargo-style), so a green parallel
+    /// run stays clean. `--nocapture` (or `CRYO_TEST_NOCAPTURE`) turns this
+    /// off: the child inherits the parent's stdio and writes live, the
+    /// pre-capture behaviour.
+    capture:       boolean;
+    /// Show captured output for *passing* tests too, not just failures.
+    /// Set by `--show-output`. No effect when `capture` is off.
+    show_output:   boolean;
     /// Re-exec child selector: `>= 0` means "run only descriptors[child_idx]
     /// and exit 0/1, no header/loop".  Set by the internal
     /// `--test-runner-child=<n>` flag the Windows runner passes when it
@@ -152,6 +170,8 @@ type struct RunOptions {
             timeout_explicit: false,
             jobs:            0,
             jobs_explicit:   false,
+            capture:         true,
+            show_output:     false,
             child_idx:       -1,
         };
     }
@@ -184,6 +204,38 @@ type enum TestOutcome {
     Timeout(u32);
     /// Couldn't `fork()` or `waitpid()`; runner-internal error.
     RunnerError(i32);            // errno
+}
+
+// TestRun: a finished test's outcome plus any captured output
+//
+// `run_one` returns this. `captured` holds the bytes the child wrote to its
+// stdout+stderr when capture is enabled (empty otherwise, e.g. `--nocapture`
+// or a pipe-setup failure that fell back to inherited stdio). The reporter
+// replays `captured` under failing tests (or all tests with `--show-output`).
+
+type struct TestRun {
+    outcome:  TestOutcome;
+    captured: String;
+
+    /// Outcome with no captured bytes (capture off / nothing to show).
+    static bare(outcome: TestOutcome) -> TestRun {
+        return TestRun { outcome: outcome, captured: String::new() };
+    }
+
+    /// Move the captured buffer out, leaving an empty one behind so the
+    /// remaining `TestRun` still drops cleanly. Swap-based to avoid a
+    /// partial move out of a `Drop` aggregate (E0453).
+    take_captured(mut &this) -> String {
+        mut out: String = String::new();
+        mem::swap<String>(&this.captured, &out);
+        return out;
+    }
+}
+
+implement trait Drop for struct TestRun {
+    drop(mut &this) -> void {
+        this.captured.drop();
+    }
 }
 
 // Counters: running tally for the final summary
@@ -224,6 +276,11 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
         } else if (arg.equals(&Str::new("-q"))
                 || arg.equals(&Str::new("--quiet"))) {
             opts.quiet = true;
+        } else if (arg.equals(&Str::new("--nocapture"))
+                || arg.equals(&Str::new("--no-capture"))) {
+            opts.capture = false;
+        } else if (arg.equals(&Str::new("--show-output"))) {
+            opts.show_output = true;
         } else if (arg_starts_with(arg, "--format=")) {
             const v: Str = arg.sub_bytes(9, arg.length());
             if (apply_format(&opts, v)) {
@@ -391,6 +448,19 @@ function apply_jobs(opts: mut &RunOptions, value: Str) -> boolean {
 ///   CRYO_TEST_JOBS    = worker threads (0 = auto / CPU count)
 ///   NO_COLOR          = (any value) -> force ColorMode::Never
 function apply_env_defaults(opts: mut &RunOptions) -> void {
+    // CRYO_TEST_NOCAPTURE: presence (any value) forces capture off, the same
+    // as passing `--nocapture`. A CLI `--nocapture` already set capture=false,
+    // so this only adds the env path; there's no env to force capture back on.
+    if (opts.capture) {
+        const nc_opt: Option<String> = env::var(Str::new("CRYO_TEST_NOCAPTURE"));
+        match (nc_opt) {
+            Option::Some(mut s) => {
+                opts.capture = false;
+                s.drop();
+            }
+            Option::None => { }
+        }
+    }
     if (!opts.jobs_explicit) {
         const j_opt: Option<String> = env::var(Str::new("CRYO_TEST_JOBS"));
         match (j_opt) {
@@ -616,21 +686,43 @@ function num_cpus() -> u32 {
 /// call concurrently from worker threads: the child only `execv`s (an
 /// async-signal-safe op) and never touches the forking thread's heap, so
 /// there is no malloc-lock-at-fork deadlock.
+/// Drain a readable fd fully into `out` (read until EOF). Used to siphon a
+/// captured child's stdout+stderr off the pipe's read end. Retries on EINTR;
+/// stops on EOF (0) or any hard error. The parent drains BEFORE `waitpid`, so
+/// a child that fills the ~64KB pipe buffer can't deadlock against a parent
+/// blocked in wait.
 ![target(unix)]
-function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome {
+function drain_fd_into(fd: i32, out: mut &String) -> void {
+    mut buf: u8[4096];
+    loop {
+        const n: i64 = libc::read(fd, &buf[0], 4096u64);
+        if (n > 0i64) {
+            out.push(Str::from_raw(&buf[0], n as u64));
+        } else if (n == 0i64) {
+            return;                                  // EOF: all write ends closed
+        } else {
+            if (libc::errno() == 4) { continue; }    // EINTR
+            return;                                  // hard error; stop draining
+        }
+    }
+}
+
+![target(unix)]
+function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
+                 capture: boolean) -> TestRun {
     // Drain libc-buffered stdio in the parent before fork so the child
     // doesn't inherit a half-full FILE buffer and re-emit it on flush.
     intrinsics::fflush(null);
 
     // Resolve this executable's path so the child can re-exec it. All of
     // the allocation below happens in the PARENT, before fork; the child
-    // path stays async-signal-safe (execv + _exit only).
+    // path stays async-signal-safe (dup2/close/execv + _exit only).
     mut exe_buf: u8[4096];
     mut exe_path: String = String::from_str_c(Str::new("/proc/self/exe"));
     const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095u64);
     exe_path.drop();
     if (exe_n <= 0i64) {
-        return TestOutcome::RunnerError(libc::errno());
+        return TestRun::bare(TestOutcome::RunnerError(libc::errno()));
     }
     exe_buf[exe_n as u64] = 0u8; // readlink does not NUL-terminate.
 
@@ -654,22 +746,55 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
     match (argv.push(child_arg.as_ptr()))   { Result::Ok(_) => { } Result::Err(_) => { } }
     match (argv.push(null))                 { Result::Ok(_) => { } Result::Err(_) => { } }
 
+    // Capture pipe: the child's stdout+stderr go to the write end, the parent
+    // drains the read end. Created in the parent before fork; a pipe() failure
+    // falls back to inherited stdio (rd/wr stay -1, captured stays empty).
+    mut rd: i32 = -1;
+    mut wr: i32 = -1;
+    if (capture) {
+        mut fds: i32[2];
+        if (libc::pipe(&fds[0]) == 0) {
+            rd = fds[0];
+            wr = fds[1];
+        }
+    }
+
     const pid: i32 = libc::fork();
     if (pid < 0) {
         const e: i32 = libc::errno();
+        if (rd >= 0) { libc::close(rd); }
+        if (wr >= 0) { libc::close(wr); }
         argv.drop(); child_arg.drop(); timeout_arg.drop();
-        return TestOutcome::RunnerError(e);
+        return TestRun::bare(TestOutcome::RunnerError(e));
     }
 
     if (pid == 0) {
-        // Child: async-signal-safe only. Re-exec the test binary to run
-        // exactly this test; `_exit(127)` if exec fails (parent reads it
+        // Child: async-signal-safe only. Point stdout+stderr at the pipe's
+        // write end (dup2/close are signal-safe), then re-exec the test binary
+        // to run exactly this test; `_exit(127)` if exec fails (parent reads it
         // as the standard "exec not found" code).
+        if (wr >= 0) {
+            libc::dup2(wr, 1);
+            libc::dup2(wr, 2);
+            libc::close(rd);
+            libc::close(wr);
+        }
         libc::execv(&exe_buf[0], argv.as_ptr());
         libc::_exit(127);
     }
 
-    // Parent: wait for the child, retrying on EINTR.
+    // Parent: close the write end so the read end sees EOF when the child
+    // exits, then drain fully BEFORE reaping (the active read keeps the pipe
+    // from backing up, so waitpid never deadlocks against a full buffer).
+    mut captured: String = String::new();
+    if (wr >= 0) { libc::close(wr); wr = -1; }
+    if (rd >= 0) {
+        drain_fd_into(rd, &captured);
+        libc::close(rd);
+        rd = -1;
+    }
+
+    // Wait for the child, retrying on EINTR.
     mut status: i32 = 0;
     loop {
         const rc: i32 = libc::waitpid(pid, &status, 0);
@@ -677,7 +802,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
         const err: i32 = libc::errno();
         if (err != 4) { // EINTR
             argv.drop(); child_arg.drop(); timeout_arg.drop();
-            return TestOutcome::RunnerError(err);
+            return TestRun { outcome: TestOutcome::RunnerError(err), captured: captured };
         }
     }
 
@@ -686,7 +811,8 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
     timeout_arg.drop();
 
     const exit_status: ExitStatus = decode_wstatus(status);
-    return classify_outcome(exit_status, d.should_panic, timeout_secs);
+    const outcome: TestOutcome = classify_outcome(exit_status, d.should_panic, timeout_secs);
+    return TestRun { outcome: outcome, captured: captured };
 }
 
 /// Arm the per-test watchdog in a re-exec'd child. SIGALRM's default
@@ -752,18 +878,42 @@ function append_u64(out: mut &String, x: u64) -> void {
     }
 }
 
+/// Windows: read a finished capture temp file's full contents into `out`.
+/// The write handle must already be closed so the data is flushed and the
+/// open doesn't hit a sharing violation.
+![target(windows)]
+function read_capture_file(path: &String, out: mut &String) -> void {
+    const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_READ,
+        syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE, null,
+        syscall::OPEN_EXISTING, 0u32, null);
+    if ((h as i64) == -1) { return; }   // local -1, not the cross-module const
+    mut buf: u8[4096];
+    loop {
+        mut nread: u32 = 0u32;
+        const ok: i32 = syscall::ReadFile(h, &buf[0], 4096u32, &nread, null);
+        if (ok == 0) { break; }          // read error
+        if (nread == 0u32) { break; }    // EOF
+        out.push(Str::from_raw(&buf[0], nread as u64));
+    }
+    syscall::CloseHandle(h);
+}
+
 /// Windows: run one test in a fresh process.  No `fork`, so re-exec the test
 /// binary (GetModuleFileNameA) with `--test-runner-child=<idx>`, wait with the
-/// per-test timeout, and classify the exit code.  Stdio is inherited so the
-/// child's failure output reaches the console; the timeout is enforced here
-/// in the parent (WaitForSingleObject) rather than by an in-child watchdog.
+/// per-test timeout, and classify the exit code.  With `capture`, the child's
+/// stdout+stderr are redirected to a per-test temp file (a file can't deadlock
+/// on a full pipe buffer, so the parent's WaitForSingleObject timeout stays
+/// intact); the file is read back after the child exits.  Without `capture`
+/// stdio is inherited so output reaches the console live.  The timeout is
+/// enforced here in the parent rather than by an in-child watchdog.
 ![target(windows)]
-function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome {
+function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
+                 capture: boolean) -> TestRun {
     intrinsics::fflush(null);
 
     mut exe_buf: u8[1024];
     const n: u32 = syscall::GetModuleFileNameA(null, &exe_buf[0], 1024u32);
-    if (n == 0u32 || n >= 1024u32) { return TestOutcome::RunnerError(0); }
+    if (n == 0u32 || n >= 1024u32) { return TestRun::bare(TestOutcome::RunnerError(0)); }
     exe_buf[n as u64] = 0u8;
 
     // Command line:  "<exe>" --test-runner-child=<idx>\0   (CreateProcessA may
@@ -777,6 +927,38 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
     append_u64(&cmd, idx);
     cmd.push(0u8);
 
+    // Capture: redirect the child's stdout+stderr to a per-test temp file.
+    // A setup failure falls back to inherited stdio (have_cap stays false).
+    mut cap_handle: u8*     = null;
+    mut cap_path:   String  = String::new();
+    mut have_cap:   boolean = false;
+    if (capture) {
+        mut dir_buf: u8[512];
+        const dl: u32 = syscall::GetTempPathA(512u32, &dir_buf[0]);
+        if (dl > 0u32 && dl < 512u32) {
+            mut name_buf: u8[512];
+            mut prefix: String = String::from_str_c(Str::new("cyt"));
+            // GetTempFileNameA creates a unique empty file and writes its full
+            // NUL-terminated path into name_buf.
+            const uniq: u32 = syscall::GetTempFileNameA(&dir_buf[0], prefix.as_ptr(),
+                                                        0u32, &name_buf[0]);
+            prefix.drop();
+            if (uniq != 0u32) {
+                mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
+                    nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
+                };
+                const h: u8* = syscall::CreateFileA(&name_buf[0], syscall::GENERIC_WRITE,
+                    syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE, &sa as u8*,
+                    syscall::CREATE_ALWAYS, 0u32, null);
+                if ((h as i64) != -1) {
+                    cap_handle = h;
+                    cap_path   = String::from_str_c(cstr_to_str(&name_buf[0]));
+                    have_cap   = true;
+                }
+            }
+        }
+    }
+
     mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
         cb: 104u32, lpReserved: null, lpDesktop: null, lpTitle: null,
         dwX: 0u32, dwY: 0u32, dwXSize: 0u32, dwYSize: 0u32,
@@ -784,13 +966,30 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
         dwFlags: 0u32, wShowWindow: 0u16, cbReserved2: 0u16,
         lpReserved2: null, hStdInput: null, hStdOutput: null, hStdError: null
     };
+    mut inherit: i32 = 0;
+    if (have_cap) {
+        // USESTDHANDLES needs all three handles valid and inheritable; hand
+        // the child our own stdin and the temp file for stdout+stderr.
+        si.dwFlags    = syscall::STARTF_USESTDHANDLES;
+        si.hStdInput  = syscall::GetStdHandle(syscall::STD_INPUT_HANDLE);
+        si.hStdOutput = cap_handle;
+        si.hStdError  = cap_handle;
+        inherit = 1;
+    }
     mut pi: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
         hProcess: null, hThread: null, dwProcessId: 0u32, dwThreadId: 0u32
     };
     const ok: i32 = syscall::CreateProcessA(null, cmd.as_ptr(), null, null,
-                                            1, 0u32, null, null, &si, &pi);
+                                            inherit, 0u32, null, null, &si, &pi);
     cmd.drop();
-    if (ok == 0) { return TestOutcome::RunnerError(0); }
+    if (ok == 0) {
+        if (have_cap) {
+            syscall::CloseHandle(cap_handle);
+            syscall::DeleteFileA(cap_path.as_ptr());
+        }
+        cap_path.drop();
+        return TestRun::bare(TestOutcome::RunnerError(0));
+    }
     syscall::CloseHandle(pi.hThread);
 
     const ms: u32 = if (timeout_secs > 0u32) { timeout_secs * 1000u32 } else { 0xFFFFFFFFu32 };
@@ -799,16 +998,34 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
         syscall::TerminateProcess(pi.hProcess, 1u32);
         syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFFu32);
         syscall::CloseHandle(pi.hProcess);
-        return TestOutcome::Timeout(timeout_secs);
+        mut cap_to: String = String::new();
+        if (have_cap) {
+            syscall::CloseHandle(cap_handle);
+            read_capture_file(&cap_path, &cap_to);
+            syscall::DeleteFileA(cap_path.as_ptr());
+        }
+        cap_path.drop();
+        return TestRun { outcome: TestOutcome::Timeout(timeout_secs), captured: cap_to };
     }
     mut code: u32 = 0u32;
     syscall::GetExitCodeProcess(pi.hProcess, &code);
     syscall::CloseHandle(pi.hProcess);
 
+    mut captured: String = String::new();
+    if (have_cap) {
+        // Close the write handle first so the file is flushed and the reader
+        // doesn't trip a sharing violation, then read it back and delete it.
+        syscall::CloseHandle(cap_handle);
+        read_capture_file(&cap_path, &captured);
+        syscall::DeleteFileA(cap_path.as_ptr());
+    }
+    cap_path.drop();
+
     // No signals on Windows: a plain normal-exit ExitStatus drives the same
     // classifier the POSIX path uses.
     const st: ExitStatus = ExitStatus { code: code as i32, signal: 0, signaled: false };
-    return classify_outcome(st, d.should_panic, timeout_secs);
+    const outcome: TestOutcome = classify_outcome(st, d.should_panic, timeout_secs);
+    return TestRun { outcome: outcome, captured: captured };
 }
 
 /// Translate a child's exit status into a `TestOutcome`, applying the
@@ -1130,45 +1347,11 @@ function compact_skipped(state: mut &ReporterState, name: Str) -> void {
     state.cur_skip = state.cur_skip + 1;
 }
 
-// ---- Format-dispatched reporter façade ----
-
-function reporter_begin_test(opts: &RunOptions, state: mut &ReporterState,
-                              name: Str) -> void {
-    match (opts.format) {
-        TestFormat::Plain   => { plain_begin_test(name); }
-        TestFormat::Pretty  => { pretty_begin_test(state, name); }
-        TestFormat::Compact => { compact_begin_test(state, name); }
-    }
-    intrinsics::fflush(null);
-}
-
-function reporter_end_test(opts: &RunOptions, state: mut &ReporterState,
-                            outcome: TestOutcome, was_should_panic: boolean) -> void {
-    match (opts.format) {
-        TestFormat::Plain   => { plain_end_test(outcome, was_should_panic); }
-        TestFormat::Pretty  => { pretty_end_test(opts, outcome, was_should_panic); }
-        TestFormat::Compact => { compact_end_test(state, outcome); }
-    }
-}
-
-function reporter_skipped(opts: &RunOptions, state: mut &ReporterState,
-                           name: Str) -> void {
-    match (opts.format) {
-        TestFormat::Plain   => { plain_skipped(name); }
-        TestFormat::Pretty  => { pretty_skipped(state, opts, name); }
-        TestFormat::Compact => { compact_skipped(state, name); }
-    }
-}
-
-/// Called once after the loop completes: Compact mode needs to flush
-/// the last group's buffered line; Plain/Pretty are no-ops.
-function reporter_finalize(opts: &RunOptions, state: mut &ReporterState) -> void {
-    match (opts.format) {
-        TestFormat::Plain   => { }
-        TestFormat::Pretty  => { }
-        TestFormat::Compact => { compact_flush_group(state); }
-    }
-}
+// The format-dispatched reporter façade now lives as methods on
+// `TestRunner` (`report_begin` / `report_end` / `report_skipped` /
+// `report_finalize`); see the entry-point section below. The
+// `plain_*` / `pretty_*` / `compact_*` helpers above stay free functions
+// the methods delegate to.
 
 // Parallel execution
 //
@@ -1181,9 +1364,25 @@ function reporter_finalize(opts: &RunOptions, state: mut &ReporterState) -> void
 // order tests actually finished in.
 
 /// One finished test, addressed back to its slot in the descriptor table.
+/// `captured` carries the child's output (moved across the channel; `String`
+/// is structurally `Send`); empty when capture is off.
 type struct WorkerResult {
-    idx:     u64;
-    outcome: TestOutcome;
+    idx:      u64;
+    outcome:  TestOutcome;
+    captured: String;
+
+    /// Move the captured buffer out (swap-based; see `TestRun::take_captured`).
+    take_captured(mut &this) -> String {
+        mut out: String = String::new();
+        mem::swap<String>(&this.captured, &out);
+        return out;
+    }
+}
+
+implement trait Drop for struct WorkerResult {
+    drop(mut &this) -> void {
+        this.captured.drop();
+    }
 }
 
 /// Everything a pool worker needs, moved into the thread by value. The
@@ -1197,6 +1396,7 @@ type struct WorkerCtx {
     n_runnable:   u64;
     descriptors:  TestDescriptor*;
     timeout_secs: u32;
+    capture:      boolean;
     sender:       mpsc::Sender<WorkerResult>;
 }
 
@@ -1211,8 +1411,12 @@ function test_worker(ctx: WorkerCtx) -> void {
         if (k >= ctx.n_runnable) { break; }
         const idx: u64 = ctx.runnable[k];
         const d: TestDescriptor = ctx.descriptors[idx];
-        const outcome: TestOutcome = run_one(d, idx, ctx.timeout_secs);
-        match (ctx.sender.send(WorkerResult { idx: idx, outcome: outcome })) {
+        mut tr: TestRun = run_one(d, idx, ctx.timeout_secs, ctx.capture);
+        const wr: WorkerResult = WorkerResult {
+            idx: idx, outcome: tr.outcome, captured: tr.take_captured()
+        };
+        tr.drop();
+        match (ctx.sender.send(wr)) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }
@@ -1220,15 +1424,16 @@ function test_worker(ctx: WorkerCtx) -> void {
 }
 
 /// Run the `runnable` tests across `jobs` worker threads and return a
-/// `count`-sized buffer of outcomes indexed by descriptor position.
+/// `count`-sized buffer of `TestRun`s indexed by descriptor position.
 /// Non-runnable slots are left as a placeholder the caller never reads.
 function execute_parallel(descriptors: TestDescriptor*, count: u64,
                           runnable: u64*, n_runnable: u64,
-                          timeout_secs: u32, jobs: u32) -> Array<TestOutcome> {
-    mut results: Array<TestOutcome> = Array::with_capacity(count);
+                          timeout_secs: u32, jobs: u32,
+                          capture: boolean) -> Array<TestRun> {
+    mut results: Array<TestRun> = Array::with_capacity(count);
     mut p: u64 = 0;
     while (p < count) {
-        results.push(TestOutcome::Pass); // placeholder; overwritten if runnable
+        results.push(TestRun::bare(TestOutcome::Pass)); // placeholder; maybe overwritten
         p = p + 1;
     }
 
@@ -1249,6 +1454,7 @@ function execute_parallel(descriptors: TestDescriptor*, count: u64,
                 n_runnable:   n_runnable,
                 descriptors:  descriptors,
                 timeout_secs: timeout_secs,
+                capture:      capture,
                 sender:       rx.sender(),
             };
             scope.spawn<WorkerCtx>(ctx, test_worker);
@@ -1261,8 +1467,11 @@ function execute_parallel(descriptors: TestDescriptor*, count: u64,
         mut got: u64 = 0;
         while (got < n_runnable) {
             match (rx.recv()) {
-                Result::Ok(wr) => {
-                    results.set(wr.idx, wr.outcome);
+                Result::Ok(mut wr) => {
+                    results.set(wr.idx, TestRun {
+                        outcome: wr.outcome, captured: wr.take_captured()
+                    });
+                    wr.drop();
                     got = got + 1;
                 }
                 Result::Err(_) => { break; }
@@ -1275,66 +1484,333 @@ function execute_parallel(descriptors: TestDescriptor*, count: u64,
     return results;
 }
 
-/// Parallel driver: build the runnable index list, run the pool, then
-/// replay the reporter in original order, tallying `counts` exactly as the
-/// sequential loop would. Keeps the displayed output deterministic.
-function run_all_parallel(descriptors: TestDescriptor*, count: u64,
-                          opts: &RunOptions, jobs: u32, to_run: u64,
-                          counts: mut &Counters, rstate: mut &ReporterState) -> void {
-    // Indices that will actually execute (match filter, not skipped-ignored).
-    mut runnable: Array<u64> = Array::with_capacity(to_run);
-    mut i: u64 = 0;
-    while (i < count) {
-        const d: TestDescriptor = descriptors[i];
-        if (name_matches(d.name, opts) && (!d.ignored || opts.include_ignored)) {
-            runnable.push(i);
-        }
-        i = i + 1;
+// TestRunner: owns the run's configuration, tally, and reporter state and
+// drives the whole suite. `run_all` (below) constructs one and delegates to
+// `run`; the reporter façade and the sequential / parallel drivers are
+// methods, so the threaded state travels with the object instead of being
+// passed by reference through a pile of free functions.
+//
+// Target-gated primitives (`run_one`, `num_cpus`, `arm_watchdog`) and the
+// thread-pool core (`test_worker`, `execute_parallel`) stay free functions:
+// the first because `![target(...)]` variants can't be methods, the second
+// because the worker body is handed to `thread::spawn` as a plain function
+// pointer.
+
+type struct TestRunner {
+    opts:        RunOptions;
+    counts:      Counters;
+    rstate:      ReporterState;
+    /// Static descriptor table baked into the executable by `TestMainCodegen`.
+    /// Non-owning: valid for the lifetime of the call, never freed here.
+    descriptors: TestDescriptor*;
+    count:       u64;
+
+    /// Take ownership of the parsed options and wrap the descriptor table.
+    static new(opts: RunOptions, descriptors: TestDescriptor*, count: u64) -> TestRunner {
+        return TestRunner {
+            opts:        opts,
+            counts:      Counters::new(),
+            rstate:      ReporterState::new(),
+            descriptors: descriptors,
+            count:       count,
+        };
     }
 
-    mut results: Array<TestOutcome> = execute_parallel(
-        descriptors, count, runnable.as_ptr(), runnable.length(),
-        opts.timeout_secs, jobs);
+    // ---- Reporter façade (format-dispatched) ----
 
-    // Replay: drive the existing reporter sequentially, in index order.
-    i = 0;
-    while (i < count) {
-        const d: TestDescriptor = descriptors[i];
-
-        if (!name_matches(d.name, opts)) {
-            counts.filtered = counts.filtered + 1;
-            i = i + 1;
-            continue;
+    /// In-flight prefix for a test about to run. Flushed so a hang at
+    /// least shows which test was in flight.
+    report_begin(mut &this, name: Str) -> void {
+        const f: TestFormat = this.opts.format;
+        match (f) {
+            TestFormat::Plain   => { plain_begin_test(name); }
+            TestFormat::Pretty  => { pretty_begin_test(&this.rstate, name); }
+            TestFormat::Compact => { compact_begin_test(&this.rstate, name); }
         }
+        intrinsics::fflush(null);
+    }
 
-        if (d.ignored && !opts.include_ignored) {
-            if (!opts.quiet) {
-                reporter_skipped(opts, rstate, d.name);
+    /// Outcome word / chip / dot for a finished test.
+    report_end(mut &this, outcome: TestOutcome, was_should_panic: boolean) -> void {
+        const f: TestFormat = this.opts.format;
+        match (f) {
+            TestFormat::Plain   => { plain_end_test(outcome, was_should_panic); }
+            TestFormat::Pretty  => { pretty_end_test(&this.opts, outcome, was_should_panic); }
+            TestFormat::Compact => { compact_end_test(&this.rstate, outcome); }
+        }
+    }
+
+    /// Report an `![ignore]`-skipped test without running it. The Pretty
+    /// arm is split into begin + end so each call borrows a single field.
+    report_skipped(mut &this, name: Str) -> void {
+        const f: TestFormat = this.opts.format;
+        match (f) {
+            TestFormat::Plain   => { plain_skipped(name); }
+            TestFormat::Pretty  => {
+                pretty_begin_test(&this.rstate, name);
+                pretty_end_test(&this.opts, TestOutcome::Skipped, false);
             }
-            counts.ignored = counts.ignored + 1;
-            i = i + 1;
-            continue;
+            TestFormat::Compact => { compact_skipped(&this.rstate, name); }
         }
-
-        reporter_begin_test(opts, rstate, d.name);
-        mut outcome: TestOutcome = TestOutcome::RunnerError(0);
-        match (results.get(i)) {
-            Option::Some(o) => { outcome = o; }
-            Option::None    => { }
-        }
-        const failed: boolean = is_failure(outcome);
-        reporter_end_test(opts, rstate, outcome, d.should_panic);
-
-        if (failed) {
-            counts.failed = counts.failed + 1;
-        } else {
-            counts.passed = counts.passed + 1;
-        }
-        i = i + 1;
     }
 
-    results.drop();
-    runnable.drop();
+    /// Compact mode flushes the last in-flight group; Plain/Pretty no-op.
+    report_finalize(mut &this) -> void {
+        const f: TestFormat = this.opts.format;
+        match (f) {
+            TestFormat::Plain   => { }
+            TestFormat::Pretty  => { }
+            TestFormat::Compact => { compact_flush_group(&this.rstate); }
+        }
+    }
+
+    /// Should this test's captured output be replayed? Only when capture is
+    /// on and there's something to show: every failing test, plus passing
+    /// tests too under `--show-output`.
+    should_show(&this, failed: boolean) -> boolean {
+        if (!this.opts.capture) { return false; }
+        return failed || this.opts.show_output;
+    }
+
+    /// Replay one test's captured stdout+stderr under a labelled rule.
+    /// Caller has already decided this should print (see `should_show`) and
+    /// that `captured` is non-empty.
+    report_output(&this, name: Str, captured: &String) -> void {
+        const v: Str = captured.as_str();
+        intrinsics::printf("---- %.*s : output ----\n",
+            name.length() as i32, name.as_ptr());
+        intrinsics::printf("%.*s", v.length() as i32, v.as_ptr());
+        // Guarantee the trailing rule starts on its own line even when the
+        // test's last write had no newline.
+        if (v.length() == 0u64 || v.as_ptr()[v.length() - 1u64] != 0x0Au8) {
+            intrinsics::printf("\n");
+        }
+        intrinsics::printf("----\n");
+    }
+
+    // ---- Drivers ----
+
+    /// `--list`: print each matching test name and return without running.
+    list(&this) -> void {
+        mut i: u64 = 0;
+        while (i < this.count) {
+            const d: TestDescriptor = this.descriptors[i];
+            if (name_matches(d.name, &this.opts)) {
+                if (d.ignored) {
+                    intrinsics::printf("%.*s: test, ignored\n",
+                        d.name.length() as i32, d.name.as_ptr());
+                } else if (d.should_panic) {
+                    intrinsics::printf("%.*s: test, should_panic\n",
+                        d.name.length() as i32, d.name.as_ptr());
+                } else {
+                    intrinsics::printf("%.*s: test\n",
+                        d.name.length() as i32, d.name.as_ptr());
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Sequential driver: the classic one-test-at-a-time path (`--jobs=1`,
+    /// or a single matching test). Byte-for-byte the pre-parallel output.
+    run_sequential(mut &this) -> void {
+        mut i: u64 = 0;
+        while (i < this.count) {
+            const d: TestDescriptor = this.descriptors[i];
+
+            if (!name_matches(d.name, &this.opts)) {
+                this.counts.filtered = this.counts.filtered + 1;
+                i = i + 1;
+                continue;
+            }
+
+            if (d.ignored && !this.opts.include_ignored) {
+                if (!this.opts.quiet) {
+                    this.report_skipped(d.name);
+                }
+                this.counts.ignored = this.counts.ignored + 1;
+                i = i + 1;
+                continue;
+            }
+
+            // Always emit a prefix for runs we actually execute so the
+            // user can see which test is in flight (helps debug a hang).
+            this.report_begin(d.name);
+            mut tr: TestRun = run_one(d, i, this.opts.timeout_secs, this.opts.capture);
+            const outcome: TestOutcome = tr.outcome;
+            const failed: boolean = is_failure(outcome);
+            this.report_end(outcome, d.should_panic);
+            if (this.should_show(failed) && tr.captured.length() > 0u64) {
+                this.report_output(d.name, &tr.captured);
+            }
+            tr.drop();
+
+            if (failed) {
+                this.counts.failed = this.counts.failed + 1;
+            } else {
+                this.counts.passed = this.counts.passed + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Parallel driver: run matching tests across `jobs` workers, then
+    /// replay the reporter in original index order so the on-screen output
+    /// stays byte-for-byte identical to the sequential path.
+    run_parallel(mut &this, jobs: u32, to_run: u64) -> void {
+        // Indices that will actually execute (match filter, not skipped-ignored).
+        mut runnable: Array<u64> = Array::with_capacity(to_run);
+        mut i: u64 = 0;
+        while (i < this.count) {
+            const d: TestDescriptor = this.descriptors[i];
+            if (name_matches(d.name, &this.opts) && (!d.ignored || this.opts.include_ignored)) {
+                runnable.push(i);
+            }
+            i = i + 1;
+        }
+
+        mut results: Array<TestRun> = execute_parallel(
+            this.descriptors, this.count, runnable.as_ptr(), runnable.length(),
+            this.opts.timeout_secs, jobs, this.opts.capture);
+
+        // Replay: drive the reporter sequentially, in index order.
+        i = 0;
+        while (i < this.count) {
+            const d: TestDescriptor = this.descriptors[i];
+
+            if (!name_matches(d.name, &this.opts)) {
+                this.counts.filtered = this.counts.filtered + 1;
+                i = i + 1;
+                continue;
+            }
+
+            if (d.ignored && !this.opts.include_ignored) {
+                if (!this.opts.quiet) {
+                    this.report_skipped(d.name);
+                }
+                this.counts.ignored = this.counts.ignored + 1;
+                i = i + 1;
+                continue;
+            }
+
+            this.report_begin(d.name);
+            mut outcome: TestOutcome = TestOutcome::RunnerError(0);
+            match (results.get_ref(i)) {
+                Option::Some(trp) => { outcome = (*trp).outcome; }
+                Option::None      => { }
+            }
+            const failed: boolean = is_failure(outcome);
+            this.report_end(outcome, d.should_panic);
+            if (this.should_show(failed)) {
+                match (results.get_ref(i)) {
+                    Option::Some(trp) => {
+                        if ((*trp).captured.length() > 0u64) {
+                            this.report_output(d.name, &(*trp).captured);
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+
+            if (failed) {
+                this.counts.failed = this.counts.failed + 1;
+            } else {
+                this.counts.passed = this.counts.passed + 1;
+            }
+            i = i + 1;
+        }
+
+        results.drop();
+        runnable.drop();
+    }
+
+    /// Print the framed run header.
+    print_header(&this, jobs: u32, to_run: u64, parallel: boolean) -> void {
+        intrinsics::printf("\n%s\n", RULE_HEAVY);
+        if (to_run == 1) {
+            intrinsics::printf("  CRYO TESTS  /  unit  --  running 1 test\n");
+        } else if (parallel) {
+            intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests on %u threads\n",
+                to_run, jobs);
+        } else {
+            intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests\n", to_run);
+        }
+        intrinsics::printf("%s\n\n", RULE_HEAVY);
+    }
+
+    /// Print the framed trailing summary block.
+    print_summary(&this) -> void {
+        const verdict: string = if (this.counts.failed == 0) { "PASS" } else { "FAIL" };
+        intrinsics::printf("\n%s\n", RULE_HEAVY);
+        intrinsics::printf("  unit test summary\n");
+        intrinsics::printf("%s\n", RULE_THIN);
+        intrinsics::printf("    %-9s%6llu\n", "passed",   this.counts.passed);
+        intrinsics::printf("    %-9s%6llu\n", "failed",   this.counts.failed);
+        intrinsics::printf("    %-9s%6llu\n", "ignored",  this.counts.ignored);
+        intrinsics::printf("    %-9s%6llu\n", "filtered", this.counts.filtered);
+        intrinsics::printf("%s\n", RULE_THIN);
+        if (this.opts.color_active && this.counts.failed == 0) {
+            intrinsics::printf("    result   %s%s%s\n", ANSI_GREEN, verdict, ANSI_RESET);
+        } else if (this.opts.color_active && this.counts.failed > 0) {
+            intrinsics::printf("    result   %s%s%s\n", ANSI_RED, verdict, ANSI_RESET);
+        } else {
+            intrinsics::printf("    result   %s\n", verdict);
+        }
+        intrinsics::printf("%s\n", RULE_HEAVY);
+    }
+
+    /// Drive the whole suite: resolve the worker count, honour `--list`,
+    /// print the header, run (sequential or parallel), finalize the
+    /// reporter, and print the summary. Returns the process exit code.
+    run(mut &this) -> i32 {
+        // Resolve the worker count: explicit `--jobs`/`CRYO_TEST_JOBS`, else
+        // the online CPU count. Clamp to at least 1.
+        mut jobs: u32 = this.opts.jobs;
+        if (jobs == 0u32) { jobs = num_cpus(); }
+        if (jobs == 0u32) { jobs = 1u32; }
+
+        // Pre-pass: count how many descriptors match the filter so the
+        // `running N tests` header is honest.
+        mut to_run: u64 = 0;
+        mut i: u64 = 0;
+        while (i < this.count) {
+            const d: TestDescriptor = this.descriptors[i];
+            if (name_matches(d.name, &this.opts)) {
+                to_run = to_run + 1;
+            }
+            i = i + 1;
+        }
+
+        if (this.opts.list_only) {
+            // `--list`: print names, exit 0. No runs, no header.
+            this.list();
+            return 0;
+        }
+
+        // A worker pool only pays off with more than one test to spread.
+        const parallel: boolean = jobs > 1u32 && to_run > 1u64;
+
+        this.print_header(jobs, to_run, parallel);
+
+        if (parallel) {
+            this.run_parallel(jobs, to_run);
+        } else {
+            this.run_sequential();
+        }
+        // Compact mode: flush the last in-flight group line. Plain/Pretty
+        // are no-ops here.
+        this.report_finalize();
+
+        this.print_summary();
+        return if (this.counts.failed == 0) { 0 } else { 1 };
+    }
+}
+
+implement trait Drop for struct TestRunner {
+    drop(mut &this) -> void {
+        this.rstate.drop();
+        this.opts.drop();
+    }
 }
 
 // Entry point: called by the compiler-synthesized test main
@@ -1345,7 +1821,9 @@ function run_all_parallel(descriptors: TestDescriptor*, count: u64,
 ///
 /// `descriptors` is a static array baked into the executable by the
 /// compiler's `TestMainCodegen` pass. `count` is the number of entries.
-/// Both must be valid for the duration of the call.
+/// Both must be valid for the duration of the call. This free function
+/// keeps the exact signature the compiler synthesizes a call to; it
+/// constructs a `TestRunner` and delegates.
 function run_all(argc: i32, argv: u8**,
                  descriptors: TestDescriptor*, count: u64) -> i32 {
     mut opts: RunOptions = parse_options(argc, argv);
@@ -1360,127 +1838,6 @@ function run_all(argc: i32, argv: u8**,
                                 opts.timeout_secs);
     }
 
-    // Resolve the worker count: explicit `--jobs`/`CRYO_TEST_JOBS`, else the
-    // online CPU count. Clamp to at least 1.
-    mut jobs: u32 = opts.jobs;
-    if (jobs == 0u32) { jobs = num_cpus(); }
-    if (jobs == 0u32) { jobs = 1u32; }
-
-    // Pre-pass: count how many descriptors actually match the filter so
-    // the `running N tests` header is honest.
-    mut to_run: u64 = 0;
-    mut i: u64 = 0;
-    while (i < count) {
-        const d: TestDescriptor = descriptors[i];
-        if (name_matches(d.name, &opts)) {
-            to_run = to_run + 1;
-        }
-        i = i + 1;
-    }
-
-    if (opts.list_only) {
-        // `--list`: print names, exit 0. No runs, no header.
-        i = 0;
-        while (i < count) {
-            const d: TestDescriptor = descriptors[i];
-            if (name_matches(d.name, &opts)) {
-                if (d.ignored) {
-                    intrinsics::printf("%.*s: test, ignored\n",
-                        d.name.length() as i32, d.name.as_ptr());
-                } else if (d.should_panic) {
-                    intrinsics::printf("%.*s: test, should_panic\n",
-                        d.name.length() as i32, d.name.as_ptr());
-                } else {
-                    intrinsics::printf("%.*s: test\n",
-                        d.name.length() as i32, d.name.as_ptr());
-                }
-            }
-            i = i + 1;
-        }
-        return 0;
-    }
-
-    // A worker pool only pays off with more than one test to spread.
-    const parallel: boolean = jobs > 1u32 && to_run > 1u64;
-
-    // Header.
-    intrinsics::printf("\n%s\n", RULE_HEAVY);
-    if (to_run == 1) {
-        intrinsics::printf("  CRYO TESTS  /  unit  --  running 1 test\n");
-    } else if (parallel) {
-        intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests on %u threads\n",
-            to_run, jobs);
-    } else {
-        intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests\n", to_run);
-    }
-    intrinsics::printf("%s\n\n", RULE_HEAVY);
-
-    mut counts: Counters = Counters::new();
-    mut rstate: ReporterState = ReporterState::new();
-
-    if (parallel) {
-        run_all_parallel(descriptors, count, &opts, jobs, to_run,
-                         &counts, &rstate);
-    } else {
-        i = 0;
-        while (i < count) {
-            const d: TestDescriptor = descriptors[i];
-
-            if (!name_matches(d.name, &opts)) {
-                counts.filtered = counts.filtered + 1;
-                i = i + 1;
-                continue;
-            }
-
-            if (d.ignored && !opts.include_ignored) {
-                if (!opts.quiet) {
-                    reporter_skipped(&opts, &rstate, d.name);
-                }
-                counts.ignored = counts.ignored + 1;
-                i = i + 1;
-                continue;
-            }
-
-            // Always emit a prefix for runs we actually execute so the
-            // user can see which test is in flight (helps debug a hang).
-            reporter_begin_test(&opts, &rstate, d.name);
-            const outcome: TestOutcome = run_one(d, i, opts.timeout_secs);
-            const failed: boolean = is_failure(outcome);
-            reporter_end_test(&opts, &rstate, outcome, d.should_panic);
-
-            if (failed) {
-                counts.failed = counts.failed + 1;
-            } else {
-                counts.passed = counts.passed + 1;
-            }
-            i = i + 1;
-        }
-    }
-    // Compact mode: flush the last in-flight group line. Plain/Pretty
-    // are no-ops here.
-    reporter_finalize(&opts, &rstate);
-
-    // Trailing summary: a framed block so it stands clear of the
-    // per-test stream above it.
-    const verdict: string = if (counts.failed == 0) { "PASS" } else { "FAIL" };
-    intrinsics::printf("\n%s\n", RULE_HEAVY);
-    intrinsics::printf("  unit test summary\n");
-    intrinsics::printf("%s\n", RULE_THIN);
-    intrinsics::printf("    %-9s%6llu\n", "passed",   counts.passed);
-    intrinsics::printf("    %-9s%6llu\n", "failed",   counts.failed);
-    intrinsics::printf("    %-9s%6llu\n", "ignored",  counts.ignored);
-    intrinsics::printf("    %-9s%6llu\n", "filtered", counts.filtered);
-    intrinsics::printf("%s\n", RULE_THIN);
-    if (opts.color_active && counts.failed == 0) {
-        intrinsics::printf("    result   %s%s%s\n", ANSI_GREEN, verdict, ANSI_RESET);
-    } else if (opts.color_active && counts.failed > 0) {
-        intrinsics::printf("    result   %s%s%s\n", ANSI_RED, verdict, ANSI_RESET);
-    } else {
-        intrinsics::printf("    result   %s\n", verdict);
-    }
-    intrinsics::printf("%s\n", RULE_HEAVY);
-
-    rstate.drop();
-    const exit_code: i32 = if (counts.failed == 0) { 0 } else { 1 };
-    return exit_code;
+    mut runner: TestRunner = TestRunner::new(opts, descriptors, count);
+    return runner.run();
 }
