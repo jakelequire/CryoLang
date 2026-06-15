@@ -1,0 +1,233 @@
+///! Floating-point formatting (`fmt::float`).
+///!
+///! The public API is the extension method `f64.to_buf(buffer)` /
+///! `f64.to_buf_with(buffer, decimals)` / `f64.to_buf_roundtrip(buffer)`,
+///! plus `f64.is_negative_zero()` and the `f32` delegating wrappers. Each
+///! writes ASCII into a caller-supplied `u8*` and returns the byte count.
+///!
+///! Contract (see fmt/float.cryo):
+///!   * NaN -> "NaN", +Inf -> "inf", -Inf -> "-inf".
+///!   * Negative values and -0.0 get a leading '-'; +0.0/-0.0 print "0"/"-0".
+///!   * |v| in [1e-4, 1e16) -> fixed-point, `decimals` fractional digits
+///!     (default 6), rounded half-up (carry propagates into the integer).
+///!   * |v| >= 1e16 or 0 < |v| < 1e-4 -> scientific `<mantissa>e<sign><exp>`.
+///!   * `to_buf_roundtrip` uses libc `%g` (shortest of 15/16/17 sig digits
+///!     that re-parses exactly); only non-exponential vectors are asserted
+///!     here since `%g` exponent formatting is libc-dependent.
+///!
+///! Expected strings were derived from the implementation's algorithm, not
+///! assumed. The fixed-point default-6-decimal path overlaps the few cases
+///! already in `fmt.cryo`; this file adds the scientific, special-value,
+///! negative-zero, custom-precision, and round-trip coverage.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FmtFloatT;
+
+import std::core::result;
+import std::core::primitives;
+import std::collections::str;
+import std::math;
+import std::fmt::float;
+import std::test::error;
+import std::test::assert;
+
+// IEEE-754 `0.0 - 0.0` is *positive* zero, so a genuine -0.0 must be
+// built with copysign (set the sign bit on a zero magnitude).
+function negative_zero() -> f64 {
+    return math::copysign(0.0, 0.0 - 1.0);
+}
+
+// `Str` is a borrowed view over the format buffer, so format + compare
+// must happen in one frame; never return the `Str`.
+
+/// Format `v` with the default 6 fractional digits and assert it equals `want`.
+function fmt_default(v: f64, want: string) -> Result<(), TestError> {
+    mut buf: u8[64];
+    const n: u64 = v.to_buf(&buf[0]);
+    const got: Str = Str::from_raw(&buf[0], n);
+    return expect(got.equals(&Str::new(want)), Str::new(want));
+}
+
+/// Format `v` with `decimals` fractional digits and assert it equals `want`.
+function fmt_with(v: f64, decimals: u64, want: string) -> Result<(), TestError> {
+    mut buf: u8[64];
+    const n: u64 = v.to_buf_with(&buf[0], decimals);
+    const got: Str = Str::from_raw(&buf[0], n);
+    return expect(got.equals(&Str::new(want)), Str::new(want));
+}
+
+/// Format `v` via the shortest round-trip writer and assert it equals `want`.
+function fmt_roundtrip(v: f64, want: string) -> Result<(), TestError> {
+    mut buf: u8[64];
+    const n: u64 = v.to_buf_roundtrip(&buf[0]);
+    const got: Str = Str::from_raw(&buf[0], n);
+    return expect(got.equals(&Str::new(want)), Str::new(want));
+}
+
+// --- fixed-point, default 6 decimals ----------------------------------
+
+![test]
+function fixed_whole_number() -> Result<(), TestError> {
+    return fmt_default(1.0, "1.000000");
+}
+
+![test]
+function fixed_zero() -> Result<(), TestError> {
+    return fmt_default(0.0, "0");
+}
+
+![test]
+function fixed_negative_zero() -> Result<(), TestError> {
+    // -0.0 must keep its sign: prints "-0", not "0".
+    return fmt_default(negative_zero(), "-0");
+}
+
+![test]
+function fixed_half() -> Result<(), TestError> {
+    return fmt_default(0.5, "0.500000");
+}
+
+![test]
+function fixed_negative_value() -> Result<(), TestError> {
+    return fmt_default(0.0 - 123.456, "-123.456000");
+}
+
+![test]
+function fixed_rounds_half_up() -> Result<(), TestError> {
+    // 3.14159 rounds (not truncates) to 6 dp.
+    return fmt_default(3.14159, "3.141590");
+}
+
+![test]
+function fixed_rounding_carries_into_integer() -> Result<(), TestError> {
+    // 0.9999996 at 6 dp rolls the fraction over to 1.000000.
+    return fmt_default(0.9999996, "1.000000");
+}
+
+// --- custom precision via to_buf_with ---------------------------------
+
+![test]
+function with_two_decimals() -> Result<(), TestError> {
+    return fmt_with(3.14159, 2, "3.14");
+}
+
+![test]
+function with_zero_decimals_truncates_integer_part() -> Result<(), TestError> {
+    // decimals == 0 takes the no-fraction branch: integer part only, and
+    // the value is truncated toward zero (2.5 -> "2", no rounding here).
+    return fmt_with(2.5, 0, "2");
+}
+
+![test]
+function with_three_decimals() -> Result<(), TestError> {
+    return fmt_with(123.456, 3, "123.456");
+}
+
+![test]
+function with_four_decimals_pads() -> Result<(), TestError> {
+    // Fraction shorter than the requested width is zero-padded on the right.
+    return fmt_with(0.5, 4, "0.5000");
+}
+
+// --- scientific notation (|v| >= 1e16 or 0 < |v| < 1e-4) --------------
+
+![test]
+function scientific_large_threshold() -> Result<(), TestError> {
+    // 1e16 is the lower bound of the "large" range -> scientific.
+    return fmt_default(1.0e16, "1.000000e+16");
+}
+
+![test]
+function scientific_large_value() -> Result<(), TestError> {
+    return fmt_default(1.5e20, "1.500000e+20");
+}
+
+![test]
+function scientific_small_value() -> Result<(), TestError> {
+    // 1e-5 < 1e-4 -> scientific with a negative exponent.
+    return fmt_default(1.0e-5, "1.000000e-5");
+}
+
+![test]
+function scientific_negative_large() -> Result<(), TestError> {
+    return fmt_default(0.0 - 1.5e20, "-1.500000e+20");
+}
+
+![test]
+function small_threshold_stays_fixed() -> Result<(), TestError> {
+    // 1e-4 == SMALL_THRESHOLD; the test is `< SMALL`, so 1e-4 stays fixed.
+    return fmt_default(1.0e-4, "0.000100");
+}
+
+// --- special values ---------------------------------------------------
+
+![test]
+function format_nan() -> Result<(), TestError> {
+    return fmt_default(math::nan(), "NaN");
+}
+
+![test]
+function format_positive_infinity() -> Result<(), TestError> {
+    return fmt_default(math::infinity(), "inf");
+}
+
+![test]
+function format_negative_infinity() -> Result<(), TestError> {
+    return fmt_default(0.0 - math::infinity(), "-inf");
+}
+
+// --- is_negative_zero -------------------------------------------------
+
+![test]
+function detect_negative_zero() -> Result<(), TestError> {
+    const neg_zero: f64 = negative_zero();
+    return expect(neg_zero.is_negative_zero(),
+        Str::new("(0.0 - 0.0) should be negative zero"));
+}
+
+![test]
+function positive_zero_is_not_negative_zero() -> Result<(), TestError> {
+    return expect_false((0.0).is_negative_zero(),
+        Str::new("+0.0 is not negative zero"));
+}
+
+![test]
+function nonzero_is_not_negative_zero() -> Result<(), TestError> {
+    return expect_false((0.0 - 1.0).is_negative_zero(),
+        Str::new("-1.0 is not negative zero"));
+}
+
+// --- round-trip writer (non-exponential vectors only) -----------------
+//
+// `to_buf_roundtrip` defers to libc `%g`; exponent rendering (e.g.
+// "1e+20" vs "1e+020") is platform-dependent, so only values that `%g`
+// prints without an exponent are asserted.
+
+![test]
+function roundtrip_one() -> Result<(), TestError> {
+    return fmt_roundtrip(1.0, "1");
+}
+
+![test]
+function roundtrip_simple_fraction() -> Result<(), TestError> {
+    return fmt_roundtrip(0.5, "0.5");
+}
+
+![test]
+function roundtrip_one_tenth_is_compact() -> Result<(), TestError> {
+    // The whole point of the round-trip writer: 0.1 stays "0.1", not the
+    // noisy 0.10000000000000001 that a fixed-17-digit print would give.
+    return fmt_roundtrip(0.1, "0.1");
+}
+
+![test]
+function roundtrip_full_pi_precision() -> Result<(), TestError> {
+    // The fixed-6-decimal path would lose precision here; the round-trip
+    // writer preserves all 16 significant digits.
+    return fmt_roundtrip(3.141592653589793, "3.141592653589793");
+}
+
+![test]
+function roundtrip_negative_zero() -> Result<(), TestError> {
+    return fmt_roundtrip(negative_zero(), "-0");
+}
