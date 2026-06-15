@@ -40,6 +40,7 @@ import core::drop;
 import core::convert;
 import collections::str;
 import collections::string;
+import collections::array;
 import env;
 import io::error;
 import io::stdio;
@@ -47,6 +48,10 @@ import fmt::display;
 import ffi::libc;
 import ffi::syscall;
 import process::child;
+import process::command;
+import sync::atomic;
+import sync::mpsc;
+import thread;
 import test::descriptor;
 import test::error;
 
@@ -115,6 +120,15 @@ type struct RunOptions {
     /// True if `--timeout=` was passed explicitly (suppresses the
     /// `CRYO_TEST_TIMEOUT` env default).
     timeout_explicit: boolean;
+    /// Number of worker threads to drive tests in parallel. `0` means
+    /// "auto" -> resolved to the online CPU count at the start of
+    /// `run_all`. `1` forces the classic sequential path. Each worker
+    /// still runs every test in its own child process, so parallelism
+    /// does not weaken crash / `should_panic` isolation.
+    jobs:          u32;
+    /// True if `--jobs=`/`-j` was passed explicitly (suppresses the
+    /// `CRYO_TEST_JOBS` env default).
+    jobs_explicit: boolean;
     /// Re-exec child selector: `>= 0` means "run only descriptors[child_idx]
     /// and exit 0/1, no header/loop".  Set by the internal
     /// `--test-runner-child=<n>` flag the Windows runner passes when it
@@ -136,6 +150,8 @@ type struct RunOptions {
             color_active:    false,
             timeout_secs:    60,
             timeout_explicit: false,
+            jobs:            0,
+            jobs_explicit:   false,
             child_idx:       -1,
         };
     }
@@ -223,9 +239,31 @@ function parse_options(argc: i32, argv: u8**) -> RunOptions {
             if (apply_timeout(&opts, v)) {
                 opts.timeout_explicit = true;
             }
+        } else if (arg_starts_with(arg, "--jobs=")) {
+            const v: Str = arg.sub_bytes(7, arg.length());
+            if (apply_jobs(&opts, v)) {
+                opts.jobs_explicit = true;
+            }
+        } else if (arg.equals(&Str::new("-j"))) {
+            // `-j N`: the worker count is the following argument.
+            if (i + 1 < argc) {
+                const nraw: u8* = argv[(i + 1) as u64];
+                if (nraw != null) {
+                    if (apply_jobs(&opts, cstr_to_str(nraw))) {
+                        opts.jobs_explicit = true;
+                    }
+                    i++; // consume the value
+                }
+            }
+        } else if (arg_starts_with(arg, "-j")) {
+            // `-jN`: attached worker count.
+            const v: Str = arg.sub_bytes(2, arg.length());
+            if (apply_jobs(&opts, v)) {
+                opts.jobs_explicit = true;
+            }
         } else if (arg_starts_with(arg, "--test-runner-child=")) {
-            // Internal: the Windows runner re-execs itself with this flag to
-            // run a single test (by index) in a fresh process.
+            // Internal: the runner re-execs itself with this flag to run a
+            // single test (by index) in a fresh process.
             const v: Str = arg.sub_bytes(20, arg.length());
             opts.child_idx = parse_index(v);
         } else if (arg.length() >= 1 && arg.as_ptr()[0] == 0x2D) { // '-'
@@ -327,14 +365,42 @@ function apply_timeout(opts: mut &RunOptions, value: Str) -> boolean {
     }
 }
 
+/// Parse a worker count (whole number) and store it. `0` keeps the
+/// "auto = CPU count" default. Returns false on a non-numeric value
+/// (caller leaves the default).
+function apply_jobs(opts: mut &RunOptions, value: Str) -> boolean {
+    match (u32::try_from(value)) {
+        Result::Ok(n) => {
+            opts.jobs = n;
+            return true;
+        }
+        Result::Err(_) => {
+            intrinsics::printf("warning: invalid --jobs value: %.*s (expected a non-negative integer)\n",
+                value.length() as i32, value.as_ptr());
+            return false;
+        }
+    }
+}
+
 /// Fill in any field the user didn't pass on the CLI from environment
 /// variables. CLI > env > cryoconfig (via env, set by `cryo test`) > default.
 ///
 ///   CRYO_TEST_FORMAT  = plain|pretty|compact
 ///   CRYO_TEST_COLOR   = auto|always|never
 ///   CRYO_TEST_TIMEOUT = per-test timeout in seconds (0 disables)
+///   CRYO_TEST_JOBS    = worker threads (0 = auto / CPU count)
 ///   NO_COLOR          = (any value) -> force ColorMode::Never
 function apply_env_defaults(opts: mut &RunOptions) -> void {
+    if (!opts.jobs_explicit) {
+        const j_opt: Option<String> = env::var(Str::new("CRYO_TEST_JOBS"));
+        match (j_opt) {
+            Option::Some(mut s) => {
+                apply_jobs(opts, s.as_str());
+                s.drop();
+            }
+            Option::None => { }
+        }
+    }
     if (!opts.timeout_explicit) {
         const to_opt: Option<String> = env::var(Str::new("CRYO_TEST_TIMEOUT"));
         match (to_opt) {
@@ -506,10 +572,36 @@ function contains_substring(haystack: Str, needle: Str) -> boolean {
     return false;
 }
 
+// Worker-count detection
+
+/// Number of online CPUs, used as the default worker count. Clamped to
+/// at least 1 so the pool always makes progress.
+![target(unix)]
+function num_cpus() -> u32 {
+    // _SC_NPROCESSORS_ONLN == 84 on Linux/glibc and the BSDs.
+    const n: i64 = libc::sysconf(84);
+    if (n <= 0i64) { return 1u32; }
+    return n as u32;
+}
+
+![target(windows)]
+function num_cpus() -> u32 {
+    mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
+        wProcessorArchitecture: 0u16, wReserved: 0u16, dwPageSize: 0u32,
+        lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
+        dwActiveProcessorMask: 0u64, dwNumberOfProcessors: 0u32,
+        dwProcessorType: 0u32, dwAllocationGranularity: 0u32,
+        wProcessorLevel: 0u16, wProcessorRevision: 0u16
+    };
+    syscall::GetSystemInfo(&si as u8*);
+    if (si.dwNumberOfProcessors == 0u32) { return 1u32; }
+    return si.dwNumberOfProcessors;
+}
+
 // Single-test execution
 
-/// Run one test in a forked child and return the outcome the parent
-/// should report. Blocks until the child exits.
+/// Run one test in its own child process and return the outcome the
+/// parent should report. Blocks until the child exits.
 ///
 /// Caller is responsible for the surrounding `test NAME ... ` /
 /// `OUTCOME\n` framing AND for honouring the `ignored` flag; `run_one`
@@ -517,26 +609,63 @@ function contains_substring(haystack: Str, needle: Str) -> boolean {
 /// runner deliberately wants to execute `![ignore]`-marked tests and
 /// see their real outcome.
 ///
-/// `idx` is the test's position in `descriptors`; POSIX ignores it (the
-/// forked child holds `d.func()` directly), but the Windows variant needs it
-/// to tell the re-exec'd child process which test to run.
+/// `idx` is the test's position in `descriptors`: the child re-execs the
+/// test binary with `--test-runner-child=<idx>` so it runs exactly that
+/// one test (`run_child_single`).  Both platforms use the re-exec model -
+/// POSIX `fork`+`execv`, Windows `CreateProcess` - so `run_one` is safe to
+/// call concurrently from worker threads: the child only `execv`s (an
+/// async-signal-safe op) and never touches the forking thread's heap, so
+/// there is no malloc-lock-at-fork deadlock.
 ![target(unix)]
 function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome {
     // Drain libc-buffered stdio in the parent before fork so the child
     // doesn't inherit a half-full FILE buffer and re-emit it on flush.
     intrinsics::fflush(null);
 
+    // Resolve this executable's path so the child can re-exec it. All of
+    // the allocation below happens in the PARENT, before fork; the child
+    // path stays async-signal-safe (execv + _exit only).
+    mut exe_buf: u8[4096];
+    mut exe_path: String = String::from_str_c(Str::new("/proc/self/exe"));
+    const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095u64);
+    exe_path.drop();
+    if (exe_n <= 0i64) {
+        return TestOutcome::RunnerError(libc::errno());
+    }
+    exe_buf[exe_n as u64] = 0u8; // readlink does not NUL-terminate.
+
+    // `--timeout=<n>`: propagated so the re-exec'd child arms its own
+    // SIGALRM watchdog (the POSIX child times itself out; the parent just
+    // blocks in waitpid and classifies a SIGALRM kill as a timeout).
+    mut timeout_arg: String = String::new();
+    timeout_arg.push(Str::new("--timeout="));
+    append_u64(&timeout_arg, timeout_secs as u64);
+    timeout_arg.push(0u8);
+
+    // `--test-runner-child=<idx>`: selects the single test to run.
+    mut child_arg: String = String::new();
+    child_arg.push(Str::new("--test-runner-child="));
+    append_u64(&child_arg, idx);
+    child_arg.push(0u8);
+
+    mut argv: command::ArgvBuf = command::ArgvBuf::new();
+    match (argv.push(&exe_buf[0]))         { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (argv.push(timeout_arg.as_ptr())) { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (argv.push(child_arg.as_ptr()))   { Result::Ok(_) => { } Result::Err(_) => { } }
+    match (argv.push(null))                 { Result::Ok(_) => { } Result::Err(_) => { } }
+
     const pid: i32 = libc::fork();
     if (pid < 0) {
-        return TestOutcome::RunnerError(libc::errno());
+        const e: i32 = libc::errno();
+        argv.drop(); child_arg.drop(); timeout_arg.drop();
+        return TestOutcome::RunnerError(e);
     }
 
     if (pid == 0) {
-        // Child: run the test and exit. Use `_exit` (not `exit`) so we
-        // don't run atexit handlers that would flush parent-inherited
-        // FILE buffers.
-        run_test_in_child(d, timeout_secs);
-        // run_test_in_child does not return.
+        // Child: async-signal-safe only. Re-exec the test binary to run
+        // exactly this test; `_exit(127)` if exec fails (parent reads it
+        // as the standard "exec not found" code).
+        libc::execv(&exe_buf[0], argv.as_ptr());
         libc::_exit(127);
     }
 
@@ -547,61 +676,44 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32) -> TestOutcome 
         if (rc >= 0) { break; }
         const err: i32 = libc::errno();
         if (err != 4) { // EINTR
+            argv.drop(); child_arg.drop(); timeout_arg.drop();
             return TestOutcome::RunnerError(err);
         }
     }
+
+    argv.drop();
+    child_arg.drop();
+    timeout_arg.drop();
 
     const exit_status: ExitStatus = decode_wstatus(status);
     return classify_outcome(exit_status, d.should_panic, timeout_secs);
 }
 
-/// Child-side test invocation. Calls the user function, prints any
-/// `Err` payload to stderr, and exits with a code the parent can
-/// classify. Never returns.  (POSIX fork child; the Windows re-exec child
-/// uses `run_child_single` instead.)
+/// Arm the per-test watchdog in a re-exec'd child. SIGALRM's default
+/// disposition terminates the process; the parent sees the signal and
+/// classifies it as a timeout. `alarm(0)` (timeout disabled) is a no-op
+/// cancel. Windows has no in-child SIGALRM - the parent enforces the
+/// timeout with WaitForSingleObject - so this is a no-op there.
 ![target(unix)]
-function run_test_in_child(d: TestDescriptor, timeout_secs: u32) -> void {
-    // Arm the per-test watchdog. SIGALRM's default disposition
-    // terminates the process; the parent sees the signal and classifies
-    // it as a timeout. `alarm(0)` (timeout disabled) is a no-op cancel.
-    if (timeout_secs > 0) {
+function arm_watchdog(timeout_secs: u32) -> void {
+    if (timeout_secs > 0u32) {
         libc::alarm(timeout_secs);
-    }
-    match (d.func()) {
-        Result::Ok(_) => {
-            libc::_exit(0);
-        }
-        Result::Err(e) => {
-            mut err: TestError = e;
-            // Print the error message verbatim to stderr.  We bypass
-            // the Display path (eprintln<T>) and reach into TestError's
-            // payload directly so the runner doesn't need to specialize
-            // `eprintln<TestError>`; the monomorphizer struggles with
-            // generic Display calls reachable only through a
-            // synthesized-codegen-discovered template chain.  Borrowed
-            // `Str` view via `message_str()` avoids double-drop.
-            const view: Str = err.message_str();
-            mut stderr_h: Stderr = stderr();
-            match (stderr_h.write_all(view.as_bytes())) {
-                Result::Ok(_) => { }
-                Result::Err(_) => { }
-            }
-            match (stderr_h.write_all(Slice::from_raw("\n", 1))) {
-                Result::Ok(_) => { }
-                Result::Err(_) => { }
-            }
-            libc::_exit(1);
-        }
     }
 }
 
+![target(windows)]
+function arm_watchdog(timeout_secs: u32) -> void { }
+
 /// Re-exec child entry: run exactly one test by index and return its 0/1
-/// exit code (127 for a bad index).  Used on Windows, where each test runs
-/// in a fresh CreateProcess'd copy of the test binary (no fork) selected via
-/// `--test-runner-child=<idx>`.  No watchdog here - the parent enforces the
-/// timeout with WaitForSingleObject (Windows has no in-child SIGALRM).
-function run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64) -> i32 {
+/// exit code (127 for a bad index).  Each test runs in a fresh process
+/// (POSIX `fork`+`execv`, Windows `CreateProcess`) selected via
+/// `--test-runner-child=<idx>`.  On POSIX the child arms its own SIGALRM
+/// watchdog (`arm_watchdog`); on Windows the parent enforces the timeout
+/// with WaitForSingleObject.
+function run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64,
+                          timeout_secs: u32) -> i32 {
     if (idx >= count) { return 127; }
+    arm_watchdog(timeout_secs);
     const d: TestDescriptor = descriptors[idx];
     match (d.func()) {
         Result::Ok(_) => { return 0; }
@@ -1058,6 +1170,173 @@ function reporter_finalize(opts: &RunOptions, state: mut &ReporterState) -> void
     }
 }
 
+// Parallel execution
+//
+// A worker pool runs tests concurrently while preserving the same
+// process-per-test isolation the sequential path uses. Work is handed out
+// by a lock-free atomic cursor; each worker ships its (index, outcome)
+// back over an mpsc channel. The main thread reassembles results into a
+// per-index buffer, then replays the reporter in original order so the
+// on-screen output stays byte-for-byte deterministic regardless of the
+// order tests actually finished in.
+
+/// One finished test, addressed back to its slot in the descriptor table.
+type struct WorkerResult {
+    idx:     u64;
+    outcome: TestOutcome;
+}
+
+/// Everything a pool worker needs, moved into the thread by value. The
+/// pointers alias state owned by `run_all_parallel`, which joins every
+/// worker before returning, so they stay valid for the worker's lifetime.
+/// `Send` is satisfied structurally: raw pointers and `mpsc::Sender` are
+/// `Send`, and `WorkerResult` is plain data.
+type struct WorkerCtx {
+    counter:      Atomic<u64>*;          // shared work cursor
+    runnable:     u64*;                  // runnable descriptor indices
+    n_runnable:   u64;
+    descriptors:  TestDescriptor*;
+    timeout_secs: u32;
+    sender:       mpsc::Sender<WorkerResult>;
+}
+
+/// Pool worker body. Pulls test indices off the shared cursor until the
+/// runnable list is exhausted, running each in its own child process and
+/// shipping the outcome back. `ctx` (including its `Sender`) is dropped on
+/// return, releasing this worker's sender so the channel can disconnect
+/// once every worker has finished.
+function test_worker(ctx: WorkerCtx) -> void {
+    loop {
+        const k: u64 = (*ctx.counter).fetch_add(1u64, MemoryOrder::Relaxed);
+        if (k >= ctx.n_runnable) { break; }
+        const idx: u64 = ctx.runnable[k];
+        const d: TestDescriptor = ctx.descriptors[idx];
+        const outcome: TestOutcome = run_one(d, idx, ctx.timeout_secs);
+        match (ctx.sender.send(WorkerResult { idx: idx, outcome: outcome })) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+}
+
+/// Run the `runnable` tests across `jobs` worker threads and return a
+/// `count`-sized buffer of outcomes indexed by descriptor position.
+/// Non-runnable slots are left as a placeholder the caller never reads.
+function execute_parallel(descriptors: TestDescriptor*, count: u64,
+                          runnable: u64*, n_runnable: u64,
+                          timeout_secs: u32, jobs: u32) -> Array<TestOutcome> {
+    mut results: Array<TestOutcome> = Array::with_capacity(count);
+    mut p: u64 = 0;
+    while (p < count) {
+        results.push(TestOutcome::Pass); // placeholder; overwritten if runnable
+        p = p + 1;
+    }
+
+    // Shared work cursor on the stack; workers borrow it by pointer and we
+    // join them all before this frame returns (scoped-thread idiom).
+    mut counter: Atomic<u64> = Atomic<u64>::new(0u64);
+    const cptr: Atomic<u64>* = &counter;
+
+    mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel<WorkerResult>();
+
+    {
+        mut scope: thread::Scope = thread::Scope::new();
+        mut w: u32 = 0;
+        while (w < jobs) {
+            const ctx: WorkerCtx = WorkerCtx {
+                counter:      cptr,
+                runnable:     runnable,
+                n_runnable:   n_runnable,
+                descriptors:  descriptors,
+                timeout_secs: timeout_secs,
+                sender:       rx.sender(),
+            };
+            scope.spawn<WorkerCtx>(ctx, test_worker);
+            w = w + 1;
+        }
+
+        // Drain exactly `n_runnable` outcomes as the workers produce them.
+        // Bounded by the known count, so this never depends on channel
+        // disconnection to terminate.
+        mut got: u64 = 0;
+        while (got < n_runnable) {
+            match (rx.recv()) {
+                Result::Ok(wr) => {
+                    results.set(wr.idx, wr.outcome);
+                    got = got + 1;
+                }
+                Result::Err(_) => { break; }
+            }
+        }
+
+        scope.join_all();
+    }
+
+    return results;
+}
+
+/// Parallel driver: build the runnable index list, run the pool, then
+/// replay the reporter in original order, tallying `counts` exactly as the
+/// sequential loop would. Keeps the displayed output deterministic.
+function run_all_parallel(descriptors: TestDescriptor*, count: u64,
+                          opts: &RunOptions, jobs: u32, to_run: u64,
+                          counts: mut &Counters, rstate: mut &ReporterState) -> void {
+    // Indices that will actually execute (match filter, not skipped-ignored).
+    mut runnable: Array<u64> = Array::with_capacity(to_run);
+    mut i: u64 = 0;
+    while (i < count) {
+        const d: TestDescriptor = descriptors[i];
+        if (name_matches(d.name, opts) && (!d.ignored || opts.include_ignored)) {
+            runnable.push(i);
+        }
+        i = i + 1;
+    }
+
+    mut results: Array<TestOutcome> = execute_parallel(
+        descriptors, count, runnable.as_ptr(), runnable.length(),
+        opts.timeout_secs, jobs);
+
+    // Replay: drive the existing reporter sequentially, in index order.
+    i = 0;
+    while (i < count) {
+        const d: TestDescriptor = descriptors[i];
+
+        if (!name_matches(d.name, opts)) {
+            counts.filtered = counts.filtered + 1;
+            i = i + 1;
+            continue;
+        }
+
+        if (d.ignored && !opts.include_ignored) {
+            if (!opts.quiet) {
+                reporter_skipped(opts, rstate, d.name);
+            }
+            counts.ignored = counts.ignored + 1;
+            i = i + 1;
+            continue;
+        }
+
+        reporter_begin_test(opts, rstate, d.name);
+        mut outcome: TestOutcome = TestOutcome::RunnerError(0);
+        match (results.get(i)) {
+            Option::Some(o) => { outcome = o; }
+            Option::None    => { }
+        }
+        const failed: boolean = is_failure(outcome);
+        reporter_end_test(opts, rstate, outcome, d.should_panic);
+
+        if (failed) {
+            counts.failed = counts.failed + 1;
+        } else {
+            counts.passed = counts.passed + 1;
+        }
+        i = i + 1;
+    }
+
+    results.drop();
+    runnable.drop();
+}
+
 // Entry point: called by the compiler-synthesized test main
 
 /// Run every test in `descriptors` that matches `argc/argv` filtering,
@@ -1073,12 +1352,19 @@ function run_all(argc: i32, argv: u8**,
     // Pin color decision now so reporters don't re-evaluate per test.
     opts.color_active = resolve_color_active(&opts);
 
-    // Re-exec child path (Windows runs one test per CreateProcess): run only
-    // the selected test and exit 0/1, with no header or driver loop.  The
-    // parent process classifies the exit code.
+    // Re-exec child path: run only the selected test and exit 0/1, with no
+    // header or driver loop.  The parent process classifies the exit code.
+    // (Both POSIX fork+execv and Windows CreateProcess re-exec land here.)
     if (opts.child_idx >= 0) {
-        return run_child_single(opts.child_idx as u64, descriptors, count);
+        return run_child_single(opts.child_idx as u64, descriptors, count,
+                                opts.timeout_secs);
     }
+
+    // Resolve the worker count: explicit `--jobs`/`CRYO_TEST_JOBS`, else the
+    // online CPU count. Clamp to at least 1.
+    mut jobs: u32 = opts.jobs;
+    if (jobs == 0u32) { jobs = num_cpus(); }
+    if (jobs == 0u32) { jobs = 1u32; }
 
     // Pre-pass: count how many descriptors actually match the filter so
     // the `running N tests` header is honest.
@@ -1114,10 +1400,16 @@ function run_all(argc: i32, argv: u8**,
         return 0;
     }
 
+    // A worker pool only pays off with more than one test to spread.
+    const parallel: boolean = jobs > 1u32 && to_run > 1u64;
+
     // Header.
     intrinsics::printf("\n%s\n", RULE_HEAVY);
     if (to_run == 1) {
         intrinsics::printf("  CRYO TESTS  /  unit  --  running 1 test\n");
+    } else if (parallel) {
+        intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests on %u threads\n",
+            to_run, jobs);
     } else {
         intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests\n", to_run);
     }
@@ -1125,38 +1417,44 @@ function run_all(argc: i32, argv: u8**,
 
     mut counts: Counters = Counters::new();
     mut rstate: ReporterState = ReporterState::new();
-    i = 0;
-    while (i < count) {
-        const d: TestDescriptor = descriptors[i];
 
-        if (!name_matches(d.name, &opts)) {
-            counts.filtered = counts.filtered + 1;
-            i = i + 1;
-            continue;
-        }
+    if (parallel) {
+        run_all_parallel(descriptors, count, &opts, jobs, to_run,
+                         &counts, &rstate);
+    } else {
+        i = 0;
+        while (i < count) {
+            const d: TestDescriptor = descriptors[i];
 
-        if (d.ignored && !opts.include_ignored) {
-            if (!opts.quiet) {
-                reporter_skipped(&opts, &rstate, d.name);
+            if (!name_matches(d.name, &opts)) {
+                counts.filtered = counts.filtered + 1;
+                i = i + 1;
+                continue;
             }
-            counts.ignored = counts.ignored + 1;
+
+            if (d.ignored && !opts.include_ignored) {
+                if (!opts.quiet) {
+                    reporter_skipped(&opts, &rstate, d.name);
+                }
+                counts.ignored = counts.ignored + 1;
+                i = i + 1;
+                continue;
+            }
+
+            // Always emit a prefix for runs we actually execute so the
+            // user can see which test is in flight (helps debug a hang).
+            reporter_begin_test(&opts, &rstate, d.name);
+            const outcome: TestOutcome = run_one(d, i, opts.timeout_secs);
+            const failed: boolean = is_failure(outcome);
+            reporter_end_test(&opts, &rstate, outcome, d.should_panic);
+
+            if (failed) {
+                counts.failed = counts.failed + 1;
+            } else {
+                counts.passed = counts.passed + 1;
+            }
             i = i + 1;
-            continue;
         }
-
-        // Always emit a prefix for runs we actually execute so the
-        // user can see which test is in flight (helps debug a hang).
-        reporter_begin_test(&opts, &rstate, d.name);
-        const outcome: TestOutcome = run_one(d, i, opts.timeout_secs);
-        const failed: boolean = is_failure(outcome);
-        reporter_end_test(&opts, &rstate, outcome, d.should_panic);
-
-        if (failed) {
-            counts.failed = counts.failed + 1;
-        } else {
-            counts.passed = counts.passed + 1;
-        }
-        i = i + 1;
     }
     // Compact mode: flush the last in-flight group line. Plain/Pretty
     // are no-ops here.
