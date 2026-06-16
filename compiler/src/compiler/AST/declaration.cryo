@@ -621,12 +621,25 @@ public:
 }
 
 
+/// An associated-type member declared inside a trait body: `type Item;` or
+/// `type Item: Copy + Clone;`. `bounds` holds the declaration-site trait
+/// constraints (empty for an unbounded `type Item;`). Stored on
+/// `TraitDeclNode.assoc_types`; bound concretely per-impl (see ImplBlockNode's
+/// assoc bindings) and projected via `TypeAnnotation::Projection`.
+type struct AssocTypeDeclNode {
+    name:   SymbolStr;
+    bounds: TraitRef[];
+    span:   SourceSpan;
+}
+
 type class TraitDeclNode : DeclarationNode {
 public:
     name:           SymbolStr;
     generic_params: GenericParamNode*[];
     methods:        FunctionDeclNode*[];
     base_traits:    BaseTraitInfo[];
+    /// Associated-type members (`type Item;`). Empty for traits without any.
+    assoc_types:    AssocTypeDeclNode*[];
 
     TraitDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::TraitDeclaration, span) {
@@ -634,9 +647,11 @@ public:
         this.generic_params = [];
         this.methods        = [];
         this.base_traits    = [];
+        this.assoc_types    = [];
     }
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
+    has_assoc_types() -> boolean { return this.assoc_types.length > 0; }
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
@@ -648,6 +663,18 @@ public:
 
     add_base_trait(info: BaseTraitInfo) -> void {
         this.base_traits.push(info);
+    }
+
+    add_assoc_type(decl: AssocTypeDeclNode*) -> void {
+        this.assoc_types.push(decl);
+    }
+
+    /// The associated-type decl named `n`, or null if the trait has none such.
+    lookup_assoc_type(&this, n: SymbolStr) -> AssocTypeDeclNode* {
+        for (mut i: i64 = 0; i < this.assoc_types.length; i++) {
+            if (this.assoc_types[i].name.equals(n)) { return this.assoc_types[i]; }
+        }
+        return null;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -819,6 +846,16 @@ public:
     derived_param_names: SymbolStr[];
     derived_param_types: TypeRef[];
 
+    /// Associated-type bindings this impl provides for the trait, as written
+    /// (parallel arrays: name -> annotation). Two sources feed these:
+    ///   * the explicit body form `type Item = T;`
+    ///   * positional-sugar desugaring of the impl header: for a trait with 0
+    ///     generic params and 1 associated type, `implement Iterator<A> for X`
+    ///     binds `Item := A` (see the desugar in TypeResolution).
+    /// `TypeAnnotation::Projection(This::Item)` resolves through these.
+    assoc_binding_names:       SymbolStr[];
+    assoc_binding_annotations: TypeAnnotation*[];
+
     ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ImplementationBlock, span) {
         this.target_type           = target_type;
@@ -831,6 +868,8 @@ public:
         this.target_type_span      = SourceSpan::none();
         this.derived_param_names   = [];
         this.derived_param_types   = [];
+        this.assoc_binding_names       = [];
+        this.assoc_binding_annotations = [];
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -880,6 +919,24 @@ public:
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// Record an associated-type binding (`type Item = T;` or desugared from
+    /// the positional header). The annotation is stored as written; it is
+    /// resolved against the impl's generic params during type resolution.
+    add_assoc_binding(mut &this, name: SymbolStr, ann: TypeAnnotation*) -> void {
+        this.assoc_binding_names.push(name);
+        this.assoc_binding_annotations.push(ann);
+    }
+
+    /// The annotation bound for associated type `name`, or null if unbound.
+    lookup_assoc_binding(&this, name: SymbolStr) -> TypeAnnotation* {
+        for (mut i: i64 = 0; i < this.assoc_binding_names.length; i++) {
+            if (this.assoc_binding_names[i].equals(name)) {
+                return this.assoc_binding_annotations[i];
+            }
+        }
+        return null;
     }
 }
 

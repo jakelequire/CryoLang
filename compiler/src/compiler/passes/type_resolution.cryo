@@ -133,21 +133,43 @@ type struct TypeResolutionRunner {
         if (!trait_leaf.is_valid()) { return; }
         const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
         if (trait_decl == null) { return; }
-        // Arity mismatch is a user-level error caught elsewhere; bail
-        // silently here rather than emit a duplicate diagnostic.
-        if (trait_decl.generic_params.length != gen.args.length) { return; }
 
-        // Resolve each arg in the impl's own resolution context (which
-        // already has the impl's `<T, ...>` params bound), then map the
-        // trait param's name onto it.  `Iterator<T>` impl: trait_decl's
-        // param[0] is `Item` and arg[0] resolves to the impl's `T`, so
-        // we add `Item -> T` to the context.
-        for (mut i: i64 = 0; i < gen.args.length; i++) {
-            const gp: GenericParamNode* = trait_decl.generic_params[i];
-            if (gp == null) { continue; }
-            const arg_ty: TypeRef = this.resolver.resolve(gen.args[i], res_ctx);
-            if (!arg_ty.is_valid()) { continue; }
-            res_ctx.add_binding(gp.name, arg_ty);
+        const ngp: i64   = trait_decl.generic_params.length;
+        const nargs: i64 = gen.args.length;
+
+        // Legacy generic-param trait (e.g. the pre-migration `Iterator<Item>`):
+        // exact-arity positional binding, mapping trait param[i] -> impl arg[i]
+        // (`Iterator<T>` binds `Item -> T`). Arity mismatch is a user error
+        // caught elsewhere; bail silently (preserves prior behavior exactly).
+        if (ngp > 0) {
+            if (ngp != nargs) { return; }
+            for (mut i: i64 = 0; i < nargs; i++) {
+                const gp: GenericParamNode* = trait_decl.generic_params[i];
+                if (gp == null) { continue; }
+                const arg_ty: TypeRef = this.resolver.resolve(gen.args[i], res_ctx);
+                if (!arg_ty.is_valid()) { continue; }
+                res_ctx.add_binding(gp.name, arg_ty);
+            }
+            return;
+        }
+
+        // Associated-type positional sugar (plan rule #6): a trait with 0
+        // generic params and exactly 1 associated type binds that associated
+        // type from a single positional arg — `implement Iterator<T>` ⇒
+        // `Item -> T`. Binds `Item` in the impl context so `This::Item` (and
+        // cloned trait default methods) resolve, and records the binding on
+        // the impl node so a concrete `X::Item` projection can look it up.
+        if (trait_decl.assoc_types.length == 1 && nargs == 1) {
+            const adecl: AssocTypeDeclNode* = trait_decl.assoc_types[0];
+            if (adecl != null) {
+                const arg_ty: TypeRef = this.resolver.resolve(gen.args[0], res_ctx);
+                if (arg_ty.is_valid()) {
+                    res_ctx.add_binding(adecl.name, arg_ty);
+                }
+                if (impl_node.lookup_assoc_binding(adecl.name) == null) {
+                    impl_node.add_assoc_binding(adecl.name, gen.args[0]);
+                }
+            }
         }
     }
 
@@ -2002,6 +2024,14 @@ type struct TypeResolutionPasses {
                     } else { null };
                     if (tr_t != null && tr_t.kind == TypeKind::Trait) {
                         mut tr_type: TraitType* = tr_t as TraitType*;
+                        // Register associated-type members (`type Item;`) so the
+                        // projection resolver and the positional-sugar desugar
+                        // can see which member names this trait declares and how
+                        // many it has.
+                        for (mut ai: i64 = 0; ai < node.assoc_types.length; ai++) {
+                            const adecl: AssocTypeDeclNode* = node.assoc_types[ai];
+                            if (adecl != null) { tr_type.add_assoc_type(adecl.name); }
+                        }
                         for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
                             const tfunc: FunctionDeclNode* = node.methods[mi];
                             if (tfunc == null) { continue; }

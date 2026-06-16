@@ -1391,6 +1391,15 @@ public:
             this.collect_doc_comments();
             if (this.check(TokenType::RBrace)) { break; }
 
+            // Associated-type member: `type Item;` or `type Item: Bound;`.
+            // Intercepted before the method path because `type` is a keyword
+            // and would otherwise be taken as a (keyword-named) method head.
+            if (this.check(TokenType::KwType)) {
+                const assoc: AssocTypeDeclNode* = this.parse_assoc_type_decl();
+                if (assoc != null) { node.add_assoc_type(assoc); }
+                continue;
+            }
+
             mut is_static: boolean = false;
             if (this.check(TokenType::KwStatic)) {
                 is_static = true;
@@ -1416,6 +1425,33 @@ public:
 
         this.consume(TokenType::RBrace, "'}'");
         node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse an associated-type declaration inside a trait body:
+    /// `type Item;` or `type Item: Copy + Clone;`. The leading `type` keyword
+    /// is consumed here. Declaration-site bounds are captured as trait refs
+    /// (empty for the unbounded form).
+    parse_assoc_type_decl() -> AssocTypeDeclNode* {
+        const start: Token = this.advance(); // consume 'type'
+        const name_tok: Token = this.consume(TokenType::Identifier, "associated type name");
+
+        mut bounds: TraitRef[] = [];
+        if (this.match_tok(TokenType::Colon)) {
+            while (true) {
+                bounds.push(this.parse_trait_ref());
+                if (!this.match_tok(TokenType::Plus)) { break; }
+            }
+        }
+
+        this.consume(TokenType::Semicolon, "';'");
+
+        mut node: AssocTypeDeclNode* = malloc(sizeof(AssocTypeDeclNode)) as AssocTypeDeclNode*;
+        *node = AssocTypeDeclNode {
+            name:   this.intern_lexeme(name_tok),
+            bounds: bounds,
+            span:   this.span_from(start),
+        };
         return node;
     }
 
@@ -1846,6 +1882,22 @@ public:
                 if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
+
+            // Associated-type binding: `type Item = T;`. The explicit body
+            // form of binding a trait's associated type in this impl (the
+            // positional header form `Iterator<T>` is desugared to the same
+            // binding later, in TypeResolution).
+            if (this.check(TokenType::KwType)) {
+                this.advance(); // consume 'type'
+                const an_tok: Token = this.consume(TokenType::Identifier, "associated type name");
+                this.consume(TokenType::Equal, "'='");
+                const bound_ann: TypeAnnotation* = this.parse_type_annotation();
+                this.consume(TokenType::Semicolon, "';'");
+                if (bound_ann != null) {
+                    node.add_assoc_binding(this.intern_lexeme(an_tok), bound_ann);
+                }
+                continue;
+            }
 
             // Methods in impl blocks
             if (this.check(TokenType::Identifier) || this.check(TokenType::KwFunction) ||
