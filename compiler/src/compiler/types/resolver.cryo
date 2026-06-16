@@ -345,9 +345,18 @@ type struct TypeResolver {
         const bare: SymbolStr = this.proj_bare_name(base_ty);
         if (!bare.is_valid()) { return TypeRef::invalid(); }
 
+        // Element-wise copy, NOT `base_args = inst.type_args`: a by-value
+        // assignment of an owning array aliases the InstantiatedType's buffer,
+        // and dropping the local at function exit would free the base type's
+        // live `type_args` storage (use-after-free that silently corrupts a
+        // sibling instantiation's args — surfaces as a cyclic type graph and a
+        // SIGSEGV when chaining adapters, e.g. `First<First<IntSeq>>`).
         mut base_args: TypeRef[] = [];
         if (bt.kind == TypeKind::InstantiatedType) {
-            base_args = (bt as InstantiatedType*).type_args;
+            const binst: InstantiatedType* = bt as InstantiatedType*;
+            for (mut bi: i64 = 0; bi < binst.type_args.length; bi++) {
+                base_args.push(binst.type_args[bi]);
+            }
         }
 
         for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
