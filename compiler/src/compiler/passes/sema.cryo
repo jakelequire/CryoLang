@@ -1322,6 +1322,7 @@ public:
         this.visit(node.body);
         this.body_count += 1;
         this.check_function_returns(node);
+        this.check_opaque_return_item(node);
     }
 
     /// All-paths-return check: when a function declares a non-trivial
@@ -1813,6 +1814,11 @@ public:
             const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
             if (!trait_name.is_valid()) { continue; }
             if (this.ctx.monomorphizer.type_satisfies_opaque_bound(concrete, trait_name)) {
+                // The right trait — now also check the bound's element argument.
+                // `implement Iterator<T>` is positional sugar for `Item = T`, so
+                // a concrete type implementing the trait with a *different* Item
+                // means the opaque type names the wrong element type.
+                this.check_opaque_assoc_item(imp.bounds[i], concrete, var_node);
                 continue;
             }
             const var_name:  string = this.intern.resolve(var_node.name);
@@ -1824,6 +1830,123 @@ public:
                        var_name, trait_str, conc_str, trait_str));
             diag = diag.at_with_label(annotation_span(var_node.type_annotation),
                 "this opaque type requires the initializer to implement the trait");
+            this.ctx.emit_diagnostic(diag);
+            return;
+        }
+    }
+
+    /// Core of the opaque-return element-type check. For an `implement Trait<T>`
+    /// bound whose `Trait` follows the associated-type positional-sugar shape
+    /// (0 generic params, exactly 1 associated type — Iterator's case), compare
+    /// `concrete`'s actual associated item against the declared `T` (`<T>` is
+    /// sugar for `<Item = T>`). Returns true on a CONFIRMED mismatch — both the
+    /// declared and the actual item resolve to distinct concrete types — writing
+    /// them into `out_expected`/`out_actual` (plus the trait + item names) for
+    /// the caller's diagnostic. Returns false (no diagnostic) when either can't
+    /// be determined (no false positives) or the trait is a legacy generic-param
+    /// trait (its positional arg fills a generic parameter, not an assoc type).
+    opaque_assoc_item_mismatch(mut &this, bound_ann: TypeAnnotation*,
+                               concrete: TypeRef, out_expected: TypeRef*,
+                               out_actual: TypeRef*, out_trait: SymbolStr*,
+                               out_item: SymbolStr*) -> boolean {
+        if (bound_ann == null) { return false; }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
+            return false;
+        }
+        // Need a Generic annotation carrying exactly one positional arg.
+        mut gen: GenericAnnotation* = null;
+        match (*bound_ann) {
+            TypeAnnotation::Generic(g) => { gen = g; }
+            _ => { return false; }
+        }
+        if (gen == null || gen.args.length != 1) { return false; }
+
+        const trait_leaf: SymbolStr = this.trait_leaf_name(bound_ann);
+        if (!trait_leaf.is_valid()) { return false; }
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        if (tdecl == null) { return false; }
+        // Positional-sugar associated-type shape only.
+        if (tdecl.generic_params.length != 0 || tdecl.assoc_types.length != 1) {
+            return false;
+        }
+        const adecl: AssocTypeDeclNode* = tdecl.assoc_types[0];
+        if (adecl == null) { return false; }
+
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        const expected: TypeRef = this.ctx.type_resolver.resolve(gen.args[0], &rc);
+        const actual:   TypeRef = this.ctx.type_resolver.resolve_concrete_member(
+            concrete, adecl.name, &rc);
+        if (!expected.is_valid() || !actual.is_valid()) { return false; }
+        if (this.arena.canon_type_id(expected) == this.arena.canon_type_id(actual)) {
+            return false;
+        }
+        *out_expected = expected;
+        *out_actual   = actual;
+        *out_trait    = trait_leaf;
+        *out_item     = adecl.name;
+        return true;
+    }
+
+    /// Binding-site check: `mut it: implement Iterator<i64> = arr.iter()` where
+    /// the items are actually `i32`. Emits E0200 on a confirmed Item mismatch.
+    check_opaque_assoc_item(mut &this, bound_ann: TypeAnnotation*,
+                            concrete: TypeRef, var_node: VarDeclNode*) -> void {
+        mut expected: TypeRef = TypeRef::invalid();
+        mut actual:   TypeRef = TypeRef::invalid();
+        mut trait_sym: SymbolStr = SymbolStr::empty();
+        mut item_sym:  SymbolStr = SymbolStr::empty();
+        if (!this.opaque_assoc_item_mismatch(bound_ann, concrete, &expected,
+                &actual, &trait_sym, &item_sym)) {
+            return;
+        }
+        const var_name:  string = this.intern.resolve(var_node.name);
+        const trait_str: string = this.intern.resolve(trait_sym);
+        const item_str:  string = this.intern.resolve(item_sym);
+        const exp_str:   string = this.type_display_name(expected);
+        const act_str:   string = this.type_display_name(actual);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0200_TYPE_MISMATCH,
+            format("`%s` is declared `implement %s<%s>`, but its initializer's `%s::%s` is `%s`, not `%s`",
+                   var_name, trait_str, exp_str, trait_str, item_str, act_str, exp_str));
+        diag = diag.at_with_label(annotation_span(var_node.type_annotation),
+            "this opaque type's element type does not match the initializer");
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Return-site check: `function f() -> implement Iterator<i64> { return X; }`
+    /// where `X`'s actual item is `i32`. `infer_impl_trait_return` already pinned
+    /// `func.resolved_return_type` to the concrete returned type, ignoring the
+    /// declared `<T>`; this enforces that the producer's `<T>` claim is honest.
+    check_opaque_return_item(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.return_type_annotation == null) { return; }
+        if (!func.resolved_return_type.is_valid()) { return; }
+        mut imp: ImplTraitAnnotation* = null;
+        match (*func.return_type_annotation) {
+            TypeAnnotation::ImplTrait(node) => { imp = node; }
+            _ => { return; }
+        }
+        if (imp == null) { return; }
+        for (mut i: i64 = 0; i < imp.bounds.length; i++) {
+            mut expected: TypeRef = TypeRef::invalid();
+            mut actual:   TypeRef = TypeRef::invalid();
+            mut trait_sym: SymbolStr = SymbolStr::empty();
+            mut item_sym:  SymbolStr = SymbolStr::empty();
+            if (!this.opaque_assoc_item_mismatch(imp.bounds[i],
+                    func.resolved_return_type, &expected, &actual,
+                    &trait_sym, &item_sym)) {
+                continue;
+            }
+            const fn_name:   string = this.intern.resolve(func.name);
+            const trait_str: string = this.intern.resolve(trait_sym);
+            const item_str:  string = this.intern.resolve(item_sym);
+            const exp_str:   string = this.type_display_name(expected);
+            const act_str:   string = this.type_display_name(actual);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0200_TYPE_MISMATCH,
+                format("`%s` is declared to return `implement %s<%s>`, but it returns a type whose `%s::%s` is `%s`, not `%s`",
+                       fn_name, trait_str, exp_str, trait_str, item_str, act_str, exp_str));
+            diag = diag.at_with_label(annotation_span(func.return_type_annotation),
+                "this opaque return type's element type does not match the returned value");
             this.ctx.emit_diagnostic(diag);
             return;
         }
