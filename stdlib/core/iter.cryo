@@ -19,11 +19,16 @@ import core::option;
 import core::clone;
 import collections::pair;
 
-type trait Iterator<Item> {
+type trait Iterator {
+    /// The element type this iterator yields. Each implementor binds it once
+    /// (positional sugar: `implement Iterator<T> for X` ⇒ `Item = T`); refer
+    /// to it as `This::Item` inside the trait and `X::Item` outside.
+    type Item;
+
     /// Advance the sequence and return the next value, or `None` when
     /// exhausted. Calling `next` again after `None` may return `None`
     /// forever or may panic; implementations should document which.
-    next(mut &this) -> Option<Item>;
+    next(mut &this) -> Option<This::Item>;
 
     /// Number of remaining elements. The default walks the iterator to
     /// count, consuming it. Implementations with O(1) knowledge of
@@ -41,7 +46,7 @@ type trait Iterator<Item> {
 
     /// Reduce the sequence to a single value. `initial` is the starting
     /// accumulator; `f` folds each element into it.
-    fold<Acc>(mut &this, initial: Acc, f: (Acc, Item) -> Acc) -> Acc {
+    fold<Acc>(mut &this, initial: Acc, f: (Acc, This::Item) -> Acc) -> Acc {
         mut acc: Acc = initial;
         loop {
             match (this.next()) {
@@ -54,7 +59,7 @@ type trait Iterator<Item> {
 
     /// Call `f` on each element, discarding the results. The natural
     /// way to consume an iterator purely for its side effects.
-    for_each(mut &this, f: (Item) -> void) -> void {
+    for_each(mut &this, f: (This::Item) -> void) -> void {
         loop {
             match (this.next()) {
                 Option::Some(value) => { f(value); }
@@ -70,13 +75,13 @@ type trait Iterator<Item> {
 
     /// Transform each element with `f`, yielding the results. `f` must be a
     /// non-capturing function (a plain `fn` or a non-capturing lambda).
-    map<B>(this, f: (Item) -> B) -> MapIter<This, Item, B> {
+    map<B>(this, f: (This::Item) -> B) -> MapIter<This, B> {
         return MapIter::new(this, f);
     }
 
     /// Yield only the elements for which `pred` returns `true`. `pred` must be
     /// a non-capturing function.
-    filter(this, pred: (Item) -> boolean) -> FilterIter<This, Item> {
+    filter(this, pred: (This::Item) -> boolean) -> FilterIter<This> {
         return FilterIter::new(this, pred);
     }
 
@@ -91,7 +96,7 @@ type trait Iterator<Item> {
     /// `u64`.  The pair is `Pair<u64, Item>`: `p.first` is the index,
     /// `p.second` the element.  (Cryo has no heterogeneous tuple literal,
     /// so `Pair` is the element type.)
-    enumerate(this) -> EnumerateIter<This, Item> {
+    enumerate(this) -> EnumerateIter<This> {
         return EnumerateIter::new(this);
     }
 
@@ -107,7 +112,7 @@ type trait Iterator<Item> {
 
     /// True if `pred` holds for at least one element. Short-circuits on
     /// the first match; consumes elements up to it.
-    any(mut &this, pred: (Item) -> boolean) -> boolean {
+    any(mut &this, pred: (This::Item) -> boolean) -> boolean {
         loop {
             match (this.next()) {
                 Option::Some(value) => { if (pred(value)) { return true; } }
@@ -118,7 +123,7 @@ type trait Iterator<Item> {
 
     /// True if `pred` holds for every element. Short-circuits on the
     /// first failure; vacuously true for an empty iterator.
-    all(mut &this, pred: (Item) -> boolean) -> boolean {
+    all(mut &this, pred: (This::Item) -> boolean) -> boolean {
         loop {
             match (this.next()) {
                 Option::Some(value) => { if (!pred(value)) { return false; } }
@@ -129,7 +134,7 @@ type trait Iterator<Item> {
 
     /// The first element for which `pred` holds, or `None`. Consumes
     /// elements up to and including the match.
-    find(mut &this, pred: (Item) -> boolean) -> Option<Item> {
+    find(mut &this, pred: (This::Item) -> boolean) -> Option<This::Item> {
         loop {
             match (this.next()) {
                 Option::Some(value) => {
@@ -162,30 +167,29 @@ where I: Iterator<A> {
     }
 }
 
-/// Adapter applying `f` to each element of `inner`.  `A` is the inner
-/// iterator's element type; `O` is the mapped result (Output) type.  Both
-/// appear in the stored function's type, so they are struct parameters rather
-/// than where-clause-only generics.
+/// Adapter applying `f` to each element of `inner`.  The input element type is
+/// the inner iterator's associated item `I::Item`; `O` is the mapped result
+/// (Output) type, the only element-type struct parameter needed.
 ///
 /// The result-type param is named `O`, NOT `B`, on purpose: the `map<B>`
-/// trait default returns `MapIter<This, Item, B>`, so a struct param named
-/// `B` would collide with the default's own generic `B`.  When `map` is
-/// applied to a `MapIter` receiver (`r.map(f).map(g)`), the impl-spec
-/// substituter rewrites every `B` in the inherited default - including its
-/// own generic - to the receiver's concrete element, leaving `map`'s `B`
-/// unbindable.  A distinct name keeps the default's generic independent of
-/// the adapter's parameters.
-type struct MapIter<I, A, O> {
+/// trait default returns `MapIter<This, B>`, so a struct param named `B`
+/// would collide with the default's own generic `B`.  When `map` is applied
+/// to a `MapIter` receiver (`r.map(f).map(g)`), the impl-spec substituter
+/// rewrites every `B` in the inherited default - including its own generic -
+/// to the receiver's concrete element, leaving `map`'s `B` unbindable.  A
+/// distinct name keeps the default's generic independent of the adapter's
+/// parameter.
+type struct MapIter<I, O> {
     inner: I;
-    f:     (A) -> O;
+    f:     (I::Item) -> O;
 
-    static new(inner: I, f: (A) -> O) -> MapIter<I, A, O> {
-        return MapIter<I, A, O> { inner: inner, f: f };
+    static new(inner: I, f: (I::Item) -> O) -> MapIter<I, O> {
+        return MapIter<I, O> { inner: inner, f: f };
     }
 }
 
-implement<I, A, O> trait Iterator<O> for struct MapIter<I, A, O>
-where I: Iterator<A> {
+implement<I, O> trait Iterator<O> for struct MapIter<I, O>
+where I: Iterator {
     next(mut &this) -> Option<O> {
         return match (this.inner.next()) {
             Option::Some(value) => { Option::Some(this.f(value)) }
@@ -195,18 +199,18 @@ where I: Iterator<A> {
 }
 
 /// Adapter yielding only the elements of `inner` for which `pred` holds.
-type struct FilterIter<I, A> {
+type struct FilterIter<I> {
     inner: I;
-    pred:  (A) -> boolean;
+    pred:  (I::Item) -> boolean;
 
-    static new(inner: I, pred: (A) -> boolean) -> FilterIter<I, A> {
-        return FilterIter<I, A> { inner: inner, pred: pred };
+    static new(inner: I, pred: (I::Item) -> boolean) -> FilterIter<I> {
+        return FilterIter<I> { inner: inner, pred: pred };
     }
 }
 
-implement<I, A> trait Iterator<A> for struct FilterIter<I, A>
-where I: Iterator<A> {
-    next(mut &this) -> Option<A> {
+implement<I> trait Iterator<I::Item> for struct FilterIter<I>
+where I: Iterator {
+    next(mut &this) -> Option<I::Item> {
         loop {
             match (this.inner.next()) {
                 Option::Some(value) => {
@@ -247,27 +251,25 @@ where I: Iterator<A>, J: Iterator<A> {
 }
 
 /// Adapter pairing each element of `inner` with its 0-based index.  The
-/// element type `A` is carried as a struct parameter (not a where-clause-only
-/// generic) so the `next` body's `Pair<u64, A>` literal substitutes through
-/// the normal struct-param path.  `A` is also pinned to `inner`'s element by
-/// the `where`-bound, which keeps the impl honest.
-type struct EnumerateIter<I, A> {
+/// element type is the inner iterator's associated item `I::Item`; the yielded
+/// item is `Pair<u64, I::Item>`.
+type struct EnumerateIter<I> {
     inner: I;
     index: u64;
 
-    static new(inner: I) -> EnumerateIter<I, A> {
-        return EnumerateIter<I, A> { inner: inner, index: 0 };
+    static new(inner: I) -> EnumerateIter<I> {
+        return EnumerateIter<I> { inner: inner, index: 0 };
     }
 }
 
-implement<I, A> trait Iterator<Pair<u64, A>> for struct EnumerateIter<I, A>
-where I: Iterator<A> {
-    next(mut &this) -> Option<Pair<u64, A>> {
+implement<I> trait Iterator<Pair<u64, I::Item>> for struct EnumerateIter<I>
+where I: Iterator {
+    next(mut &this) -> Option<Pair<u64, I::Item>> {
         match (this.inner.next()) {
             Option::Some(value) => {
                 const i: u64 = this.index;
                 this.index = this.index + 1;
-                return Option::Some(Pair<u64, A> { first: i, second: value });
+                return Option::Some(Pair<u64, I::Item> { first: i, second: value });
             }
             Option::None => { return Option::None; }
         }
