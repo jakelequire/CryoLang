@@ -173,6 +173,84 @@ type struct TypeResolutionRunner {
         }
     }
 
+    /// Stage-5 associated-type diagnostics, run once per source-level trait
+    /// impl during the function-signature phase (after
+    /// `bind_trait_args_for_impl` has recorded any positional-sugar binding).
+    /// Emits two user-facing errors that the silent-bail binding path above
+    /// would otherwise leave undiagnosed:
+    ///
+    ///   * **E0310** - the trait has generic *params* and the impl tried to
+    ///     bind an associated type *positionally* (more `<...>` args than the
+    ///     trait has generic params).  Decision #6: positional args fill the
+    ///     generic params only; an associated type of such a trait must be
+    ///     bound by name (`Out = ...`).
+    ///   * **E0309** - the trait declares associated types but this impl binds
+    ///     none of them (no positional-sugar arg and no `type Item = ...;`
+    ///     body form), so a `This::Item` projection would never reduce.
+    ///
+    /// A trait with no associated types is untouched (returns immediately), so
+    /// every legacy / non-assoc impl is unaffected.
+    validate_impl_assoc_bindings(&this, impl_node: ImplBlockNode*) -> void {
+        if (impl_node == null || !impl_node.is_trait_impl()) { return; }
+        if (this.ctx.generic_registry == null) { return; }
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return; }
+        const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
+        if (!trait_leaf.is_valid()) { return; }
+        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        if (trait_decl == null) { return; }
+        // Only traits with associated types are subject to these checks.
+        if (trait_decl.assoc_types.length == 0) { return; }
+
+        const intern: InternTable* = this.ctx.get_intern_table();
+        const trait_name: string = intern.resolve(trait_leaf);
+        const span: SourceSpan = if (impl_node.target_type_span.has_location()) {
+            impl_node.target_type_span
+        } else {
+            impl_node.span
+        };
+
+        const ngp: i64 = trait_decl.generic_params.length;
+        const gen: GenericAnnotation* = TypeResolutionPasses::peel_to_generic(trait_ann);
+        const nargs: i64 = if (gen == null) { 0 } else { gen.args.length };
+
+        // E0310: positional associated-type binding while the trait also has
+        // generic params.  The extra positional args (beyond `ngp`) can only be
+        // an attempt to bind an associated type positionally, which is rejected.
+        if (ngp > 0 && nargs > ngp) {
+            const adecl0: AssocTypeDeclNode* = trait_decl.assoc_types[0];
+            const aname: string = if (adecl0 == null) {
+                "the associated type"
+            } else {
+                intern.resolve(adecl0.name)
+            };
+            this.ctx.emit_error_at(
+                ErrorCode::E0310_POSITIONAL_ASSOC_WITH_GENERICS,
+                format(
+                    "trait `%s` has generic parameters - bind `%s` by name (`%s = ...`)",
+                    trait_name, aname, aname),
+                span);
+            return;
+        }
+
+        // E0309: a declared associated type left unbound by this impl.  After
+        // `bind_trait_args_for_impl`, every bound assoc type (positional sugar
+        // or `type Item = ...;` body form) is recorded on the impl node; an
+        // unrecorded one is genuinely unbound.
+        for (mut i: i64 = 0; i < trait_decl.assoc_types.length; i++) {
+            const adecl: AssocTypeDeclNode* = trait_decl.assoc_types[i];
+            if (adecl == null) { continue; }
+            if (impl_node.lookup_assoc_binding(adecl.name) != null) { continue; }
+            const aname: string = intern.resolve(adecl.name);
+            this.ctx.emit_error_at(
+                ErrorCode::E0309_ASSOC_TYPE_NOT_BOUND,
+                format(
+                    "associated type `%s` not bound in this impl of trait `%s`",
+                    aname, trait_name),
+                span);
+        }
+    }
+
 
     // Did-you-mean helpers for E0203
     //
@@ -2081,6 +2159,11 @@ type struct TypeResolutionPasses {
                     // mangler downstream produces a junk symbol with a
                     // hole where `Item` should be.
                     runner.bind_trait_args_for_impl(node, &impl_ctx);
+                    // Stage-5 diagnostics: flag an unbound associated type
+                    // (E0309) or a positional assoc binding on a trait that
+                    // also has generic params (E0310).  Runs once per
+                    // source-level impl here in the FuncSig phase.
+                    runner.validate_impl_assoc_bindings(node);
                     // Look up the owner type; try qualified first, then bare
                     // (primitive impls like `implement string` use bare).
                     mut impl_owner: TypeRef = ctx.decl_index.lookup_type(
