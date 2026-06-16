@@ -506,3 +506,47 @@ function inclusive_range_pattern() -> Result<(), TestError> {
     }
     return expect_eq(g, 1);
 }
+
+// Named-constant patterns. A bare identifier in a `match` arm that resolves
+// to a `const` is a VALUE pattern (compare the subject against the constant),
+// not a catch-all binding. Regression for the bug where every const arm was
+// treated as an irrefutable binding, so only the first arm ever ran (e.g.
+// `IoError::from_errno` folding every errno to `NotFound`).
+
+const KCODE_A: i32 = 10;
+const KCODE_B: i32 = 20;
+const KCODE_C: i32 = 30;
+
+function classify_code(code: i32) -> i32 {
+    return match (code) {
+        KCODE_A => { 1 }
+        KCODE_B => { 2 }
+        KCODE_C => { 3 }
+        _       => { 0 }
+    };
+}
+
+![test]
+function match_named_constants() -> Result<(), TestError> {
+    expect_eq(classify_code(10), 1)?;
+    expect_eq(classify_code(20), 2)?;   // 2nd arm, not the 1st
+    expect_eq(classify_code(30), 3)?;   // 3rd arm
+    expect_eq(classify_code(99), 0)?;   // wildcard fall-through
+    return Result::Ok(());
+}
+
+// A bare identifier that does NOT name a const stays a fresh binding
+// (catch-all that captures the subject), not a value comparison.
+function bind_or_const(code: i32) -> i32 {
+    return match (code) {
+        KCODE_A => { 100 }
+        other   => { other + 1 }
+    };
+}
+
+![test]
+function match_binding_still_binds() -> Result<(), TestError> {
+    expect_eq(bind_or_const(10), 100)?;   // const arm matches
+    expect_eq(bind_or_const(41), 42)?;    // binding arm: captures 41, +1
+    return Result::Ok(());
+}

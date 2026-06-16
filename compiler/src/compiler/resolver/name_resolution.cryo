@@ -114,8 +114,17 @@ public:
             NodeKind::VariableDeclaration => {
                 const var_node: VarDeclNode* = node as VarDeclNode*;
                 if (var_node.is_global) {
-                    const sym_id: SymbolID = this.resolver.declare_variable(
-                        var_node.name, var_node.span, var_node.is_mutable);
+                    // An immutable global is a named constant
+                    // (`SymbolKind::Constant`); a mutable global is a variable.
+                    // The kind lets later passes treat a const named in a
+                    // `match` arm as a value pattern rather than a binding.
+                    const sym_id: SymbolID = if (var_node.is_mutable) {
+                        this.resolver.declare_variable(
+                            var_node.name, var_node.span, true)
+                    } else {
+                        this.resolver.declare_constant(
+                            var_node.name, var_node.span)
+                    };
                     this.resolver.record_resolution(var_node.span, sym_id);
                 }
             }
@@ -760,9 +769,26 @@ public:
     }
 
     override visit(node: PatternNode*) -> void {
-        // Identifier patterns introduce a binding
+        // A bare identifier pattern is normally a fresh binding. But if the
+        // name resolves to an existing `const`, it is a *value* pattern -
+        // compare the subject against the constant - not a binding (the rule
+        // Rust uses for named constants in patterns). Without this, a match
+        // like `match (code) { ENOENT => ...; EAGAIN => ... }` silently treats
+        // every const arm as a catch-all binding, so only the first arm ever
+        // runs. Reclassify by moving the name into `value` and clearing
+        // `binding_name`; downstream passes (sema, codegen) treat an Identifier
+        // pattern with no `binding_name` as a constant-value pattern.
         if (node.pattern_kind == PatternKind::Identifier) {
-            this.resolver.declare_variable(node.binding_name, node.span, false);
+            const sym: SymbolID = this.resolver.lookup(
+                node.binding_name, this.resolver.current_scope);
+            if (sym.is_valid()
+                    && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
+                this.resolver.record_resolution(node.span, sym);
+                node.set_value(node.binding_name);
+                node.set_binding_name(SymbolStr::empty());
+            } else {
+                this.resolver.declare_variable(node.binding_name, node.span, false);
+            }
         }
     }
 
