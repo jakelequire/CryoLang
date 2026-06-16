@@ -2413,6 +2413,37 @@ public:
         }
     }
 
+    /// True if `ty` is, or structurally contains, an unresolved associated-type
+    /// projection (`AssocProjection` with no `resolved_type`). Such a type can't
+    /// be checked concretely in the abstract trait-decl pass — the real check
+    /// runs when the default method is specialized into a concrete impl — so
+    /// callers skip strict equality/assignability checks involving it.
+    type_has_unresolved_projection(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::AssocProjection) {
+            return !(t as AssocProjectionType*).resolved_type.is_valid();
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.type_has_unresolved_projection(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.type_has_unresolved_projection((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.type_has_unresolved_projection((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.type_has_unresolved_projection((t as OptionalType*).wrapped);
+        }
+        return false;
+    }
+
     override visit(mut &this, node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
             // Set expected_type to the function's return type so that
@@ -2425,7 +2456,9 @@ public:
             }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
             this.expected_type = saved_expected;
-            if (expr_type.is_valid() && this.return_type.is_valid()) {
+            if (expr_type.is_valid() && this.return_type.is_valid()
+                    && !this.type_has_unresolved_projection(this.return_type)
+                    && !this.type_has_unresolved_projection(expr_type)) {
                 if (!this.checker.can_assign(expr_type, this.return_type)) {
                     const value_span: SourceSpan =
                         if (node.expression != null) {

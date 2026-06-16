@@ -242,6 +242,53 @@ public:
     // Annotation substitution helpers
 
     substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
+        // Associated-type projection on a generic param written as a FLAT
+        // qualified name (`I::Item` — only `This::Item` is a Projection node).
+        // If the segment before the first `::` is one of our substituted params,
+        // rewrite the whole thing to a `Projection` over the param's concrete
+        // replacement, so a field/signature type `(I::Item)->O` becomes a real
+        // projection over `IntSeq` that the resolver reduces to the member type.
+        const nm_str: string = this.intern_table.resolve(named.name);
+        const nm_len: i64 = intrinsics::strlen(nm_str) as i64;
+        if (nm_len > 2) {
+            mut sep: i64 = -1;
+            mut k: i64 = 0;
+            while (k + 1 < nm_len) {
+                if (nm_str[k] == ':' && nm_str[k + 1] == ':') { sep = k; break; }
+                k = k + 1;
+            }
+            if (sep > 0) {
+                const pfx: string = nm_str.substring(0, sep);
+                const pfx_sym: SymbolStr = this.intern_table.intern(pfx);
+                for (mut pi: i64 = 0; pi < this.param_names.length; pi++) {
+                    if (pfx_sym.equals(this.param_names[pi])) {
+                        const member_str: string = nm_str.substring(sep + 2, nm_len - sep - 2);
+                        const member_sym: SymbolStr = this.intern_table.intern(member_str);
+                        const base_named: NamedAnnotation* =
+                            malloc(sizeof(NamedAnnotation)) as NamedAnnotation*;
+                        *base_named = NamedAnnotation {
+                            name:         this.type_arg_displays[pi],
+                            span:         named.span,
+                            pre_resolved: this.resolved_arg_typeref(pi),
+                        };
+                        const base_ann: TypeAnnotation* =
+                            new TypeAnnotation::Named(base_named);
+                        const proj: ProjectionAnnotation* =
+                            malloc(sizeof(ProjectionAnnotation)) as ProjectionAnnotation*;
+                        *proj = ProjectionAnnotation {
+                            base:         base_ann,
+                            member:       member_sym,
+                            owning_trait: SymbolStr::empty(),
+                            resolved:     TypeRef::invalid(),
+                            span:         named.span,
+                        };
+                        *ann = TypeAnnotation::Projection(proj);
+                        return ann;
+                    }
+                }
+            }
+        }
+
         // Check if this named annotation is one of our generic params.
         for (mut i: i64 = 0; i < this.param_names.length; i++) {
             if (named.name.equals(this.param_names[i])) {
