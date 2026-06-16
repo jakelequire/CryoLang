@@ -386,14 +386,16 @@ type struct PatternEmitter {
             }
 
             if (pat.pattern_kind == PatternKind::Wildcard
-                || pat.pattern_kind == PatternKind::Identifier) {
+                || (pat.pattern_kind == PatternKind::Identifier
+                    && pat.binding_name.is_valid())) {
                 // Wildcard and bare-identifier bindings match unconditionally
                 // (an identifier binds the whole subject, like `_` but named);
                 // branch straight to the arm body. Any later OR alternatives
                 // are unreachable. The binding itself is materialized by
-                // `bind_arm_value_bindings` in the arm/guard block. Cryo enum
-                // variants are always written `Enum::Variant`, so a bare
-                // identifier is never a variant reference.
+                // `bind_arm_value_bindings` in the arm/guard block. An
+                // Identifier whose `binding_name` was cleared by the resolver is
+                // a constant-value pattern, not a binding, and falls through to
+                // the comparison below.
                 this.cg.builder.build_br(arm_bb);
                 return;
             }
@@ -426,6 +428,19 @@ type struct PatternEmitter {
                             subject, pat_val_coerced,
                             format("%s.cmp", name_prefix));
                     }
+                }
+            } else if (pat.pattern_kind == PatternKind::Identifier) {
+                // Constant-value pattern: the resolver cleared `binding_name`
+                // because the identifier names a `const`. Compare the subject
+                // against the constant's loaded value, like a literal arm.
+                const pat_val: LValue =
+                    this.codegen_pattern_value(pat, minfo.subject_ty);
+                if (pat_val.is_valid()) {
+                    const coerced: LValue =
+                        this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
+                                             minfo.subject_ty);
+                    cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
+                        subject, coerced, format("%s.cmp", name_prefix));
                 }
             } else if (pat.pattern_kind == PatternKind::Range) {
                 // Inclusive `lo..hi` range: `lo <= subject && subject <= hi`.
@@ -631,18 +646,20 @@ type struct PatternEmitter {
             return this.lower_scalar_literal(intern.resolve(pat.value),
                                              pat.literal_kind, subj_ty);
         } else if (pat.pattern_kind == PatternKind::Identifier) {
-            // Identifier pattern: could be an enum variant name.
-            // Look it up as a named value or try to resolve as an enum discriminant.
-            const val: LValue = this.cg.values.get(pat.value);
-            if (val.is_valid()) {
-                // Load the named value.
-                const ty: LType = LType::i32();
-                return this.cg.builder.build_load(ty, val, "pat.load");
+            // Constant-value pattern: `pat.value` holds the const's name (the
+            // resolver set it after recognising the identifier as a `const`).
+            // Load its value - from a local/parameter slot if present, else the
+            // module global - for the icmp. Loaded at the subject's width so the
+            // comparison operands agree.
+            mut slot: LValue = this.cg.values.get(pat.value);
+            if (!slot.is_valid()) {
+                slot = this.cg.resolver.resolve_global(pat.value);
             }
-            // Try as a scope-resolved enum variant (e.g., TokenType::Plus).
-            // The value field might contain just the variant name.
-            // For simple enums, variants are sequential i32 constants.
-            // This needs the enum type info to resolve the discriminant.
+            if (slot.is_valid()) {
+                mut ty: LType = this.cg.type_mapper.map_type(subj_ty);
+                if (!ty.is_valid()) { ty = LType::i32(); }
+                return this.cg.builder.build_load(ty, slot, "pat.const");
+            }
             return LValue::null();
         }
         return LValue::null();
