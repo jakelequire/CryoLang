@@ -108,13 +108,49 @@ jobs:
             dist/cryo-*-windows-x86_64.zip.sha256
 
   # ---------------------------------------------------------------------------
+  # Verify — re-run the correctness suite on the tagged commit itself, so a tag
+  # pushed to a commit that never went green on main (or a flaky/skipped CI run)
+  # cannot publish a miscompiled binary. Mirrors the CI build job's gates.
+  # ---------------------------------------------------------------------------
+  test:
+    name: verify suite on the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Restore the LLVM toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cryo-ci
+          key: llvm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/llvm-version.env') }}
+
+      - name: Install the LLVM toolchain (apt.llvm.org on cache miss)
+        run: ./scripts/ci/install-llvm.sh
+
+      - name: Verify the committed pins match their sidecars (sha256)
+        run: make verify-pin
+
+      - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo)
+        run: make cryo
+
+      - name: Run the test suite (default -O2)
+        run: make test
+
+      - name: Run the test suite at -O0
+        run: make test ARGS="--opt-level=0"
+
+      - name: Check example program output against goldens
+        run: make examples-golden
+
+  # ---------------------------------------------------------------------------
   # Publish — verify both platforms' archives, then attach them to the GH
   # Release with a curated body (CHANGELOG section + platform matrix).
   # ---------------------------------------------------------------------------
   publish:
     name: publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [linux, windows]
+    needs: [linux, windows, test]
     permissions:
       contents: write   # create the GitHub Release + upload assets
     steps:
@@ -130,6 +166,14 @@ jobs:
           echo "VERSION=$VER  tag=$TAG  base=$BASE"
           if [ "$VER" != "$BASE" ]; then
             echo "::error::tag '$GITHUB_REF_NAME' does not match VERSION '$VER' in compiler/src/main.cryo"
+            exit 1
+          fi
+          # Version single-source-of-truth: the latest CHANGELOG header must
+          # match VERSION, so a code bump that forgets the changelog can't ship.
+          CHLOG=$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | sed -E 's/.*\[([0-9.]+)\].*/\1/')
+          echo "CHANGELOG latest=$CHLOG"
+          if [ "$CHLOG" != "$VER" ]; then
+            echo "::error::CHANGELOG latest version '[$CHLOG]' does not match VERSION '$VER' in compiler/src/main.cryo"
             exit 1
           fi
           if [ "$TAG" != "$BASE" ]; then

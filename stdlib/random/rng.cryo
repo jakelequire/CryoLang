@@ -12,6 +12,7 @@ import random::source;
 import random::bits;
 import random::secure;
 import ffi::libc;
+import ffi::syscall;
 
 /// A fast non-cryptographic PRNG (xoshiro256**). The 256-bit state is
 /// the four words `s0..s3`.
@@ -47,12 +48,29 @@ type struct Rng {
             return non_zero_state(load_u64_le(&buf[0]),  load_u64_le(&buf[8]),
                                   load_u64_le(&buf[16]), load_u64_le(&buf[24]));
         }
-        mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
-        clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
-        const seed: u64 = ((ts.tv_sec as u64) * 1000000000u64 + (ts.tv_nsec as u64))
-                          ^ ((getpid() as u64) << 32u64);
-        return Rng::from_seed(seed);
+        return Rng::from_seed(fallback_seed());
     }
+}
+
+/// Last-resort seed for `from_os` when the OS CSPRNG is briefly unavailable.
+/// Mixes a high-resolution monotonic counter with the process id. The libc
+/// (`clock_gettime`/`getpid`) and Win32 (`QueryPerformanceCounter`/
+/// `GetCurrentProcessId`) sources are `![target]`-gated so neither platform
+/// links the other's symbols. Non-crypto only; for cryptography use `SecureRng`.
+![target(unix)]
+private function fallback_seed() -> u64 {
+    mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
+    return ((ts.tv_sec as u64) * 1000000000u64 + (ts.tv_nsec as u64))
+           ^ ((getpid() as u64) << 32u64);
+}
+
+![target(windows)]
+private function fallback_seed() -> u64 {
+    mut counter: LARGE_INTEGER = LARGE_INTEGER { QuadPart: 0i64 };
+    syscall::QueryPerformanceCounter(&counter);
+    return (counter.QuadPart as u64)
+           ^ ((syscall::GetCurrentProcessId() as u64) << 32u64);
 }
 
 implement trait RandomSource for struct Rng {
