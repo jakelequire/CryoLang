@@ -483,10 +483,15 @@ different concrete types cannot be returned from one `implement Trait`
 function (that would require a dynamically-dispatched trait object, which Cryo
 does not provide).
 
-The trait argument is matched by name, not by its associated item: a binding
-annotated `implement Iterator<i32>` is verified to implement `Iterator`, but
-the `<i32>` element type is not yet cross-checked against the iterator's
-actual item type.
+The trait argument carries the trait's associated item: `Iterator<i32>` is
+sugar for `Iterator<Item = i32>`, so a binding annotated `implement
+Iterator<i32>` is verified both to implement `Iterator` *and* to have an
+actual `Item` of `i32`. A genuine element-type mismatch (e.g. binding an
+iterator of `String` to `implement Iterator<i32>`) is rejected as `E0200`.
+The cross-check is category-level: it flags a structurally distinct item
+(one user struct vs another, struct vs primitive) but stays silent when the
+declared and actual items are implicitly inter-convertible (`i32` vs `i64`)
+or differ only in representation (`String` vs `String<GlobalAlloc>`).
 
 ---
 
@@ -1524,7 +1529,7 @@ where T: Hash + Eq, V: Clone
 | `Eq` | Equality. |
 | `Ord` (`: Eq`) | Total ordering via `compare(...) -> Ordering`. |
 | `Hash` | Type-level hashing into a `Hasher`. |
-| `Iterator<Item>` | Lazy sequence with `next() -> Option<Item>`. |
+| `Iterator` | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
 | `IntoIterator` | Conversion into an iterator. |
 | `From<T>` / `Into<T>` | Infallible conversions. |
 | `TryFrom<T>` / `TryInto<T>` | Fallible conversions returning `Result`. |
@@ -1536,6 +1541,60 @@ where T: Hash + Eq, V: Clone
 Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FmtWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
 
 The collection iterator entry points (`Array::iter`, `HashMap::keys`/`values`, `Str::split`, …) return [`implement Iterator<…>`](#211-opaque-types-implement-trait) rather than naming their concrete cursor structs, so you consume them through the trait and a `for-in` loop without ever spelling the underlying type.
+
+### 11.5 Associated Types
+
+A trait may declare an **associated type** — a type that each implementation
+supplies, named once in the trait and referred to by every method. The
+standard `Iterator` is written this way:
+
+```cryo
+type trait Iterator {
+    type Item;                              // each impl chooses its element type
+    next(mut &this) -> Option<This::Item>;  // `This::Item` projects it
+    // ... defaults (count, fold, map, filter, …) all in terms of This::Item ...
+}
+```
+
+`This::Item` is a **projection**: inside the trait it stands for "the `Item`
+this implementation bound". Projections also work off a generic parameter — a
+generic adapter names its source's element as `I::Item`:
+
+```cryo
+type struct MapIter<I, O> { inner: I; f: (I::Item) -> O; }
+```
+
+**Binding the associated type.** An implementation binds each associated type
+in one of two ways:
+
+```cryo
+// 1. Positional sugar - `Iterator<i32>` ≡ `Iterator<Item = i32>`. Available
+//    only when the trait has no generic params of its own (Iterator's case).
+implement trait Iterator<i32> for struct Counter { ... }
+
+// 2. Explicit body form - always available, and required when a value
+//    expression rather than sugar is clearer.
+implement trait Iterator for struct Counter {
+    type Item = i32;
+    ...
+}
+```
+
+The positional form scales to where-clause adapters, whose element flows from
+the source: `implement<I, A> trait Iterator<A> for struct TakeIter<I> where I:
+Iterator<A>` binds `Item := A := I::Item`.
+
+**Diagnostics.** Two errors guard the binding rules:
+
+- `E0309` — an impl of a trait that declares an associated type binds none of
+  them (no positional arg and no `type Item = …;` body). The projection could
+  never reduce, so it is rejected up front.
+- `E0310` — an associated type bound *positionally* on a trait that also has
+  generic parameters. Positional args fill the declared generic params in
+  order; an associated type of such a trait must be named (`Out = …`).
+
+Because Cryo monomorphises, a projection is fully resolved at compile time:
+`MapIter<Range<i32>, i64>::Item` reduces to `i64` with no runtime cost.
 
 ---
 
