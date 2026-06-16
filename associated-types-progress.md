@@ -144,13 +144,30 @@ order; a lone positional arg binds the sole associated type **only when the trai
     field/sig projections through the existing `resolve_projection`→`project_member`
     →concrete-resolution path. Guarded to params only (module-qualified names like
     `std::core::Option` have non-param prefixes, unaffected).
+  - **CHAINED ADAPTERS NOW WORK — `scratch/assoc_chain_test.cryo` → exit 4**
+    (minimized: `scratch/cyc_a.cryo`; controls `cyc_b`/`cyc_c`). `First<First<IntSeq>>`
+    with `type Item = I::Item` (a projection whose base is itself an adapter) compiles
+    and delegates correctly through both layers. Root cause was NOT in the projection
+    logic at all: `resolver.cryo` `resolve_concrete_member` did a by-value owning-array
+    assignment `base_args = (bt as InstantiatedType*).type_args;`, which aliases the
+    base `InstantiatedType`'s buffer; the local drops at function exit and FREES
+    `First<IntSeq>`'s live `type_args` storage. The freed block is reused by the next
+    instantiation, so `First<IntSeq>.type_args[0]` transiently reads as
+    `First<First<IntSeq>>` → cyclic `InstantiatedType` graph (597↔598) → unbounded
+    `TypeSubstitution.apply`↔`apply_instantiation` recursion → SIGSEGV. (cyc_c, no
+    `type Item =` binding, never calls `resolve_concrete_member` → no crash; cyc_b, no
+    trait → no crash.) **Fix:** element-wise `.push` copy so `base_args` owns its
+    buffer — the documented Cryo by-value/`*ptr` owning-array-alias landmine in a fresh
+    spot. 10-line change, sole edit. Validated: all 6 prior assoc repros + the chain
+    repro correct, suite 1230 + 94 GREEN, Linux selfhost BYTE-IDENTICAL fixed point.
+    Committed + repinned (`make pin` now pins both linux and windows).
   - **Core engine status:** associated types now work for the Iterator-rollout shapes —
     `type Item;` decls, positional sugar, `This::Item` in default methods (sig+body),
-    `I::Item` in method signatures AND struct fields, concrete reduction at mono. All
-    six repros pass (min1/min2/default/parse/adapter/field).
-  - **Remaining:** opaque returns carry Item (decision #4); diagnostics (Stage 5);
-    chained adapters / `where I::Item: Copy` bounds; then the repin + stdlib migration
-    (Stage 6) + full validation. (old note below.)
+    `I::Item` in method signatures AND struct fields, concrete reduction at mono, AND
+    chained adapters (`First<First<IntSeq>>`). Seven repros pass
+    (min1/min2/default/parse/adapter/field/chain).
+  - **Remaining:** diagnostics (Stage 5); `where I::Item: Copy` bounds; then the
+    repin + stdlib migration (Stage 6) + full validation. (old note below.)
   - (old note) Repro `scratch/assoc_adapter_test.cryo` (a generic
     adapter `First<I> where I: Seq` with `type Item = I::Item` + `next_one -> Option<I::Item>`):
     currently CRASHES (exit 3, no diagnostic) during **TypeResolution Phase 3 (function
@@ -162,15 +179,75 @@ order; a lone positional arg binds the sole associated type **only when the trai
     symbolic), THEN the concrete reduction at mono. The compiler itself is unaffected:
     builds clean, full suite GREEN (1231 + 94), blocker #1 repros (min1/min2/assoc_default)
     all pass.
-- [ ] **Stage 4 — opaque returns carry Item.** `implement Iterator<T>` propagates the
-  bound `Item` for monomorphization + for-in + (optionally) the §2.11 cross-check.
+- [x] **Stage 4 — opaque returns carry Item.** DONE. The opaque `implement Trait<T>`
+  type now CARRIES + ENFORCES its associated item: `Trait<T>` is positional sugar for
+  `Trait<Item = T>`, so the declared `<T>` is checked against the concrete type's actual
+  `Item` at BOTH sites — the binding (`mut it: implement Seq<i64> = make_seq()`) and the
+  return (`function f() -> implement Seq<i64> { return X; }`). Before Stage 4 the `<T>`
+  was decorative (any element type was silently accepted). Implemented in `sema.cryo`:
+  shared core `opaque_assoc_item_mismatch` (resolves declared `<T>` vs
+  `resolve_concrete_member(concrete, Item)`, canon-id compare; emits ONLY on a confirmed
+  mismatch — silent when undeterminable, and skips legacy generic-param traits) +
+  `check_opaque_assoc_item` (binding, wired into `verify_impl_trait_bounds`) +
+  `check_opaque_return_item` (return, wired into the function visit). The concrete return
+  type already flows for monomorphization (a producer `-> implement Seq<i32>` returning a
+  concrete impl builds + iterates correctly).
+  - **Bonus crash fix (assoc types under `cryo check`):** `cryo check` SIGABRT'd on ANY
+    associated-type trait+impl (mangler ICE — `encode_type_ref` aborts on an invalid
+    `TypeRef`). Root cause: in `check` mode monomorphization (which resolves impl-method
+    signatures in a full build) does not run, so a trait-impl method whose trait declares
+    a `This::Item`-projecting signature reaches decl-index registration with an unresolved
+    return type, and the mangler aborts the whole compiler. Fix in `decl_index.cryo`
+    `register_methods_with_module_aliased`: skip FunctionType-registration + mangling when
+    `resolved_return_type` is invalid (the mangled symbol only feeds codegen, which `check`
+    skips; a full build always has a valid type here → no-op for build, byte-identical).
+    This made the LSP/editor path stop crashing on assoc code AND unblocked the harness
+    (compile-fail tests run via `cryo check`). NB: `cryo check` on a *bare single file*
+    still emits unrelated false positives (`Option::Some not found`, method-not-found) —
+    that's a pre-existing general check-mode-on-loose-file limitation (reproduces on plain
+    non-assoc Option code too), NOT assoc-specific and out of Stage-4 scope.
+  - **Tests:** two negative regression tests
+    `tests/tests/negative/E0200_opaque_assoc_item_{binding,return}.cryo`
+    (compile-fail count 94 → 96). Full suite GREEN (1230 unit / 96 compile-fail), Linux
+    selfhost byte-identical fixed point. UNCOMMITTED.
 - [ ] **Stage 5 — diagnostics.** "assoc type `Item` not bound in this impl";
   "trait `Foo` has generic params — bind `Out` by name".
-- [ ] **Stage 6 — repin, then migrate stdlib.** `make pin` (WSL) so the pin parses the
-  new syntax. Then: trait decl → `type Item;`; defaults → `This::Item`; drop adapter
-  input-item params (`MapIter<I,A,O>`→`<I,O>`, `FilterIter<I,A>`→`<I>`,
-  `EnumerateIter<I,A>`→`<I>`, `ZipIter<I,J,A,O>`→`<I,J>`); 16 impl headers stay
-  positional (sugar), arity updated.
+- [~] **Stage 6 — repin, then migrate stdlib.** IN PROGRESS.
+  - **Phase A — compiler prep (DONE, validated, UNCOMMITTED).** A spike mirroring the
+    real adapter shapes (`scratch/assoc_combinator_chain.cryo`, `scratch/proj_wherebound.cryo`)
+    surfaced TWO compiler gaps the migration needs; both fixed in `resolver.cryo`
+    `resolve_concrete_member`:
+    1. **Project `::Item` off a where-clause-only adapter.** `TakeIter`/`ChainIter`/
+       `ZipIter`/`FilterIter` carry their item only via a where-bound
+       (`implement<I,A> Iterator<A> for TakeIter<I> where I: Iterator<A>` → Item = A,
+       A = I::Item). The resolver only read direct target-arg bindings, so `TakeIter<R>::Item`
+       didn't resolve. New helper `derive_where_assoc_bindings` mirrors the monomorphizer's
+       `derive_impl_where_generics`: binds where-clause-derived generics into the projection
+       context, recursing through `resolve_concrete_member` so an adapter chain bottoms out
+       at the source.
+    2. **Recover the InstantiatedType wrapper for a concrete spec receiver.** During
+       combinator inference (`c.take(2).map(dbl)`) the receiver resolves to a concrete
+       *spec struct* (mangled name, NO type_args), so `This::Item` stayed symbolic and the
+       `map<B>` formal `(This::Item)->B` never unified → no spec → unsubstituted return.
+       `resolve_concrete_member` now recovers the `InstantiatedType` via `find_inst_wrapping`
+       (same recovery `concrete_trait_args_for` already uses) to get the bare template name +
+       type_args. (Required a new `import Compiler::Types::Inference` in resolver.cryo.)
+    Validated against the CURRENT (un-migrated) stdlib: full suite 1230 unit / 96 compile-fail
+    GREEN, Linux selfhost byte-identical fixed point. The OLD 3-param adapter shape worked all
+    along; only the NEW assoc-type shape exposed these — confirmed by spike A/B/C bisection.
+  - **BOOTSTRAP GATE (Phase A must be pinned before Phase B).** `make cryo`/`make test`/
+    selfhost build the stdlib with the PIN. The migrated stdlib needs the two Phase-A fixes
+    to build, so the pin must include them first. Order: commit Phase A → `make pin` → then
+    Phase B can build. (This is the plan's "repin, then migrate" — the pin must carry the
+    fixes, not just parse the syntax.)
+  - **Phase B — stdlib migration (NOT STARTED, needs Phase-A pin).** trait decl → `type Item;`,
+    defaults → `This::Item`; drop adapter input-item params (`MapIter<I,A,O>`→`<I,O>`,
+    `FilterIter<I,A>`→`<I>`, `EnumerateIter<I,A>`→`<I>`). NOTE from reading the code:
+    `TakeIter<I>`, `ChainIter<I,J>`, `ZipIter<I,J>` are ALREADY where-clause-only (`A`/`O` are
+    impl generics, not struct params) → their struct defs + impls are UNCHANGED; only `MapIter`,
+    `FilterIter`, `EnumerateIter` drop a struct param. Explicit-arity call sites to fix:
+    `tests/tests/stdlib/iter.cryo` (`EnumerateIter<R,i32>`→`<R>` ×2,
+    `MapIter<TakeIter<R>,i32,i32>`→`<...,i32>`). 16 impl headers stay positional (sugar).
 - [ ] **Stage 7 — validate.** Full suite O2 + O0; stage-2 self-host rebuild; add the
   re-adapt-opaque-local test + negative tests (unbound / wrongly-positional assoc);
   final repin.

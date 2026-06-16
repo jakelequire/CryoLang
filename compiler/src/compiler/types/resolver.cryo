@@ -28,6 +28,7 @@ import Compiler::Resolver::InternTable;
 import Compiler::Resolver::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Registry;
+import Compiler::Types::Inference;
 import Compiler::DeclIndex;
 import Utils::Logger;
 import std::collections::pair;
@@ -337,9 +338,24 @@ type struct TypeResolver {
     /// reading that impl's binding for `member` (the positional trait arg under
     /// the sugar, or an explicit `type Item = ...` body binding), instantiated
     /// against `Base`'s own type arguments. Returns invalid when none applies.
-    resolve_concrete_member(&this, base_ty: TypeRef, member: SymbolStr,
+    resolve_concrete_member(&this, base_ty_in: TypeRef, member: SymbolStr,
                             ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
+        // A base that is already a concrete spec'd Struct/Class/Enum (e.g. the
+        // monomorphized `TakeIter` a combinator receiver resolved to) carries
+        // its mangled spec name and NO type_args — the trait-impl lookup (keyed
+        // on the template's bare name) and the target-arg binding below both
+        // need the InstantiatedType wrapper instead. Recover it. Mirrors the
+        // same recovery in the monomorphizer's `concrete_trait_args_for`.
+        mut base_ty: TypeRef = base_ty_in;
+        const bt0: Type* = this.arena.lookup(base_ty_in.id);
+        if (bt0 != null
+                && (bt0.kind == TypeKind::Struct
+                    || bt0.kind == TypeKind::Class
+                    || bt0.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, base_ty_in);
+            if (wrapper.is_valid()) { base_ty = wrapper; }
+        }
         const bt: Type* = this.arena.lookup(base_ty.id);
         if (bt == null) { return TypeRef::invalid(); }
         const bare: SymbolStr = this.proj_bare_name(base_ty);
@@ -404,6 +420,12 @@ type struct TypeResolver {
                     }
                 }
             }
+            // An adapter whose item is carried only by a where-bound
+            // (`implement<I,A> Iterator<A> for TakeIter<I> where I: Iterator<A>`)
+            // names `A` in its `Item` binding, but `A` is not a target param —
+            // it is determined by `I: Iterator<A>` once `I` is concrete. Derive
+            // those where-clause generics into `bctx` so the binding resolves.
+            this.derive_where_assoc_bindings(impl_node, &bctx);
             const r: TypeRef = this.resolve(ann, &bctx);
             if (r.is_valid()) {
                 const rt: Type* = this.arena.lookup(r.id);
@@ -414,6 +436,61 @@ type struct TypeResolver {
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// Bind impl where-clause-derived generics into `bctx` for projection
+    /// resolution. An adapter can carry its associated item only through a
+    /// where-bound — `implement<I,A> Iterator<A> for TakeIter<I>
+    /// where I: Iterator<A>` binds `Item` to `A`, but `A` is not a target
+    /// parameter; it is determined by `I: Iterator<A>` once `I` is concrete.
+    /// For each bound whose subject is already bound to a concrete type in
+    /// `bctx`, project the bound trait's associated type(s) off that concrete
+    /// subject and bind the corresponding positional generic param. Mirrors the
+    /// monomorphizer's `derive_impl_where_generics`, recursing through
+    /// `resolve_concrete_member` so a chain of adapters bottoms out at the
+    /// source. Only simple `Named` param args are bound (a projection or
+    /// concrete arg names no generic to derive); existing bindings are kept.
+    derive_where_assoc_bindings(&this, impl_node: ImplBlockNode*,
+                                bctx: ResolutionContext*) -> void {
+        if (impl_node == null) { return; }
+        for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
+            const bound: TraitBound* = &impl_node.where_bounds[bi];
+            const subject: TypeRef = bctx.lookup_binding(bound.type_parameter);
+            if (!subject.is_valid()) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: TraitRef* = &bound.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const tdecl: TraitDeclNode* =
+                    this.generic_registry.get_trait_decl(trait_leaf);
+                if (tdecl == null) { continue; }
+                const ngp: i64 = tdecl.generic_params.length;
+                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                    // Positional args fill generic params first, then assoc
+                    // types; only the assoc-type slots derive a member here.
+                    if (ai < ngp) { continue; }
+                    const assoc_idx: i64 = ai - ngp;
+                    if (assoc_idx >= tdecl.assoc_types.length) { continue; }
+                    if (tdecl.assoc_types[assoc_idx] == null) { continue; }
+                    const arg_ann: TypeAnnotation* = tr.type_args[ai];
+                    if (arg_ann == null) { continue; }
+                    match (*arg_ann) {
+                        TypeAnnotation::Named(n) => {
+                            if (!bctx.lookup_binding(n.name).is_valid()) {
+                                const member: SymbolStr =
+                                    tdecl.assoc_types[assoc_idx].name;
+                                const derived: TypeRef =
+                                    this.resolve_concrete_member(subject, member, bctx);
+                                if (derived.is_valid()) {
+                                    bctx.add_binding(n.name, derived);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     // Batch resolution helpers (shared by TypeResolution & Monomorphizer)
