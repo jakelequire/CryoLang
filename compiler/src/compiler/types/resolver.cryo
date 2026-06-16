@@ -276,11 +276,133 @@ type struct TypeResolver {
     /// looks up that type's impl binding (wired in Stage 3b).
     project_from_base(base_ty: TypeRef, proj: ProjectionAnnotation*,
                       ctx: ResolutionContext*) -> TypeRef {
+        return this.project_member(base_ty, proj.member, ctx);
+    }
+
+    /// Project associated type `member` off a resolved base type, yielding a
+    /// symbolic `AssocProjection`. A generic-param base stays symbolic until
+    /// specialization; a CONCRETE base (e.g. `IntSeq::Item` after `I` is bound
+    /// to `IntSeq` in a spec context) is reduced to the actual member type by
+    /// the monomorphizer's `reduce_projections` (which owns the impl-binding
+    /// lookup via `concrete_trait_args_for`). The resolver itself only forms
+    /// the projection node; it has no impl-instantiation machinery of its own.
+    project_member(&this, base_ty: TypeRef, member: SymbolStr,
+                   ctx: ResolutionContext*) -> TypeRef {
         const bt: Type* = this.arena.lookup(base_ty.id);
         if (bt == null) { return TypeRef::invalid(); }
-        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam) {
-            return this.arena.create_assoc_projection(
-                base_ty, proj.member, TypeRef::invalid());
+        // Generic / still-symbolic base: keep it a symbolic projection, resolved
+        // when the base is specialized (the monomorphizer reduces it).
+        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam
+                || bt.kind == TypeKind::AssocProjection) {
+            return this.arena.create_assoc_projection(base_ty, member, TypeRef::invalid());
+        }
+        // Concrete base (`IntSeq::Item`, `Range<i32>::Item`): resolve straight
+        // to the member type by reading the base's trait-impl binding, so a
+        // projection never enters an enclosing instantiation (`Option<i32>`,
+        // not `Option<IntSeq::Item>`). Fall back to a symbolic projection if no
+        // such impl/binding is found (a later pass diagnoses the real error).
+        const concrete: TypeRef = this.resolve_concrete_member(base_ty, member, ctx);
+        if (concrete.is_valid()) { return concrete; }
+        return this.arena.create_assoc_projection(base_ty, member, TypeRef::invalid());
+    }
+
+    /// Bare (unqualified) leaf name of a type, for keying the trait-impl
+    /// registry. Generic instantiations key against the TEMPLATE's bare name.
+    /// Mirrors Monomorphizer::bare_name_of.
+    proj_bare_name(&this, ty: TypeRef) -> SymbolStr {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return SymbolStr::empty(); }
+        const k: TypeKind = t.kind;
+        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
+            k == TypeKind::Char || k == TypeKind::String) {
+            return this.intern_table.intern(t.display_name());
+        }
+        if (k == TypeKind::InstantiatedType) {
+            return this.proj_bare_name((t as InstantiatedType*).generic_base);
+        }
+        const qname: SymbolStr = this.arena.get_qualified_name(ty);
+        if (!qname.is_valid()) { return SymbolStr::empty(); }
+        const qstr: string = this.intern_table.resolve(qname);
+        const qlen: i64 = strlen(qstr) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < qlen; i++) {
+            if (qstr[i] == ':' && qstr[i + 1] == ':') { last_sep = i + 2; }
+        }
+        if (last_sep < 0) { return qname; }
+        return this.intern_table.intern(qstr.substring(last_sep, qlen - last_sep));
+    }
+
+    /// Resolve a concrete `Base::Member` projection to the member's actual type
+    /// by finding the trait (declaring `member`) that `Base` implements and
+    /// reading that impl's binding for `member` (the positional trait arg under
+    /// the sugar, or an explicit `type Item = ...` body binding), instantiated
+    /// against `Base`'s own type arguments. Returns invalid when none applies.
+    resolve_concrete_member(&this, base_ty: TypeRef, member: SymbolStr,
+                            ctx: ResolutionContext*) -> TypeRef {
+        if (this.generic_registry == null) { return TypeRef::invalid(); }
+        const bt: Type* = this.arena.lookup(base_ty.id);
+        if (bt == null) { return TypeRef::invalid(); }
+        const bare: SymbolStr = this.proj_bare_name(base_ty);
+        if (!bare.is_valid()) { return TypeRef::invalid(); }
+
+        mut base_args: TypeRef[] = [];
+        if (bt.kind == TypeKind::InstantiatedType) {
+            base_args = (bt as InstantiatedType*).type_args;
+        }
+
+        for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
+            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
+            if (tdecl == null) { continue; }
+            mut assoc_pos: i64 = -1;
+            for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
+                if (tdecl.assoc_types[a] != null
+                        && tdecl.assoc_types[a].name.equals(member)) {
+                    assoc_pos = a;
+                    break;
+                }
+            }
+            if (assoc_pos < 0) { continue; }
+            const impl_node: ImplBlockNode* =
+                this.generic_registry.lookup_trait_impl(tdecl.name, bare);
+            if (impl_node == null) { continue; }
+
+            // The binding annotation: positional trait arg (sugar) at
+            // generic-params + assoc index, else an explicit body binding.
+            mut ann: TypeAnnotation* = null;
+            const idx: i64 = tdecl.generic_params.length + assoc_pos;
+            if (impl_node.trait_annotation != null) {
+                match (*impl_node.trait_annotation) {
+                    TypeAnnotation::Generic(g) => {
+                        if (idx < g.args.length) { ann = g.args[idx]; }
+                    }
+                    _ => {}
+                }
+            }
+            if (ann == null) { ann = impl_node.lookup_assoc_binding(member); }
+            if (ann == null) { continue; }
+
+            // Resolve the binding with the impl's target params bound to the
+            // base's concrete args (`T -> i32` for `Range<i32>`); empty for a
+            // non-generic base like `IntSeq`.
+            mut bctx: ResolutionContext = ResolutionContext::new("", "");
+            if (impl_node.target_args.length == base_args.length) {
+                for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
+                    const ta: TypeAnnotation* = impl_node.target_args[ti];
+                    if (ta == null) { continue; }
+                    match (*ta) {
+                        TypeAnnotation::Named(n) => { bctx.add_binding(n.name, base_args[ti]); }
+                        _ => {}
+                    }
+                }
+            }
+            const r: TypeRef = this.resolve(ann, &bctx);
+            if (r.is_valid()) {
+                const rt: Type* = this.arena.lookup(r.id);
+                // Guard against returning another unresolved projection.
+                if (rt != null && rt.kind != TypeKind::AssocProjection) {
+                    return r;
+                }
+            }
         }
         return TypeRef::invalid();
     }
@@ -691,6 +813,34 @@ private:
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
             return binding;
+        }
+
+        // 1b. Associated-type projection on a generic parameter: `I::Item`,
+        //     where `I` is a generic parameter in scope. Such a projection is
+        //     parsed as a FLAT qualified Named (only `This::Item` becomes a
+        //     Projection node), so detect it here: if the segment before the
+        //     first `::` binds to a type in scope, project the remainder off it.
+        //     A real module-qualified type (`core::iter::Foo`) has a prefix
+        //     (`core`) that is NOT a generic-param binding, so it is unaffected.
+        if (name_len > 2) {
+            mut sep: i64 = -1;
+            mut k: i64 = 0;
+            while (k + 1 < name_len) {
+                if (name_str[k] == ':' && name_str[k + 1] == ':') { sep = k; break; }
+                k = k + 1;
+            }
+            if (sep > 0) {
+                const prefix_str: string = name_str.substring(0, sep);
+                const prefix_sym: SymbolStr = this.intern_table.intern(prefix_str);
+                const prefix_ty: TypeRef = ctx.lookup_binding(prefix_sym);
+                if (prefix_ty.is_valid()) {
+                    const member_str: string =
+                        name_str.substring(sep + 2, name_len - sep - 2);
+                    const member_sym: SymbolStr = this.intern_table.intern(member_str);
+                    const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
+                    if (proj.is_valid()) { return proj; }
+                }
+            }
         }
 
         // 2. Check if this is a primitive type name.

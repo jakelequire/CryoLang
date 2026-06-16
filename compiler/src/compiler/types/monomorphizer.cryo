@@ -1966,6 +1966,133 @@ type struct Monomorphizer {
         return out;
     }
 
+    /// Reduce an associated-type projection over a CONCRETE base to its member
+    /// type: `Range<i32>::Item` -> `i32`. Finds the trait the base implements
+    /// that declares `member`, then reads the bound arg via
+    /// `concrete_trait_args_for` (for the positional-sugar impls, that arg list
+    /// *is* the associated-type binding). Returns invalid when the base is still
+    /// symbolic (generic param) or no such impl/binding exists.
+    resolve_concrete_projection(mut &this, base_ty: TypeRef, member: SymbolStr) -> TypeRef {
+        if (this.generic_registry == null) { return TypeRef::invalid(); }
+        const bt: Type* = this.arena.lookup(base_ty.id);
+        if (bt == null) { return TypeRef::invalid(); }
+        // Only concrete bases reduce here; a generic-param / still-symbolic base
+        // stays a projection (resolved at a later/outer specialization).
+        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam
+                || bt.kind == TypeKind::AssocProjection) {
+            return TypeRef::invalid();
+        }
+        for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
+            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
+            if (tdecl == null) { continue; }
+            // Position of `member` among the trait's associated types.
+            mut assoc_pos: i64 = -1;
+            for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
+                if (tdecl.assoc_types[a] != null
+                        && tdecl.assoc_types[a].name.equals(member)) {
+                    assoc_pos = a;
+                    break;
+                }
+            }
+            if (assoc_pos < 0) { continue; }
+            // Positional-sugar index: declared generic params come first in the
+            // trait-arg list, then the associated types.
+            const idx: i64 = tdecl.generic_params.length + assoc_pos;
+            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, tdecl.name);
+            if (idx < args.length && args[idx].is_valid()) {
+                return args[idx];
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Recursively replace concrete-base associated-type projections in `ty`
+    /// with their member type (`Option<Range<i32>::Item>` -> `Option<i32>`),
+    /// caching the result on each `AssocProjectionType`. Symbolic (generic-base)
+    /// projections and projection-free types are returned unchanged. Called on a
+    /// spec'd method's signature after generic substitution, so adapter element
+    /// types like `MapIter.f: (I::Item)->O` become concrete before mangling.
+    reduce_projections(mut &this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return ty; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
+                const base: TypeRef = this.reduce_projections(proj.base);
+                const reduced: TypeRef = this.resolve_concrete_projection(base, proj.member);
+                if (reduced.is_valid()) {
+                    proj.set_resolved_type(reduced);
+                    return reduced;
+                }
+                return ty;
+            }
+            TypeKind::Pointer => {
+                const p: PointerType* = t as PointerType*;
+                const inner: TypeRef = this.reduce_projections(p.pointee);
+                if (inner.equals(p.pointee)) { return ty; }
+                return this.arena.get_pointer_to(inner);
+            }
+            TypeKind::Reference => {
+                const r: ReferenceType* = t as ReferenceType*;
+                const inner: TypeRef = this.reduce_projections(r.referent);
+                if (inner.equals(r.referent)) { return ty; }
+                return this.arena.get_reference_to(inner, r.mutability);
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = t as ArrayType*;
+                const inner: TypeRef = this.reduce_projections(a.element);
+                if (inner.equals(a.element)) { return ty; }
+                return this.arena.get_array_of(inner, a.size);
+            }
+            TypeKind::Optional => {
+                const o: OptionalType* = t as OptionalType*;
+                const inner: TypeRef = this.reduce_projections(o.wrapped);
+                if (inner.equals(o.wrapped)) { return ty; }
+                return this.arena.get_optional_of(inner);
+            }
+            TypeKind::Function => {
+                const f: FunctionType* = t as FunctionType*;
+                const new_ret: TypeRef = this.reduce_projections(f.return_type);
+                mut changed: boolean = !new_ret.equals(f.return_type);
+                mut new_params: TypeRef[] = [];
+                for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                    const np: TypeRef = this.reduce_projections(f.param_types[i]);
+                    new_params.push(np);
+                    if (!np.equals(f.param_types[i])) { changed = true; }
+                }
+                if (!changed) { return ty; }
+                return this.arena.get_function(new_ret, new_params, f.is_variadic);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                mut changed_t: boolean = false;
+                mut new_elems: TypeRef[] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    const ne: TypeRef = this.reduce_projections(tup.elements[i]);
+                    new_elems.push(ne);
+                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
+                }
+                if (!changed_t) { return ty; }
+                return this.arena.get_tuple(new_elems);
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                mut changed_i: boolean = false;
+                mut new_args: TypeRef[] = [];
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    const na: TypeRef = this.reduce_projections(inst.type_args[i]);
+                    new_args.push(na);
+                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
+                }
+                if (!changed_i) { return ty; }
+                return this.arena.create_instantiation(inst.generic_base, new_args);
+            }
+            _ => { return ty; }
+        }
+    }
+
     /// Bind impl-introduced generic params that the Self type doesn't
     /// determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
     /// where I: Iterator<A>`) into `res_ctx`, by resolving each where-bound
@@ -2731,6 +2858,23 @@ type struct Monomorphizer {
                 }
             }
         }
+
+        // Reduce concrete-base associated-type projections in the spec
+        // signature: resolving a `P::Item` annotation under concrete bindings
+        // (`P := IntSeq`) yields `AssocProjection(IntSeq, Item)`; reduce it to
+        // the member type (`i32`) by reading IntSeq's trait-impl binding, so the
+        // spec signature is fully concrete before it is registered/mangled.
+        if (func.resolved_return_type.is_valid()) {
+            func.resolved_return_type =
+                this.reduce_projections(func.resolved_return_type);
+        }
+        for (mut rpi: i64 = 0; rpi < func.parameters.length; rpi++) {
+            const rpp: VarDeclNode* = func.parameters[rpi];
+            if (rpp != null && rpp.resolved_type.is_valid()) {
+                rpp.resolved_type = this.reduce_projections(rpp.resolved_type);
+            }
+        }
+
         if (func.body != null) {
             this.resolve_body_locals(func.body, res_ctx);
             // Walk the body to find inferred-arg generic free-function
@@ -6392,6 +6536,22 @@ type struct Monomorphizer {
             const sp: VarDeclNode* = spec_method.func.parameters[i];
             if (sp != null && sp.resolved_type.is_valid()) {
                 sp.set_resolved_type(subst_ptr.apply(sp.resolved_type, this.arena));
+            }
+        }
+
+        // Associated-type projection reduction.  Substitution above turned a
+        // generic-base projection (`I::Item`) into a concrete-base one
+        // (`IntSeq::Item`); reduce that to the actual member type (`i32`) by
+        // reading the base's trait-impl binding, so the spec signature is fully
+        // concrete before mangling (adapter elements `f: (I::Item)->O` etc.).
+        if (spec_method.func.resolved_return_type.is_valid()) {
+            spec_method.func.set_resolved_return_type(
+                this.reduce_projections(spec_method.func.resolved_return_type));
+        }
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const sp2: VarDeclNode* = spec_method.func.parameters[i];
+            if (sp2 != null && sp2.resolved_type.is_valid()) {
+                sp2.set_resolved_type(this.reduce_projections(sp2.resolved_type));
             }
         }
 
