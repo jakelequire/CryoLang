@@ -57,7 +57,19 @@ stage_common() {
     ( cd "${ROOT}/stdlib" && tar --exclude='.bin/obj' --exclude='.bin/win-*' \
         --exclude='.bin/self' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
     [ -f "${ROOT}/LICENSE" ] && cp "${ROOT}/LICENSE" "${stage}/LICENSE" || true
+    stage_third_party_licenses "$stage"
     echo "$VER" > "${stage}/VERSION"
+}
+
+stage_third_party_licenses() {
+    # libLLVM is redistributed (statically linked into the Linux cryo, shipped
+    # as LLVM-C.dll on Windows). Its Apache-2.0-with-LLVM-exceptions license
+    # MUST accompany the binary, so this is a hard requirement, not best-effort.
+    local stage="$1"
+    local llvm_lic="${ROOT}/LLVM-LICENSE.txt"
+    [ -f "$llvm_lic" ] || { echo "error: ${llvm_lic} missing - libLLVM is redistributed and its license must ship" >&2; exit 1; }
+    mkdir -p "${stage}/THIRD_PARTY_LICENSES"
+    cp "$llvm_lic" "${stage}/THIRD_PARTY_LICENSES/LLVM-LICENSE.txt"
 }
 
 build_linux() {
@@ -123,6 +135,7 @@ build_windows() {
     mkdir -p "${stage}/stdlib"
     ( cd "${ROOT}/stdlib" && tar --exclude='.bin' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
     [ -f "${ROOT}/LICENSE" ] && cp "${ROOT}/LICENSE" "${stage}/LICENSE" || true
+    stage_third_party_licenses "$stage"
     echo "$VER" > "${stage}/VERSION"
 
     local archive="${DIST}/cryo-${VER}-windows-x86_64.zip"

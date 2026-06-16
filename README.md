@@ -418,7 +418,7 @@ entry_point = "src/tool/main.cryo"
 | `thread` | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
 | `test` | The built-in unit-test framework. |
 
-The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `collections::array`, and `alloc::box`.
+The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::varargs`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
 
 ---
 
@@ -540,7 +540,7 @@ for the full 1.0 release notes.
 **Beyond 1.0 (post-stable):**
 
 - Async / await / coroutines (currently parser-only).
-- The remaining iterator adapters (`.collect`, `.zip`, `.chain`, `.enumerate`, …). `.take`, `.map`, `.filter`, `.copied`, and `.cloned` ship in 1.0 — they work directly on iterators consumed by `.count` / `.fold` / `for-in`, but own-generic adapters chained after another adapter (e.g. `.take().map()`) are not yet supported. `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
+- Re-adapting an opaque-typed iterator **local**. The adapters `.map`, `.filter`, `.take`, `.chain`, `.enumerate`, `.zip` (plus `.copied` / `.cloned`) ship in 1.0 and compose when chained directly off the source (`src.map(f).filter(g)`), consumed by `.count` / `.fold` / `.for_each` / `for-in` or gathered with `from_iter`. The residual limitation is binding an adapter to a local and re-adapting it (`let it = src.map(f); it.filter(g)`) — see [`docs/cryo.md` § 2.11](./docs/cryo.md). `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
 - Dialable IPv6 (the `IpAddr::V6` representation and DNS resolution exist in 1.0; connecting over v6 does not yet).
 - macOS / Darwin targets. (x86_64 Linux and x86_64 Windows — native builds plus Linux→Windows cross via mingw-w64 — ship in 1.0.)
 
