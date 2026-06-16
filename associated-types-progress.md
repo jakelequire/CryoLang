@@ -49,7 +49,7 @@ order; a lone positional arg binds the sole associated type **only when the trai
 
 ## Staging (each stage compiles; validated before the next)
 
-- [~] **Stage 0 — baseline & loop.** DONE. Suite green; inner loop = `make cryo`
+- [x] **Stage 0 — baseline & loop.** DONE. Suite green; inner loop = `make cryo`
   (pin rebuilds stage-2) → test stage-2 against standalone programs. CRYO_CC=gcc.
 - [x] **Stage 1 — parser + AST.** DONE. Added `AssocTypeDeclNode` + `TraitDeclNode.assoc_types`;
   `ImplBlockNode` assoc bindings; `TypeAnnotation::Projection` + `ProjectionAnnotation`.
@@ -60,13 +60,13 @@ order; a lone positional arg binds the sole associated type **only when the trai
   (assoc decl + `This::Item` + positional header + `type Item = T;` body form) compiles
   AND runs → `exit=7`. NB: didn't yet *force* projection resolution (impls gave concrete
   return types); that's Stage 3.
-- [~] **Stage 2 — type-system representation.** Additive foundation landed:
+- [x] **Stage 2 — type-system representation.** Additive foundation landed:
   `AssocProjectionType` class + `TypeKind::AssocProjection` (only `to_string` needed an
   arm; `is_primitive`/`is_compound` have wildcards); arena `create_assoc_projection`
   factory + dedup cache; `TraitType.assoc_type_names` (+ add/has/count); assoc decls
   registered into TraitType in TypeResolution. **Remaining for Stage 3:** resolve impl
   bindings (`type Item = T` + positional-sugar desugar) onto the impl as TypeRefs.
-- [~] **Stage 3 — resolution & inference.** IN PROGRESS. Landed & validated:
+- [x] **Stage 3 — resolution & inference.** DONE (engine landed; residual gaps tracked in the audit at the bottom). Landed & validated:
   - `bind_trait_args_for_impl` extended with the positional-sugar desugar
     (0 generic params + 1 assoc type ⇒ `Item -> T` bound in the impl context +
     recorded on the impl node). Legacy generic-param path preserved exactly.
@@ -166,8 +166,20 @@ order; a lone positional arg binds the sole associated type **only when the trai
     `I::Item` in method signatures AND struct fields, concrete reduction at mono, AND
     chained adapters (`First<First<IntSeq>>`). Seven repros pass
     (min1/min2/default/parse/adapter/field/chain).
-  - **Remaining:** diagnostics (Stage 5); `where I::Item: Copy` bounds; then the
-    repin + stdlib migration (Stage 6) + full validation. (old note below.)
+  - **Remaining:** diagnostics (Stage 5 — NOW DONE); `where I::Item: Copy` bounds
+    (see gap note below); then the repin + stdlib migration (Stage 6) + full
+    validation. (old note below.)
+  - **`where I::Item: Copy` — DOCUMENTED GAP (not wired).** Tested
+    `function f<I>(...) where I: Iterator, I::Item: Copy`: it does **not parse** —
+    the where-clause subject parser rejects a projection (`expected trait name,
+    found '::'` at the `::` in `I::Item`). This is a parser-level gap: a where
+    bound's subject must be a bare generic param, not a `Param::Member`
+    projection. Not exercised by the current stdlib (no adapter needs a bound on
+    a projected item), and wiring it touches parser + AST (projection-subject
+    representation) + resolver/sema bound-checking + monomorphizer enforcement —
+    a real chunk of work with bootstrap-repin risk for zero current callers.
+    Left as a documented limitation; revisit if a stdlib/user adapter ever needs
+    a trait bound on `I::Item`.
   - (old note) Repro `scratch/assoc_adapter_test.cryo` (a generic
     adapter `First<I> where I: Seq` with `type Item = I::Item` + `next_one -> Option<I::Item>`):
     currently CRASHES (exit 3, no diagnostic) during **TypeResolution Phase 3 (function
@@ -210,10 +222,32 @@ order; a lone positional arg binds the sole associated type **only when the trai
     `tests/tests/negative/E0200_opaque_assoc_item_{binding,return}.cryo`
     (compile-fail count 94 → 96). Full suite GREEN (1230 unit / 96 compile-fail), Linux
     selfhost byte-identical fixed point. UNCOMMITTED.
-- [ ] **Stage 5 — diagnostics.** "assoc type `Item` not bound in this impl";
-  "trait `Foo` has generic params — bind `Out` by name".
-- [~] **Stage 6 — repin, then migrate stdlib.** IN PROGRESS.
-  - **Phase A — compiler prep (DONE, validated, UNCOMMITTED).** A spike mirroring the
+- [x] **Stage 5 — diagnostics.** DONE. Two new error codes
+  (`compiler/src/compiler/diag/_module.cryo`): **E0309** ("associated type
+  `Item` not bound in this impl of trait `Foo`") and **E0310** ("trait `Foo`
+  has generic parameters - bind `Out` by name (`Out = ...`)"). Both emitted from
+  a new `validate_impl_assoc_bindings` in `passes/type_resolution.cryo`, called
+  once per source-level trait impl in the FuncSig phase right after
+  `bind_trait_args_for_impl` (so the positional-sugar binding is already
+  recorded on the node when we check). Logic:
+  - Return early unless the impl's trait declares ≥1 associated type (so every
+    legacy / non-assoc impl is untouched — only Iterator is affected today).
+  - **E0310** fires when `ngp > 0 && nargs > ngp` (overflow positional args can
+    only be a positional assoc bind); returns before E0309.
+  - **E0309** fires for any declared assoc type with no
+    `impl_node.lookup_assoc_binding(name)` after binding. Where-clause adapters
+    (`implement<I,A> Iterator<A> for TakeIter<I> where I: Iterator<A>`) bind
+    `Item := A` via positional sugar (Iterator has 0 generic params) so they are
+    correctly NOT flagged.
+  - **Tests:** `tests/tests/negative/E0309_assoc_type_not_bound.cryo` and
+    `E0310_positional_assoc_with_generics.cryo` (compile-fail 96 → 98). The
+    positive stdlib adapters produce no false positives (the full stdlib builds
+    clean). Suite **1230 unit / 98 compile-fail GREEN**, Linux selfhost
+    byte-identical fixed point (md5 `00d9c2f9…`). UNCOMMITTED; needs a repin so
+    the installed `bin/cryo` emits the new codes (not a bootstrap necessity —
+    the compiler source uses no new syntax, so the old pin builds it fine).
+- [x] **Stage 6 — repin, then migrate stdlib.** DONE (committed + pinned; the “UNCOMMITTED” notes below are historical).
+  - **Phase A — compiler prep (DONE, COMMITTED+PINNED as `6effa486`).** A spike mirroring the
     real adapter shapes (`scratch/assoc_combinator_chain.cryo`, `scratch/proj_wherebound.cryo`)
     surfaced TWO compiler gaps the migration needs; both fixed in `resolver.cryo`
     `resolve_concrete_member`:
@@ -240,17 +274,69 @@ order; a lone positional arg binds the sole associated type **only when the trai
     to build, so the pin must include them first. Order: commit Phase A → `make pin` → then
     Phase B can build. (This is the plan's "repin, then migrate" — the pin must carry the
     fixes, not just parse the syntax.)
-  - **Phase B — stdlib migration (NOT STARTED, needs Phase-A pin).** trait decl → `type Item;`,
-    defaults → `This::Item`; drop adapter input-item params (`MapIter<I,A,O>`→`<I,O>`,
-    `FilterIter<I,A>`→`<I>`, `EnumerateIter<I,A>`→`<I>`). NOTE from reading the code:
-    `TakeIter<I>`, `ChainIter<I,J>`, `ZipIter<I,J>` are ALREADY where-clause-only (`A`/`O` are
-    impl generics, not struct params) → their struct defs + impls are UNCHANGED; only `MapIter`,
-    `FilterIter`, `EnumerateIter` drop a struct param. Explicit-arity call sites to fix:
-    `tests/tests/stdlib/iter.cryo` (`EnumerateIter<R,i32>`→`<R>` ×2,
-    `MapIter<TakeIter<R>,i32,i32>`→`<...,i32>`). 16 impl headers stay positional (sugar).
-- [ ] **Stage 7 — validate.** Full suite O2 + O0; stage-2 self-host rebuild; add the
-  re-adapt-opaque-local test + negative tests (unbound / wrongly-positional assoc);
-  final repin.
+  - **Phase B — stdlib migration (DONE, validated, UNCOMMITTED; needs a bootstrap repin).**
+    `stdlib/core/iter.cryo`: trait `Iterator<Item>` → `Iterator { type Item; }`, every default's
+    `Item` → `This::Item`; `MapIter<I,A,O>`→`<I,O>` (field `f: (I::Item)->O`),
+    `FilterIter<I,A>`→`<I>` (`pred: (I::Item)->boolean`, impl `Iterator<I::Item>`),
+    `EnumerateIter<I,A>`→`<I>` (impl `Iterator<Pair<u64,I::Item>>`). `TakeIter`/`ChainIter`/
+    `ZipIter` were ALREADY where-clause-only → struct+impl UNCHANGED. Collection iterators
+    (`HashMapIter`, `RefIter`, `CopiedIter`, `SliceIter`, `Range`, …) use positional sugar and
+    needed NO source change. Call sites fixed: `tests/tests/stdlib/iter.cryo`
+    (`EnumerateIter<R>` ×2, `MapIter<...,i32>`).
+    - **Gap 3 found + fixed during Phase B:** `CopiedIter`/`ClonedIter` bind their item via a
+      POINTER-wrapped where-arg (`where I: Iterator<T*>` — bridge `RefIter`'s `T*` to `T`). My
+      Phase-A `derive_where_assoc_bindings` only bound simple `Named` args, so `CopiedIter<RefIter<u8>>::Item`
+      stayed symbolic and leaked an unreduced projection into `Option<u8>` (E0200 in option.cryo
+      during stdlib build). Fix: factored `bind_where_arg_into_ctx` (resolver.cryo) mirroring the
+      monomorphizer's `bind_where_arg_param` — peels `Pointer`/`Reference` wrappers to bind the
+      inner param. (UNCOMMITTED, NOT in pin yet.)
+    - **Stage-4 cross-check relaxed (false positive fixed):** `implement Iterator<String>` bound to
+      an iterator whose Item is `String<GlobalAlloc>` (same nominal type, default-allocator repr)
+      wrongly errored under the strict `canon_type_id` compare. Now flags ONLY a category-level
+      mismatch (`check_compatibility == Incompatible` BOTH directions) — distinct user structs /
+      struct-vs-primitive. Trade-off: a widening-adjacent slip (`i32` vs `i64`) is implicit-
+      convertible so it is no longer flagged. Negative tests rewritten to distinct user structs
+      (`Apple` vs `Orange`) which also resolve under the compile-fail harness's `cryo check`.
+    - **VALIDATION (via `build/cryo` built against the migrated stdlib, NOT the stale pin):** full
+      suite **1230 unit / 96 compile-fail GREEN**; the compiler self-builds against the migrated
+      stdlib; manual 2-cycle rebuild is **BYTE-IDENTICAL FIXED POINT** (md5 `6b0cb226…`).
+    - **⚠ BOOTSTRAP REPIN REQUIRED (the catch).** The committed pin (`6effa486`) predates Gap 3 +
+      the migrated stdlib, so `make pin`/`make cryo`/`selfhost-check.py` (which build the stdlib
+      with the pin) will FAIL on the migrated stdlib. Recovery (2-phase): promote the known-good
+      working compiler into the pin slot first, e.g. `cp compiler/build/cryo bin/cryo` (Linux)
+      then `make pin` + `selfhost-check.py` succeed; the Windows pin (`bin/cryo.exe`) needs its
+      usual wine cross-build. Until then the working tree's normal `make` targets are bootstrap-
+      blocked — validate with `cd stdlib && ../compiler/build/cryo build` then
+      `cd compiler && build/cryo build` + `make test`.
+- [x] **Stage 7 — validate.** DONE (one finding + the final repin is the user's).
+  - **Full suite at BOTH opt levels:** `make test ARGS="--opt-level=0"` and
+    `--opt-level=2` → **1230 unit / 98 compile-fail GREEN** at each.
+  - **Self-host rebuild:** `selfhost-check.py --no-windows` → BYTE-IDENTICAL
+    fixed point (md5 `00d9c2f9444aa3b72d71c25c43fac816`). The committed/pinned
+    `bin/cryo` builds the new compiler source fine (no new syntax in the
+    compiler), so there is NO bootstrap gate this round — unlike the Stage 6
+    Phase B catch.
+  - **re-adapt-opaque-local — NOT lifted (verified, limitation stands).** Tested
+    `mut it: implement Iterator<i32> = Range<i32>::new(0,10); it.take(3)` → still
+    `E0636` (`no method 'take' on Range<i32>` / `no method 'next' on
+    TakeIter<This>`). The opaque local's *visible* type is the abstract trait, so
+    the combinator has no concrete receiver to specialize against — exactly the
+    `docs/cryo.md` §2.11 limitation, which this migration did **not** change. So
+    NO positive re-adapt test was added, and the §2.11 + `core/iter.cryo`
+    header + CHANGELOG limitation notes were KEPT (only the stale "`<i32>` not
+    yet cross-checked" §2.11 paragraph was corrected — Stage 4 made it real).
+  - **Negative tests for unbound / wrongly-positional:** the E0309 / E0310 cases
+    added in Stage 5 (overlap, as noted).
+  - **Final repin: the user's action.** A repin captures E0309/E0310 into
+    `bin/cryo`; it is not required for a green tree (additive, no new syntax).
+- **Docs sweep — DONE.** `docs/cryo.md`: new §11.5 "Associated Types" (decls,
+  projections, positional/body binding, E0309/E0310), updated the §11.4 Iterator
+  table row, and corrected the §2.11 cross-check paragraph. `CHANGELOG.md`: new
+  `[Unreleased]` section (Added: associated types + diagnostics; Changed:
+  `core::iter` Iterator migration, source-compatible via sugar) — the frozen
+  1.0.0 section is left intact (it correctly records the historical
+  generic-param form). `stdlib/core/iter.cryo` header limitation note KEPT
+  (re-adapt-opaque-local is genuinely still restricted).
 
 ## Key files (from the structural map)
 - Parser: `parser/parser.cryo` (`parse_trait_declaration` :1344, `parse_implementation_block`
@@ -269,3 +355,89 @@ order; a lone positional arg binds the sole associated type **only when the trai
   spot; it must resolve during `MapIter` monomorphization.
 - Bootstrap: compiler source must NOT use the new syntax until after the repin
   (Stage 6), so the old pin can always rebuild the compiler.
+
+## Feature-completeness audit (2026-06-16, post-repin)
+
+Jake asked "is this completely complete?" — so the whole plan (not just the
+progress file) was re-audited against `associated-types-plan.md`. **The Iterator
+rollout — the actual v1.0 deliverable — is complete and solid:** trait `type
+Item;` decls, `This::Item`/`I::Item` projections, positional sugar, the explicit
+`type Item = …;` body form (works for generic-param traits too), concrete
+reduction at mono, chained adapters, opaque-return Item cross-check (E0200),
+declaration-site bound enforcement (E0306), E0309/E0310, full suite 1230/99 at
+**O0 + O2**, selfhost byte-identical. Three plan items were flagged in the
+audit; **item 2 is now implemented**, items 1 & 3 remain latent (no
+current/stdlib caller) — documented here as conscious deferrals, not oversights:
+
+1. **Inline named binding `<Name = T>` — NOT parsed (deferred sugar).**
+   Plan decision #6 ("Named bindings are always allowed", example
+   `implement trait Foo<i32, Out = bool>`). The parser rejects `=` inside the
+   angle brackets (`expected '>', found '='`). **Capability is NOT lost** — an
+   associated type on a generic-param trait is bound via the **body form**
+   (`implement trait Conv<i32> for X { type Out = i64; … }`), which works and is
+   what **E0310 now recommends** (the message was reworded from the unparseable
+   `Out = …` angle form to `type Out = …;`). Only the inline-sugar convenience
+   is missing; zero stdlib callers (Iterator has 0 generic params). Wiring it =
+   parser (`parse_generic_arguments` to accept `ident = type`) + desugar into the
+   impl assoc-binding table. Deferred.
+
+2. **Declaration-site assoc bounds (`type Item: Copy`) — NOW ENFORCED (Gap 2
+   DONE, 2026-06-16).** Plan decision #1 + compiler-work #2. Previously
+   `AssocTypeDeclNode.bounds` was parsed but read by no pass, so an impl binding
+   a non-`Copy` `Item` to a `type Item: Copy` trait was silently accepted. Fix:
+   `Sema::check_assoc_decl_bounds` (sema.cryo), called from `visit(ImplBlockNode*)`
+   for each CONCRETE trait impl. For every associated type the trait declares
+   WITH a bound, it resolves the impl's concrete binding via
+   `type_resolver.resolve_concrete_member(impl_this, Item)` and checks it against
+   each `adecl.bounds` entry with the authoritative
+   `ctx.monomorphizer.type_implements_trait` (markers Copy/Send/Sync handled
+   structurally via OwnershipQuery; nominal traits via the trait-impl registry,
+   which is fully populated by the time sema runs). Emits **E0306** on a
+   confirmed violation; conservative (skips an undeterminable or still-generic
+   item → no false positives, and an unbounded `type Item;` never reaches the
+   bound loop, so Iterator is untouched). Fires under both `build` and `check`
+   (positional sugar AND `type Item = …;` body form). **Test:**
+   `tests/tests/negative/E0306_assoc_decl_bound.cryo` (compile-fail 98 → 99).
+   **Deferred slice:** generic-adapter impls whose `Item` is symbolic
+   (`I::Item`) are checked per concrete instantiation only if reached; today
+   they're doubly-unreachable (you'd need the non-parsing `where I::Item: Copy`).
+   Suite 1230/99 GREEN at O0+O2, selfhost byte-identical. UNCOMMITTED — needs a
+   repin.
+
+3. **Opaque-local re-adaptation — INVESTIGATED + attempted; NOT lifted, by
+   design-cost (Gap 3).** `mut it: implement Iterator<i32> = …; it.take(3)` →
+   E0636. **Precise blocker (root-caused this session):** the receiver typing is
+   actually fine — sema already back-fills the opaque local's `resolved_type` to
+   the concrete initializer type (sema.cryo ~2279-2309). The failure is pass
+   ORDER: **Monomorphization runs BEFORE FunctionBodyTypeCheck/sema** (pipeline
+   309 vs 312), so at mono time the opaque local has no concrete type yet, and
+   mono's combinator-specialization walk leaves `TakeIter<This>` unspecialized.
+   The natural fix — type the opaque local from its initializer in
+   `Monomorphizer::collect_locals_in_stmt` — was tried and **reverted**: mono's
+   `resolve_arg_type_for_inference` *deliberately* returns invalid for a
+   static-call receiver like `Range<i32>::new(...)` (monomorphizer.cryo
+   ~3895-3905, to avoid mis-specializing generic methods on call-expr receivers),
+   which is exactly the canonical §2.11 initializer. So typing the initializer at
+   mono time collides head-on with that guard, in the most regression-prone part
+   of the compiler (the combinator inference pinned by ~30 `iter.cryo` tests).
+   A real fix needs either an early opaque-local concrete-inference pre-pass or a
+   targeted static-constructor-return resolver — substantial, and tangential to
+   associated types (the limit is opaque-type/inference machinery, not Item
+   ambiguity). **Verdict:** kept as a documented limitation (§2.11 +
+   `core/iter.cryo` header); the clean workaround (chain on the expression, or
+   bind a concrete adapter-typed local) stands. Recommended next pickup if the
+   limit is ever worth lifting: the pass-order + static-call-receiver-typing work
+   above, on its own branch, with the full iter suite as the guard.
+
+**Bookkeeping reconciled:** Stage 0/2/3/6 checkboxes flipped `[~]`→`[x]`; the
+Stage-6 "UNCOMMITTED / needs bootstrap repin" notes are historical (now
+committed `14ed77ba`/`6effa486`/… + pinned by Jake). The `where I::Item: Copy`
+where-bound-subject gap (also a parser limitation, see Stage-3 note) stands.
+
+**Status (2026-06-16, post-Gap-2):** the Iterator rollout is done AND
+declaration-site bound enforcement (Gap 2) is done. Remaining deferred, all
+zero-caller today: inline `<Name = T>` sugar (item 1 — Jake chose the body form
+for now), the `where I::Item: Copy` where-subject parse, and opaque-local
+re-adaptation (item 3 — deep, off-feature). Suite 1230 unit / 99 compile-fail
+GREEN at O0+O2, selfhost byte-identical (md5 `399e90d4…`). UNCOMMITTED — Gap 2
+(sema.cryo + the E0306 test) and the earlier E0310-message reword need a repin.

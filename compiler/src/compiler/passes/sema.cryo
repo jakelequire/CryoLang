@@ -1705,7 +1705,80 @@ public:
             if (greg.get_template(qualified_target) != null) { return; }
         }
         const impl_this: TypeRef = this.lookup_type_by_sym(node.target_type);
+        // Enforce declaration-site associated-type bounds (`type Item: Copy`)
+        // for this concrete impl (generic templates already returned above;
+        // their Item is per-spec and re-checked at each instantiation).
+        this.check_assoc_decl_bounds(node, impl_this);
         this.visit_methods(node.methods, impl_this);
+    }
+
+    /// Enforce a trait's declaration-site associated-type bounds against this
+    /// concrete impl's binding. For each associated type the trait declares
+    /// WITH a bound (`type Item: Copy + Clone;`), resolve what this impl binds
+    /// it to (`X::Item`) and verify the concrete type satisfies every bound;
+    /// emit E0306 otherwise. This closes the gap where `AssocTypeDeclNode.bounds`
+    /// was parsed but never checked, so a non-`Copy` `Item` bound to a
+    /// `type Item: Copy` trait was silently accepted.
+    ///
+    /// Conservative: emits only on a CONFIRMED violation (the item resolves to a
+    /// fully concrete type AND `type_implements_trait` says no). An
+    /// undeterminable or still-generic item is skipped (no false positives), so
+    /// an unbounded `type Item;` (Iterator's case) never reaches the bound loop.
+    check_assoc_decl_bounds(mut &this, node: ImplBlockNode*, impl_this: TypeRef) -> void {
+        if (node == null || !node.is_trait_impl()) { return; }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
+        if (this.ctx.monomorphizer == null) { return; }
+        if (!impl_this.is_valid()) { return; }
+        const trait_leaf: SymbolStr = this.trait_leaf_name(node.trait_annotation);
+        if (!trait_leaf.is_valid()) { return; }
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        if (tdecl == null) { return; }
+
+        const span: SourceSpan = if (node.target_type_span.has_location()) {
+            node.target_type_span
+        } else {
+            node.span
+        };
+        const trait_str: string = this.intern.resolve(trait_leaf);
+
+        for (mut i: i64 = 0; i < tdecl.assoc_types.length; i++) {
+            const adecl: AssocTypeDeclNode* = tdecl.assoc_types[i];
+            if (adecl == null || adecl.bounds.length == 0) { continue; }
+
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            const item_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(
+                impl_this, adecl.name, &rc);
+            // Undeterminable or still-generic -> can't confirm a violation, so
+            // stay silent (the per-instantiation path re-checks concrete specs).
+            if (!item_ty.is_valid()) { continue; }
+            if (Monomorphizer::mono_type_contains_generic_param(this.arena, item_ty)) {
+                continue;
+            }
+
+            const item_name: string = this.intern.resolve(adecl.name);
+            const item_t: Type* = this.arena.lookup(item_ty.id);
+            const item_disp: string = if (item_t != null) {
+                this.arena.format_display(item_t)
+            } else {
+                "?"
+            };
+
+            for (mut b: i64 = 0; b < adecl.bounds.length; b++) {
+                const tref: TraitRef* = &adecl.bounds[b];
+                if (tref.path.length == 0) { continue; }
+                const bound_trait: SymbolStr = tref.path[tref.path.length - 1];
+                if (this.ctx.monomorphizer.type_implements_trait(item_ty, bound_trait, 0)) {
+                    continue;
+                }
+                const bound_str: string = this.intern.resolve(bound_trait);
+                this.ctx.emit_error_at(
+                    ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                    format(
+                        "associated type `%s` of trait `%s` is bound to `%s`, which does not satisfy the declared bound `%s: %s`",
+                        item_name, trait_str, item_disp, item_name, bound_str),
+                    span);
+            }
+        }
     }
 
     /// Type-check all method bodies in a type or impl block.
