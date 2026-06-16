@@ -474,22 +474,47 @@ type struct TypeResolver {
                     if (tdecl.assoc_types[assoc_idx] == null) { continue; }
                     const arg_ann: TypeAnnotation* = tr.type_args[ai];
                     if (arg_ann == null) { continue; }
-                    match (*arg_ann) {
-                        TypeAnnotation::Named(n) => {
-                            if (!bctx.lookup_binding(n.name).is_valid()) {
-                                const member: SymbolStr =
-                                    tdecl.assoc_types[assoc_idx].name;
-                                const derived: TypeRef =
-                                    this.resolve_concrete_member(subject, member, bctx);
-                                if (derived.is_valid()) {
-                                    bctx.add_binding(n.name, derived);
-                                }
-                            }
-                        }
-                        _ => {}
+                    const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
+                    const derived: TypeRef =
+                        this.resolve_concrete_member(subject, member, bctx);
+                    if (derived.is_valid()) {
+                        this.bind_where_arg_into_ctx(arg_ann, derived, bctx);
                     }
                 }
             }
+        }
+    }
+
+    /// Bind the generic param(s) named in a where-bound trait arg against the
+    /// concrete member type derived from the subject, peeling pointer/reference
+    /// wrappers so `where I: Iterator<T*>` binds `T` to the pointee of the
+    /// subject's `Item` (the `CopiedIter`/`ClonedIter` by-ref→by-value bridge).
+    /// Mirrors the monomorphizer's `bind_where_arg_param`. Existing bindings are
+    /// kept (the Self-type substitution already fixed any struct params).
+    bind_where_arg_into_ctx(&this, ta: TypeAnnotation*, concrete: TypeRef,
+                            bctx: ResolutionContext*) -> void {
+        if (ta == null || !concrete.is_valid()) { return; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                if (!bctx.lookup_binding(n.name).is_valid()) {
+                    bctx.add_binding(n.name, concrete);
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                const ct: Type* = this.arena.lookup(concrete.id);
+                if (ct != null && ct.kind == TypeKind::Pointer) {
+                    this.bind_where_arg_into_ctx(p.inner,
+                        (ct as PointerType*).pointee, bctx);
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                const ct: Type* = this.arena.lookup(concrete.id);
+                if (ct != null && ct.kind == TypeKind::Reference) {
+                    this.bind_where_arg_into_ctx(r.inner,
+                        (ct as ReferenceType*).referent, bctx);
+                }
+            }
+            _ => {}
         }
     }
 
