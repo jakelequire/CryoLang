@@ -1584,14 +1584,26 @@ The positional form scales to where-clause adapters, whose element flows from
 the source: `implement<I, A> trait Iterator<A> for struct TakeIter<I> where I:
 Iterator<A>` binds `Item := A := I::Item`.
 
-**Diagnostics.** Two errors guard the binding rules:
+**Declaration-site bounds.** An associated type may carry a bound
+(`type Item: Copy;`). Every impl's concrete binding is checked against it — an
+impl whose `Item` does not satisfy the bound is rejected with `E0306`:
 
+```cryo
+type trait Seq { type Item: Copy; next_one(&this) -> i32; }
+implement trait Seq<NotCopy> for struct Holder { … }   // E0306: Item not Copy
+```
+
+**Diagnostics.** Three errors guard the rules:
+
+- `E0306` — an impl binds an `Item` that does not satisfy a declaration-site
+  bound (`type Item: Copy;`).
 - `E0309` — an impl of a trait that declares an associated type binds none of
   them (no positional arg and no `type Item = …;` body). The projection could
   never reduce, so it is rejected up front.
 - `E0310` — an associated type bound *positionally* on a trait that also has
   generic parameters. Positional args fill the declared generic params in
-  order; an associated type of such a trait must be named (`Out = …`).
+  order, so an associated type of such a trait must be bound with the explicit
+  body form (`type Out = …;`).
 
 Because Cryo monomorphises, a projection is fully resolved at compile time:
 `MapIter<Range<i32>, i64>::Item` reduces to `i64` with no runtime cost.

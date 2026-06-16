@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Added
+
+- **Associated types.** A trait may declare an associated type
+  (`type Item;`) and refer to it by projection (`This::Item` inside the trait,
+  `I::Item` off a generic parameter). Each impl binds it positionally
+  (`implement trait Iterator<i32> for X` — sugar for `Iterator<Item = i32>`,
+  available when the trait has no generic params of its own) or with the
+  explicit body form (`type Item = i32;`). Two diagnostics enforce the binding
+  rules: `E0309` (a declared associated type left unbound by an impl) and
+  `E0310` (an associated type bound positionally on a trait that also has
+  generic params — use the explicit body form `type Out = …;` instead).
+  Declaration-site bounds on an associated type (`type Item: Copy;`) are
+  enforced against each impl's concrete binding (`E0306`). Opaque `implement Iterator<T>`
+  bindings now cross-check `<T>` against the iterator's actual `Item` (`E0200`
+  on a category-level mismatch). See [`docs/cryo.md` §11.5](./docs/cryo.md#115-associated-types).
+
+### Changed
+
+- **`core::iter`:** `Iterator` migrated from the generic-param form
+  `Iterator<Item>` to an associated type — `type trait Iterator { type Item;
+  next(...) -> Option<This::Item>; ... }`. Existing `Iterator<T>` impls,
+  `where I: Iterator<T>` bounds, and `implement Iterator<T>` opaque returns
+  continue to work unchanged via positional sugar; the migration is
+  source-compatible for these forms. The `MapIter`/`FilterIter`/`EnumerateIter`
+  adapters dropped their redundant element parameter (`MapIter<I, A, O>` →
+  `MapIter<I, O>`, etc.), deriving it from the source's `Item`.
+
+
 ## [1.0.0] - 2026-06-11
 
 The first stable release. The compiler is self-hosted, the standard library
