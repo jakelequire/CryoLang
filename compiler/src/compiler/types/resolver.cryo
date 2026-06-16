@@ -229,7 +229,60 @@ type struct TypeResolver {
                 // Invalid here means inference hasn't primed it yet.
                 imp.resolved
             }
+            TypeAnnotation::Projection(proj) => {
+                // `Base::Member` associated-type projection. Resolves once the
+                // base's trait impl is known. The full resolution (concrete
+                // base -> impl binding lookup; generic-param base -> a symbolic
+                // AssocProjection type carried through monomorphization) is
+                // wired in Stage 3; until then we hand back any cached value,
+                // exactly like Typeof/ImplTrait.
+                this.resolve_projection(proj, ctx)
+            }
         };
+    }
+
+    /// Resolve an associated-type projection `Base::Member`.
+    ///   * `This::Item` — resolved via the `Item` binding the impl context
+    ///     carries (added by `bind_trait_args_for_impl`), so a trait default
+    ///     method / impl method body referencing `This::Item` lands on the
+    ///     impl's bound element. This reuses the exact mechanism the old bare
+    ///     generic-param `Item` used, so the delicate default-method machinery
+    ///     carries over.
+    ///   * `I::Item` (generic-param base) — stays a symbolic AssocProjection,
+    ///     resolved by the monomorphizer once `I` is specialized.
+    ///   * `X::Item` (concrete base) — looks up X's impl binding (Stage 3b).
+    resolve_projection(proj: ProjectionAnnotation*, ctx: ResolutionContext*) -> TypeRef {
+        if (proj.resolved.is_valid()) { return proj.resolved; }
+
+        match (*proj.base) {
+            TypeAnnotation::ThisType(_tt) => {
+                const b: TypeRef = ctx.lookup_binding(proj.member);
+                if (b.is_valid()) { return b; }
+                if (ctx.this_type.is_valid()) {
+                    return this.project_from_base(ctx.this_type, proj, ctx);
+                }
+                return TypeRef::invalid();
+            }
+            _ => {}
+        }
+
+        const base_ty: TypeRef = this.resolve(proj.base, ctx);
+        if (!base_ty.is_valid()) { return TypeRef::invalid(); }
+        return this.project_from_base(base_ty, proj, ctx);
+    }
+
+    /// Project `member` off a resolved base type. A generic-param base yields a
+    /// symbolic AssocProjection (resolved at monomorphization); a concrete base
+    /// looks up that type's impl binding (wired in Stage 3b).
+    project_from_base(base_ty: TypeRef, proj: ProjectionAnnotation*,
+                      ctx: ResolutionContext*) -> TypeRef {
+        const bt: Type* = this.arena.lookup(base_ty.id);
+        if (bt == null) { return TypeRef::invalid(); }
+        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam) {
+            return this.arena.create_assoc_projection(
+                base_ty, proj.member, TypeRef::invalid());
+        }
+        return TypeRef::invalid();
     }
 
     // Batch resolution helpers (shared by TypeResolution & Monomorphizer)

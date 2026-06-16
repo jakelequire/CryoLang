@@ -2272,13 +2272,29 @@ public:
         }
 
         // `This` placeholder: only meaningful inside trait/impl scopes;
-        // sema (Phase B.1) substitutes the implementing type.
+        // sema (Phase B.1) substitutes the implementing type. A trailing
+        // `::Member` makes it an associated-type projection `This::Item`,
+        // captured as a Projection node (the base is the keyword `This`, which
+        // can't be flattened into an identifier qualified-name like `I::Item`).
         if (tok.kind == TokenType::KwThisType) {
             this.advance();
-            const tt: ThisTypeAnnotation* = new ThisTypeAnnotation {
-                span: this.span_from_token(tok),
-            };
-            return new TypeAnnotation::ThisType(tt);
+            mut base_ann: TypeAnnotation* = new TypeAnnotation::ThisType(
+                new ThisTypeAnnotation { span: this.span_from_token(tok) }
+            );
+            while (this.check(TokenType::ColonColon)) {
+                this.advance(); // consume '::'
+                const mem_tok: Token = this.consume(TokenType::Identifier,
+                    "associated type name after '::'");
+                const pj: ProjectionAnnotation* = new ProjectionAnnotation {
+                    base:         base_ann,
+                    member:       this.ctx.intern(mem_tok.lexeme),
+                    owning_trait: SymbolStr::empty(),
+                    resolved:     TypeRef::invalid(),
+                    span:         this.span_from(tok),
+                };
+                base_ann = new TypeAnnotation::Projection(pj);
+            }
+            return base_ann;
         }
 
         // `typeof(expr)` in type position (decltype): resolves to the operand

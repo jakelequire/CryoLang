@@ -94,6 +94,7 @@ type struct TypeArena {
     // fresh TypeRef instead of hitting the cache.
     generic_param_cache:   HashMap<u64, TypeRef>;
     bounded_param_cache:   HashMap<u64, TypeRef>;
+    assoc_projection_cache: HashMap<string, TypeRef>;
 
     // -- Reverse index: bare leaf name -> qualified name --
     // Populated by create_struct/class/enum/trait/alias.
@@ -157,6 +158,7 @@ type struct TypeArena {
             func_template_cache: HashMap<u32, TypeRef>::new(),
             generic_param_cache: HashMap<u64, TypeRef>::new(),
             bounded_param_cache: HashMap<u64, TypeRef>::new(),
+            assoc_projection_cache: HashMap<string, TypeRef>::new(),
             leaf_index:          HashMap<u32, u32>::new(),
             inst_by_base:        HashMap<u64, u32[]>::new(),
         };
@@ -475,6 +477,21 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new BoundedParamType(this.next_id, name, index, bounds));
         this.bounded_param_cache.insert(key, ref);
+        return ref;
+    }
+
+    /// Get or create a symbolic associated-type projection `Base::Member`.
+    /// Deduplicated by (base.id, member.id, owning_trait.id) so the same
+    /// projection always shares one arena slot — important so the
+    /// monomorphizer's `set_resolved_type` reaches every reference.
+    create_assoc_projection(mut &this, base: TypeRef, member: SymbolStr, owning_trait: TypeRef) -> TypeRef {
+        const key: string = format("%llu::%u@%llu", base.id, member.id, owning_trait.id);
+        const cached: Option<TypeRef> = this.assoc_projection_cache.get(&key);
+        if (cached.is_some()) { return cached.unwrap(); }
+
+        mut ref: TypeRef = this.alloc_type(
+            new AssocProjectionType(this.next_id, base, member, owning_trait));
+        this.assoc_projection_cache.insert(key, ref);
         return ref;
     }
 
