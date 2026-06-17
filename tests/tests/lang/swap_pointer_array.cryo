@@ -1,0 +1,72 @@
+///! Regression: monomorphizing `mem::swap<Array<T*>>` — a swap of an array
+///! whose element is a POINTER — used to ICE the name mangler. The AST type
+///! substituter (`rewrite_to_array`) built the array's element annotation as a
+///! bare-name `Named("i32*")` with no pre-resolved TypeRef, so it resolved to
+///! `Array<invalid>`; `encode_type_ref` then hit `mangler_ice` at `Array.element`
+///! while registering the spec, aborting the compiler. Value-element arrays
+///! (`i32[]`) and plain pointers (`i32*`) were unaffected — only `Array<ptr>`.
+///! Fixed by carrying the element's pre-resolved TypeRef through
+///! `rewrite_to_array` (mirroring the already-fixed `rewrite_to_pointer`).
+///! Compiling this file at all is the regression; the asserts also check that
+///! the swap is semantically correct.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::SwapPointerArray;
+
+import std::core::result;
+import std::core::mem;
+import std::test::error;
+import std::test::assert;
+
+type class Base {
+public:
+    virtual tag(&this) -> i32;
+}
+
+type class Node : Base {
+public:
+    v: i32;
+    Node(v: i32) : Base() { this.v = v; }
+    override tag(&this) -> i32 { return this.v; }
+}
+
+// swap two arrays of pointer-to-(vtable)class. `swap<Array<Node*>>` previously
+// ICE'd the mangler.
+![test]
+function swap_class_pointer_arrays() -> Result<(), TestError> {
+    mut n1: Node = Node(1);
+    mut n2: Node = Node(2);
+    mut n3: Node = Node(3);
+    mut a: Node*[] = [];
+    a.push(&n1);
+    a.push(&n2);
+    mut b: Node*[] = [];
+    b.push(&n3);
+    mem::swap(&a, &b);
+    expect_eq(a.length as i32, 1)?;
+    expect_eq(b.length as i32, 2)?;
+    expect_eq(a[0].tag(), 3)?;
+    expect_eq(b[0].tag(), 1)?;
+    expect_eq(b[1].tag(), 2)?;
+    return Result::Ok(());
+}
+
+// swap arrays of pointer-to-scalar (`i32*[]`) — the minimal trigger.
+![test]
+function swap_scalar_pointer_arrays() -> Result<(), TestError> {
+    mut x: i32 = 10;
+    mut y: i32 = 20;
+    mut z: i32 = 30;
+    mut a: i32*[] = [];
+    a.push(&x);
+    a.push(&y);
+    mut b: i32*[] = [];
+    b.push(&z);
+    mem::swap(&a, &b);
+    // Lengths swap (1<->2), proving the swap moved the array bodies; compiling
+    // `swap<Array<i32*>>` at all is the core regression. Element-pointee value
+    // checks are covered by the class-pointer test via method dispatch.
+    expect_eq(a.length as i32, 1)?;
+    expect_eq(b.length as i32, 2)?;
+    return Result::Ok(());
+}

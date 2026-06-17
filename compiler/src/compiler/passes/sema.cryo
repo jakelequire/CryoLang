@@ -71,8 +71,10 @@ mut g_try_counter: u32 = 0;
 // live as file-scope globals rather than TypeCheckVisitor fields on purpose:
 // TypeCheckVisitor is a `type class` with inheritance, and this codebase has a
 // known class-field-offset/vtable miscompile (see the `source_module` note
-// elsewhere in this file). Adding boolean fields to it perturbed an aliased
-// field; globals (like g_try_counter) sidestep that entirely.
+// elsewhere in this file). Adding fields to it crashes the pinned compiler
+// (empirically: a globals→fields migration aborts `bin/cryo` during build,
+// 2026-06-17). The right fix is to repair that codegen bug + repin, THEN move
+// these to fields; until then, globals sidestep it (like g_try_counter).
 //
 // Cached env gate. Uses a zero-as-unread sentinel because this codebase does
 // not honor non-zero global initializers (globals are zero-initialized):
@@ -92,9 +94,22 @@ mut g_symbolic_owner_param_ids: u32[] = [];
 // True while symbolically checking a method of a GENERIC owner (struct/class/
 // impl). The owner's fields carry abstract types that the template type can't
 // resolve concretely here, so owner-rooted field/method accesses (`this.field`)
-// are deferred — the concrete monomorphizations re-check them in full. Resolving
-// `this.field` to its abstract field type is the deeper Phase-2 follow-up.
+// are deferred — the concrete monomorphizations re-check them in full.
 mut g_symbolic_owner_is_generic: boolean = false;
+// The OWNER type's generic-param AST nodes (e.g. `Box<T>`'s `T`), in declaration
+// order, for the generic owner whose methods are being symbolically checked. The
+// position of each node in this list IS its abstract-param index, matching
+// `create_generic_param_types`. Set/restored by `symbolic_check_owner_methods`;
+// read by `symbolic_bind_params` to bind each param name to its abstract
+// GenericParam TypeRef. Carries the constraint list too, so bounded params get a
+// BoundedParamType (not a bare GenericParam).
+mut g_symbolic_owner_param_nodes: GenericParamNode*[] = [];
+// The CURRENT method/free-fn's own generic-param AST nodes, in declaration order
+// (position == abstract index). Set/restored by `symbolic_check_body`; read by
+// `symbolic_bind_params`. Kept separate from the owner list because each has its
+// own 0-based index space (an owner `T` at 0 and a method `U` at 0 are distinct
+// abstract params).
+mut g_symbolic_method_param_nodes: GenericParamNode*[] = [];
 // Cumulative measurement counters (only meaningful when gate is on).
 mut g_symbolic_bodies_walked:   i64 = 0;
 mut g_symbolic_total_would_emit: i64 = 0;
@@ -238,8 +253,9 @@ public:
     in_implicit_conversion: boolean;
     // NOTE: the symbolic generic-body check (Phase 2) state lives in file-scope
     // globals (g_symbolic_check_gate / g_in_symbolic_check), NOT as fields here,
-    // to avoid this class's known field-offset miscompile. See the globals near
-    // the top of this file.
+    // to avoid this class's known field-offset miscompile (proven still-live
+    // 2026-06-17: a fields migration aborts the pinned compiler). See the globals
+    // near the top of this file.
 
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
@@ -1971,27 +1987,36 @@ public:
         const saved_owner:    TypeRef = this.current_owner_type;
         const saved_symbolic: boolean = g_in_symbolic_check;
         const saved_params:   u32[]   = g_symbolic_generic_param_ids;
+        const saved_method_nodes: GenericParamNode*[] = g_symbolic_method_param_nodes;
         this.current_owner_type = owner_type;
         g_in_symbolic_check     = true;
         mut param_ids: u32[] = [];
+        // The method's own generic-param nodes, in declaration order so each
+        // node's position is its abstract-param index (`symbolic_bind_params`).
+        mut method_nodes: GenericParamNode*[] = [];
         // Owner type params first (e.g. `Box<T>`'s `T`), then the method's own.
         for (mut op: i64 = 0; op < g_symbolic_owner_param_ids.length; op++) {
             param_ids.push(g_symbolic_owner_param_ids[op]);
         }
         for (mut gp: i64 = 0; gp < func.generic_params.length; gp++) {
             const pnode: GenericParamNode* = func.generic_params[gp];
-            if (pnode != null) { param_ids.push(pnode.name.id); }
+            if (pnode != null) {
+                param_ids.push(pnode.name.id);
+                method_nodes.push(pnode);
+            }
         }
-        g_symbolic_generic_param_ids = param_ids;
+        g_symbolic_generic_param_ids   = param_ids;
+        g_symbolic_method_param_nodes  = method_nodes;
         sink.begin_suppress();
 
         this.enter_function(func, this_type);
         this.visit(func.body);
 
         sink.end_suppress();
-        g_in_symbolic_check          = saved_symbolic;
-        g_symbolic_generic_param_ids = saved_params;
-        this.current_owner_type      = saved_owner;
+        g_in_symbolic_check           = saved_symbolic;
+        g_symbolic_generic_param_ids  = saved_params;
+        g_symbolic_method_param_nodes = saved_method_nodes;
+        this.current_owner_type       = saved_owner;
 
         g_symbolic_bodies_walked += 1;
         const would_emit: u32 = sink.suppressed_error_total() - before;
@@ -2014,13 +2039,19 @@ public:
                                  owner_params: &GenericParamNode*[]) -> void {
         if (!sema_symbolic_check_enabled()) { return; }
         const saved_owner_params: u32[]  = g_symbolic_owner_param_ids;
+        const saved_owner_nodes: GenericParamNode*[] = g_symbolic_owner_param_nodes;
         const saved_owner_generic: boolean = g_symbolic_owner_is_generic;
         mut oids: u32[] = [];
+        mut onodes: GenericParamNode*[] = [];
         for (mut i: i64 = 0; i < owner_params.length; i++) {
             const p: GenericParamNode* = owner_params[i];
-            if (p != null) { oids.push(p.name.id); }
+            if (p != null) {
+                oids.push(p.name.id);
+                onodes.push(p);
+            }
         }
-        g_symbolic_owner_param_ids = oids;
+        g_symbolic_owner_param_ids  = oids;
+        g_symbolic_owner_param_nodes = onodes;
         g_symbolic_owner_is_generic = true;
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
@@ -2037,8 +2068,55 @@ public:
             };
             this.symbolic_check_body(method.func, sym_this, owner_type);
         }
-        g_symbolic_owner_param_ids  = saved_owner_params;
-        g_symbolic_owner_is_generic = saved_owner_generic;
+        g_symbolic_owner_param_ids   = saved_owner_params;
+        g_symbolic_owner_param_nodes = saved_owner_nodes;
+        g_symbolic_owner_is_generic  = saved_owner_generic;
+    }
+
+    /// During a symbolic generic-body walk, prime a freshly-created
+    /// `ResolutionContext` for abstract resolution: bind every in-scope generic
+    /// param (owner params first, then the current method/free-fn's own) to its
+    /// abstract `GenericParam` TypeRef and switch the context to demand-free mode.
+    ///
+    /// Without the bindings a bare param annotation (`mut alloc: A`) resolves `A`
+    /// through global name lookup, which — when a generic body is compiled
+    /// alongside an unrelated same-named type — binds to the WRONG type (a
+    /// cross-unit false positive). With them, `A` resolves to the abstract param.
+    /// Demand-free mode (`symbolic_no_demand`) keeps any param-bearing
+    /// instantiation (`Pair<T, V>`) in the arena only, so it never registers a
+    /// monomorphization demand that would later leak as E0900.
+    ///
+    /// No-op outside a symbolic walk, so concrete-code resolution is unchanged.
+    symbolic_bind_params(&this, ctx: ResolutionContext*) -> void {
+        if (!g_in_symbolic_check) { return; }
+        if (this.arena == null) { return; }
+        ctx.symbolic_no_demand = true;
+        for (mut i: i64 = 0; i < g_symbolic_owner_param_nodes.length; i++) {
+            const p: GenericParamNode* = g_symbolic_owner_param_nodes[i];
+            if (p != null) { ctx.add_binding(p.name, this.symbolic_param_ref(p, i as u64)); }
+        }
+        for (mut j: i64 = 0; j < g_symbolic_method_param_nodes.length; j++) {
+            const p: GenericParamNode* = g_symbolic_method_param_nodes[j];
+            if (p != null) { ctx.add_binding(p.name, this.symbolic_param_ref(p, j as u64)); }
+        }
+    }
+
+    /// Build the abstract type for one in-scope generic param at `index` (its
+    /// position in its own param list, matching `create_generic_param_types`).
+    /// A param with trait constraints becomes a `BoundedParamType` (so bound
+    /// checks can see the constraints); an unconstrained one a bare
+    /// `GenericParam`. Both are arena-deduped by (name.id, index).
+    symbolic_param_ref(&this, p: GenericParamNode*, index: u64) -> TypeRef {
+        mut bounds: TypeRef[] = [];
+        for (mut k: i64 = 0; k < p.constraints.length; k++) {
+            const trait_ref: TypeRef = this.arena.lookup_by_leaf(p.constraints[k]);
+            if (trait_ref.is_valid()) { bounds.push(trait_ref); }
+        }
+        if (bounds.length > 0) {
+            return this.arena.create_bounded_param(p.name, index, bounds);
+        }
+        bounds.drop();
+        return this.arena.create_generic_param(p.name, index);
     }
 
     /// True (only in a generic-owner symbolic walk) when `ty` is the abstract
@@ -2432,6 +2510,7 @@ public:
             this.prime_typeof_annotation(var_node.type_annotation);
             mut res_ctx: ResolutionContext = ResolutionContext::new(
                 this.ctx.source_file, "");
+            this.symbolic_bind_params(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(
                 var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) {
@@ -2702,6 +2781,7 @@ public:
                 && this.ctx.type_resolver != null) {
             mut res_ctx: ResolutionContext = ResolutionContext::new(
                 this.ctx.source_file, "");
+            this.symbolic_bind_params(&res_ctx);
             const ttype: TypeRef = this.ctx.type_resolver.resolve(
                 node.type_annotation, &res_ctx);
             if (ttype.is_valid()) {
@@ -2736,6 +2816,18 @@ public:
                         node.initializer);
                 }
             }
+        }
+
+        // Symbolic walk: a destructure whose target is an abstract generic-owner
+        // type (`const { ptr, alloc }: Box<T, A> = self;` inside `Box`'s own
+        // methods) resolves to an InstantiatedType whose template fields are NOT
+        // synced — `run_struct_field_sync` skips `is_generic()` templates — so the
+        // field-presence check below would spuriously report E0361 "non-struct".
+        // Defer it: the concrete monomorphization re-checks the destructure with
+        // real fields. Register the bindings void so they stay visible in scope.
+        if (this.symbolic_defer_type(node.resolved_type)) {
+            this.register_destructure_locals_void(node);
+            return;
         }
 
         // Look up the struct fields and validate each binding.  If the
@@ -3940,6 +4032,7 @@ public:
     resolve_lambda(mut &this, node: LambdaExprNode*) -> TypeRef {
         mut res_ctx: ResolutionContext = ResolutionContext::new(
             this.ctx.source_file, "");
+        this.symbolic_bind_params(&res_ctx);
 
         // Resolve parameter types from their annotations.
         mut param_types: TypeRef[] = [];
@@ -9141,6 +9234,7 @@ public:
 
         mut res_ctx: ResolutionContext = ResolutionContext::new(
             this.ctx.source_file, "");
+        this.symbolic_bind_params(&res_ctx);
         mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_args.length; i++) {
             const arg_ref: TypeRef = this.ctx.type_resolver.resolve(

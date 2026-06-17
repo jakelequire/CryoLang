@@ -313,6 +313,142 @@ gate-ON 1673 bodies / 0 would-emit / exit 0). All bridge edits removed; selfhost
 after revert reproduced the EXACT task-#3 fixed point md5
 `a7dd0530b91e03fc79cbaa1c238cdacb` — confirming a perfectly clean revert.
 
+### Phase 2 — KEYSTONE: demand-free abstract resolution + param binding (2026-06-17) — DONE
+THE REAL BLOCKER above is **RESOLVED**. The symbolic walk now resolves
+generic-param-bearing annotations to ABSTRACT types *with* binding on, WITHOUT
+leaking E0900 — the exact infrastructure the bridge and the flip were gated on.
+This is strictly stronger than the `a7dd0530` checkpoint: that hit 0 would-emit
+only by DEFERRING abstract calls (never resolving them); this RESOLVES them.
+
+What landed (all paths dormant unless `CRYO_SYMBOLIC_CHECK` is set, so gate-OFF is
+byte-identical):
+- **`resolver.cryo`** — new `ResolutionContext.symbolic_no_demand: boolean`
+  (default false in `new`, preserved in `clone`). In `resolve_generic`, when set,
+  return `arena.create_instantiation(base, &args)` (arena-only, registry-free)
+  instead of `generic_registry.instantiate_for_module(...)`. The arena path does
+  NOT register a monomorphization demand, so `collect_unmonomorphized` never sees
+  it → no E0900. (Confirmed by reading `create_instantiation` ~509: arena-cache
+  only, no registry touch; `collect_unmonomorphized` scans only registry cache_keys.)
+- **`sema.cryo`** — `symbolic_bind_params(ctx)` + `symbolic_param_ref(p, index)`:
+  bind each in-scope generic param (owner params first, then the method/free-fn's
+  own; `index` = position in its OWN list, matching `create_generic_param_types`)
+  to its abstract `GenericParam` (or `BoundedParamType` when it has constraints)
+  and flip `ctx.symbolic_no_demand = true`. No-op outside a symbolic walk. The
+  param AST nodes are carried in two new globals `g_symbolic_owner_param_nodes` /
+  `g_symbolic_method_param_nodes` (set+restored in `symbolic_check_owner_methods` /
+  `symbolic_check_body`, alongside the existing id lists). Wired into the 4
+  body-level resolution sites: `visit(DeclStmtNode)` lazy-resolve,
+  `visit(DestructureDeclNode)`, `resolve_lambda`, `resolve_generic_scope_name`.
+  → This fixes the cross-unit name-collision FP (bare `A` now resolves to the
+  abstract param, not an unrelated same-named global type).
+- **`sema.cryo`** — destructure defer: in `visit(DestructureDeclNode)`, before the
+  field-presence check, `if (this.symbolic_defer_type(node.resolved_type))` →
+  register bindings void + return. Closes the re-surfaced E0361 class. With binding
+  on, `const { ... }: Box<T,A> = self;` resolves to an InstantiatedType whose
+  template fields are unsynced (`run_struct_field_sync` skips `is_generic()`), so
+  the field check would spuriously emit E0361 "non-struct"; deferring lets the
+  concrete monomorphization re-check it.
+
+**The FP cascade the bridge predicted, closed empirically:** gate-ON stdlib with
+binding+demand-free initially showed exactly **7 would-emit, all E0361** on
+abstract-owner destructures (`Box<T,A>`, `RawBuffer<T,A>`, `String<A>`,
+`Sender<T>`, `JoinHandle<T>` — bodies `into_raw`/`leak`/`join`/`detach`/`close`).
+The single destructure defer drove all 7 → 0. The lesser match-arm-binding class
+(FmtError-vs-boolean) the bridge also saw did NOT reappear (binding fixed its root
+cause — the abstract scrutinee now resolves correctly rather than to a wrong
+concrete type).
+
+**VALIDATED (Linux host, this session):**
+- `make cryo` green.
+- Gate-ON stdlib (`CRYO_SYMBOLIC_CHECK=1`): **1681 bodies walked / 0 would-emit /
+  exit 0** — NO E0900 with binding on (the keystone's whole point).
+- `make test`: unit ok, compile-fail **99/0**.
+- `selfhost-check --no-windows`: **✓ FIXED POINT OK** (stage-3 == stage-4),
+  Linux IR md5 `c5ba1405d09e94f617f08a42fc7498d4` (size 49,120,934). New md5 vs
+  prior because the compiler source changed; it is its own clean fixed point.
+- Temp `[symbolic-emit]` dump in `sink.cryo` added for FP triage, then REMOVED.
+- UNCOMMITTED. Jake owns commit + (no repin needed — gate-OFF byte-identical
+  through the pin).
+
+NEXT (unchanged sequence, now unblocked): the BRIDGE — un-suppress the walk
+(remove `begin/end_suppress` in `symbolic_check_body`, make it default-ON with an
+env kill-switch, keep `g_in_symbolic_check`). Acceptance = make test 99 +
+self-host byte-identical. Should be close: only 12/99 compile-fail tests use
+generics and most assert concrete-instantiation errors the walk defers on.
+
+### GLOBALS→FIELDS migration ATTEMPTED, REVERTED — landmine CONFIRMED LIVE (2026-06-17)
+Jake asked to remove the `g_symbolic_*` / `g_try_counter` file-scope globals,
+moving the per-walk state to `TypeCheckVisitor` fields (his hypothesis: the
+"adding fields to the vtable class segfaults" landmine was stale). Did the full,
+correct migration: 10 globals → fields, 2 free fns → methods, env-gate read once
+in the constructor, owning-array save/restore via the `swap`-with-empty discipline
+`resolve_lambda` uses, all 55 refs rewired.
+
+**Result: the landmine is REAL and STILL LIVE.** The field-migrated source
+*compiles its stdlib* but then **aborts the pinned `bin/cryo` (SIGABRT, core
+dumped) during the compiler self-build** — a silent Cryo panic after parsing all
+modules, deep in a whole-program analysis pass (heavy alloc → abort; stripped
+backtrace shows recursion). The prior keystone+destructure source built fine
+through the same pin, so the field additions to `TypeCheckVisitor` (a
+`type class : BaseASTVisitor`, i.e. a vtable'd class hierarchy) are the sole
+trigger. This matches the in-file note at `sema.cryo` ~1351: *"Direct field writes
+to source_module don't survive vtable-offset miscompiles on class hierarchies, so
+we route through the Monomorphizer as a side channel."* The bug is documented and
+unfixed; my migration just exercised it harder (a hard abort, not the silent
+miscompile the note describes).
+
+**Reverted cleanly** — restored the globals + 2 free functions + the global-based
+save/restore; `make cryo` green, `make test` 99/0, self-host re-validated (see
+below). Working tree is back to the keystone state.
+
+**The RIGHT fix (Jake's stated preference: right long-term call over a quick green,
+grind through the struggle, no workaround hacks):** repair the underlying
+vtable/class-hierarchy field-offset codegen miscompile, then repin. Once fields on
+`TypeCheckVisitor` work, BOTH these symbolic globals AND the `source_module`
+Monomorphizer side-channel hack (sema ~1351) can be deleted. This is a bootstrap
+sequence: the codegen fix lives in the codegen/type-lowering pass (compilable by
+the current pin) → validate → `make pin-cryo` → THEN migrate globals→fields. It is
+a deep, separate task; flagged for Jake to greenlight before sinking days in.
+Diagnosis pointers: the miscompile is offset/layout-sensitive on classes deriving a
+vtable base (`: BaseASTVisitor`); start at declaration/field-layout emission and
+the GEP offsets for derived-class fields (compare a field's computed offset vs the
+vtable-prefixed layout). The `source_module` note is a concrete reproducer to
+study (a single field whose direct writes are lost).
+
+### MANGLER FIX — `swap<Array<ptr>>` ICE root-caused & fixed (2026-06-17)
+Jake asked to remove the `g_symbolic_*`/`g_try_counter` globals (move per-walk state
+to `TypeCheckVisitor` fields) and to FIX the underlying codegen bug rather than keep
+a workaround. Investigation overturned the "vtable field-offset landmine" framing:
+
+**The landmine was a MISDIAGNOSIS.** Fields on the vtable'd class work fine — bisection
+showed scalar/`u32[]`/8-mixed-type fields + `this.field` access all build clean. The
+globals→fields migration crashed for ONE reason: it used `swap(&this.field, …)` on the
+`GenericParamNode*[]` (array-of-pointers) fields, i.e. `mem::swap<Array<ptr>>`. A
+standalone repro with NO fields and NO vtable class — `mut a: Node*[]; mem::swap(&a,&b)`
+— aborts the compiler; `swap<i32*>` and `swap<i32[]>` are fine, only `swap<Array<ptr>>`.
+
+**Root cause (symbolized backtrace + instrumentation):** `MangledName::mangler_ice` ←
+`encode_type_ref` ← `register_injected_decl` (spec registration), message
+`encode_type_ref: invalid TypeRef (id=0) at Array.element`. The AST substituter
+`rewrite_to_array` (AST/substituter.cryo) built the array element as bare
+`Named("i32*")` with `pre_resolved=invalid` → resolved by name → `Array<invalid>` →
+ICE. Its sibling `rewrite_to_pointer` was already fixed for exactly this; the array
+path was missed.
+
+**Fix:** `rewrite_to_array` now takes `inner_pre_resolved` and sets it on the element
+`Named` (mirrors `rewrite_to_pointer`); caller passes
+`arena.array_element_of(resolved_arg_typeref(i).id)` (new arena helper). Defensive
+guard added to `TypeResolver`'s Array case (returns invalid on unresolvable element,
+matching Pointer/Reference). +regression test `tests/tests/lang/swap_pointer_array.cryo`.
+
+**VALIDATED:** repro compiles+runs (correct swap semantics); `make test` 99/0;
+selfhost **FIXED POINT** IR md5 `88481be5e90bbbc00995149e7dfe7242` (new vs c5ba1405 —
+source changed). Repinning (`make pin`) so the migration can build on the fixed pin.
+
+**NEXT:** (C) re-do the globals→fields migration on the fixed pin — plain field swap
+now works; (D) the `source_module` Monomorphizer side-channel (sema ~1351) was a
+workaround for the SAME mangler-bug class and can likely be deleted too.
+
 ### FLIP-READINESS ASSESSMENT (2026-06-16) — what Phase 3 actually requires
 Mapped the full reorder surface so the flip can be executed deliberately:
 

@@ -80,11 +80,19 @@ function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
 }
 
 /// Rewrite a TypeAnnotation* in-place from Named to Array(Named(inner), -1).
-function rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr, span: SourceSpan) -> void {
+/// `inner_pre_resolved` is the element type's TypeRef when known (the
+/// substituter has it from `subst.replacements[i]`'s array element). Mirrors
+/// `rewrite_to_pointer`: without it, the inner Named is resolved by bare name
+/// in a fresh empty ResolutionContext, which fails for any element that isn't a
+/// bare-name-resolvable type — e.g. a pointer element (`i32*[]`, the inner
+/// display `i32*` names no type) or a user-defined type out of scope at the
+/// spec site — yielding an `Array<invalid>` that later ICEs the mangler.
+function rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr,
+                          inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
     const inner_named: NamedAnnotation* = new NamedAnnotation {
         name: inner_name,
         span: span,
-        pre_resolved: TypeRef::invalid(),
+        pre_resolved: inner_pre_resolved,
     };
     const inner_ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
     *inner_ann = TypeAnnotation::Named(inner_named);
@@ -327,7 +335,14 @@ public:
                 if (display_len > 2 && display[display_len - 2] == '[' && display[display_len - 1] == ']') {
                     const inner_str: string = display.substr(0, display_len - 2);
                     const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                    rewrite_to_array(ann, inner_sym, named.span);
+                    // Unwrap one Array level off the substitution arg so the
+                    // inner Named gets a pre_resolved TypeRef (mirrors the
+                    // Pointer branch above). Without it, a non-bare-name element
+                    // (a pointer, or an out-of-scope user type) resolves to
+                    // invalid and produces an Array<invalid> that ICEs mangling.
+                    const inner_pre: TypeRef = this.arena.array_element_of(
+                        this.resolved_arg_typeref(i).id);
+                    rewrite_to_array(ann, inner_sym, inner_pre, named.span);
                     return ann;
                 }
                 // User-defined type: keep as Named with new name, and attach
