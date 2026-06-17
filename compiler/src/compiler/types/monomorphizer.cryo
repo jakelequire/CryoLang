@@ -2944,6 +2944,46 @@ type struct Monomorphizer {
         }
     }
 
+    /// Recover the CONCRETE type of an opaque `implement Trait` local from
+    /// its initializer when the initializer is a direct static constructor
+    /// call (`mut it: implement Iterator<i32> = Range<i32>::new(0,10)`).
+    ///
+    /// The annotation names only the abstract trait, so the binding's
+    /// combinator-receiver type is unknowable from the annotation alone.
+    /// Sema (which runs AFTER mono) back-fills the concrete initializer type
+    /// onto the binding (sema.cryo ~2302), but the combinator-specialization
+    /// walk here runs first, so it would leave `it.take(n)` typed against the
+    /// abstract trait -> `TakeIter<This>` never specializes (E0636, docs §2.11
+    /// "re-adapt opaque local").  Recover the concrete type here, mirroring
+    /// the `is_auto` static-constructor lift below and the inline-combinator
+    /// receiver resolution (`Range<i32>::new(..).take(n)`), so the local table
+    /// hands the combinator walk a concrete `Range<i32>` receiver.
+    ///
+    /// Deliberately reuses `resolve_static_call_return_type` (not
+    /// `resolve_arg_type_for_inference`, which intentionally refuses
+    /// static-call receivers - see its guard) and is gated strictly to the
+    /// opaque-annotation + direct-static-call shape, so every other binding
+    /// flows through the caller's normal annotation path unchanged.
+    opaque_impl_local_init_type(mut &this, vd: VarDeclNode*) -> TypeRef {
+        if (vd == null || vd.type_annotation == null || vd.initializer == null) {
+            return TypeRef::invalid();
+        }
+        mut is_opaque: boolean = false;
+        match (*vd.type_annotation) {
+            TypeAnnotation::ImplTrait(imp) => { is_opaque = true; }
+            _ => {}
+        }
+        if (!is_opaque) { return TypeRef::invalid(); }
+        const init_n: ASTNode* = vd.initializer as ASTNode*;
+        if (init_n.kind != NodeKind::CallExpression) { return TypeRef::invalid(); }
+        const init_call: CallExprNode* = vd.initializer as CallExprNode*;
+        if (init_call.callee == null
+                || (init_call.callee as ASTNode*).kind != NodeKind::ScopeResolution) {
+            return TypeRef::invalid();
+        }
+        return this.resolve_static_call_return_type(init_call);
+    }
+
     collect_locals_in_stmt(mut &this, stmt: StatementNode*,
                            names: SymbolStr[]*, types: TypeRef[]*) -> void {
         if (stmt == null) { return; }
@@ -2956,9 +2996,23 @@ type struct Monomorphizer {
                     const inner_node: ASTNode* = inner as ASTNode*;
                     if (inner_node.kind == NodeKind::VariableDeclaration) {
                         const vd: VarDeclNode* = inner as VarDeclNode*;
+                        const opaque_init: TypeRef =
+                            if (vd.resolved_type.is_valid()) {
+                                TypeRef::invalid()
+                            } else {
+                                this.opaque_impl_local_init_type(vd)
+                            };
                         if (vd.resolved_type.is_valid()) {
                             names.push(vd.name);
                             types.push(vd.resolved_type);
+                        } else if (opaque_init.is_valid()) {
+                            // Opaque `implement Trait` local with a direct
+                            // static-constructor initializer: type it from the
+                            // initializer's concrete return so the combinator
+                            // walk gets a concrete receiver (see
+                            // `opaque_impl_local_init_type`).
+                            names.push(vd.name);
+                            types.push(opaque_init);
                         } else if (vd.type_annotation != null
                                 && this.type_resolver != null) {
                             // Mono runs BEFORE sema in the pipeline, so most

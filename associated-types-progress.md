@@ -404,9 +404,58 @@ current/stdlib caller) — documented here as conscious deferrals, not oversight
    Suite 1230/99 GREEN at O0+O2, selfhost byte-identical. UNCOMMITTED — needs a
    repin.
 
-3. **Opaque-local re-adaptation — INVESTIGATED + attempted; NOT lifted, by
-   design-cost (Gap 3).** `mut it: implement Iterator<i32> = …; it.take(3)` →
-   E0636. **Precise blocker (root-caused this session):** the receiver typing is
+3. **Opaque-local re-adaptation — PARTIALLY LIFTED (static-constructor form,
+   2026-06-17).** The canonical §2.11 case now works:
+   `mut it: implement Iterator<i32> = Range<i32>::new(0,10); it.take(3)`
+   compiles and runs (positive test `opaque_iter_local_takes` in
+   `tests/tests/stdlib/iter.cryo`). **The pipeline reorder was NOT done — it is
+   a multi-week, cross-module rewrite** (spike findings below); the narrower
+   fallback the handoff proposed was implemented instead, and it covers the
+   acceptance criterion. Suite 1230+/99 GREEN at O0+O2, selfhost byte-identical
+   (md5 `4ef7c5bf…`). UNCOMMITTED — needs a repin (additive, no new syntax; the
+   old pin self-builds the new source, so no bootstrap gate).
+
+   **The fix (mono-side, ~45 lines, `monomorphizer.cryo`):** new helper
+   `opaque_impl_local_init_type(vd)` recovers the CONCRETE type of an opaque
+   `implement Trait` local from a direct static-constructor initializer
+   (`Range<i32>::new(...)`) via the existing `resolve_static_call_return_type`,
+   and `collect_locals_in_stmt` stamps that into the local-type table BEFORE the
+   combinator-specialization walk runs. So `it.take(3)`'s receiver resolves to
+   `Range<i32>` (was the abstract trait → E0636). Reuses the SAME primitive the
+   working inline form (`Range<i32>::new(..).take(3)`) and the `is_auto`
+   for-in lift already trust; deliberately does NOT route through
+   `resolve_arg_type_for_inference` (its static-call-receiver guard is why last
+   session's attempt collided — see the old note). `ensure_receiver_inst_resolved`
+   (mono 5742) then monomorphizes the recovered receiver, identical to the inline
+   path.
+
+   **Still restricted (documented, NOT a regression):** an opaque local whose
+   initializer is a PRODUCER that itself returns an opaque iterator
+   (`let it = arr.iter(); it.take(3)`) — the concrete cursor is hidden behind
+   that opaque return, so there's no concrete type to recover. That's the harder
+   opaque-return-composition problem, not opaque-local typing. Workaround
+   unchanged: chain off the source expression. Docs §2.11 + `core/iter.cryo`
+   header + CHANGELOG updated to draw this exact line.
+
+   **Why the full reorder was NOT attempted (spike, 2026-06-17):** mapped all
+   three dependency directions. (a) Sema's 5 `ctx.monomorphizer` sites
+   (`check_assoc_decl_bounds` E0306, `verify_impl_trait_bounds` E0200, the two
+   method-bound diagnostics E0358, `resolve_method_call`) use ONLY
+   arena/registry/intern_table — no live mono state — so they COULD be re-homed
+   via an extracted `type_implements_trait` helper. (b) BUT the multi-module
+   orchestrator (`instance.cryo` Phase 6a/6b) deliberately monomorphizes ALL
+   modules before ANY validation/sema, because `GenericValidation` + sema walk a
+   shared cross-module TypeArena; and the pass-graph hard-chains
+   `Mono → GenExprRes → GenValidation → FunctionBodyTypeCheck` via provisions
+   (`pass_id.cryo`). (c) Sema currently SKIPS generic bodies entirely and relies
+   on mono's concrete specs being registered in `decl_index` — flipping the
+   order means teaching sema to type-check generic bodies symbolically. That is
+   the multi-week rewrite the handoff warned about, in the most regression-prone
+   machinery in the compiler. The fallback achieves the payoff for the documented
+   case at ~45 lines and zero architectural risk.
+
+   --- historical (pre-fix) note kept for context ---
+   `mut it: implement Iterator<i32> = …; it.take(3)` → E0636. **Precise blocker (root-caused this session):** the receiver typing is
    actually fine — sema already back-fills the opaque local's `resolved_type` to
    the concrete initializer type (sema.cryo ~2279-2309). The failure is pass
    ORDER: **Monomorphization runs BEFORE FunctionBodyTypeCheck/sema** (pipeline
@@ -434,10 +483,15 @@ Stage-6 "UNCOMMITTED / needs bootstrap repin" notes are historical (now
 committed `14ed77ba`/`6effa486`/… + pinned by Jake). The `where I::Item: Copy`
 where-bound-subject gap (also a parser limitation, see Stage-3 note) stands.
 
-**Status (2026-06-16, post-Gap-2):** the Iterator rollout is done AND
-declaration-site bound enforcement (Gap 2) is done. Remaining deferred, all
-zero-caller today: inline `<Name = T>` sugar (item 1 — Jake chose the body form
-for now), the `where I::Item: Copy` where-subject parse, and opaque-local
-re-adaptation (item 3 — deep, off-feature). Suite 1230 unit / 99 compile-fail
-GREEN at O0+O2, selfhost byte-identical (md5 `399e90d4…`). UNCOMMITTED — Gap 2
-(sema.cryo + the E0306 test) and the earlier E0310-message reword need a repin.
+**Status (2026-06-17, post-Gap-3-partial):** the Iterator rollout, Gap 2
+(decl-site bounds), and the static-constructor slice of Gap 3 (opaque-local
+re-adaptation) are all done. The full Mono-after-sema pipeline reorder was
+SPIKED and consciously NOT done (multi-week cross-module rewrite — see item 3
+above); the narrower fallback lifts the documented §2.11 case. Remaining
+deferred, all zero-caller today: inline `<Name = T>` sugar (item 1), the
+`where I::Item: Copy` where-subject parse, and the producer-initialized
+opaque-local form (the opaque-return-composition residual of item 3). Suite
+1230 unit / 99 compile-fail GREEN at O0+O2, selfhost byte-identical
+(md5 `4ef7c5bf…`). UNCOMMITTED — the Gap-3 fix (monomorphizer.cryo + the
+`opaque_iter_local_takes` test + docs/CHANGELOG/iter.cryo header) needs a repin
+(additive, no new syntax → no bootstrap gate; old pin self-builds new source).
