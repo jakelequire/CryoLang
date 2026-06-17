@@ -212,33 +212,23 @@ function register_injected_decl(stmt: ASTNode*, owner_mod: SymbolStr,
 }
 
 /// Tag an AST node's source_module field with the template's module name.
-/// Uses concrete-type casts to avoid the vtable-offset miscompile when
-/// writing fields through base class (DeclarationNode*) pointers.
+/// struct/class/enum/function/impl decls are all DeclarationNode subclasses and
+/// `source_module` lives on that shared base, so a single base-pointer write
+/// covers every kind. (The kind check keeps the cast sound — only declaration
+/// nodes are written.) The earlier per-leaf concrete casts here worked around a
+/// believed vtable field-offset miscompile; that was misdiagnosed — base-pointer
+/// field writes on the vtable'd AST hierarchy are correct (verified 2026-06-17,
+/// O0+O2). The real crash was a since-fixed mangler ICE on `Array<ptr>` specs.
 function tag_decl_source_module(node: ASTNode*, module: string) -> void {
     if (node == null) { return; }
-    match (node.kind) {
-        NodeKind::StructDeclaration => {
-            const sn: StructDeclNode* = node as StructDeclNode*;
-            sn.source_module = module;
-        }
-        NodeKind::ClassDeclaration => {
-            const cn: ClassDeclNode* = node as ClassDeclNode*;
-            cn.source_module = module;
-        }
-        NodeKind::EnumDeclaration => {
-            const en: EnumDeclNode* = node as EnumDeclNode*;
-            en.source_module = module;
-        }
-        NodeKind::FunctionDeclaration => {
-            const fn_node: FunctionDeclNode* = node as FunctionDeclNode*;
-            fn_node.source_module = module;
-        }
-        NodeKind::ImplementationBlock => {
-            const impl_node: ImplBlockNode* = node as ImplBlockNode*;
-            impl_node.source_module = module;
-        }
-        _ => {}
-    }
+    const k: NodeKind = node.kind;
+    const is_decl: boolean =
+        k == NodeKind::StructDeclaration || k == NodeKind::ClassDeclaration
+        || k == NodeKind::EnumDeclaration || k == NodeKind::FunctionDeclaration
+        || k == NodeKind::ImplementationBlock;
+    if (!is_decl) { return; }
+    const decl: DeclarationNode* = node as DeclarationNode*;
+    decl.source_module = module;
 }
 
 /// Register a specialized type declaration using the arena type's actual
@@ -710,8 +700,15 @@ type struct SpecializationPasses {
         }
 
         // Scope-tag the main AST with its template module origin in the
-        // CompilationContext's side table (not on the AST node itself, to
-        // avoid vtable field-write miscompiles).  Physical placement into the
+        // CompilationContext's node-identity side table. This is kept separate
+        // from the node's `source_module` field on purpose: that field is also
+        // used to stamp ordinary (non-injected) decls with their defining module
+        // (see type_resolution's ImplementationBlock handler), so it can't mark
+        // "this exact node is an injected spec" without conflation. The side
+        // table only ever holds injected specs, which is what `dispatch_top_level`
+        // needs. (An earlier comment blamed a vtable field-write miscompile; that
+        // was misdiagnosed — base writes are correct — but the side table stays
+        // for the disambiguation reason above.) Physical placement into the
         // owner module's root happens later in Phase 6a-iii.
         if (entry.ast_node != null) {
             if (entry.template_module.is_valid()) {
