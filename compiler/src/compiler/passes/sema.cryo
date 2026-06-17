@@ -182,8 +182,9 @@ public:
     try_counter: u32;
 
     // Symbolic generic-body check (Phase 2 of the mono-after-sema reorder).
-    // Cached env gate (`CRYO_SYMBOLIC_CHECK`), read once in the constructor.
-    // Uses a zero-as-unread sentinel: 0 = not yet read, 1 = off, 2 = on.
+    // Cached gate, read once in the constructor. ON by default;
+    // `CRYO_NO_SYMBOLIC_CHECK` is the kill-switch. Zero-as-unread sentinel:
+    // 0 = not yet read, 1 = off, 2 = on.
     symbolic_check_gate: i32;
     // True only while a symbolic generic-body walk is in progress, so body
     // visitors can later relax concrete-type expectations.
@@ -212,7 +213,8 @@ public:
     // read by `symbolic_bind_params`. Kept separate from the owner list because
     // each has its own 0-based index space.
     symbolic_method_param_nodes: GenericParamNode*[];
-    // Measurement counters (only meaningful when the gate is on).
+    // Telemetry (debug-only cumulative line): generic bodies walked and the
+    // number of real errors those symbolic walks emitted.
     symbolic_bodies_walked:   i64;
     symbolic_total_would_emit: i64;
 
@@ -249,13 +251,16 @@ public:
         this.closure_spec_map    = HashMap<string, u32>::new();
         this.in_implicit_conversion = false;
         this.try_counter            = 0;
-        // Read the symbolic-check env gate once, here, so the predicate is a pure
-        // `&this` reader callable from any context.
-        const raw: i8* = intrinsics::getenv("CRYO_SYMBOLIC_CHECK") as i8*;
-        if (raw != null && intrinsics::strlen(raw as string) > 0) {
-            this.symbolic_check_gate = 2;
+        // Read the symbolic-check gate once, here, so the predicate is a pure
+        // `&this` reader callable from any context. The symbolic generic-body
+        // check is ON by default — it is now a real check of never-instantiated
+        // generic templates (the "bridge"), not a measurement harness. The
+        // `CRYO_NO_SYMBOLIC_CHECK` env var is a kill-switch for fast triage.
+        const off: i8* = intrinsics::getenv("CRYO_NO_SYMBOLIC_CHECK") as i8*;
+        if (off != null && intrinsics::strlen(off as string) > 0) {
+            this.symbolic_check_gate = 1;   // off (kill-switch set)
         } else {
-            this.symbolic_check_gate = 1;
+            this.symbolic_check_gate = 2;   // on (default)
         }
         this.in_symbolic_check           = false;
         this.symbolic_generic_param_ids  = [];
@@ -274,11 +279,11 @@ public:
         return TypeCheckVisitor(ctx.type_arena, ctx.get_intern_table(), ctx);
     }
 
-    /// Whether the additive symbolic generic-body type-check is enabled, via the
-    /// `CRYO_SYMBOLIC_CHECK` env var. Phase-2 measurement harness: when set, sema
-    /// also walks generic templates with their type parameters abstract, under
-    /// diagnostic suppression, and logs what it would report. Off by default, so
-    /// the normal build is unaffected. The gate is cached in the constructor.
+    /// Whether the symbolic generic-body type-check is enabled. ON by default:
+    /// sema walks generic templates with their type parameters abstract and emits
+    /// real diagnostics for errors in never-instantiated generics. The
+    /// `CRYO_NO_SYMBOLIC_CHECK` env var is a kill-switch. The gate is cached in
+    /// the constructor.
     sema_symbolic_check_enabled(&this) -> boolean {
         return this.symbolic_check_gate == 2;
     }
@@ -1182,9 +1187,23 @@ public:
         // Fallback B: look up by the pattern's enum name (non-generic enums
         // where the pattern name matches the type name exactly).
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) {
-            const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
-            if (enum_type_ref.is_valid()) {
-                enum_ty = this.unwrap_to_enum(enum_type_ref);
+            // In a symbolic generic-body walk, only trust this name-based lookup
+            // when the matched value's own type is resolved. With a deferred or
+            // abstract subject the pattern's enum name can be a stale/unrelated
+            // concrete spec — e.g. an inner `Result::Err(e)` matching
+            // `f.write_str()` (`Result<(), FmtError>`) whose node carries a
+            // concrete `Result<i32, X>` name from another instantiation context.
+            // Trusting it would bind a wrong concrete payload and emit a spurious
+            // error. Defer instead; the concrete monomorphization re-checks it
+            // for real (when the subject IS resolved, Fallback A above already
+            // wins, so this only changes the can't-know case).
+            const subject_unresolved: boolean =
+                this.in_symbolic_check && this.symbolic_type_unresolved(value_type);
+            if (!subject_unresolved) {
+                const enum_type_ref: TypeRef = this.lookup_type_by_sym(enum_pat.enum_name);
+                if (enum_type_ref.is_valid()) {
+                    enum_ty = this.unwrap_to_enum(enum_type_ref);
+                }
             }
         }
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return payload_types; }
@@ -1967,17 +1986,17 @@ public:
         }
     }
 
-    /// Additive symbolic type-check of a generic function/method body (Phase 2
-    /// of the mono-after-sema reorder). Walks the body with its type parameters
-    /// left abstract, under full diagnostic suppression, and reports how many
-    /// errors it WOULD have emitted. This is a measurement harness: it emits no
-    /// real diagnostics, and because generic templates are inert after
-    /// monomorphization (downstream passes skip `is_generic()` nodes, and the
-    /// monomorphizer already cloned them), mutating their AST here cannot affect
-    /// codegen. Only runs when CRYO_SYMBOLIC_CHECK is set.
-    ///
-    /// As the symbolic checker matures, a clean run (zero "would-emit" on all
-    /// valid generic code) is the gate for moving sema ahead of mono.
+    /// Symbolic type-check of a generic function/method body (Phase 2 of the
+    /// mono-after-sema reorder). Walks the body with its type parameters left
+    /// abstract and emits REAL diagnostics, so type errors inside a generic
+    /// template are caught even when the template is never instantiated. The
+    /// abstract-mode resolution (`symbolic_bind_params` + the arena's
+    /// demand-free/`is_symbolic` tagging) keeps every instantiation it reaches
+    /// out of monomorphization and out of GenericValidation, and the various
+    /// `symbolic_defer_*` predicates defer checks that can only be decided once
+    /// the type params are concrete (re-run per concrete monomorphization).
+    /// On valid generic code it emits nothing, so production output is unchanged.
+    /// On by default; `CRYO_NO_SYMBOLIC_CHECK` is the kill-switch.
     symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
                         owner_type: TypeRef) -> void {
         if (!this.sema_symbolic_check_enabled()) { return; }
@@ -1985,7 +2004,7 @@ public:
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
 
-        const before: u32 = sink.suppressed_error_total();
+        const snap: DiagnosticSnapshot = sink.snapshot();
         const saved_owner:    TypeRef = this.current_owner_type;
         const saved_symbolic: boolean = this.in_symbolic_check;
         // Owning-array fields: swap out to an empty so the later reassignment
@@ -1997,6 +2016,17 @@ public:
         swap(&this.symbolic_method_param_nodes, &saved_method_nodes);
         this.current_owner_type = owner_type;
         this.in_symbolic_check  = true;
+        // Walk-scoped symbolic mode on the shared arena — the single chokepoint
+        // every instantiation flows through. While set: (1) the GenericRegistry
+        // keeps walk instantiations demand-free, and (2) `create_instantiation`
+        // tags new InstantiatedTypes `is_symbolic` so GenericValidation skips
+        // them. A concrete instantiation reached only inside this (possibly
+        // never-instantiated) template is thus never monomorphized AND never
+        // flagged as an unresolved-instantiation E0900.
+        const ar: TypeArena* = this.arena;
+        const saved_no_demand: boolean =
+            if (ar != null) { ar.symbolic_no_demand_active } else { false };
+        if (ar != null) { ar.set_symbolic_no_demand(true); }
         mut param_ids: u32[] = [];
         // The method's own generic-param nodes, in declaration order so each
         // node's position is its abstract-param index (`symbolic_bind_params`).
@@ -2014,26 +2044,21 @@ public:
         }
         this.symbolic_generic_param_ids   = param_ids;   // field was [], no leak
         this.symbolic_method_param_nodes  = method_nodes;
-        sink.begin_suppress();
 
         this.enter_function(func, this_type);
         this.visit(func.body);
 
-        sink.end_suppress();
+        if (ar != null) { ar.set_symbolic_no_demand(saved_no_demand); }
         // Restore: the body's arrays land back in the locals and drop at scope end.
         swap(&this.symbolic_generic_param_ids, &saved_params);
         swap(&this.symbolic_method_param_nodes, &saved_method_nodes);
         this.in_symbolic_check  = saved_symbolic;
         this.current_owner_type = saved_owner;
 
+        // Telemetry only (the diagnostics above are already real). Counts errors
+        // this body's symbolic walk contributed, for the debug cumulative line.
         this.symbolic_bodies_walked += 1;
-        const would_emit: u32 = sink.suppressed_error_total() - before;
-        if (would_emit > 0) {
-            this.symbolic_total_would_emit += would_emit as i64;
-            const fname: string = this.intern.resolve(func.name);
-            fmt::eprintf("[symbolic-check] would-emit %u in generic body `%s`\n",
-                         would_emit, fname);
-        }
+        this.symbolic_total_would_emit += sink.errors_since(snap) as i64;
     }
 
     /// Symbolically check every method of a generic struct/class/impl owner.
@@ -5100,21 +5125,24 @@ public:
             rhs = this.resolve_expr(bin.right);
         }
 
+        // Symbolic generic-body walk: a binary expression with a deferred
+        // (abstract / `void` / unresolved) operand must defer BEFORE the concrete
+        // binary-op check — otherwise an operand that a deferred match binding
+        // resolved to `void` (e.g. `total + n` where `n` came from
+        // `Result::Ok(n)` on a deferred subject) trips E0229 "Int and Void", and
+        // a comparison whose operand deferred to invalid would mis-resolve to the
+        // other operand's type and then trip the return-type check. The concrete
+        // monomorphization re-checks this for real.
+        if (this.symbolic_type_unresolved(lhs) || this.symbolic_type_unresolved(rhs)) {
+            return TypeRef::invalid();
+        }
+
         if (lhs.is_valid() && rhs.is_valid()) {
             const result: TypeCheckResult = this.checker.check_binary_op(
                 bin.op.lexeme, lhs, rhs);
             if (result.success) { return result.result_type; }
             this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
                 result.error_message, bin.span);
-        }
-
-        // Symbolic generic-body walk: a binary expression with a deferred
-        // (abstract/`void`/unresolved) operand must itself defer rather than
-        // fall back to the other operand's type. Otherwise a comparison like
-        // `rng.next_f64() < this.p` — whose LHS deferred to invalid — would
-        // mis-resolve to `f64` and then trip the return-type check (`boolean`).
-        if (this.symbolic_type_unresolved(lhs) || this.symbolic_type_unresolved(rhs)) {
-            return TypeRef::invalid();
         }
 
         if (lhs.is_valid()) { return lhs; }
@@ -9350,7 +9378,9 @@ public:
             if (all_valid) {
                 // Build a concrete InstantiatedType for (generic_base, explicit args).
                 // Goes through the registry cache so the monomorphizer's
-                // `set_resolved_type` call is visible to this TypeRef.
+                // `set_resolved_type` call is visible to this TypeRef. (During a
+                // symbolic walk the registry is in demand-free mode, so this stays
+                // arena-only and records no monomorphization demand.)
                 return this.ctx.generic_registry.instantiate(
                     ret_inst.generic_base, resolved_args);
             }
@@ -11237,8 +11267,8 @@ type struct SemanticPasses {
                 visitor.body_count);
         }
 
-        if (visitor.sema_symbolic_check_enabled()) {
-            fmt::eprintf("[symbolic-check] cumulative: walked %lld generic bodies, %lld would-emit\n",
+        if (ctx.debug_mode && visitor.sema_symbolic_check_enabled()) {
+            cdebug("[symbolic-check] walked %lld generic bodies, emitted %lld errors\n",
                 visitor.symbolic_bodies_walked, visitor.symbolic_total_would_emit);
         }
 
