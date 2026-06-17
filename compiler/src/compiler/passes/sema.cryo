@@ -56,6 +56,7 @@ import Compiler::ModuleGraph;
 import std::collections::hashmap;
 import std::core::slice;
 import std::core::mem;
+import std::fmt;
 import Utils::Logger;
 
 
@@ -64,6 +65,66 @@ import Utils::Logger;
 // arm-scoped so a fixed name would already be collision-free, but a unique
 // suffix keeps nested `?` readable in AST dumps and the LSP.
 mut g_try_counter: u32 = 0;
+
+
+// Symbolic generic-body check (Phase 2 of the mono-after-sema reorder). These
+// live as file-scope globals rather than TypeCheckVisitor fields on purpose:
+// TypeCheckVisitor is a `type class` with inheritance, and this codebase has a
+// known class-field-offset/vtable miscompile (see the `source_module` note
+// elsewhere in this file). Adding boolean fields to it perturbed an aliased
+// field; globals (like g_try_counter) sidestep that entirely.
+//
+// Cached env gate. Uses a zero-as-unread sentinel because this codebase does
+// not honor non-zero global initializers (globals are zero-initialized):
+//   0 = not yet read, 1 = off, 2 = on.
+mut g_symbolic_check_gate: i32 = 0;
+// True only while a symbolic generic-body walk is in progress, so body
+// visitors can later relax concrete-type expectations.
+mut g_in_symbolic_check: boolean = false;
+// Intern ids of the generic-parameter names in scope for the body currently
+// being symbolically checked (e.g. `T`, `U`). Lets body visitors recognize
+// `T::method(...)` / abstract-type references and defer concrete-only checks.
+mut g_symbolic_generic_param_ids: u32[] = [];
+// Intern ids of the OWNER type's generic params (e.g. the `T` of `Box<T>`) for a
+// generic struct/class/impl whose methods are being symbolically checked. Set by
+// the decl visitors; merged into g_symbolic_generic_param_ids per method body.
+mut g_symbolic_owner_param_ids: u32[] = [];
+// True while symbolically checking a method of a GENERIC owner (struct/class/
+// impl). The owner's fields carry abstract types that the template type can't
+// resolve concretely here, so owner-rooted field/method accesses (`this.field`)
+// are deferred — the concrete monomorphizations re-check them in full. Resolving
+// `this.field` to its abstract field type is the deeper Phase-2 follow-up.
+mut g_symbolic_owner_is_generic: boolean = false;
+// Cumulative measurement counters (only meaningful when gate is on).
+mut g_symbolic_bodies_walked:   i64 = 0;
+mut g_symbolic_total_would_emit: i64 = 0;
+
+/// True when `sym` names a generic parameter of the body currently under
+/// symbolic check (only meaningful while `g_in_symbolic_check`).
+function symbolic_name_is_generic_param(sym: SymbolStr) -> boolean {
+    if (!g_in_symbolic_check) { return false; }
+    for (mut i: i64 = 0; i < g_symbolic_generic_param_ids.length; i++) {
+        if (g_symbolic_generic_param_ids[i] == sym.id) { return true; }
+    }
+    return false;
+}
+
+/// Whether the additive symbolic generic-body type-check is enabled, via the
+/// `CRYO_SYMBOLIC_CHECK` env var. Phase-2 measurement harness: when set, sema
+/// also walks generic templates with their type parameters abstract, under
+/// diagnostic suppression, and logs what it would report. Off by default, so
+/// the normal build is unaffected. Result is cached after the first read.
+function sema_symbolic_check_enabled() -> boolean {
+    if (g_symbolic_check_gate == 0) {
+        const raw: i8* = intrinsics::getenv("CRYO_SYMBOLIC_CHECK") as i8*;
+        if (raw != null && intrinsics::strlen(raw as string) > 0) {
+            g_symbolic_check_gate = 2;
+        } else {
+            g_symbolic_check_gate = 1;
+        }
+    }
+    return g_symbolic_check_gate == 2;
+}
 
 
 // TypeCheckVisitor: visitor-based function body type checker
@@ -175,6 +236,10 @@ public:
     // own arguments don't themselves trigger another conversion attempt
     // (and so converter-aware method selection doesn't recurse).
     in_implicit_conversion: boolean;
+    // NOTE: the symbolic generic-body check (Phase 2) state lives in file-scope
+    // globals (g_symbolic_check_gate / g_in_symbolic_check), NOT as fields here,
+    // to avoid this class's known field-offset miscompile. See the globals near
+    // the top of this file.
 
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
@@ -1309,7 +1374,13 @@ public:
     }
 
     override visit(mut &this, node: FunctionDeclNode*) -> void {
-        if (node.body == null || node.is_generic()) { return; }
+        if (node.body == null) { return; }
+        if (node.is_generic()) {
+            // Generic templates are skipped by the normal (concrete-only) walk;
+            // the additive symbolic checker measures them when enabled.
+            this.symbolic_check_body(node, TypeRef::invalid(), TypeRef::invalid());
+            return;
+        }
         const _fn_name: string = this.intern.resolve(node.name);
         // A `private` type from another module may not appear in a public
         // signature (params / return) either.
@@ -1654,14 +1725,28 @@ public:
     }
 
     override visit(mut &this, node: StructDeclNode*) -> void {
-        if (node.is_generic()) { return; }
+        if (node.is_generic()) {
+            if (sema_symbolic_check_enabled()) {
+                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
+            }
+            return;
+        }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
         const st_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
         this.visit_methods(node.methods, st_type);
     }
 
     override visit(mut &this, node: ClassDeclNode*) -> void {
-        if (node.is_generic()) { return; }
+        if (node.is_generic()) {
+            if (sema_symbolic_check_enabled()) {
+                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
+            }
+            return;
+        }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
         const cl_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
         this.visit_methods(node.methods, cl_type);
@@ -1690,7 +1775,18 @@ public:
     }
 
     override visit(mut &this, node: ImplBlockNode*) -> void {
-        if (node.is_generic()) { return; }
+        if (node.is_generic()) {
+            // A generic impl (`implement<T> ... for Foo<T>`): its methods'
+            // bodies reference the impl's abstract params. Walk them
+            // symbolically (when enabled) with `this` typed as the target and
+            // the impl's params exposed as abstract; otherwise skip as before.
+            if (sema_symbolic_check_enabled()) {
+                const impl_target: TypeRef = this.lookup_type_by_sym(node.target_type);
+                this.symbolic_check_owner_methods(node.methods, impl_target,
+                                                  node.generic_params);
+            }
+            return;
+        }
         // Skip impls whose target is a generic template; those exist only
         // as a source for monomorphization. Type-checking the template body
         // would bind `this` to the bare-template type, which has no concrete
@@ -1799,9 +1895,19 @@ public:
             if (method == null || method.func == null || method.func.body == null) {
                 continue;
             }
-            // Skip generic methods: their bodies contain unsubstituted
-            // type parameters (T) that can't be resolved until monomorphization.
-            if (method.func.is_generic()) { continue; }
+            // Skip generic methods in the normal walk: their bodies contain
+            // unsubstituted type parameters (T) that can't be resolved until
+            // monomorphization. The additive symbolic checker measures them
+            // (with T abstract) when enabled.
+            if (method.func.is_generic()) {
+                const sym_this: TypeRef = if (method.is_static) {
+                    TypeRef::invalid()
+                } else {
+                    owner_type
+                };
+                this.symbolic_check_body(method.func, sym_this, owner_type);
+                continue;
+            }
             // Skip self-returning trait-default templates (combinators): they
             // are instantiated lazily at call sites and only their concrete
             // specializations (with the flag cleared) carry resolvable types.
@@ -1841,6 +1947,199 @@ public:
             }
             this.current_owner_type = saved_owner;
         }
+    }
+
+    /// Additive symbolic type-check of a generic function/method body (Phase 2
+    /// of the mono-after-sema reorder). Walks the body with its type parameters
+    /// left abstract, under full diagnostic suppression, and reports how many
+    /// errors it WOULD have emitted. This is a measurement harness: it emits no
+    /// real diagnostics, and because generic templates are inert after
+    /// monomorphization (downstream passes skip `is_generic()` nodes, and the
+    /// monomorphizer already cloned them), mutating their AST here cannot affect
+    /// codegen. Only runs when CRYO_SYMBOLIC_CHECK is set.
+    ///
+    /// As the symbolic checker matures, a clean run (zero "would-emit" on all
+    /// valid generic code) is the gate for moving sema ahead of mono.
+    symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
+                        owner_type: TypeRef) -> void {
+        if (!sema_symbolic_check_enabled()) { return; }
+        if (func == null || func.body == null) { return; }
+        const sink: DiagnosticSink* = this.ctx.diagnostics;
+        if (sink == null) { return; }
+
+        const before: u32 = sink.suppressed_error_total();
+        const saved_owner:    TypeRef = this.current_owner_type;
+        const saved_symbolic: boolean = g_in_symbolic_check;
+        const saved_params:   u32[]   = g_symbolic_generic_param_ids;
+        this.current_owner_type = owner_type;
+        g_in_symbolic_check     = true;
+        mut param_ids: u32[] = [];
+        // Owner type params first (e.g. `Box<T>`'s `T`), then the method's own.
+        for (mut op: i64 = 0; op < g_symbolic_owner_param_ids.length; op++) {
+            param_ids.push(g_symbolic_owner_param_ids[op]);
+        }
+        for (mut gp: i64 = 0; gp < func.generic_params.length; gp++) {
+            const pnode: GenericParamNode* = func.generic_params[gp];
+            if (pnode != null) { param_ids.push(pnode.name.id); }
+        }
+        g_symbolic_generic_param_ids = param_ids;
+        sink.begin_suppress();
+
+        this.enter_function(func, this_type);
+        this.visit(func.body);
+
+        sink.end_suppress();
+        g_in_symbolic_check          = saved_symbolic;
+        g_symbolic_generic_param_ids = saved_params;
+        this.current_owner_type      = saved_owner;
+
+        g_symbolic_bodies_walked += 1;
+        const would_emit: u32 = sink.suppressed_error_total() - before;
+        if (would_emit > 0) {
+            g_symbolic_total_would_emit += would_emit as i64;
+            const fname: string = this.intern.resolve(func.name);
+            fmt::eprintf("[symbolic-check] would-emit %u in generic body `%s`\n",
+                         would_emit, fname);
+        }
+    }
+
+    /// Symbolically check every method of a generic struct/class/impl owner.
+    /// Unlike `visit_methods`, ALL methods are routed through the symbolic walk
+    /// (even non-generic ones), because their bodies reference the owner's
+    /// abstract type parameters (`Box<T>`'s `T`). The owner params are exposed
+    /// via `g_symbolic_owner_param_ids` so `symbolic_check_body` merges them
+    /// with each method's own params. No-op unless symbolic checking is enabled.
+    symbolic_check_owner_methods(mut &this, methods: &MethodNode*[],
+                                 owner_type: TypeRef,
+                                 owner_params: &GenericParamNode*[]) -> void {
+        if (!sema_symbolic_check_enabled()) { return; }
+        const saved_owner_params: u32[]  = g_symbolic_owner_param_ids;
+        const saved_owner_generic: boolean = g_symbolic_owner_is_generic;
+        mut oids: u32[] = [];
+        for (mut i: i64 = 0; i < owner_params.length; i++) {
+            const p: GenericParamNode* = owner_params[i];
+            if (p != null) { oids.push(p.name.id); }
+        }
+        g_symbolic_owner_param_ids = oids;
+        g_symbolic_owner_is_generic = true;
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null || method.func.body == null) {
+                continue;
+            }
+            // Self-returning trait-default combinators are instantiated lazily;
+            // their template self-application is intentionally not walked.
+            if (method.func.is_self_returning_default) { continue; }
+            const sym_this: TypeRef = if (method.is_static) {
+                TypeRef::invalid()
+            } else {
+                owner_type
+            };
+            this.symbolic_check_body(method.func, sym_this, owner_type);
+        }
+        g_symbolic_owner_param_ids  = saved_owner_params;
+        g_symbolic_owner_is_generic = saved_owner_generic;
+    }
+
+    /// True (only in a generic-owner symbolic walk) when `ty` is the abstract
+    /// owner type itself — so an access rooted at `this` whose field/method
+    /// types are abstract should be deferred rather than reported.
+    symbolic_is_generic_owner_receiver(&this, ty: TypeRef) -> boolean {
+        if (!g_in_symbolic_check || !g_symbolic_owner_is_generic) { return false; }
+        if (!ty.is_valid() || !this.current_owner_type.is_valid()) { return false; }
+        const recv_base:  Type* = this.unwrap_to_base_type(ty);
+        const owner_base: Type* = this.unwrap_to_base_type(this.current_owner_type);
+        if (recv_base == null || owner_base == null) { return false; }
+        return recv_base.id == owner_base.id;
+    }
+
+    /// During a generic-owner symbolic walk, resolve `this.<field>` to the
+    /// field's abstract declared type (e.g. `Box<T>::value : T`, `RcInner<T,A>`'s
+    /// `count : u64`). The owner's *arena* StructType/ClassType carries no
+    /// `FieldInfo[]` — `run_struct_field_sync` skips `is_generic()` templates —
+    /// so `check_field_access` can't see the field. But the owner template's AST
+    /// `FieldDeclNode.resolved_type` IS populated with the abstract type (struct
+    /// fields are resolved under `make_generic_context`, with each param bound to
+    /// its `GenericParam`, during TypeResolution). Read it straight off the
+    /// template AST. Returns invalid when not in a generic-owner walk, the
+    /// receiver isn't the owner, or `field` names no field of it — so a genuine
+    /// typo (`this.nonexistent`) still falls through to the normal E0204 path.
+    symbolic_resolve_owner_field(mut &this, recv_type: TypeRef,
+                                 field: SymbolStr) -> TypeRef {
+        if (!this.symbolic_is_generic_owner_receiver(recv_type)) {
+            return TypeRef::invalid();
+        }
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const base: Type* = this.unwrap_to_base_type(recv_type);
+        if (base == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.fields.length; i++) {
+                const f: FieldDeclNode* = sn.fields[i];
+                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                    return f.resolved_type;
+                }
+            }
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.fields.length; i++) {
+                const f: FieldDeclNode* = cn.fields[i];
+                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                    return f.resolved_type;
+                }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// During a generic-owner symbolic walk, resolve `this.<method>()`'s return
+    /// type to its abstract declared return (e.g. `Box<T>::get(&this) -> T`).
+    /// Like fields, a generic owner's arena `MethodInfo[]` is empty
+    /// (`run_struct_field_sync` skips generic templates), so the normal method
+    /// lookup can't see it; but the owner template's AST `MethodNode.func`
+    /// carries `resolved_return_type` resolved abstractly (method signatures are
+    /// resolved under `make_generic_context` at TypeResolution). Returns the
+    /// abstract return type when EXACTLY ONE non-static method of that name
+    /// exists; returns invalid for 0 matches or an ambiguous overload set (the
+    /// caller then defers, exactly as before — no new false positive). Trait-impl
+    /// and inherited methods live elsewhere and are intentionally not resolved
+    /// here, so they keep deferring rather than risk a wrong-method match.
+    symbolic_resolve_owner_method_return(mut &this, recv_type: TypeRef,
+                                         method_name: SymbolStr) -> TypeRef {
+        if (!this.symbolic_is_generic_owner_receiver(recv_type)) {
+            return TypeRef::invalid();
+        }
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const base: Type* = this.unwrap_to_base_type(recv_type);
+        if (base == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            methods = &sn.methods;
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            methods = &cn.methods;
+        } else {
+            return TypeRef::invalid();
+        }
+        mut found_count: i64 = 0;
+        mut ret: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.is_static) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            found_count += 1;
+            ret = m.func.resolved_return_type;
+        }
+        if (found_count == 1 && ret.is_valid()) { return ret; }
+        return TypeRef::invalid();
     }
 
 
@@ -2322,8 +2621,15 @@ public:
                 this.verify_impl_trait_bounds(imp_ann, init_type, var_node);
             }
             if (var_node.has_resolved_type() && init_type.is_valid()
-                    && imp_ann == null) {
-                // Declared type exists; check that the initializer is compatible
+                    && imp_ann == null
+                    && !this.symbolic_defer_type(init_type)
+                    && !this.symbolic_defer_type(var_node.resolved_type)) {
+                // Declared type exists; check that the initializer is compatible.
+                // In a symbolic generic-body walk the guards above skip this when
+                // either side is still abstract: a match-arm binding whose
+                // scrutinee deferred (`this.read_request()` on the generic owner)
+                // falls back to the enum template's bare generic param, which is a
+                // valid-but-abstract type that can_assign would spuriously reject.
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
                     // A typed binding is a coercion site too: `mut s: Str =
                     // "text"` bridges `string -> Str` through the registered
@@ -2667,6 +2973,31 @@ public:
         return false;
     }
 
+    /// During a symbolic generic-body walk, a concrete-only check against a
+    /// type that still carries an abstract type parameter (`T`, `U`, ...) must
+    /// be deferred, not reported: it can only be decided once the template is
+    /// monomorphized. Returns true when the check should be skipped. A no-op
+    /// outside symbolic mode (and, since concrete bodies never carry generic
+    /// params, effectively a no-op there too — but the gate keeps it explicit).
+    symbolic_defer_type(&this, ty: TypeRef) -> boolean {
+        if (!g_in_symbolic_check) { return false; }
+        if (!ty.is_valid()) { return true; }
+        return Monomorphizer::mono_type_contains_generic_param(this.arena, ty);
+    }
+
+    /// Broader symbolic-mode predicate for receiver/operand positions: a type
+    /// that is invalid, `void` (sema's unresolved fallback), or still carries an
+    /// abstract type parameter cannot drive a concrete-only check (field access,
+    /// method resolution, dereference, ...). Such a check must defer to the
+    /// concrete monomorphization. A no-op outside symbolic mode.
+    symbolic_type_unresolved(&this, ty: TypeRef) -> boolean {
+        if (!g_in_symbolic_check) { return false; }
+        if (!ty.is_valid()) { return true; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t != null && t.kind == TypeKind::Void) { return true; }
+        return Monomorphizer::mono_type_contains_generic_param(this.arena, ty);
+    }
+
     override visit(mut &this, node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
             // Set expected_type to the function's return type so that
@@ -2681,7 +3012,9 @@ public:
             this.expected_type = saved_expected;
             if (expr_type.is_valid() && this.return_type.is_valid()
                     && !this.type_has_unresolved_projection(this.return_type)
-                    && !this.type_has_unresolved_projection(expr_type)) {
+                    && !this.type_has_unresolved_projection(expr_type)
+                    && !this.symbolic_defer_type(this.return_type)
+                    && !this.symbolic_defer_type(expr_type)) {
                 if (!this.checker.can_assign(expr_type, this.return_type)) {
                     const value_span: SourceSpan =
                         if (node.expression != null) {
@@ -3067,7 +3400,10 @@ public:
     /// non-generic use (unsupported); flag it and check only the first arm.
     override visit(mut &this, node: StaticMatchStmtNode*) -> void {
         if (node == null || node.arms.length == 0) { return; }
-        if (node.arms.length > 1) {
+        // In a symbolic generic-body walk the monomorphizer hasn't pruned the
+        // `static match (T)` to a single arm yet (T is still abstract), so a
+        // multi-arm node here is expected, not the unsupported non-generic use.
+        if (node.arms.length > 1 && !g_in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 node.span);
@@ -4667,6 +5003,15 @@ public:
                 result.error_message, bin.span);
         }
 
+        // Symbolic generic-body walk: a binary expression with a deferred
+        // (abstract/`void`/unresolved) operand must itself defer rather than
+        // fall back to the other operand's type. Otherwise a comparison like
+        // `rng.next_f64() < this.p` — whose LHS deferred to invalid — would
+        // mis-resolve to `f64` and then trip the return-type check (`boolean`).
+        if (this.symbolic_type_unresolved(lhs) || this.symbolic_type_unresolved(rhs)) {
+            return TypeRef::invalid();
+        }
+
         if (lhs.is_valid()) { return lhs; }
         if (rhs.is_valid()) { return rhs; }
         return TypeRef::invalid();
@@ -4759,6 +5104,11 @@ public:
                         || recv_t.kind == TypeKind::Reference)) {
                     return;
                 }
+                // Symbolic generic-body walk: an abstract/`void`/unresolved
+                // receiver type can't be confirmed value-vs-pointer (e.g.
+                // `entry: Entry<K,V>*` where K,V are abstract), so don't recurse
+                // into the immutable-lvalue check and mis-report the binding.
+                if (this.symbolic_type_unresolved(ma.object.resolved_type)) { return; }
                 this.check_assignment_lvalue(ma.object);
             }
             NodeKind::ArrayAccess => {
@@ -4770,6 +5120,7 @@ public:
                         || arr_t.kind == TypeKind::Reference)) {
                     return;
                 }
+                if (this.symbolic_type_unresolved(aa.array.resolved_type)) { return; }
                 this.check_assignment_lvalue(aa.array);
             }
             NodeKind::Literal => {
@@ -4822,6 +5173,12 @@ public:
         const result: TypeCheckResult = this.checker.check_unary_op(
             unary.op.lexeme, operand_type);
         if (!result.success) {
+            // Symbolic generic-body walk: `*x` / unary ops on an abstract or
+            // `void` (unresolved) operand can't be validated until the operand
+            // type is concrete; defer rather than report a bogus operand error.
+            if (this.symbolic_type_unresolved(operand_type)) {
+                return operand_type;
+            }
             this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP,
                 result.error_message, unary.span);
             return operand_type;
@@ -6213,6 +6570,14 @@ public:
         // set - e.g. a `T: Display`-bounded receiver, or recursion inside a
         // trait-impl method - mono already chose, so this stays silent.)
         if (trait_ambiguous && !member.resolved_trait.is_valid()) {
+            // Symbolic generic-body walk: trait dispatch is pinned by the
+            // monomorphizer, which sets `member.resolved_trait` on the concrete
+            // clone — never on the template we're walking here. So a same-named
+            // method from two traits ALWAYS looks ambiguous symbolically, even
+            // when each concrete instantiation disambiguates cleanly. Defer to
+            // those instantiations, which re-run this exact check with
+            // `resolved_trait` set.
+            if (g_in_symbolic_check) { return; }
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0154_AMBIGUOUS_CALL,
                 format("call to `%s` is ambiguous: it is provided by multiple traits implemented for this type",
@@ -7560,6 +7925,25 @@ public:
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid -> upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+        // Symbolic generic-body walk: an abstract / `void` (unresolved) receiver
+        // can't drive concrete method resolution (which would spuriously report
+        // "no method" or "ambiguous call"); defer to the concrete instantiation.
+        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
+        // Method call on the abstract generic owner (`this.get()` in a `Box<T>`
+        // method): resolve its return type off the owner template AST (the arena
+        // has no methods for a generic template). An unambiguous match resolves
+        // to the abstract return type; 0 matches or an overload set (or a
+        // trait-impl/inherited method that lives elsewhere) returns invalid and
+        // defers, exactly as the previous blanket defer did — so no new FP.
+        if (this.symbolic_is_generic_owner_receiver(obj_type)) {
+            const mret: TypeRef =
+                this.symbolic_resolve_owner_method_return(obj_type, member.member);
+            if (mret.is_valid()) {
+                member.set_resolved_type(mret);
+                return mret;
+            }
+            return TypeRef::invalid();
+        }
 
         // Unwrap Pointer / Reference / InstantiatedType so method lookup
         // works on `this.intern_table.resolve(name)` where `intern_table`
@@ -8184,6 +8568,32 @@ public:
         if (this.ctx.type_resolver == null)    { return fallback; }
         if (member.generic_args.length == 0)   { return fallback; }
 
+        // Symbolic generic-body walk: when an explicit method-level generic arg
+        // references the enclosing body's still-abstract type params
+        // (`raw.cast<RcInner<T, A>>()` inside `Rc<T, A>::try_new_in`), the call
+        // cannot select a concrete instantiation - its result type is only known
+        // after monomorphization. Resolving such an arg through the owner-bound
+        // context below is actively harmful: an identically-named owner param
+        // (NonNull's own `T`) shadows the enclosing `T`, the arg lands on a
+        // wrong-but-valid concrete spec, and that poison propagates down the
+        // local-type inference chain (`typed`, `inner_ptr`) producing spurious
+        // E0204s. Detect abstract args in a FRESH context (no bindings, so an
+        // enclosing param resolves to invalid while a genuinely concrete arg
+        // like `cast<i32>()` still resolves) and defer the whole call.
+        if (g_in_symbolic_check) {
+            mut sym_ctx: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            for (mut i: i64 = 0; i < member.generic_args.length; i++) {
+                const a: TypeRef = this.ctx.type_resolver.resolve(
+                    member.generic_args[i], &sym_ctx);
+                if (!a.is_valid()
+                        || Monomorphizer::mono_type_contains_generic_param(
+                               this.arena, a)) {
+                    return TypeRef::invalid();
+                }
+            }
+        }
+
         // Unwrap one layer of Pointer/Reference if present so we end up at
         // the InstantiatedType (or template Struct/Class) that owns the
         // method.  Method-call resolution already did this for the lookup
@@ -8389,6 +8799,14 @@ public:
         // 4. CImport alias-qualified function (e.g., llvm::FunctionName)
         const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
         if (cimport_ret.is_valid()) { return cimport_ret; }
+
+        // Symbolic generic-body walk: `T::method(...)` on an abstract type
+        // parameter (e.g. `T::__pluck` in `next<T> where T: VaArg`) can only be
+        // resolved once T is concrete. Defer rather than report a missing
+        // symbol; the concrete monomorphization re-checks it for real.
+        if (symbolic_name_is_generic_param(scope.scope_name)) {
+            return TypeRef::invalid();
+        }
 
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
@@ -9201,6 +9619,25 @@ public:
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid -> upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+        // Symbolic generic-body walk: a receiver that resolved to `void` or
+        // still carries an abstract type parameter is unresolved, not genuinely
+        // fieldless — defer field resolution to the concrete instantiation.
+        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
+        // Access rooted at the abstract generic owner (`this.value` in a
+        // `Box<T>` method): resolve the field to its abstract declared type off
+        // the owner template's AST (the arena StructType has no fields for a
+        // generic template). A concrete field (`count: u64`) resolves concretely;
+        // a `T`-typed field resolves to a GenericParam that downstream checks
+        // defer on. A name that is NOT a field falls through to the normal path
+        // (method lookup / E0204), so `this.nonexistent` is still a true error.
+        if (this.symbolic_is_generic_owner_receiver(obj_type)) {
+            const owner_field: TypeRef =
+                this.symbolic_resolve_owner_field(obj_type, member.member);
+            if (owner_field.is_valid()) {
+                member.set_resolved_type(owner_field);
+                return owner_field;
+            }
+        }
 
         // Tuple positional access: `t.0`, `t.1`. The parser interns the
         // numeric token's lexeme as the member SymbolStr (same field as
@@ -9269,6 +9706,10 @@ public:
             return result.result_type;
         }
 
+        // Symbolic generic-body walk: the (unwrapped) receiver resolved to
+        // `void`/abstract, so field+method lookup can't be decided yet — defer.
+        if (this.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
+
         // Fall back to method lookup with inheritance chain. Resolve the type
         // symbol from the *dereferenced* receiver (`walk_ty`, already walked
         // past pointer/reference/instantiation wrappers above) rather than the
@@ -9321,6 +9762,9 @@ public:
         const index_type: TypeRef = this.resolve_expr(access.index);
         // Input invalid -> upstream error already emitted, stay silent
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
+        // Symbolic generic-body walk: indexing an abstract/`void` (unresolved)
+        // receiver can't be checked until it's concrete; defer.
+        if (this.symbolic_type_unresolved(array_type)) { return TypeRef::invalid(); }
 
         // Tuple bracket indexing: `t[0]`, `t[1]`. Tuples have a fixed,
         // statically-known shape, so the index MUST be an integer literal
@@ -9561,7 +10005,9 @@ public:
     /// first arm and flag it, rather than type-check provably-dead arms.
     resolve_static_match_expr(mut &this, sm: StaticMatchExprNode*) -> TypeRef {
         if (sm == null || sm.arms.length == 0) { return TypeRef::invalid(); }
-        if (sm.arms.length > 1) {
+        // Symbolic generic-body walk: an unpruned multi-arm `static match (T)`
+        // is expected here (T still abstract), not the unsupported non-generic use.
+        if (sm.arms.length > 1 && !g_in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 sm.span);
@@ -9728,6 +10174,10 @@ public:
         // 2. Classify the operand: 1 = Result-shaped, 2 = Option-shaped.
         const operand_shape: i32 = this.enum_try_shape(operand_type);
         if (operand_shape == 0) {
+            // Symbolic generic-body walk: an abstract operand (e.g.
+            // `Result<Entry<K,V>*, E>` with K,V abstract) can't be classified as
+            // Result/Option shape yet; defer to the concrete instantiation.
+            if (this.symbolic_type_unresolved(operand_type)) { return TypeRef::invalid(); }
             const ot: Type* = this.arena.lookup(operand_type.id);
             const disp: string = if (ot != null) {
                 this.arena.format_display(ot)
@@ -9745,6 +10195,13 @@ public:
         //    failure arm's early `return` is well-typed.
         const fn_shape: i32 = this.enum_try_shape(this.return_type);
         if (fn_shape != operand_shape) {
+            // Symbolic generic-body walk: if the enclosing function's return
+            // type (or the operand) is abstract, the shapes can't be compared
+            // reliably; defer to the concrete instantiation.
+            if (this.symbolic_type_unresolved(this.return_type)
+                    || this.symbolic_type_unresolved(operand_type)) {
+                return TypeRef::invalid();
+            }
             const want: string = if (operand_shape == 1) { "Result" } else { "Option" };
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0235_TRY_OUTSIDE_RESULT_FN,
@@ -10672,6 +11129,11 @@ type struct SemanticPasses {
         if (ctx.debug_mode) {
             cdebug("[FunctionBodyTypeCheck] Type-checked %lld function bodies\n",
                 visitor.body_count);
+        }
+
+        if (sema_symbolic_check_enabled()) {
+            fmt::eprintf("[symbolic-check] cumulative: walked %lld generic bodies, %lld would-emit\n",
+                g_symbolic_bodies_walked, g_symbolic_total_would_emit);
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
