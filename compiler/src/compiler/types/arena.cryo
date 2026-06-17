@@ -30,6 +30,13 @@ type struct TypeArena {
     // -- Ownership --
     types:   Type*[];           // All types (indexed by allocation order)
     next_id: u64;               // Monotonic counter (starts at 1; 0 = invalid)
+    // True for the duration of a symbolic generic-body walk (sema sets it around
+    // `symbolic_check_body`). While set, `create_instantiation` tags every new
+    // InstantiatedType `is_symbolic`, so concrete instantiations that exist only
+    // inside a never-instantiated template (resolved by the walk but never
+    // monomorphized) are excluded from GenericValidation's E0900 check. The
+    // GenericRegistry also consults it to keep walk instantiations demand-free.
+    symbolic_no_demand_active: boolean;
 
     // -- Interned string table (borrowed from CompilationContext) --
     intern_table: InternTable*;
@@ -119,6 +126,7 @@ type struct TypeArena {
         mut arena: TypeArena = TypeArena {
             types:   [],
             next_id: 1,
+            symbolic_no_demand_active: false,
             intern_table: intern_table,
 
             void_type:   TypeRef::invalid(),
@@ -495,6 +503,11 @@ type struct TypeArena {
         return ref;
     }
 
+    /// Enter/leave walk-scoped symbolic mode (see `symbolic_no_demand_active`).
+    set_symbolic_no_demand(mut &this, on: boolean) -> void {
+        this.symbolic_no_demand_active = on;
+    }
+
     /// Create a generic type instantiation.  Deduplicates by
     /// (generic_base, type_args) so that the same (base, args) tuple
     /// always returns the same arena slot, regardless of whether the
@@ -527,7 +540,12 @@ type struct TypeArena {
         for (mut i: i64 = 0; i < args.length; i++) {
             args_owned.push(args[i]);
         }
-        const ref: TypeRef = this.alloc_type(new InstantiatedType(this.next_id, base, args_owned));
+        mut inst_node: InstantiatedType* = new InstantiatedType(this.next_id, base, args_owned);
+        // Tag instantiations minted during a symbolic walk so GenericValidation
+        // skips them (they may be concrete instantiations living only inside a
+        // never-instantiated template and are never monomorphized/codegen'd).
+        if (this.symbolic_no_demand_active) { inst_node.is_symbolic = true; }
+        const ref: TypeRef = this.alloc_type(inst_node);
         const pos: u32 = (this.types.length - 1) as u32;
         const bucket: u32[]* = this.inst_by_base.get_or_insert(base.id, []);
         (*bucket).push(pos);
