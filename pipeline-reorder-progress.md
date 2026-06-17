@@ -587,3 +587,343 @@ TypeCheckVisitor one; the real bug was the mangler ICE).
 UNCOMMITTED. Needs a **repin** (`make pin` refreshes linux + win on this host).
 Validated: make cryo ✓, gate-ON stdlib 1681/0/exit0, make test 99/0, selfhost
 FIXED POINT `ba7ccfb4`. Repro files: `/tmp/basewrite.cryo`, `/tmp/basewrite3.cryo`.
+
+---
+
+## 2026-06-17 — BRIDGE attempt #2 (post Phase-C) → EXPERIMENT data, REVERTED
+
+Attempted the BRIDGE again now that Phase C landed: made the symbolic generic-body
+walk **default-ON** (kill-switch `CRYO_NO_SYMBOLIC_CHECK`) and **removed
+`begin/end_suppress`** in `symbolic_check_body` so it emits REAL diagnostics; the
+per-body would-emit eprintf was replaced with real-error telemetry
+(`sink.errors_since(snap)`) and the cumulative line gated behind `debug_mode`.
+Verified first that `TypeCheckVisitor` emits 0 warnings (63 error sites, 0 warning
+sites) → un-suppressing can only surface errors, never spurious warnings.
+
+**Pre-flight (clean):**
+- stdlib-alone via the default-ON compiler: **0 errors, exit 0**.
+- `CRYO_SYMBOLIC_CHECK=1 make cryo` (compiler + stdlib, fresh): **9515 generic
+  bodies walked / 0 would-emit / exit 0**. So the compiler's OWN generics are clean.
+
+**`make test` REGRESSED (5 errors) — the EXPERIMENT result.** The failure is NOT in
+the 12 generic compile-fail tests; it is in **stdlib `fmt/display.cryo`**, and ONLY
+when stdlib is compiled in the same unit as the test corpus (stdlib-alone and
+compiler+stdlib are both clean). Two FP classes, both **cross-unit spec pollution**:
+1. **4× E0214 in `Result<T,E>`'s `Display::fmt` / `Debug::fmt`** (display.cryo
+   590/601/621/632). The arm `Result::Err(e) => fmt_err(e)` binds `e` to a CONCRETE
+   `Result` spec's Err-payload pulled from ANOTHER unit — `std::test::error::TestError`
+   (Display) and `boolean` (Debug) — instead of `FmtError` from the concrete
+   scrutinee `f.write_str()` (`Result<(), FmtError>`). The symbolic walk's match-arm
+   enum-pattern payload binding resolves the `Result::Err` variant payload against a
+   cross-unit concrete spec rather than the abstract owner / the scrutinee's resolved
+   type. (`mono_type_contains_generic_param` DOES recurse through Reference/Pointer,
+   so the `resolve_method_call` defer guard at sema ~8034 is not the gap; the gap is
+   the enum-pattern payload resolution path.)
+2. **1× E0900 `Pair` (inst_id=15334)** — an abstract `Pair<,>` instantiation leaks as
+   un-monomorphized in the test-corpus unit despite `symbolic_no_demand`; a path that
+   doesn't route through the demand-free resolver. Cross-unit only.
+
+**This confirms prior bridge findings #1/#3 persist** for constructs the keystone
+didn't cover: the keystone's `symbolic_bind_params` fixed bare-param-annotation
+collisions (`mut alloc: A`), but NOT (a) match-arm enum-pattern payload binding, nor
+(b) this `Pair` E0900 path. "0 would-emit on stdlib/compiler" remains necessary but
+NOT sufficient — cross-unit (test-corpus) builds still pollute symbolic resolution.
+
+**REVERTED** to the committed checkpoint (`git checkout HEAD -- sema.cryo`); make cryo
++ make test 99/0 confirm a clean revert. The env-gated default-OFF measurement harness
+(committed @ `54277d4e`) is intact.
+
+**GAP TO CLOSE before the bridge is shippable (the multi-day core, now scoped):**
+make the symbolic walk's resolution collision-proof across units for:
+- **match-arm enum-pattern payload binding** — bind the variant payload from the
+  scrutinee's resolved type (or the abstract owner), never via a global/cross-unit
+  concrete-spec lookup; defer when the subject is symbolic-unresolved.
+- **the `Pair` E0900 path** — route (or defer) whatever instantiates `Pair` in this
+  body through `symbolic_no_demand` so it stays arena-only.
+Recommended next: build a minimal 2-"unit" repro (an abstract-owner generic method
+matching `Result::Err(e)` + a colliding concrete `Result<_, X>` spec in the same
+build) to pin the exact resolution site, then fix + re-run the bridge. Flagged for
+Jake to greenlight the deep dive.
+
+---
+
+## 2026-06-17 — BRIDGE SHIPPED ✅ (un-suppressed, default-ON) + 3 FP classes root-caused & fixed
+
+The BRIDGE is DONE: the symbolic generic-body walk now runs **default-ON** and
+**un-suppressed**, emitting REAL diagnostics for type errors in never-instantiated
+generic templates. Kill-switch: `CRYO_NO_SYMBOLIC_CHECK`. This turns the Phase-2
+measurement harness into a production feature and is the stepping-stone to the flip.
+
+**Validated (Linux):** `make test` unit ok + **compile-fail 99/0**; `selfhost-check
+--no-windows` **✓ FIXED POINT** IR md5 `ab153ba479198730fdc29e2f811476f1`; TEETH
+confirmed (a never-instantiated `Thing<T>` with `string + 5` inside → E0200 ON,
+silent under the kill-switch). gate-OFF path is byte-identical (all new logic is
+behind the arena's walk-scoped flag, set only during `symbolic_check_body`).
+
+The BRIDGE attempt #2 had surfaced 3 cross-unit FP classes (only in the multi-unit
+`cryo test` build; stdlib-alone + compiler were clean). Each root-caused and fixed
+with a principled, sound (never-false-positive) defer/tag — NOT a suppression hack:
+
+1. **E0214 `FmtError` vs `TestError`/`boolean`** (`Result<T,E>::fmt`, display.cryo).
+   Root: the inner `Result::Err(e)` matches `f.write_str()` (`Result<(),FmtError>`)
+   but its subject DEFERS (receiver `&Formatter<W>`, W abstract → `resolve_method_call`
+   returns invalid). With an invalid subject, `resolve_variant_payload_types` fell to
+   **Fallback B** — a global name lookup of the pattern's enum name — which, with the
+   pattern node carrying a stale/concrete `Result<i32,X>` name from another
+   instantiation context, bound `e` to a wrong cross-unit payload. **Fix:** in a
+   symbolic walk, skip Fallback B when the subject type is `symbolic_type_unresolved`
+   (defer; the concrete mono re-checks). sema ~1184. When the subject IS resolved,
+   Fallback A already wins, so only the can't-know case changes.
+
+2. **E0900 `Pair` unresolved-instantiation** (GenericValidation, specialization.cryo
+   ~916). Root (NOT the registry/demand path — that was a red herring): the walk
+   resolves a CONCRETE `Pair<X,Y>` that lives only inside a never-instantiated
+   template; it lands in the **arena** with `resolved_type` invalid, nothing
+   monomorphizes it, and a later module's GenericValidation (shared arena) flags it.
+   gate-OFF the walk never runs so the node never exists → false positive. **Fix:**
+   a walk-scoped flag on the **TypeArena** (`symbolic_no_demand_active`, the single
+   instantiation chokepoint) tags every InstantiatedType minted during the walk
+   `is_symbolic` (new field on InstantiatedType); GenericValidation skips `is_symbolic`
+   nodes exactly like it already skips generic-arg ones. The GenericRegistry also
+   reads the arena flag to keep walk instantiations demand-free. Real code that later
+   needs the same (base,args) reuses the arena node and sets resolved_type, after
+   which the tag is moot.
+
+3. **E0229 `Cannot apply '+' to Int and Void`** (io/traits.cryo `total + n`).
+   Root: with the #1 fix, a deferred-subject match binding resolves to `void`; the
+   binary-op check emitted E0229 (`Int + Void`) BEFORE its existing symbolic defer.
+   **Fix:** move the `symbolic_type_unresolved(lhs|rhs)` defer ABOVE the
+   `check_binary_op`/E0229 emit (sema ~5128). No-op outside the walk.
+
+**Design note (soundness):** every fix makes the walk DEFER (or tag-and-skip) what it
+cannot resolve abstractly — a sound over-approximation that never false-positives,
+and the concrete monomorphization still re-checks the deferred parts. This is exactly
+the bridge's intended semantics. The eventual FLIP (mono-after-sema) will need the
+walk to RESOLVE more abstractly (e.g. trait-method return types on abstract receivers)
+rather than defer, but that is Phase 3+ and is not regressed here.
+
+Files: `passes/sema.cryo` (bridge + #1 + #3 + arena-flag wiring), `types/arena.cryo`
+(flag + `is_symbolic` tagging + setter), `types/generic.cryo` (`InstantiatedType.is_symbolic`),
+`types/generic_registry.cryo` (demand-free via arena flag), `passes/specialization.cryo`
+(GenericValidation skip). UNCOMMITTED; needs a **repin** (compiler source changed).
+
+NEXT (per RECOMMENDED NEXT SEQUENCE): the EXPERIMENT — apply the actual pass reorder
+(FunctionBodyTypeCheck before mono), run `make test`, record which compile-fail tests
+regress, then REVERT. That quantifies the remaining gap for the real flip.
+
+---
+
+## 2026-06-17 — THE EXPERIMENT (§2): reorder measured, REVERTED — result is a CONFOUNDED zero
+
+Ran the §2 gap-measurement experiment on `build_standard_pipeline` (single-module,
+smallest surface) and reverted it. **Headline: 0 regressions — but the measurement is
+confounded and must NOT be read as "the flip is free."**
+
+**What was changed (two edits, both reverted):**
+1. `passes/pass_registry.cryo build_standard_pipeline`: moved `FunctionBodyTypeCheck`
+   from after `GenericValidation` to **immediately before `Monomorphization`** (right
+   after `DirectiveProcessing`). MoveCheck/DropInsertion stayed after mono.
+2. `passes/pass_id.cryo`: changed `FunctionBodyTypeCheck`'s requirement from
+   `GenericsValidated` → `StructFieldsSynced`. **Required** — the registry runs passes
+   in array order and `validate()` does a linear "is each required provision satisfied
+   by an earlier pass" scan (no topo re-sort), so without this the new order is
+   rejected. `StructFieldsSynced` is provided by `StructFieldTypeSync` (already
+   upstream). This is exactly flip step 4 for this one builder.
+
+   NB: flip step 2 ("route is_generic bodies through the symbolic check") was **already
+   done by the BRIDGE** — `visit(FunctionDeclNode*)` (sema ~1415) already calls
+   `symbolic_check_body` for generic nodes and `symbolic_check_owner_methods` for
+   methods. So the experiment is purely the reorder + the requirement swap.
+
+**Result:** `make cryo` built clean (pinned cryo compiled the reordered source fine);
+`make test` → **unit 1233/1233 PASS, compile-fail 99/0**. No validation abort, no
+unit regression, no compile-fail regression. The gap list is EMPTY.
+
+**Why the zero is CONFOUNDED (the important finding):** the experiment moved
+`FunctionBodyTypeCheck` earlier but **left Monomorphization, GenericExpressionResolution,
+and GenericValidation fully intact and still running after it.** Those passes still
+emit the instantiation-site diagnostics. Concretely, `E0306_trait_bound.cryo`
+(`cf_need<i32>(5)`, `i32` fails `where T: CfShow`) is the canonical §3 gap — a
+trait-bound check on a concrete instantiation — and it STILL fired, because it is
+emitted by **`monomorphizer.cryo:4483 emit_call_bound_failure`** (mono's own
+`type_implements_trait` call-site check), NOT by `FunctionBodyTypeCheck`. Moving the
+body check earlier cannot lose an error that a still-present downstream pass owns.
+
+So: the reorder is mechanically sound and loses nothing **while mono's diagnostic
+engine remains as a backstop.** The real defer-vs-resolve gap (§3) is MASKED by that
+backstop and will only surface as regressions when **flip step 6** deletes mono's
+private inference/checking. The §2 experiment as literally specified cannot see the
+gap — its premise ("reordering exposes the regressions") is wrong given the current
+pipeline shape.
+
+**Corrected next measurement (the experiment that actually quantifies the gap):**
+reorder AS ABOVE **and** neuter mono's type-error emission (a proxy for step 6 —
+e.g. suppress `emit_call_bound_failure` + mono's other diagnostic sites, or gate them
+off), THEN run `make test` and count regressions. Those regressions = the concrete
+defer→resolve worklist for flip step 3 (trait-bound satisfaction at instantiation
+sites, abstract trait-method return resolution, bound-directed dispatch). Until mono's
+diagnostics are removed, the body-check reorder is a no-op from the error-coverage
+point of view.
+
+Tree restored to checkpoint (HEAD `5f4a2223`); baseline `build/cryo` rebuilt. Only
+this doc + untracked HANDOFF.md dirty. No repin needed (no committed source changed).
+
+---
+
+## 2026-06-17 (cont.) — FLIP IMPLEMENTATION: single-module reorder + sema owns call-site checks (VALIDATED, selfhost FIXED POINT)
+
+Continuing the mono-after-sema hard switch. This session corrected a flawed
+measurement, then landed the first real implementation increment.
+
+### Correction to the prior "§2 experiment = 0 regressions"
+That experiment reordered `build_standard_pipeline` — but `cryo check` (the
+compile-fail path) goes through `compile_for_check` → **`build_frontend_pipeline`**,
+which I had NOT reordered. The reorder was inert; 99/0 proved nothing. Redone
+correctly (all three single-module builders reordered), the real gap surfaced:
+**5 compile-fail regressions = exactly {E0306×2, E0307, E0214×2}** — the three
+monomorphizer inference-engine diagnostics. E0645 (static-match) and E0900 (ICE)
+stay in mono (specialization mechanics, not inference). **Zero §3 abstract-
+resolution gap in the corpus** — all five are concrete call-site checks.
+
+### What landed (committed-quality, in tree; NOT git-committed)
+1. **Pipeline reorder (single-module).** `build_standard/frontend/raw_pipeline`
+   in `passes/pass_registry.cryo`: `FunctionBodyTypeCheck` moved to immediately
+   before `Monomorphization`. `passes/pass_id.cryo`: FunctionBodyTypeCheck
+   requirement `GenericsValidated` → `StructFieldsSynced` (so `validate()`'s
+   linear provision scan accepts the new order). MoveCheck/DropInsertion/
+   GenericValidation stay after mono.
+2. **Sema owns the three call-site checks** (`passes/sema.cryo`). New
+   `check_generic_free_call(call, ident)`, invoked from `resolve_call`'s
+   Identifier branch, ports the monomorphizer's `try_infer_function_call`
+   three-pass inference onto the shared `InferCtx` unifier (new
+   `import Compiler::Types::Inference`) reusing sema's already-resolved arg
+   types. Emits E0306 (where-bound), E0307 (un-inferable `![implicit]`), E0214
+   (conflicting `T`). Helpers: `find_fn_template_for_call` (bare-name+arity,
+   defers on ambiguity), `sema_arg_is_polymorphic_literal` (node-kind only — in
+   sema literals already carry a resolved_type, unlike pre-sema mono),
+   `free_infer_type_concrete`, `free_infer_arg_reliable`, plus three emit_*.
+
+### The key soundness finding (drives the rest of the flip)
+Moving FunctionBodyTypeCheck ahead of mono exposed that **sema's `resolved_type`
+is not yet authoritative pre-mono** for *call-expression arguments*:
+  * a nested **inferred generic call** stays abstract (`max_of(3,9)` → `T`, since
+    mono binds its `T`); and
+  * a **bare-name call mis-resolves cross-namespace** to a same-leaf sibling
+    (`classify(...)` → `PatternMatching::Sign` via `decl_index.lookup_func_return`
+    on the bare name) in the mega unit-test build.
+Trusting those wrong types made the call-site check false-positive (14 unit-build
+errors: `Sign`-vs-`i32`, `T`-vs-`i32`). Fix = the bridge's defer discipline:
+`free_infer_arg_reliable` treats a `CallExpression` arg as non-authoritative and
+**defers** it (mono still backstops the specialization); literals / variables /
+turbofish stay reliable and drive the checks. E0307 tightened to the airtight
+arg-less case. Result: **make test 99/0 + unit ok; selfhost ✓ FIXED POINT**, new
+IR md5 `79c53d890923e539a9525e79396548d1`.
+
+### Why this is an increment, not the finished flip
+The compiler's OWN build still uses the multi-module orchestrator, which runs
+sema in Phase 6b (AFTER mono) — so the orchestrator is NOT yet flipped. And the
+two `resolved_type` deficiencies above are *deferred*, not *fixed*; mono's
+inference still backstops them. The remaining flip work, in order:
+  * **(A)** Sema must INFER + PIN `resolved_callee` + set concrete `resolved_type`
+    for generic free calls, so nested calls resolve concretely pre-mono
+    (closes the `max_of`→`T` deficiency). `check_generic_free_call` already
+    computes the bindings; extend it to pin + set the return type.
+  * **(B)** Sema must resolve a bare-name direct call's `resolved_type` from the
+    arg-type-selected overload (its `resolved_callee`), not the last-write-wins
+    bare `decl_index.lookup_func_return` (closes `classify`→`Sign`).
+  * **Orchestrator reorder**: extract `FunctionBodyTypeCheck` into a new
+    per-module phase between Phase 6a-i (DirectiveProcessing) and 6a-ii (mono);
+    Phase 6b keeps GenericValidation/MoveCheck/DropInsertion/TypeLowering.
+  * **Delete mono's inference engine** (the ~27 fns A2 mapped) only AFTER A+B
+    make sema authoritative — it is the backstop until then.
+
+Tree: single-module reorder + sema checks in place, selfhost fixed point. Not
+git-committed; not yet repinned (pinned BRIDGE compiler still builds the new
+source fine).
+
+---
+
+## 2026-06-17 (cont. 2) — ORCHESTRATOR REORDER attempted; the (A) blocker mapped precisely; CONSOLIDATED to a green selfhost fixed point
+
+Pushed past the single-module reorder into the real flip: reordering the
+multi-module orchestrator (`instance.cryo`) so the compiler's OWN build runs
+`FunctionBodyTypeCheck` before `Monomorphization`.  The reorder itself is
+mechanically correct and got remarkably far, but it surfaced a concrete,
+multi-faceted blocker — sema is not yet authoritative for *generic call return
+types* pre-mono.  Reverted the orchestrator change to keep a green, validated
+base; kept the sound pre-mono groundwork.
+
+### Orchestrator reorder (reverted, but documented for redo)
+In `compile_project_with_ctx`: inserted a new per-module phase
+`[FunctionBodyTypeCheck]` between Phase 6a-i (DirectiveProcessing) and 6a-ii
+(Monomorphization), with `validate_with_initial` provisions {ASTValidated,
+NamesResolved, TypesResolved, StructFieldsSynced, DirectivesProcessed}; removed
+FunctionBodyTypeCheck from Phase 6b and marked `BodiesTypeChecked` as an incoming
+provision there (for MoveCheck).  No `pm_cached` skip in the new phase (the
+incremental-cache decision isn't computed until after mono).  This compiles and
+the structure is right; redo it once (A) below lands.
+
+### The blocker: sema must resolve GENERIC CALL RETURN TYPES pre-mono (work item A)
+With mono after sema, mono SKIPS calls sema already resolved, so any wrong/abstract
+`resolved_type` sema leaves on a generic call reaches codegen.  The reorder build
+failed ONLY on this class (the rest of the huge compiler+stdlib build was clean):
+
+1. **Turbofish scope call return** — `mem::transmute<f64,i64>(x)` resolved to the
+   abstract template return `To` instead of `i64`.  **FIXED** (kept): new
+   `subst_return_from_call_args` + a pre-mono fallback in
+   `resolve_module_qualified_function` (sema ~895) that substitutes the turbofish
+   args (`scope.generic_args`/`call.generic_args`) into the template return via
+   `TypeSubstitution::from_params` when the spec doesn't exist yet.
+2. **`?` on an unresolved `Result<...>`** — `enum_try_shape` → `unwrap_to_enum`
+   returns null for an InstantiatedType with no `resolved_type`.  **FIXED** (kept):
+   localized `generic_base` fallback in `enum_try_shape` (sema ~10567) — variant
+   NAMES only, so payload-reading callers of unwrap_to_enum are untouched.
+3. **Match exhaustiveness / all-paths-return on unresolved `Option<...>`** —
+   `patterns_cover` → same null.  **FIXED** (kept): same localized `generic_base`
+   fallback in `patterns_cover` (sema ~3726).
+4. **STILL OPEN — the core of (A): INFERRED generic call/method returns stay
+   abstract.**  `choose(&r, &view)` (free) → `Option<T>` not `Option<i32>`;
+   `s.get(index)` (method on `Slice<u8>`) → `Option<T>` not `Option<u8>`;
+   `op_from_u8(..)` similarly.  The match subject is then abstract, so `Some(b)`
+   binds `b: T` (E0200 `found T`), exhaustiveness/divergence misfire (E0405/E0403).
+   FIX = sema must INFER the type args from the arguments and SUBSTITUTE them into
+   the return type, for BOTH free calls and method calls, setting the call's
+   `resolved_type` to the concrete instantiation (`Option<i32>`/`Option<u8>`).
+   `check_generic_free_call` already computes the bindings (via `InferCtx`); extend
+   it to return the substituted concrete return and have `resolve_call` use it; do
+   the analogous thing on the method-call path (`resolve_method_call`).  WATCH the
+   mono coupling: do NOT pin `resolved_callee` for the inferred case (the
+   pin-stranding warning at sema ~859) — leave it unpinned so mono still
+   specializes; only set `resolved_type`.  Pattern binding already substitutes
+   concrete `type_args` into payloads via `peel_to_instantiation`, so a concrete
+   `Option<i32>` subject is enough for `Some(b): i32`.
+
+Item 4 is the heart of "make sema the source of truth" (Phase 5 / step A) and is a
+real multi-faceted piece (free + method + turbofish inferred returns).  It must
+land BEFORE the orchestrator reorder can keep selfhost green, and BEFORE mono's
+inference engine can be deleted (step 6).
+
+### Consolidated checkpoint (GREEN, VALIDATED — current tree, uncommitted)
+- Single-module pipelines reordered (`pass_registry.cryo`) + `pass_id.cryo`
+  requirement swap.
+- Sema owns E0306/E0307/E0214 call-site checks (`check_generic_free_call` + helpers).
+- Pre-mono resolution groundwork (items 1-3 above) — INERT in the current
+  (orchestrator-unchanged) order because sema still runs after mono there, so the
+  fallbacks never trigger; they are correct and ready for the orchestrator redo.
+- `make test`: unit ok + compile-fail **99/0**.
+- `selfhost-check --no-windows`: **✓ FIXED POINT**, IR md5
+  `d767168da7706567c64ab5fb6b1c7bb6`.
+- NOT git-committed; NOT repinned (the pinned BRIDGE compiler still builds the new
+  source fine, so no repin is required to continue).
+
+### RECOMMENDED NEXT SEQUENCE (for the next session)
+1. Land work item **A.4** (inferred free + method call return substitution) — the
+   keystone.  Validate against the orchestrator reorder by re-applying it
+   temporarily and building stdlib via stage-2 (`frame.cryo` is the canary:
+   `byte_at` / `read_frame`).  Iterate until stdlib+compiler build clean under the
+   reorder.
+2. Re-apply the orchestrator reorder (documented above) + validate selfhost fixed
+   point + make test.
+3. THEN delete mono's inference engine (step 6, the ~27 fns A2 mapped) and mono's
+   E0306/E0307/E0214 emission; sema is now authoritative.  Validate.
+4. Repin (linux) once the flip is complete and green.

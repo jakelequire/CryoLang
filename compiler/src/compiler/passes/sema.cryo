@@ -51,6 +51,7 @@ import Compiler::Resolver::Resolver;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Substitution;
+import Compiler::Types::Inference;
 import Compiler::Types::TraitChecker;
 import Compiler::ModuleGraph;
 import std::collections::hashmap;
@@ -895,11 +896,62 @@ public:
                     return spec_ret;
                 }
             }
+            // Pre-monomorphization (sema-before-mono): the spec function
+            // doesn't exist yet, so the lookup above missed and we'd otherwise
+            // surface the ABSTRACT template return (`To` for
+            // `mem::transmute<From,To>`).  When the call carries explicit
+            // turbofish args, substitute them straight into the template return
+            // so sema is the source of truth (`mem::transmute<f64,i64>` -> i64).
+            // Mono still produces the concrete spec from `call.resolved_callee`.
+            mut subst_ret: TypeRef = TypeRef::invalid();
+            if (spec_sym.is_valid()) {
+                if (scope != null && scope.generic_args.length > 0) {
+                    subst_ret = this.subst_return_from_call_args(
+                        tmpl, &scope.generic_args, ret);
+                } else if (call.generic_args.length > 0) {
+                    subst_ret = this.subst_return_from_call_args(
+                        tmpl, &call.generic_args, ret);
+                }
+            }
+            if (subst_ret.is_valid()) {
+                call.set_resolved_callee(spec_sym);
+                return subst_ret;
+            }
         }
         if (!is_fn_template) {
             this.pin_scope_callee_qsym(call, q_sym);
         }
         return ret;
+    }
+
+    /// Substitute a generic function's explicit turbofish args into its
+    /// (still-generic) return type, yielding the concrete return BEFORE the
+    /// monomorphizer has created the spec.  This makes sema authoritative for
+    /// a turbofish call's type when it runs ahead of mono.  Returns invalid
+    /// when the args don't resolve, the arity disagrees, or the substituted
+    /// return is still abstract (then the caller keeps its existing behaviour).
+    subst_return_from_call_args(mut &this, tmpl: TemplateEntry*,
+                                generic_args: &TypeAnnotation*[],
+                                tmpl_ret: TypeRef) -> TypeRef {
+        if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
+        if (generic_args.length != tmpl.param_type_ids.length) {
+            return TypeRef::invalid();
+        }
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic_bind_params(&rc);
+        mut arg_refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < generic_args.length; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &rc);
+            if (!tr.is_valid()) { arg_refs.drop(); return TypeRef::invalid(); }
+            arg_refs.push(tr);
+        }
+        mut subst: TypeSubstitution =
+            TypeSubstitution::from_params(tmpl.param_type_ids, arg_refs);
+        const out: TypeRef = subst.apply(tmpl_ret, this.arena);
+        if (!out.is_valid() || this.contains_generic_param(out)) {
+            return TypeRef::invalid();
+        }
+        return out;
     }
 
     /// Parameter count of the free function registered under qualified name
@@ -3671,7 +3723,17 @@ public:
                 return true;
             }
         }
-        const enum_ty: Type* = this.unwrap_to_enum(value_type);
+        mut enum_ty: Type* = this.unwrap_to_enum(value_type);
+        // Pre-monomorphization (sema-before-mono): an unresolved `Result<...>`
+        // / `Option<...>` InstantiatedType has no resolved_type yet; fall back
+        // to the generic base enum, whose variant NAMES are all coverage
+        // analysis needs here (payload narrowing recurses on irrefutable arms).
+        if (enum_ty == null) {
+            const inst: InstantiatedType* = this.peel_to_instantiation(value_type);
+            if (inst != null && !inst.has_resolved_type()) {
+                enum_ty = this.unwrap_to_enum(inst.generic_base);
+            }
+        }
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return false; }
         const et: EnumType* = enum_ty as EnumType*;
         if (et.variants.length == 0) { return false; }
@@ -5773,6 +5835,16 @@ public:
             // through unchanged.
             this.try_specialize_for_closure_args(call, ident);
 
+            // Pre-mono call-site checks for a generic free-function call:
+            // where-bound satisfaction (E0306), inference conflict (E0214),
+            // and un-inferable `![implicit]` (E0307).  These used to be the
+            // monomorphizer's job, but with FunctionBodyTypeCheck hoisted
+            // ahead of Monomorphization, sema resolves the call first and
+            // short-circuits mono's inference, so the diagnostics must
+            // originate here.  Sound over-approximation: a binding that stays
+            // abstract is deferred, never flagged.
+            this.check_generic_free_call(call, ident);
+
             // If mono pre-pinned a specialized callee (inferred-arg generic
             // free-function calls inside a spec'd body, e.g.
             // `alloc_entry(this, h, k, v)` after HashMap<K,V,A>::insert is
@@ -5894,6 +5966,315 @@ public:
         }
 
         return this.resolve_expr(callee);
+    }
+
+    /// Find the single generic free-function template matching a bare call
+    /// name AND parameter arity.  Returns null on no match OR ambiguity
+    /// (two same-name, same-arity templates): the check defers rather than
+    /// risk binding the wrong template's bounds - a sound over-approximation.
+    find_fn_template_for_call(&this, name: SymbolStr, argc: i64) -> TemplateEntry* {
+        const reg: GenericRegistry* = this.ctx.generic_registry;
+        if (reg == null) { return null; }
+        mut found: TemplateEntry* = null;
+        mut count: i64 = 0;
+        const total: i64 = reg.template_count();
+        for (mut i: i64 = 0; i < total; i++) {
+            const cand: TemplateEntry* = &reg.entries[i];
+            if (cand == null) { continue; }
+            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (!cand.name.equals(name)) { continue; }
+            const f: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
+            if (f == null) { continue; }
+            if (f.parameters.length != argc) { continue; }
+            found = cand;
+            count = count + 1;
+        }
+        if (count == 1) { return found; }
+        return null;
+    }
+
+    /// A bare (or simply negated / arithmetic-constant) integer / float
+    /// literal is POLYMORPHIC for generic inference: it must adopt whatever
+    /// type a non-literal argument or the return context binds, defaulting to
+    /// i32 / f64 only as a last resort.  Unlike the monomorphizer's version,
+    /// this does NOT short-circuit on a valid `resolved_type` - sema has
+    /// already typed the literal (a bare `5` carries i32), so the node kind
+    /// is the only reliable signal.
+    sema_arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            return lit.literal_kind == LiteralKind::Integer
+                || lit.literal_kind == LiteralKind::Float;
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+                return this.sema_arg_is_polymorphic_literal(u.operand);
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            const op: string = b.op.lexeme;
+            const is_arith: boolean =
+                op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+                || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+            if (!is_arith) { return false; }
+            return this.sema_arg_is_polymorphic_literal(b.left)
+                && this.sema_arg_is_polymorphic_literal(b.right);
+        }
+        return false;
+    }
+
+    /// True when `t` bottoms out at a fully concrete representation (no open
+    /// generic/bounded param, not void/unit).  Mirrors the monomorphizer's
+    /// `infer_type_is_concrete` so the E0214 conflict gate stays identical:
+    /// only two genuinely concrete actuals for one `T` are a hard error.
+    free_infer_type_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::GenericParam)     { return false; }
+        if (ty.kind == TypeKind::BoundedParam)     { return false; }
+        if (ty.kind == TypeKind::FunctionTemplate) { return false; }
+        if (ty.kind == TypeKind::Function)         { return false; }
+        if (ty.kind == TypeKind::Unit)             { return false; }
+        if (ty.kind == TypeKind::Void)             { return false; }
+        if (ty.kind == TypeKind::Pointer) {
+            return this.free_infer_type_concrete((ty as PointerType*).pointee);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            return this.free_infer_type_concrete((ty as ReferenceType*).referent);
+        }
+        if (ty.kind == TypeKind::Array) {
+            return this.free_infer_type_concrete((ty as ArrayType*).element);
+        }
+        if (ty.kind == TypeKind::Optional) {
+            return this.free_infer_type_concrete((ty as OptionalType*).wrapped);
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return false; }
+        }
+        return true;
+    }
+
+    /// Whether a call argument's `resolved_type` is authoritative enough,
+    /// before monomorphization, to drive an inference conflict / bound error.
+    /// A call expression's pre-mono type is NOT: a nested inferred generic
+    /// call stays abstract until mono binds its `T`, and a bare-name call can
+    /// mis-resolve to a same-leaf sibling in another namespace.  Such args are
+    /// deferred (the concrete monomorphization still re-checks them) so the
+    /// call-site analysis never false-positives - the bridge's defer-don't-
+    /// guess discipline.  Literals, variables, field accesses and casts carry
+    /// a reliable sema type and are kept.
+    free_infer_arg_reliable(&this, arg: ExpressionNode*) -> boolean {
+        if (arg == null) { return false; }
+        const node: ASTNode* = arg as ASTNode*;
+        if (node.kind == NodeKind::CallExpression) { return false; }
+        return true;
+    }
+
+    /// Pre-monomorphization call-site analysis for a generic free-function
+    /// call.  Ports the monomorphizer's `try_infer_function_call` inference
+    /// (three-pass: non-literal args, return-type context, literal fallback)
+    /// and where-bound check into sema, reusing the shared `InferCtx`
+    /// unifier and sema's already-resolved argument types.  Emits E0214
+    /// (conflicting `T`), E0307 (un-inferable `![implicit]`), and E0306
+    /// (unsatisfied `where` bound).  Any binding that stays abstract is
+    /// deferred - never flagged - so calls inside still-generic bodies don't
+    /// false-positive.
+    check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
+        const entry: TemplateEntry* =
+            this.find_fn_template_for_call(ident.name, call.arguments.length);
+        if (entry == null) { return; }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null) { return; }
+        if (entry.param_type_ids.length == 0) { return; }   // not generic
+
+        // Per-param concrete bindings, in generic-parameter declaration order.
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
+            bindings.push(TypeRef::invalid());
+        }
+
+        if (call.generic_args.length > 0) {
+            // Explicit turbofish is authoritative; resolve each annotation.
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            mut n: i64 = call.generic_args.length;
+            if (n > bindings.length) { n = bindings.length; }
+            for (mut i: i64 = 0; i < n; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(call.generic_args[i], &rc);
+                if (tr.is_valid()) { bindings[i] = tr; }
+            }
+        } else {
+            // Infer from argument types via the shared structural unifier.
+            if (tmpl.parameters.length != call.arguments.length) { return; }
+            mut pids: u64[] = [];
+            for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
+                pids.push(entry.param_type_ids[i]);
+            }
+            mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+
+            // PASS A - bind from non-literal arguments; reject two concrete
+            // actuals for one `T` (E0214).
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = tmpl.parameters[i];
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                if (!this.free_infer_arg_reliable(arg)) { continue; }
+                const actual: TypeRef = arg.resolved_type;
+                if (!actual.is_valid()) { continue; }
+                ictx.conflict_from = TypeRef::invalid();
+                ictx.conflict_to   = TypeRef::invalid();
+                ictx.unify(param.resolved_type, actual);
+                if (ictx.conflict_from.is_valid() && ictx.conflict_to.is_valid()
+                        && this.free_infer_type_concrete(ictx.conflict_from)
+                        && this.free_infer_type_concrete(ictx.conflict_to)) {
+                    this.emit_free_infer_conflict(call, tmpl.name, arg,
+                        ictx.conflict_from, ictx.conflict_to);
+                    return;
+                }
+            }
+
+            // PASS B - recover still-unbound params from the expected type.
+            if (this.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()) {
+                mut any_unbound: boolean = false;
+                for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+                    if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
+                }
+                if (any_unbound) {
+                    ictx.unify(tmpl.resolved_return_type, this.expected_type);
+                }
+            }
+
+            // PASS C - literal fallback: a polymorphic literal adopts an
+            // already-pinned numeric `T`, but a non-numeric binding
+            // (`second(5, "hello")` pins `T = string`) is a hard conflict.
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = tmpl.parameters[i];
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                const lit_actual: TypeRef = arg.resolved_type;
+                if (!lit_actual.is_valid()) { continue; }
+                const f_idx: i64 = ictx.binding_index(param.resolved_type.id);
+                if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) {
+                    const bnd: TypeRef = ictx.bindings[f_idx];
+                    if (this.free_infer_type_concrete(bnd)
+                            && this.checker.check_compatibility(lit_actual, bnd)
+                            == TypeCompatibility::Incompatible) {
+                        this.emit_free_infer_conflict(call, tmpl.name, arg, bnd, lit_actual);
+                        return;
+                    }
+                    continue;
+                }
+                ictx.unify(param.resolved_type, lit_actual);
+            }
+
+            for (mut i: i64 = 0; i < bindings.length; i++) {
+                bindings[i] = ictx.bindings[i];
+            }
+
+            // E0307 - an `![implicit]` call we still couldn't fully infer.
+            mut all_bound: boolean = true;
+            for (mut i: i64 = 0; i < bindings.length; i++) {
+                if (!bindings[i].is_valid()) { all_bound = false; break; }
+            }
+            if (!all_bound) {
+                // Only a truly arg-less implicit call is unambiguously
+                // un-inferable (E0307: `make()`).  With arguments present we
+                // may simply have deferred an unreliable call-expression arg,
+                // so stay silent rather than risk a false positive.
+                if (tmpl.is_implicit && call.arguments.length == 0
+                        && !this.expected_type.is_valid()) {
+                    this.emit_free_cannot_infer(call, tmpl.name);
+                }
+                return;
+            }
+        }
+
+        // E0306 - where-clause bound satisfaction for the bound type args.
+        if (tmpl.trait_bounds.length == 0) { return; }
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
+            const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            mut idx: i64 = -1;
+            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
+                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
+            }
+            if (idx < 0 || idx >= bindings.length) { continue; }
+            const concrete: TypeRef = bindings[idx];
+            if (!concrete.is_valid()) { continue; }
+            if (this.contains_generic_param(concrete)) { continue; }   // defer abstract
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef* = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
+                    this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// E0306: an inferred/explicit type arg fails a `where` bound at a call.
+    emit_free_call_bound_failure(mut &this, call: CallExprNode*,
+                                 tmpl: FunctionDeclNode*, tref: TraitRef*,
+                                 concrete: TypeRef, trait_name: SymbolStr) -> void {
+        const trait_str: string = this.intern.resolve(trait_name);
+        const fn_str:    string = this.intern.resolve(tmpl.name);
+        const conc_str:  string = this.type_display_name(concrete);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str));
+        d = d.at(call.span);
+        d = d.also_at(tref.span, format("required by this bound in `%s`", fn_str));
+        d = d.with_note(format("the trait `%s` is not implemented for `%s`",
+            trait_str, conc_str));
+        d = d.help(format(
+            "implement `%s` for `%s`, or pass an argument of a type that already does",
+            trait_str, conc_str));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// E0307: an `![implicit]` generic call with no recoverable type arg.
+    emit_free_cannot_infer(mut &this, call: CallExprNode*, fn_name: SymbolStr) -> void {
+        const fn_str: string = this.intern.resolve(fn_name);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            format("cannot infer the type argument for `%s`", fn_str));
+        d = d.at(call.span);
+        d = d.with_note(
+            "`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
+        d = d.help(format("write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// E0214: one type parameter inferred to two distinct concrete types.
+    emit_free_infer_conflict(mut &this, call: CallExprNode*, fn_name: SymbolStr,
+                             arg: ExpressionNode*, bound: TypeRef, got: TypeRef) -> void {
+        const fn_str:    string = this.intern.resolve(fn_name);
+        const bound_str: string = this.type_display_name(bound);
+        const got_str:   string = this.type_display_name(got);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0214_ARGUMENT_MISMATCH,
+            format("conflicting types for the type parameter of `%s`", fn_str));
+        const anchor: SourceSpan = if (arg != null && arg.span.has_location()) {
+            arg.span
+        } else {
+            call.span
+        };
+        d = d.at_with_label(anchor,
+            format("expected `%s` (inferred from an earlier argument), found `%s`",
+                   bound_str, got_str));
+        d = d.with_note(format("a single type parameter cannot be both `%s` and `%s`",
+            bound_str, got_str));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Conservative arity check for direct free-function calls.
@@ -10194,7 +10575,19 @@ public:
     /// on variant names rather than the enum's (possibly mangled or
     /// specialized) name, so it works for `Result_i32_string` etc.
     enum_try_shape(&this, ty: TypeRef) -> i32 {
-        const e: Type* = this.unwrap_to_enum(ty);
+        mut e: Type* = this.unwrap_to_enum(ty);
+        // Pre-monomorphization (sema-before-mono): an unresolved
+        // `Result<...>` / `Option<...>` InstantiatedType has no resolved_type
+        // yet, so unwrap_to_enum returns null.  Classify via the generic base
+        // enum, whose variant set (Ok/Err, Some/None) is all shape detection
+        // needs.  Localized here because payload-reading callers of
+        // unwrap_to_enum must NOT see the abstract base's variant payloads.
+        if (e == null) {
+            const inst: InstantiatedType* = this.peel_to_instantiation(ty);
+            if (inst != null && !inst.has_resolved_type()) {
+                e = this.unwrap_to_enum(inst.generic_base);
+            }
+        }
         if (e == null || e.kind != TypeKind::Enum) { return 0; }
         const et: EnumType* = e as EnumType*;
         if (et.get_variant(this.intern.intern("Ok")) != null
