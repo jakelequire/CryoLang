@@ -49,6 +49,16 @@ type struct ResolutionContext {
     /// Invalid outside trait/impl scopes; using `This` there is an error.
     this_type:        TypeRef;
 
+    /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
+    /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
+    /// instead of routing through `generic_registry.instantiate_for_module`. The
+    /// arena path does NOT register a monomorphization demand, so
+    /// `collect_unmonomorphized` never sees the instantiation and no spurious
+    /// E0900 (un-monomorphized) leaks. The symbolic generic-body walk sets this
+    /// so it can resolve `Pair<T, V>`-style abstract annotations without polluting
+    /// the registry with type-param-bearing instantiations.
+    symbolic_no_demand: boolean;
+
     static new(current_module: string, source_file: string) -> ResolutionContext {
         return ResolutionContext {
             current_module:   current_module,
@@ -56,6 +66,7 @@ type struct ResolutionContext {
             import_modules:   [],
             generic_bindings: [],
             this_type:        TypeRef::invalid(),
+            symbolic_no_demand: false,
         };
     }
 
@@ -91,6 +102,7 @@ type struct ResolutionContext {
         mut out: ResolutionContext =
             ResolutionContext::new(this.current_module, this.source_file);
         out.this_type = this.this_type;
+        out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
             out.add_binding(this.generic_bindings[i].first,
                             this.generic_bindings[i].second);
@@ -185,6 +197,13 @@ type struct TypeResolver {
             }
             TypeAnnotation::Array(a) => {
                 mut elem: TypeRef = this.resolve(a.element, ctx);
+                // An array with an unresolvable element is itself unresolvable;
+                // propagate invalid rather than minting `Array<invalid>` (which
+                // later ICEs the mangler at `Array.element`). Mirrors the
+                // Pointer/Reference cases above.
+                if (!elem.is_valid()) {
+                    return TypeRef::invalid();
+                }
                 return this.arena.get_array_of(elem, a.size);
             }
             TypeAnnotation::Function(f) => {
@@ -1203,6 +1222,16 @@ private:
                     return this.resolve(alias_node.target_annotation, &alias_ctx);
                 }
             }
+        }
+
+        // Demand-free (symbolic) mode: build the InstantiatedType in the arena
+        // only, skipping the registry's per-module demand registration. This lets
+        // the symbolic generic-body walk resolve type-param-bearing annotations
+        // (e.g. `Pair<T, V>`) to a concrete arena slot WITHOUT creating a
+        // monomorphization demand that `collect_unmonomorphized` would later flag
+        // as un-monomorphized (E0900). The arena dedupes by (base, args).
+        if (ctx.symbolic_no_demand) {
+            return this.arena.create_instantiation(base, &args);
         }
 
         // Track which module requested this instantiation for per-module codegen.
