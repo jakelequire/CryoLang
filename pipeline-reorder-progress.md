@@ -524,3 +524,66 @@ Cluster to move (all closed over the 4 read-only pointers; verified):
 Free-fn deps: `find_inst_wrapping` (types/inference.cryo), `OwnershipQuery::*`.
 
 Status: writing `compiler/src/compiler/types/trait_checker.cryo`.
+
+---
+
+## 2026-06-17 — Phase C (globals→fields) DONE + Phase D (source_module side-channel) VERIFIED
+
+Built directly on the mangler fix (`swap<Array<ptr>>` ICE) from the MANGLER FIX
+section. Both validated; tree needs a **repin** (compiler source changed).
+
+### Phase C — symbolic-check globals are now TypeCheckVisitor fields
+Deleted the file-scope `mut g_*` block in `passes/sema.cryo` and the two free
+functions; they are now ordinary fields + methods of `TypeCheckVisitor`:
+- `g_try_counter`→`try_counter`; `g_symbolic_check_gate`→`symbolic_check_gate`
+  (read ONCE in the constructor, so `sema_symbolic_check_enabled(&this)` is a pure
+  `this.symbolic_check_gate == 2` reader); `g_in_symbolic_check`→`in_symbolic_check`;
+  the four `g_symbolic_*param*` arrays + `g_symbolic_owner_is_generic` +
+  `g_symbolic_bodies_walked`/`g_symbolic_total_would_emit` → fields.
+- `symbolic_name_is_generic_param`/`sema_symbolic_check_enabled` are now methods.
+- The owning-array fields (`symbolic_generic_param_ids`,
+  `symbolic_method_param_nodes`, `symbolic_owner_param_ids`,
+  `symbolic_owner_param_nodes`) use the **swap-with-empty save/restore idiom** in
+  `symbolic_check_body`/`symbolic_check_owner_methods` (mirrors `resolve_lambda`'s
+  `undo_*`). This is exactly the `swap<Array<ptr>>` shape the mangler fix enabled —
+  it built clean, proving the fix is the real unblock.
+- This confirms the OLD "adding fields to the vtable'd TypeCheckVisitor crashes the
+  compiler" claim was a MISDIAGNOSIS; the crash was only the mangler ICE.
+
+Validation: `make cryo` ✓; gate-ON stdlib walks **1681 generic bodies / 0
+would-emit / exit 0** (identical to the globals baseline — the per-module
+"cumulative" lines now report per-pass-invocation since the counters are fields,
+but they sum to 1681); `make test` unit ok + **compile-fail 99/0**; selfhost
+**✓ FIXED POINT** IR md5 `ba7ccfb4e9ab278994f1ec243e70f49f` (this md5 is AFTER
+Phase C + D1 together).
+
+### Phase D — verify-first on the `source_module` base-pointer field-write workaround
+**Finding: the suspected base-pointer field-write miscompile is NOT reproducible.**
+A faithful 3-level vtable'd repro (`ASTNode` root → `DeclarationNode` owns the
+field → `StructDeclNode` leaf; write the field through an `ASTNode*`-cast-to-
+`DeclarationNode*`, read back through the leaf and the mid) PASSES at both O0 and
+O2 — field write survives, neighbor fields intact, vtable dispatch intact. So the
+workaround's stated rationale ("direct field writes don't survive vtable-offset
+miscompiles") is **obsolete** (it was the same misdiagnosis as the
+TypeCheckVisitor one; the real bug was the mangler ICE).
+
+- **D1 (done):** Simplified `tag_decl_source_module` (`passes/specialization.cryo`)
+  from a 5-arm per-leaf concrete-cast match to a single kind-guarded base-pointer
+  write (`node as DeclarationNode*`). Functionally identical, workaround removed.
+- **D2 (NOT done — and should NOT be):** Deleting the `lookup_injected_origin`
+  side-channel and reading the field in `dispatch_top_level` is **unsafe**, for a
+  reason INDEPENDENT of the (obsolete) miscompile: the `source_module` field is
+  semantically **overloaded**. `type_resolution.cryo` (~1177) stamps every
+  NON-injected impl block with its own defining module (`ctx.source_file`), so the
+  field cannot distinguish "injected spec from template X" from "ordinary local
+  impl". The side table only ever holds injected specs, so it answers
+  `dispatch_top_level`'s question (is-this-an-injected-spec + which template)
+  cleanly. The side table is therefore load-bearing for disambiguation, not a
+  codegen workaround. Kept it; corrected the misleading "vtable miscompile"
+  comments at both sites (`dispatch_top_level` and the inject site) to state the
+  real rationale.
+
+### Status
+UNCOMMITTED. Needs a **repin** (`make pin` refreshes linux + win on this host).
+Validated: make cryo ✓, gate-ON stdlib 1681/0/exit0, make test 99/0, selfhost
+FIXED POINT `ba7ccfb4`. Repro files: `/tmp/basewrite.cryo`, `/tmp/basewrite3.cryo`.

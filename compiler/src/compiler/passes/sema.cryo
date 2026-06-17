@@ -60,89 +60,12 @@ import std::fmt;
 import Utils::Logger;
 
 
-// Monotonic counter for the synthetic bindings introduced when lowering the
-// `?` operator to a `match` (`resolve_try_expr`).  Match-arm bindings are
-// arm-scoped so a fixed name would already be collision-free, but a unique
-// suffix keeps nested `?` readable in AST dumps and the LSP.
-mut g_try_counter: u32 = 0;
-
-
-// Symbolic generic-body check (Phase 2 of the mono-after-sema reorder). These
-// live as file-scope globals rather than TypeCheckVisitor fields on purpose:
-// TypeCheckVisitor is a `type class` with inheritance, and this codebase has a
-// known class-field-offset/vtable miscompile (see the `source_module` note
-// elsewhere in this file). Adding fields to it crashes the pinned compiler
-// (empirically: a globals→fields migration aborts `bin/cryo` during build,
-// 2026-06-17). The right fix is to repair that codegen bug + repin, THEN move
-// these to fields; until then, globals sidestep it (like g_try_counter).
-//
-// Cached env gate. Uses a zero-as-unread sentinel because this codebase does
-// not honor non-zero global initializers (globals are zero-initialized):
-//   0 = not yet read, 1 = off, 2 = on.
-mut g_symbolic_check_gate: i32 = 0;
-// True only while a symbolic generic-body walk is in progress, so body
-// visitors can later relax concrete-type expectations.
-mut g_in_symbolic_check: boolean = false;
-// Intern ids of the generic-parameter names in scope for the body currently
-// being symbolically checked (e.g. `T`, `U`). Lets body visitors recognize
-// `T::method(...)` / abstract-type references and defer concrete-only checks.
-mut g_symbolic_generic_param_ids: u32[] = [];
-// Intern ids of the OWNER type's generic params (e.g. the `T` of `Box<T>`) for a
-// generic struct/class/impl whose methods are being symbolically checked. Set by
-// the decl visitors; merged into g_symbolic_generic_param_ids per method body.
-mut g_symbolic_owner_param_ids: u32[] = [];
-// True while symbolically checking a method of a GENERIC owner (struct/class/
-// impl). The owner's fields carry abstract types that the template type can't
-// resolve concretely here, so owner-rooted field/method accesses (`this.field`)
-// are deferred — the concrete monomorphizations re-check them in full.
-mut g_symbolic_owner_is_generic: boolean = false;
-// The OWNER type's generic-param AST nodes (e.g. `Box<T>`'s `T`), in declaration
-// order, for the generic owner whose methods are being symbolically checked. The
-// position of each node in this list IS its abstract-param index, matching
-// `create_generic_param_types`. Set/restored by `symbolic_check_owner_methods`;
-// read by `symbolic_bind_params` to bind each param name to its abstract
-// GenericParam TypeRef. Carries the constraint list too, so bounded params get a
-// BoundedParamType (not a bare GenericParam).
-mut g_symbolic_owner_param_nodes: GenericParamNode*[] = [];
-// The CURRENT method/free-fn's own generic-param AST nodes, in declaration order
-// (position == abstract index). Set/restored by `symbolic_check_body`; read by
-// `symbolic_bind_params`. Kept separate from the owner list because each has its
-// own 0-based index space (an owner `T` at 0 and a method `U` at 0 are distinct
-// abstract params).
-mut g_symbolic_method_param_nodes: GenericParamNode*[] = [];
-// Cumulative measurement counters (only meaningful when gate is on).
-mut g_symbolic_bodies_walked:   i64 = 0;
-mut g_symbolic_total_would_emit: i64 = 0;
-
-/// True when `sym` names a generic parameter of the body currently under
-/// symbolic check (only meaningful while `g_in_symbolic_check`).
-function symbolic_name_is_generic_param(sym: SymbolStr) -> boolean {
-    if (!g_in_symbolic_check) { return false; }
-    for (mut i: i64 = 0; i < g_symbolic_generic_param_ids.length; i++) {
-        if (g_symbolic_generic_param_ids[i] == sym.id) { return true; }
-    }
-    return false;
-}
-
-/// Whether the additive symbolic generic-body type-check is enabled, via the
-/// `CRYO_SYMBOLIC_CHECK` env var. Phase-2 measurement harness: when set, sema
-/// also walks generic templates with their type parameters abstract, under
-/// diagnostic suppression, and logs what it would report. Off by default, so
-/// the normal build is unaffected. Result is cached after the first read.
-function sema_symbolic_check_enabled() -> boolean {
-    if (g_symbolic_check_gate == 0) {
-        const raw: i8* = intrinsics::getenv("CRYO_SYMBOLIC_CHECK") as i8*;
-        if (raw != null && intrinsics::strlen(raw as string) > 0) {
-            g_symbolic_check_gate = 2;
-        } else {
-            g_symbolic_check_gate = 1;
-        }
-    }
-    return g_symbolic_check_gate == 2;
-}
-
-
 // TypeCheckVisitor: visitor-based function body type checker
+//
+// The `?`-lowering try counter and the symbolic generic-body check (Phase 2 of
+// the mono-after-sema reorder) state live as ordinary fields of
+// TypeCheckVisitor (see `try_counter` / `symbolic_*` below) — per-pass mutable
+// state belongs on the visitor, not in file-scope globals.
 
 /// Walks all function bodies, filling resolved_type on every ExpressionNode.
 /// Queries the shared DeclarationIndex (populated by TypeResolution and
@@ -251,11 +174,47 @@ public:
     // own arguments don't themselves trigger another conversion attempt
     // (and so converter-aware method selection doesn't recurse).
     in_implicit_conversion: boolean;
-    // NOTE: the symbolic generic-body check (Phase 2) state lives in file-scope
-    // globals (g_symbolic_check_gate / g_in_symbolic_check), NOT as fields here,
-    // to avoid this class's known field-offset miscompile (proven still-live
-    // 2026-06-17: a fields migration aborts the pinned compiler). See the globals
-    // near the top of this file.
+
+    // Monotonic counter for the synthetic bindings introduced when lowering the
+    // `?` operator to a `match` (`build_try_desugar`). Match-arm bindings are
+    // arm-scoped so a fixed name would already be collision-free, but a unique
+    // suffix keeps nested `?` readable in AST dumps and the LSP.
+    try_counter: u32;
+
+    // Symbolic generic-body check (Phase 2 of the mono-after-sema reorder).
+    // Cached env gate (`CRYO_SYMBOLIC_CHECK`), read once in the constructor.
+    // Uses a zero-as-unread sentinel: 0 = not yet read, 1 = off, 2 = on.
+    symbolic_check_gate: i32;
+    // True only while a symbolic generic-body walk is in progress, so body
+    // visitors can later relax concrete-type expectations.
+    in_symbolic_check: boolean;
+    // Intern ids of the generic-parameter names in scope for the body currently
+    // being symbolically checked (e.g. `T`, `U`). Lets body visitors recognize
+    // `T::method(...)` / abstract-type references and defer concrete-only checks.
+    symbolic_generic_param_ids: u32[];
+    // Intern ids of the OWNER type's generic params (e.g. the `T` of `Box<T>`) for
+    // a generic struct/class/impl whose methods are being symbolically checked.
+    // Set by the decl visitors; merged into symbolic_generic_param_ids per body.
+    symbolic_owner_param_ids: u32[];
+    // True while symbolically checking a method of a GENERIC owner (struct/class/
+    // impl). The owner's fields carry abstract types that the template type can't
+    // resolve concretely here, so owner-rooted field/method accesses (`this.field`)
+    // are deferred — the concrete monomorphizations re-check them in full.
+    symbolic_owner_is_generic: boolean;
+    // The OWNER type's generic-param AST nodes (e.g. `Box<T>`'s `T`), in
+    // declaration order; each node's position IS its abstract-param index,
+    // matching `create_generic_param_types`. Set/restored by
+    // `symbolic_check_owner_methods`; read by `symbolic_bind_params`. Carries the
+    // constraint list too, so bounded params get a BoundedParamType.
+    symbolic_owner_param_nodes: GenericParamNode*[];
+    // The CURRENT method/free-fn's own generic-param AST nodes, in declaration
+    // order (position == abstract index). Set/restored by `symbolic_check_body`;
+    // read by `symbolic_bind_params`. Kept separate from the owner list because
+    // each has its own 0-based index space.
+    symbolic_method_param_nodes: GenericParamNode*[];
+    // Measurement counters (only meaningful when the gate is on).
+    symbolic_bodies_walked:   i64;
+    symbolic_total_would_emit: i64;
 
 
     TypeCheckVisitor(arena: TypeArena*, intern: InternTable*,
@@ -289,6 +248,23 @@ public:
         this.closure_counter     = 0;
         this.closure_spec_map    = HashMap<string, u32>::new();
         this.in_implicit_conversion = false;
+        this.try_counter            = 0;
+        // Read the symbolic-check env gate once, here, so the predicate is a pure
+        // `&this` reader callable from any context.
+        const raw: i8* = intrinsics::getenv("CRYO_SYMBOLIC_CHECK") as i8*;
+        if (raw != null && intrinsics::strlen(raw as string) > 0) {
+            this.symbolic_check_gate = 2;
+        } else {
+            this.symbolic_check_gate = 1;
+        }
+        this.in_symbolic_check           = false;
+        this.symbolic_generic_param_ids  = [];
+        this.symbolic_owner_param_ids    = [];
+        this.symbolic_owner_is_generic   = false;
+        this.symbolic_owner_param_nodes  = [];
+        this.symbolic_method_param_nodes = [];
+        this.symbolic_bodies_walked      = 0;
+        this.symbolic_total_would_emit   = 0;
     }
 
     /// Build a TypeCheckVisitor from the compilation context.
@@ -296,6 +272,25 @@ public:
     /// of truth for declaration-level types), so no AST scan is needed here.
     static build(ctx: CompilationContext*) -> TypeCheckVisitor {
         return TypeCheckVisitor(ctx.type_arena, ctx.get_intern_table(), ctx);
+    }
+
+    /// Whether the additive symbolic generic-body type-check is enabled, via the
+    /// `CRYO_SYMBOLIC_CHECK` env var. Phase-2 measurement harness: when set, sema
+    /// also walks generic templates with their type parameters abstract, under
+    /// diagnostic suppression, and logs what it would report. Off by default, so
+    /// the normal build is unaffected. The gate is cached in the constructor.
+    sema_symbolic_check_enabled(&this) -> boolean {
+        return this.symbolic_check_gate == 2;
+    }
+
+    /// True when `sym` names a generic parameter of the body currently under
+    /// symbolic check (only meaningful while `this.in_symbolic_check`).
+    symbolic_name_is_generic_param(&this, sym: SymbolStr) -> boolean {
+        if (!this.in_symbolic_check) { return false; }
+        for (mut i: i64 = 0; i < this.symbolic_generic_param_ids.length; i++) {
+            if (this.symbolic_generic_param_ids[i] == sym.id) { return true; }
+        }
+        return false;
     }
 
 
@@ -1351,11 +1346,18 @@ public:
         mut saved_scope: u64 = 0;
         mut saved_namespace: SymbolStr = SymbolStr::empty();
         mut needs_restore: boolean = false;
-        // Check if this statement is an injected specialization by scanning
-        // the Monomorphizer's spec_entries for a matching AST node pointer.
-        // Direct field writes to source_module don't survive vtable-offset
-        // miscompiles on class hierarchies, so we route through the
-        // Monomorphizer as a side channel.
+        // Determine whether this statement is an INJECTED specialization, and
+        // from which template module, via the CompilationContext's node-identity
+        // side table (keyed by AST node pointer). This is deliberately NOT read
+        // from the node's `source_module` field: that field is semantically
+        // overloaded — type resolution stamps every non-injected impl block with
+        // its own defining module (`ctx.source_file`), so the field cannot
+        // distinguish "injected spec from template X" from "ordinary local decl".
+        // The side table only ever contains injected specs, so it answers that
+        // question cleanly. (Historically a comment here blamed a vtable
+        // field-write miscompile; that was a misdiagnosis — base-pointer field
+        // writes are correct — but the side table is still required for the
+        // disambiguation reason above.)
         const template_mod: SymbolStr = this.find_template_module(stmt);
         if (template_mod.is_valid()) {
             const resolver: Resolver* = this.ctx.get_resolver();
@@ -1742,7 +1744,7 @@ public:
 
     override visit(mut &this, node: StructDeclNode*) -> void {
         if (node.is_generic()) {
-            if (sema_symbolic_check_enabled()) {
+            if (this.sema_symbolic_check_enabled()) {
                 const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
                 const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
                 this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
@@ -1756,7 +1758,7 @@ public:
 
     override visit(mut &this, node: ClassDeclNode*) -> void {
         if (node.is_generic()) {
-            if (sema_symbolic_check_enabled()) {
+            if (this.sema_symbolic_check_enabled()) {
                 const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
                 const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
                 this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
@@ -1796,7 +1798,7 @@ public:
             // bodies reference the impl's abstract params. Walk them
             // symbolically (when enabled) with `this` typed as the target and
             // the impl's params exposed as abstract; otherwise skip as before.
-            if (sema_symbolic_check_enabled()) {
+            if (this.sema_symbolic_check_enabled()) {
                 const impl_target: TypeRef = this.lookup_type_by_sym(node.target_type);
                 this.symbolic_check_owner_methods(node.methods, impl_target,
                                                   node.generic_params);
@@ -1978,25 +1980,30 @@ public:
     /// valid generic code) is the gate for moving sema ahead of mono.
     symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
                         owner_type: TypeRef) -> void {
-        if (!sema_symbolic_check_enabled()) { return; }
+        if (!this.sema_symbolic_check_enabled()) { return; }
         if (func == null || func.body == null) { return; }
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
 
         const before: u32 = sink.suppressed_error_total();
         const saved_owner:    TypeRef = this.current_owner_type;
-        const saved_symbolic: boolean = g_in_symbolic_check;
-        const saved_params:   u32[]   = g_symbolic_generic_param_ids;
-        const saved_method_nodes: GenericParamNode*[] = g_symbolic_method_param_nodes;
+        const saved_symbolic: boolean = this.in_symbolic_check;
+        // Owning-array fields: swap out to an empty so the later reassignment
+        // doesn't leak (Cryo field reassignment does not drop the old value),
+        // and restore by swapping back after the walk.
+        mut saved_params: u32[] = [];
+        mut saved_method_nodes: GenericParamNode*[] = [];
+        swap(&this.symbolic_generic_param_ids, &saved_params);
+        swap(&this.symbolic_method_param_nodes, &saved_method_nodes);
         this.current_owner_type = owner_type;
-        g_in_symbolic_check     = true;
+        this.in_symbolic_check  = true;
         mut param_ids: u32[] = [];
         // The method's own generic-param nodes, in declaration order so each
         // node's position is its abstract-param index (`symbolic_bind_params`).
         mut method_nodes: GenericParamNode*[] = [];
         // Owner type params first (e.g. `Box<T>`'s `T`), then the method's own.
-        for (mut op: i64 = 0; op < g_symbolic_owner_param_ids.length; op++) {
-            param_ids.push(g_symbolic_owner_param_ids[op]);
+        for (mut op: i64 = 0; op < this.symbolic_owner_param_ids.length; op++) {
+            param_ids.push(this.symbolic_owner_param_ids[op]);
         }
         for (mut gp: i64 = 0; gp < func.generic_params.length; gp++) {
             const pnode: GenericParamNode* = func.generic_params[gp];
@@ -2005,23 +2012,24 @@ public:
                 method_nodes.push(pnode);
             }
         }
-        g_symbolic_generic_param_ids   = param_ids;
-        g_symbolic_method_param_nodes  = method_nodes;
+        this.symbolic_generic_param_ids   = param_ids;   // field was [], no leak
+        this.symbolic_method_param_nodes  = method_nodes;
         sink.begin_suppress();
 
         this.enter_function(func, this_type);
         this.visit(func.body);
 
         sink.end_suppress();
-        g_in_symbolic_check           = saved_symbolic;
-        g_symbolic_generic_param_ids  = saved_params;
-        g_symbolic_method_param_nodes = saved_method_nodes;
-        this.current_owner_type       = saved_owner;
+        // Restore: the body's arrays land back in the locals and drop at scope end.
+        swap(&this.symbolic_generic_param_ids, &saved_params);
+        swap(&this.symbolic_method_param_nodes, &saved_method_nodes);
+        this.in_symbolic_check  = saved_symbolic;
+        this.current_owner_type = saved_owner;
 
-        g_symbolic_bodies_walked += 1;
+        this.symbolic_bodies_walked += 1;
         const would_emit: u32 = sink.suppressed_error_total() - before;
         if (would_emit > 0) {
-            g_symbolic_total_would_emit += would_emit as i64;
+            this.symbolic_total_would_emit += would_emit as i64;
             const fname: string = this.intern.resolve(func.name);
             fmt::eprintf("[symbolic-check] would-emit %u in generic body `%s`\n",
                          would_emit, fname);
@@ -2032,15 +2040,19 @@ public:
     /// Unlike `visit_methods`, ALL methods are routed through the symbolic walk
     /// (even non-generic ones), because their bodies reference the owner's
     /// abstract type parameters (`Box<T>`'s `T`). The owner params are exposed
-    /// via `g_symbolic_owner_param_ids` so `symbolic_check_body` merges them
+    /// via `this.symbolic_owner_param_ids` so `symbolic_check_body` merges them
     /// with each method's own params. No-op unless symbolic checking is enabled.
     symbolic_check_owner_methods(mut &this, methods: &MethodNode*[],
                                  owner_type: TypeRef,
                                  owner_params: &GenericParamNode*[]) -> void {
-        if (!sema_symbolic_check_enabled()) { return; }
-        const saved_owner_params: u32[]  = g_symbolic_owner_param_ids;
-        const saved_owner_nodes: GenericParamNode*[] = g_symbolic_owner_param_nodes;
-        const saved_owner_generic: boolean = g_symbolic_owner_is_generic;
+        if (!this.sema_symbolic_check_enabled()) { return; }
+        const saved_owner_generic: boolean = this.symbolic_owner_is_generic;
+        // Owning-array owner fields: swap out to empties (see symbolic_check_body
+        // for why a plain field reassignment would leak), restore by swap.
+        mut saved_owner_params: u32[] = [];
+        mut saved_owner_nodes: GenericParamNode*[] = [];
+        swap(&this.symbolic_owner_param_ids, &saved_owner_params);
+        swap(&this.symbolic_owner_param_nodes, &saved_owner_nodes);
         mut oids: u32[] = [];
         mut onodes: GenericParamNode*[] = [];
         for (mut i: i64 = 0; i < owner_params.length; i++) {
@@ -2050,9 +2062,9 @@ public:
                 onodes.push(p);
             }
         }
-        g_symbolic_owner_param_ids  = oids;
-        g_symbolic_owner_param_nodes = onodes;
-        g_symbolic_owner_is_generic = true;
+        this.symbolic_owner_param_ids  = oids;     // field was [], no leak
+        this.symbolic_owner_param_nodes = onodes;
+        this.symbolic_owner_is_generic = true;
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null || method.func.body == null) {
@@ -2068,9 +2080,9 @@ public:
             };
             this.symbolic_check_body(method.func, sym_this, owner_type);
         }
-        g_symbolic_owner_param_ids   = saved_owner_params;
-        g_symbolic_owner_param_nodes = saved_owner_nodes;
-        g_symbolic_owner_is_generic  = saved_owner_generic;
+        swap(&this.symbolic_owner_param_ids, &saved_owner_params);
+        swap(&this.symbolic_owner_param_nodes, &saved_owner_nodes);
+        this.symbolic_owner_is_generic  = saved_owner_generic;
     }
 
     /// During a symbolic generic-body walk, prime a freshly-created
@@ -2088,15 +2100,15 @@ public:
     ///
     /// No-op outside a symbolic walk, so concrete-code resolution is unchanged.
     symbolic_bind_params(&this, ctx: ResolutionContext*) -> void {
-        if (!g_in_symbolic_check) { return; }
+        if (!this.in_symbolic_check) { return; }
         if (this.arena == null) { return; }
         ctx.symbolic_no_demand = true;
-        for (mut i: i64 = 0; i < g_symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = g_symbolic_owner_param_nodes[i];
+        for (mut i: i64 = 0; i < this.symbolic_owner_param_nodes.length; i++) {
+            const p: GenericParamNode* = this.symbolic_owner_param_nodes[i];
             if (p != null) { ctx.add_binding(p.name, this.symbolic_param_ref(p, i as u64)); }
         }
-        for (mut j: i64 = 0; j < g_symbolic_method_param_nodes.length; j++) {
-            const p: GenericParamNode* = g_symbolic_method_param_nodes[j];
+        for (mut j: i64 = 0; j < this.symbolic_method_param_nodes.length; j++) {
+            const p: GenericParamNode* = this.symbolic_method_param_nodes[j];
             if (p != null) { ctx.add_binding(p.name, this.symbolic_param_ref(p, j as u64)); }
         }
     }
@@ -2123,7 +2135,7 @@ public:
     /// owner type itself — so an access rooted at `this` whose field/method
     /// types are abstract should be deferred rather than reported.
     symbolic_is_generic_owner_receiver(&this, ty: TypeRef) -> boolean {
-        if (!g_in_symbolic_check || !g_symbolic_owner_is_generic) { return false; }
+        if (!this.in_symbolic_check || !this.symbolic_owner_is_generic) { return false; }
         if (!ty.is_valid() || !this.current_owner_type.is_valid()) { return false; }
         const recv_base:  Type* = this.unwrap_to_base_type(ty);
         const owner_base: Type* = this.unwrap_to_base_type(this.current_owner_type);
@@ -3072,7 +3084,7 @@ public:
     /// outside symbolic mode (and, since concrete bodies never carry generic
     /// params, effectively a no-op there too — but the gate keeps it explicit).
     symbolic_defer_type(&this, ty: TypeRef) -> boolean {
-        if (!g_in_symbolic_check) { return false; }
+        if (!this.in_symbolic_check) { return false; }
         if (!ty.is_valid()) { return true; }
         return Monomorphizer::mono_type_contains_generic_param(this.arena, ty);
     }
@@ -3083,7 +3095,7 @@ public:
     /// method resolution, dereference, ...). Such a check must defer to the
     /// concrete monomorphization. A no-op outside symbolic mode.
     symbolic_type_unresolved(&this, ty: TypeRef) -> boolean {
-        if (!g_in_symbolic_check) { return false; }
+        if (!this.in_symbolic_check) { return false; }
         if (!ty.is_valid()) { return true; }
         const t: Type* = this.arena.lookup(ty.id);
         if (t != null && t.kind == TypeKind::Void) { return true; }
@@ -3495,7 +3507,7 @@ public:
         // In a symbolic generic-body walk the monomorphizer hasn't pruned the
         // `static match (T)` to a single arm yet (T is still abstract), so a
         // multi-arm node here is expected, not the unsupported non-generic use.
-        if (node.arms.length > 1 && !g_in_symbolic_check) {
+        if (node.arms.length > 1 && !this.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 node.span);
@@ -6670,7 +6682,7 @@ public:
             // when each concrete instantiation disambiguates cleanly. Defer to
             // those instantiations, which re-run this exact check with
             // `resolved_trait` set.
-            if (g_in_symbolic_check) { return; }
+            if (this.in_symbolic_check) { return; }
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0154_AMBIGUOUS_CALL,
                 format("call to `%s` is ambiguous: it is provided by multiple traits implemented for this type",
@@ -8673,7 +8685,7 @@ public:
         // E0204s. Detect abstract args in a FRESH context (no bindings, so an
         // enclosing param resolves to invalid while a genuinely concrete arg
         // like `cast<i32>()` still resolves) and defer the whole call.
-        if (g_in_symbolic_check) {
+        if (this.in_symbolic_check) {
             mut sym_ctx: ResolutionContext = ResolutionContext::new(
                 this.ctx.source_file, "");
             for (mut i: i64 = 0; i < member.generic_args.length; i++) {
@@ -8897,7 +8909,7 @@ public:
         // parameter (e.g. `T::__pluck` in `next<T> where T: VaArg`) can only be
         // resolved once T is concrete. Defer rather than report a missing
         // symbol; the concrete monomorphization re-checks it for real.
-        if (symbolic_name_is_generic_param(scope.scope_name)) {
+        if (this.symbolic_name_is_generic_param(scope.scope_name)) {
             return TypeRef::invalid();
         }
 
@@ -10101,7 +10113,7 @@ public:
         if (sm == null || sm.arms.length == 0) { return TypeRef::invalid(); }
         // Symbolic generic-body walk: an unpruned multi-arm `static match (T)`
         // is expected here (T still abstract), not the unsupported non-generic use.
-        if (sm.arms.length > 1 && !g_in_symbolic_check) {
+        if (sm.arms.length > 1 && !this.in_symbolic_check) {
             this.ctx.emit_error_at(ErrorCode::E0645_NO_STATIC_MATCH_ARM,
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 sm.span);
@@ -10178,7 +10190,7 @@ public:
     /// once); the failure arm early-returns from the enclosing function.
     build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean) -> MatchExprNode* {
         const span: SourceSpan = node.span;
-        g_try_counter += 1;
+        this.try_counter += 1;
 
         const enum_name: SymbolStr =
             this.intern.intern(if (is_result) { "Result" } else { "Option" });
@@ -10187,7 +10199,7 @@ public:
         const err_variant: SymbolStr =
             this.intern.intern(if (is_result) { "Err" } else { "None" });
         const ok_bind: SymbolStr =
-            this.intern.intern(format("__cryo_try_%u", g_try_counter));
+            this.intern.intern(format("__cryo_try_%u", this.try_counter));
 
         mut match_expr: MatchExprNode* = new MatchExprNode(node.operand, span);
 
@@ -10214,7 +10226,7 @@ public:
         mut ret_value: ExpressionNode* = null;
         if (is_result) {
             const err_bind: SymbolStr =
-                this.intern.intern(format("__cryo_try_err_%u", g_try_counter));
+                this.intern.intern(format("__cryo_try_err_%u", this.try_counter));
             const err_pb: PatternBinding* =
                 new PatternBinding { name: err_bind, span: span };
             err_pat.add_element(PatternElement::Binding(err_pb));
@@ -11225,9 +11237,9 @@ type struct SemanticPasses {
                 visitor.body_count);
         }
 
-        if (sema_symbolic_check_enabled()) {
+        if (visitor.sema_symbolic_check_enabled()) {
             fmt::eprintf("[symbolic-check] cumulative: walked %lld generic bodies, %lld would-emit\n",
-                g_symbolic_bodies_walked, g_symbolic_total_would_emit);
+                visitor.symbolic_bodies_walked, visitor.symbolic_total_would_emit);
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
