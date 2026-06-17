@@ -461,12 +461,21 @@ declaration* it introduces an implement block — the two never overlap.)
   mut it: implement Iterator<i32> = some_non_iterator;  // E0200
   ```
 
-  Because the binding's *visible* type is the opaque trait, not the concrete
-  cursor, you cannot apply a combinator to such a local — `it.take(2)` has no
-  concrete receiver to specialise the adapter against. Chain the combinator on
-  the producing expression instead (`arr.iter().take(2).count()`), or bind to
-  the concrete adapter type when you need a named local
-  (`mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);`).
+  When the initialiser is a **concrete static constructor**
+  (`mut it: implement Iterator<i32> = Range<i32>::new(0, 10);`), you can
+  re-adapt the local directly — `it.take(3)` specialises the adapter against
+  the recovered concrete receiver. The binding's *visible* type is still the
+  opaque trait; the compiler recovers the concrete initialiser type for
+  combinator specialisation.
+
+  This recovery only applies when the initialiser names its concrete type.
+  When the producer itself returns an opaque iterator
+  (`mut it: implement Iterator<i32> = arr.iter();`, where `iter` returns
+  `implement Iterator<…>`), the concrete cursor is hidden behind that opaque
+  return, so the local has no concrete receiver to specialise against — chain
+  the combinator on the producing expression instead
+  (`arr.iter().take(2).count()`), or bind to the concrete adapter type when you
+  need a named local (`mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);`).
 
 To accept *any* iterator as a **parameter**, use a generic with a trait bound
 instead — that is the tool for the input side:

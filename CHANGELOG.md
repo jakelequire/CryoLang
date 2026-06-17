@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Re-adapting an opaque iterator local (static-constructor form).** An opaque
+  `implement Iterator<T>` local whose initialiser is a concrete static
+  constructor can now be re-adapted with a combinator
+  (`mut it: implement Iterator<i32> = Range<i32>::new(0,10); it.take(3)`); this
+  previously failed with `E0636`. A local initialised from a producer that
+  itself returns an opaque iterator (`let it = arr.iter(); it.map(..)`) remains
+  restricted — chain off the source. See
+  [`docs/cryo.md` §2.11](./docs/cryo.md#211-opaque-types-implement-trait).
+
 - **Associated types.** A trait may declare an associated type
   (`type Item;`) and refer to it by projection (`This::Item` inside the trait,
   `I::Item` off a generic parameter). Each impl binds it positionally
