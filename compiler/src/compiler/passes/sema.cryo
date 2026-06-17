@@ -51,6 +51,7 @@ import Compiler::Resolver::Resolver;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Substitution;
+import Compiler::Types::TraitChecker;
 import Compiler::ModuleGraph;
 import std::collections::hashmap;
 import std::core::slice;
@@ -1712,6 +1713,17 @@ public:
         this.visit_methods(node.methods, impl_this);
     }
 
+    /// Build a standalone trait-satisfaction checker over the shared read-only
+    /// components (arena / generic-registry / intern-table / diagnostics).
+    /// Sema uses this for its trait-bound queries instead of reaching into the
+    /// monomorphizer, so it carries no runtime dependency on monomorphization
+    /// having run. The TraitChecker holds no mutable state, so a fresh value
+    /// per call is cheap (four pointers).
+    trait_checker(&this) -> TraitChecker {
+        return TraitChecker::new(this.arena, this.ctx.generic_registry,
+                                 this.intern, this.ctx.diagnostics);
+    }
+
     /// Enforce a trait's declaration-site associated-type bounds against this
     /// concrete impl's binding. For each associated type the trait declares
     /// WITH a bound (`type Item: Copy + Clone;`), resolve what this impl binds
@@ -1727,7 +1739,6 @@ public:
     check_assoc_decl_bounds(mut &this, node: ImplBlockNode*, impl_this: TypeRef) -> void {
         if (node == null || !node.is_trait_impl()) { return; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
-        if (this.ctx.monomorphizer == null) { return; }
         if (!impl_this.is_valid()) { return; }
         const trait_leaf: SymbolStr = this.trait_leaf_name(node.trait_annotation);
         if (!trait_leaf.is_valid()) { return; }
@@ -1767,7 +1778,7 @@ public:
                 const tref: TraitRef* = &adecl.bounds[b];
                 if (tref.path.length == 0) { continue; }
                 const bound_trait: SymbolStr = tref.path[tref.path.length - 1];
-                if (this.ctx.monomorphizer.type_implements_trait(item_ty, bound_trait, 0)) {
+                if (this.trait_checker().type_implements_trait(item_ty, bound_trait, 0)) {
                     continue;
                 }
                 const bound_str: string = this.intern.resolve(bound_trait);
@@ -1882,11 +1893,11 @@ public:
     /// "right trait, wrong element type".
     verify_impl_trait_bounds(mut &this, imp: ImplTraitAnnotation*,
                              concrete: TypeRef, var_node: VarDeclNode*) -> void {
-        if (imp == null || this.ctx.monomorphizer == null) { return; }
+        if (imp == null || this.ctx.generic_registry == null) { return; }
         for (mut i: i64 = 0; i < imp.bounds.length; i++) {
             const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
             if (!trait_name.is_valid()) { continue; }
-            if (this.ctx.monomorphizer.type_satisfies_opaque_bound(concrete, trait_name)) {
+            if (this.trait_checker().type_satisfies_opaque_bound(concrete, trait_name)) {
                 // The right trait — now also check the bound's element argument.
                 // `implement Iterator<T>` is positional sugar for `Item = T`, so
                 // a concrete type implementing the trait with a *different* Item
@@ -7383,7 +7394,7 @@ public:
     try_diagnose_method_bound_failure(mut &this, obj_type: TypeRef,
                                        member: MemberAccessNode*) -> boolean {
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
-        if (reg == null || this.ctx.monomorphizer == null) { return false; }
+        if (reg == null) { return false; }
 
         // Peel ref/ptr to find the InstantiatedType wrapper that carries the
         // concrete type arguments.
@@ -7426,7 +7437,7 @@ public:
                 const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (this.ctx.monomorphizer.type_implements_trait(concrete, trait_name, 0)) {
+                if (this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
                     continue;
                 }
                 // Unmet bound - build the diagnostic.
@@ -7477,7 +7488,7 @@ public:
         if (!is_next && !is_iter) { return false; }
 
         const reg: GenericRegistry* = this.ctx.get_generic_registry();
-        if (reg == null || this.ctx.monomorphizer == null) { return false; }
+        if (reg == null) { return false; }
 
         // Peel ref/ptr to the InstantiatedType carrying the element arg.
         mut t: Type* = this.arena.lookup(obj_type.id);
@@ -7681,7 +7692,7 @@ public:
         }
 
         // Inputs were valid but method not found.  Before emitting the
-        // generic "method not found" diagnostic, ask the monomorphizer
+        // generic "method not found" diagnostic, ask the TraitChecker
         // whether a trait impl that COULD have provided this method has
         // its where-bounds violated for this specialization; that's
         // the truthful diagnostic for `result.clone()` on a
@@ -7708,8 +7719,8 @@ public:
             member.span
         };
 
-        if (this.ctx.monomorphizer != null) {
-            const failed_trait: SymbolStr = this.ctx.monomorphizer.diagnose_method_bounds_failure(
+        if (this.ctx.generic_registry != null) {
+            const failed_trait: SymbolStr = this.trait_checker().diagnose_method_bounds_failure(
                 lookup_ref, member.member);
             if (failed_trait.is_valid()) {
                 const trait_str: string = this.intern.resolve(failed_trait);
