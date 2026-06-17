@@ -26,6 +26,13 @@ type struct DiagnosticSink {
     reached_max_errors: boolean;
     seen_keys:         HashMap<string, boolean>;
 
+    // Speculative-suppression scope. While `suppress_depth > 0` every emit()
+    // is counted (errors only) but neither stored, deduped, nor rendered.
+    // Used by sema's additive symbolic generic-body type-check to measure what
+    // it WOULD diagnose without perturbing real diagnostic output.
+    suppress_depth:    u32;
+    suppressed_errors: u32;
+
     static new() -> DiagnosticSink {
         return DiagnosticSink {
             diagnostics:       [],
@@ -35,6 +42,8 @@ type struct DiagnosticSink {
             config:            DiagConfig::default(),
             reached_max_errors: false,
             seen_keys:         HashMap<string, boolean>::new(),
+            suppress_depth:    0,
+            suppressed_errors: 0,
         };
     }
 
@@ -50,6 +59,15 @@ type struct DiagnosticSink {
 
     /// Emit a diagnostic, applying filtering, dedup, and rendering.
     emit(mut &this, diag: Diagnostic) -> void {
+        // 0. Speculative suppression: while a symbolic/trial scope is active,
+        //    count errors but discard the diagnostic entirely (no store, no
+        //    dedup, no counters, no max-errors interaction). This keeps the
+        //    additive symbolic generic-body walk from perturbing real output.
+        if (this.suppress_depth > 0) {
+            if (diag.severity.is_error()) { this.suppressed_errors += 1; }
+            return;
+        }
+
         // 1. Max-errors cutoff: stop emitting after the limit
         if (this.reached_max_errors) {
             return;
@@ -136,6 +154,35 @@ type struct DiagnosticSink {
                 }
             }
         }
+    }
+
+    /// Begin a speculative-suppression scope. Nestable: each begin must be
+    /// matched by an end_suppress(). While active, emit() counts errors but
+    /// stores/renders nothing.
+    begin_suppress(mut &this) -> void {
+        this.suppress_depth += 1;
+    }
+
+    /// End a speculative-suppression scope opened by begin_suppress().
+    end_suppress(mut &this) -> void {
+        if (this.suppress_depth > 0) {
+            this.suppress_depth -= 1;
+        }
+    }
+
+    /// Whether a suppression scope is currently active.
+    is_suppressing(&this) -> boolean {
+        return this.suppress_depth > 0;
+    }
+
+    /// Total errors that have been suppressed (counted) since the last reset.
+    suppressed_error_total(&this) -> u32 {
+        return this.suppressed_errors;
+    }
+
+    /// Reset the suppressed-error tally to zero.
+    reset_suppressed(mut &this) -> void {
+        this.suppressed_errors = 0;
     }
 
     /// Take a snapshot of current counters.
