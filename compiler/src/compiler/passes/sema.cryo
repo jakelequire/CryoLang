@@ -1060,6 +1060,14 @@ public:
             if (inst.has_resolved_type()) {
                 return this.ctx.decl_index.lookup_type_name(inst.resolved_type);
             }
+            // Mono-after-sema: pre-mono an instantiation (`Array<i32>`) has no
+            // resolved concrete struct yet, but its template's methods are
+            // keyed under the base name.  Fall back to the generic base so
+            // method-lookup-by-type (e.g. the for-in `iter()`/`next()` probe)
+            // resolves identically in the pre- and post-mono passes.
+            const base: SymbolStr =
+                this.ctx.decl_index.lookup_type_name(inst.generic_base);
+            if (base.is_valid()) { return base; }
         }
 
         return SymbolStr::empty();
@@ -4211,6 +4219,20 @@ public:
     /// at the end of Phase 1; later phases switch capturing lambdas to
     /// emit a synthesised closure struct.
     resolve_lambda(mut &this, node: LambdaExprNode*) -> TypeRef {
+        // Lowering a capturing lambda is a one-shot side-effecting operation:
+        // `synthesize_closure_struct` mints a fresh closure struct + `__call__`
+        // method and appends the (already-walked) body statements into it.
+        // Under mono-after-sema the post-mono pass re-resolves cached nodes
+        // (`post_mono_verify`), which would lower the SAME lambda a second time
+        // - minting a duplicate struct and re-walking the synthesized
+        // `this.cap_i` shadows with no `this_type` in scope (E0201 "cannot find
+        // value `this`").  Once lowered, the node carries its closure-struct
+        // type; return it and skip re-lowering.
+        if (node.is_capturing() && node.has_resolved_type()
+                && this.is_closure_struct_type(node.resolved_type)) {
+            return node.resolved_type;
+        }
+
         mut res_ctx: ResolutionContext = ResolutionContext::new(
             this.ctx.source_file, "");
         this.symbolic_bind_params(&res_ctx);
@@ -5067,8 +5089,20 @@ public:
     }
 
     resolve_identifier(mut &this, ident: IdentifierNode*) -> TypeRef {
-        if (ident.name.equals(this.this_sym) && this.this_type.is_valid()) {
-            return this.this_type;
+        if (ident.name.equals(this.this_sym)) {
+            if (this.this_type.is_valid()) {
+                return this.this_type;
+            }
+            // Mono-after-sema: a `this` node the closure-lowering synthesized
+            // (`this.cap_i` inside a closure `__call__` body) already carries
+            // its concrete closure-struct type.  The post-mono pass re-resolves
+            // cached nodes (`post_mono_verify`); if it re-walks such a `this`
+            // outside an active method `this_type` context it would spuriously
+            // E0201.  A `this` that already resolved is authoritative - honor it
+            // rather than re-deriving from a context that may not be a method.
+            if (ident.resolved_type.is_valid()) {
+                return ident.resolved_type;
+            }
         }
         // Check the local scope HashMap (covers params + locals registered
         // during this function's type-check walk via enter_function and
@@ -6258,7 +6292,17 @@ public:
             }
 
             // PASS B - recover still-unbound params from the expected type.
-            if (this.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()) {
+            // Only when the expected type is CONCRETE: a nested call resolved as
+            // an argument to an outer generic call (`identity(123)` feeding
+            // `expect_eq<T>(a: T, ...)`) sees the outer param `T` as its
+            // expected type.  Unifying against that abstract `T` would pin
+            // identity's own param to `T` and yield an abstract return, which
+            // then defeats the literal-driven inference at the OUTER call and
+            // leaves the specialization undiscovered (E0636 at codegen).  An
+            // abstract expectation carries no information; skip it and let
+            // PASS C's literal fallback pin the param to a concrete type.
+            if (this.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
+                    && !this.contains_generic_param(this.expected_type)) {
                 mut any_unbound: boolean = false;
                 for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
                     if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
@@ -10725,8 +10769,23 @@ public:
         const method_ret: TypeRef = this.lookup_method_return(
             lookup_sym, scope.member_name);
         if (method_ret.is_valid()) {
-            const resolved: TypeRef = this.try_resolve_generic_return(
+            mut resolved: TypeRef = this.try_resolve_generic_return(
                 method_ret, scope.scope_name, scope.member_name, scope);
+            // `try_resolve_generic_return` only pins the owner from a turbofish
+            // or the expected type; a bare `Range::new(0, 5)` (no turbofish, no
+            // expected type - the synthesized for-in iterator local) stays the
+            // abstract `Range<T>`.  Refine it from the call's value arguments
+            // via the template path so sema - the source of truth post-flip -
+            // types the initializer as `Range<i32>`, matching what mono lifts
+            // onto the binding.
+            if (this.contains_generic_param(resolved)) {
+                const inferred: TypeRef =
+                    this.resolve_static_method_return_via_template(scope, call);
+                if (inferred.is_valid()
+                        && !this.contains_generic_param(inferred)) {
+                    resolved = inferred;
+                }
+            }
             scope.set_resolved_type(resolved);
             this.pin_scope_callee_combined(call, lookup_sym, scope.member_name);
             return resolved;
@@ -10778,7 +10837,7 @@ public:
         // return.  `resolved_callee` is left unpinned so mono's
         // `try_infer_static_method_on_generic_template` specializes and pins.
         const tmpl_ret: TypeRef =
-            this.resolve_static_method_return_via_template(scope);
+            this.resolve_static_method_return_via_template(scope, call);
         if (tmpl_ret.is_valid()) {
             scope.set_resolved_type(tmpl_ret);
             return tmpl_ret;
@@ -10795,7 +10854,8 @@ public:
     /// `subst_method_return_from_receiver`.  Returns invalid on 0/ambiguous
     /// matches, a method-generic match, or a still-abstract result.
     resolve_static_method_return_via_template(mut &this,
-                                              scope: ScopeResolutionNode*) -> TypeRef {
+                                              scope: ScopeResolutionNode*,
+                                              call: CallExprNode*) -> TypeRef {
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
         // Resolve the scope name to a generic template (bare, then qualified).
         mut tmpl: TemplateEntry* =
@@ -10822,6 +10882,7 @@ public:
         }
         mut found_count: i64 = 0;
         mut abstract_ret: TypeRef = TypeRef::invalid();
+        mut matched: MethodNode* = null;
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || !m.is_static) { continue; }
@@ -10829,12 +10890,31 @@ public:
             if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
             found_count += 1;
             abstract_ret = m.func.resolved_return_type;
+            matched = m;
         }
         if (found_count != 1 || !abstract_ret.is_valid()) {
             return TypeRef::invalid();
         }
         // Already concrete (no owner param in the return): use directly.
         if (!this.contains_generic_param(abstract_ret)) { return abstract_ret; }
+
+        // Infer the owner's type args from the call's VALUE arguments before
+        // falling back to the owner default below.  `Range::new(0, 5)` (no
+        // turbofish, no expected type - the synthesized for-in iterator local)
+        // must resolve to `Range<i32>`, not the abstract `Range<T>`: unify the
+        // static method's declared parameter types (in terms of the owner's
+        // generic params) against the argument types, then substitute the
+        // recovered bindings into the return.  The static-constructor analogue
+        // of `check_generic_free_call`; leaves `resolved_callee` unpinned so
+        // mono still specializes.
+        if (call != null) {
+            const inferred: TypeRef = this.infer_static_owner_return_from_args(
+                tmpl, matched, abstract_ret, call);
+            if (inferred.is_valid()
+                    && !this.contains_generic_param(inferred)) {
+                return inferred;
+            }
+        }
 
         // Prefer the expected type when it concretely instantiates the SAME
         // template as the abstract return (`mut out: Array<u8> = Array::new()`
@@ -10870,6 +10950,73 @@ public:
         }
         if (!owner_concrete.is_valid()) { return TypeRef::invalid(); }
         return this.subst_method_return_from_receiver(owner_concrete, abstract_ret);
+    }
+
+    /// Recover a generic static-constructor call's concrete return by unifying
+    /// the static method's declared parameter types (expressed in the owner
+    /// template's generic params) against the call's argument types, then
+    /// substituting the inferred owner type args into the abstract return.
+    /// `Range::new(0, 5)` binds owner `T := i32` -> `Range<i32>`.  The
+    /// static-constructor analogue of `check_generic_free_call`: a non-literal
+    /// argument pins a param structurally; an all-literal call adopts the
+    /// literal's resolved type for any param still unbound.  Returns invalid
+    /// when nothing pins every owner param or the result stays abstract.
+    infer_static_owner_return_from_args(mut &this, tmpl: TemplateEntry*,
+                                        method: MethodNode*, abstract_ret: TypeRef,
+                                        call: CallExprNode*) -> TypeRef {
+        if (method == null || method.func == null) { return TypeRef::invalid(); }
+        if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
+        if (method.func.parameters.length != call.arguments.length) {
+            return TypeRef::invalid();
+        }
+
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) {
+            pids.push(tmpl.param_type_ids[i]);
+        }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+
+        // PASS A - bind owner params from non-literal arguments.
+        for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+            const p: VarDeclNode* = method.func.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const actual: TypeRef = arg.resolved_type;
+            if (!actual.is_valid()) { continue; }
+            ictx.unify(p.resolved_type, actual);
+        }
+
+        // PASS B - literal fallback: a still-unbound owner param adopts a
+        // polymorphic literal's resolved type (`Range::new(0, 5)` -> i32).
+        for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+            const p2: VarDeclNode* = method.func.parameters[i];
+            if (p2 == null || !p2.resolved_type.is_valid()) { continue; }
+            const arg2: ExpressionNode* = call.arguments[i];
+            if (arg2 == null || !this.sema_arg_is_polymorphic_literal(arg2)) { continue; }
+            const f_idx: i64 = ictx.binding_index(p2.resolved_type.id);
+            if (f_idx >= 0 && !ictx.bindings[f_idx].is_valid()) {
+                const lit_actual: TypeRef = arg2.resolved_type;
+                if (lit_actual.is_valid()) {
+                    ictx.unify(p2.resolved_type, lit_actual);
+                }
+            }
+        }
+
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+            bindings.push(ictx.bindings[i]);
+        }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
+            if (this.contains_generic_param(bindings[i])) { return TypeRef::invalid(); }
+        }
+        // `tmpl.param_type_ids` is the same id list (and order) `pids` was
+        // copied from; reuse it here since `pids` was moved into the InferCtx.
+        mut subst: TypeSubstitution =
+            TypeSubstitution::from_params(tmpl.param_type_ids, bindings);
+        return subst.apply(abstract_ret, this.arena);
     }
 
     /// Try resolving Scope::Member as a type-based construct:

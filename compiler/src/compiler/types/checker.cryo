@@ -297,6 +297,35 @@ type struct TypeChecker {
             }
         }
 
+        // InstantiatedType structural equality.  Like Reference/Tuple above,
+        // the arena does NOT dedupe instantiations (see `create_instantiation`
+        // / `propagate_instantiated_resolution`): the same logical
+        // `Foo<Bar<i32>>` gets a fresh TypeID at each call site.  Under
+        // mono-after-sema the pre-mono and post-mono passes mint distinct IDs
+        // for one for-loop iterator type, and when neither side carries a
+        // propagated `resolved_type` (so the deref above was a no-op) they
+        // would otherwise read as Incompatible.  Compare the generic base and
+        // each type argument structurally instead.
+        if (from_type.kind == TypeKind::InstantiatedType
+                && to_type.kind == TypeKind::InstantiatedType) {
+            const from_inst2: InstantiatedType* = from_type as InstantiatedType*;
+            const to_inst2:   InstantiatedType* = to_type as InstantiatedType*;
+            if (from_inst2.generic_base.equals(to_inst2.generic_base)
+                    && from_inst2.type_args.length == to_inst2.type_args.length) {
+                mut args_identical: boolean = true;
+                for (mut i: i64 = 0; i < from_inst2.type_args.length; i++) {
+                    if (this.check_compatibility(from_inst2.type_args[i],
+                            to_inst2.type_args[i]) != TypeCompatibility::Identical) {
+                        args_identical = false;
+                        break;
+                    }
+                }
+                if (args_identical) {
+                    return TypeCompatibility::Identical;
+                }
+            }
+        }
+
         // Pointer conversions
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
             const from_ptr: PointerType* = from_type as PointerType*;
