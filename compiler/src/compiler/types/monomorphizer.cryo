@@ -4355,13 +4355,21 @@ type struct Monomorphizer {
                     // `T`: reject, mirroring the two-concrete case in Pass A.
                     // Without this, reordering literals to a later pass would
                     // let `second(5, "hello")` slip through unflagged.
-                    mut tc: TypeChecker = TypeChecker::new(this.arena);
-                    if (tc.check_compatibility(lit_actual, bound)
-                            == TypeCompatibility::Incompatible) {
-                        this.emit_infer_conflict(call, callee_name, arg, bound, lit_actual);
-                        return;
+                    //
+                    // Only flag when the binding is CONCRETE: inside a generic
+                    // body the param may be bound to the enclosing `T` (an
+                    // abstract GenericParam), where a literal legitimately adopts
+                    // `T` at instantiation - defer rather than conflict (mirrors
+                    // sema's `free_infer_type_concrete` guard).
+                    if (this.infer_type_is_concrete(bound)) {
+                        mut tc: TypeChecker = TypeChecker::new(this.arena);
+                        if (tc.check_compatibility(lit_actual, bound)
+                                == TypeCompatibility::Incompatible) {
+                            this.emit_infer_conflict(call, callee_name, arg, bound, lit_actual);
+                            return;
+                        }
                     }
-                    continue;  // numeric: codegen coerces the literal to `bound`
+                    continue;  // numeric / abstract: codegen coerces or defers
                 }
                 // Param still unbound: fill it with the literal's default type.
                 this.unify_for_inference(param.resolved_type, lit_actual);
@@ -4568,7 +4576,15 @@ type struct Monomorphizer {
     /// resolved_type here; that is exactly why the default must not pin T.
     arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null) { return false; }
-        if (expr.resolved_type.is_valid()) { return false; }
+        // Mono-after-sema: sema now types every expression before the
+        // monomorphizer runs, so a bare numeric literal ALWAYS carries a
+        // resolved_type (a default-width `i32`/`f64`).  The old short-circuit
+        // (`resolved_type.is_valid() -> not polymorphic`) was correct only when
+        // mono ran first and literals were still untyped; today it would make
+        // EVERY literal read as non-polymorphic, so an `i64`/`u64` param paired
+        // with a bare literal (`expect_eq(x_i64, 3)`) spuriously conflicts on
+        // `i64` vs the literal's `i32`.  The node kind is the reliable signal
+        // (matching sema's `sema_arg_is_polymorphic_literal`).
         const node: ASTNode* = expr as ASTNode*;
         if (node.kind == NodeKind::Literal) {
             const lit: LiteralNode* = expr as LiteralNode*;
@@ -4952,7 +4968,13 @@ type struct Monomorphizer {
         // gets the right owner instantiation). Fill-only; never overrides a
         // param a real argument already pinned.
         if (this.current_expected_type.is_valid()
-                && method_func.resolved_return_type.is_valid()) {
+                && method_func.resolved_return_type.is_valid()
+                && !this.type_contains_generic_param(this.current_expected_type)) {
+            // Only recover an owner param from a CONCRETE expected type.  An
+            // abstract expected type (e.g. the still-generic `Range<T>` a for-in
+            // scrutinee carries before mono) would unify `T` against `T` and
+            // pin the param to the abstract placeholder, after which a literal
+            // arg (`Range::new(0, 5)`) spuriously conflicts (`T` vs `i32`).
             mut any_unbound_b: boolean = false;
             for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
                 if (!this.inference_bindings[i].is_valid()) { any_unbound_b = true; break; }
@@ -4979,11 +5001,16 @@ type struct Monomorphizer {
             }
             const bound: TypeRef = this.bound_type_for_formal(param.resolved_type);
             if (bound.is_valid()) {
-                mut tc_c: TypeChecker = TypeChecker::new(this.arena);
-                if (tc_c.check_compatibility(lit_actual, bound)
-                        == TypeCompatibility::Incompatible) {
-                    this.emit_infer_conflict(call, member_name, arg, bound, lit_actual);
-                    return true;
+                // Only flag a conflict for a CONCRETE binding; an abstract
+                // binding (the enclosing `T` inside a generic body) defers - the
+                // literal adopts the concrete type at instantiation.
+                if (this.infer_type_is_concrete(bound)) {
+                    mut tc_c: TypeChecker = TypeChecker::new(this.arena);
+                    if (tc_c.check_compatibility(lit_actual, bound)
+                            == TypeCompatibility::Incompatible) {
+                        this.emit_infer_conflict(call, member_name, arg, bound, lit_actual);
+                        return true;
+                    }
                 }
                 continue;
             }
