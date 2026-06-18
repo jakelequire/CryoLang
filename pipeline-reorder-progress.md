@@ -1289,3 +1289,117 @@ md5 differs because compiler source changed, but the fixed-point property holds.
 stage-2 rebuilt after (WSL run wipes compiler/build). Tree compiles the full suite to the
 2 documented `identity`-collision errors; everything else green. NOT yet run: `make test`
 to completion (blocked on the 2), O0/O2 split, Windows self-host. Jake commits + repins.
+
+================================================================================
+## 2026-06-18 (cont. 5) — VaArgs + identity + static-method-spec cascade: 8 errors -> 1
+
+### Starting state (committed `12a9d306`, repinned)
+Contrary to the cont.4 handoff ("2 identity errors"), the COMMITTED tree builds the
+suite to **8 errors, all `va.next<T>()` E0636** in `tests/stdlib/varargs.cryo`. The
+`identity` collision was resolved in `12a9d306` and that resolution UNMASKED the VaArgs
+gap (the cont.4 doc predicted exactly this coupling). The committed PIN (`bin/cryo`) is
+**NOT** the "1234/0 green oracle" the handoff claims — it fails `va.next<i64>()` too (that
+claim refers to a stale pre-flip pin). Verified with a standalone repro.
+
+### THREE root-caused fixes (suite 8 errors -> 1). Self-host VALIDATED.
+**#1 — VaArgs generic-instance-method-on-concrete-receiver (monomorphizer.cryo
+`try_infer_method_call` ~5640).** The early-return `if (call.resolved_method != null)
+return;` assumed "sema resolved the method => fully handled". FALSE for generic methods:
+sema resolves the call's TYPE and pins `resolved_method` to the **template** (`next<T>`,
+`generic_params.length==1`) + pins `resolved_callee` to the abstract template mangle, but
+does NOT mint the per-instantiation spec. Mono then skipped specialization -> codegen
+E0636 (no `next<i64>` symbol). FIX: skip only when the resolved method is already concrete
+(`rm.func.generic_params.length == 0` — a non-generic method or an already-minted spec
+that mono pinned back). A still-generic template falls through to the existing turbofish/
+inference path; downstream guards (unresolved receiver, still-generic bindings) keep
+abstract contexts deferred. Confirmed via debug: `resolved_method=1 rm_generic_params=1
+generic_args=1`.
+
+**#2 — `identity<T>` collision (sema.cryo `find_fn_template_for_call` ~6114).** Two
+1-arg `identity<T>` templates (generics.cryo + match_generic_free_fn.cryo, distinct
+namespaces). Bare-name+arity lookup returned null on the tie (count!=1) -> identity's
+abstract `T` poisoned the enclosing `expect_eq` inference -> E0636. FIX: module-disambig
+TIE-BREAK — preserve the `count==1` fast path exactly; on a tie, prefer the candidate whose
+`module_name` == `current_module_name()`. Helps ALL callers (incl. `resolve_direct_call`,
+which WANTS the non-null generic template to defer correctly). The cont.4 `_local`-variant
+attempts cascaded into VaArgs — that cascade target is now fixed at the root (#1), so the
+shared-helper fix is clean.
+
+**#3 — generic STATIC-method abstract-callee pin (sema.cryo `scope_is_generic_template`
+~10659).** `Layout::of<T>()`, `Request::parse<R>`, `Response::parse<R>` linked against
+ABSTRACT template symbols (`...Layout::of` no type-args, `...parse<1R>`). Cause:
+`register_static_method_templates` keys generic statics under the FULLY-QUALIFIED owner
+path (`std::alloc::layout::Layout::of`), but the guard's combined-key check built only the
+BARE `Layout::of` -> missed -> `pin_scope_callee_combined` pinned the abstract `scope::member`
+symbol -> mono's `try_infer_function_call` early-returns on a valid `resolved_callee` ->
+spec never built -> link error. FIX: mirror the existing qualified-scope lookup on the
+combined key (resolve_qualified(scope)::member). All three statics now specialize+link.
+(These three were PRE-EXISTING, masked by the earlier codegen abort; surfaced once codegen
+passed.)
+
+### Validation
+- Standalone repros built+ran: `va.next<i64>()` (7+35=42), `Layout::of<Thing>()` (size 16).
+- Full suite: **8 errors -> 1** (the one below).
+- **Linux self-host: byte-identical FIXED POINT** (stage-3==stage-4),
+  IR md5 `88120bf3ad1135b905c0ca3d27372e54`, 49,893,083 bytes. The 3 fixes do NOT break
+  self-compilation.
+- Diff: sema.cryo +45, monomorphizer.cryo +20. No debug code left. UNCOMMITTED.
+- NOT done: O0/O2 split, Windows. Jake commits + repins.
+
+### THE 1 REMAINING ERROR — PRE-EXISTING (pin fails identically), NOT from these fixes
+`Box<String>::clone` (in box.o) references the BARE `std::collections::string::String::clone`
+which is never emitted (the real spec is `String<GlobalAlloc>::clone`). Root cause: a
+MALFORMED `Box<String /*bare, missing inner GlobalAlloc*/, GlobalAlloc>` spec is created
+whose body's `self.value.clone()` has receiver `String*` (bare). Confirmed by debug: the
+FAILING case (`Box::new(String::from_str(...))` inline init) discovers an extra clone
+receiver `std::collections::string::String*` that the PASSING case (`Box::new(s)` typed var)
+does not. The bare `String` (a generic with all-defaulted `A=GlobalAlloc`) is NOT canonical-
+ized to `String<GlobalAlloc>` in mono's substitution path — the substituted body annotation
+carries a `pre_resolved` Named = bare String (resolver.cryo:174 short-circuits resolve_named
+on `pre_resolved`, so any resolve-time canonicalizer is bypassed).
+- Repro: `/tmp/vrepro/co2.cryo` (fails on BOTH my build AND committed pin).
+- ATTEMPTED (reverted): a `resolve_named` canonicalizer (`maybe_canonicalize_default_generic`)
+  folding bare all-default generics -> default instantiation + a `resolve_generic` base-peel.
+  It fixed the SEMA side (a string.cryo `String<A>` E0200 it first caused, then peeled) but
+  did NOT fix co2 — the bare String also enters via mono's `pre_resolved` substitution, which
+  bypasses resolve_named. Incomplete -> reverted to avoid broad unvalidated behavior change.
+- The real fix is one of: (a) canonicalize bare all-default generics at SUBSTITUTION time
+  (where `pre_resolved` is set) so `String` -> `String<GlobalAlloc>` consistently; or
+  (b) Step C — mono trusts sema's already-canonical resolved_type instead of re-deriving the
+  element type. (b) is the principled mono-after-sema direction.
+
+### NEXT
+1. Fix the `Box<String>::clone` bare-String default-expansion (option (a) above is the
+   localized fix: canonicalize in the AST substituter / wherever `pre_resolved` bare
+   all-default generics are formed). Then re-run suite -> expect green, chase any unmask.
+2. O0/O2 split + Windows self-host.
+3. Step C — delete mono's inference engine (the payoff).
+
+### UPDATE (cont. 5, same day) — SUITE NOW GREEN. The "1 remaining" fixed at root.
+Fixed the pre-existing `Box<String>::clone` bare-String bug — fix #4. Root cause confirmed
+by instrumentation: sema typed `String::from_str(...)` (a generic-with-all-defaults static
+return, `-> String`) as the BARE template base `String`, NOT `String<GlobalAlloc>` — because
+the method's return annotation was resolved during BOOTSTRAP (resolve_named's arena fallback,
+which no default-expansion path covers). A free fn `mk() -> String` inline worked, a typed var
+laundered it, a cast laundered it — only the direct static-method-call return leaked the bare
+base into `Box::new`'s T inference → `Box<String/*bare*/>` → bogus bare `String::clone` ref.
+
+FIX #4 (resolver.cryo + sema.cryo): added `TypeResolver::canonicalize_default_generic_type` —
+folds an already-resolved bare all-default-generic BASE (`String`) into its default
+instantiation (`String<GlobalAlloc>`) via the arena's dedup (no new demand; the canonical form
+is already demanded). Wired into sema's `lookup_method_return` (split into `_raw` + a
+canonicalizing wrapper) so EVERY method/static return read agrees with the annotation/inference
+paths. Safe: operates on a resolved TypeRef (an explicit `String<A>` is an InstantiatedType,
+skipped — no double-apply), fires only on a registered template base whose every param is
+defaulted (so `Array<T>`/`Box<T>` are untouched).
+- An earlier resolve_named-wide canonicalizer was tried+reverted (broke `String<A>` -> needed a
+  peel, and missed the bootstrap path anyway). The read-site fix is narrower and correct.
+
+### FINAL VALIDATION (cont. 5) — STEP A/B COMPLETE
+- **`make test` GREEN at O0 AND O2**: unit **1233 passed / 0 failed**, compile-fail **99 / 0**.
+- **Linux self-host: byte-identical FIXED POINT** (stage-3==stage-4),
+  IR md5 `35513c9a565c04519ebf999c29cd9243`, 49,913,597 bytes.
+- Diff (UNCOMMITTED): sema.cryo +62, monomorphizer.cryo +20, resolver.cryo +43. No debug code.
+- Four fixes total this session: #1 mono generic-method early-return, #2 sema find_fn module
+  disambig, #3 sema qualified-combined static-spec, #4 default-generic method-return canonical.
+- NOT done: Windows (suite + self-host); Jake commits + repins. THEN Step C (delete mono engine).
