@@ -1721,6 +1721,44 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
+        // Phase 6a-i.5: FunctionBodyTypeCheck (semantic analysis) for ALL
+        // modules, BEFORE Monomorphization.  This is the mono-after-sema flip:
+        // sema is the single source of truth for resolved types, and mono runs
+        // afterward to specialize what sema resolved.  Sema needs every
+        // module's directives processed (Phase 6a-i) so `![repr]`/layout flags
+        // are visible, but must precede mono so it - not mono's now-deleted
+        // inference engine - resolves generic call return types.  No
+        // `pm_cached` skip: the incremental-cache decision isn't computed until
+        // after mono, so every module's bodies are type-checked here.
+        pipeline.set_passes([PassID::FunctionBodyTypeCheck]);
+        {
+            mut init6sema: ProvisionSet = ProvisionSet::empty();
+            init6sema.mark(Provision::ASTValidated);
+            init6sema.mark(Provision::NamesResolved);
+            init6sema.mark(Provision::TypesResolved);
+            init6sema.mark(Provision::StructFieldsSynced);
+            init6sema.mark(Provision::DirectivesProcessed);
+            pipeline.validate_with_initial(init6sema);
+        }
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            ctx.provisions.mark(Provision::DirectivesProcessed);
+            if (!pipeline.run_all(ctx)) {
+                return this.project_failure_release(ctx, ast_buf, scope_buf);
+            }
+            pipeline.reset();
+        }
+
         // Phase 6a-ii: Monomorphization + GenericExpressionResolution for
         // ALL modules, now that every template carries its final layout.
         pipeline.set_passes([
@@ -1920,6 +1958,10 @@ type struct CompilerInstance {
         // Now that every module has been monomorphized and specialized ASTs
         // injected, GenericValidation can safely walk the entire arena
         // without false positives from not-yet-monomorphized modules.
+        // FunctionBodyTypeCheck now runs in Phase 6a-i.5 (before mono); 6b is
+        // post-mono validation only.  BodiesTypeChecked is an INCOMING
+        // provision here (sema provided it earlier) so MoveCheck's requirement
+        // is satisfied.
         pipeline.set_passes([
             PassID::GenericValidation,
             PassID::FunctionBodyTypeCheck,
@@ -1935,6 +1977,7 @@ type struct CompilerInstance {
             initial6b.mark(Provision::StructFieldsSynced);
             initial6b.mark(Provision::MonomorphizationComplete);
             initial6b.mark(Provision::GenericExpressionsResolved);
+            initial6b.mark(Provision::BodiesTypeChecked);
             pipeline.validate_with_initial(initial6b);
         }
 
@@ -1959,6 +2002,7 @@ type struct CompilerInstance {
             ctx.provisions.mark(Provision::StructFieldsSynced);
             ctx.provisions.mark(Provision::MonomorphizationComplete);
             ctx.provisions.mark(Provision::GenericExpressionsResolved);
+            ctx.provisions.mark(Provision::BodiesTypeChecked);
             if (!pipeline.run_all(ctx)) {
                 phase6_failed = true;
             }

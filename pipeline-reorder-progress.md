@@ -927,3 +927,107 @@ inference engine can be deleted (step 6).
 3. THEN delete mono's inference engine (step 6, the ~27 fns A2 mapped) and mono's
    E0306/E0307/E0214 emission; sema is now authoritative.  Validate.
 4. Repin (linux) once the flip is complete and green.
+
+---
+
+## 2026-06-18 — THE FLIP SELF-HOSTS ✅ (orchestrator reordered, sema-before-mono, byte-identical fixed point)
+
+Drove the mono-after-sema flip all the way through the compiler's OWN multi-module
+build.  The orchestrator now runs `FunctionBodyTypeCheck` BEFORE `Monomorphization`,
+sema resolves generic call/member types pre-mono, and the compiler **self-hosts
+byte-identically** under the new order.
+
+### Result
+- `selfhost-check --no-windows`: **✓ FIXED POINT OK** (6/6 stages, stage-3 == stage-4
+  byte-identical IR, md5 `83bc582db52cc446e2a654aacd9d7bb2`).
+- `cryo build stdlib/lib.cryo`: **compiles clean** under the new-order stage-2.
+- `make test`: **6 residual errors** — ALL in `tests/stdlib/iter.cryo`, all
+  associated-type-projection reductions in iterator combinators (`filter`/`zip`/
+  `enumerate` `This::Item`).  See "Remaining" below.  Everything else green.
+- NOT git-committed, NOT repinned (pinned BRIDGE compiler still builds the new source).
+
+### Architecture landed (in `instance.cryo`)
+Sema runs in TWO orchestrator phases now, with distinct jobs:
+- **Phase 6a-i.5 (NEW, pre-mono)**: `FunctionBodyTypeCheck` over all modules, between
+  6a-i (DirectiveProcessing) and 6a-ii (Monomorphization).  Drives generic CALL-SITE
+  resolution (the A.4 keystone) so mono specializes correctly.  It CANNOT fully resolve
+  bodies that reference concrete generic instantiations whose specs don't exist yet
+  (`Array<i64>.ptr`, `Slice<u8>::get`, ...), so it leaves some nodes abstract.
+- **Phase 6b (post-mono)**: `FunctionBodyTypeCheck` REMAINS here (the handoff said remove
+  it; that's wrong — spec bodies created by mono only exist post-mono and MUST be
+  type-checked, e.g. `offset<u8>`'s body).  It is the AUTHORITATIVE pass for codegen.
+  6b is detected via `Provision::MonomorphizationComplete` and sets
+  `TypeCheckVisitor.post_mono_verify`.
+
+**Key correctness mechanism — `post_mono_verify`:** in the post-mono pass `resolve_expr`
+does NOT short-circuit on a cached `resolved_type` (it re-resolves), because the pre-mono
+pass may have left a parent expression resolved while a child arg stayed abstract (e.g.
+`Option::Some(this.values.ptr[slot])` — the call resolved to `Option<i64>` in 6a but its
+arg stayed unresolved because `Array<i64>` wasn't specialized).  Without re-resolution 6b
+skipped the resolved parent and never fixed the child → codegen got a null payload →
+SIGSEGV.
+
+### The surface area of the flip — pre-mono member resolution (all in `sema.cryo`)
+With mono AFTER sema, every place sema leaned on mono having run first had to learn to
+resolve against the generic TEMPLATE + substitute type_args.  Each is principled (no
+band-aids):
+1. **`resolve_direct_call` expected-type strip** — only swap in `expected_type` for an
+   unresolved-instantiation return when it's genuinely ABSTRACT (`contains_generic_param`),
+   not merely spec-less; a concrete `Option<Color>` pre-mono was being collapsed to
+   `Color`, breaking match exhaustiveness/binding.
+2. **`check_generic_free_call` returns the concrete return** (A.4 keystone, free calls):
+   infer type args, `TypeSubstitution::from_params(...).apply(template_ret)` →
+   `choose(...) -> Option<i32>`.  `resolved_callee` stays unpinned (mono specializes +
+   backfills via `propagate_instantiated_resolution`).
+3. **`resolve_method_return_via_template`** (A.4, methods) — receiver instantiation has no
+   reverse type-symbol pre-mono; resolve the method off the BASE template (inline struct
+   methods) OR the DI under the base symbol (impl-block + enum methods like
+   `Option::unwrap`) OR the implemented traits (combinator defaults like `take`), then
+   `subst_method_return_from_receiver` (own type_args) + `subst_this_in_type` (the `This`
+   Self placeholder, `take -> TakeIter<This>` -> `TakeIter<Range<i32>>`).
+4. **`resolve_static_method_return_via_template`** — `String::with_capacity`,
+   `Slice::from_raw`: resolve off the template, prefer `expected_type` when it instantiates
+   the same base (`Array::new()` with `mut x: Array<u8>`), else substitute the owner's
+   default/explicit instantiation.
+5. **`resolve_field_via_template` + field subst** — `Pair<u32,i64>.second` pre-mono:
+   `check_field_access` fails on the unresolved instantiation; read the field off the
+   template AST and substitute (`Y -> i64`).
+6. **Pin-stranding fixes** (a call pinned to an ABSTRACT template symbol makes mono SKIP
+   it — `try_infer_*` early-returns on a valid `resolved_callee`/`resolved_method` — and
+   codegen then can't resolve the never-built spec):
+   - `resolve_module_qualified_function`: don't pin the constructed spec name in the
+     pre-mono turbofish path (`mem::transmute<f32,u32>`).
+   - `scope_is_generic_template`: also resolve the bare scope to its QUALIFIED template
+     (`Slice` -> `std::core::slice::Slice`) so `Slice::from_raw` isn't pinned.
+   - `try_pin_overload_mangled_callee`: skip generic function templates, found via
+     `find_fn_template_for_call` (bare-name+arity) so a call whose template lives under a
+     DIFFERENT module path (`swap` -> `std::core::mem::swap`) is recognized — this was the
+     `undefined reference to swap<T>` link failure in `symbolic_check_body`.
+7. **Void back-fill guard** — don't back-fill an opaque/adapter local's `resolved_type`
+   from a `void` initializer (an adapter chain resolves to void pre-mono); leaving it
+   unresolved lets the post-mono pass back-fill the concrete type.
+
+### Remaining (the ONLY thing between here and full green)
+6 errors in `tests/stdlib/iter.cryo`: associated-type-projection reduction in combinators.
+`next(mut &this) -> Option<This::Item>` on `FilterIter<Range<i32>>` / `ZipIter` /
+`EnumerateIter`.  `subst_this_in_type` substitutes the projection BASE
+(`This -> FilterIter<Range<i32>>`) but the result is still an `AssocProjection`
+(`FilterIter<Range<i32>>::Item`) — it needs RECURSIVE reduction to `i32` (walk the impl's
+`Item` binding through the combinator chain).  Mono does this today
+(`proj.set_resolved_type`); sema must do it pre-mono.  This is a DISTINCT mechanism from
+the type-arg substitution above (`substitution.cryo:apply_assoc_projection` only rebuilds
+the projection, doesn't reduce it).  Next session's work item.
+
+### Mono's inference engine is NOT yet deleted (step 6)
+It still backstops every generic specialization (sema leaves `resolved_callee`/
+`resolved_method` unpinned for the inferred case precisely so mono still discovers +
+specializes).  Sema is now the source of truth for resolved TYPES; mono still owns
+DISCOVERY + specialization.  Deleting mono's `try_infer_*` requires sema to create the
+instantiation demand — defer until after the assoc-projection reduction lands and the
+suite is fully green.
+
+### Files
+`instance.cryo` (orchestrator: +Phase 6a-i.5, 6b keeps FunctionBodyTypeCheck +
+BodiesTypeChecked provision).  `sema.cryo` (all of the above; `post_mono_verify` field).
+The single-module pipeline reorder + `pass_id.cryo` requirement swap are from the prior
+session (committed at HEAD `f9a1ffa1`).  UNCOMMITTED; Jake commits.
