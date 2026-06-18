@@ -176,6 +176,18 @@ public:
     // (and so converter-aware method selection doesn't recurse).
     in_implicit_conversion: boolean;
 
+    // Mono-after-sema: true when this FunctionBodyTypeCheck runs AFTER
+    // Monomorphization (Phase 6b), false for the pre-mono pass (Phase 6a-i.5).
+    // The pre-mono pass cannot fully resolve bodies that reference concrete
+    // generic instantiations whose specs don't exist yet (e.g. `Array<i64>`'s
+    // `.ptr` field), so it leaves some expressions abstract/unresolved.  When
+    // `post_mono_verify` is set, `resolve_expr` re-resolves nodes that already
+    // carry a (possibly-stale, pre-mono) resolved_type so the post-mono pass is
+    // authoritative for codegen.  Without this, a parent expression resolved in
+    // 6a (e.g. `Option::Some(...)`) short-circuits 6b before its still-abstract
+    // child arg is re-resolved against the now-existing spec.
+    post_mono_verify: boolean;
+
     // Monotonic counter for the synthetic bindings introduced when lowering the
     // `?` operator to a `match` (`build_try_desugar`). Match-arm bindings are
     // arm-scoped so a fixed name would already be collision-free, but a unique
@@ -251,6 +263,7 @@ public:
         this.closure_counter     = 0;
         this.closure_spec_map    = HashMap<string, u32>::new();
         this.in_implicit_conversion = false;
+        this.post_mono_verify       = false;
         this.try_counter            = 0;
         // Read the symbolic-check gate once, here, so the predicate is a pure
         // `&this` reader callable from any context. The symbolic generic-body
@@ -902,19 +915,24 @@ public:
             // `mem::transmute<From,To>`).  When the call carries explicit
             // turbofish args, substitute them straight into the template return
             // so sema is the source of truth (`mem::transmute<f64,i64>` -> i64).
-            // Mono still produces the concrete spec from `call.resolved_callee`.
+            //
+            // CRUCIAL: do NOT pin `resolved_callee` here.  The spec doesn't
+            // exist yet, so pinning a constructed spec name strands the
+            // instantiation - mono's `try_infer_function_call` early-returns on
+            // a valid `resolved_callee` (it would never specialize the call),
+            // and codegen then can't resolve the bare-template / never-built
+            // spec symbol (the exact pin-stranding hazard documented above).
+            // Leaving it unpinned lets mono specialize the call and pin the
+            // authoritative spec symbol; sema only fixes the TYPE.
             mut subst_ret: TypeRef = TypeRef::invalid();
-            if (spec_sym.is_valid()) {
-                if (scope != null && scope.generic_args.length > 0) {
-                    subst_ret = this.subst_return_from_call_args(
-                        tmpl, &scope.generic_args, ret);
-                } else if (call.generic_args.length > 0) {
-                    subst_ret = this.subst_return_from_call_args(
-                        tmpl, &call.generic_args, ret);
-                }
+            if (scope != null && scope.generic_args.length > 0) {
+                subst_ret = this.subst_return_from_call_args(
+                    tmpl, &scope.generic_args, ret);
+            } else if (call.generic_args.length > 0) {
+                subst_ret = this.subst_return_from_call_args(
+                    tmpl, &call.generic_args, ret);
             }
             if (subst_ret.is_valid()) {
-                call.set_resolved_callee(spec_sym);
                 return subst_ret;
             }
         }
@@ -2777,7 +2795,21 @@ public:
             // Sema's own scope table already falls back to `init_type` here (see
             // the registration block below); this keeps the AST node consistent
             // with that so codegen agrees.
+            // Mono-after-sema: in the pre-mono pass an adapter/opaque
+            // initializer can resolve to `void` because its generic
+            // instantiation isn't specialized yet (e.g. `Range<i32>::new(..)`
+            // -> the spec doesn't exist, so the chain `it.take(3)` bottoms out
+            // at void).  Back-filling that void onto the binding poisons the
+            // post-mono pass: `has_resolved_type()` is then true (void IS a
+            // valid TypeRef) and the re-backfill below is skipped, leaving a
+            // `void` iterator local whose `.next()` fails.  Skip back-filling a
+            // void initializer type so the binding stays unresolved until the
+            // post-mono pass, where the concrete adapter type is available.
+            const init_t_node: Type* = this.arena.lookup(init_type.id);
+            const init_is_void: boolean =
+                init_t_node != null && init_t_node.kind == TypeKind::Void;
             if (!var_node.has_resolved_type() && init_type.is_valid()
+                    && !init_is_void
                     && var_node.initializer != null
                     && ((var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression
                         || var_node.is_auto
@@ -4061,7 +4093,15 @@ public:
     /// Sets resolved_type on the node and returns the TypeRef.
     resolve_expr(mut &this, expr: ExpressionNode*) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
-        if (expr.has_resolved_type()) { return expr.resolved_type; }
+        // Pre-mono pass: trust a cached resolved_type (fast path).  Post-mono
+        // pass (`post_mono_verify`): re-resolve even when a type is cached, so
+        // any node the pre-mono pass left abstract/unresolved (because its
+        // generic instantiation hadn't been specialized yet) is corrected here
+        // with the concrete spec now present.  The re-resolution overwrites the
+        // stale annotation via `set_resolved_type` below.
+        if (expr.has_resolved_type() && !this.post_mono_verify) {
+            return expr.resolved_type;
+        }
 
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
@@ -5843,7 +5883,16 @@ public:
             // short-circuits mono's inference, so the diagnostics must
             // originate here.  Sound over-approximation: a binding that stays
             // abstract is deferred, never flagged.
-            this.check_generic_free_call(call, ident);
+            //
+            // It also returns the CONCRETE return type of the call when every
+            // type arg infers concretely (the keystone of mono-after-sema):
+            // `choose(&r, &v)` -> `Option<i32>`, not the abstract `Option<T>`.
+            // Used below (after the mono pre-pin check) as the call's resolved
+            // type.  `resolved_callee` stays unpinned so the monomorphizer
+            // still specializes the call and back-fills `resolved_type` on the
+            // instantiation via `propagate_instantiated_resolution`.
+            const inferred_generic_ret: TypeRef =
+                this.check_generic_free_call(call, ident);
 
             // If mono pre-pinned a specialized callee (inferred-arg generic
             // free-function calls inside a spec'd body, e.g.
@@ -5858,6 +5907,10 @@ public:
                 const spec_ret: TypeRef = this.lookup_func_return(call.resolved_callee);
                 if (spec_ret.is_valid()) { return spec_ret; }
             }
+            // Sema-inferred concrete return for a generic free call (keystone).
+            // Preferred over the turbofish/overload/direct paths below, all of
+            // which would surface the template's still-abstract return pre-mono.
+            if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
             // If the call has generic args (e.g., identity<int>(100)),
             // resolve the specialized function name first.  We pin the
             // specialized callee symbol on the call so codegen can find
@@ -6086,14 +6139,25 @@ public:
     /// (unsatisfied `where` bound).  Any binding that stays abstract is
     /// deferred - never flagged - so calls inside still-generic bodies don't
     /// false-positive.
-    check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
+    /// Pre-mono call-site checks for a generic free-function call, AND the
+    /// keystone of the mono-after-sema flip: returns the CONCRETE return type
+    /// of the call by inferring the type args from the arguments (or reading
+    /// the explicit turbofish) and substituting them into the template return
+    /// (e.g. `choose(&r, &v)` over `choose<T>(...) -> Option<T>` yields
+    /// `Option<i32>`, not the abstract `Option<T>`).  Returns invalid when the
+    /// call isn't a generic free call, a binding stays abstract, or a
+    /// diagnostic fired - the caller then keeps its existing resolution.
+    /// `resolved_callee` is deliberately NOT pinned for the inferred case: the
+    /// monomorphizer still specializes the call and back-fills `resolved_type`
+    /// on this instantiation via `propagate_instantiated_resolution`.
+    check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         const entry: TemplateEntry* =
             this.find_fn_template_for_call(ident.name, call.arguments.length);
-        if (entry == null) { return; }
+        if (entry == null) { return TypeRef::invalid(); }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
-        if (tmpl == null) { return; }
-        if (entry.param_type_ids.length == 0) { return; }   // not generic
+        if (tmpl == null) { return TypeRef::invalid(); }
+        if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }   // not generic
 
         // Per-param concrete bindings, in generic-parameter declaration order.
         mut bindings: TypeRef[] = [];
@@ -6112,7 +6176,7 @@ public:
             }
         } else {
             // Infer from argument types via the shared structural unifier.
-            if (tmpl.parameters.length != call.arguments.length) { return; }
+            if (tmpl.parameters.length != call.arguments.length) { return TypeRef::invalid(); }
             mut pids: u64[] = [];
             for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
                 pids.push(entry.param_type_ids[i]);
@@ -6137,7 +6201,7 @@ public:
                         && this.free_infer_type_concrete(ictx.conflict_to)) {
                     this.emit_free_infer_conflict(call, tmpl.name, arg,
                         ictx.conflict_from, ictx.conflict_to);
-                    return;
+                    return TypeRef::invalid();
                 }
             }
 
@@ -6169,7 +6233,7 @@ public:
                             && this.checker.check_compatibility(lit_actual, bnd)
                             == TypeCompatibility::Incompatible) {
                         this.emit_free_infer_conflict(call, tmpl.name, arg, bnd, lit_actual);
-                        return;
+                        return TypeRef::invalid();
                     }
                     continue;
                 }
@@ -6194,12 +6258,11 @@ public:
                         && !this.expected_type.is_valid()) {
                     this.emit_free_cannot_infer(call, tmpl.name);
                 }
-                return;
+                return TypeRef::invalid();
             }
         }
 
         // E0306 - where-clause bound satisfaction for the bound type args.
-        if (tmpl.trait_bounds.length == 0) { return; }
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
             const bound: TraitBound* = &tmpl.trait_bounds[bi];
             mut idx: i64 = -1;
@@ -6216,10 +6279,39 @@ public:
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
                     this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
-                    return;
+                    return TypeRef::invalid();
                 }
             }
         }
+
+        // KEYSTONE: all type args concrete and bounds satisfied - substitute
+        // them into the template return so sema is the source of truth for the
+        // call's concrete type pre-mono.  Sound only when every binding is
+        // concrete (else we'd mint an abstract instantiation).
+        return this.subst_free_call_return(entry, &bindings, tmpl.resolved_return_type);
+    }
+
+    /// Substitute a generic free function's inferred/explicit per-param type
+    /// args (`bindings`, parallel to `entry.param_type_ids`) into its template
+    /// return type, yielding the concrete call return BEFORE mono creates the
+    /// spec.  Returns invalid when a binding is missing/abstract or the
+    /// substituted return is still generic, so the caller falls back to its
+    /// prior resolution.
+    subst_free_call_return(mut &this, entry: TemplateEntry*, bindings: &TypeRef[],
+                           tmpl_ret: TypeRef) -> TypeRef {
+        if (!tmpl_ret.is_valid()) { return TypeRef::invalid(); }
+        if (bindings.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
+            if (this.contains_generic_param(bindings[i])) { return TypeRef::invalid(); }
+        }
+        mut subst: TypeSubstitution =
+            TypeSubstitution::from_params(entry.param_type_ids, bindings);
+        const out: TypeRef = subst.apply(tmpl_ret, this.arena);
+        if (!out.is_valid() || this.contains_generic_param(out)) {
+            return TypeRef::invalid();
+        }
+        return out;
     }
 
     /// E0306: an inferred/explicit type arg fails a `where` bound at a call.
@@ -7463,6 +7555,25 @@ public:
                                     ident: IdentifierNode*) -> void {
         if (call.resolved_callee.is_valid()) { return; }
 
+        // Generic function template (`connect<S>(...)`, `swap<T>(...)`): the
+        // concrete spec doesn't exist before Monomorphization, so the only
+        // mangled symbol registered is the template's ABSTRACT form (with the
+        // param unbound).  Pinning it strands mono - `try_infer_function_call`
+        // early-returns on a valid `resolved_callee` and never specializes the
+        // call - and codegen then emits a call to the never-defined abstract
+        // symbol (a link error).  Leave it unpinned so mono infers the type
+        // args, specializes, and pins the concrete spec.  (Mono-after-sema:
+        // this path now runs BEFORE mono.)  Use the bare-name+arity template
+        // lookup (the same one `check_generic_free_call` uses) so a call whose
+        // template lives under a DIFFERENT module path (`swap` ->
+        // `std::core::mem::swap`) is still recognized - a current-module
+        // `qualify_symbol_sym` / bare `get_template` would miss it.
+        const gen_tmpl: TemplateEntry* =
+            this.find_fn_template_for_call(ident.name, call.arguments.length);
+        if (gen_tmpl != null && gen_tmpl.param_type_ids.length > 0) {
+            return;
+        }
+
         // Gather arg types.  Bail if any arg failed to resolve; we'd
         // otherwise mismatch on TypeRef::invalid().
         mut arg_types: TypeRef[] = [];
@@ -7598,10 +7709,20 @@ public:
                     if (ret_t.kind == TypeKind::FunctionTemplate) {
                         return this.expected_type;
                     }
-                    // InstantiatedType with unresolved generic params
+                    // InstantiatedType with unresolved generic params.
+                    // Mono-after-sema: an instantiation lacks `resolved_type`
+                    // until mono runs, so `!has_resolved_type()` alone is no
+                    // longer evidence the return is abstract - a CONCRETE
+                    // `Option<Color>` also has no resolved_type pre-mono, and
+                    // substituting the expected type for it strips the `Option`
+                    // wrapper (the match subject becomes `Color`, breaking
+                    // exhaustiveness/binding).  Only swap in the expected type
+                    // when the declared return genuinely still contains an
+                    // unbound generic param (e.g. `Result<T, E>` from `ok<T,E>`).
                     if (ret_t.kind == TypeKind::InstantiatedType) {
                         const inst: InstantiatedType* = ret_t as InstantiatedType*;
-                        if (!inst.has_resolved_type()) {
+                        if (!inst.has_resolved_type()
+                                && this.contains_generic_param(func_ret)) {
                             return this.expected_type;
                         }
                     }
@@ -8502,6 +8623,20 @@ public:
                     return trait_ret;
                 }
             }
+            // Mono-after-sema: an unresolved generic instantiation
+            // (`Slice<u8>` pre-mono) has no concrete spec, so `lookup_type_sym`
+            // fails.  Resolve the method's return off the generic BASE template
+            // and substitute the receiver's type_args (`Option<T>` ->
+            // `Option<u8>`).  `resolved_callee`/`resolved_method` stay unpinned
+            // so mono still specializes and back-fills.
+            if (base_t != null && base_t.kind == TypeKind::InstantiatedType) {
+                const tmpl_ret: TypeRef = this.resolve_method_return_via_template(
+                    lookup_ref, member.member);
+                if (tmpl_ret.is_valid()) {
+                    member.set_resolved_type(tmpl_ret);
+                    return tmpl_ret;
+                }
+            }
             // Valid type but no reverse mapping; internal gap, not user error
             return TypeRef::invalid();
         }
@@ -8529,7 +8664,12 @@ public:
                 this.resolve_method_return_with_explicit_args(
                     obj_type, member, ret)
             } else {
-                ret
+                // Mono-after-sema keystone (method path): the bare lookup
+                // returns the method's template return with the RECEIVER's
+                // type params still abstract (`Slice<T>::get -> Option<T>`).
+                // Substitute the receiver instantiation's type_args so the
+                // call types concretely pre-mono (`Slice<u8>` -> `Option<u8>`).
+                this.subst_method_return_from_receiver(obj_type, ret)
             };
             member.set_resolved_type(refined);
             return refined;
@@ -8557,8 +8697,17 @@ public:
         const inherited: TypeRef = this.lookup_method_through_trait_impls(
             type_sym, member.member);
         if (inherited.is_valid()) {
-            member.set_resolved_type(inherited);
-            return inherited;
+            // Mono-after-sema: a trait DEFAULT method's return references the
+            // `This` (Self) placeholder - e.g. the Iterator combinator
+            // `take(this, n) -> TakeIter<This>`.  Substitute `This` with the
+            // concrete receiver so `Range<i32>.take(3)` types as
+            // `TakeIter<Range<i32>>` pre-mono, instead of leaving `This`
+            // abstract (which collapses downstream to `void`, breaking the
+            // opaque-iterator local `mut t: implement Iterator = r.take(3)`).
+            const subst_inherited: TypeRef =
+                this.subst_this_in_type(inherited, obj_type);
+            member.set_resolved_type(subst_inherited);
+            return subst_inherited;
         }
 
         // Before giving up, check if the member is a field with function type.
@@ -8718,6 +8867,204 @@ public:
 
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
+    }
+
+    /// Mono-after-sema: substitute the `This` (Self) placeholder in a trait
+    /// default method's return type with the concrete receiver type, so a
+    /// combinator like `take -> TakeIter<This>` types as `TakeIter<Range<i32>>`
+    /// on a `Range<i32>` receiver.  `This` is the canonical GenericParam the
+    /// type resolver / TraitDeclNode walk mint as `("This", 0xFFFFFFFF)`.
+    /// Returns `ty` unchanged when it carries no generic param (concrete
+    /// return) or the receiver can't be peeled.
+    subst_this_in_type(mut &this, ty: TypeRef, receiver: TypeRef) -> TypeRef {
+        if (!ty.is_valid() || !this.contains_generic_param(ty)) { return ty; }
+        // Peel the receiver to its bare nominal type (drop `&` / `*`).
+        mut recv: TypeRef = receiver;
+        mut rt: Type* = this.arena.lookup(recv.id);
+        mut depth: i32 = 0;
+        while (rt != null && depth < 5) {
+            if (rt.kind == TypeKind::Reference) {
+                recv = (rt as ReferenceType*).referent;
+                rt = this.arena.lookup(recv.id);
+            } else if (rt.kind == TypeKind::Pointer) {
+                recv = (rt as PointerType*).pointee;
+                rt = this.arena.lookup(recv.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (!recv.is_valid()) { return ty; }
+        const this_name: SymbolStr = this.intern.intern("This");
+        const this_ph: TypeRef =
+            this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        subst.add(this_ph.id, recv);
+        const out: TypeRef = subst.apply(ty, this.arena);
+        if (!out.is_valid()) { return ty; }
+        return out;
+    }
+
+    /// Mono-after-sema: resolve a FIELD's type when the receiver is an
+    /// unresolved generic instantiation (`Pair<u32, i64>` pre-mono), for which
+    /// `check_field_access` fails because no concrete struct exists yet.  Reads
+    /// the field's abstract type off the generic BASE template's AST and
+    /// substitutes the receiver's type_args (`Y` -> `i64`).  Returns invalid
+    /// when the receiver isn't a concrete instantiation or names no such field.
+    resolve_field_via_template(mut &this, recv_type: TypeRef,
+                               field: SymbolStr) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const inst: InstantiatedType* = this.peel_to_instantiation(recv_type);
+        if (inst == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        mut abstract_field: TypeRef = TypeRef::invalid();
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.fields.length; i++) {
+                const f: FieldDeclNode* = sn.fields[i];
+                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                    abstract_field = f.resolved_type;
+                    break;
+                }
+            }
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.fields.length; i++) {
+                const f: FieldDeclNode* = cn.fields[i];
+                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                    abstract_field = f.resolved_type;
+                    break;
+                }
+            }
+        } else {
+            return TypeRef::invalid();
+        }
+        if (!abstract_field.is_valid()) { return TypeRef::invalid(); }
+        return this.subst_method_return_from_receiver(recv_type, abstract_field);
+    }
+
+    /// Mono-after-sema: resolve a method's return type when the receiver is an
+    /// unresolved generic instantiation (`Slice<u8>` pre-mono, whose concrete
+    /// spec - and thus reverse type-symbol - doesn't exist yet).  Walks the
+    /// generic BASE template's method list for an unambiguous, non-static,
+    /// non-method-generic match, then substitutes the receiver's type_args into
+    /// the (abstract) return (`Option<T>` -> `Option<u8>`).  Returns invalid on
+    /// 0/ambiguous matches, a method with its own generic params (needs
+    /// arg-driven inference mono does), or a still-abstract result - so those
+    /// calls defer to the monomorphizer.
+    resolve_method_return_via_template(mut &this, recv_type: TypeRef,
+                                       method_name: SymbolStr) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const inst: InstantiatedType* = this.peel_to_instantiation(recv_type);
+        if (inst == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            methods = &sn.methods;
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            methods = &cn.methods;
+        }
+        // (Enums carry no inline methods on the decl node - their `unwrap`/`map`
+        // etc. live in impl blocks, resolved via the DI fallback below.)
+        mut found_count: i64 = 0;
+        mut abstract_ret: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.is_static) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            // A method with its OWN generic params needs arg-driven inference
+            // we don't perform here; defer it to mono.
+            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            found_count += 1;
+            abstract_ret = m.func.resolved_return_type;
+        }
+
+        // Fallback for impl-block methods (the only place enum methods live,
+        // and where many struct/class methods live too): look the method's
+        // return up in the DI under the generic BASE's symbol.  This returns
+        // the template's still-abstract return (`unwrap -> T`), which the
+        // receiver substitution below turns concrete (`Option<i64>` -> `i64`).
+        if (found_count == 0) {
+            mut base_sym: SymbolStr = this.lookup_type_sym(inst.generic_base);
+            if (!base_sym.is_valid()) {
+                base_sym = this.arena.get_qualified_name(inst.generic_base);
+            }
+            if (base_sym.is_valid()) {
+                const di_ret: TypeRef =
+                    this.lookup_method_return(base_sym, method_name);
+                if (di_ret.is_valid()) {
+                    abstract_ret = di_ret;
+                    found_count = 1;
+                }
+                // Trait-default fallback: the method may be a default provided
+                // by a trait the base implements (`Range` impls `Iterator`,
+                // which provides `take -> TakeIter<This>`).  Resolve it through
+                // the implemented traits so combinators on a generic receiver
+                // type concretely pre-mono (the `This` subst below makes it
+                // `TakeIter<Range<i32>>`).  Without this, the early return here
+                // would short-circuit `resolve_method_call`'s own trait-impl
+                // fallback (which only runs on the type_sym-VALID path).
+                if (found_count == 0) {
+                    const tr_ret: TypeRef =
+                        this.lookup_method_through_trait_impls(base_sym, method_name);
+                    if (tr_ret.is_valid()) {
+                        abstract_ret = tr_ret;
+                        found_count = 1;
+                    }
+                }
+            }
+        }
+
+        if (found_count != 1 || !abstract_ret.is_valid()) {
+            return TypeRef::invalid();
+        }
+        // Substitute the receiver's own type params (`Option<T>::unwrap -> T`
+        // with T=i64), THEN the `This` (Self) placeholder for trait-default
+        // returns (`take -> TakeIter<This>` -> `TakeIter<Range<i32>>`).
+        const recv_subst: TypeRef =
+            this.subst_method_return_from_receiver(recv_type, abstract_ret);
+        return this.subst_this_in_type(recv_subst, recv_type);
+    }
+
+    /// Mono-after-sema keystone (method path): substitute a concrete receiver
+    /// instantiation's type_args into a method's still-abstract bare-lookup
+    /// return type, so e.g. `Slice<u8>::get` types as `Option<u8>` (not the
+    /// template's `Option<T>`) BEFORE mono runs.  Returns `ret` unchanged when
+    /// the return is already concrete, the receiver isn't a concrete
+    /// instantiation, the template arity disagrees, or any receiver type_arg is
+    /// itself abstract (a symbolic generic-body walk) - so no concrete or
+    /// symbolic call is disturbed.  `resolved_callee`/`resolved_method` are NOT
+    /// touched: mono still specializes the method and back-fills resolved_type.
+    subst_method_return_from_receiver(mut &this, recv_type: TypeRef,
+                                      ret: TypeRef) -> TypeRef {
+        if (!ret.is_valid()) { return ret; }
+        if (!this.contains_generic_param(ret)) { return ret; }   // already concrete
+        const inst: InstantiatedType* = this.peel_to_instantiation(recv_type);
+        if (inst == null) { return ret; }
+        const gr: GenericRegistry* = this.ctx.get_generic_registry();
+        if (gr == null) { return ret; }
+        const tmpl: TemplateEntry* =
+            gr.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null) { return ret; }
+        if (tmpl.param_type_ids.length != inst.type_args.length) { return ret; }
+        // Only substitute when every receiver type_arg is concrete; an abstract
+        // arg means the method is being checked inside another generic body, so
+        // the return legitimately stays abstract until mono.
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (this.contains_generic_param(inst.type_args[i])) { return ret; }
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(
+            tmpl.param_type_ids, inst.type_args);
+        const out: TypeRef = subst.apply(ret, this.arena);
+        if (!out.is_valid() || this.contains_generic_param(out)) { return ret; }
+        return out;
     }
 
     /// Check if a member is a field with function type on a struct/class.
@@ -9371,6 +9718,23 @@ public:
         const scope_entry: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
         if (scope_entry != null) { return true; }
 
+        // Qualified lookup: the source writes a bare scope (`Slice::from_raw`)
+        // but the template is registered under its fully-qualified name
+        // (`std::core::slice::Slice`).  Mirror the monomorphizer's
+        // `resolve_qualified` -> `get_template` resolution
+        // (`try_infer_static_method_on_generic_template`) so the same generic
+        // static-method calls are recognized here and NOT pinned to the bare
+        // `scope::member` form (which would strand mono's specialization and
+        // leave codegen unable to resolve the never-built spec).
+        if (this.ctx.decl_index != null) {
+            const qscope: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+            if (qscope.is_valid() && !qscope.equals(scope_sym)) {
+                const q_entry: TemplateEntry* =
+                    this.ctx.generic_registry.get_template(qscope);
+                if (q_entry != null) { return true; }
+            }
+        }
+
         // Function template registered under the combined `scope::member`
         // key (e.g. `Layout::array<T>(n)`; Layout itself isn't generic,
         // but `Layout::array` IS a function template).
@@ -9550,7 +9914,109 @@ public:
                 return resolved;
             }
         }
+
+        // Mono-after-sema: a static method on a generic struct/class template
+        // (`String::with_capacity`, `Slice::from_raw`) can't be found by the
+        // DI/method-return lookups above when the concrete spec doesn't exist
+        // yet (pre-mono) - the methods are keyed under the unbuilt spec name.
+        // Resolve the method off the TEMPLATE's AST and substitute the owner's
+        // type args (explicit turbofish, or the default instantiation of the
+        // bare scope name, e.g. `String` -> `String<GlobalAlloc>`) into its
+        // return.  `resolved_callee` is left unpinned so mono's
+        // `try_infer_static_method_on_generic_template` specializes and pins.
+        const tmpl_ret: TypeRef =
+            this.resolve_static_method_return_via_template(scope);
+        if (tmpl_ret.is_valid()) {
+            scope.set_resolved_type(tmpl_ret);
+            return tmpl_ret;
+        }
         return TypeRef::invalid();
+    }
+
+    /// Mono-after-sema (static-method path): resolve a static method's return
+    /// type off a generic owner TEMPLATE when the concrete spec doesn't exist
+    /// yet.  Walks the template's static methods for an unambiguous,
+    /// non-method-generic match, then substitutes the owner instantiation's
+    /// type args (explicit `Scope<Args>::m`, else the default instantiation of
+    /// the bare scope name) into the (abstract) return via
+    /// `subst_method_return_from_receiver`.  Returns invalid on 0/ambiguous
+    /// matches, a method-generic match, or a still-abstract result.
+    resolve_static_method_return_via_template(mut &this,
+                                              scope: ScopeResolutionNode*) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        // Resolve the scope name to a generic template (bare, then qualified).
+        mut tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template(scope.scope_name);
+        if (tmpl == null && this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
+            if (q.is_valid() && !q.equals(scope.scope_name)) {
+                tmpl = this.ctx.generic_registry.get_template(q);
+            }
+        }
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
+
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            methods = &sn.methods;
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            methods = &cn.methods;
+        } else {
+            return TypeRef::invalid();
+        }
+        mut found_count: i64 = 0;
+        mut abstract_ret: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.is_static) { continue; }
+            if (!m.func.name.equals(scope.member_name)) { continue; }
+            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            found_count += 1;
+            abstract_ret = m.func.resolved_return_type;
+        }
+        if (found_count != 1 || !abstract_ret.is_valid()) {
+            return TypeRef::invalid();
+        }
+        // Already concrete (no owner param in the return): use directly.
+        if (!this.contains_generic_param(abstract_ret)) { return abstract_ret; }
+
+        // Prefer the expected type when it concretely instantiates the SAME
+        // template as the abstract return (`mut out: Array<u8> = Array::new()`
+        // -> `Array<u8>`, not the abstract `Array<T>`; the method's own
+        // generics like Array's `T` are inferred from the binding's type, not
+        // the owner default).  Mirrors `resolve_direct_call`'s expected-type
+        // recovery.  Only fires when the bases match, so an unrelated expected
+        // type can't hijack the return.
+        const ret_inst: InstantiatedType* = this.peel_to_instantiation(abstract_ret);
+        if (this.expected_type.is_valid() && ret_inst != null) {
+            const exp_inst: InstantiatedType* =
+                this.peel_to_instantiation(this.expected_type);
+            if (exp_inst != null
+                    && exp_inst.generic_base.id == ret_inst.generic_base.id
+                    && !this.contains_generic_param(this.expected_type)) {
+                return this.expected_type;
+            }
+        }
+
+        // Else substitute the owner instantiation's type args (explicit
+        // turbofish `Scope<Args>::m`, or the default instantiation of the bare
+        // scope name, `String` -> `String<GlobalAlloc>`) into the return.
+        mut owner_concrete: TypeRef = TypeRef::invalid();
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) {
+                owner_concrete = this.lookup_type_by_sym(spec_sym);
+            }
+        }
+        if (!owner_concrete.is_valid()) {
+            owner_concrete = this.lookup_type_by_sym(scope.scope_name);
+        }
+        if (!owner_concrete.is_valid()) { return TypeRef::invalid(); }
+        return this.subst_method_return_from_receiver(owner_concrete, abstract_ret);
     }
 
     /// Try resolving Scope::Member as a type-based construct:
@@ -10220,7 +10686,24 @@ public:
                 member.span
             };
             this.enforce_field_visibility(obj_type, member.member, acc_span);
-            return result.result_type;
+            // Mono-after-sema: on an unresolved generic instantiation
+            // (`Pair<X, i64>` pre-mono) `check_field_access` may return the
+            // TEMPLATE field's abstract type (`.second -> Y`).  Substitute the
+            // receiver's type_args so the field types concretely (`-> i64`); a
+            // concrete field type passes through unchanged.
+            return this.subst_method_return_from_receiver(
+                obj_type, result.result_type);
+        }
+
+        // Mono-after-sema: `check_field_access` fails outright on an unresolved
+        // generic instantiation (`Pair<u32, i64>` pre-mono - no concrete struct
+        // exists yet to read fields from).  Resolve the field off the generic
+        // BASE template's AST and substitute the receiver's type_args (`Y` ->
+        // `i64`), so `.second` types concretely before mono runs.
+        const field_ret: TypeRef =
+            this.resolve_field_via_template(obj_type, member.member);
+        if (field_ret.is_valid()) {
+            return field_ret;
         }
 
         // Symbolic generic-body walk: the (unwrapped) receiver resolved to
@@ -11651,8 +12134,14 @@ type struct SemanticPasses {
             return PassResult::ok();
         }
 
-        // Build the visitor and drive it through the AST
+        // Build the visitor and drive it through the AST.  Detect whether this
+        // is the post-mono (Phase 6b) run: when Monomorphization has completed,
+        // every concrete instantiation is resolved, so this pass is the
+        // authoritative type-check and must re-resolve nodes the pre-mono pass
+        // (Phase 6a-i.5) left abstract (see `post_mono_verify`).
         mut visitor: TypeCheckVisitor = TypeCheckVisitor::build(ctx);
+        visitor.post_mono_verify =
+            ctx.provisions.has(Provision::MonomorphizationComplete);
         visitor.visit(root);
 
         if (ctx.debug_mode) {
