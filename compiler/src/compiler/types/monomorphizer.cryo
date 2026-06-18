@@ -5637,7 +5637,25 @@ type struct Monomorphizer {
                           subst: TypeSubstitution*,
                           names: &SymbolStr[], types: &TypeRef[]) -> void {
         if (call == null) { return; }
-        if (call.resolved_method != null) { return; }
+        // A sema-resolved method that is still a GENERIC TEMPLATE has NOT been
+        // specialized: sema resolves the call's *type* (return / turbofish) and
+        // pins `resolved_method` to the template, but does not mint the
+        // per-instantiation spec or emit its symbol.  Mono owns specialization,
+        // so it must still run inference here for such calls (e.g. an explicit
+        // turbofish `va.next<i64>()` on the non-generic `VaArgs`).  Only skip
+        // when the resolved method is already concrete - a genuinely
+        // non-generic method, or an already-minted spec (mono pins the spec
+        // back into `resolved_method` at the end of this function, so a second
+        // walk over the same call lands here with `generic_params.length == 0`
+        // and correctly short-circuits).  The downstream guards (unresolved
+        // receiver, still-generic bindings) keep abstract contexts deferred.
+        if (call.resolved_method != null) {
+            const rm: MethodNode* = call.resolved_method as MethodNode*;
+            if (rm == null || rm.func == null
+                    || rm.func.generic_params.length == 0) {
+                return;
+            }
+        }
         if (call.callee == null) { return; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
         if (callee_node.kind != NodeKind::MemberAccess) { return; }

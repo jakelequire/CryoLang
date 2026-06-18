@@ -898,6 +898,49 @@ type struct TypeResolver {
         }
     }
 
+    /// Fold an already-resolved BARE reference to a generic whose parameters
+    /// are ALL defaulted (`String` for `String<A = GlobalAlloc>`) into its
+    /// fully-defaulted instantiation (`String<GlobalAlloc>`).
+    ///
+    /// A bare `String` and a `-> String` return must denote the SAME concrete
+    /// type, but a method's return annotation resolved during bootstrap keeps
+    /// the raw template base while annotation / inference paths land on
+    /// `String<GlobalAlloc>`.  The divergence mints two manglings of one type -
+    /// surfacing as a spurious `Box<String/*bare*/>::clone` that calls a
+    /// never-emitted bare `String::clone` (link error).  Read sites (e.g. a
+    /// method's stored return type) call this so every path agrees.
+    ///
+    /// Operates on an already-resolved TypeRef (not an annotation), so unlike
+    /// a resolve-time canonicalizer it cannot stack onto an explicit
+    /// `Type<ExplicitArgs>` (those resolve to an `InstantiatedType`, which is
+    /// skipped here).  Uses the arena's dedup instantiation - NO new demand:
+    /// the all-default form is already demanded wherever the type is used, and
+    /// the canonical TypeRef flows on through normal mono discovery.  No-op
+    /// unless `ty` is a registered template BASE with >0 params, every one
+    /// defaulted.
+    canonicalize_default_generic_type(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid() || this.generic_registry == null) { return ty; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return ty; }
+        if (t.kind != TypeKind::Struct
+                && t.kind != TypeKind::Class
+                && t.kind != TypeKind::Enum) { return ty; }
+        const entry: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(ty.id);
+        if (entry == null || entry.param_count <= 0) { return ty; }
+        const params: GenericParamNode*[] = entry.get_generic_params();
+        if (params.length < entry.param_count) { return ty; }
+        for (mut i: i64 = 0; i < entry.param_count; i++) {
+            const gp: GenericParamNode* = params[i];
+            if (gp == null || !gp.has_default_annotation()) { return ty; }
+        }
+        mut ctx: ResolutionContext = ResolutionContext::new("", "");
+        mut empty: TypeRef[] = [];
+        const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
+        if (filled.length != entry.param_count) { return ty; }
+        return this.arena.create_instantiation(ty, &filled);
+    }
+
 
 private:
     // Dispatch helpers

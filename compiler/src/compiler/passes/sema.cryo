@@ -320,6 +320,23 @@ public:
     }
 
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        return this.canonicalize_method_return(
+            this.lookup_method_return_raw(type_sym, method_sym));
+    }
+
+    /// A method's stored return annotation resolved during bootstrap can be the
+    /// raw template base of an all-default generic (`String` for `-> String`,
+    /// not `String<GlobalAlloc>`).  Fold it to the canonical instantiation so a
+    /// call's resolved type matches every other path (see
+    /// `TypeResolver::canonicalize_default_generic_type`); otherwise an inline
+    /// `Box::new(String::from_str(..))` mints a bogus `Box<String/*bare*/>`
+    /// whose clone calls a never-emitted bare `String::clone` (link error).
+    canonicalize_method_return(&this, ty: TypeRef) -> TypeRef {
+        if (this.ctx.type_resolver == null) { return ty; }
+        return this.ctx.type_resolver.canonicalize_default_generic_type(ty);
+    }
+
+    lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
         // Try the name as-is first (handles already-qualified names from
         // monomorphized types whose arena qualified name was used directly).
         const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
@@ -6116,6 +6133,18 @@ public:
         if (reg == null) { return null; }
         mut found: TemplateEntry* = null;
         mut count: i64 = 0;
+        // Collision tie-break: the same bare name + arity can exist as a
+        // free-function template in more than one module (e.g. a test-local
+        // `identity<T>` in two different test files).  Bare-name+arity lookup
+        // alone returns null on a tie, which strands the generic call - its
+        // return type stays abstract and poisons the enclosing inference
+        // (`expect_eq(identity(123), 123)` then can't pin a spec -> E0636).
+        // When tied, prefer the candidate defined in the CALLING module; this
+        // is the same disambiguator `GenericRegistry::finalize_disambiguation`
+        // already uses to keep the two specializations' symbols distinct.
+        mut module_match: TemplateEntry* = null;
+        mut module_match_count: i64 = 0;
+        const cur_mod: string = this.current_module_name();
         const total: i64 = reg.template_count();
         for (mut i: i64 = 0; i < total; i++) {
             const cand: TemplateEntry* = &reg.entries[i];
@@ -6127,8 +6156,17 @@ public:
             if (f.parameters.length != argc) { continue; }
             found = cand;
             count = count + 1;
+            const cand_mod: string = this.intern.resolve(cand.module_name);
+            if (intrinsics::strcmp(cand_mod, cur_mod) == 0) {
+                module_match = cand;
+                module_match_count = module_match_count + 1;
+            }
         }
         if (count == 1) { return found; }
+        // Tied across modules: the calling module breaks the tie when exactly
+        // one candidate lives there.  Still ambiguous (none or several in the
+        // calling module) -> null, preserving the conservative deferral.
+        if (module_match_count == 1) { return module_match; }
         return null;
     }
 
@@ -10642,6 +10680,30 @@ public:
             const csym: SymbolStr = this.intern.intern(combined);
             const fn_entry: TemplateEntry* = this.ctx.generic_registry.get_template(csym);
             if (fn_entry != null) { return true; }
+
+            // A generic STATIC method registers its template under the FULLY-
+            // qualified owner path (`register_static_method_templates` keys
+            // `Layout::of<T>` as `std::alloc::layout::Layout::of`), not the
+            // bare `Layout::of` the source writes.  Mirror the qualified-scope
+            // lookup above on the combined key so `Layout::of<T>()` /
+            // `Request::parse<R>(..)` are recognized as templates and NOT
+            // pinned to the abstract `scope::member` form here - which would
+            // strand the monomorphizer (`try_infer_function_call` early-returns
+            // on a valid `resolved_callee`) and leave codegen referencing a
+            // never-built abstract spec (link error).
+            if (this.ctx.decl_index != null) {
+                const qscope2: SymbolStr =
+                    this.ctx.decl_index.resolve_qualified(scope_sym);
+                if (qscope2.is_valid() && !qscope2.equals(scope_sym)) {
+                    const qscope2_str: string = this.intern.resolve(qscope2);
+                    const qcombined: string =
+                        format("%s::%s", qscope2_str, member_str);
+                    const qcsym: SymbolStr = this.intern.intern(qcombined);
+                    const qfn_entry: TemplateEntry* =
+                        this.ctx.generic_registry.get_template(qcsym);
+                    if (qfn_entry != null) { return true; }
+                }
+            }
         }
 
         // Scope name resolved by AST specialization to a spec'd type
