@@ -968,6 +968,37 @@ public:
                     return spec_ret;
                 }
             }
+            // Arg-inferred generic module call WITHOUT turbofish
+            // (`mem::offset(p, n)`, `mem::swap(a, b)`): infer the type args from
+            // the argument types and STASH them on the call so the monomorphizer
+            // enqueues this exact instantiation without re-running its own
+            // inference (mono-after-sema: sema is the source of truth).  Also
+            // substitute them into the template return for the concrete call
+            // type when every binding is concrete here; inside a generic body
+            // the bindings stay abstract (the stash is still correct - mono's
+            // substituter concretizes it per-spec) and we fall through to the
+            // abstract template return below.  Do NOT pin `resolved_callee`
+            // (pin-stranding hazard; mono pins the authoritative spec symbol).
+            const no_turbofish: boolean =
+                (scope == null || scope.generic_args.length == 0)
+                && call.generic_args.length == 0;
+            if (no_turbofish) {
+                const tfn: FunctionDeclNode* = tmpl.ast_node as FunctionDeclNode*;
+                if (tfn != null) {
+                    mut binds: TypeRef[] =
+                        this.infer_free_call_bindings(call, tmpl, tfn);
+                    if (binds.length > 0) {
+                        mut stash: TypeRef[] = [];
+                        for (mut i: i64 = 0; i < binds.length; i++) {
+                            stash.push(binds[i]);
+                        }
+                        call.set_resolved_type_args(stash);
+                        const cret: TypeRef =
+                            this.subst_free_call_return(tmpl, &binds, ret);
+                        if (cret.is_valid()) { return cret; }
+                    }
+                }
+            }
             // Pre-monomorphization (sema-before-mono): the spec function
             // doesn't exist yet, so the lookup above missed and we'd otherwise
             // surface the ABSTRACT template return (`To` for
@@ -986,10 +1017,10 @@ public:
             mut subst_ret: TypeRef = TypeRef::invalid();
             if (scope != null && scope.generic_args.length > 0) {
                 subst_ret = this.subst_return_from_call_args(
-                    tmpl, &scope.generic_args, ret);
+                    call, tmpl, &scope.generic_args, ret);
             } else if (call.generic_args.length > 0) {
                 subst_ret = this.subst_return_from_call_args(
-                    tmpl, &call.generic_args, ret);
+                    call, tmpl, &call.generic_args, ret);
             }
             if (subst_ret.is_valid()) {
                 return subst_ret;
@@ -1007,7 +1038,7 @@ public:
     /// a turbofish call's type when it runs ahead of mono.  Returns invalid
     /// when the args don't resolve, the arity disagrees, or the substituted
     /// return is still abstract (then the caller keeps its existing behaviour).
-    subst_return_from_call_args(mut &this, tmpl: TemplateEntry*,
+    subst_return_from_call_args(mut &this, call: CallExprNode*, tmpl: TemplateEntry*,
                                 generic_args: &TypeAnnotation*[],
                                 tmpl_ret: TypeRef) -> TypeRef {
         if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
@@ -1021,6 +1052,15 @@ public:
             const tr: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &rc);
             if (!tr.is_valid()) { arg_refs.drop(); return TypeRef::invalid(); }
             arg_refs.push(tr);
+        }
+        // Stash the explicit turbofish bindings on the call so the monomorphizer
+        // enqueues this spec without re-inferring (mono-after-sema), even when
+        // the return is void/abstract.  In a generic body these are the enclosing
+        // template's params; mono's substituter concretizes the stash per-spec.
+        if (call != null) {
+            mut stash: TypeRef[] = [];
+            for (mut i: i64 = 0; i < arg_refs.length; i++) { stash.push(arg_refs[i]); }
+            call.set_resolved_type_args(stash);
         }
         mut subst: TypeSubstitution =
             TypeSubstitution::from_params(tmpl.param_type_ids, arg_refs);
@@ -2182,7 +2222,18 @@ public:
         this.symbolic_generic_param_ids   = param_ids;   // field was [], no leak
         this.symbolic_method_param_nodes  = method_nodes;
 
-        this.enter_function(func, this_type);
+        // `this` carries the owner's full abstract type-args (Owner<P…>), not
+        // the bare template, so a free call inside the body can recover an
+        // owner-only param (the allocator `A` in `alloc_entry<K,V,A>(this,…)`)
+        // from the receiver.  Only the non-static generic-owner receiver
+        // (this_type == the bare owner) is rewritten; static methods (invalid
+        // this_type) and non-generic owners (no owner params) are unaffected.
+        mut eff_this: TypeRef = this_type;
+        if (this_type.is_valid() && owner_type.is_valid()
+                && this_type.id == owner_type.id) {
+            eff_this = this.symbolic_owner_instance(owner_type);
+        }
+        this.enter_function(func, eff_this);
         this.visit(func.body);
 
         if (ar != null) { ar.set_symbolic_no_demand(saved_no_demand); }
@@ -2293,13 +2344,84 @@ public:
         return this.arena.create_generic_param(p.name, index);
     }
 
+    /// The true type of `this` during a generic-owner symbolic walk: the
+    /// owner's self-instantiation `Owner<P0, P1, …>` with each param as its
+    /// abstract `GenericParam`/`BoundedParamType` (`symbolic_param_ref`).
+    /// A bare owner template loses the param args, so a free call that can
+    /// only recover a param from the receiver — e.g. the allocator `A` in
+    /// `alloc_entry<K,V,A>(this, …)` where `this: HashMap<K,V,A>` — cannot
+    /// bind it; the abstract self-instantiation restores them, and the shared
+    /// `InferCtx` then unifies it structurally (Inst-vs-Inst) against the
+    /// callee's `Owner<…>` parameter.  Returns `owner_type` unchanged when it
+    /// is not a bare generic owner with params (so static methods, non-generic
+    /// owners and already-instantiated impl targets are left as-is).  Must run
+    /// inside the symbolic walk so `create_instantiation` tags the minted type
+    /// `is_symbolic` (kept out of monomorphization / GenericValidation).
+    symbolic_owner_instance(mut &this, owner_type: TypeRef) -> TypeRef {
+        if (!owner_type.is_valid()) { return owner_type; }
+        if (this.symbolic_owner_param_nodes.length == 0) { return owner_type; }
+        const t: Type* = this.arena.lookup(owner_type.id);
+        if (t == null || t.kind == TypeKind::InstantiatedType) { return owner_type; }
+        mut args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < this.symbolic_owner_param_nodes.length; i++) {
+            const p: GenericParamNode* = this.symbolic_owner_param_nodes[i];
+            if (p == null) { args.drop(); return owner_type; }
+            args.push(this.symbolic_param_ref(p, i as u64));
+        }
+        const inst: TypeRef = this.arena.create_instantiation(owner_type, &args);
+        args.drop();
+        return inst;
+    }
+
+    /// Peel references/pointers off `ty`; if the result is an
+    /// `InstantiatedType`, return its `generic_base` (else invalid).  Used to
+    /// recognize the owner's abstract self-instantiation, which has no resolved
+    /// type for `unwrap_to_base_type` to follow.
+    symbolic_inst_generic_base(&this, ty: TypeRef) -> TypeRef {
+        mut t: Type* = this.arena.lookup(ty.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            match (t.kind) {
+                TypeKind::Pointer => {
+                    const pt: PointerType* = t as PointerType*;
+                    t = this.arena.lookup(pt.pointee.id);
+                }
+                TypeKind::Reference => {
+                    const rt: ReferenceType* = t as ReferenceType*;
+                    t = this.arena.lookup(rt.referent.id);
+                }
+                TypeKind::InstantiatedType => {
+                    return (t as InstantiatedType*).generic_base;
+                }
+                _ => { return TypeRef::invalid(); }
+            }
+            depth += 1;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve a symbolic-walk receiver to its base struct/class `Type*`,
+    /// peeling references/pointers and — unlike `unwrap_to_base_type` —
+    /// following the owner's abstract self-instantiation (`Owner<P…>`, which is
+    /// never monomorphized and so has no resolved type) to its `generic_base`
+    /// template.  Returns null when no base is reachable.  Shared by the
+    /// symbolic owner-receiver fast paths so they recognize `this` whether it
+    /// is the bare owner template or its abstract self-instantiation.
+    symbolic_recv_base(&this, recv_type: TypeRef) -> Type* {
+        const base: Type* = this.unwrap_to_base_type(recv_type);
+        if (base != null) { return base; }
+        const gb: TypeRef = this.symbolic_inst_generic_base(recv_type);
+        if (gb.is_valid()) { return this.unwrap_to_base_type(gb); }
+        return null;
+    }
+
     /// True (only in a generic-owner symbolic walk) when `ty` is the abstract
     /// owner type itself — so an access rooted at `this` whose field/method
     /// types are abstract should be deferred rather than reported.
     symbolic_is_generic_owner_receiver(&this, ty: TypeRef) -> boolean {
         if (!this.in_symbolic_check || !this.symbolic_owner_is_generic) { return false; }
         if (!ty.is_valid() || !this.current_owner_type.is_valid()) { return false; }
-        const recv_base:  Type* = this.unwrap_to_base_type(ty);
+        const recv_base:  Type* = this.symbolic_recv_base(ty);
         const owner_base: Type* = this.unwrap_to_base_type(this.current_owner_type);
         if (recv_base == null || owner_base == null) { return false; }
         return recv_base.id == owner_base.id;
@@ -2322,7 +2444,7 @@ public:
             return TypeRef::invalid();
         }
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        const base: Type* = this.unwrap_to_base_type(recv_type);
+        const base: Type* = this.symbolic_recv_base(recv_type);
         if (base == null) { return TypeRef::invalid(); }
         const tmpl: TemplateEntry* =
             this.ctx.generic_registry.get_template_by_type_id(base.id);
@@ -2365,7 +2487,7 @@ public:
             return TypeRef::invalid();
         }
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        const base: Type* = this.unwrap_to_base_type(recv_type);
+        const base: Type* = this.symbolic_recv_base(recv_type);
         if (base == null) { return TypeRef::invalid(); }
         const tmpl: TemplateEntry* =
             this.ctx.generic_registry.get_template_by_type_id(base.id);
@@ -6118,6 +6240,12 @@ public:
                 this.check_scope_call_arg_types(
                     callee as ScopeResolutionNode*, call);
             }
+            // Additively stash bindings for a type-scoped generic static method
+            // (`Layout::of<T>()`) so the monomorphizer enqueues the spec from
+            // sema's resolution instead of re-inferring.  Resolution above is
+            // unaffected.
+            this.stash_scope_resolution_call_bindings(
+                call, callee as ScopeResolutionNode*);
             return scope_ret;
         }
 
@@ -6291,7 +6419,14 @@ public:
 
         if (call.generic_args.length > 0) {
             // Explicit turbofish is authoritative; resolve each annotation.
+            // Bind the enclosing template's generic params symbolically so a
+            // turbofish that NAMES an outer param (`sort_range_by<T>(...)` inside
+            // `Array<T>::sort`) resolves `T` to its symbolic GenericParam during
+            // the pre-mono symbolic walk - otherwise it resolves to invalid, the
+            // binding is dropped, and the call is never stashed (so the
+            // monomorphizer falls back to re-inference for the whole sort family).
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic_bind_params(&rc);
             mut n: i64 = call.generic_args.length;
             if (n > bindings.length) { n = bindings.length; }
             for (mut i: i64 = 0; i < n; i++) {
@@ -6422,6 +6557,23 @@ public:
         // them into the template return so sema is the source of truth for the
         // call's concrete type pre-mono.  Sound only when every binding is
         // concrete (else we'd mint an abstract instantiation).
+        //
+        // Stash the bindings on the call so the monomorphizer can enqueue this
+        // exact instantiation without re-deriving them (mono-after-sema: sema
+        // is the source of truth).  Stash whenever every binding is BOUND, even
+        // if still abstract: inside a generic template body the bindings are the
+        // enclosing template's own params (e.g. `alloc_entry<K,V,A>`), which mono
+        // concretizes by applying the active specialization `subst` to the stash
+        // when it clones the body.  A partially-bound set is not stored.
+        mut all_bound_stash: boolean = bindings.length == entry.param_type_ids.length;
+        for (mut ci: i64 = 0; ci < bindings.length && all_bound_stash; ci++) {
+            if (!bindings[ci].is_valid()) { all_bound_stash = false; }
+        }
+        if (all_bound_stash) {
+            mut stash: TypeRef[] = [];
+            for (mut ci: i64 = 0; ci < bindings.length; ci++) { stash.push(bindings[ci]); }
+            call.set_resolved_type_args(stash);
+        }
         return this.subst_free_call_return(entry, &bindings, tmpl.resolved_return_type);
     }
 
@@ -6446,6 +6598,144 @@ public:
             return TypeRef::invalid();
         }
         return out;
+    }
+
+    /// PASS A/B/C argument inference for a generic free-function call, returning
+    /// the per-param bindings (parallel to `entry.param_type_ids`) or an empty
+    /// array when arity disagrees, a binding stays unbound, or a hard PASS-A
+    /// conflict is hit.  Pure inference - emits NO diagnostics (the bare-name
+    /// keystone `check_generic_free_call` and the monomorphizer own E0214/E0306/
+    /// E0307).  Used by the module-scoped scope-resolution path
+    /// (`mem::offset(p, n)`) to compute + stash bindings so the monomorphizer
+    /// need not re-infer.  Mirrors the inference inside `check_generic_free_call`;
+    /// the two converge once mono's engine is deleted.
+    infer_free_call_bindings(mut &this, call: CallExprNode*, entry: TemplateEntry*,
+                             tmpl: FunctionDeclNode*) -> TypeRef[] {
+        mut empty: TypeRef[] = [];
+        if (entry.param_type_ids.length == 0) { return empty; }
+        if (tmpl.parameters.length != call.arguments.length) { return empty; }
+
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) {
+            pids.push(entry.param_type_ids[i]);
+        }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+
+        // PASS A - bind from non-literal, reliable arguments.  Bail on a hard
+        // two-concrete-actuals conflict (mono emits the E0214).
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = tmpl.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            if (!this.free_infer_arg_reliable(arg)) { continue; }
+            const actual: TypeRef = arg.resolved_type;
+            if (!actual.is_valid()) { continue; }
+            ictx.conflict_from = TypeRef::invalid();
+            ictx.conflict_to   = TypeRef::invalid();
+            ictx.unify(param.resolved_type, actual);
+            if (ictx.conflict_from.is_valid() && ictx.conflict_to.is_valid()
+                    && this.free_infer_type_concrete(ictx.conflict_from)
+                    && this.free_infer_type_concrete(ictx.conflict_to)) {
+                return empty;
+            }
+        }
+
+        // PASS B - recover still-unbound params from a CONCRETE expected type
+        // (`mem::transmute<From,To>` pins `To` from the expected type).
+        if (this.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
+                && !this.contains_generic_param(this.expected_type)) {
+            mut any_unbound: boolean = false;
+            for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+                if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
+            }
+            if (any_unbound) {
+                ictx.unify(tmpl.resolved_return_type, this.expected_type);
+            }
+        }
+
+        // PASS C - literal fallback for any param still unbound.
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = tmpl.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const lit_actual: TypeRef = arg.resolved_type;
+            if (!lit_actual.is_valid()) { continue; }
+            const f_idx: i64 = ictx.binding_index(param.resolved_type.id);
+            if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
+            ictx.unify(param.resolved_type, lit_actual);
+        }
+
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+            bindings.push(ictx.bindings[i]);
+        }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return empty; }
+        }
+        return bindings;
+    }
+
+    /// Stash the generic type-arg bindings for a scope-resolution call to a
+    /// generic free-function-style template.  Module functions (`mem::offset`)
+    /// are handled in `resolve_module_qualified_function`; this covers
+    /// TYPE-scoped generic STATIC METHODS (`Layout::of<T>()`,
+    /// `Layout::array<T>(n)`), which the registry stores as `Owner::method`
+    /// function templates (the method owns the generic param; the owner is not
+    /// generic).  Purely ADDITIVE: it computes the bindings (turbofish - with
+    /// the enclosing template's params bound symbolically so an outer-param
+    /// turbofish like `Slice::from_raw<T>` resolves during the pre-mono walk -
+    /// or argument inference) and stores them on the call so the monomorphizer
+    /// can enqueue the spec without re-inferring.  Leaves all existing
+    /// resolution/pinning untouched; mirrors mono `try_infer_function_call`'s
+    /// type-scope template lookup so the bindings (hence the spec mangle) match.
+    stash_scope_resolution_call_bindings(mut &this, call: CallExprNode*,
+                                         scope: ScopeResolutionNode*) -> void {
+        if (call == null || scope == null) { return; }
+        if (call.resolved_type_args.length > 0) { return; }   // already stashed
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
+
+        // Resolve `scope::member` to a function-template entry (qualified first,
+        // then bare), mirroring mono's type-scope lookup.
+        const member_str: string = this.intern.resolve(scope.member_name);
+        mut entry: TemplateEntry* = null;
+        if (this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
+            if (q.is_valid()) {
+                const qstr: string = this.intern.resolve(q) + "::" + member_str;
+                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
+            }
+        }
+        if (entry == null) {
+            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
+            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
+        }
+        if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+        if (entry.param_type_ids.length == 0) { return; }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null) { return; }
+
+        // Turbofish lives on the call or the scope member; mirror mono's pick.
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        if (targs.length == 0 && scope.generic_args.length > 0) {
+            targs = &scope.generic_args;
+        }
+        mut binds: TypeRef[] = [];
+        if (targs.length > 0) {
+            if (targs.length != entry.param_type_ids.length) { return; }
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < targs.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+                if (!tr.is_valid()) { return; }
+                binds.push(tr);
+            }
+        } else {
+            binds = this.infer_free_call_bindings(call, entry, tmpl);
+            if (binds.length == 0) { return; }
+        }
+        call.set_resolved_type_args(binds);
     }
 
     /// E0306: an inferred/explicit type arg fails a `where` bound at a call.
@@ -8718,16 +9008,15 @@ public:
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid -> upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
-        // Symbolic generic-body walk: an abstract / `void` (unresolved) receiver
-        // can't drive concrete method resolution (which would spuriously report
-        // "no method" or "ambiguous call"); defer to the concrete instantiation.
-        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
         // Method call on the abstract generic owner (`this.get()` in a `Box<T>`
         // method): resolve its return type off the owner template AST (the arena
         // has no methods for a generic template). An unambiguous match resolves
         // to the abstract return type; 0 matches or an overload set (or a
         // trait-impl/inherited method that lives elsewhere) returns invalid and
         // defers, exactly as the previous blanket defer did — so no new FP.
+        // Checked BEFORE the `symbolic_type_unresolved` bail: `this` is the
+        // owner's self-instantiation (`Owner<P…>`), which carries abstract
+        // params and so would otherwise be deferred as unresolved.
         if (this.symbolic_is_generic_owner_receiver(obj_type)) {
             const mret: TypeRef =
                 this.symbolic_resolve_owner_method_return(obj_type, member.member);
@@ -8737,6 +9026,10 @@ public:
             }
             return TypeRef::invalid();
         }
+        // Symbolic generic-body walk: an abstract / `void` (unresolved) receiver
+        // can't drive concrete method resolution (which would spuriously report
+        // "no method" or "ambiguous call"); defer to the concrete instantiation.
+        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
 
         // Unwrap Pointer / Reference / InstantiatedType so method lookup
         // works on `this.intern_table.resolve(name)` where `intern_table`
@@ -11664,10 +11957,6 @@ public:
         const obj_type: TypeRef = this.resolve_expr(member.object);
         // Input invalid -> upstream error already emitted, stay silent
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
-        // Symbolic generic-body walk: a receiver that resolved to `void` or
-        // still carries an abstract type parameter is unresolved, not genuinely
-        // fieldless — defer field resolution to the concrete instantiation.
-        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
         // Access rooted at the abstract generic owner (`this.value` in a
         // `Box<T>` method): resolve the field to its abstract declared type off
         // the owner template's AST (the arena StructType has no fields for a
@@ -11675,6 +11964,9 @@ public:
         // a `T`-typed field resolves to a GenericParam that downstream checks
         // defer on. A name that is NOT a field falls through to the normal path
         // (method lookup / E0204), so `this.nonexistent` is still a true error.
+        // Checked BEFORE the `symbolic_type_unresolved` bail: `this` is the
+        // owner's self-instantiation (`Owner<P…>`), which carries abstract
+        // params and so would otherwise be deferred as unresolved.
         if (this.symbolic_is_generic_owner_receiver(obj_type)) {
             const owner_field: TypeRef =
                 this.symbolic_resolve_owner_field(obj_type, member.member);
@@ -11683,6 +11975,10 @@ public:
                 return owner_field;
             }
         }
+        // Symbolic generic-body walk: a receiver that resolved to `void` or
+        // still carries an abstract type parameter is unresolved, not genuinely
+        // fieldless — defer field resolution to the concrete instantiation.
+        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
 
         // Tuple positional access: `t.0`, `t.1`. The parser interns the
         // numeric token's lexeme as the member SymbolStr (same field as
