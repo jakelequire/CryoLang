@@ -1152,3 +1152,140 @@ enum_discriminant point). My changes are platform-agnostic compiler logic.
 - Step C (delete mono inference) still pending — though #5/#7/#8 already adapted several
   mono-staleness points toward it.
 - Tree UNCOMMITTED. Jake commits + repins.
+
+## 2026-06-17 (cont. 3) — "heap corruption" ROOT-CAUSED (by-value TraitRef UAF) + cascade narrowed to 3 sema-authority gaps
+
+### The "STATUS_HEAP_CORRUPTION at startup" diagnosis was WRONG — corrected here
+Prior session reported the test binary heap-corrupts at startup, even `--list`. Re-measured:
+- The unit test BINARY runs fine standalone: from `tests/` cwd, `--jobs=1` AND default
+  parallel both give **1234 passed / 0 failed**. (`--list` works too.) The earlier "even
+  --list crashes" was running `cryo test` — i.e. the COMPILER — not the binary, and from the
+  wrong cwd (the 2 TLS failures were just a missing `fixtures/tls/` relative to `tests/build`).
+- The crash is in the **compiler process**, during the in-process `compile_project` of the
+  test project (`cryo test` rebuilds it), specifically in **Monomorphization**.
+
+### Root cause (valgrind, Linux): use-after-free of a shared `Array<SymbolStr>` buffer
+Linux glibc TOLERATES the corruption (exit 0); Windows heap aborts (0xC0000374) — so parity
+"held" only in the sense both miscompile; only Windows surfaces it. Ran the Linux build under
+`valgrind --track-origins=yes`: **Invalid read** in `Monomorphizer::check_function_bounds_at_call`,
+of a 16-byte block **free'd by `Array<SymbolStr>::drop` inside `Monomorphizer::emit_call_bound_failure`**.
+- `emit_call_bound_failure(... tref: TraitRef ...)` took the `TraitRef` **BY VALUE**. Cryo
+  shallow-copies the struct (incl. `path: SymbolStr[]`), sharing the backing buffer; the
+  param drops at return and frees the AST's `bound.trait_refs[ri].path` buffer → next read of
+  that path (here, or the post-mono sema pass) is a UAF. Sema's twin `emit_free_call_bound_failure`
+  already takes `tref: TraitRef*`; mono diverged. **FIX: take `tref: TraitRef*`** (monomorphizer.cryo).
+- Under gdb the UAF surfaced as a zeroed trait-name SymbolStr → false `E0306 "T: " is not
+  satisfied` (empty trait name); without gdb, a clobbered pointer → hard crash. Same bug.
+
+### Second fix exposed by the first: mono bound-check ran on ABSTRACT bindings
+After the UAF fix the 4 remaining errors were `E0306: T: Eq is not satisfied` (concrete = the
+still-abstract `T`). `check_function_bounds_at_call` lacked the abstract-defer guard sema has.
+**FIX: `if (this.type_contains_generic_param(concrete)) { continue; }`** before the bound check
+(mirrors sema's `check_generic_free_call`). monomorphizer.cryo.
+
+### Result: crash GONE. Suite now COMPILES past mono; 149 → 145 real compile errors remain.
+All flip regressions (pin compiles identical sources 1234/0). Two more fixes landed:
+- **InstantiatedType structural equality** in `checker.cryo` `check_compatibility` (mirrors the
+  existing Reference/Tuple/GenericParam fallbacks): the arena does NOT dedupe instantiations,
+  so pre-/post-mono mint distinct TypeIDs for one logical `Foo<Bar<i32>>`. Compare base+args
+  structurally. (Helped marginally; the bulk of E0200 is a different shape — see below.)
+- **Sema-demand enqueue** in mono discovery (monomorphizer.cryo `discover_inferred_calls_in_stmt`
+  VarDecl case): enqueue a local binding's sema-resolved concrete instantiation directly, so
+  adapter CHAINS (`a.iter_ref().copied()`, the for-in iterator local) get specialized even when
+  mono's call-by-call walk can't reconstruct the chain result. Fixed all 3 **E0900** (unresolved
+  instantiation). Minimal "sema creates the demand" — the spirit of Step C.
+
+### Remaining 145 = THREE sema-authority gaps (all in the for-in / lambda / static-ctor area):
+1. **E0200 (104)** — `for (i in Range::new(0,5))`: sema types the initializer as abstract
+   `Range<T>` (no type-arg inference for a generic STATIC-CONSTRUCTOR call), while mono lifts the
+   binding to `Range<i32>` → `can_assign(Range<T>, Range<i32>)` fails in the post-mono pass.
+   Need sema to infer `T` from the value args of `Range::new(0,5)` (the static-ctor analogue of
+   `check_generic_free_call` / `resolve_generic_method_return`).
+2. **E0201 (36)** — `cannot find value 'this'` inside a lambda body that captures a local
+   (`(x) -> i32 { x + bias }`). Closure-capture resolution gap (a captured local is being looked
+   up through a `this` that the pass doesn't have).
+3. **E0358 (5)** — `for (x in arr)` over an `Array<i32>`: "no method named `next`". The for-in
+   desugar isn't inserting the `.iter()` (container → iterator) for a direct-container scrutinee.
+
+### Validation state
+- Windows: `cryo test` no longer crashes; 145 compile errors (above). Repros for the for-iter
+  E0900 and a standalone iterator program compile AND run correctly.
+- Linux: not re-run since these 4 fixes; parity expected. self-host NOT re-checked. O2 not run.
+- Tree UNCOMMITTED. Files touched: monomorphizer.cryo (UAF by-ptr, abstract-defer, demand-enqueue),
+  checker.cryo (InstantiatedType structural eq). Jake commits + repins.
+
+## 2026-06-17 (cont. 4) — Heap-corruption KILLED + cascade driven 149 → 2 (nine root-caused fixes)
+
+Picked up from "cont. 3". Drove the flip from "crashes, nothing runs" to a **2-error**
+compile of the full suite. Every fix root-caused, no masking. The two remaining are ONE
+precisely-identified nested-generic corner (below).
+
+### Fixes that landed this session (all validated against the full suite, both root + cause):
+1. **UAF (the "heap corruption")** — `monomorphizer.cryo` `emit_call_bound_failure` took
+   `tref: TraitRef` BY VALUE; the shallow copy shared the AST's `Array<SymbolStr> path`
+   buffer and the param-drop freed it → next read UAF (crash on Windows, silent on Linux).
+   FIX: take `tref: TraitRef*` (matches sema's twin). Found via valgrind on Linux.
+2. **mono bound-check on abstract bindings** — `check_function_bounds_at_call` lacked the
+   abstract-defer guard. FIX: `if (this.type_contains_generic_param(concrete)) continue;`.
+3. **InstantiatedType structural equality** — `checker.cryo` `check_compatibility` had no
+   structural fallback for two non-deduped instantiations of one logical type (it has them
+   for Reference/Tuple/GenericParam). FIX: compare generic_base + each type_arg recursively.
+4. **for-iter adapter-chain demand** — mono never enqueued the for-in iterator local's
+   sema-resolved instantiation, so `a.iter_ref().copied()` (`CopiedIter<RefIter<i32>>`)
+   stayed unresolved (E0900). FIX: in mono VarDecl discovery, `enqueue_from_type_ref(
+   vd.resolved_type)` (guarded no-op unless a registered concrete template).
+5. **generic STATIC-CONSTRUCTOR inference** — `Range::new(0,5)` (no turbofish, no expected
+   type, the for-in local) typed as abstract `Range<T>` while mono lifted the binding to
+   `Range<i32>` → E0200. FIX: `infer_static_owner_return_from_args` in sema unifies the
+   ctor's params against the arg types to recover the owner's type args; wired into
+   `try_resolve_static_method` as a refinement when steps 1-3 return an abstract result.
+   (Cleared 97 of the E0200s.)
+6. **for-in over a CONTAINER** — `for (x in arr)` typed the iterator binding as the
+   container `Array<i32>` (pre-mono couldn't peel the unresolved inst to find `iter()`),
+   inconsistent with post-mono → E0200/E0358. FIX: `lookup_type_sym` falls back to an
+   instantiation's `generic_base` name when unresolved, so the `iter()`/`next()` probe
+   resolves identically in both passes.
+7. **PASS B unified against an ABSTRACT expected type** — a nested call `identity(123)` fed
+   to `expect_eq<T>` saw the outer abstract `T` as its expected type and bound identity's
+   own param to it. FIX: gate `check_generic_free_call` PASS B on
+   `!contains_generic_param(expected_type)`. (Cleared the `max_of` E0636s.)
+8. **lambda double-lowering (`cannot find value this`, 36×E0201)** — `resolve_lambda` re-ran
+   in the post-mono pass (`post_mono_verify` re-resolves cached nodes) and re-invoked
+   `synthesize_closure_struct`, re-walking synthesized `this.cap_i` with no `this_type`.
+   FIXES: (a) idempotency guard - once a capturing lambda carries its closure-struct type,
+   return it; (b) `resolve_identifier` honors a `this` node that already carries a resolved
+   type (compiler-synthesized closure-field access is authoritative).
+
+### THE REMAINING 2 (generics.cryo:158,168) — ROOT-CAUSED, fix deferred (cascade risk)
+`expect_eq(identity(123), 123)` / `expect_eq(identity(v), v)`: there are **two** `identity<T>`
+(1-arg) templates - `tests/lang/generics.cryo:148` and `tests/lang/match_generic_free_fn.cryo:24`.
+`find_fn_template_for_call` requires a UNIQUE bare-name+arity match (`count == 1`), so the
+collision makes it return null → `check_generic_free_call` bails → `identity(123)` surfaces
+its template's abstract return `T` → poisons the outer `expect_eq` inference → no spec pinned
+→ E0636 at codegen. (`max_of` has one definition, so #7 already fixed those.)
+- Confirmed via debug print: `check_generic_free_call` is never entered for `identity`.
+- ATTEMPTED FIX (reverted): namespace-disambiguate the collision to the calling module's
+  candidate. Done in the shared helper it broke `resolve_direct_call`'s deferral (8 errors);
+  isolated to a `check_generic_free_call`-only `_local` variant it STILL cascaded into 8
+  `va.next()` E0636 in varargs.cryo. Fixing identity's resolution shifts the specialization
+  graph and unmasks a VaArgs method-spec gap. This is the fragile mono-inference interaction
+  Step C is meant to delete; it wants the holistic treatment, not another point-patch.
+- Recommended next step: tackle as part of Step C (sema creates demands), OR rename one of
+  the two test-local `identity`s if a quick green is needed for an interim checkpoint - but
+  the collision handling is a real compiler gap worth fixing properly.
+
+### Files touched (all uncommitted): monomorphizer.cryo (#1,#2,#4), checker.cryo (#3),
+### ownership.cryo (prior session #2), sema.cryo (#5,#6,#7,#8), passes unchanged.
+
+### Validation: full suite compiles to 2 errors (above). Self-host fixed-point + Linux O0/O2
+### + `make test` green were NOT yet reached (blocked on the 2). Self-host check running at
+### handoff write time. Jake commits + repins once green.
+
+### Self-host VALIDATED 2026-06-17 (end of "cont. 4")
+Linux `selfhost-check.py --no-windows`: **byte-identical FIXED POINT** (stage-3 == stage-4),
+IR md5 `3b7396b71606a4ce108ab0b0c3b7e1df`, 49,883,221 bytes. So the nine fixes did NOT
+break self-host. (Prior baseline `83bc582db52cc446e2a654aacd9d7bb2` was pre-these-fixes;
+md5 differs because compiler source changed, but the fixed-point property holds.) Windows
+stage-2 rebuilt after (WSL run wipes compiler/build). Tree compiles the full suite to the
+2 documented `identity`-collision errors; everything else green. NOT yet run: `make test`
+to completion (blocked on the 2), O0/O2 split, Windows self-host. Jake commits + repins.

@@ -2836,6 +2836,28 @@ type struct Monomorphizer {
                                 vd.resolved_type = inst_from_init;
                             }
 
+                            // Mono-after-sema: sema already resolved this
+                            // binding's type to a concrete instantiation
+                            // (`mut it: CopiedIter<RefIter<i32>> = a.iter_ref()
+                            // .copied()`, including the synthesized for-in
+                            // iterator local).  An adapter CHAIN's result type
+                            // is one mono's call-by-call inference walk does not
+                            // always reconstruct (the receiver of a `.copied()`
+                            // is a method-call temporary, not a name it can look
+                            // up), leaving the instantiation unresolved at
+                            // codegen (E0900).  Treat sema's binding type as the
+                            // demand and enqueue it directly; `enqueue_from_type_
+                            // ref` is a guarded no-op unless it is a registered
+                            // template with fully concrete args, and processing
+                            // it requests the nested adapter specs in turn.
+                            if (vd.resolved_type.is_valid()) {
+                                mut bind_ty: TypeRef = vd.resolved_type;
+                                if (subst != null) {
+                                    bind_ty = subst.apply(bind_ty, this.arena);
+                                }
+                                this.enqueue_from_type_ref(bind_ty);
+                            }
+
                             // for-in over a fixed-size array `T[N]`: sema
                             // (which runs AFTER mono) lowers the scrutinee
                             // to `Slice<T>::from_raw(...).iter()`, but mono
@@ -4454,6 +4476,12 @@ type struct Monomorphizer {
             if (idx < 0 || idx >= this.inference_bindings.length) { continue; }
             const concrete: TypeRef = this.inference_bindings[idx];
             if (!concrete.is_valid()) { continue; }
+            // Defer when the inferred binding is still abstract (a generic
+            // param leaked in from a nested call whose return mono has not yet
+            // substituted): `T: Eq` is unknowable until a concrete
+            // specialization pins `T`, and is re-checked then.  Mirrors sema's
+            // `check_generic_free_call` guard so the two agree.
+            if (this.type_contains_generic_param(concrete)) { continue; }
             // Each `T: A + B` carries a list of trait_refs; every one
             // must hold.  First failure emits and short-circuits.
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
@@ -4477,7 +4505,7 @@ type struct Monomorphizer {
     /// with the actionable next step.
     emit_call_bound_failure(mut &this, call: CallExprNode*,
                               tmpl_func: FunctionDeclNode*,
-                              tref: TraitRef, concrete: TypeRef,
+                              tref: TraitRef*, concrete: TypeRef,
                               trait_name: SymbolStr) -> void {
         const trait_str: string = this.intern_table.resolve(trait_name);
         const fn_str: string = this.intern_table.resolve(tmpl_func.name);
