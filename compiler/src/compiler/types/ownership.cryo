@@ -38,6 +38,7 @@ import Compiler::Types::Compound;
 import Compiler::Types::UserDefined;
 import Compiler::Types::Generic;
 import Compiler::Types::GenericRegistry;
+import Compiler::Types::Substitution;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 
@@ -360,11 +361,88 @@ type struct OwnershipQuery {
                 return OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
                                                                 inst.resolved_type, depth + 1);
             }
-            return false;
+            // Mono-after-sema: the instantiation has no concrete spec yet (the
+            // monomorphizer runs after sema, which owns `where`-bound checks).
+            // Walk the template's declared components with the instantiation's
+            // type args substituted in, so the marker query is correct
+            // pre-mono - e.g. `Atomic<u32>` (field `value: T` with T=u32) is
+            // Send even before its concrete struct exists.
+            return OwnershipQuery::inst_template_thread_safe(arena, registry,
+                                                              intern, inst, depth + 1);
         }
 
         // Generic params, traits, function templates: not concrete
         // value positions for the marker query.  Conservative false.
+        return false;
+    }
+
+    /// Thread-safety for an UNRESOLVED generic instantiation, computed off the
+    /// template's declaration plus the instantiation's type args.  Required
+    /// now that sema (which owns `where`-bound satisfaction) runs BEFORE the
+    /// monomorphizer creates the concrete spec the resolved-type walk needs.
+    /// Struct/class fields come from the AST (their `resolved_type` carries the
+    /// abstract field types post-TypeResolution); enum variant payloads come
+    /// from the template's arena type.  Each component type is substituted
+    /// (`T -> u32`) and recursed.  Returns false when the template or a
+    /// component can't be recovered - conservatively forbidding the bound
+    /// rather than enabling an unsound thread-crossing (matching the
+    /// conservative-false policy of the rest of this query).
+    static inst_template_thread_safe(arena: TypeArena*, registry: GenericRegistry*,
+                                      intern: InternTable*, inst: InstantiatedType*,
+                                      depth: i32) -> boolean {
+        if (depth >= 32) { return false; }
+        if (registry == null) { return false; }
+        const tmpl: TemplateEntry* =
+            registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null) { return false; }
+        if (tmpl.param_type_ids.length != inst.type_args.length) { return false; }
+        mut subst: TypeSubstitution =
+            TypeSubstitution::from_params(&tmpl.param_type_ids, &inst.type_args);
+
+        if (tmpl.node_kind == NodeKind::StructDeclaration && tmpl.ast_node != null) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.fields.length; i++) {
+                const f: FieldDeclNode* = sn.fields[i];
+                if (f == null || !f.resolved_type.is_valid()) { return false; }
+                const ft: TypeRef = subst.apply(f.resolved_type, arena);
+                if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                              ft, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (tmpl.node_kind == NodeKind::ClassDeclaration && tmpl.ast_node != null) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.fields.length; i++) {
+                const f: FieldDeclNode* = cn.fields[i];
+                if (f == null || !f.resolved_type.is_valid()) { return false; }
+                const ft: TypeRef = subst.apply(f.resolved_type, arena);
+                if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                              ft, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (tmpl.node_kind == NodeKind::EnumDeclaration) {
+            // Variant payloads aren't on the AST as resolved TypeRefs (only as
+            // annotations); read them off the template's arena enum type.
+            const base_t: Type* = arena.lookup(inst.generic_base.id);
+            if (base_t == null || base_t.kind != TypeKind::Enum) { return false; }
+            const et: EnumType* = base_t as EnumType*;
+            for (mut vi: i64 = 0; vi < et.variants.length; vi++) {
+                const payloads: &TypeRef[] = &et.variants[vi].payload_types;
+                for (mut pi: i64 = 0; pi < payloads.length; pi++) {
+                    const pt: TypeRef = subst.apply(payloads[pi], arena);
+                    if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry,
+                                                                  intern, pt, depth + 1)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
         return false;
     }
 

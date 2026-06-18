@@ -1031,3 +1031,124 @@ suite is fully green.
 BodiesTypeChecked provision).  `sema.cryo` (all of the above; `post_mono_verify` field).
 The single-module pipeline reorder + `pass_id.cryo` requirement swap are from the prior
 session (committed at HEAD `f9a1ffa1`).  UNCOMMITTED; Jake commits.
+
+---
+
+## 2026-06-17 — Cross-platform baseline re-audit (start of finish-the-flip session)
+
+Rebuilt stage-2 and ran `make test` on BOTH platforms from a clean checkout of HEAD
+`6e074d37` (pin still pre-flip `54277d4e`).
+
+**The prior docs undercounted the Linux failing set.** The claim "Linux green except 6
+iter.cryo errors" is WRONG. Reality, verified this session:
+
+- **Windows** (`$env:CRYO_CC='gcc'; make cryo` clean → `make test`): aborts in
+  `tests/lang/lambdas.cryo` with 3× `E0200` on `Option::map`:
+  - :234 `some.map<i32>(...)` — method turbofish
+  - :244 `some.map(tentimes)` — named-fn arg
+  - :252 `some.map((n:i32)->i32{...})` — lambda arg
+  `expected Option<i32>, found Option<U>`.
+- **Linux/WSL** (`make cryo` clean → `make test`): **IDENTICAL** — same 3× E0200 in
+  `lambdas.cryo`, same lines, same message.
+
+**Discrepancy resolved: both platforms fail identically.** The suite aborts at
+`lambdas.cryo` on BOTH, so neither ever reaches `iter.cryo`. The "6 iter.cryo errors"
+are real (Step B) but masked behind the lambdas abort (Step A). Platform parity holds —
+I can develop on Windows and confirm on Linux rather than hunting a platform gap.
+
+**Plan unchanged, ordering confirmed:** Step A (method-call/turbofish inferred return)
+unblocks the suite to reach `iter.cryo`, then Step B (assoc-projection reduction), then
+Step C (delete mono inference), then Step D (Jake repins). lambdas.cryo is the Step A
+canary; iter.cryo the Step B canary.
+
+
+## 2026-06-17 (cont.) — Steps A+B landed; flip is FAR more broken than documented
+
+### CRITICAL: the pinned (pre-flip 54277d4e) compiler passes ALL 1234 unit tests, 0 failed.
+Ran `bin/cryo.exe test` (pinned) on the current tree: 1234 passed / 0 failed, then into
+compile-fail tests. So EVERY failure below is a **flip-introduced regression**, masked
+behind the `lambdas.cryo` abort the suite hit first. The handoff's "Linux green except 6
+iter.cryo" was very wrong — the flip broke a broad swath; they just never ran past lambdas.
+
+### Fixed this session (each root-caused, both the symptom and the cause):
+1. **lambdas.cryo (Step A)** — inferred/turbofish generic METHOD-call returns. New
+   `resolve_generic_method_return` in sema.cryo: infers method-level type params from args
+   (shared `InferCtx`) or reads method turbofish, binds `This`, handles inline/impl-block/
+   trait-impl/trait-DEFAULT methods AND non-generic owners (`VaArgs::next<T>`), plus
+   `![implicit]` return-type-driven inference. Wired into all three method-return paths in
+   `resolve_method_call`. Leaves callee/method UNPINNED.
+2. **send_sync_auto_derive.cryo** — `is_send`/`is_sync`/(`is_copy` shares the shape)
+   returned false for an UNRESOLVED instantiation (`Atomic<u32>` pre-mono). Added
+   `OwnershipQuery::inst_template_thread_safe`: walks the template's fields/variant payloads
+   with type-args substituted when no concrete spec exists yet. (ownership.cryo)
+3. **iter.cryo (Step B)** — recursive assoc-type-projection reduction. Ported mono's
+   `concrete_trait_args_for` / `derive_impl_where_generics` / `bind_where_arg_param` /
+   `resolve_concrete_projection` / `reduce_projections` into sema as the `proj_*` /
+   `reduce_assoc_projections` cluster, plus `resolve_trait_impl_method_return` (binds struct
+   params + where-derived params + This, resolves the return annotation, reduces
+   projections) and `finalize_assoc_return`. Handles FilterIter/EnumerateIter (`I::Item`),
+   ZipIter (`Pair<A,O>` where-derived), MapIter/TakeIter chains.
+4. **varargs.cryo** — `![implicit]` `va.next()` on the NON-generic `VaArgs` receiver:
+   generalized `resolve_generic_method_return` to handle non-generic owners
+   (`lookup_inherent_owner`) and added return-type-driven inference from `expected_type`.
+5. **array_literals.cryo** — `expect_eq(i64_val, 3)` false E0214. Root cause: mono's
+   `arg_is_polymorphic_literal` short-circuited on a valid `resolved_type` — correct only
+   when mono ran first (literals untyped); post-flip sema types every literal, so EVERY
+   literal read as non-polymorphic and an `i64`/`u64` param vs a bare `i32` literal
+   spuriously conflicted. Removed the short-circuit (monomorphizer.cryo); node kind is the
+   signal, matching sema's version. This is a Step-C-class staleness fix.
+
+### Current wall: enum_discriminant_base.cryo — wrong overload picked
+`classify(Color::Blue)` (file-local `classify(Color)->i32`) resolves to `Sign` — the
+`classify(Option<i32>)->Sign` overload from pattern_matching.cryo (the whole tests/ dir
+compiles together). So sema's flip-era call-site overload resolution is picking a same-named
+free fn by bare name rather than by argument type. Next: inspect resolve_direct_call's
+overload selection. This is a regression (pin resolves it correctly).
+
+### NOT yet done
+Step C (delete mono inference engine, sema creates demand) and Step D (repin). Self-host
+NOT re-validated since these edits; Linux NOT re-checked this session. Tree UNCOMMITTED.
+
+### Continued fixes (overload + abstract-defer), then hit a runtime wall
+6. **enum_discriminant_base.cryo** — wrong overload picked. `resolve_direct_call` set the
+   call's return type via BARE-name `lookup_func_return`, ignoring the arg-matched overload
+   `try_pin_overload_mangled_callee` had just selected — so `classify(Color)->i32` resolved
+   to a same-named `classify(Option<i32>)->Sign` from another test module. Fix: made
+   `try_pin_overload_mangled_callee` RETURN the matched overload's concrete return type and
+   `resolve_call` prefer it (sema.cryo). Unique-(qualified-)name and multi-overload-by-arg
+   both return the authoritative type; generic templates still defer to resolve_direct_call.
+7. **for_in.cryo** — `Range::new(0,5)` in a for-in: mono static-method inference PASS B
+   unified `Range<T>` against an ABSTRACT expected type (the still-generic scrutinee type),
+   pinning `T:=T`, after which the i32 literal conflicted. Gated PASS B on a CONCRETE
+   expected type (monomorphizer.cryo). Exposed once #5 routed literals into PASS C.
+8. **generics.cryo** — calls inside generic bodies (`expect_eq(t_val, 0)` with abstract
+   `T`): mono's PASS C literal fallback emitted E0214/checked compatibility against an
+   ABSTRACT bound instead of deferring. Added the `infer_type_is_concrete(bound)` guard to
+   BOTH mono PASS C sites (free + static), mirroring sema's `free_infer_type_concrete`
+   guard. Exposed by #5.
+
+### CURRENT WALL (2026-06-17 end): runtime HEAP CORRUPTION in the full test binary
+After the above, ALL test files COMPILE (huge progress from "aborts at lambdas"). But
+`cryo test` now crashes with `0xC0000374` (STATUS_HEAP_CORRUPTION) at runtime — and the
+runner buffers per-test output, so the crash loses all of it (even a single-test pattern
+crashes, because the harness builds the whole tests/ project into one binary).
+- A standalone iterator program (`Range::new(0,5).map(f)` for-in summing to 20) compiles
+  AND runs correctly with the new compiler — so the core iterator/method-inference codegen
+  is sound; the corruption is elsewhere in the full set.
+- The PINNED (pre-flip) compiler runs the identical test sources 1234/0 clean. So this is a
+  flip-era MISCOMPILE in some file my compile-fixes newly enabled (a bad global-init / drop
+  / layout from a wrong resolved_type somewhere), NOT in the basic paths I validated.
+- NEXT: file-level bisection of tests/ (move out halves, re-run) to find the miscompiling
+  file, then trace its codegen. Determine whether a resolved_type one of my fixes sets is
+  subtly wrong for that shape, or it's independent flip codegen debt.
+
+### Both-platform status: PERFECT PARITY maintained
+At every checkpoint Windows and Linux failed identically (verified Linux at the
+enum_discriminant point). My changes are platform-agnostic compiler logic.
+
+### Validation gaps to close next session
+- self-host fixed point NOT re-checked since these edits.
+- O2 not separately run (blocked behind the heap corruption at O0).
+- Step C (delete mono inference) still pending — though #5/#7/#8 already adapted several
+  mono-staleness points toward it.
+- Tree UNCOMMITTED. Jake commits + repins.
