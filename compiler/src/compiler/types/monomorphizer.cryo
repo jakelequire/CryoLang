@@ -4273,171 +4273,14 @@ type struct Monomorphizer {
             }
         }
 
-        if (from_stash) {
-            // bindings already seeded from sema's stash; skip re-inference.
-        } else if (explicit_args.length > 0) {
-            // Caller-supplied generic args are authoritative; resolve each
-            // annotation to a TypeRef and seed the bindings directly.  This
-            // skips arg-type unification because the caller already pinned
-            // every parameter.  Handles both `Layout::array<T>(n)` (one
-            // explicit arg, one generic param) and partially-supplied cases
-            // by running expand_default_type_args afterward.
-            if (res_ctx == null || this.type_resolver == null) { return; }
-            mut seeded: TypeRef[] = [];
-            for (mut i: i64 = 0; i < explicit_args.length; i++) {
-                mut tr: TypeRef = this.type_resolver.resolve(explicit_args[i], res_ctx);
-                if (!tr.is_valid()) { return; }
-                if (subst != null) {
-                    tr = subst.apply(tr, this.arena);
-                }
-                seeded.push(tr);
-            }
-            seeded = this.type_resolver.expand_default_type_args(entry, seeded, res_ctx);
-            if (seeded.length != entry.param_type_ids.length) { return; }
-            for (mut i: i64 = 0; i < seeded.length; i++) {
-                this.inference_bindings[i] = seeded[i];
-            }
-        } else {
-            // No explicit args; infer from the call's argument types.
-            if (tmpl_func.parameters.length != call.arguments.length) { return; }
-
-            // Walk every (formal, actual) pair, but skip the arg when it
-            // can't be resolved to a TypeRef (e.g. a literal that hasn't
-            // gone through sema yet) or the formal lacks a resolved type.
-            // Skipping is safe: unify_for_inference only fills a binding on
-            // match, so a missed arg can't introduce a wrong binding; it
-            // just leaves that binding for another arg to fill.  The
-            // post-loop "all bindings valid" check below remains the
-            // authoritative gate; we only pin a callee when every generic
-            // param has been bound.  This is what lets `mem::offset(this.ptr,
-            // 1)` resolve: T pins from arg[0] (`T*` <-> `Point*`), arg[1] (`1`)
-            // is unresolvable but inconsequential since it has no generics.
-            // PASS A - bind generic params from NON-literal arguments only.
-            // Integer/float literals are polymorphic (see
-            // arg_is_polymorphic_literal): they must not pin `T` to their i32
-            // default, or a wider sibling argument / return-type context gets
-            // silently narrowed. Literals are filled in Pass C below.
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const param: VarDeclNode* = tmpl_func.parameters[i];
-                if (param == null || !param.resolved_type.is_valid()) { continue; }
-                const arg: ExpressionNode* = call.arguments[i];
-                if (this.arg_is_polymorphic_literal(arg)) { continue; }
-                mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-                if (!actual.is_valid()) { continue; }
-                if (subst != null) {
-                    actual = subst.apply(actual, this.arena);
-                }
-                this.infer_conflict_from = TypeRef::invalid();
-                this.infer_conflict_to   = TypeRef::invalid();
-                this.unify_for_inference(param.resolved_type, actual);
-                // A generic param bound by an earlier argument now meets a
-                // structurally different actual in this position. Both are
-                // NON-literal concrete types (literals were skipped), so there
-                // is genuinely no single `T`: reject precisely - whether the
-                // pair is a hard category mismatch (`i32`/`string`) or merely a
-                // coercible numeric pair (`i32`/`i64`). The old code let
-                // coercible pairs through "pin-first", which silently narrowed
-                // the second argument to the first's width - a miscompile. Any
-                // pair still carrying a generic param keeps pin-first so
-                // generic forwarding (`T` <- `U`) is unaffected.
-                if (this.infer_conflict_from.is_valid()
-                        && this.infer_conflict_to.is_valid()
-                        && this.infer_type_is_concrete(this.infer_conflict_from)
-                        && this.infer_type_is_concrete(this.infer_conflict_to)) {
-                    this.emit_infer_conflict(call, callee_name, arg,
-                        this.infer_conflict_from, this.infer_conflict_to);
-                    return;
-                }
-            }
-        }
-
-        // PASS B - return-type-driven inference. Any generic param still
-        // unbound after non-literal args is recovered by unifying the
-        // template's declared return type against the call's expected type
-        // (the `const x: T = ...` this call initializes). Bare `T` return
-        // types bind directly; compound return types (`Option<T>`, `T*`,
-        // `Box<T>`) bind structurally via the same unifier.
-        //
-        // This now runs for ALL callees (not just `![implicit]`): with Pass A
-        // no longer letting a polymorphic literal pin `T`, a call like
-        // `mut b: Box<i64> = Box::new(99)` must recover `T = i64` from the
-        // expected `Box<i64>` rather than defaulting the literal to i32 and
-        // monomorphizing `Box<i32>` (the silent-truncation miscompile). It is
-        // fill-only (guarded by `any_unbound`) and never overrides a param a
-        // real argument already pinned, so calls that fully infer from their
-        // arguments are unaffected.
-        if (!from_stash && this.current_expected_type.is_valid()
-                && tmpl_func.resolved_return_type.is_valid()) {
-            mut any_unbound: boolean = false;
-            for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-                if (!this.inference_bindings[i].is_valid()) { any_unbound = true; break; }
-            }
-            if (any_unbound) {
-                this.unify_for_inference(
-                    tmpl_func.resolved_return_type, this.current_expected_type);
-            }
-        }
-
-        // PASS C - literal fallback. A polymorphic literal argument whose
-        // generic param is STILL unbound (no non-literal arg and no usable
-        // return-type context pinned it) fills the param with its default
-        // type (i32 / f64). A literal whose param another source already
-        // bound is left alone - codegen coerces the literal to that width, so
-        // `Box<i64>::new(99)` stores a full i64. This keeps `Box::new(99)` and
-        // `id(0)` inferring as before when no wider context exists.
-        if (!from_stash && explicit_args.length == 0) {
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const param: VarDeclNode* = tmpl_func.parameters[i];
-                if (param == null || !param.resolved_type.is_valid()) { continue; }
-                const arg: ExpressionNode* = call.arguments[i];
-                if (!this.arg_is_polymorphic_literal(arg)) { continue; }
-                mut lit_actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-                if (!lit_actual.is_valid()) { continue; }
-                if (subst != null) {
-                    lit_actual = subst.apply(lit_actual, this.arena);
-                }
-                const bound: TypeRef = this.bound_type_for_formal(param.resolved_type);
-                if (bound.is_valid()) {
-                    // The param was already pinned (by a non-literal arg or the
-                    // return type). The literal adopts that type IF it can
-                    // coerce to it - any numeric width. A non-numeric binding
-                    // (e.g. `second(5, "hello")` pins `T = string` from the
-                    // string arg) means the literal genuinely has no shared
-                    // `T`: reject, mirroring the two-concrete case in Pass A.
-                    // Without this, reordering literals to a later pass would
-                    // let `second(5, "hello")` slip through unflagged.
-                    //
-                    // Only flag when the binding is CONCRETE: inside a generic
-                    // body the param may be bound to the enclosing `T` (an
-                    // abstract GenericParam), where a literal legitimately adopts
-                    // `T` at instantiation - defer rather than conflict (mirrors
-                    // sema's `free_infer_type_concrete` guard).
-                    if (this.infer_type_is_concrete(bound)
-                            && !this.literal_adopts_binding(bound)) {
-                        this.emit_infer_conflict(call, callee_name, arg, bound, lit_actual);
-                        return;
-                    }
-                    continue;  // numeric / abstract: codegen coerces or defers
-                }
-                // Param still unbound: fill it with the literal's default type.
-                this.unify_for_inference(param.resolved_type, lit_actual);
-            }
-        }
-
-        mut fn_all_bound: boolean = true;
-        for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-            if (!this.inference_bindings[i].is_valid()) { fn_all_bound = false; break; }
-        }
-        if (!fn_all_bound) {
-            // An `![implicit]` callee with no explicit args that we still
-            // couldn't pin had no usable expected type (or a return type the
-            // expected type didn't determine): report it precisely instead of
-            // letting codegen later fail with a misleading "not in scope".
-            if (tmpl_func.is_implicit && explicit_args.length == 0) {
-                this.emit_cannot_infer(call, tmpl_func.name);
-            }
-            return;
-        }
+        // Mono-after-sema: sema (the source of truth) stashes every free call's
+        // type args (`check_generic_free_call` keystone + the module-scope path);
+        // mono no longer re-derives them.  A call reaching here WITHOUT a stash is
+        // outside sema's visibility and is left unspecialized (deferred pre-flip
+        // too).  The old explicit-args + PASS A/B/C argument-inference engine that
+        // lived here has been removed; only the stash seeding above fills
+        // `inference_bindings`.
+        if (!from_stash) { return; }
 
         // Where-clause bound check at the call site.  If the inferred
         // type args don't satisfy the function's `where T: Trait`
@@ -4554,23 +4397,6 @@ type struct Monomorphizer {
         diag = diag.help(format(
             "implement `%s` for `%s`, or pass an argument of a type that already does",
             trait_str, concrete_str));
-        this.diagnostics.emit(diag);
-    }
-
-    /// Emit E0307 for an `![implicit]` call whose generic type argument could
-    /// not be recovered: there was no expected type at the call site (it isn't
-    /// the initializer of a typed binding) and no argument pins the parameter.
-    /// Points at the call and suggests writing the type argument explicitly.
-    emit_cannot_infer(mut &this, call: CallExprNode*, fn_name: SymbolStr) -> void {
-        const fn_str: string = this.intern_table.resolve(fn_name);
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
-            format("cannot infer the type argument for `%s`", fn_str));
-        diag = diag.at(call.span);
-        diag = diag.with_note(
-            "`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
-        diag = diag.help(format(
-            "write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
         this.diagnostics.emit(diag);
     }
 

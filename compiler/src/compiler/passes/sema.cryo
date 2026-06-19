@@ -6419,7 +6419,19 @@ public:
     free_infer_arg_reliable(&this, arg: ExpressionNode*) -> boolean {
         if (arg == null) { return false; }
         const node: ASTNode* = arg as ASTNode*;
-        if (node.kind == NodeKind::CallExpression) { return false; }
+        if (node.kind == NodeKind::CallExpression) {
+            // Trust a call-expression argument ONLY when its resolved_type is
+            // already CONCRETE: arguments are resolved before the enclosing call
+            // (post-order), so a nested free/method call's return type is in hand
+            // here, and using it lets sema infer + stash the enclosing call's type
+            // args (`expect_eq(take_i64(1<<40), …)`, `litexpr_box(take_i64(…))`)
+            // instead of deferring to the monomorphizer.  An abstract or invalid
+            // result (the nested callee couldn't be typed pre-mono, e.g. itself a
+            // still-abstract generic call) carries no reliable info - defer it as
+            // before so we don't pin `T` from a half-resolved type.
+            return arg.resolved_type.is_valid()
+                && !this.contains_generic_param(arg.resolved_type);
+        }
         return true;
     }
 
@@ -8181,7 +8193,19 @@ public:
             }
         }
 
-        const func_ret: TypeRef = this.lookup_func_return(ident.name);
+        // Prefer the current-module definition over a same-leaf function in
+        // another compilation unit.  `lookup_func_return(bare)` is a single-slot,
+        // last-write-wins map: when two modules both define `classify`, the bare
+        // lookup returns whichever was registered last (a cross-module
+        // mis-resolution - the #9 bug, unmasked once sema trusts call-expr args
+        // for inference).  The module-qualified name uniquely identifies the
+        // local definition, so try it first; fall back to the bare name for a
+        // genuinely-imported function whose leaf isn't defined in this module.
+        const qual_name: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        mut func_ret: TypeRef = this.lookup_func_return(qual_name);
+        if (!func_ret.is_valid()) {
+            func_ret = this.lookup_func_return(ident.name);
+        }
         if (func_ret.is_valid()) {
             // If the return type is an unresolved generic (e.g., Result<T, E>
             // from a generic function like ok<T, E>) and we have an expected
