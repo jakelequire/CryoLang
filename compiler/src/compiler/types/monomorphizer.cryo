@@ -4246,7 +4246,36 @@ type struct Monomorphizer {
             this.inference_param_ids.push(entry.param_type_ids[i]);
         }
 
-        if (explicit_args.length > 0) {
+        // Mono-after-sema: FunctionBodyTypeCheck (run BEFORE mono) already
+        // inferred this call's concrete type args and stashed them on the node
+        // (`check_generic_free_call` keystone / module-scope path).  Read them
+        // directly — sema is the source of truth — instead of re-running the
+        // PASS A/B/C inference below.  Apply the active specialization `subst`:
+        // a stash on a template body holds the enclosing template's params
+        // (`alloc_entry<K,V,A>` inside `HashMap<K,V,A>::insert`), which this
+        // spec concretizes (no-op on an already-concrete stash).  A
+        // length-matched, all-concrete stash fully determines the bindings; any
+        // partial/invalid stash resets and falls back to inference below.
+        mut from_stash: boolean = false;
+        if (entry.param_type_ids.length > 0
+                && call.resolved_type_args.length == entry.param_type_ids.length) {
+            from_stash = true;
+            for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
+                mut b: TypeRef = call.resolved_type_args[i];
+                if (subst != null) { b = subst.apply(b, this.arena); }
+                if (!b.is_valid()) { from_stash = false; break; }
+                this.inference_bindings[i] = b;
+            }
+            if (!from_stash) {
+                for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
+                    this.inference_bindings[i] = TypeRef::invalid();
+                }
+            }
+        }
+
+        if (from_stash) {
+            // bindings already seeded from sema's stash; skip re-inference.
+        } else if (explicit_args.length > 0) {
             // Caller-supplied generic args are authoritative; resolve each
             // annotation to a TypeRef and seed the bindings directly.  This
             // skips arg-type unification because the caller already pinned
@@ -4337,7 +4366,7 @@ type struct Monomorphizer {
         // fill-only (guarded by `any_unbound`) and never overrides a param a
         // real argument already pinned, so calls that fully infer from their
         // arguments are unaffected.
-        if (this.current_expected_type.is_valid()
+        if (!from_stash && this.current_expected_type.is_valid()
                 && tmpl_func.resolved_return_type.is_valid()) {
             mut any_unbound: boolean = false;
             for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
@@ -4356,7 +4385,7 @@ type struct Monomorphizer {
         // bound is left alone - codegen coerces the literal to that width, so
         // `Box<i64>::new(99)` stores a full i64. This keeps `Box::new(99)` and
         // `id(0)` inferring as before when no wider context exists.
-        if (explicit_args.length == 0) {
+        if (!from_stash && explicit_args.length == 0) {
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const param: VarDeclNode* = tmpl_func.parameters[i];
                 if (param == null || !param.resolved_type.is_valid()) { continue; }
@@ -4383,13 +4412,10 @@ type struct Monomorphizer {
                     // abstract GenericParam), where a literal legitimately adopts
                     // `T` at instantiation - defer rather than conflict (mirrors
                     // sema's `free_infer_type_concrete` guard).
-                    if (this.infer_type_is_concrete(bound)) {
-                        mut tc: TypeChecker = TypeChecker::new(this.arena);
-                        if (tc.check_compatibility(lit_actual, bound)
-                                == TypeCompatibility::Incompatible) {
-                            this.emit_infer_conflict(call, callee_name, arg, bound, lit_actual);
-                            return;
-                        }
+                    if (this.infer_type_is_concrete(bound)
+                            && !this.literal_adopts_binding(bound)) {
+                        this.emit_infer_conflict(call, callee_name, arg, bound, lit_actual);
+                        return;
                     }
                     continue;  // numeric / abstract: codegen coerces or defers
                 }
@@ -4590,6 +4616,21 @@ type struct Monomorphizer {
             if (!inst.has_resolved_type()) { return false; }
         }
         return true;
+    }
+
+    /// A polymorphic numeric literal (int/float) adopts ANY numeric binding
+    /// (codegen coerces the width) and ANY enum binding (an int literal names a
+    /// discriminant); it can NOT adopt string/bool/struct/etc - that is a hard
+    /// `T` conflict.  Shared with sema's `literal_adopts_binding` so the E0214
+    /// literal-conflict gate is identical in both passes (a raw
+    /// `check_compatibility` wrongly rejected i32-vs-i64 and i32-vs-enum).
+    literal_adopts_binding(&this, bnd: TypeRef) -> boolean {
+        if (!bnd.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(bnd.id);
+        if (ty == null) { return false; }
+        return ty.kind == TypeKind::Int
+            || ty.kind == TypeKind::Float
+            || ty.kind == TypeKind::Enum;
     }
 
     /// True when `expr` is a bare (or simply negated) integer / float
@@ -5032,13 +5073,10 @@ type struct Monomorphizer {
                 // Only flag a conflict for a CONCRETE binding; an abstract
                 // binding (the enclosing `T` inside a generic body) defers - the
                 // literal adopts the concrete type at instantiation.
-                if (this.infer_type_is_concrete(bound)) {
-                    mut tc_c: TypeChecker = TypeChecker::new(this.arena);
-                    if (tc_c.check_compatibility(lit_actual, bound)
-                            == TypeCompatibility::Incompatible) {
-                        this.emit_infer_conflict(call, member_name, arg, bound, lit_actual);
-                        return true;
-                    }
+                if (this.infer_type_is_concrete(bound)
+                        && !this.literal_adopts_binding(bound)) {
+                    this.emit_infer_conflict(call, member_name, arg, bound, lit_actual);
+                    return true;
                 }
                 continue;
             }
@@ -5907,14 +5945,42 @@ type struct Monomorphizer {
             }
         }
 
-        // Two paths to populate `inference_bindings`:
+        // M1 (mono reads sema's method stash): sema's
+        // `resolve_generic_method_return` already inferred this method's own
+        // generic params (turbofish or formal/actual unify) and stashed them on
+        // the call in declaration order.  When present and length-matching, seed
+        // `inference_bindings` from it and skip re-inference - exactly the
+        // free-call C1d pattern.  Apply the active specialization `subst` (method
+        // stashes are concrete today, so this is a no-op, but mirror the free
+        // path for safety).  A partial/invalid stash resets and falls back to the
+        // inference paths below.
+        mut m_from_stash: boolean = false;
+        if (call.resolved_type_args.length == n_method_params
+                && n_method_params > 0) {
+            m_from_stash = true;
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                mut sv: TypeRef = call.resolved_type_args[i];
+                if (subst != null) { sv = subst.apply(sv, this.arena); }
+                if (!sv.is_valid()) { m_from_stash = false; break; }
+                this.inference_bindings[i] = sv;
+            }
+            if (!m_from_stash) {
+                for (mut i: i64 = 0; i < n_method_params; i++) {
+                    this.inference_bindings[i] = TypeRef::invalid();
+                }
+            }
+        }
+
+        // Two paths to populate `inference_bindings` (when not read from stash):
         //   - Explicit method-level generic args at the call site
         //     (`obj.method<U>(...)`): resolve them in `method_ctx` and bind
         //     directly.  Skips unification entirely; the args ARE the answer.
         //   - Inference from formal/actual arg unification: used when the
         //     user didn't write explicit args, so `U` has to fall out of the
         //     pairing between each formal type and the call's actual.
-        if (call.generic_args.length > 0
+        if (m_from_stash) {
+            // bindings already seeded from the stash; nothing to infer.
+        } else if (call.generic_args.length > 0
                 && call.generic_args.length == n_method_params
                 && this.type_resolver != null) {
             mut all_resolved: boolean = true;

@@ -6366,6 +6366,24 @@ public:
         return true;
     }
 
+    /// Whether a polymorphic numeric literal (int/float) can adopt the concrete
+    /// binding `bnd` already pinned for its generic param.  A literal carries no
+    /// fixed width, so it adopts ANY numeric binding (codegen coerces the width
+    /// - `i32`-vs-`i64` is not a conflict) and ANY enum binding (an int literal
+    /// names a discriminant).  It can NOT adopt a string/bool/struct/etc binding
+    /// - that is a genuine `T` conflict (`second(5, "hello")` pins `T = string`
+    /// -> E0214).  This replaces a raw `check_compatibility(i32_default, bnd)`
+    /// that wrongly rejected the numeric-width and enum cases; the monomorphizer
+    /// applies the identical rule so both passes agree.
+    literal_adopts_binding(&this, bnd: TypeRef) -> boolean {
+        if (!bnd.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(bnd.id);
+        if (ty == null) { return false; }
+        return ty.kind == TypeKind::Int
+            || ty.kind == TypeKind::Float
+            || ty.kind == TypeKind::Enum;
+    }
+
     /// Whether a call argument's `resolved_type` is authoritative enough,
     /// before monomorphization, to drive an inference conflict / bound error.
     /// A call expression's pre-mono type is NOT: a nested inferred generic
@@ -6499,8 +6517,7 @@ public:
                 if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) {
                     const bnd: TypeRef = ictx.bindings[f_idx];
                     if (this.free_infer_type_concrete(bnd)
-                            && this.checker.check_compatibility(lit_actual, bnd)
-                            == TypeCompatibility::Incompatible) {
+                            && !this.literal_adopts_binding(bnd)) {
                         this.emit_free_infer_conflict(call, tmpl.name, arg, bnd, lit_actual);
                         return TypeRef::invalid();
                     }
@@ -10442,6 +10459,19 @@ public:
                 || this.contains_unresolved_projection(refined)) {
             return fallback;
         }
+        // M1 (sema is the source of truth for method-level bindings): stash the
+        // method's own concrete generic-param bindings (declaration order) on the
+        // call so the monomorphizer's `try_infer_method_call` reads them instead
+        // of re-inferring.  Mirrors the free-call C1d stash in
+        // `check_generic_free_call`.  Every `method_bindings[i]` is concrete here
+        // - the inference/turbofish loops above returned `fallback` on any invalid
+        // or still-abstract binding - so the stash is always a complete, concrete
+        // set in mono's expected order (`orig_func.generic_params`).
+        mut m_stash: TypeRef[] = [];
+        for (mut si: i64 = 0; si < n_method_params; si++) {
+            m_stash.push(method_bindings[si]);
+        }
+        call.set_resolved_type_args(m_stash);
         return refined;
     }
 
