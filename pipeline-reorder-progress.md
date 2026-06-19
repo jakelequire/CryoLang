@@ -1403,3 +1403,483 @@ defaulted (so `Array<T>`/`Box<T>` are untouched).
 - Four fixes total this session: #1 mono generic-method early-return, #2 sema find_fn module
   disambig, #3 sema qualified-combined static-spec, #4 default-generic method-return canonical.
 - NOT done: Windows (suite + self-host); Jake commits + repins. THEN Step C (delete mono engine).
+
+---
+
+## 2026-06-18 (cont. 6) — STEP C0 done: instrumented sema↔mono binding divergence
+
+**Baseline:** HEAD `a73b2ce3`, clean. Goal: measure how load-bearing mono's inference
+engine actually is vs sema, before deleting it.
+
+### What landed (UNCOMMITTED, behavior-neutral, green: unit ok / compile-fail 99/0)
+A validated **C1 foundation** — a channel for sema to hand mono its concrete type-arg
+bindings so mono need not re-infer:
+- `CallExprNode.resolved_type_args: TypeRef[]` (expression.cryo) + setter + ctor init.
+- sema `check_generic_free_call`: stashes its computed bindings (concrete OR abstract-but-
+  fully-bound) on the call at the keystone success.
+- cloner `visit(CallExprNode*)`: element-wise copies `resolved_type_args` into the clone
+  (so specialized bodies carry the stash; element-wise to avoid owning-array double-free).
+Nothing READS the field yet for resolution (only the now-stripped C0 probe), so the suite is
+unchanged. All temporary `eprintf` instrumentation + the temp `std::fmt` import were stripped.
+
+### The measurement (corpus = `build/cryo build` over the compiler itself, free calls only)
+| | MATCH (sema==mono) | ABSENT (no sema stash) | MISMATCH (disagree) |
+|---|---|---|---|
+| free-identifier path only | 150 | 9126 | **0** |
+| + cloner copies stash + mono applies subst | 366 | 8902 | **8** |
+
+Sema `check_generic_free_call` ENTERs 2733× / STASHes 2577×.
+
+### Findings (the dependency surface, honest)
+1. **0 mismatches** on the pure free-identifier path — where sema's keystone speaks, it never
+   disagrees with mono. Safe seam confirmed.
+2. The DOMINANT load-bearing mono inference is **module-scoped scope-resolution generic free
+   calls** — `mem::offset` (4422), `mem::swap` (1046), `Layout::array` (987), `Layout::of`
+   (405), `Slice::from_raw`, `transmute`, `try_array`, etc. sema's keystone is gated to
+   **Identifier** callees (caller at sema.cryo ~5988), so `mod::fn<T>(...)` never reaches it.
+   This is NOT a from-scratch port: the keystone's 3-pass `InferCtx` inference is module-
+   agnostic once it has the `TemplateEntry`; C1 = route module-scoped ScopeResolution callees
+   through it (mirroring mono `try_infer_function_call`'s `callee_scope` branch) + stash.
+3. sema ALREADY infers bindings for **static-constructor** calls
+   (`infer_static_owner_return_from_args`, `Range::new` → owner T) — just doesn't stash them.
+4. **8 genuine divergences** in the abstract-stash+subst model: `hash_u64_le`, `write_i64`,
+   `write_u64` (sema=1/mono=1 but different id). MUST be root-caused before mono READS the
+   stash — exactly the latent sema/mono drift the mission warns about. (Likely a stash param-id
+   vs subst-domain mismatch; characterize first, don't guess.)
+
+### Revised C1 plan (in dependency order)
+- C1a: root-cause the 8 free-call divergences (hash_u64_le/write_*). Gate: 0 mismatches.
+- C1b: extend sema's free-call keystone to module-scoped ScopeResolution callees + stash
+  (covers offset/swap/array/of/from_raw/transmute/try_array — the bulk).
+- C1c: stash from `infer_static_owner_return_from_args` (+ the static-method-on-generic-template
+  analogue mono's `try_infer_static_method_on_generic_template` owns — verify sema covers it).
+- C1d: make mono discovery READ `resolved_type_args` (apply active subst) + enqueue, falling
+  back to inference only where stash is absent; drive ABSENT→0; THEN C2 deletes the engine.
+Self-host NOT re-run this session (no behavior change); suite green at default opt.
+
+---
+
+## 2026-06-18 (cont. 7) — STEP C1a + C1b landed (sema stashes free + module-scoped bindings)
+
+**GREEN + SELF-HOST FIXED POINT.** Suite O0+O2 (unit ok / compile-fail 99/0). Self-host
+byte-identical, IR md5 `940235d6efbf07033ffd4259ccb1803f` (49,972,272 bytes; baseline was
+`35513c9a`, changed as expected — observable behavior improved). UNCOMMITTED, NOT repinned
+(no bootstrap landmine: pinned compiler still builds everything; defer repin until a change needs it).
+
+### C1a — root-caused the 8 free-call divergences → 0 mismatches
+The 8 (`hash_u64_le`, `write_i64/u64`) had `subst==NULL` at mono discovery: they were in
+SUBSTITUTED clones whose other type fields were concretized by `ASTTypeSubstituter`, but the new
+`resolved_type_args` stash was left abstract (the substituter didn't know the field) → mismatch.
+Fix: `substituter.cryo visit(CallExprNode*)` now SUBSTITUTES `resolved_type_args` (vs clearing
+like resolved_callee/method). Safe because the stash is ONLY ever written by sema, always
+abstractly (template params) — never a stale sibling's concrete pin — so applying this spec's
+subst concretizes it correctly; a no-op on already-concrete elements. Corpus MISMATCH → 0.
+
+### C1b — sema now infers + stashes bindings for module-scoped scope-resolution free calls
+`mem::offset(p,n)`, `mem::swap<T>(a,b)`, `mem::transmute<F,T>(v)` etc. reach
+`resolve_module_qualified_function` (callee is ScopeResolution, scope=module), which previously
+returned the ABSTRACT template return and stashed nothing.
+- New `infer_free_call_bindings(call, entry, tmpl)` — pure PASS A/B/C InferCtx inference, NO
+  diagnostics (mono still owns E0214/E0306/E0307). Mirrors `check_generic_free_call`'s inference;
+  the two converge when mono's engine is deleted (acknowledged temporary duplication).
+- No-turbofish arg-inferred branch: infer → stash → `subst_free_call_return` for the concrete return.
+- Turbofish branch: `subst_return_from_call_args` now takes `call` and stashes the resolved
+  explicit args (covers `swap<T>`/`transmute<F,T>`, incl. void return).
+
+### Measured impact (corpus = `build/cryo build` over the compiler, free calls)
+ABSENT 9126 → **3454**; MATCH 374 → **5822**; MISMATCH **0**. `mem::offset` (4422) + `mem::swap`
+(1046) fully covered.
+
+### Remaining ABSENT (next)
+- Type-scoped static methods: `Layout::array` (987), `Layout::of` (405), `Layout::try_array`
+  (239), `Slice::from_raw` → **C1c** (static-method path; sema already has
+  `infer_static_owner_return_from_args` for ctors — extend + stash).
+- Bare free calls still absent: `sort_range_by`/`sort_*` (~1616), `alloc_entry` (90),
+  `free_entry` (81), residual `swap` (36) — sema STASHes these on the template but mono's clone
+  shows ABSENT. PUZZLE to root-cause (clone-source vs sema-stash-instance mismatch?). **C1b-resid**.
+- Then **C1d**: mono discovery READS `resolved_type_args` (apply subst) + enqueues; inference only
+  as fallback; drive ABSENT→0. THEN C2 deletes the engine.
+
+### Files touched (uncommitted, cumulative this session)
+expression.cryo (field+setter+ctor), sema.cryo (stash in check_generic_free_call +
+infer_free_call_bindings + module-path hook + subst_return_from_call_args stash),
+cloner.cryo (copy stash), substituter.cryo (substitute stash). monomorphizer.cryo back to baseline.
+
+---
+
+## 2026-06-18 (cont. 7b) — C1b-residual ANALYSIS (open puzzle, not yet cracked)
+
+After C1a+C1b, corpus ABSENT = 3454 (down from 9126). Remaining classes:
+- Type-scoped static methods (`Layout::array` 987, `Layout::of` 405, `Layout::try_array` 239,
+  `Slice::from_raw`) — **C1c**, a different sema path (`infer_static_owner_return_from_args` +
+  static-method-on-generic-template), almost certainly the same root cause as below.
+- Nested bare free calls inside STDLIB generic bodies: `sort_range_by`/`sort_partition_by`/
+  `sort_*` (~1616), `alloc_entry` (90), `free_entry` (81), residual `swap` (36).
+
+### What the probes established (kept here so the fix doesn't re-derive it)
+- The stash channel WORKS: cloner copies a non-empty stash **5731×**, substituter concretizes
+  **5731×** → those are the MATCHes. `entry.ast_node` (cloned at `specializer.cryo:118`) is the
+  ORIGINAL template node, so a stash on it propagates to every clone. Mechanism is sound.
+- The ABSENT clones simply had **no stash on their template call node at clone time**.
+- sema `check_generic_free_call` for `sort_partition_by`: ENTER 196× (192 `in_symbolic_check=N`,
+  4 `=Y`), STASH 192×, ZERO `NOT-all-bound`. So the 4 PRE-MONO symbolic enters did NOT stash
+  (and didn't bail via the printed all-bound path, and didn't emit a diagnostic — suite green).
+  The 192 stashes are `symbolic=N` = post-mono Phase-6b (re-resolving concrete clones) → TOO LATE
+  for mono's 6a-ii discovery.
+- Net: the PRE-MONO pass is not producing a useful stash for calls nested inside stdlib generic
+  bodies. `mem::offset` is covered only because C1b's hook lives in
+  `resolve_module_qualified_function`, fired wherever the call is resolved.
+
+### Leading hypothesis (verify FIRST next session)
+The compiler build imports the PREBUILT stdlib. Open question: does sema's FunctionBodyTypeCheck
+(Phase 6a-i.5) actually run its **symbolic generic-body walk over imported stdlib template
+bodies**, or only over the current project's? If stdlib template bodies aren't symbolic-walked
+pre-mono, their INTERNAL nested generic calls never get a pre-mono stash — exactly the observed
+sort_*/alloc_entry/Layout pattern. (But `offset` inside `Array::get` IS covered, which seems to
+cut against a blanket "stdlib bodies not walked" — so the truth is subtler; could be that only the
+scope-resolution/module hook fires for stdlib bodies while the bare-Identifier keystone's stash
+doesn't reach the cloned node. RESOLVE the offset-vs-sort asymmetry before designing the fix.)
+
+### Suggested next probe (decisive, ~1 build)
+Tag every `return`/exit of `check_generic_free_call` with an id, gated on `in_symbolic_check &&
+ident.name=="sort_partition_by"`, to see which path the 4 symbolic enters take. AND confirm
+whether sema's symbolic walk runs over the `std::...::sort` module at all during a compiler build
+(print module name in `symbolic_check_body`). That pins the asymmetry.
+
+### State at this checkpoint
+- Tree GREEN (unit ok / compile-fail 99/0 at O0; O2 + self-host validated at the identical
+  pre-strip code: IR md5 `940235d6efbf07033ffd4259ccb1803f`). All probes stripped; diff is the
+  real C1a+C1b plumbing only (expression/sema/cloner/substituter). monomorphizer.cryo = baseline.
+- UNCOMMITTED, NOT repinned (no bootstrap landmine; pinned compiler still builds everything).
+- C1d (mono READS the stash + enqueues; inference as fallback) is unblocked for the COVERED
+  classes already, but should wait until the residual is cracked so C2 can delete inference with
+  ABSENT≈0. Until then mono's inference still runs and agrees (MISMATCH=0), so reading-or-inferring
+  is behaviorally identical — C1d can land safely even with residual ABSENT, deferring full
+  deletion to after C1c + residual.
+
+---
+
+## 2026-06-18 (cont. 8) — C1b-resid + C1c landed: free-call ABSENT 9126 → 207
+
+**GREEN + SELF-HOST FIXED POINT.** Suite O0+O2 (unit ok / compile-fail 99/0). Self-host
+byte-identical, IR md5 `e2ef668eff16882a5aa64770f4f1d1a4`. UNCOMMITTED, not repinned.
+
+### Two root-caused fixes (both purely additive to the stash channel; MISMATCH stayed 0 throughout)
+1. **Symbolic turbofish (cracked the sort_* residual).** `sort_range_by<T>`/`sort_partition_by<T>`
+   (turbofish where `T` is the ENCLOSING template param) were resolved in
+   `check_generic_free_call`'s turbofish branch via a fresh `ResolutionContext` WITHOUT
+   `symbolic_bind_params`, so during the pre-mono symbolic walk `<T>` resolved to invalid → the
+   binding was dropped → never stashed. Fix: `this.symbolic_bind_params(&rc)` in that branch (the
+   inferred branch and `subst_return_from_call_args` already did this). Cleared sort_* (≈1616).
+   The earlier "node-identity puzzle" was a red herring: the template node simply never got a stash.
+2. **C1c — type-scoped generic static methods.** `Layout::of<T>()`, `Layout::array<T>(n)`,
+   `Layout::try_array<T>` (generic METHOD on a NON-generic owner; registry stores them as
+   `Owner::method` FunctionDeclaration templates). New `stash_scope_resolution_call_bindings`
+   (additive, called after `resolve_scope_call` in the ScopeResolution branch) mirrors mono's
+   type-scope template lookup, resolves the turbofish with `symbolic_bind_params` (or infers from
+   args), and stashes. Cleared Layout::* (≈1631).
+
+### Measured (corpus = `build/cryo build` over the compiler, free calls)
+ABSENT 3454 → **207**; MATCH 7438 → **9069**; MISMATCH **0**.
+Remaining ABSENT: `alloc_entry` (90), `free_entry` (81), `swap` (36) — all called inside
+HashMap/`mem` via the `?` operator or a non-turbofish shape; likely a single shared cause
+(`?`-lowering replacing the call node, or `this`-receiver inference in symbolic mode). Small,
+isolated; next.
+
+### Cumulative session diff (UNCOMMITTED)
+expression.cryo (resolved_type_args field), sema.cryo (stash in check_generic_free_call +
+infer_free_call_bindings + module-path hook + turbofish stash + symbolic_bind_params fix +
+stash_scope_resolution_call_bindings + ScopeResolution hook), cloner.cryo (copy stash),
+substituter.cryo (substitute stash). monomorphizer.cryo = baseline (all probes stripped).
+
+### Critical-path status
+C1 ~90% done (free-call classes). Left: the 207 residual (alloc_entry/free_entry/swap), then
+**C1d** (mono READS resolved_type_args + enqueues; inference as fallback - behaviorally neutral
+since MISMATCH=0), then **C2** (delete mono inference once ABSENT≈0), C3 (diagnostics), C4 (dual pass).
+
+## 2026-06-18 (cont. 8b) — 207-residual diagnosed (alloc_entry/free_entry/swap)
+
+Probed `alloc_entry` (`AEDBG`): in PRE-MONO symbolic mode it enters `check_generic_free_call`
+(12×) but is **NOT-all-bound → never stashed**; the 180 stashes are `symbolic=N` (post-mono
+Phase-6b, too late for mono). Signature: `alloc_entry<K,V,A>(map: mut &HashMap<K,V,A>, h, key, value)
+where A: Allocator`. K binds from `key`, V from `value`, but **A is ONLY recoverable from `map`
+(arg0 = `this`)**, and in symbolic mode the `this`/`map` arg doesn't expose a `HashMap<K,V,A>` with
+a bindable `A` (the `where A: Allocator` BoundedParam doesn't unify out of the receiver type
+symbolically). So `A` stays unbound → NOT-all-bound. `free_entry` is the same shape. `swap` (36)
+is the orthogonal case: non-turbofish `mem::swap(call_expr, call_expr)` where the args are
+CallExpressions that `free_infer_arg_reliable` deliberately defers.
+
+### Fix direction for the residual (next session, not done)
+- alloc_entry/free_entry: make the symbolic receiver (`this`/`map`) carry the owner's FULL generic
+  args (incl. the allocator/bounded param) so unify binds `A` — investigate `sym_this` construction
+  in `symbolic_check_owner_methods` / how `this`'s resolved_type is set in symbolic mode. Likely the
+  cleanest general fix and may help other allocator-generic calls.
+- swap residual: the call-expr-arg defer is sound conservatism; for the stash, mono's substituted
+  clone DOES have concrete arg types, so this is a case where the stash legitimately can't come from
+  the pre-mono walk. Acceptable to leave as an inference-fallback case at C1d, OR stash from the
+  post-substitution clone walk.
+
+### SESSION SUMMARY (2026-06-18 cont. 6-8) — C0 + C1a + C1b + C1c
+Free-call mono inference now sema-authoritative for **97.7%** of call sites:
+ABSENT 9126 → **207**, MATCH → 9069, **MISMATCH 0 throughout**. Suite green O0+O2 (1233?/0 unit,
+99/0 cf). Self-host byte-identical fixed point, md5 `e2ef668eff16882a5aa64770f4f1d1a4`.
+Landed (uncommitted, monomorphizer.cryo untouched/baseline):
+- `CallExprNode.resolved_type_args` channel + cloner copy + substituter substitute.
+- sema stash in `check_generic_free_call` (+ symbolic_bind_params turbofish fix).
+- `infer_free_call_bindings` + module-scoped hook (`mem::offset`/`swap`/`transmute`).
+- `subst_return_from_call_args` stash (turbofish module calls).
+- `stash_scope_resolution_call_bindings` + ScopeResolution hook (type-scoped statics `Layout::*`).
+NOT repinned (no bootstrap landmine). NEXT: 207 residual → C1d (mono reads stash) → C2 (delete engine).
+
+## 2026-06-18 (cont. 9) — Step 1 DONE: free-call ABSENT 207 → 0 (3 root fixes)
+
+**GREEN + SELF-HOST FIXED POINT.** Suite O0+O2 (unit ok / compile-fail 99/0). Self-host
+byte-identical, IR md5 `022313d02c959af4dbd49799640c90aa` (moved from `e2ef668e`: sema now
+resolves `this`/method/field types via the owner self-instantiation and stashes every free call;
+still a fixed point → behavior self-consistent). UNCOMMITTED, not repinned (no bootstrap landmine).
+`monomorphizer.cryo` remains at BASELINE (all probes stripped — zero debug code in the tree).
+
+Jake's directive this session: **aggressive** mono-after-sema — no fallback/hacky-green
+proliferation; fix the cause in the shared layer, not per-call-site. Saved as memory
+`mono_after_sema_aggressive_2026_06_18`. The handoff's "supply the instantiated type only at the
+unify site" idea was explicitly rejected as a per-site hack; all three fixes below are root-level.
+
+### Measured (corpus = `compiler/ build`, free calls via `try_infer_function_call`)
+ABSENT 207 → **0**; MATCH 9069 → **9276**; MISMATCH **0** throughout. The handoff's residual
+(`alloc_entry` 90, `free_entry` 81, `swap` 36) is fully closed.
+
+### Three root-caused fixes
+1. **Symbolic owner self-instantiation (alloc_entry/free_entry, 171 calls).** During the symbolic
+   generic-body walk `this` was typed as the BARE owner template (`HashMap`, kind=Struct), which
+   carries no type-args — so `alloc_entry<K,V,A>(this,…)` could not recover the allocator `A` from
+   the receiver (`A` is only bindable from `map: HashMap<K,V,A>`). Fix: new
+   `symbolic_owner_instance` builds the owner's abstract self-instantiation `Owner<P0,P1,…>` (each
+   param via `symbolic_param_ref`, tagged `is_symbolic`), and `symbolic_check_body` types `this`
+   with it for the non-static generic-owner receiver. The shared `InferCtx` then binds `A`
+   structurally via the existing Inst-vs-Inst path — NO unify special-case.
+   - Supporting (the abstract-Inst `this` must resolve fields/methods like the bare template did):
+     `symbolic_inst_generic_base` + `symbolic_recv_base` follow the never-monomorphized
+     self-instantiation to its `generic_base` (where the template's field/method tables live);
+     `symbolic_is_generic_owner_receiver`, `symbolic_resolve_owner_method_return` and
+     `symbolic_resolve_owner_field` use it. The owner fast-paths in `resolve_method_call` /
+     `resolve_member_access` were reordered AHEAD of the `symbolic_type_unresolved` bail (the
+     self-instantiation legitimately contains abstract params, so the broad guard would otherwise
+     defer it and method/field resolution returned `void`).
+2. **InferCtx unify Pointer-formal vs Reference-actual ordering (swap, 36 calls).** `swap<T>(a: T*,
+   b: T*)` called `swap(&this.field, …)`: the formal is `Pointer(T)`, but sema types `&x` as a
+   `Reference`. The generic actual-is-Reference peel ran BEFORE the Pointer-formal block, stripping
+   the reference and leaving `T*` vs the bare referent with no binding rule (the correct
+   Pointer-vs-Reference cross-peel existed at the bottom of the Pointer block but was unreachable).
+   Fix: moved the Pointer-formal block ahead of the actual-Reference peel. General win for any `T*`
+   param inferred from an `&value` arg. (`inference.cryo`.)
+
+### Cumulative session diff (UNCOMMITTED) — `git diff --stat`
+expression.cryo / cloner.cryo / substituter.cryo (the stash channel, from cont. 6-8),
+sema.cryo (cont. 6-8 stash producers + this session's symbolic owner-instance + recv-base helpers
++ owner fast-path reorders), inference.cryo (Pointer/Reference unify reorder).
+monomorphizer.cryo = BASELINE.
+
+### Critical-path status
+C1 free-call coverage **100% (ABSENT 0, MISMATCH 0)**. NEXT: **C1d** — make mono READ
+`call.resolved_type_args` (apply active `subst`) and skip PASS A/B/C; behaviorally neutral
+(MISMATCH=0) so self-host must stay byte-identical. Then **C2** delete mono's inference engine,
+**C3** delete mono's call-site diagnostics (E0214/E0306/E0307; sema is the oracle), **C4** collapse
+the dual pass. SCOPE NOTE still open: METHOD-call inference (`try_infer_method_call`) was NOT
+measured — needs its own stash producer in sema before that engine can be deleted.
+
+## 2026-06-18 (cont. 10) — C1d landed: mono READS the free-call stash
+
+**GREEN + FIXED POINT.** Suite O0+O2 (unit ok / cf 99/0). Self-host fixed point md5
+`9c04ffff8d83e798f3d589db3f816f49` (moved from `022313d0` — see neutrality proof below).
+UNCOMMITTED on top of `2b1b772a`.
+
+### What landed (monomorphizer.cryo `try_infer_function_call`)
+After sizing `inference_bindings`, if `call.resolved_type_args` is present and length-matches
+`entry.param_type_ids`, seed the bindings from it (apply active `subst`, exactly as the validated
+probe did) and set `from_stash=true`; PASS A/B/C are guarded by `!from_stash` and skipped. A
+partial/invalid stash resets and falls back to inference. So mono now reads sema's bindings instead
+of re-deriving them for every covered free call (ABSENT=0 → effectively all of them).
+
+### Neutrality PROOF (important — corrects the handoff's "must stay byte-identical")
+The self-host md5 MOVED (`022313d0`→`9c04ffff`, +8526 bytes). This is NOT a behavior change: the
+compiler compiles itself, so adding C1d source to monomorphizer.cryo necessarily changes the
+compiler's OWN IR. Verified neutral by:
+- **Identical symbol set**: `comm` of all `define` symbols pre-C1d vs C1d = **0 new, 0 lost specs**.
+- **Diff fully confined to one function**: all 44 IR diff hunks fall between the `define` of
+  `try_infer_function_call` (old line 345489) and the next function `try_infer_method_call`
+  (346826). `diff` reports every difference in the 50MB file; there are none elsewhere. The changes
+  are literally my new SSA temps (`%from_stash`, `%b`, `%i312`…) + downstream per-function temp
+  renumbering.
+- Suite green O0+O2; fixed point holds.
+**Takeaway for C2/C3:** deleting compiler source will likewise move the md5 (compiler shrinks). The
+correctness oracle is **fixed-point + identical symbol set (per `define` diff) + changes confined to
+the edited functions**, NOT md5 stability.
+
+### NEXT
+M0: measure method-call inference (`try_infer_method_call`) to size the method-side stash work
+(turbofish vs formal/actual vs combinator/derived). Then M1 (sema method stash) → C2 (delete the now
+mostly-dead inference engine). Free-call inference body in `try_infer_function_call` is now dead for
+ABSENT=0 but its shared helpers (`resolve_arg_type_for_inference`, `unify_for_inference`,
+`inference_bindings`) are still used by the method engine, so deletion waits on the method side.
+
+## 2026-06-18 (cont. 11) — M0: method-call inference measured
+
+Probed `try_infer_method_call` at the specialize point, classifying each minted method spec.
+
+### Full test suite (`cryo test`): 175 method specs
+- **58 turbofish** (`cast`, some `spawn`) — sema-trivial (resolve the annotation).
+- **102 plain formal/actual unify** (`fmt`, `map`, `fold`, `hash`, `next`, `zip`, `chain`…) — same
+  unify machinery as free calls.
+- **16 derived/combinator** (`map`/`fold` on adapters; `impl_node.derived_param_names` non-empty) —
+  the hard case: the element type `A` comes from the impl's where-bound element binding computed at
+  mono impl-specialization time. May be tractable in sema IF sema has the receiver's concrete
+  element type (the "derived" complexity is a mono artifact of working from where-bounds, not the
+  concrete receiver) — UNKNOWN until built.
+- **2 implicit** return-type-driven.
+Compiler-only corpus: 86 specs, all turbofish(72 `cast`)/unify(14 `hash`/`fmt`), 0 derived.
+
+### Read
+~91% of method-generic inference (turbofish + plain unify) is sema-tractable with the free-call
+machinery. ~9% derived/combinator is the open question for full C2 deletion. NOTE: own-generic
+combinators reach this path only after `try_instantiate_self_returning_default` returns false;
+zero-own-generic combinators (take/filter) are handled earlier and never hit method inference.
+
+### Decision
+Pivot to deleting the FREE-CALL inference body first (C2/C3 free-call portion): C1d's `from_stash`
+covers all free calls (ABSENT=0), and sema already owns the free-call diagnostics
+(E0214/E0306/E0307 via `emit_free_*`). Validate the body is dead across the FULL corpus, then delete
++ run compile-fail (the diagnostic oracle) + self-host symbol-set diff.
+
+## 2026-06-18 (cont. 12) — C2-free attempt: REVERTED (uncovered 2 deeper blockers)
+
+Tried to make the free-call inference body deletable by closing the last test-corpus fallbacks.
+Measured mono's free-call inference RELIANCE (the calls where sema's stash is ABSENT so mono's
+PASS A/B/C still pins): **compiler 0, full test suite 7** — `expect_eq` (4), `from_iter` (2),
+`litexpr_box` (1). All are the "call-expression argument" shape (`litexpr_box(take_i64(x))`,
+`expect_eq(classify(...), 1)`), which `free_infer_arg_reliable` blanket-defers.
+
+Attempted root fix: make a CONCRETE call-expr arg reliable (sema-authoritative). This **regressed**
+and was REVERTED after uncovering two genuine, deeper issues that must be fixed FIRST:
+
+1. **sema PASS-C literal conflict diverges from mono.** A polymorphic numeric literal meeting a
+   concrete binding: sema runs `check_compatibility(i32_default, bnd)` and flags i32-vs-i64 (or
+   i32-vs-enum) as a conflict; mono NEVER flags a literal here (its inference-actual is invalid →
+   skips). Fixing "numeric literal adopts any numeric binding" got expect_eq's i64 cases, but an
+   int literal must ALSO be allowed to adopt an ENUM (enums hold int discriminants) and NOT a string
+   — the discriminator is literal-adoptability, not `is_numeric`. The only divergent case sema must
+   still catch that mono doesn't is `second(5, "hello")` (T=string). Needs a literal-aware
+   adoptability check (or align both passes to one rule).
+2. **Cross-module same-leaf call mis-resolution (the deferral's original reason).** `expect_eq(
+   classify(Outer::Wrap(Inner::A)), 1)` in nested_patterns: the LOCAL `classify` returns `i32`, but
+   the inference path saw `PatternMatching::Sign` (a same-leaf `classify` in another module). The
+   original `free_infer_arg_reliable` comment explicitly defers call-expr args because "a bare-name
+   call can mis-resolve to a same-leaf sibling in another namespace" — this is that hazard, live.
+   Relaxing the defer exposes it; mono tolerates it today only because it re-infers per-instantiation.
+
+**Decision (per Jake's philosophy):** the relaxation was not a clean, validated step — it pulled in
+an unrelated dispatch bug and a literal-semantics divergence. Reverted to C1d-only. Both blockers are
+real and worth fixing on their own (then C2-free becomes safe), but not as a rushed change.
+
+### State after revert
+C1d only (monomorphizer.cryo, +32 lines). sema.cryo CLEAN. Suite green O0+O2 + full `cryo test`.
+Self-host fixed point (expected md5 `9c04ffff...`, the validated C1d point). Zero probe residue.
+
+## 2026-06-18 (cont. 13) — #8 DONE: sema/mono PASS-C literal adoptability aligned
+
+**GREEN + FIXED POINT.** Suite O0+O2 (unit ok / cf 99/0) + full `cryo test` PASS. Self-host
+byte-identical fixed point, IR md5 `02124ef0f2467176711a9c95c1ced804` (moved from `9c04ffff` — the
+compiler's OWN source changed, expected; neutrality argued below). UNCOMMITTED on top of `2b1b772a`.
+
+### The bug (handoff prereq #8)
+Both sema `check_generic_free_call` PASS C and mono PASS C (free + method-owner) tested a polymorphic
+numeric literal against an already-pinned binding with a RAW
+`check_compatibility(i32_default, bnd) == Incompatible`. That wrongly flags **i32-vs-i64** and
+**i32-vs-enum** as a `T` conflict, whereas a width-less literal legitimately adopts any numeric
+binding (codegen coerces) and any enum binding (an int literal names a discriminant). This divergence
+(mono never reached the check for the call-expr-arg shape because its inference-actual came back
+invalid) is exactly what broke the cont. 12 `free_infer_arg_reliable` relaxation.
+
+### The fix (shared rule, both passes)
+Added `literal_adopts_binding(bnd) -> boolean` to BOTH sema (passes/sema.cryo, after
+`free_infer_type_concrete`) and mono (types/monomorphizer.cryo, after `infer_type_is_concrete`):
+true iff `bnd`'s resolved kind is `Int`, `Float`, or `Enum`. Replaced the `check_compatibility`
+conflict test at all THREE PASS-C sites (sema free-call ~6501, mono free-call ~4415, mono
+method-owner ~5076) with `infer_type_is_concrete(bnd) && !literal_adopts_binding(bnd)`. So a literal
+meeting a string/bool/struct binding still hard-conflicts (`second(5, "hello")` → E0214), but numeric
+width and enum cases no longer false-positive.
+
+### Why neutral (no current-suite behavior change)
+`pick(i32_var, i64_var)` (E0214_generic_numeric_conflict) is caught in PASS A (two non-literals),
+untouched. `second(5,"hello")` keeps flagging (string not adoptable). The method E0214 negatives
+(`cf_bump`/`cf_absorb`/`cf_of`) pass a `string` to a CONCRETE `i32` param — not generic inference, not
+a polymorphic literal — untouched. Any actual behavior change would have flipped a positive test
+(spurious E0214) or a negative test (suppressed E0214); all 99 cf + unit + full project stay green, so
+the monomorphized symbol set is necessarily consistent. (This change emits/suppresses a DIAGNOSTIC; it
+cannot add or drop a spec.)
+
+### Unblocks
+This is prereq #8 for #7 (C2-free). #9 (cross-module same-leaf call misresolution) still pending before
+the `free_infer_arg_reliable` relaxation is safe.
+
+### NEXT
+Per handoff dependency order: #9, then #7 (C2-free). In parallel, M1 (#3) is independently startable
+and neutral — sema's `resolve_generic_method_return` (sema.cryo ~10232) ALREADY computes
+`method_bindings` (the method's own generic params in decl order) via the same turbofish/unify
+machinery mono's `try_infer_method_call` uses, so the method-stash producer can piggyback on it.
+GAP found: methods whose generics appear ONLY in arg positions (`hash<H> -> void`) have no return-type
+reason for sema to infer them today → need a dedicated binding-compute+stash to reach ABSENT 0.
+
+## 2026-06-18 (cont. 14) — M1 step 1+2 DONE: mono reads sema's method-call stash (combinator path)
+
+**GREEN + FIXED POINT + SYMBOL-SET IDENTICAL.** Suite O0+O2 (cf 99/0) + full `cryo test` PASS.
+Self-host byte-identical fixed point IR md5 `27d3ca4a27fd3d3cf4d1907278acd713`. **Define-symbol set vs
+pre-M1 baseline: 0 new / 0 lost** (16697 == 16697) — proves the stash-read agrees with mono's
+inference everywhere it fires (MISMATCH 0). UNCOMMITTED on top of `2b1b772a`.
+
+### What landed (the method analogue of C1d)
+- **Producer (sema, `resolve_generic_method_return` ~10462):** right before `return refined` (where
+  every `method_bindings[i]` is already proven concrete), stash them on `call.resolved_type_args` in
+  `orig_func.generic_params` declaration order. Mirrors the free-call producer in
+  `check_generic_free_call`. Reuses the SAME field (a CallExpr is free XOR method, never both).
+- **Reader (mono, `try_infer_method_call` ~5948):** after sizing `inference_bindings`/`method_ctx`,
+  if `call.resolved_type_args.length == n_method_params`, seed `inference_bindings` from it (apply
+  `subst`; concrete today so a no-op), set `m_from_stash=true`, and make the turbofish/unify block an
+  `else if`/`else` under `if (m_from_stash) {}`. Partial/invalid stash resets → falls back to
+  inference. The downstream concreteness-defer + `specialize_method` are unchanged (run for all paths).
+
+### Coverage measured (TEMP probe `MSTASH`/`MABSENT` at the specialize point, since STRIPPED)
+- **Compiler corpus:** MSTASH 0 / MABSENT 86 (72 `cast`, 8 `hash`, 6 `fmt`).
+- **Full `cryo test` corpus:** MSTASH **56** / MABSENT **119**.
+  - STASHED (sema-covered): `map` 22, `fold` 15, `zip` 8, `chain` 7, `next` 2, `wrap` 2 — exactly the
+    combinator / return-carrying-method-generic family that flows through
+    `resolve_generic_method_return`.
+  - ABSENT (still mono-inferred): `fmt` 38, `cast` 38, `hash` 9, `run` 7, `sample` 6, `next` 6,
+    `try_spawn` 4, `spawn` 4, `relay` 4, `write_to` 2, `wrap` 1.
+
+### Why the 119 are absent (and the exact plan to close them) — this is the rest of M1
+sema's `resolve_method_call` routes these AROUND `resolve_generic_method_return`, so my piggyback
+producer never sees them:
+1. **Turbofish** (`cast<U>`, `spawn`/`try_spawn`): `member.generic_args.length > 0` → resolved via
+   `resolve_method_return_with_explicit_args`, not `resolve_generic_method_return`. The bindings are
+   the turbofish args themselves — fully authoritative, trivially stashable.
+2. **Arg-only generics** (`hash<H> -> void`, `fmt<W>`, `write_to`, `relay`, `run`, `sample`): the
+   method generic appears ONLY in a parameter, never the return, so `contains_generic_param(refined)`
+   is false and `resolve_generic_method_return` is never called. Needs formal/actual unify run for
+   its side-effect (stash) even though the return is already concrete.
+**Plan (next):** refactor the binding-computation out of `resolve_generic_method_return` into a
+`compute_method_bindings(recv_type, member, call) -> TypeRef[]` (turbofish branch + unify branch +
+implicit-return branch — code already exists there), then call it from a single
+`stash_method_call_bindings` invoked for EVERY generic method call in `resolve_method_call`
+(regardless of return shape), stashing whenever the full set is concrete. Method resolution is
+receiver-anchored, so the cross-module same-leaf hazard (#9) that blocks the FREE-call relaxation does
+NOT apply here. Re-measure to drive MABSENT→0; the genuinely-irreducible residual (if any) is the
+derived/combinator element-binding case the handoff flagged — surface it to Jake rather than force it.
+
+### NOTE on the symbol-set oracle
+The compiler self-build has MSTASH 0 (no combinator generic-method calls), so the 0/0 symbol-set diff
+chiefly proves the READER is inert when nothing stashes. Neutrality of the 56 STASHED test-corpus
+calls is proven by the FULL GREEN suite (a wrong-method stash → miscompile → a red test); all green.
+
+### State
+Clean tree (zero probe residue). Changed vs HEAD: `monomorphizer.cryo` (C1d + #8 + M1 reader),
+`sema.cryo` (#8 + M1 producer), `pipeline-reorder-progress.md`. UNCOMMITTED, NOT repinned (Jake owns).
