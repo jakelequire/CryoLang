@@ -1,0 +1,319 @@
+/// Mono State  (Compiler::Mono::State)
+///
+/// Shared mutable per-run state for the monomorphization subsystem: the pending
+/// worklist, the nested-instantiation discovery engine, and the error counter,
+/// plus the environment pointers those need (arena, generic registry, intern
+/// table, type resolver).  Mirrors codegen's `VisitorState` — the orchestrator
+/// owns one `MonoState` by value and lends `MonoState*` to the collaborators that
+/// must enqueue work or report errors (`MonoAstResolver`, `MonoCallSpecializer`),
+/// which keeps those collaborators from importing the orchestrator concretely
+/// (no module cycle).
+///
+/// `MonomorphRequest` lives here (not on the orchestrator) so both `MonoState`
+/// (which builds + queues requests) and the orchestrator (which drains them) see
+/// it without a cycle.  The specialization cache (`spec_entries` etc.),
+/// cycle-detection set, injection cursor, current module, and consumer tracking
+/// stay on the orchestrator — only it touches them.
+
+namespace Compiler::Mono::State;
+
+import Compiler::AST;
+import Compiler::Types::Generic;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Resolver;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Monomorphizer;   // mono_type_contains_generic_param + mono_copy_type_refs (types-rooted)
+import Compiler::Diag::SourceSpan;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+
+
+// MonomorphRequest: a pending instantiation to specialize
+
+type struct MonomorphRequest {
+    generic_type: TypeRef;          // The InstantiatedType
+    type_args:    TypeRef[];        // Concrete type arguments
+    base_type:    TypeRef;          // The generic base type
+    span:         SourceSpan;
+
+    /// Deep copy.  `type_args` is a heap array of Copy `TypeRef` handles, so the
+    /// worklist loop clones an entry before processing it: the worklist (`pending`)
+    /// grows during processing (specialization enqueues more instantiations), and
+    /// the cloned snapshot owns an independent buffer so dropping it at the end of
+    /// an iteration cannot double-free the entry the worklist still owns.
+    clone(&this) -> MonomorphRequest {
+        mut args_copy: TypeRef[] = [];
+        for (mut i: i64 = 0; i < this.type_args.length; i++) {
+            args_copy.push(this.type_args[i]);
+        }
+        return MonomorphRequest {
+            generic_type: this.generic_type,
+            type_args:    args_copy,
+            base_type:    this.base_type,
+            span:         this.span,
+        };
+    }
+}
+
+
+// SpecializationEntry: a completed specialization
+//
+// Lives here (with `spec_entries` on `MonoState`) rather than on the orchestrator
+// so `MonoCallSpecializer` can read the table (to route an inherent-generic spec
+// method to the receiver's already-materialized spec AST) without importing the
+// orchestrator module (which would cycle).  The orchestrator still owns the
+// cache *logic* (key/index/cycle); only the entry array is shared here.
+
+type struct SpecializationEntry {
+    specialized_type:  TypeRef;
+    specialized_name:  SymbolStr;
+    ast_node:          ASTNode*;
+    impl_nodes:        ASTNode*[];
+    origin_module:     SymbolStr;      // Module that created this spec (creating-module fallback owner)
+    template_module:   SymbolStr;      // Module where the template is defined (deterministic owner key)
+    instantiated_type: TypeRef;        // The InstantiatedType that was resolved
+    injected:          boolean;        // True once placed into its owner module's AST root (Phase 6a-iii)
+    owner_source:      SymbolStr;      // Resolved owner module's source-file path; drives BOTH DI
+                                       // ownership and AST placement so they always agree.
+}
+
+
+// MonoState: worklist + discovery engine + spec table + error counter
+
+type struct MonoState {
+    // Environment (lent by the orchestrator at wire time).
+    arena:            TypeArena*;
+    generic_registry: GenericRegistry*;
+    intern_table:     InternTable*;
+    type_resolver:    TypeResolver*;
+
+    // Worklist.
+    pending:          MonomorphRequest[];
+    pending_cursor:   i64;                  // Index cursor (avoids O(n) erase-from-front)
+
+    // Completed specialization entries (parallel to the orchestrator's
+    // string-keyed `spec_index`).  Shared so MonoCallSpecializer can read it.
+    spec_entries:     SpecializationEntry[];
+
+    // Visited set for request_nested_instantiations cycle detection.
+    nested_visited:   u64[];
+
+    // Error tracking (shared: the orchestrator's spine and the collaborators that
+    // emit diagnostics both bump this; process_all returns error_count == 0).
+    error_count:      i64;
+
+    static null() -> MonoState {
+        return MonoState {
+            arena:            null,
+            generic_registry: null,
+            intern_table:     null,
+            type_resolver:    null,
+            pending:          [],
+            pending_cursor:   0,
+            spec_entries:     [],
+            nested_visited:   [],
+            error_count:      0,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,
+                    intern_table: InternTable*, type_resolver: TypeResolver*) -> void {
+        this.arena            = arena;
+        this.generic_registry = generic_registry;
+        this.intern_table     = intern_table;
+        this.type_resolver    = type_resolver;
+    }
+
+
+    /// True if every queued specialization request has been drained.
+    worklist_empty(&this) -> boolean {
+        return this.pending_cursor >= this.pending.length;
+    }
+
+    /// Number of requests still queued (for diagnostic messages).
+    pending_count(&this) -> i64 {
+        const remaining: i64 = this.pending.length - this.pending_cursor;
+        if (remaining < 0) { return 0; }
+        return remaining;
+    }
+
+    /// Reset the per-module worklist + error state (cache is preserved on the
+    /// orchestrator).  Called between modules in StdlibBatch mode.
+    reset_worklist(mut &this) -> void {
+        this.pending        = [];
+        this.pending_cursor = 0;
+        this.error_count    = 0;
+    }
+
+
+    // -- Enqueue / discovery --
+
+    /// Enqueue a monomorphization request from a TypeRef that is an InstantiatedType.
+    /// Skips instantiations that cannot be monomorphized:
+    ///   - Base type is not a registered template (e.g., void, primitives)
+    ///   - Base type is a TypeAlias (generic aliases are expanded during type
+    ///     resolution, not monomorphized)
+    ///   - Type args containing unresolved GenericParamType or BoundedParamType
+    enqueue_from_type_ref(mut &this, ty: TypeRef) -> void {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+
+        // Skip if base type is not a monomorphizable kind.  Only Struct, Enum,
+        // Class, Trait, and Function types can be templates.
+        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
+        if (base_t == null) { return; }
+        if (base_t.kind == TypeKind::TypeAlias) { return; }
+        if (base_t.kind != TypeKind::Struct &&
+            base_t.kind != TypeKind::Enum &&
+            base_t.kind != TypeKind::Class &&
+            base_t.kind != TypeKind::Trait &&
+            base_t.kind != TypeKind::Function &&
+            base_t.kind != TypeKind::FunctionTemplate) {
+            return;
+        }
+
+        // Double-check against the GenericRegistry; only enqueue types that were
+        // actually registered as templates during TemplateRegistration.
+        if (!this.generic_registry.is_template(inst.generic_base.id)) {
+            return;
+        }
+
+        // Skip partial specs; any type arg that *contains* an unresolved
+        // GenericParam at any depth is not yet concrete.  Mono should only
+        // process fully-concrete specs.
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (this.type_contains_generic_param(inst.type_args[i])) {
+                return;
+            }
+        }
+
+        this.enqueue_from_inst(ty, inst);
+    }
+
+    /// Delegate to the shared `mono_type_contains_generic_param` free function
+    /// (types-rooted) so this and the generic-validation pass share one
+    /// implementation and cannot drift.
+    type_contains_generic_param(&this, ty: TypeRef) -> boolean {
+        return mono_type_contains_generic_param(this.arena, ty);
+    }
+
+    enqueue_from_inst(mut &this, ty: TypeRef, inst: InstantiatedType*) -> void {
+        const request: MonomorphRequest = MonomorphRequest {
+            generic_type: ty,
+            type_args:    mono_copy_type_refs(&inst.type_args),
+            base_type:    inst.generic_base,
+            span:         SourceSpan::none(),
+        };
+        this.pending.push(request);
+    }
+
+    /// Walk a type recursively, enqueuing any unmonomorphized InstantiatedTypes.
+    /// Uses enqueue_from_type_ref (not enqueue_from_inst) so that all requests go
+    /// through the same validation.  `nested_visited` must be reset by the caller
+    /// before each top-level traversal.
+    request_nested_instantiations(mut &this, ty: TypeRef) -> void {
+        if (ty.is_invalid() || ty.id == 0) { return; }
+
+        // Cycle detection: skip types we've already visited in this traversal
+        for (mut v: i64 = 0; v < this.nested_visited.length; v++) {
+            if (this.nested_visited[v] == ty.id) { return; }
+        }
+        this.nested_visited.push(ty.id);
+
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return; }
+
+        match (t.kind) {
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.has_resolved_type()) {
+                    this.enqueue_from_type_ref(ty);
+                }
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    this.request_nested_instantiations(inst.type_args[i]);
+                }
+            }
+            TypeKind::Pointer => {
+                const ptr: PointerType* = t as PointerType*;
+                this.request_nested_instantiations(ptr.pointee);
+            }
+            TypeKind::Reference => {
+                const ref: ReferenceType* = t as ReferenceType*;
+                this.request_nested_instantiations(ref.referent);
+            }
+            TypeKind::Array => {
+                const arr: ArrayType* = t as ArrayType*;
+                this.request_nested_instantiations(arr.element);
+                // For dynamic arrays with concrete element types, ensure
+                // Array<elem> is monomorphized.  T[] creates ArrayType but not
+                // InstantiatedType(Array,[T]), so the worklist misses it.
+                if (arr.is_dynamic() && arr.element.is_valid()) {
+                    const elem_t: Type* = this.arena.lookup(arr.element.id);
+                    if (elem_t != null && elem_t.kind != TypeKind::GenericParam
+                                       && elem_t.kind != TypeKind::BoundedParam) {
+                        const array_sym: SymbolStr = this.intern_table.intern(
+                            "std::collections::array::Array");
+                        const array_entry: TemplateEntry* =
+                            this.generic_registry.get_template(array_sym);
+                        if (array_entry != null) {
+                            mut args: TypeRef[] = [];
+                            args.push(arr.element);
+                            const _empty: string = "";
+                            mut nested_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+                            args = this.type_resolver.expand_default_type_args(array_entry, args, &nested_ctx);
+                            const inst_ref: TypeRef =
+                                this.generic_registry.instantiate(array_entry.base_type, args);
+                            this.enqueue_from_type_ref(inst_ref);
+                        }
+                    }
+                }
+            }
+            TypeKind::Optional => {
+                const opt: OptionalType* = t as OptionalType*;
+                this.request_nested_instantiations(opt.wrapped);
+            }
+            TypeKind::Function => {
+                const func: FunctionType* = t as FunctionType*;
+                this.request_nested_instantiations(func.return_type);
+                for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                    this.request_nested_instantiations(func.param_types[i]);
+                }
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    this.request_nested_instantiations(tup.elements[i]);
+                }
+            }
+            TypeKind::Struct => {
+                const st: StructType* = t as StructType*;
+                for (mut i: i64 = 0; i < st.fields.length; i++) {
+                    this.request_nested_instantiations(st.fields[i].field_type);
+                }
+            }
+            TypeKind::Class => {
+                const cl: ClassType* = t as ClassType*;
+                for (mut i: i64 = 0; i < cl.fields.length; i++) {
+                    this.request_nested_instantiations(cl.fields[i].field_type);
+                }
+            }
+            TypeKind::Enum => {
+                const en: EnumType* = t as EnumType*;
+                for (mut i: i64 = 0; i < en.variants.length; i++) {
+                    for (mut j: i64 = 0; j < en.variants[i].payload_types.length; j++) {
+                        const payload_ty: TypeRef = en.variants[i].payload_types[j];
+                        this.request_nested_instantiations(payload_ty);
+                    }
+                }
+            }
+            _ => {
+                // No nested types to discover
+            }
+        }
+    }
+}

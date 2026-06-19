@@ -1,0 +1,75 @@
+/// ResolveOutcome
+///
+/// The typed result of a name/type resolution attempt inside Sema.
+///
+/// This replaces the historic sentinel overloading (root cause R3): the old
+/// `TypeCheckVisitor` overloaded two genuinely-inhabited values to mean
+/// "not resolved" — `void` as the unresolved-local sentinel and
+/// `TypeRef::invalid()` as the deferral return — which let a void-sentinel
+/// collide with a real `void` and trip spurious checks.  A resolution now
+/// reports one of three first-class states, so the defer/error distinction is
+/// checked once at the resolution boundary and genuine errors propagate as
+/// `ErrorType`, restoring the type system's "no fallbacks by design" invariant.
+///
+///   Resolved(ty) -- a concrete (or legitimately abstract-in-template) type.
+///   Deferred     -- cannot be resolved *here* but is not an error: a symbolic
+///                   generic-body walk where `T` is never concrete, awaiting a
+///                   later authoritative pass.  Carries no type.
+///   Error        -- resolution failed and a diagnostic was (or will be) emitted;
+///                   callers propagate `ErrorType`, they do not retry.
+///
+/// Implemented as a struct with a kind discriminator rather than an enum with
+/// associated data, mirroring `SymbolKey` — fields are directly accessible
+/// without pattern matching for the common `is_*` / `get_type` operations.
+
+namespace Compiler::Sema::Outcome;
+
+import Compiler::Types::TypeRef;
+
+type enum ResolveOutcomeKind {
+    Resolved;
+    Deferred;
+    Error;
+}
+
+type struct ResolveOutcome {
+    kind: ResolveOutcomeKind;
+    ty:   TypeRef;            // valid only when kind == Resolved
+
+    /// A successful resolution to a concrete or template-abstract type.
+    static resolved(ty: TypeRef) -> ResolveOutcome {
+        return ResolveOutcome { kind: ResolveOutcomeKind::Resolved, ty: ty };
+    }
+
+    /// Not resolvable here, but not an error (symbolic/abstract context).
+    static deferred() -> ResolveOutcome {
+        return ResolveOutcome { kind: ResolveOutcomeKind::Deferred, ty: TypeRef::invalid() };
+    }
+
+    /// Resolution failed; a diagnostic accompanies it.  Callers stop.
+    static error() -> ResolveOutcome {
+        return ResolveOutcome { kind: ResolveOutcomeKind::Error, ty: TypeRef::invalid() };
+    }
+
+    is_resolved(&this) -> boolean {
+        return match (this.kind) { ResolveOutcomeKind::Resolved => { true } _ => { false } };
+    }
+
+    is_deferred(&this) -> boolean {
+        return match (this.kind) { ResolveOutcomeKind::Deferred => { true } _ => { false } };
+    }
+
+    is_error(&this) -> boolean {
+        return match (this.kind) { ResolveOutcomeKind::Error => { true } _ => { false } };
+    }
+
+    /// The resolved type, or `TypeRef::invalid()` for Deferred/Error.  Use this
+    /// only after checking `is_resolved()`; it never returns a sentinel that a
+    /// caller could mistake for a real type.
+    get_type(&this) -> TypeRef {
+        return match (this.kind) {
+            ResolveOutcomeKind::Resolved => { this.ty }
+            _                            => { TypeRef::invalid() }
+        };
+    }
+}

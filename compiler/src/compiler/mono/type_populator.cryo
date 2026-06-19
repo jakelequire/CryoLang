@@ -1,0 +1,253 @@
+/// Mono Type Populator  (Compiler::Mono::TypePopulator)
+///
+/// Reads a freshly specialized + re-resolved AST and fills the concrete arena
+/// type's fields / methods / variants (struct, class, enum), and builds a
+/// concrete `FunctionType` for specialized function templates.  Runs after
+/// `MonoAstResolver` has resolved every annotation on the spec'd AST, so it only
+/// copies already-resolved `TypeRef`s into the arena type.
+///
+/// Plain `type struct` collaborator: needs only `arena` + `intern_table` (it never
+/// enqueues, resolves, or reports errors).  Per-call generic-method specialization
+/// + DeclarationIndex registration live in `MonoCallSpecializer`, which consumes
+/// sema's stash; this collaborator is purely "spec'd AST -> arena type".
+
+namespace Compiler::Mono::TypePopulator;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Generic;
+import Compiler::Types::Substitution;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+
+
+type struct MonoTypePopulator {
+    arena:        TypeArena*;
+    intern_table: InternTable*;
+
+    static null() -> MonoTypePopulator {
+        return MonoTypePopulator {
+            arena:        null,
+            intern_table: null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern_table: InternTable*) -> void {
+        this.arena        = arena;
+        this.intern_table = intern_table;
+    }
+
+
+    populate_concrete_type(mut &this, concrete_type: TypeRef, specialized_ast: ASTNode*,
+                           node_kind: NodeKind, subst: TypeSubstitution*,
+                           entry: TemplateEntry*) -> void {
+        const concrete_t: Type* = this.arena.lookup(concrete_type.id);
+        if (concrete_t == null || specialized_ast == null) { return; }
+
+        match (node_kind) {
+            NodeKind::StructDeclaration => {
+                this.populate_struct_fields(concrete_t as StructType*,
+                    specialized_ast as StructDeclNode*);
+            }
+            NodeKind::ClassDeclaration => {
+                this.populate_class_fields(concrete_t as ClassType*,
+                    specialized_ast as ClassDeclNode*);
+            }
+            NodeKind::EnumDeclaration => {
+                this.populate_enum_variants(concrete_t as EnumType*,
+                    specialized_ast as EnumDeclNode*, subst, entry);
+            }
+            _ => {}
+        }
+    }
+
+    /// Populate a specialized StructType's fields from the specialized AST.
+    /// resolved_type on each FieldDeclNode was filled by resolve_specialized_ast().
+    populate_struct_fields(mut &this, st: StructType*, decl: StructDeclNode*) -> void {
+        if (decl == null) { return; }
+
+        mut field_infos: FieldInfo[] = [];
+        for (mut i: i64 = 0; i < decl.fields.length; i++) {
+            const field: FieldDeclNode* = decl.fields[i];
+            if (field == null) { continue; }
+            const is_pub: boolean = field.visibility == Visibility::Public;
+            const is_prot: boolean = field.visibility == Visibility::Protected;
+            field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+        }
+        st.set_fields(field_infos);
+
+        // Stamp the chosen layout onto the concrete type.  The flags came from the
+        // generic template via the cloner; DirectiveProcessing runs before mono and
+        // never sees this specialization, so without this a `![repr]` / `![align]`
+        // on a generic struct would be silently dropped for every instantiation.
+        st.set_repr(decl.repr_c, decl.repr_packed, decl.repr_transparent);
+        st.set_min_alignment(decl.min_alignment);
+
+        this.populate_struct_methods(st, decl);
+    }
+
+    /// Populate a specialized ClassType's fields from the specialized AST.
+    populate_class_fields(mut &this, ct: ClassType*, decl: ClassDeclNode*) -> void {
+        if (decl == null) { return; }
+
+        mut field_infos: FieldInfo[] = [];
+        for (mut i: i64 = 0; i < decl.fields.length; i++) {
+            const field: FieldDeclNode* = decl.fields[i];
+            if (field == null) { continue; }
+            const is_pub: boolean = field.visibility == Visibility::Public;
+            const is_prot: boolean = field.visibility == Visibility::Protected;
+            field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+        }
+        ct.set_fields(field_infos);
+
+        ct.set_repr(decl.repr_c, decl.repr_packed, decl.repr_transparent);
+        ct.set_min_alignment(decl.min_alignment);
+
+        this.populate_class_methods(ct, decl);
+    }
+
+    /// Mirror the specialized AST's methods onto the spec'd StructType.  Without
+    /// this, sema's `resolve_method_overload` can't find any methods on `Box<i32>`
+    /// etc.; that breaks consume detection for by-value receivers.
+    populate_struct_methods(mut &this, st: StructType*, decl: StructDeclNode*) -> void {
+        if (st == null || decl == null) { return; }
+        const this_amp: SymbolStr = this.intern_table.intern("&this");
+        const this_val: SymbolStr = this.intern_table.intern("this");
+        for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
+            const m: MethodNode* = decl.methods[mi];
+            if (m == null || m.func == null) { continue; }
+            mut ptypes: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
+                const pp: VarDeclNode* = m.func.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.name.equals(this_amp)) { continue; }
+                if (pp.name.equals(this_val)) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            const fn_ty: TypeRef = this.arena.get_function(
+                m.func.resolved_return_type, ptypes, m.func.is_variadic);
+            const minfo: MethodInfo = MethodInfo {
+                name:          m.func.name,
+                function_type: fn_ty,
+                is_public:     m.visibility == Visibility::Public,
+                is_protected:  m.visibility == Visibility::Protected,
+                is_static:     m.is_static,
+                is_virtual:    m.is_virtual,
+                is_override:   m.is_override,
+                param_types:   ptypes,
+                ast_node:      m as void*,
+            };
+            st.add_method(minfo);
+        }
+    }
+
+    /// Class counterpart to populate_struct_methods.
+    populate_class_methods(mut &this, ct: ClassType*, decl: ClassDeclNode*) -> void {
+        if (ct == null || decl == null) { return; }
+        const this_amp: SymbolStr = this.intern_table.intern("&this");
+        const this_val: SymbolStr = this.intern_table.intern("this");
+        for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
+            const m: MethodNode* = decl.methods[mi];
+            if (m == null || m.func == null) { continue; }
+            mut ptypes: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
+                const pp: VarDeclNode* = m.func.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.name.equals(this_amp)) { continue; }
+                if (pp.name.equals(this_val)) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            const fn_ty: TypeRef = this.arena.get_function(
+                m.func.resolved_return_type, ptypes, m.func.is_variadic);
+            const minfo: MethodInfo = MethodInfo {
+                name:          m.func.name,
+                function_type: fn_ty,
+                is_public:     m.visibility == Visibility::Public,
+                is_protected:  m.visibility == Visibility::Protected,
+                is_static:     m.is_static,
+                is_virtual:    m.is_virtual,
+                is_override:   m.is_override,
+                param_types:   ptypes,
+                ast_node:      m as void*,
+            };
+            ct.add_method(minfo);
+        }
+    }
+
+    /// Populate a specialized EnumType's variants by applying the substitution to
+    /// the base generic enum's variant payload types.  Substituting against the
+    /// base's already-resolved payload TypeRefs avoids the binding gap that walking
+    /// the substituted AST would hit for partial specs (e.g. `Option<T*>`).
+    populate_enum_variants(mut &this, et: EnumType*, decl: EnumDeclNode*,
+                           subst: TypeSubstitution*, entry: TemplateEntry*) -> void {
+        if (entry == null || subst == null) { return; }
+
+        // Stamp the chosen layout onto the concrete enum.
+        if (decl != null) {
+            et.set_repr_c(decl.repr_c);
+            et.set_min_alignment(decl.min_alignment);
+        }
+
+        // Idempotency guard: partial specs collapse to the same spec_name + EnumType
+        // in the arena.  Without this guard, populate runs once per outer caller and
+        // accumulates duplicate variants.
+        if (et.variants.length > 0) { return; }
+
+        // Look up the base generic enum.  Its variants were populated by type
+        // resolution with GenericParam payloads (`Some(T)` -> [GenericParam_T]).
+        const base_t: Type* = this.arena.lookup(entry.base_type.id);
+        if (base_t == null || base_t.kind != TypeKind::Enum) { return; }
+        const base_et: EnumType* = base_t as EnumType*;
+
+        // Propagate the explicit discriminant base (`type enum E<T> : i64`) to the
+        // spec so a SIMPLE enum spec lowers its tag at the declared width.
+        if (base_et.discriminant_type.is_valid()) {
+            et.set_discriminant_type(
+                subst.apply(base_et.discriminant_type, this.arena));
+        }
+
+        for (mut i: i64 = 0; i < base_et.variants.length; i++) {
+            const base_variant: EnumVariantInfo* = &base_et.variants[i];
+            mut payload_types: TypeRef[] = [];
+            for (mut j: i64 = 0; j < base_variant.payload_types.length; j++) {
+                const substituted: TypeRef = subst.apply(base_variant.payload_types[j], this.arena);
+                payload_types.push(substituted);
+            }
+            et.add_variant(EnumVariantInfo::new(
+                base_variant.name, payload_types, base_variant.tag_value));
+        }
+    }
+
+    /// Build a concrete FunctionType from a specialized FunctionDeclNode whose
+    /// signature has already been resolved by resolve_specialized_ast().  Returns
+    /// invalid if any signature slot wasn't resolved (defensive).
+    build_function_type_from_ast(mut &this, ast_node: ASTNode*) -> TypeRef {
+        if (ast_node == null) { return TypeRef::invalid(); }
+        const func: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+        if (func == null) { return TypeRef::invalid(); }
+
+        const ret_type: TypeRef = func.resolved_return_type;
+        if (!ret_type.is_valid()) {
+            return TypeRef::invalid();
+        }
+
+        mut param_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param != null && param.resolved_type.is_valid()) {
+                param_types.push(param.resolved_type);
+            } else {
+                return TypeRef::invalid();
+            }
+        }
+
+        return this.arena.get_function(ret_type, param_types, func.is_variadic);
+    }
+}

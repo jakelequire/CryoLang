@@ -1,0 +1,197 @@
+/// SemaState
+///
+/// Per-pass MUTABLE state for the semantic-analysis visitor, factored out of the
+/// main `SemaVisitor` so the `type struct` collaborators (ScopeManager,
+/// CallResolver, SymbolicChecker, ...) can share it by pointer — mirroring how
+/// codegen's `VisitorState` is shared across its sub-emitters.
+///
+/// The IMMUTABLE environment (`arena`, `intern`, `ctx`), the interned-once
+/// `this_sym`, and the by-value `checker` stay owned on `SemaVisitor` and are
+/// handed to collaborators as pointers via `wire()`.  Only state that is reset
+/// or mutated during the walk lives here.
+///
+/// `SemaState::new()` reproduces the original `TypeCheckVisitor` constructor
+/// body minus those env fields.
+///
+/// Leaf component: owns its fields, holds no back-pointers.
+
+namespace Compiler::Sema::State;
+
+import Compiler::Types::TypeRef;
+import Compiler::Diag::SourceSpan;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Declaration;
+import std::collections::hashmap;
+
+type struct SemaState {
+    // -- Per-function locals (reset via ScopeManager.enter_function) --
+    locals:         HashMap<u32, TypeRef>;   // local variable scope (fast path)
+    local_muts:     HashMap<u32, boolean>;   // mutability flag for each local
+    // Span of the declaring `const`/`mut` keyword (top-level locals) or a
+    // zero-width insertion anchor (params declared without `mut`).  E0218
+    // reads this for a precise "replace `const` with `mut`" / "insert `mut`"
+    // quickfix; a missing entry means the explanatory note only.
+    local_kw_spans: HashMap<u32, SourceSpan>;
+    undo_keys:      u32[];                    // scope undo log: keys modified
+    undo_prev:      TypeRef[];                // scope undo log: previous values
+    undo_muts:      boolean[];                // scope undo log: previous mut flags
+    undo_kw_spans:  SourceSpan[];             // scope undo log: previous kw_spans
+
+    // -- Per-function frame --
+    return_type:     TypeRef;                 // current function return type
+    return_type_ann: TypeAnnotation*;         // current return-type annotation (secondary spans)
+    this_type:       TypeRef;                 // current method receiver type (invalid for static)
+    this_is_mut:     boolean;                 // method has `mut &this`
+    // Type whose method body we're inside, regardless of static-ness.  Matches
+    // `this_type` for non-static methods; for static methods `this_type` is
+    // invalid but this still names the owner so visibility checks recognize
+    // `Foo::static_method` as "inside Foo".  Invalid outside any method body.
+    current_owner_type: TypeRef;
+    body_count:      i64;                     // counter for debug output
+
+    // -- Loop/switch nesting (break/continue validation) --
+    loop_depth:   i32;
+    switch_depth: i32;
+
+    // -- Expected-type hint (set by DeclStmt for initializer resolution) --
+    expected_type: TypeRef;
+
+    // -- Match-arm payload binding names (intern ids), per function --
+    // A `match` arm pattern `Variant(p)` binds `p` to a temporary copy of the
+    // matched payload; returning a pointer/reference to `p` dangles once the
+    // function returns.  These ids let the return-escape check reject that
+    // (E0455) instead of miscompiling into a use-after-free.
+    payload_binding_ids: u32[];
+    // The current function's parameter (and `this`) names.  Autoref'd /
+    // caller-backed, so `&param` re-borrows caller storage rather than escaping
+    // a stack slot — the return-escape check flags only `&<body-local>`.
+    param_ids: u32[];
+
+    // -- Closure-capture detection (mutated by LambdaSynth, read by resolve_identifier) --
+    // `in_lambda_depth`: 0 outside any lambda, 1 inside the outermost, deeper
+    // when nested; gates the capture-fallback path so non-lambda calls never pay.
+    // `lambda_outer_locals`: names visible from outside the lambda currently
+    // being checked (enclosing function locals + outer lambdas' captures); a hit
+    // here on a `locals` miss means "free variable, record a capture".
+    // `current_lambda`: the lambda whose body we're walking — the capture sink.
+    in_lambda_depth:     i32;
+    lambda_outer_locals: HashMap<u32, TypeRef>;
+    current_lambda:      LambdaExprNode*;
+
+    // Per-module monotonic counter for synthesised closure-struct names.
+    // Cross-module uniqueness comes from the namespace prefix; never reset.
+    closure_counter: u64;
+    // Dedup closure-arg specialisations of free-function calls.  Key is
+    // `<orig_name_id>|<idx>:<closure_ty_id>...`; value is the SymbolStr.id of the
+    // spec's mangled symbol (placed on `call.resolved_callee`).
+    closure_spec_map: HashMap<string, u32>;
+
+    // Re-entrancy guard for implicit-conversion synthesis: set while re-resolving
+    // a synthesized `converter(arg)` call so its own args don't re-trigger a
+    // conversion attempt (and converter-aware method selection doesn't recurse).
+    in_implicit_conversion: boolean;
+
+    // True when this sema pass runs AFTER monomorphization (authoritative for
+    // codegen): `resolve_expr` re-resolves nodes that already carry a
+    // (possibly-stale, pre-mono) resolved_type so the post-mono pass wins.
+    post_mono_verify: boolean;
+
+    // Monotonic counter for the synthetic bindings introduced when lowering `?`
+    // to a `match` (build_try_desugar); a unique suffix keeps nested `?` readable.
+    try_counter: u32;
+
+    // -- Symbolic generic-body check (mono-after-sema Phase 2) --
+    // Cached gate, read once in `new()`.  ON by default; `CRYO_NO_SYMBOLIC_CHECK`
+    // is the kill-switch.  Zero-as-unread sentinel: 0=unread, 1=off, 2=on.
+    symbolic_check_gate: i32;
+    // True only while a symbolic generic-body walk is in progress.
+    in_symbolic_check: boolean;
+    // Intern ids of the generic-param names in scope for the body under symbolic
+    // check (`T`, `U`); lets body visitors recognize abstract refs and defer.
+    symbolic_generic_param_ids: u32[];
+    // Intern ids of the OWNER type's generic params (the `T` of `Box<T>`); merged
+    // into symbolic_generic_param_ids per body.
+    symbolic_owner_param_ids: u32[];
+    // True while symbolically checking a method of a GENERIC owner: owner-rooted
+    // field/method accesses (`this.field`) are deferred — concrete monos re-check.
+    symbolic_owner_is_generic: boolean;
+    // The OWNER type's generic-param AST nodes (`Box<T>`'s `T`), declaration
+    // order = abstract-param index; carries constraints for BoundedParamType.
+    symbolic_owner_param_nodes: GenericParamNode*[];
+    // The CURRENT method/free-fn's own generic-param AST nodes; separate 0-based
+    // index space from the owner list.
+    symbolic_method_param_nodes: GenericParamNode*[];
+    // The impl block whose method body is currently symbolically walked (the AST
+    // outlives the visitor).  Recovers an in-scope param's where-clause bounds
+    // (`T: Display`) which an abstract receiver type does not carry.
+    symbolic_impl_node: ImplBlockNode*;
+    // The function/method whose body is currently symbolically walked.  A
+    // method/free-fn `where T: Display` clause lands in
+    // `FunctionDeclNode.trait_bounds`, recovered from here for abstract receivers.
+    symbolic_current_func: FunctionDeclNode*;
+    // Telemetry (debug-only): generic bodies walked, and real errors emitted.
+    symbolic_bodies_walked:    i64;
+    symbolic_total_would_emit: i64;
+
+    // -- Recursion seam (Option B side-channel) --
+    // The expression return channel.  `SemaVisitor.resolve_expr` is the
+    // authoritative `match`-on-kind dispatch; each `override visit(SomeExpr*)`
+    // stashes its result here, and a collaborator recursing via
+    // `dispatch.resolve_expr(visitor, child)` reads it back.  Avoids importing
+    // the concrete `SemaVisitor` into collaborators (keeps the graph acyclic),
+    // and avoids touching the live shared `BaseASTVisitor` vtable.
+    last_expr_type: TypeRef;
+
+    static new() -> SemaState {
+        // Read the symbolic-check gate once.  ON by default; the
+        // `CRYO_NO_SYMBOLIC_CHECK` env var is a kill-switch for fast triage.
+        mut gate: i32 = 2;
+        const off: i8* = intrinsics::getenv("CRYO_NO_SYMBOLIC_CHECK") as i8*;
+        if (off != null && intrinsics::strlen(off as string) > 0) {
+            gate = 1;   // off (kill-switch set)
+        }
+
+        return SemaState {
+            locals:         HashMap<u32, TypeRef>::new(),
+            local_muts:     HashMap<u32, boolean>::new(),
+            local_kw_spans: HashMap<u32, SourceSpan>::new(),
+            undo_keys:      [],
+            undo_prev:      [],
+            undo_muts:      [],
+            undo_kw_spans:  [],
+            return_type:     TypeRef::invalid(),
+            return_type_ann: null,
+            this_type:       TypeRef::invalid(),
+            this_is_mut:     false,
+            current_owner_type: TypeRef::invalid(),
+            body_count:      0,
+            loop_depth:   0,
+            switch_depth: 0,
+            expected_type: TypeRef::invalid(),
+            payload_binding_ids: [],
+            param_ids: [],
+            in_lambda_depth:     0,
+            lambda_outer_locals: HashMap<u32, TypeRef>::new(),
+            current_lambda:      null,
+            closure_counter:  0,
+            closure_spec_map: HashMap<string, u32>::new(),
+            in_implicit_conversion: false,
+            post_mono_verify: false,
+            try_counter: 0,
+            symbolic_check_gate: gate,
+            in_symbolic_check:           false,
+            symbolic_generic_param_ids:  [],
+            symbolic_owner_param_ids:    [],
+            symbolic_owner_is_generic:   false,
+            symbolic_owner_param_nodes:  [],
+            symbolic_method_param_nodes: [],
+            symbolic_impl_node:    null,
+            symbolic_current_func: null,
+            symbolic_bodies_walked:    0,
+            symbolic_total_would_emit: 0,
+            last_expr_type: TypeRef::invalid(),
+        };
+    }
+}

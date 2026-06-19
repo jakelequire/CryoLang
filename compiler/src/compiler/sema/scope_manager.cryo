@@ -1,0 +1,180 @@
+/// ScopeManager
+///
+/// Owns the per-function local-variable scope and its undo log.  A lexical
+/// scope is entered by `save_scope()` (returns a checkpoint) and left by
+/// `restore_scope(checkpoint)`, which rolls every binding made since back to
+/// its prior value — restoring shadowed outer-scope bindings exactly.
+///
+/// All state lives on the shared `SemaState` (locals / local_muts /
+/// local_kw_spans + the four parallel undo logs + param_ids /
+/// payload_binding_ids); this collaborator is the single owner of the logic
+/// that reads and mutates it.  No env back-pointers are needed.
+
+namespace Compiler::Sema::ScopeManager;
+
+import Compiler::Types::TypeRef;
+import Compiler::Diag::SourceSpan;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Sema::State;
+import std::collections::hashmap;
+import std::core::option;
+
+type struct ScopeManager {
+    state: SemaState*;
+
+    static null() -> ScopeManager {
+        return ScopeManager { state: null };
+    }
+
+    wire(mut &this, state: SemaState*) -> void {
+        this.state = state;
+    }
+
+
+    // -- Lookup --
+
+    /// The type bound to a local name, or invalid if not a local.
+    lookup_local(&this, name: SymbolStr) -> TypeRef {
+        return match (this.state.locals.get(&name.id)) {
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
+        };
+    }
+
+    /// Whether `name` is a local binding (or parameter) in the current scope.
+    is_local_or_param(&this, name: SymbolStr) -> boolean {
+        return match (this.state.locals.get(&name.id)) {
+            Option::Some(_) => { true }
+            Option::None    => { false }
+        };
+    }
+
+    /// Whether `name` is one of the current function's parameters (or `this`).
+    /// Parameters are autoref'd (caller-backed), so `&param` re-borrows caller
+    /// storage rather than escaping a stack slot.
+    is_param(&this, name: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < this.state.param_ids.length; i++) {
+            if (this.state.param_ids[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `name` is a `match`-arm payload binding.  Such a binding aliases
+    /// a stack temporary, so returning a pointer/reference to it dangles — the
+    /// return-escape check (E0455) consults this.
+    is_payload_binding(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.state.payload_binding_ids.length; i++) {
+            if (this.state.payload_binding_ids[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// A local binding's mutability.  Returns true for unknown names so callers
+    /// don't false-positive on globals or otherwise-tracked symbols.
+    local_is_mutable(&this, name: SymbolStr) -> boolean {
+        return match (this.state.local_muts.get(&name.id)) {
+            Option::Some(v) => { v }
+            Option::None    => { true }
+        };
+    }
+
+
+    // -- Scope save / restore --
+
+    /// Checkpoint the current scope: an index into the undo log that
+    /// `restore_scope` rolls back to.
+    save_scope(&this) -> i64 {
+        return this.state.undo_keys.length;
+    }
+
+    /// Register an immutable (`const`) local, recording any prior binding in the
+    /// undo log so it is restored on scope exit.
+    register_local(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        this.register_local_with_mut(name, ty, false);
+    }
+
+    /// Register a `mut` local.
+    register_local_mut(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        this.register_local_with_mut(name, ty, true);
+    }
+
+    /// Register a local with an explicit mutability flag, pushing the previous
+    /// binding (type, mut flag, keyword span) onto the parallel undo logs.
+    register_local_with_mut(mut &this, name: SymbolStr, ty: TypeRef,
+                            is_mut: boolean) -> void {
+        const key: u32 = name.id;
+
+        this.state.undo_keys.push(key);
+        match (this.state.locals.get(&key)) {
+            Option::Some(val) => { this.state.undo_prev.push(val); }
+            Option::None      => { this.state.undo_prev.push(TypeRef::invalid()); }
+        }
+        match (this.state.local_muts.get(&key)) {
+            Option::Some(prev) => { this.state.undo_muts.push(prev); }
+            Option::None       => { this.state.undo_muts.push(false); }
+        }
+        match (this.state.local_kw_spans.get(&key)) {
+            Option::Some(prev) => { this.state.undo_kw_spans.push(prev); }
+            Option::None       => { this.state.undo_kw_spans.push(SourceSpan::none()); }
+        }
+
+        this.state.locals.insert(key, ty);
+        this.state.local_muts.insert(key, is_mut);
+        // Drop any prior keyword anchor so a stale outer-scope binding's span
+        // doesn't leak into the inner shadowing one; the caller re-attaches via
+        // `record_local_kw_span` when it has a parser-derived span.
+        this.state.local_kw_spans.remove(&key);
+    }
+
+    /// Attach a `const`/`mut` keyword-span anchor to a just-registered local,
+    /// used by E0218 for a precise "replace `const` with `mut`" / "insert `mut`"
+    /// quickfix.  No-op when the span lacks a location.
+    record_local_kw_span(mut &this, name: SymbolStr, kw_span: SourceSpan) -> void {
+        if (!kw_span.has_location()) { return; }
+        this.state.local_kw_spans.insert(name.id, kw_span);
+    }
+
+    /// Roll local bindings back to a checkpoint, restoring shadowed outer-scope
+    /// bindings and truncating the undo log.
+    restore_scope(mut &this, save_point: i64) -> void {
+        // Undo in reverse order.
+        for (mut i: i64 = this.state.undo_keys.length - 1; i >= save_point; i -= 1) {
+            const key: u32 = this.state.undo_keys[i];
+            const prev: TypeRef = this.state.undo_prev[i];
+            const prev_mut: boolean = this.state.undo_muts[i];
+            const prev_kw: SourceSpan = this.state.undo_kw_spans[i];
+            if (prev.is_valid()) {
+                this.state.locals.insert(key, prev);
+                this.state.local_muts.insert(key, prev_mut);
+                if (prev_kw.has_location()) {
+                    this.state.local_kw_spans.insert(key, prev_kw);
+                } else {
+                    this.state.local_kw_spans.remove(&key);
+                }
+            } else {
+                this.state.locals.remove(&key);
+                this.state.local_muts.remove(&key);
+                this.state.local_kw_spans.remove(&key);
+            }
+        }
+
+        // Truncate the undo logs back to the save point.
+        if (save_point < this.state.undo_keys.length) {
+            mut new_keys: u32[] = [];
+            mut new_prev: TypeRef[] = [];
+            mut new_muts: boolean[] = [];
+            mut new_kw_spans: SourceSpan[] = [];
+            for (mut i: i64 = 0; i < save_point; i++) {
+                new_keys.push(this.state.undo_keys[i]);
+                new_prev.push(this.state.undo_prev[i]);
+                new_muts.push(this.state.undo_muts[i]);
+                new_kw_spans.push(this.state.undo_kw_spans[i]);
+            }
+            this.state.undo_keys     = new_keys;
+            this.state.undo_prev     = new_prev;
+            this.state.undo_muts     = new_muts;
+            this.state.undo_kw_spans = new_kw_spans;
+        }
+    }
+}

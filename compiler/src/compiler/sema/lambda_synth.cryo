@@ -1,0 +1,616 @@
+/// LambdaSynth
+///
+/// Lambda typing + closure lowering: resolving a lambda's param/return types and
+/// walking its body in a fresh per-function frame, recording captured names off
+/// the enclosing scope, synthesising a closure struct (+ `__call__`, + `drop` for
+/// non-Copy captures) for a capturing lambda, rewriting `f(args)` to
+/// `f.__call__(args)` when `f` is a closure local, and the Phase-5 free-call
+/// closure-arg specialisation.
+///
+/// `resolve_lambda` walks the body via the dispatch seam, so it takes
+/// `visitor: ASTVisitor*`.  All per-function frame save/restore goes through
+/// `state` (the same alias-and-restore the monolith used, relying on Cryo not
+/// dropping on field reassignment; owning arrays are exchanged via `swap`).
+///
+/// Env (arena/intern/ctx) + peers: state, symbolic (param binding), scopes (local
+/// registration), dispatch (body walk).
+
+namespace Compiler::Sema::LambdaSynth;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Ownership;
+import Compiler::Types::Resolver;
+import Compiler::Types::GenericRegistry;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::AST::Cloner;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::CompilationContext;
+import Compiler::Sema::State;
+import Compiler::Sema::SymbolicChecker;
+import Compiler::Sema::ScopeManager;
+import Compiler::Sema::Dispatch;
+import std::collections::hashmap;
+import std::core::option;
+import std::core::mem;
+import std::fmt;
+
+type struct LambdaSynth {
+    arena:    TypeArena*;
+    intern:   InternTable*;
+    ctx:      CompilationContext*;
+    state:    SemaState*;
+    symbolic: SymbolicChecker*;
+    scopes:   ScopeManager*;
+    dispatch: SemaDispatch*;
+
+    static null() -> LambdaSynth {
+        return LambdaSynth {
+            arena: null, intern: null, ctx: null, state: null,
+            symbolic: null, scopes: null, dispatch: null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+                    state: SemaState*, symbolic: SymbolicChecker*, scopes: ScopeManager*,
+                    dispatch: SemaDispatch*) -> void {
+        this.arena    = arena;
+        this.intern   = intern;
+        this.ctx      = ctx;
+        this.state    = state;
+        this.symbolic = symbolic;
+        this.scopes   = scopes;
+        this.dispatch = dispatch;
+    }
+
+
+    /// Type a lambda: resolve its param/return types, walk its body in a fresh
+    /// per-function frame (capturing free variables), and return either the
+    /// synthesised closure-struct type (capturing) or a function type (non-capturing).
+    resolve_lambda(mut &this, visitor: ASTVisitor*, node: LambdaExprNode*) -> TypeRef {
+        // One-shot guard: a capturing lambda already lowered (post_mono re-walk)
+        // carries its closure-struct type — return it, don't re-lower.
+        if (node.is_capturing() && node.has_resolved_type()
+                && this.is_closure_struct_type(node.resolved_type)) {
+            return node.resolved_type;
+        }
+
+        mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&res_ctx);
+
+        mut param_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null) { continue; }
+            mut pty: TypeRef = p.resolved_type;
+            if (!pty.is_valid() && p.type_annotation != null && this.ctx.type_resolver != null) {
+                pty = this.ctx.type_resolver.resolve(p.type_annotation, &res_ctx);
+                if (pty.is_valid()) { p.resolved_type = pty; }
+            }
+            if (!pty.is_valid()) { pty = this.arena.get_void(); }
+            param_types.push(pty);
+        }
+
+        mut ret_ty: TypeRef = node.return_type;
+        if (!ret_ty.is_valid()) {
+            if (node.return_type_ann != null && this.ctx.type_resolver != null) {
+                ret_ty = this.ctx.type_resolver.resolve(node.return_type_ann, &res_ctx);
+            }
+            if (!ret_ty.is_valid()) { ret_ty = this.arena.get_void(); }
+            node.set_return_type(ret_ty);
+        }
+
+        // Save the enclosing frame, install a fresh one for the lambda body.  See
+        // the monolith's notes: HashMaps alias-and-restore (no drop on reassign);
+        // owning undo/payload arrays start empty and are exchanged via `swap`.
+        const saved_locals:    HashMap<u32, TypeRef>    = this.state.locals;
+        const saved_muts:      HashMap<u32, boolean>    = this.state.local_muts;
+        const saved_kw:        HashMap<u32, SourceSpan> = this.state.local_kw_spans;
+        mut saved_undo_keys: u32[]        = [];
+        mut saved_undo_prev: TypeRef[]    = [];
+        mut saved_undo_muts: boolean[]    = [];
+        mut saved_undo_kw:   SourceSpan[] = [];
+        const saved_ret:       TypeRef         = this.state.return_type;
+        const saved_ret_ann:   TypeAnnotation* = this.state.return_type_ann;
+        const saved_this:      TypeRef         = this.state.this_type;
+        const saved_this_mut:  boolean         = this.state.this_is_mut;
+        mut saved_payload:   u32[]             = [];
+        const saved_expected:  TypeRef         = this.state.expected_type;
+        const saved_loop:      i32             = this.state.loop_depth;
+        const saved_switch:    i32             = this.state.switch_depth;
+        const saved_outer_locals: HashMap<u32, TypeRef> = this.state.lambda_outer_locals;
+        const saved_lambda_depth: i32                   = this.state.in_lambda_depth;
+        const saved_current_lam:  LambdaExprNode*       = this.state.current_lambda;
+
+        // Compose the body's view of out-of-scope bindings: further-out captures
+        // ∪ immediate enclosing locals (the latter shadows the former).
+        mut new_outer_locals: HashMap<u32, TypeRef> = HashMap<u32, TypeRef>::new();
+        mut outer_it: HashMapIter<u32, TypeRef> = saved_outer_locals.iter();
+        loop {
+            match (outer_it.next()) {
+                Option::Some(pair) => { new_outer_locals.insert(pair.first, pair.second); }
+                Option::None => { break; }
+            }
+        }
+        mut local_it: HashMapIter<u32, TypeRef> = saved_locals.iter();
+        loop {
+            match (local_it.next()) {
+                Option::Some(pair) => { new_outer_locals.insert(pair.first, pair.second); }
+                Option::None => { break; }
+            }
+        }
+
+        this.state.locals         = HashMap<u32, TypeRef>::new();
+        this.state.local_muts     = HashMap<u32, boolean>::new();
+        this.state.local_kw_spans = HashMap<u32, SourceSpan>::new();
+        swap(&this.state.undo_keys,     &saved_undo_keys);
+        swap(&this.state.undo_prev,     &saved_undo_prev);
+        swap(&this.state.undo_muts,     &saved_undo_muts);
+        swap(&this.state.undo_kw_spans, &saved_undo_kw);
+        this.state.return_type     = ret_ty;
+        this.state.return_type_ann = node.return_type_ann;
+        this.state.this_type       = TypeRef::invalid();
+        this.state.this_is_mut     = false;
+        swap(&this.state.payload_binding_ids, &saved_payload);
+        this.state.param_ids = [];
+        this.state.expected_type   = TypeRef::invalid();
+        this.state.loop_depth      = 0;
+        this.state.switch_depth    = 0;
+        this.state.lambda_outer_locals = new_outer_locals;
+        this.state.in_lambda_depth     = saved_lambda_depth + 1;
+        this.state.current_lambda      = node;
+
+        for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
+            const p: VarDeclNode* = node.parameters[pi];
+            if (p == null) { continue; }
+            this.scopes.register_local_with_mut(p.name, p.resolved_type, p.is_mutable);
+        }
+
+        if (node.body != null) {
+            this.dispatch.dispatch_stmt(visitor, node.body);
+        }
+
+        // Restore the enclosing frame.
+        this.state.locals         = saved_locals;
+        this.state.local_muts     = saved_muts;
+        this.state.local_kw_spans = saved_kw;
+        swap(&this.state.undo_keys,     &saved_undo_keys);
+        swap(&this.state.undo_prev,     &saved_undo_prev);
+        swap(&this.state.undo_muts,     &saved_undo_muts);
+        swap(&this.state.undo_kw_spans, &saved_undo_kw);
+        this.state.return_type     = saved_ret;
+        this.state.return_type_ann = saved_ret_ann;
+        this.state.this_type       = saved_this;
+        this.state.this_is_mut     = saved_this_mut;
+        swap(&this.state.payload_binding_ids, &saved_payload);
+        this.state.expected_type   = saved_expected;
+        this.state.loop_depth      = saved_loop;
+        this.state.switch_depth    = saved_switch;
+        this.state.lambda_outer_locals = saved_outer_locals;
+        this.state.in_lambda_depth     = saved_lambda_depth;
+        this.state.current_lambda      = saved_current_lam;
+
+        // Nested-capture propagation: an inner lambda's captures not in the outer
+        // lambda's own locals must be captured by the outer lambda too.
+        if (node.is_capturing() && saved_current_lam != null && saved_lambda_depth > 0) {
+            const prop_registry: GenericRegistry* = this.ctx.get_generic_registry();
+            for (mut ci: i64 = 0; ci < node.captured_names.length; ci++) {
+                const cap_name: SymbolStr = node.captured_names[ci];
+                if (!this.scopes.lookup_local(cap_name).is_valid()) {
+                    const cap_ty: TypeRef = node.captured_types[ci];
+                    saved_current_lam.add_capture(cap_name, cap_ty, node.captured_spans[ci]);
+                    if (!OwnershipQuery::is_copy(this.arena, prop_registry, this.intern, cap_ty)) {
+                        saved_current_lam.is_move = true;
+                    }
+                }
+            }
+        }
+
+        if (node.is_capturing()) {
+            return this.synthesize_closure_struct(node);
+        }
+        return this.arena.get_function(ret_ty, param_types, false);
+    }
+
+    /// Record a captured outer binding `outer_ty` for the surrounding lambda
+    /// (non-Copy captures flip `is_move`), shadow it as a per-lambda local, and
+    /// return its type so the referencing identifier resolves.
+    record_lambda_capture(mut &this, ident: IdentifierNode*, outer_ty: TypeRef) -> TypeRef {
+        const is_copy: boolean = OwnershipQuery::is_copy(this.arena,
+            this.ctx.get_generic_registry(), this.intern, outer_ty);
+        if (!is_copy && this.state.current_lambda != null) {
+            this.state.current_lambda.is_move = true;
+        }
+        this.scopes.register_local(ident.name, outer_ty);
+        if (this.state.current_lambda != null) {
+            this.state.current_lambda.add_capture(ident.name, outer_ty, ident.span);
+        }
+        return outer_ty;
+    }
+
+    /// Mint a unique closure type name `<ns>::__Closure_<N>`.
+    mint_closure_name(mut &this) -> SymbolStr {
+        const idx: u64 = this.state.closure_counter;
+        this.state.closure_counter += 1;
+        const ns_str: string = if (this.ctx.has_namespace()) {
+            this.ctx.namespace_display()
+        } else {
+            this.ctx.source_file
+        };
+        return this.intern.intern(format("%s::__Closure_%lld", ns_str, idx as i64));
+    }
+
+    /// Synthesise the closure-struct + `__call__` (+ `drop` for non-Copy captures)
+    /// for a capturing lambda; returns the closure struct's TypeRef.
+    synthesize_closure_struct(mut &this, lambda: LambdaExprNode*) -> TypeRef {
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const intern_ptr: InternTable* = this.intern;
+        const arena_ptr: TypeArena* = this.arena;
+
+        const qual_name: SymbolStr = this.mint_closure_name();
+        const module_sym: SymbolStr = intern_ptr.intern(ctx_ptr.source_file);
+        const span: SourceSpan = lambda.span;
+
+        // 1. StructDeclNode + FieldDeclNodes.
+        mut struct_decl: StructDeclNode* = new StructDeclNode(qual_name, span);
+        struct_decl.repr_c = false;
+        struct_decl.repr_packed = false;
+        struct_decl.repr_transparent = false;
+        struct_decl.min_alignment = 0;
+
+        for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
+            mut field: FieldDeclNode* = new FieldDeclNode(lambda.captured_names[i], span);
+            field.set_visibility(Visibility::Public);
+            field.set_resolved_type(lambda.captured_types[i]);
+            struct_decl.add_field(field);
+        }
+
+        // 2. Arena StructType + fields.
+        const struct_ref: TypeRef = arena_ptr.create_struct(qual_name, module_sym);
+        const struct_t: Type* = arena_ptr.lookup(struct_ref.id);
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut infos: FieldInfo[] = [];
+            for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
+                infos.push(FieldInfo::new(
+                    lambda.captured_names[i], lambda.captured_types[i], true, false, false));
+            }
+            st.set_fields(infos);
+        }
+
+        // 3. `__call__` FunctionDeclNode (implicit receiver).
+        const call_name: SymbolStr = intern_ptr.intern("__call__");
+        mut call_fn: FunctionDeclNode* = new FunctionDeclNode(call_name, span);
+        call_fn.set_resolved_return_type(lambda.return_type);
+        for (mut i: i64 = 0; i < lambda.parameters.length; i++) {
+            call_fn.add_parameter(lambda.parameters[i]);
+        }
+
+        // 4. __call__ body: `{ const cap_i = this.cap_i; <lambda body> }`.
+        mut body_block: BlockStmtNode* = new BlockStmtNode(span);
+        const this_ident_sym: SymbolStr = intern_ptr.intern("this");
+        const cap_registry: GenericRegistry* = this.ctx.get_generic_registry();
+        for (mut i: i64 = 0; i < lambda.captured_names.length; i++) {
+            const cap_name: SymbolStr = lambda.captured_names[i];
+            const cap_ty:   TypeRef   = lambda.captured_types[i];
+
+            mut this_ident: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
+            this_ident.set_resolved_type(struct_ref);
+            mut access: MemberAccessNode* = new MemberAccessNode(
+                this_ident as ExpressionNode*, cap_name, span, span);
+            access.set_resolved_type(cap_ty);
+            mut shadow: VarDeclNode* = new VarDeclNode(cap_name, span);
+            shadow.set_mutable(false);
+            shadow.set_resolved_type(cap_ty);
+            shadow.set_initializer(access as ExpressionNode*);
+            if (lambda.is_move
+                    && !OwnershipQuery::is_copy(arena_ptr, cap_registry, intern_ptr, cap_ty)) {
+                shadow.set_capture_alias(true);
+            }
+            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
+            body_block.add_statement(shadow_stmt as StatementNode*);
+        }
+        if (lambda.body != null) {
+            if (lambda.body.kind == NodeKind::BlockStatement) {
+                const orig_blk: BlockStmtNode* = lambda.body as BlockStmtNode*;
+                for (mut bi: i64 = 0; bi < orig_blk.statements.length; bi++) {
+                    body_block.add_statement(orig_blk.statements[bi]);
+                }
+            } else {
+                body_block.add_statement(lambda.body);
+            }
+        }
+        call_fn.set_body(body_block);
+
+        // 5. MethodNode + attach.
+        mut method: MethodNode* = new MethodNode(call_fn, span);
+        method.set_visibility(Visibility::Public);
+        method.set_static(false);
+        method.set_sink(false);
+        struct_decl.add_method(method);
+
+        // 5b. Synthesize `drop` if any capture is non-Copy.
+        mut drop_method: MethodNode* = null;
+        const registry_ptr: GenericRegistry* = this.ctx.get_generic_registry();
+        mut has_noncopy_capture: boolean = false;
+        for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
+            if (!OwnershipQuery::is_copy(arena_ptr, registry_ptr, intern_ptr, lambda.captured_types[di])) {
+                has_noncopy_capture = true;
+                break;
+            }
+        }
+        if (has_noncopy_capture) {
+            const drop_name: SymbolStr = intern_ptr.intern("drop");
+            mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
+            drop_fn.set_resolved_return_type(arena_ptr.get_void());
+
+            mut drop_body: BlockStmtNode* = new BlockStmtNode(span);
+            for (mut di: i64 = 0; di < lambda.captured_names.length; di++) {
+                const cap_name: SymbolStr = lambda.captured_names[di];
+                const cap_ty:   TypeRef   = lambda.captured_types[di];
+                if (OwnershipQuery::is_copy(arena_ptr, registry_ptr, intern_ptr, cap_ty)) { continue; }
+
+                mut this_id: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
+                this_id.set_resolved_type(struct_ref);
+                mut field_acc: MemberAccessNode* = new MemberAccessNode(
+                    this_id as ExpressionNode*, cap_name, span, span);
+                field_acc.set_resolved_type(cap_ty);
+                mut drop_acc: MemberAccessNode* = new MemberAccessNode(
+                    field_acc as ExpressionNode*, drop_name, span, span);
+                mut drop_call: CallExprNode* = new CallExprNode(drop_acc as ExpressionNode*, span);
+                const drop_stmt: ExprStmtNode* = new ExprStmtNode(drop_call as ExpressionNode*, span);
+                drop_body.add_statement(drop_stmt as StatementNode*);
+            }
+            drop_fn.set_body(drop_body);
+            drop_method = new MethodNode(drop_fn, span);
+            drop_method.set_visibility(Visibility::Public);
+            drop_method.set_static(false);
+            drop_method.set_sink(false);
+            struct_decl.add_method(drop_method);
+        }
+
+        // 6. Populate StructType.methods so overload resolution finds `__call__`/`drop`.
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut method_param_types: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < call_fn.parameters.length; pi++) {
+                const pp: VarDeclNode* = call_fn.parameters[pi];
+                if (pp != null && pp.resolved_type.is_valid()) {
+                    method_param_types.push(pp.resolved_type);
+                }
+            }
+            const call_fn_ty: TypeRef = arena_ptr.get_function(
+                lambda.return_type, method_param_types, false);
+            const minfo: MethodInfo = MethodInfo {
+                name:          call_name,
+                function_type: call_fn_ty,
+                is_public:     true,
+                is_protected:  false,
+                is_static:     false,
+                is_virtual:    false,
+                is_override:   false,
+                param_types:   method_param_types,
+                ast_node:      method as void*,
+            };
+            st.add_method(minfo);
+
+            if (drop_method != null) {
+                mut drop_param_types: TypeRef[] = [];
+                const drop_fn_ty: TypeRef = arena_ptr.get_function(
+                    arena_ptr.get_void(), drop_param_types, false);
+                const drop_minfo: MethodInfo = MethodInfo {
+                    name:          intern_ptr.intern("drop"),
+                    function_type: drop_fn_ty,
+                    is_public:     true,
+                    is_protected:  false,
+                    is_static:     false,
+                    is_virtual:    false,
+                    is_override:   false,
+                    param_types:   drop_param_types,
+                    ast_node:      drop_method as void*,
+                };
+                st.add_method(drop_minfo);
+            }
+        }
+
+        // 7. DeclarationIndex registration.
+        ctx_ptr.decl_index.register_type_with_module(qual_name, struct_ref, module_sym);
+        mut method_arr: MethodNode*[] = [method];
+        if (drop_method != null) { method_arr.push(drop_method); }
+        ctx_ptr.decl_index.register_methods_with_module(
+            qual_name, method_arr, module_sym, intern_ptr, arena_ptr);
+
+        // 8. Inject into ProgramNode so subsequent passes walk it.
+        if (ctx_ptr.artifacts.ast.root != null) {
+            ctx_ptr.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+        }
+
+        return struct_ref;
+    }
+
+    /// True when `ty` is a struct carrying a `__call__` method (a closure type).
+    is_closure_struct_type(mut &this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::Struct) { return false; }
+        const st: StructType* = t as StructType*;
+        return st.get_method(this.intern.intern("__call__")) != null;
+    }
+
+    /// If `call.callee` is a closure-struct local, rewrite `f(args)` to
+    /// `f.__call__(args)` in place.
+    maybe_rewrite_closure_call(mut &this, call: CallExprNode*) -> void {
+        if (call == null || call.callee == null) { return; }
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn.kind != NodeKind::Identifier) { return; }
+        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+        const local_ty: TypeRef = this.scopes.lookup_local(ident.name);
+        if (!this.is_closure_struct_type(local_ty)) { return; }
+        ident.set_resolved_type(local_ty);
+        const call_sym: SymbolStr = this.intern.intern("__call__");
+        mut access: MemberAccessNode* = new MemberAccessNode(
+            call.callee, call_sym, ident.span, ident.span);
+        call.callee = access as ExpressionNode*;
+    }
+
+    /// Phase 5: when a call passes capturing closures to fn-typed params of a
+    /// non-generic free function, synthesise a spec'd clone whose params are typed
+    /// as the concrete closure-struct, inject it, and pin `call.resolved_callee`.
+    try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
+        if (call == null || ident == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (call.generic_args.length > 0) { return; }
+
+        mut callee_fn_ref: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
+        if (!callee_fn_ref.is_valid()) {
+            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            if (!qual.equals(ident.name)) {
+                callee_fn_ref = this.ctx.decl_index.lookup_func_type(qual);
+            }
+        }
+        if (!callee_fn_ref.is_valid()) { return; }
+
+        const ft_raw: Type* = this.arena.lookup(callee_fn_ref.id);
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
+        const ft: FunctionType* = ft_raw as FunctionType*;
+        if (ft.is_variadic) { return; }
+        if (ft.param_types.length != call.arguments.length) { return; }
+
+        mut sub_indices: i64[] = [];
+        mut sub_types:   TypeRef[] = [];
+        for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+            const p_t: Type* = this.arena.lookup(ft.param_types[i].id);
+            if (p_t == null || p_t.kind != TypeKind::Function) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (!this.is_closure_struct_type(arg.resolved_type)) { continue; }
+            sub_indices.push(i);
+            sub_types.push(arg.resolved_type);
+        }
+        if (sub_indices.length == 0) { return; }
+
+        mut key: string = format("%u", ident.name.id);
+        for (mut ki: i64 = 0; ki < sub_indices.length; ki++) {
+            key = format("%s|%lld:%llu", key, sub_indices[ki], sub_types[ki].id);
+        }
+        match (this.state.closure_spec_map.get(&key)) {
+            Option::Some(prior) => {
+                call.set_resolved_callee(SymbolStr::from_id(prior));
+                return;
+            }
+            Option::None => { /* fall through */ }
+        }
+
+        mut orig_func: FunctionDeclNode* = this.find_top_level_function(ident.name);
+        if (orig_func == null) {
+            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            if (!qual.equals(ident.name)) {
+                orig_func = this.find_top_level_function(qual);
+            }
+        }
+        if (orig_func == null) { return; }
+        if (orig_func.is_generic()) { return; }
+        if (orig_func.body == null) { return; }
+
+        mut cloner: ASTCloner = ASTCloner();
+        const cloned_node: ASTNode* = cloner.clone_node(orig_func as ASTNode*);
+        if (cloned_node == null) { return; }
+        if (cloned_node.kind != NodeKind::FunctionDeclaration) { return; }
+        mut spec_func: FunctionDeclNode* = cloned_node as FunctionDeclNode*;
+
+        for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
+            mut p: VarDeclNode* = spec_func.parameters[i];
+            if (p == null) { continue; }
+            mut sub_ty: TypeRef = TypeRef::invalid();
+            for (mut si: i64 = 0; si < sub_indices.length; si++) {
+                if (sub_indices[si] == i) { sub_ty = sub_types[si]; break; }
+            }
+            if (sub_ty.is_valid()) {
+                p.set_resolved_type(sub_ty);
+            } else if (i < orig_func.parameters.length
+                    && orig_func.parameters[i] != null
+                    && orig_func.parameters[i].resolved_type.is_valid()) {
+                p.set_resolved_type(orig_func.parameters[i].resolved_type);
+            }
+        }
+        spec_func.set_resolved_return_type(orig_func.resolved_return_type);
+
+        const spec_name: SymbolStr = this.mint_closure_spec_name(orig_func.name, sub_types);
+        spec_func.set_name(spec_name);
+
+        if (this.ctx.artifacts.ast.root != null) {
+            this.ctx.artifacts.ast.root.add_statement(spec_func as ASTNode*);
+        }
+
+        const qualified_spec: SymbolStr = this.ctx.qualify_symbol_sym(spec_name);
+        mut spec_param_types: TypeRef[] = [];
+        for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
+            spec_param_types.push(spec_func.parameters[i].resolved_type);
+        }
+        const mangled: MangledName = MangledName::for_free_function(
+            this.intern, this.arena,
+            QualifiedName::from_symbol(qualified_spec),
+            spec_param_types, spec_func.resolved_return_type, false);
+        call.set_resolved_callee(mangled.value);
+        this.state.closure_spec_map.insert(key, mangled.value.id);
+    }
+
+    /// Linear scan for a top-level FunctionDeclNode named `name`.
+    find_top_level_function(&this, name: SymbolStr) -> FunctionDeclNode* {
+        if (this.ctx.artifacts.ast.root == null) { return null; }
+        const stmts: &ASTNode*[] = &this.ctx.artifacts.ast.root.statements;
+        for (mut i: i64 = 0; i < stmts.length; i++) {
+            const s: ASTNode* = stmts[i];
+            if (s == null) { continue; }
+            if (s.kind != NodeKind::FunctionDeclaration) { continue; }
+            const fn: FunctionDeclNode* = s as FunctionDeclNode*;
+            if (fn.name.id == name.id) { return fn; }
+        }
+        return null;
+    }
+
+    /// Mint a stable spec name `<orig>__cl_<ty1>_<ty2>_...` for a closure-arg spec.
+    mint_closure_spec_name(mut &this, orig: SymbolStr, closure_tys: TypeRef[]) -> SymbolStr {
+        mut s: string = this.intern.resolve(orig);
+        s = format("%s__cl", s);
+        for (mut i: i64 = 0; i < closure_tys.length; i++) {
+            s = format("%s_%llu", s, closure_tys[i].id);
+        }
+        return this.intern.intern(s);
+    }
+
+    /// Emit E0458 for each closure-struct argument to a method / scope call (v1.0
+    /// routes closures through free-function `(Args) -> Ret` params only).
+    reject_closure_struct_args_in_non_free_call(mut &this, call: CallExprNode*,
+                                                context_msg: string) -> void {
+        if (call == null) { return; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (!this.is_closure_struct_type(arg.resolved_type)) { continue; }
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0458_CLOSURE_ARG_NON_FREE,
+                format("%s is not yet supported", context_msg));
+            diag = diag.at_with_label(arg.span, "this is a capturing closure (anonymous struct value)");
+            diag = diag.with_note(
+                "v1.0 routes capturing closures through free-function `(Args) -> Ret` parameters only; method-call and scope-resolution-call closure parameters are deferred");
+            diag = diag.with_note(
+                "workaround: pull the call out into a free function, or pre-extract the closure into a fn-pointer if the capture set is empty");
+            this.ctx.emit_diagnostic(diag);
+        }
+    }
+}

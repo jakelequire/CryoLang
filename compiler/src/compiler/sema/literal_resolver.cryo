@@ -1,0 +1,130 @@
+/// LiteralResolver
+///
+/// Types literal expressions and answers the literal-shape questions the call /
+/// binary resolvers ask.  Integer and float literals are width-polymorphic: when
+/// a concrete `expected_type` is in scope they adopt it (with an overflow check);
+/// otherwise they fall back to the canonical default width.
+///
+/// This collaborator owns the *single* literal-default rule.  The width→bound
+/// mapping and the default-width selection both live in `Helpers`
+/// (`sema_int_unsigned_bound` / `sema_default_int_type`) so there is one source
+/// of truth, not the copies the monolith carried.
+
+namespace Compiler::Sema::LiteralResolver;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Lex;
+import Compiler::AST;
+import Compiler::AST::Expression;
+import Compiler::Diag;
+import Compiler::CompilationContext;
+import Compiler::Sema::State;
+import Compiler::Sema::Helpers;
+import std::fmt;
+
+type struct LiteralResolver {
+    arena: TypeArena*;
+    ctx:   CompilationContext*;
+    state: SemaState*;
+
+    static null() -> LiteralResolver {
+        return LiteralResolver { arena: null, ctx: null, state: null };
+    }
+
+    wire(mut &this, arena: TypeArena*, ctx: CompilationContext*, state: SemaState*) -> void {
+        this.arena = arena;
+        this.ctx   = ctx;
+        this.state = state;
+    }
+
+    /// Type a literal of any kind.
+    resolve_literal(&this, lit: LiteralNode*) -> TypeRef {
+        return match (lit.literal_kind) {
+            LiteralKind::Integer => { this.resolve_integer_literal(lit) }
+            LiteralKind::Float   => { this.resolve_float_literal(lit) }
+            LiteralKind::String  => { this.arena.get_string() }
+            LiteralKind::Char    => { this.arena.get_char() }
+            LiteralKind::Boolean => { this.arena.get_bool() }
+            LiteralKind::Null    => {
+                // Type `null` as `void*` (Pointer to Void) rather than bare Void:
+                // the `void* <-> T*` rule in TypeChecker handles assignment to any
+                // concrete pointer type without a dedicated `void -> Pointer`
+                // widening, preserving null semantics without letting arbitrary
+                // void-typed expressions widen.
+                this.arena.get_pointer_to(this.arena.get_void())
+            }
+        };
+    }
+
+    /// Type an integer literal.  Adopts an integer `expected_type` (bounds-checked
+    /// against its width); otherwise falls back to the default width.
+    resolve_integer_literal(&this, lit: LiteralNode*) -> TypeRef {
+        if (this.state.expected_type.is_valid()) {
+            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp != null && exp.kind == TypeKind::Int) {
+                const it: IntType* = exp as IntType*;
+                // Bound the literal by what fits in the target's bit width (its
+                // unsigned max).  Catches genuine overflow (`u8 = 99999999`) while
+                // admitting two's-complement bit-pattern initializers up to the
+                // width.  128-bit bounds exceed u64, so they are left unchecked
+                // (sema_int_unsigned_bound returns 0 there).
+                const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+                if (max_mag != 0 && int_literal_exceeds(lit.value, max_mag)) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0010_NUMBER_TOO_LARGE,
+                        format("integer literal `%s` is out of range for type `%s`",
+                            lit.value, it.int_kind.to_string()),
+                        lit.span);
+                }
+                return this.state.expected_type;
+            }
+        }
+        // No integer expected-type hint: pick the narrowest default width that
+        // holds the literal's magnitude (i32 -> i64 -> u64).
+        return sema_default_int_type(this.arena, lit.value);
+    }
+
+    /// Type a float literal: adopt a float `expected_type`, else default to f64.
+    resolve_float_literal(&this, lit: LiteralNode*) -> TypeRef {
+        if (this.state.expected_type.is_valid()) {
+            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp != null && exp.kind == TypeKind::Float) {
+                return this.state.expected_type;
+            }
+        }
+        return this.arena.get_f64();
+    }
+
+    /// Whether the current `expected_type` hint is a concrete integer type (so a
+    /// literal/constant being resolved would already adopt it).
+    expected_type_is_int_type(&this) -> boolean {
+        if (!this.state.expected_type.is_valid()) { return false; }
+        const e: Type* = this.arena.lookup(this.state.expected_type.id);
+        return e != null && e.kind == TypeKind::Int;
+    }
+
+    /// Whether an integer-literal argument fits the target integer type's width.
+    int_literal_fits_target(&this, arg: ExpressionNode*, target: TypeRef) -> boolean {
+        if (!is_numeric_literal_expr(arg)) { return false; }
+        const lit: LiteralNode* = arg as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        const t: Type* = this.arena.lookup(target.id);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        const it: IntType* = t as IntType*;
+        const max_mag: u64 = sema_int_unsigned_bound(it.int_kind.bit_width());
+        if (max_mag == 0) { return false; }
+        return !int_literal_exceeds(lit.value, max_mag);
+    }
+
+    /// True when `ty` resolves to a signed integer type.  Decides whether a
+    /// negative numeric-literal argument may adopt a parameter's type: a SIGNED
+    /// slot is the i64::MIN-width fix; an UNSIGNED slot would turn `-1` huge.
+    is_signed_int_type(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::Int) { return false; }
+        return (t as IntType*).int_kind.is_signed();
+    }
+}

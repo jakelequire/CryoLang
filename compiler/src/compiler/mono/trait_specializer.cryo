@@ -1,0 +1,521 @@
+/// Mono Trait Specializer  (Compiler::Mono::TraitSpecializer)
+///
+/// Trait-impl conditional instantiation for the monomorphizer: where-bound
+/// derivation/binding, associated-type projection reduction, and bounds-violation
+/// filtering of impls/methods.  Trait-satisfaction queries themselves forward to
+/// the standalone `TraitChecker` (shared with sema).
+///
+/// Plain `type struct` collaborator: env back-pointers + a `TraitChecker*`, set by
+/// `wire()`.  Holds no worklist/cache state (it never enqueues), so it takes no
+/// `MonoState`.
+
+namespace Compiler::Mono::TraitSpecializer;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::Types::Generic;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Substitution;
+import Compiler::Types::Resolver;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
+import Compiler::Types::TraitChecker;
+import Compiler::Types::Monomorphizer;   // mono_type_contains_generic_param (types-rooted)
+import Compiler::AST::Substituter;
+import Compiler::Diag::Sink;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+
+
+type struct MonoTraitSpecializer {
+    arena:            TypeArena*;
+    generic_registry: GenericRegistry*;
+    intern_table:     InternTable*;
+    diagnostics:      DiagnosticSink*;
+    type_resolver:    TypeResolver*;
+    trait_checker:    TraitChecker*;
+
+    static null() -> MonoTraitSpecializer {
+        return MonoTraitSpecializer {
+            arena:            null,
+            generic_registry: null,
+            intern_table:     null,
+            diagnostics:      null,
+            type_resolver:    null,
+            trait_checker:    null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,
+                    intern_table: InternTable*, diagnostics: DiagnosticSink*,
+                    type_resolver: TypeResolver*, trait_checker: TraitChecker*) -> void {
+        this.arena            = arena;
+        this.generic_registry = generic_registry;
+        this.intern_table     = intern_table;
+        this.diagnostics      = diagnostics;
+        this.type_resolver    = type_resolver;
+        this.trait_checker    = trait_checker;
+    }
+
+
+    bind_trait_args_for_spec_impl(mut &this, impl_node: ImplBlockNode*,
+                                   res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || !impl_node.is_trait_impl()) { return; }
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return; }
+
+        // Extract concrete args.  Mirrors TypeResolutionPasses::extract_trait_args.
+        mut trait_args: TypeAnnotation*[] = [];
+        match (*trait_ann) {
+            TypeAnnotation::Generic(g) => { trait_args = g.args; }
+            _ => { return; }
+        }
+        if (trait_args.length == 0) { return; }
+
+        // Extract the trait's bare leaf name to look up its decl.
+        mut trait_leaf: SymbolStr = SymbolStr::empty();
+        match (*trait_ann) {
+            TypeAnnotation::Named(n) => { trait_leaf = n.name; }
+            TypeAnnotation::Generic(g) => {
+                match (*g.base) {
+                    TypeAnnotation::Named(n) => { trait_leaf = n.name; }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if (!trait_leaf.is_valid()) { return; }
+        if (this.generic_registry == null) { return; }
+        const trait_decl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_leaf);
+        if (trait_decl == null) { return; }
+        if (trait_decl.generic_params.length != trait_args.length) { return; }
+
+        for (mut i: i64 = 0; i < trait_args.length; i++) {
+            const gp: GenericParamNode* = trait_decl.generic_params[i];
+            if (gp == null) { continue; }
+            const arg_ty: TypeRef = this.type_resolver.resolve(trait_args[i], res_ctx);
+            if (!arg_ty.is_valid()) { continue; }
+            res_ctx.add_binding(gp.name, arg_ty);
+        }
+    }
+
+    /// Given a concrete type `subject` (e.g. `Range<i32>`) and a bare trait leaf
+    /// name (e.g. `Iterator`), return the concrete trait args of `subject`'s impl
+    /// of that trait (e.g. `[i32]`).  Empty on any failure.
+    concrete_trait_args_for(mut &this, subject_in: TypeRef,
+                            trait_leaf: SymbolStr) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (this.generic_registry == null || this.type_resolver == null) { return out; }
+        // The monomorphizer often binds a where-clause param straight to the
+        // concrete spec'd Struct/Class/Enum rather than its InstantiatedType
+        // wrapper.  Recover the wrapper first (mirrors `type_implements_trait`).
+        mut subject: TypeRef = subject_in;
+        const subj_t: Type* = this.arena.lookup(subject_in.id);
+        if (subj_t != null
+                && (subj_t.kind == TypeKind::Struct
+                    || subj_t.kind == TypeKind::Class
+                    || subj_t.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, subject_in);
+            if (wrapper.is_valid()) { subject = wrapper; }
+        }
+        const base_name: SymbolStr = this.bare_name_of(subject);
+        if (!base_name.is_valid()) { return out; }
+        const impl_node: ImplBlockNode* =
+            this.generic_registry.lookup_trait_impl(trait_leaf, base_name);
+        if (impl_node == null) { return out; }
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return out; }
+
+        mut ctx: ResolutionContext = ResolutionContext::new("", "");
+        const st: Type* = this.arena.lookup(subject.id);
+        if (st != null && st.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = st as InstantiatedType*;
+            // Bind the struct's OWN params from the TARGET args, not the full
+            // generic-param list (a where-clause can introduce extra generics).
+            mut subst: TypeSubstitution = TypeSubstitution::empty();
+            if (impl_node.target_args.length == inst.type_args.length) {
+                for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
+                    const ta: TypeAnnotation* = impl_node.target_args[i];
+                    if (ta == null) { continue; }
+                    match (*ta) {
+                        TypeAnnotation::Named(n) => {
+                            ctx.add_binding(n.name, inst.type_args[i]);
+                            const gp_ref: TypeRef =
+                                this.arena.create_generic_param(n.name, i as u64);
+                            subst.add(gp_ref.id, inst.type_args[i]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Derive any where-clause-introduced generic the struct args don't
+            // determine (e.g. `A` in `implement<I,A> Iterator<A> for TakeIter<I>
+            // where I: Iterator<A>`).
+            this.derive_impl_where_generics(impl_node, &subst, &ctx);
+        }
+
+        match (*trait_ann) {
+            TypeAnnotation::Generic(g) => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    out.push(this.type_resolver.resolve(g.args[i], &ctx));
+                }
+            }
+            _ => {}
+        }
+        return out;
+    }
+
+    /// Reduce an associated-type projection over a CONCRETE base to its member
+    /// type: `Range<i32>::Item` -> `i32`.  Returns invalid when the base is still
+    /// symbolic or no such impl/binding exists.
+    resolve_concrete_projection(mut &this, base_ty: TypeRef, member: SymbolStr) -> TypeRef {
+        if (this.generic_registry == null) { return TypeRef::invalid(); }
+        const bt: Type* = this.arena.lookup(base_ty.id);
+        if (bt == null) { return TypeRef::invalid(); }
+        // Only concrete bases reduce here; a generic-param / still-symbolic base
+        // stays a projection (resolved at a later/outer specialization).
+        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam
+                || bt.kind == TypeKind::AssocProjection) {
+            return TypeRef::invalid();
+        }
+        for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
+            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
+            if (tdecl == null) { continue; }
+            // Position of `member` among the trait's associated types.
+            mut assoc_pos: i64 = -1;
+            for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
+                if (tdecl.assoc_types[a] != null
+                        && tdecl.assoc_types[a].name.equals(member)) {
+                    assoc_pos = a;
+                    break;
+                }
+            }
+            if (assoc_pos < 0) { continue; }
+            // Positional-sugar index: declared generic params come first in the
+            // trait-arg list, then the associated types.
+            const idx: i64 = tdecl.generic_params.length + assoc_pos;
+            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, tdecl.name);
+            if (idx < args.length && args[idx].is_valid()) {
+                return args[idx];
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Recursively replace concrete-base associated-type projections in `ty` with
+    /// their member type (`Option<Range<i32>::Item>` -> `Option<i32>`), caching
+    /// the result on each `AssocProjectionType`.
+    reduce_projections(mut &this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return ty; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
+                const base: TypeRef = this.reduce_projections(proj.base);
+                const reduced: TypeRef = this.resolve_concrete_projection(base, proj.member);
+                if (reduced.is_valid()) {
+                    proj.set_resolved_type(reduced);
+                    return reduced;
+                }
+                return ty;
+            }
+            TypeKind::Pointer => {
+                const p: PointerType* = t as PointerType*;
+                const inner: TypeRef = this.reduce_projections(p.pointee);
+                if (inner.equals(p.pointee)) { return ty; }
+                return this.arena.get_pointer_to(inner);
+            }
+            TypeKind::Reference => {
+                const r: ReferenceType* = t as ReferenceType*;
+                const inner: TypeRef = this.reduce_projections(r.referent);
+                if (inner.equals(r.referent)) { return ty; }
+                return this.arena.get_reference_to(inner, r.mutability);
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = t as ArrayType*;
+                const inner: TypeRef = this.reduce_projections(a.element);
+                if (inner.equals(a.element)) { return ty; }
+                return this.arena.get_array_of(inner, a.size);
+            }
+            TypeKind::Optional => {
+                const o: OptionalType* = t as OptionalType*;
+                const inner: TypeRef = this.reduce_projections(o.wrapped);
+                if (inner.equals(o.wrapped)) { return ty; }
+                return this.arena.get_optional_of(inner);
+            }
+            TypeKind::Function => {
+                const f: FunctionType* = t as FunctionType*;
+                const new_ret: TypeRef = this.reduce_projections(f.return_type);
+                mut changed: boolean = !new_ret.equals(f.return_type);
+                mut new_params: TypeRef[] = [];
+                for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                    const np: TypeRef = this.reduce_projections(f.param_types[i]);
+                    new_params.push(np);
+                    if (!np.equals(f.param_types[i])) { changed = true; }
+                }
+                if (!changed) { return ty; }
+                return this.arena.get_function(new_ret, new_params, f.is_variadic);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                mut changed_t: boolean = false;
+                mut new_elems: TypeRef[] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    const ne: TypeRef = this.reduce_projections(tup.elements[i]);
+                    new_elems.push(ne);
+                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
+                }
+                if (!changed_t) { return ty; }
+                return this.arena.get_tuple(new_elems);
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                mut changed_i: boolean = false;
+                mut new_args: TypeRef[] = [];
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    const na: TypeRef = this.reduce_projections(inst.type_args[i]);
+                    new_args.push(na);
+                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
+                }
+                if (!changed_i) { return ty; }
+                return this.arena.create_instantiation(inst.generic_base, new_args);
+            }
+            _ => { return ty; }
+        }
+    }
+
+    /// Bind impl-introduced generic params that the Self type doesn't determine
+    /// (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I> where I: Iterator<A>`)
+    /// into `res_ctx`, by resolving each where-bound against the concrete subject.
+    derive_impl_where_generics(mut &this, impl_node: ImplBlockNode*,
+                               subst: TypeSubstitution*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || subst == null) { return; }
+        if (impl_node.where_bounds.length == 0) { return; }
+        for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
+            const bound: TraitBound* = &impl_node.where_bounds[bi];
+            const subject: TypeRef = this.lookup_subst_for_param(
+                bound.type_parameter, subst);
+            if (!subject.is_valid()) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: TraitRef* = &bound.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const concrete_args: TypeRef[] =
+                    this.concrete_trait_args_for(subject, trait_leaf);
+                if (concrete_args.length != tr.type_args.length) { continue; }
+                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                    const ta: TypeAnnotation* = tr.type_args[ai];
+                    if (ta == null) { continue; }
+                    this.bind_where_arg_param(ta, concrete_args[ai], subst, res_ctx);
+                }
+            }
+        }
+    }
+
+    /// Snapshot the concrete generic bindings accumulated in `res_ctx` onto the
+    /// spec'd impl node, so a self-returning default specialized later can recover
+    /// the trait element it doesn't carry as a struct parameter.  Only
+    /// fully-concrete bindings are kept.
+    cache_derived_trait_params(mut &this, impl_node: ImplBlockNode*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || res_ctx == null) { return; }
+        for (mut i: i64 = 0; i < res_ctx.generic_bindings.length; i++) {
+            const name: SymbolStr = res_ctx.generic_bindings[i].first;
+            const ty: TypeRef = res_ctx.generic_bindings[i].second;
+            if (!ty.is_valid()) { continue; }
+            if (mono_type_contains_generic_param(this.arena, ty)) { continue; }
+            if (impl_node.lookup_derived_param(name).is_valid()) { continue; }
+            impl_node.add_derived_param(name, ty);
+        }
+    }
+
+    /// Rewrite the impl's where-bound-derived generics (cached on the spec'd impl)
+    /// inside its method BODIES, by re-running `ASTTypeSubstituter` over each body
+    /// with a `name -> concrete` substitution.  Signatures are deliberately NOT
+    /// touched (they already resolve concretely through `res_ctx`); self-returning
+    /// defaults are skipped (specialized lazily per call site).
+    substitute_derived_params_in_method_bodies(mut &this, decl: ImplBlockNode*) -> void {
+        if (decl == null) { return; }
+        if (decl.derived_param_names.length == 0) { return; }
+        mut arg_displays: SymbolStr[] = [];
+        mut param_ids: u64[] = [];
+        for (mut i: i64 = 0; i < decl.derived_param_names.length; i++) {
+            const ty: TypeRef = decl.derived_param_types[i];
+            mut display: string = "";
+            const arg_t: Type* = this.arena.lookup(ty.id);
+            if (arg_t != null) {
+                const qname: SymbolStr = this.arena.get_qualified_name(ty);
+                if (qname.is_valid()) {
+                    display = this.intern_table.resolve(qname);
+                } else {
+                    display = this.arena.format_display(arg_t);
+                }
+            } else {
+                display = format("unknown_%llu", ty.id);
+            }
+            arg_displays.push(this.intern_table.intern(display));
+            const gp_ref: TypeRef = this.arena.create_generic_param(
+                decl.derived_param_names[i], i as u64);
+            param_ids.push(gp_ref.id);
+        }
+        const subst_val: TypeSubstitution = TypeSubstitution::from_params(
+            &param_ids, &decl.derived_param_types);
+        // Heap-allocate the subst: ASTTypeSubstituter holds the pointer and
+        // attaches `pre_resolved` TypeRefs that outlive this call.
+        const subst_ptr: TypeSubstitution* =
+            malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
+        *subst_ptr = subst_val;
+        const empty_sym: SymbolStr = SymbolStr::empty();
+        // Copy the node's derived names: the substituter constructor moves
+        // `param_names`, and the node keeps owning its `derived_param_names`.
+        mut pnames: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < decl.derived_param_names.length; i++) {
+            pnames.push(decl.derived_param_names[i]);
+        }
+        mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
+            subst_ptr, this.arena, this.intern_table,
+            empty_sym, empty_sym,
+            pnames, arg_displays);
+        for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
+            const method: MethodNode* = decl.methods[mi];
+            if (method == null || method.func == null) { continue; }
+            if (method.func.is_self_returning_default) { continue; }
+            if (method.func.body == null) { continue; }
+            (method.func.body as ASTNode*).accept(substituter);
+        }
+    }
+
+    /// Bind a where-bound trait-arg annotation against a concrete trait arg,
+    /// descending through pointer/reference wrappers so a param that appears only
+    /// *inside* a pointer can still be recovered.
+    bind_where_arg_param(mut &this, ta: TypeAnnotation*, concrete: TypeRef,
+                         subst: TypeSubstitution*,
+                         res_ctx: ResolutionContext*) -> void {
+        if (ta == null || !concrete.is_valid()) { return; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                if (this.lookup_subst_for_param(n.name, subst).is_invalid()
+                        && res_ctx.lookup_binding(n.name).is_invalid()) {
+                    res_ctx.add_binding(n.name, concrete);
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                const inner: TypeRef = this.peel_pointer_pointee(concrete);
+                if (inner.is_valid()) {
+                    this.bind_where_arg_param(p.inner, inner, subst, res_ctx);
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                const inner: TypeRef = this.peel_reference_referent(concrete);
+                if (inner.is_valid()) {
+                    this.bind_where_arg_param(r.inner, inner, subst, res_ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pointee of a concrete pointer TypeRef, or invalid if not a pointer.
+    peel_pointer_pointee(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty != null && ty.kind == TypeKind::Pointer) {
+            return (ty as PointerType*).pointee;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Referent of a concrete reference TypeRef, or invalid if not a ref.
+    peel_reference_referent(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty != null && ty.kind == TypeKind::Reference) {
+            return (ty as ReferenceType*).referent;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Check that every TraitBound in `bounds` has a registered trait-impl for the
+    /// substituted concrete type.  Forwards to the standalone `TraitChecker`.
+    bounds_satisfied(&this, bounds: &TraitBound[], subst: TypeSubstitution*) -> boolean {
+        return this.trait_checker.bounds_satisfied(bounds, subst);
+    }
+
+    /// Drop methods whose own where-bounds aren't satisfied by `subst` from the
+    /// spec'd type's inherent-method list.  In-place on Struct/Class AST nodes.
+    filter_bounds_violating_methods(mut &this, ast_node: ASTNode*,
+                                     subst: TypeSubstitution*) -> void {
+        if (ast_node == null) { return; }
+        if (ast_node.kind == NodeKind::StructDeclaration) {
+            const decl: StructDeclNode* = ast_node as StructDeclNode*;
+            decl.methods = this.filter_methods(decl.methods, subst);
+        } else if (ast_node.kind == NodeKind::ClassDeclaration) {
+            const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
+            decl.methods = this.filter_methods(decl.methods, subst);
+        }
+    }
+
+    /// Drop bounds-violating impls entirely; for surviving impls, drop any methods
+    /// whose own where-bounds don't hold.  Returns the pruned impl-AST array.
+    filter_bounds_violating_impls(mut &this, impl_asts: &ASTNode*[],
+                                   subst: TypeSubstitution*) -> ASTNode*[] {
+        mut kept: ASTNode*[] = [];
+        for (mut i: i64 = 0; i < impl_asts.length; i++) {
+            const impl_ast: ASTNode* = impl_asts[i];
+            const impl_node: ImplBlockNode* = impl_ast as ImplBlockNode*;
+            if (impl_node == null) { continue; }
+            if (!this.bounds_satisfied(impl_node.where_bounds, subst)) {
+                continue;
+            }
+            impl_node.methods = this.filter_methods(impl_node.methods, subst);
+            kept.push(impl_ast);
+        }
+        return kept;
+    }
+
+    /// Keep only methods whose per-method where-bounds are satisfied by `subst`.
+    filter_methods(&this, methods: &MethodNode*[],
+                    subst: TypeSubstitution*) -> MethodNode*[] {
+        mut kept: MethodNode*[] = [];
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!this.method_bounds_satisfied(m.func, subst)) {
+                continue;
+            }
+            kept.push(m);
+        }
+        return kept;
+    }
+
+    /// Check that every `where`-clause TraitBound on `func` has a registered impl
+    /// for the substituted type.  Forwards to the standalone `TraitChecker`.
+    method_bounds_satisfied(&this, func: FunctionDeclNode*,
+                            subst: TypeSubstitution*) -> boolean {
+        return this.trait_checker.method_bounds_satisfied(func, subst);
+    }
+
+    /// Recursively check whether a concrete TypeRef implements a trait.  Forwards
+    /// to the standalone `TraitChecker`.
+    type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
+        return this.trait_checker.type_implements_trait(ty, trait_name, depth);
+    }
+
+    /// Find the substituted concrete TypeRef for a generic param by name.
+    lookup_subst_for_param(&this, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
+        return this.trait_checker.lookup_subst_for_param(name, subst);
+    }
+
+    /// Return the bare (unqualified) leaf name of a TypeRef.
+    bare_name_of(&this, ty: TypeRef) -> SymbolStr {
+        return this.trait_checker.bare_name_of(ty);
+    }
+}

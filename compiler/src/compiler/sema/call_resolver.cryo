@@ -1,0 +1,2794 @@
+/// CallResolver
+///
+/// The call-expression resolution core: the central `resolve_call` dispatcher
+/// (closure-call rewrite → arg resolution with expected-type propagation →
+/// auto-ref → identifier / method / scope dispatch), free-function overload
+/// resolution + arity/arg-type checking + implicit-converter synthesis, generic
+/// free-call inference (the Pass-A/B/C keystone that types a generic call
+/// concretely pre-mono and stashes its bindings), instance-method overload
+/// resolution + return typing, and the scope-resolution (`Type::method` /
+/// `Module::func` / enum-variant) family.
+///
+/// Env (arena/intern/ctx/checker) + peers: state, types (TypeUtils), literals
+/// (LiteralResolver), diag (Diagnostics), binding (MethodBinding), symbolic
+/// (SymbolicChecker), member (MemberResolver), lambda (LambdaSynth), scopes
+/// (ScopeManager), dispatch (recursion seam).  A fresh `TraitChecker` is built on
+/// demand.  `resolve_call` + the method/arg-check methods that recurse into
+/// argument resolution take `visitor: ASTVisitor*`.
+///
+/// GATED (R1/R2 — mono-after-sema): `try_resolve_static_method` +
+/// `resolve_static_method_return_via_template` + `infer_static_owner_return_from_args`
+/// (the literal-default-guess / Atomic<u64> trap) carry pre-mono re-derivation;
+/// `scope_is_generic_template` + `try_pin_overload_mangled_callee`'s no-op-on-template
+/// are the two-resolver "decline to pin" seams.  Ported faithfully + tagged; the
+/// 3 inference copies collapse + the literal-default site hardens once mono-after-sema lands.
+
+namespace Compiler::Sema::CallResolver;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Types::Substitution;
+import Compiler::Types::Inference;
+import Compiler::Types::TraitChecker;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Resolver;
+import Compiler::Types::Checker;
+import Compiler::Types::Ownership;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
+import Compiler::Diag::SourceSpan;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::ModuleGraph;
+import Compiler::Lex;
+import Compiler::Sema::State;
+import Compiler::Sema::TypeUtils;
+import Compiler::Sema::LiteralResolver;
+import Compiler::Sema::Diagnostics;
+import Compiler::Sema::MethodBinding;
+import Compiler::Sema::SymbolicChecker;
+import Compiler::Sema::MemberResolver;
+import Compiler::Sema::LambdaSynth;
+import Compiler::Sema::ScopeManager;
+import Compiler::Sema::Dispatch;
+import Compiler::Sema::Helpers;
+import std::core::slice;
+import std::core::option;
+import std::fmt;
+
+type struct CallResolver {
+    arena:    TypeArena*;
+    intern:   InternTable*;
+    ctx:      CompilationContext*;
+    checker:  TypeChecker*;
+    state:    SemaState*;
+    types:    TypeUtils*;
+    literals: LiteralResolver*;
+    diag:     Diagnostics*;
+    binding:  MethodBinding*;
+    symbolic: SymbolicChecker*;
+    member:   MemberResolver*;
+    lambda:   LambdaSynth*;
+    scopes:   ScopeManager*;
+    dispatch: SemaDispatch*;
+
+    static null() -> CallResolver {
+        return CallResolver {
+            arena: null, intern: null, ctx: null, checker: null, state: null,
+            types: null, literals: null, diag: null, binding: null, symbolic: null,
+            member: null, lambda: null, scopes: null, dispatch: null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+                    checker: TypeChecker*, state: SemaState*, types: TypeUtils*,
+                    literals: LiteralResolver*, diag: Diagnostics*, binding: MethodBinding*,
+                    symbolic: SymbolicChecker*, member: MemberResolver*, lambda: LambdaSynth*,
+                    scopes: ScopeManager*, dispatch: SemaDispatch*) -> void {
+        this.arena    = arena;
+        this.intern   = intern;
+        this.ctx      = ctx;
+        this.checker  = checker;
+        this.state    = state;
+        this.types    = types;
+        this.literals = literals;
+        this.diag     = diag;
+        this.binding  = binding;
+        this.symbolic = symbolic;
+        this.member   = member;
+        this.lambda   = lambda;
+        this.scopes   = scopes;
+        this.dispatch = dispatch;
+    }
+
+    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    trait_checker(&this) -> TraitChecker {
+        return TraitChecker::new(this.arena, this.ctx.generic_registry,
+                                 this.intern, this.ctx.diagnostics);
+    }
+
+    /// Module identity for the code currently being checked.
+    current_module_name(&this) -> string {
+        if (this.ctx.has_namespace()) { return this.ctx.namespace_display(); }
+        return this.ctx.source_file;
+    }
+
+
+    // -- Callee / payload-type lookups (for expected-type propagation) --
+
+    lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
+        if (callee == null) { return TypeRef::invalid(); }
+        const n: ASTNode* = callee as ASTNode*;
+        if (n.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = callee as IdentifierNode*;
+            const bare: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
+            if (bare.is_valid()) { return bare; }
+            const q_sym: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            return this.ctx.decl_index.lookup_func_type(q_sym);
+        }
+        if (n.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
+            const bare_combined: string = format("%s::%s",
+                this.intern.resolve(sr.scope_name), this.intern.resolve(sr.member_name));
+            const bare_sym: SymbolStr = this.intern.intern(bare_combined);
+            const bare_ft: TypeRef = this.ctx.decl_index.lookup_func_type(bare_sym);
+            if (bare_ft.is_valid()) { return bare_ft; }
+            const resolved_scope: SymbolStr = this.ctx.decl_index.resolve_qualified(sr.scope_name);
+            if (resolved_scope.is_valid()) {
+                const q_combined: string = format("%s::%s",
+                    this.intern.resolve(resolved_scope), this.intern.resolve(sr.member_name));
+                const q_sym: SymbolStr = this.intern.intern(q_combined);
+                return this.ctx.decl_index.lookup_func_type(q_sym);
+            }
+            return TypeRef::invalid();
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Arity-matching method overloads' non-receiver param types for `member`, as
+    /// an expected-type hint (a position-wise merge where all overloads agree).
+    lookup_method_param_types(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
+                              arg_count: i64) -> TypeRef[] {
+        const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
+        if (!obj_type.is_valid()) { return []; }
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut depth: i32 = 0;
+        while (base_t != null && depth < 5) {
+            match (base_t.kind) {
+                TypeKind::Pointer => { base_t = this.arena.lookup((base_t as PointerType*).pointee.id); }
+                TypeKind::Reference => { base_t = this.arena.lookup((base_t as ReferenceType*).referent.id); }
+                TypeKind::InstantiatedType => {
+                    const inst: InstantiatedType* = base_t as InstantiatedType*;
+                    if (!inst.has_resolved_type()) { break; }
+                    base_t = this.arena.lookup(inst.resolved_type.id);
+                }
+                _ => { break; }
+            }
+            depth += 1;
+        }
+        if (base_t == null) { return []; }
+
+        mut found: MethodInfo*[] = [];
+        if (base_t.kind == TypeKind::Class) {
+            const ct: ClassType* = base_t as ClassType*;
+            for (mut i: i64 = 0; i < ct.methods.length; i++) {
+                const m: MethodInfo* = &ct.methods[i];
+                if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+            }
+        } else if (base_t.kind == TypeKind::Struct) {
+            const st: StructType* = base_t as StructType*;
+            for (mut i: i64 = 0; i < st.methods.length; i++) {
+                const m: MethodInfo* = &st.methods[i];
+                if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+            }
+        } else if (base_t.kind == TypeKind::BoundedParam) {
+            const bp: BoundedParamType* = base_t as BoundedParamType*;
+            for (mut bi: i64 = 0; bi < bp.bounds.length; bi++) {
+                const bt: Type* = this.arena.lookup(bp.bounds[bi].id);
+                if (bt == null || bt.kind != TypeKind::Trait) { continue; }
+                const tt: TraitType* = bt as TraitType*;
+                for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
+                    const m: MethodInfo* = &tt.required_methods[mi];
+                    if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+                }
+            }
+        } else {
+            return [];
+        }
+
+        if (found.length == 0) { return []; }
+        if (found.length == 1) {
+            mut single: TypeRef[] = [];
+            for (mut i: i64 = 0; i < found[0].param_types.length; i++) {
+                single.push(found[0].param_types[i]);
+            }
+            return single;
+        }
+        mut merged: TypeRef[] = [];
+        for (mut p: i64 = 0; p < arg_count; p++) {
+            const first_ty: TypeRef = found[0].param_types[p];
+            mut agree: boolean = true;
+            for (mut j: i64 = 1; j < found.length; j++) {
+                if (found[j].param_types[p].id != first_ty.id) { agree = false; break; }
+            }
+            if (agree) { merged.push(first_ty); } else { merged.push(TypeRef::invalid()); }
+        }
+        return merged;
+    }
+
+    /// Enum-variant payload types for a scope callee (`Option::Some`), so args get
+    /// proper expected-type hints; consults `expected_type` for the spec when the
+    /// template's variants are empty.
+    lookup_scope_variant_payload_types(&this, scope: ScopeResolutionNode*) -> TypeRef[] {
+        mut type_ref: TypeRef = this.types.lookup_type_by_sym(scope.scope_name);
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) {
+                const spec_ref: TypeRef = this.types.lookup_type_by_sym(spec_sym);
+                if (spec_ref.is_valid()) { type_ref = spec_ref; }
+            }
+        }
+        if (!type_ref.is_valid()) { return []; }
+        mut enum_t: Type* = this.arena.lookup(type_ref.id);
+        if (enum_t == null) { return []; }
+        if (enum_t.kind == TypeKind::Enum) {
+            const et: EnumType* = enum_t as EnumType*;
+            if (et.variants.length == 0 && this.state.expected_type.is_valid()) {
+                mut exp_ref: TypeRef = this.state.expected_type;
+                mut exp_t: Type* = this.arena.lookup(exp_ref.id);
+                if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
+                    const alias: TypeAliasType* = exp_t as TypeAliasType*;
+                    if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
+                }
+                if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                    const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+                    if (exp_inst.generic_base.id == type_ref.id && exp_inst.has_resolved_type()) {
+                        enum_t = this.arena.lookup(exp_inst.resolved_type.id);
+                    }
+                }
+            }
+        }
+        if (enum_t == null || enum_t.kind != TypeKind::Enum) { return []; }
+        const et: EnumType* = enum_t as EnumType*;
+        const variant: EnumVariantInfo* = et.get_variant(scope.member_name);
+        if (variant == null) { return []; }
+        if (this.state.expected_type.is_valid()) {
+            mut exp_ref2: TypeRef = this.state.expected_type;
+            mut exp_t2: Type* = this.arena.lookup(exp_ref2.id);
+            if (exp_t2 != null && exp_t2.kind == TypeKind::TypeAlias) {
+                const alias2: TypeAliasType* = exp_t2 as TypeAliasType*;
+                if (alias2.has_target()) { exp_ref2 = alias2.target; exp_t2 = this.arena.lookup(exp_ref2.id); }
+            }
+            if (exp_t2 != null && exp_t2.kind == TypeKind::InstantiatedType) {
+                const exp_inst2: InstantiatedType* = exp_t2 as InstantiatedType*;
+                if (exp_inst2.generic_base.id == type_ref.id) {
+                    return this.substitute_payload_types(variant.payload_types, type_ref, exp_inst2.type_args);
+                }
+            }
+        }
+        return sema_copy_type_refs(&variant.payload_types);
+    }
+
+    /// Substitute an enum template's generic params with concrete type args in a
+    /// payload-type list.
+    substitute_payload_types(&this, payload: &TypeRef[], template_ref: TypeRef,
+                             type_args: &TypeRef[]) -> TypeRef[] {
+        if (this.ctx.generic_registry == null) { return sema_copy_type_refs(payload); }
+        const entry: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(template_ref.id);
+        if (entry == null) { return sema_copy_type_refs(payload); }
+        if (entry.param_count != type_args.length) { return sema_copy_type_refs(payload); }
+        mut result: TypeRef[] = [];
+        for (mut i: i64 = 0; i < payload.length; i++) {
+            const pt: Type* = this.arena.lookup(payload[i].id);
+            if (pt == null) {
+                result.push(payload[i]);
+            } else if (pt.kind == TypeKind::GenericParam) {
+                const gp: GenericParamType* = pt as GenericParamType*;
+                mut substituted: TypeRef = payload[i];
+                for (mut p: i64 = 0; p < entry.param_count; p++) {
+                    if (entry.param_names[p].equals(gp.param_name)) { substituted = type_args[p]; break; }
+                }
+                result.push(substituted);
+            } else if (pt.kind == TypeKind::BoundedParam) {
+                const bp: BoundedParamType* = pt as BoundedParamType*;
+                mut substituted: TypeRef = payload[i];
+                for (mut p: i64 = 0; p < entry.param_count; p++) {
+                    if (entry.param_names[p].equals(bp.param_name)) { substituted = type_args[p]; break; }
+                }
+                result.push(substituted);
+            } else {
+                result.push(payload[i]);
+            }
+        }
+        return result;
+    }
+
+
+    // -- The central dispatcher --
+
+    resolve_call(mut &this, visitor: ASTVisitor*, call: CallExprNode*) -> TypeRef {
+        // Closure-call rewrite: `f(args)` where `f` is a closure-struct value.
+        this.lambda.maybe_rewrite_closure_call(call);
+
+        // Compute the callee's param types for expected-type propagation.
+        mut param_types: TypeRef[] = [];
+        const callee_fn_type: TypeRef = this.lookup_callee_function_type(call.callee);
+        if (callee_fn_type.is_valid()) {
+            const ft_raw: Type* = this.arena.lookup(callee_fn_type.id);
+            if (ft_raw != null && ft_raw.kind == TypeKind::Function) {
+                param_types = sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+            }
+        }
+        if (param_types.length == 0) {
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (callee_node.kind == NodeKind::MemberAccess) {
+                param_types = this.lookup_method_param_types(
+                    visitor, call.callee as MemberAccessNode*, call.arguments.length);
+            }
+        }
+        if (param_types.length == 0) {
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (callee_node.kind == NodeKind::ScopeResolution) {
+                param_types = this.lookup_scope_variant_payload_types(call.callee as ScopeResolutionNode*);
+            }
+        }
+        const saved_expected: TypeRef = this.state.expected_type;
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            mut push_expected: boolean = false;
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg != null && i < param_types.length && param_types[i].is_valid()) {
+                const arg_node: ASTNode* = arg as ASTNode*;
+                if (arg_node.kind == NodeKind::ArrayLiteral) {
+                    push_expected = true;
+                } else if (arg_node.kind == NodeKind::CallExpression
+                        || arg_node.kind == NodeKind::ScopeResolution) {
+                    push_expected = true;
+                } else if (is_negative_numeric_literal_expr(arg)
+                        && this.literals.is_signed_int_type(param_types[i])) {
+                    push_expected = true;
+                } else if ((arg_node.kind == NodeKind::BinaryExpression
+                            || arg_node.kind == NodeKind::UnaryExpression)
+                        && is_constant_numeric_expr(arg)
+                        && !is_negative_numeric_literal_expr(arg)
+                        && is_wide_int_type(this.arena, param_types[i])) {
+                    push_expected = true;
+                }
+            }
+            if (push_expected) {
+                this.state.expected_type = param_types[i];
+            } else {
+                this.state.expected_type = TypeRef::invalid();
+            }
+            this.dispatch.resolve_expr(visitor, arg);
+        }
+        this.state.expected_type = saved_expected;
+
+        this.flag_autoref_from_params(call, param_types);
+
+        const callee: ExpressionNode* = call.callee;
+        const callee_node: ASTNode* = callee as ASTNode*;
+
+        if (callee_node.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = callee as IdentifierNode*;
+            this.lambda.try_specialize_for_closure_args(call, ident);
+
+            const inferred_generic_ret: TypeRef = this.check_generic_free_call(call, ident);
+
+            if (call.resolved_callee.is_valid()) {
+                const spec_ret: TypeRef = this.types.lookup_func_return(call.resolved_callee);
+                if (spec_ret.is_valid()) { return spec_ret; }
+            }
+            if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
+            if (call.generic_args.length > 0) {
+                const spec_sym: SymbolStr = this.resolve_generic_scope_name(ident.name, call.generic_args);
+                if (spec_sym.is_valid()) {
+                    call.set_resolved_callee(spec_sym);
+                    const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
+                    if (spec_ret.is_valid()) { return spec_ret; }
+                }
+            }
+            // A local function-pointer binding shadows any global function.
+            mut fp_shadows_global: boolean = false;
+            const fp_shadow: TypeRef = this.scopes.lookup_local(ident.name);
+            if (fp_shadow.is_valid()) {
+                const fp_shadow_t: Type* = this.arena.lookup(fp_shadow.id);
+                if (fp_shadow_t != null && fp_shadow_t.kind == TypeKind::Function) {
+                    fp_shadows_global = true;
+                }
+            }
+            if (!fp_shadows_global) {
+                this.check_call_arity(visitor, call, ident);
+                const ovl_ret: TypeRef = this.try_pin_overload_mangled_callee(call, ident);
+                if (ovl_ret.is_valid() && !this.types.contains_generic_param(ovl_ret)) {
+                    return ovl_ret;
+                }
+            }
+            return this.resolve_direct_call(ident);
+        }
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            this.lambda.reject_closure_struct_args_in_non_free_call(call,
+                "passing a capturing closure as a method-call argument");
+            this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
+            this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*);
+            const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call);
+            if (mret.is_valid() && call.resolved_method != null) {
+                const ovl_rm: MethodNode* = call.resolved_method as MethodNode*;
+                if (ovl_rm != null && ovl_rm.func != null
+                        && ovl_rm.func.generic_params.length == 0
+                        && ovl_rm.func.resolved_return_type.is_valid()
+                        && ovl_rm.func.resolved_return_type.id != mret.id) {
+                    const ovl_mem: MemberAccessNode* = callee as MemberAccessNode*;
+                    ovl_mem.set_resolved_type(ovl_rm.func.resolved_return_type);
+                    return ovl_rm.func.resolved_return_type;
+                }
+            }
+            return mret;
+        }
+        if (callee_node.kind == NodeKind::ScopeResolution) {
+            this.lambda.reject_closure_struct_args_in_non_free_call(call,
+                "passing a capturing closure to a scope-resolution call");
+            const scope_ret: TypeRef = this.resolve_scope_call(callee as ScopeResolutionNode*, call);
+            if (scope_ret.is_valid()) {
+                this.check_scope_call_arg_types(visitor, callee as ScopeResolutionNode*, call);
+            }
+            this.stash_scope_resolution_call_bindings(call, callee as ScopeResolutionNode*);
+            return scope_ret;
+        }
+
+        return this.dispatch.resolve_expr(visitor, callee);
+    }
+
+    /// Mark by-value args bound to `&T` params with `autoref` (codegen takes the
+    /// address); leave explicit refs/pointers untouched.
+    flag_autoref_from_params(mut &this, call: CallExprNode*, param_types: TypeRef[]) -> void {
+        const lim: i64 = if (param_types.length < call.arguments.length) {
+            param_types.length
+        } else {
+            call.arguments.length
+        };
+        for (mut j: i64 = 0; j < lim; j++) {
+            if (!this.types.is_reference_type(param_types[j])) { continue; }
+            const arg: ExpressionNode* = call.arguments[j];
+            if (arg == null) { continue; }
+            if (this.types.is_ref_or_ptr_type(arg.resolved_type)) { continue; }
+            arg.autoref = true;
+        }
+    }
+
+
+    // -- Generic free-call inference (the keystone) --
+
+    find_fn_template_for_call(&this, name: SymbolStr, argc: i64) -> TemplateEntry* {
+        const reg: GenericRegistry* = this.ctx.generic_registry;
+        if (reg == null) { return null; }
+        mut found: TemplateEntry* = null;
+        mut count: i64 = 0;
+        mut module_match: TemplateEntry* = null;
+        mut module_match_count: i64 = 0;
+        const cur_mod: string = this.current_module_name();
+        const total: i64 = reg.template_count();
+        for (mut i: i64 = 0; i < total; i++) {
+            const cand: TemplateEntry* = &reg.entries[i];
+            if (cand == null) { continue; }
+            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (!cand.name.equals(name)) { continue; }
+            const f: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
+            if (f == null) { continue; }
+            if (f.parameters.length != argc) { continue; }
+            found = cand;
+            count = count + 1;
+            const cand_mod: string = this.intern.resolve(cand.module_name);
+            if (intrinsics::strcmp(cand_mod, cur_mod) == 0) {
+                module_match = cand;
+                module_match_count = module_match_count + 1;
+            }
+        }
+        if (count == 1) { return found; }
+        if (module_match_count == 1) { return module_match; }
+        return null;
+    }
+
+    /// A bare / negated / arithmetic-constant numeric literal is polymorphic for
+    /// generic inference (adopts whatever a non-literal arg or context binds).
+    sema_arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            return lit.literal_kind == LiteralKind::Integer || lit.literal_kind == LiteralKind::Float;
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+                return this.sema_arg_is_polymorphic_literal(u.operand);
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            const op: string = b.op.lexeme;
+            const is_arith: boolean =
+                op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+                || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+            if (!is_arith) { return false; }
+            return this.sema_arg_is_polymorphic_literal(b.left)
+                && this.sema_arg_is_polymorphic_literal(b.right);
+        }
+        return false;
+    }
+
+    /// True when `t` bottoms out fully concrete (no open generic/bounded param,
+    /// not void/unit) — mirrors mono's `infer_type_is_concrete` for the E0214 gate.
+    free_infer_type_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::GenericParam)     { return false; }
+        if (ty.kind == TypeKind::BoundedParam)     { return false; }
+        if (ty.kind == TypeKind::FunctionTemplate) { return false; }
+        if (ty.kind == TypeKind::Function)         { return false; }
+        if (ty.kind == TypeKind::Unit)             { return false; }
+        if (ty.kind == TypeKind::Void)             { return false; }
+        if (ty.kind == TypeKind::Pointer)   { return this.free_infer_type_concrete((ty as PointerType*).pointee); }
+        if (ty.kind == TypeKind::Reference) { return this.free_infer_type_concrete((ty as ReferenceType*).referent); }
+        if (ty.kind == TypeKind::Array)     { return this.free_infer_type_concrete((ty as ArrayType*).element); }
+        if (ty.kind == TypeKind::Optional)  { return this.free_infer_type_concrete((ty as OptionalType*).wrapped); }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            if (!(ty as InstantiatedType*).has_resolved_type()) { return false; }
+        }
+        return true;
+    }
+
+    /// Whether a polymorphic numeric literal can adopt the concrete binding `bnd`
+    /// already pinned for its generic param (any numeric / enum binding; not str/bool/struct).
+    literal_adopts_binding(&this, bnd: TypeRef) -> boolean {
+        if (!bnd.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(bnd.id);
+        if (ty == null) { return false; }
+        return ty.kind == TypeKind::Int || ty.kind == TypeKind::Float || ty.kind == TypeKind::Enum;
+    }
+
+    /// Whether a call argument's `resolved_type` is authoritative enough pre-mono
+    /// to drive an inference conflict / bound error.
+    free_infer_arg_reliable(&this, arg: ExpressionNode*) -> boolean {
+        if (arg == null) { return false; }
+        const node: ASTNode* = arg as ASTNode*;
+        if (node.kind == NodeKind::CallExpression) {
+            return arg.resolved_type.is_valid() && !this.types.contains_generic_param(arg.resolved_type);
+        }
+        return true;
+    }
+
+    /// Pre-mono call-site analysis + the mono-after-sema keystone: infer a generic
+    /// free call's type args from its arguments (or turbofish), emit E0214/E0306/
+    /// E0307, stash the bindings, and return the CONCRETE substituted return type.
+    /// Invalid when not a generic free call, a binding stays abstract, or a
+    /// diagnostic fired.  `resolved_callee` is left unpinned (mono specializes).
+    check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
+        const entry: TemplateEntry* = this.find_fn_template_for_call(ident.name, call.arguments.length);
+        if (entry == null) { return TypeRef::invalid(); }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null) { return TypeRef::invalid(); }
+        if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }
+
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { bindings.push(TypeRef::invalid()); }
+
+        if (call.generic_args.length > 0) {
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            mut n: i64 = call.generic_args.length;
+            if (n > bindings.length) { n = bindings.length; }
+            for (mut i: i64 = 0; i < n; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(call.generic_args[i], &rc);
+                if (tr.is_valid()) { bindings[i] = tr; }
+            }
+        } else {
+            if (tmpl.parameters.length != call.arguments.length) { return TypeRef::invalid(); }
+            mut pids: u64[] = [];
+            for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { pids.push(entry.param_type_ids[i]); }
+            mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+
+            // PASS A — non-literal args; reject two concrete actuals for one T (E0214).
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = tmpl.parameters[i];
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                if (!this.free_infer_arg_reliable(arg)) { continue; }
+                const actual: TypeRef = arg.resolved_type;
+                if (!actual.is_valid()) { continue; }
+                ictx.conflict_from = TypeRef::invalid();
+                ictx.conflict_to   = TypeRef::invalid();
+                ictx.unify(param.resolved_type, actual);
+                if (ictx.conflict_from.is_valid() && ictx.conflict_to.is_valid()
+                        && this.free_infer_type_concrete(ictx.conflict_from)
+                        && this.free_infer_type_concrete(ictx.conflict_to)) {
+                    this.emit_free_infer_conflict(call, tmpl.name, arg, ictx.conflict_from, ictx.conflict_to);
+                    return TypeRef::invalid();
+                }
+            }
+            // PASS B — recover unbound params from a CONCRETE expected type.
+            if (this.state.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
+                    && !this.types.contains_generic_param(this.state.expected_type)) {
+                mut any_unbound: boolean = false;
+                for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+                    if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
+                }
+                if (any_unbound) { ictx.unify(tmpl.resolved_return_type, this.state.expected_type); }
+            }
+            // PASS C — literal fallback (a polymorphic literal adopts a pinned numeric T).
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = tmpl.parameters[i];
+                if (param == null || !param.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                const lit_actual: TypeRef = arg.resolved_type;
+                if (!lit_actual.is_valid()) { continue; }
+                const f_idx: i64 = ictx.binding_index(param.resolved_type.id);
+                if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) {
+                    const bnd: TypeRef = ictx.bindings[f_idx];
+                    if (this.free_infer_type_concrete(bnd) && !this.literal_adopts_binding(bnd)) {
+                        this.emit_free_infer_conflict(call, tmpl.name, arg, bnd, lit_actual);
+                        return TypeRef::invalid();
+                    }
+                    continue;
+                }
+                ictx.unify(param.resolved_type, lit_actual);
+            }
+
+            for (mut i: i64 = 0; i < bindings.length; i++) { bindings[i] = ictx.bindings[i]; }
+
+            mut all_bound: boolean = true;
+            for (mut i: i64 = 0; i < bindings.length; i++) {
+                if (!bindings[i].is_valid()) { all_bound = false; break; }
+            }
+            if (!all_bound) {
+                if (tmpl.is_implicit && call.arguments.length == 0 && !this.state.expected_type.is_valid()) {
+                    this.emit_free_cannot_infer(call, tmpl.name);
+                }
+                return TypeRef::invalid();
+            }
+        }
+
+        // E0306 — where-clause bound satisfaction for the bound type args.
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
+            const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            mut idx: i64 = -1;
+            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
+                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
+            }
+            if (idx < 0 || idx >= bindings.length) { continue; }
+            const concrete: TypeRef = bindings[idx];
+            if (!concrete.is_valid()) { continue; }
+            if (this.types.contains_generic_param(concrete)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef* = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
+                    this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
+                    return TypeRef::invalid();
+                }
+            }
+        }
+
+        // KEYSTONE: stash all-bound bindings + substitute into the template return.
+        mut all_bound_stash: boolean = bindings.length == entry.param_type_ids.length;
+        for (mut ci: i64 = 0; ci < bindings.length && all_bound_stash; ci++) {
+            if (!bindings[ci].is_valid()) { all_bound_stash = false; }
+        }
+        if (all_bound_stash) {
+            mut stash: TypeRef[] = [];
+            for (mut ci: i64 = 0; ci < bindings.length; ci++) { stash.push(bindings[ci]); }
+            call.set_resolved_type_args(stash);
+        }
+        return this.subst_free_call_return(entry, &bindings, tmpl.resolved_return_type);
+    }
+
+    /// Substitute a generic free function's inferred/explicit type args into its
+    /// template return, yielding the concrete call return pre-mono (or invalid).
+    subst_free_call_return(mut &this, entry: TemplateEntry*, bindings: &TypeRef[],
+                           tmpl_ret: TypeRef) -> TypeRef {
+        if (!tmpl_ret.is_valid()) { return TypeRef::invalid(); }
+        if (bindings.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
+            if (this.types.contains_generic_param(bindings[i])) { return TypeRef::invalid(); }
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(entry.param_type_ids, bindings);
+        const out: TypeRef = subst.apply(tmpl_ret, this.arena);
+        if (!out.is_valid() || this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
+        return out;
+    }
+
+    /// PASS A/B/C argument inference returning the per-param bindings (no
+    /// diagnostics), used by the module-scoped scope-resolution path.
+    infer_free_call_bindings(mut &this, call: CallExprNode*, entry: TemplateEntry*,
+                             tmpl: FunctionDeclNode*) -> TypeRef[] {
+        mut empty: TypeRef[] = [];
+        if (entry.param_type_ids.length == 0) { return empty; }
+        if (tmpl.parameters.length != call.arguments.length) { return empty; }
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { pids.push(entry.param_type_ids[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = tmpl.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            if (!this.free_infer_arg_reliable(arg)) { continue; }
+            const actual: TypeRef = arg.resolved_type;
+            if (!actual.is_valid()) { continue; }
+            ictx.conflict_from = TypeRef::invalid();
+            ictx.conflict_to   = TypeRef::invalid();
+            ictx.unify(param.resolved_type, actual);
+            if (ictx.conflict_from.is_valid() && ictx.conflict_to.is_valid()
+                    && this.free_infer_type_concrete(ictx.conflict_from)
+                    && this.free_infer_type_concrete(ictx.conflict_to)) {
+                return empty;
+            }
+        }
+        if (this.state.expected_type.is_valid() && tmpl.resolved_return_type.is_valid()
+                && !this.types.contains_generic_param(this.state.expected_type)) {
+            mut any_unbound: boolean = false;
+            for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+                if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
+            }
+            if (any_unbound) { ictx.unify(tmpl.resolved_return_type, this.state.expected_type); }
+        }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = tmpl.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const lit_actual: TypeRef = arg.resolved_type;
+            if (!lit_actual.is_valid()) { continue; }
+            const f_idx: i64 = ictx.binding_index(param.resolved_type.id);
+            if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
+            ictx.unify(param.resolved_type, lit_actual);
+        }
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return empty; }
+        }
+        return bindings;
+    }
+
+    /// Stash the generic type-arg bindings for a TYPE-scoped generic static-method
+    /// scope-resolution call (`Layout::of<T>()`) so mono need not re-infer.
+    stash_scope_resolution_call_bindings(mut &this, call: CallExprNode*,
+                                         scope: ScopeResolutionNode*) -> void {
+        if (call == null || scope == null) { return; }
+        if (call.resolved_type_args.length > 0) { return; }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
+        const member_str: string = this.intern.resolve(scope.member_name);
+        mut entry: TemplateEntry* = null;
+        if (this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
+            if (q.is_valid()) {
+                const qstr: string = this.intern.resolve(q) + "::" + member_str;
+                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
+            }
+        }
+        if (entry == null) {
+            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
+            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
+        }
+        if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+        if (entry.param_type_ids.length == 0) { return; }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null) { return; }
+
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
+        mut binds: TypeRef[] = [];
+        if (targs.length > 0) {
+            if (targs.length != entry.param_type_ids.length) { return; }
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < targs.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+                if (!tr.is_valid()) { return; }
+                binds.push(tr);
+            }
+        } else {
+            binds = this.infer_free_call_bindings(call, entry, tmpl);
+            if (binds.length == 0) { return; }
+        }
+        call.set_resolved_type_args(binds);
+    }
+
+    emit_free_call_bound_failure(mut &this, call: CallExprNode*, tmpl: FunctionDeclNode*,
+                                 tref: TraitRef*, concrete: TypeRef, trait_name: SymbolStr) -> void {
+        const trait_str: string = this.intern.resolve(trait_name);
+        const fn_str:    string = this.intern.resolve(tmpl.name);
+        const conc_str:  string = this.types.type_display_name(concrete);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str));
+        d = d.at(call.span);
+        d = d.also_at(tref.span, format("required by this bound in `%s`", fn_str));
+        d = d.with_note(format("the trait `%s` is not implemented for `%s`", trait_str, conc_str));
+        d = d.help(format("implement `%s` for `%s`, or pass an argument of a type that already does",
+            trait_str, conc_str));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    emit_free_cannot_infer(mut &this, call: CallExprNode*, fn_name: SymbolStr) -> void {
+        const fn_str: string = this.intern.resolve(fn_name);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            format("cannot infer the type argument for `%s`", fn_str));
+        d = d.at(call.span);
+        d = d.with_note("`![implicit]` recovers the type argument from the expected type, but this call is not in a typed context (e.g. a `const x: T = ...` initializer)");
+        d = d.help(format("write the type argument explicitly, e.g. `%s<T>(...)`", fn_str));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    emit_free_infer_conflict(mut &this, call: CallExprNode*, fn_name: SymbolStr,
+                             arg: ExpressionNode*, bound: TypeRef, got: TypeRef) -> void {
+        const fn_str:    string = this.intern.resolve(fn_name);
+        const bound_str: string = this.types.type_display_name(bound);
+        const got_str:   string = this.types.type_display_name(got);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0214_ARGUMENT_MISMATCH,
+            format("conflicting types for the type parameter of `%s`", fn_str));
+        const anchor: SourceSpan = if (arg != null && arg.span.has_location()) { arg.span } else { call.span };
+        d = d.at_with_label(anchor,
+            format("expected `%s` (inferred from an earlier argument), found `%s`", bound_str, got_str));
+        d = d.with_note(format("a single type parameter cannot be both `%s` and `%s`", bound_str, got_str));
+        this.ctx.emit_diagnostic(d);
+    }
+
+
+    // -- Free-call arity + argument type checking --
+
+    check_call_arity(mut &this, visitor: ASTVisitor*, call: CallExprNode*, ident: IdentifierNode*) -> void {
+        if (call.generic_args.length > 0) { return; }
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        mut overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(qualified);
+        if (overloads.length == 0) {
+            overloads = this.ctx.decl_index.lookup_func_type_overloads(ident.name);
+        }
+        if (overloads.length == 0) { return; }
+        if (overloads.length > 1) {
+            this.check_overloaded_free_call_arity(call, ident, overloads);
+            return;
+        }
+        const ft_raw: Type* = this.arena.lookup(overloads[0].id);
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
+        const ft: FunctionType* = ft_raw as FunctionType*;
+        if (ft.is_variadic) { return; }
+        const expected: i64 = ft.param_types.length;
+        const got: i64 = call.arguments.length;
+        if (got < expected) {
+            const name: string = this.intern.resolve(ident.name);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0216_TOO_FEW_ARGS,
+                format("function `%s` takes %lld argument(s) but %lld were supplied", name, expected, got));
+            diag = diag.at_with_label(call.span,
+                format("missing %lld argument%s", expected - got, if (expected - got == 1) { "" } else { "s" }));
+            if (call.span.has_location() && call.span.end_col > 0) {
+                mut repl: string = "";
+                for (mut k: i64 = got; k < expected; k++) {
+                    const pname: string = this.arena.resolve_display_name_short(ft.param_types[k].id);
+                    const sep: string = if (k == 0) { "" } else { ", " };
+                    repl = format("%s%s<%s>", repl, sep, pname);
+                }
+                const ins: SourceSpan = SourceSpan::new(
+                    call.span.file, call.span.end_line, call.span.end_col - 1,
+                    call.span.end_line, call.span.end_col - 1);
+                diag = diag.suggest(Suggestion::single(ins, repl,
+                    if (expected - got == 1) { "provide the missing argument" } else { "provide the missing arguments" },
+                    Applicability::HasPlaceholders));
+            }
+            this.ctx.diagnostics.emit(diag);
+            return;
+        }
+        if (got > expected) {
+            const name: string = this.intern.resolve(ident.name);
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0215_TOO_MANY_ARGS,
+                format("function `%s` takes %lld argument(s) but %lld were supplied", name, expected, got));
+            diag = diag.at_with_label(call.span,
+                format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
+            mut anchor_end_line: u32 = 0;
+            mut anchor_end_col:  u32 = 0;
+            mut anchor_ok:       boolean = false;
+            if (expected == 0) {
+                if (call.arguments.length > 0 && call.arguments[0] != null
+                        && call.arguments[0].span.has_location()) {
+                    anchor_end_line = call.arguments[0].span.start_line;
+                    anchor_end_col  = call.arguments[0].span.start_col;
+                    anchor_ok = true;
+                }
+            } else {
+                const last_keep: ExpressionNode* = call.arguments[expected - 1];
+                if (last_keep != null && last_keep.span.has_location()) {
+                    anchor_end_line = last_keep.span.end_line;
+                    anchor_end_col  = last_keep.span.end_col;
+                    anchor_ok = true;
+                }
+            }
+            if (anchor_ok && call.span.has_location() && call.span.end_col > 0) {
+                const removal: SourceSpan = SourceSpan::new(
+                    call.span.file, anchor_end_line, anchor_end_col,
+                    call.span.end_line, call.span.end_col - 1);
+                diag = diag.suggest(Suggestion::machine_applicable(removal, "",
+                    if (got - expected == 1) { "remove the extra argument" }
+                    else { format("remove the %lld extra arguments", got - expected) }));
+            }
+            this.ctx.diagnostics.emit(diag);
+            return;
+        }
+        this.check_args_against_params(visitor, call, ft.param_types.as_slice());
+    }
+
+    check_overloaded_free_call_arity(mut &this, call: CallExprNode*, ident: IdentifierNode*,
+                                     overloads: TypeRef[]) -> void {
+        const got: i64 = call.arguments.length;
+        mut uniq_arity:  i64 = -1;
+        mut any_variadic: boolean = false;
+        mut matches:      boolean = false;
+        for (mut i: i64 = 0; i < overloads.length; i++) {
+            const t: Type* = this.arena.lookup(overloads[i].id);
+            if (t == null || t.kind != TypeKind::Function) { return; }
+            const ft: FunctionType* = t as FunctionType*;
+            if (ft.is_variadic) { any_variadic = true; continue; }
+            const ar: i64 = ft.param_types.length;
+            uniq_arity = this.diag.note_arity(uniq_arity, ar);
+            if (ar == got) { matches = true; }
+        }
+        if (any_variadic || matches) { return; }
+        const expected_for_msg: i64 = if (uniq_arity >= 0) { uniq_arity } else { -1 };
+        this.diag.emit_method_arity_error(call, ident.name, "function", expected_for_msg, got);
+    }
+
+    /// Non-emitting category check: do the call's args fit `params`?  Non-concrete
+    /// args/params count as fitting (mono re-checks).
+    args_fit_params_loosely(mut &this, call: CallExprNode*, params: Slice<TypeRef>) -> boolean {
+        const n: i64 = params.length as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i >= call.arguments.length) { break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const arg_ty:   TypeRef = arg.resolved_type;
+            const param_ty: TypeRef = params.get(i as u64).unwrap();
+            if (!this.types.arg_type_is_concrete(arg_ty))   { continue; }
+            if (!this.types.arg_type_is_concrete(param_ty)) { continue; }
+            const compat: TypeCompatibility = this.checker.check_compatibility(arg_ty, param_ty);
+            if (compat == TypeCompatibility::Incompatible) {
+                if (this.types.indirection_compatible(arg_ty, param_ty)) { continue; }
+                if (this.types.enum_int_compatible(arg_ty, param_ty)) { continue; }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// True when a registered `![implicit]` converter bridges `arg_ty -> param_ty`.
+    has_implicit_converter(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        if (!arg_ty.is_valid() || !param_ty.is_valid()) { return false; }
+        if (arg_ty.id == param_ty.id) { return false; }
+        if (this.ctx.decl_index.lookup_implicit_converter(arg_ty.id, param_ty.id) != 0) { return true; }
+        const base: TypeRef = this.types.generic_base_of(param_ty);
+        return base.is_valid()
+            && this.ctx.decl_index.lookup_implicit_converter(arg_ty.id, base.id) != 0;
+    }
+
+    /// Synthesize + re-resolve an implicit-converter call around `expr` when one
+    /// bridges `from_ty -> to_ty`; returns the new node, or null.
+    build_implicit_conversion(mut &this, visitor: ASTVisitor*, expr: ExpressionNode*,
+                              from_ty: TypeRef, to_ty: TypeRef) -> ExpressionNode* {
+        if (expr == null) { return null; }
+        if (!from_ty.is_valid() || !to_ty.is_valid()) { return null; }
+        if (from_ty.id == to_ty.id) { return null; }
+        if (this.state.in_implicit_conversion) { return null; }
+
+        mut packed: u64 = this.ctx.decl_index.lookup_implicit_converter(from_ty.id, to_ty.id);
+        if (packed == 0) {
+            const base: TypeRef = this.types.generic_base_of(to_ty);
+            if (base.is_valid()) {
+                packed = this.ctx.decl_index.lookup_implicit_converter(from_ty.id, base.id);
+            }
+        }
+        if (packed == 0) { return null; }
+        const type_name_id:   u32 = (packed >> 32) as u32;
+        const method_name_id: u32 = (packed & 0xFFFFFFFF) as u32;
+
+        const sp: SourceSpan = expr.span;
+        mut callee: ExpressionNode* = null;
+        if (type_name_id == 0) {
+            mut id: IdentifierNode* = new IdentifierNode(SymbolStr::from_id(method_name_id), sp);
+            callee = id as ExpressionNode*;
+        } else {
+            mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
+                SymbolStr::from_id(type_name_id), SymbolStr::from_id(method_name_id), sp);
+            const tt: Type* = this.arena.lookup(to_ty.id);
+            if (tt != null && tt.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = tt as InstantiatedType*;
+                mut gargs: TypeAnnotation*[] = [];
+                for (mut gi: i64 = 0; gi < it.type_args.length; gi++) {
+                    mut na: NamedAnnotation* = new NamedAnnotation {
+                        name:         SymbolStr::empty(),
+                        span:         sp,
+                        pre_resolved: it.type_args[gi],
+                    };
+                    gargs.push(new TypeAnnotation::Named(na));
+                }
+                sr.set_scope_generic_args(gargs);
+            }
+            callee = sr as ExpressionNode*;
+        }
+
+        mut conv_call: CallExprNode* = new CallExprNode(callee, sp);
+        conv_call.add_argument(expr);
+
+        this.state.in_implicit_conversion = true;
+        const result_ty: TypeRef = this.dispatch.resolve_expr(visitor, conv_call as ExpressionNode*);
+        this.state.in_implicit_conversion = false;
+
+        if (!result_ty.is_valid() || !this.checker.can_assign(result_ty, to_ty)) { return null; }
+        return conv_call as ExpressionNode*;
+    }
+
+    /// Rewrite `call.arguments[idx]` through an implicit converter when one bridges
+    /// `arg_ty -> param_ty`; returns true iff converted.
+    try_apply_implicit_conversion(mut &this, visitor: ASTVisitor*, call: CallExprNode*, idx: i64,
+                                  arg: ExpressionNode*, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        const c: ExpressionNode* = this.build_implicit_conversion(visitor, arg, arg_ty, param_ty);
+        if (c == null) { return false; }
+        call.set_argument(idx, c);
+        return true;
+    }
+
+    /// Per-argument type checking for a 1:1 arg/param list.  Flags only hard
+    /// category mismatches / lossy narrowing / same-width sign reinterpret;
+    /// synthesizes implicit conversions where registered.
+    check_args_against_params(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                              param_types: Slice<TypeRef>) -> void {
+        const n: i64 = param_types.length as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i >= call.arguments.length) { break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const arg_ty:   TypeRef = arg.resolved_type;
+            const param_ty: TypeRef = param_types.get(i as u64).unwrap();
+            if (!this.types.arg_type_is_concrete(arg_ty))   { continue; }
+            if (!this.types.arg_type_is_concrete(param_ty)) { continue; }
+            const compat: TypeCompatibility = this.checker.check_compatibility(arg_ty, param_ty);
+            if (compat == TypeCompatibility::Incompatible) {
+                if (this.types.indirection_compatible(arg_ty, param_ty)) { continue; }
+                if (this.types.enum_int_compatible(arg_ty, param_ty)) { continue; }
+                if (this.try_apply_implicit_conversion(visitor, call, i, arg, arg_ty, param_ty)) { continue; }
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
+                    format("argument %lld doesn't match the parameter's declared type", i + 1),
+                    SourceSpan::none(), arg);
+            } else if (this.checker.is_lossy_numeric_narrowing(arg_ty, param_ty)
+                       && !this.literals.int_literal_fits_target(arg, param_ty)) {
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
+                    format("argument %lld narrows the value and would silently truncate; add an explicit `as` cast", i + 1),
+                    SourceSpan::none(), arg);
+            } else if (this.checker.is_same_width_sign_reinterpret(arg_ty, param_ty)
+                       && (
+                           ((is_numeric_literal_expr(arg) || is_negative_numeric_literal_expr(arg))
+                            && !this.literals.int_literal_fits_target(arg, param_ty))
+                           || (!is_numeric_literal_expr(arg) && !is_negative_numeric_literal_expr(arg)
+                               && this.checker.is_subword_sign_reinterpret(arg_ty, param_ty))
+                       )) {
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0214_ARGUMENT_MISMATCH, arg.span, param_ty, arg_ty,
+                    format("argument %lld reinterprets the sign of a same-width integer and would silently change its value; add an explicit `as` cast", i + 1),
+                    SourceSpan::none(), arg);
+            }
+        }
+    }
+
+
+    // -- Method / static overload metadata helpers --
+
+    method_type_is_variadic(&this, fn_type: TypeRef) -> boolean {
+        if (!fn_type.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(fn_type.id);
+        if (t == null || t.kind != TypeKind::Function) { return false; }
+        return (t as FunctionType*).is_variadic;
+    }
+
+    method_origin_trait(&this, m: &MethodInfo) -> SymbolStr {
+        if (m.ast_node == null) { return SymbolStr::empty(); }
+        const mn: MethodNode* = m.ast_node as MethodNode*;
+        if (mn.func == null) { return SymbolStr::empty(); }
+        return this.canon_trait_name(mn.func.origin_trait);
+    }
+
+    canon_trait_name(&this, name: SymbolStr) -> SymbolStr {
+        if (!name.is_valid()) { return name; }
+        if (this.ctx.decl_index == null) { return name; }
+        return this.ctx.decl_index.resolve_qualified(name);
+    }
+
+    /// Per-argument type checking for an instance method call.  Gathers same-named
+    /// candidates from inherent methods + trait impls; checks only when a single
+    /// distinct signature emerges, else flags two-trait ambiguity / arity.
+    check_method_call_arg_types(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                                member: MemberAccessNode*) -> void {
+        const obj_type: TypeRef = member.object.resolved_type;
+        if (!obj_type.is_valid()) { return; }
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                base_t = this.arena.lookup((base_t as PointerType*).pointee.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                base_t = this.arena.lookup((base_t as ReferenceType*).referent.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { return; }
+                base_t = this.arena.lookup(inst.resolved_type.id);
+            } else {
+                break;
+            }
+            unwrap_depth += 1;
+        }
+        if (base_t == null) { return; }
+
+        const argc: i64 = call.arguments.length;
+        mut found:     boolean = false;
+        mut ambiguous: boolean = false;
+        mut trait_ambiguous: boolean = false;
+        mut found_trait: SymbolStr = SymbolStr::empty();
+        mut other_trait: SymbolStr = SymbolStr::empty();
+        mut variadic_ok: boolean = false;
+        mut chosen:    TypeRef[] = [];
+        mut name_seen:  i64 = 0;
+        mut uniq_arity: i64 = -1;
+
+        const empty_minfo: MethodInfo[] = [];
+        mut methods_ref: &MethodInfo[] = &empty_minfo;
+        mut start_cls: ClassType* = null;
+        match (base_t.kind) {
+            TypeKind::Class => { start_cls = base_t as ClassType*; methods_ref = &start_cls.methods; }
+            TypeKind::Struct => { methods_ref = &(base_t as StructType*).methods; }
+            TypeKind::Enum   => { methods_ref = &(base_t as EnumType*).methods; }
+            _ => { }
+        }
+        mut walk: ClassType* = start_cls;
+        mut cur: &MethodInfo[] = methods_ref;
+        mut depth: i32 = 0;
+        while (depth < 16) {
+            for (mut mi: i64 = 0; mi < cur.length; mi++) {
+                const m: &MethodInfo = &cur[mi];
+                if (!m.name.equals(member.member)) { continue; }
+                if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
+                name_seen  += 1;
+                uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
+                if (m.param_types.length != argc) { continue; }
+                if (!found) {
+                    found = true;
+                    chosen = [];
+                    for (mut ci: i64 = 0; ci < m.param_types.length; ci++) { chosen.push(m.param_types[ci]); }
+                    found_trait = this.method_origin_trait(m);
+                } else {
+                    const m_origin: SymbolStr = this.method_origin_trait(m);
+                    if (found_trait.is_valid() && m_origin.is_valid() && !m_origin.equals(found_trait)) {
+                        trait_ambiguous = true;
+                        other_trait = m_origin;
+                    } else if (!this.types.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
+                        ambiguous = true;
+                    }
+                }
+            }
+            if (walk == null) { break; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            walk = parent_t as ClassType*;
+            cur = &walk.methods;
+            depth += 1;
+        }
+
+        if (!ambiguous && !trait_ambiguous && this.ctx.generic_registry != null) {
+            mut target_name: SymbolStr = SymbolStr::empty();
+            match (base_t.kind) {
+                TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
+                TypeKind::Struct => { target_name = (base_t as StructType*).qualified_name; }
+                TypeKind::Enum   => { target_name = (base_t as EnumType*).qualified_name; }
+                TypeKind::Int | TypeKind::Float | TypeKind::Bool
+                | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
+                    target_name = this.intern.intern(base_t.display_name());
+                }
+                _ => { }
+            }
+            if (target_name.is_valid()) {
+                const this_amp: SymbolStr = this.intern.intern("&this");
+                const this_val: SymbolStr = this.intern.intern("this");
+                const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
+                for (mut ti: i64 = 0; ti < traits.length; ti++) {
+                    if (ambiguous || trait_ambiguous) { break; }
+                    const block: ImplBlockNode* =
+                        this.ctx.generic_registry.lookup_trait_impl(traits[ti], target_name);
+                    if (block == null) { continue; }
+                    for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
+                        const mn: MethodNode* = block.methods[bmi];
+                        if (mn == null || mn.func == null) { continue; }
+                        const fn_node: FunctionDeclNode* = mn.func;
+                        if (!fn_node.name.equals(member.member)) { continue; }
+                        if (fn_node.is_variadic) { variadic_ok = true; continue; }
+                        mut tparams: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(this_amp)) { continue; }
+                            if (pp.name.equals(this_val)) { continue; }
+                            tparams.push(pp.resolved_type);
+                        }
+                        name_seen  += 1;
+                        uniq_arity  = this.diag.note_arity(uniq_arity, tparams.length);
+                        if (tparams.length != argc) { tparams.drop(); continue; }
+                        if (!found) {
+                            found = true;
+                            chosen = tparams;
+                            found_trait = this.canon_trait_name(traits[ti]);
+                        } else {
+                            const same: boolean = this.types.same_param_sig(chosen.as_slice(), tparams.as_slice());
+                            tparams.drop();
+                            const cand_trait: SymbolStr = this.canon_trait_name(traits[ti]);
+                            if (found_trait.is_valid() && !cand_trait.equals(found_trait)) {
+                                trait_ambiguous = true;
+                                other_trait = cand_trait;
+                                break;
+                            } else if (!same) {
+                                ambiguous = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (trait_ambiguous && !member.resolved_trait.is_valid()) {
+            if (this.state.in_symbolic_check) { return; }
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0154_AMBIGUOUS_CALL,
+                format("call to `%s` is ambiguous: it is provided by multiple traits implemented for this type",
+                    this.intern.resolve(member.member)));
+            diag = diag.at_with_label(member.span,
+                format("`%s` is defined by both `%s` and `%s`",
+                    this.intern.resolve(member.member),
+                    this.intern.resolve(found_trait), this.intern.resolve(other_trait)));
+            diag = diag.with_note("disambiguate by calling the trait method explicitly, e.g. `Trait::method(receiver, args)`");
+            this.ctx.emit_diagnostic(diag);
+            return;
+        }
+        if (ambiguous) { return; }
+        if (found) {
+            this.check_args_against_params(visitor, call, chosen.as_slice());
+            return;
+        }
+        if (variadic_ok) { return; }
+        if (name_seen > 0) {
+            this.diag.emit_method_arity_error(call, member.member, "method", uniq_arity, argc);
+        }
+    }
+
+
+    // -- Direct (free-function) call resolution --
+
+    try_pin_overload_mangled_callee(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
+        if (call.resolved_callee.is_valid()) { return TypeRef::invalid(); }
+        // GATED: a generic function template has no concrete spec pre-mono; leave
+        // unpinned so mono specializes.
+        const gen_tmpl: TemplateEntry* = this.find_fn_template_for_call(ident.name, call.arguments.length);
+        if (gen_tmpl != null && gen_tmpl.param_type_ids.length > 0) { return TypeRef::invalid(); }
+
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return TypeRef::invalid(); }
+            arg_types.push(arg.resolved_type);
+        }
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        mut overloads: TypeRef[] = di.lookup_func_type_overloads(qualified);
+        mut lookup_key: SymbolStr = qualified;
+        if (overloads.length == 0) {
+            overloads = di.lookup_func_type_overloads(ident.name);
+            lookup_key = ident.name;
+        }
+        if (overloads.length == 0) { return TypeRef::invalid(); }
+        if (overloads.length == 1) {
+            mut unique_mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[0]);
+            if (!unique_mangled.is_valid()) { unique_mangled = di.lookup_mangled_name(lookup_key); }
+            if (unique_mangled.is_valid()) { call.set_resolved_callee(unique_mangled); }
+            return this.overload_return_type(overloads[0]);
+        }
+        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+            const ot: Type* = this.arena.lookup(overloads[oi].id);
+            if (ot == null || ot.kind != TypeKind::Function) { continue; }
+            const fn_ty: FunctionType* = ot as FunctionType*;
+            if (fn_ty.is_variadic) {
+                if (arg_types.length < fn_ty.param_types.length) { continue; }
+            } else if (fn_ty.param_types.length != arg_types.length) {
+                continue;
+            }
+            mut all_match: boolean = true;
+            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
+                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) {
+                    all_match = false; break;
+                }
+            }
+            if (!all_match) { continue; }
+            const mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+        return TypeRef::invalid();
+    }
+
+    overload_return_type(&this, fn_ref: TypeRef) -> TypeRef {
+        const ft: Type* = this.arena.lookup(fn_ref.id);
+        if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
+        return (ft as FunctionType*).return_type;
+    }
+
+    overload_param_matches_arg(&this, param: TypeRef, arg: TypeRef) -> boolean {
+        if (param.id == arg.id) { return true; }
+        const pt: Type* = this.arena.lookup(param.id);
+        const at: Type* = this.arena.lookup(arg.id);
+        if (pt == null || at == null) { return false; }
+        if (pt.kind == TypeKind::Pointer && at.kind == TypeKind::Reference) {
+            return (pt as PointerType*).pointee.id == (at as ReferenceType*).referent.id;
+        }
+        if (pt.kind == TypeKind::Reference && at.kind == TypeKind::Pointer) {
+            return (pt as ReferenceType*).referent.id == (at as PointerType*).pointee.id;
+        }
+        return false;
+    }
+
+    resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
+        // A local function-pointer binding shadows any global function.
+        const fp_local: TypeRef = this.scopes.lookup_local(ident.name);
+        if (fp_local.is_valid()) {
+            const fp_t: Type* = this.arena.lookup(fp_local.id);
+            if (fp_t != null && fp_t.kind == TypeKind::Function) {
+                ident.set_resolved_type(fp_local);
+                return (fp_t as FunctionType*).return_type;
+            }
+        }
+        // R4: prefer the current-module qualified definition over a same-leaf
+        // function in another unit (fixes the #9 last-write-wins collision).
+        const qual_name: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        mut func_ret: TypeRef = this.types.lookup_func_return(qual_name);
+        if (!func_ret.is_valid()) { func_ret = this.types.lookup_func_return(ident.name); }
+        if (func_ret.is_valid()) {
+            if (this.state.expected_type.is_valid()) {
+                const ret_t: Type* = this.arena.lookup(func_ret.id);
+                if (ret_t != null) {
+                    if (ret_t.kind == TypeKind::FunctionTemplate) { return this.state.expected_type; }
+                    if (ret_t.kind == TypeKind::InstantiatedType) {
+                        const inst: InstantiatedType* = ret_t as InstantiatedType*;
+                        if (!inst.has_resolved_type() && this.types.contains_generic_param(func_ret)) {
+                            return this.state.expected_type;
+                        }
+                    }
+                }
+            }
+            return func_ret;
+        }
+        const type_ref: TypeRef = this.types.lookup_type_by_sym(ident.name);
+        if (type_ref.is_valid()) { return type_ref; }
+
+        const name: string = this.intern.resolve(ident.name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0202_UNDEFINED_FUNCTION,
+            format("cannot find function `%s` in this scope", name));
+        diag = diag.at_with_label(ident.span, "not found in this scope");
+        const cands: string[] = this.diag.collect_bare_callable_names();
+        diag = this.diag.attach_did_you_mean(diag, name, cands, "function", ident.span);
+        this.ctx.emit_diagnostic(diag);
+        return TypeRef::invalid();
+    }
+
+
+    // -- Method overload selection (pins resolved_method / resolved_callee) --
+
+    pin_method_resolved_callee(mut &this, call: CallExprNode*, owner_t: Type*, m: MethodInfo*) -> void {
+        if (owner_t == null || m == null) { return; }
+        if (m.ast_node == null) { return; }
+        mut owner_str: string = "";
+        if (owner_t.kind == TypeKind::Class) {
+            owner_str = this.intern.resolve((owner_t as ClassType*).qualified_name);
+        } else if (owner_t.kind == TypeKind::Struct) {
+            owner_str = this.intern.resolve((owner_t as StructType*).qualified_name);
+        } else if (owner_t.kind == TypeKind::Enum) {
+            owner_str = this.intern.resolve((owner_t as EnumType*).qualified_name);
+        } else {
+            return;
+        }
+        this.pin_method_callee_from_qname(call, owner_str, m.ast_node as MethodNode*, m.is_static);
+    }
+
+    pin_method_callee_from_qname(mut &this, call: CallExprNode*, owner_qname_str: string,
+                                 mn: MethodNode*, is_static: boolean) -> void {
+        if (mn == null || mn.func == null) { return; }
+        if (strlen(owner_qname_str) == 0) { return; }
+        const fn_node: FunctionDeclNode* = mn.func;
+        if (!fn_node.resolved_return_type.is_valid()) { return; }
+        // GATED (R2): never stomp mono's exact-spec pin with a generic template mangle.
+        if (fn_node.generic_params.length > 0 && call.resolved_callee.is_valid()) { return; }
+        const type_qn: QualifiedName = QualifiedName::single(this.intern, owner_qname_str);
+        const recv_kind: ReceiverKind = method_receiver_kind(fn_node, is_static, this.intern);
+        const param_refs: TypeRef[] = method_non_receiver_params(fn_node, this.intern);
+        const mangled: MangledName = MangledName::for_method_or_trait_impl(
+            this.intern, this.arena, type_qn, fn_node.origin_trait, fn_node.name, recv_kind,
+            param_refs, fn_node.resolved_return_type, fn_node.is_variadic);
+        call.set_resolved_callee(mangled.value);
+    }
+
+    /// Tag `call.resolved_method` + pin `resolved_callee` for an instance method
+    /// call.  Three-pass: exact arena-id, then implicit-convert (most-specific
+    /// first), then `![implicit]` converter; finally trait-impl methods.
+    /// GATED (R2): leaves both unset on no-match so codegen can fall back.
+    resolve_method_overload(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                            member: MemberAccessNode*) -> void {
+        const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
+        if (!obj_type.is_valid()) { return; }
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                base_t = this.arena.lookup((base_t as PointerType*).pointee.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                base_t = this.arena.lookup((base_t as ReferenceType*).referent.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                base_t = this.arena.lookup(inst.resolved_type.id);
+            } else {
+                break;
+            }
+            unwrap_depth += 1;
+        }
+
+        mut methods_ref: Slice<MethodInfo> = Slice<MethodInfo>::from_raw(null, 0);
+        mut start_cls: ClassType* = null;
+        match (base_t.kind) {
+            TypeKind::Class => { start_cls = base_t as ClassType*; methods_ref = start_cls.methods.as_slice(); }
+            TypeKind::Struct => { methods_ref = (base_t as StructType*).methods.as_slice(); }
+            TypeKind::Enum => { methods_ref = (base_t as EnumType*).methods.as_slice(); }
+            TypeKind::Int | TypeKind::Float | TypeKind::Bool
+            | TypeKind::Char | TypeKind::String | TypeKind::Unit => { }
+            _ => { return; }
+        }
+
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg_expr: ExpressionNode* = call.arguments[ai];
+            if (arg_expr == null) { return; }
+            if (!arg_expr.resolved_type.is_valid()) { return; }
+            arg_types.push(arg_expr.resolved_type);
+        }
+
+        // Bound-directed dispatch: honor a pre-pinned disambiguating trait.
+        if (member.resolved_trait.is_valid() && base_t != null && call.resolved_method != null) {
+            const rm: MethodNode* = call.resolved_method as MethodNode*;
+            if (rm != null && rm.func != null && rm.func.origin_trait.is_valid()) {
+                mut owner_str: string = "";
+                match (base_t.kind) {
+                    TypeKind::Class  => { owner_str = this.intern.resolve((base_t as ClassType*).qualified_name); }
+                    TypeKind::Struct => { owner_str = this.intern.resolve((base_t as StructType*).qualified_name); }
+                    TypeKind::Enum   => { owner_str = this.intern.resolve((base_t as EnumType*).qualified_name); }
+                    TypeKind::Int | TypeKind::Float | TypeKind::Bool
+                    | TypeKind::Char | TypeKind::String | TypeKind::Unit => { owner_str = base_t.display_name(); }
+                    _ => {}
+                }
+                if (strlen(owner_str) > 0) {
+                    this.pin_method_callee_from_qname(call, owner_str, rm, rm.is_static);
+                    return;
+                }
+            }
+        }
+
+        // Pass 1: exact arena-id match (leaf -> root).
+        mut walk: ClassType* = start_cls;
+        mut depth: i32 = 0;
+        mut cur_methods: Slice<MethodInfo> = methods_ref;
+        mut owner_t: Type* = base_t;
+        while (depth < 16) {
+            for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
+                const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
+                if (!m.name.equals(member.member)) { continue; }
+                if (m.param_types.length != arg_types.length) { continue; }
+                mut exact: boolean = true;
+                for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                    if (m.param_types[pi].id != arg_types[pi].id) { exact = false; break; }
+                }
+                if (exact) {
+                    call.set_resolved_method(m.ast_node as ASTNode*);
+                    this.pin_method_resolved_callee(call, owner_t, m);
+                    return;
+                }
+            }
+            if (walk == null) { break; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            walk = parent_t as ClassType*;
+            cur_methods = walk.methods.as_slice();
+            owner_t = parent_t;
+            depth += 1;
+        }
+
+        // Pass 2: implicit-convert (2a exact pointee, 2b subclass) + take-address.
+        for (mut sub_pass: i32 = 0; sub_pass < 2; sub_pass++) {
+            const allow_subclass: boolean = (sub_pass == 1);
+            walk = start_cls;
+            depth = 0;
+            cur_methods = methods_ref;
+            owner_t = base_t;
+            while (depth < 16) {
+                for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
+                    const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
+                    if (!m.name.equals(member.member)) { continue; }
+                    if (m.param_types.length != arg_types.length) { continue; }
+                    mut compat: boolean = true;
+                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                        mut allow_implicit: boolean = true;
+                        if (!allow_subclass) {
+                            const at: Type* = this.arena.lookup(arg_types[pi].id);
+                            const ppt: Type* = this.arena.lookup(m.param_types[pi].id);
+                            if (at != null && ppt != null
+                                    && at.kind == TypeKind::Pointer && ppt.kind == TypeKind::Pointer) {
+                                if ((at as PointerType*).pointee.id != (ppt as PointerType*).pointee.id) {
+                                    allow_implicit = false;
+                                }
+                            }
+                        }
+                        if (allow_implicit && this.checker.can_implicit_convert(arg_types[pi], m.param_types[pi])) {
+                            continue;
+                        }
+                        if (pi < call.arguments.length && call.arguments[pi] != null
+                                && this.literals.int_literal_fits_target(call.arguments[pi], m.param_types[pi])) {
+                            continue;
+                        }
+                        const pt: Type* = this.arena.lookup(m.param_types[pi].id);
+                        if (pt != null) {
+                            mut pointee: TypeRef = TypeRef::invalid();
+                            if (pt.kind == TypeKind::Pointer) { pointee = (pt as PointerType*).pointee; }
+                            else if (pt.kind == TypeKind::Reference) { pointee = (pt as ReferenceType*).referent; }
+                            if (pointee.is_valid() && pointee.id == arg_types[pi].id) { continue; }
+                            const at: Type* = this.arena.lookup(arg_types[pi].id);
+                            if (at != null && pointee.is_valid()) {
+                                mut arg_pointee: TypeRef = TypeRef::invalid();
+                                if (at.kind == TypeKind::Pointer) { arg_pointee = (at as PointerType*).pointee; }
+                                else if (at.kind == TypeKind::Reference) { arg_pointee = (at as ReferenceType*).referent; }
+                                if (arg_pointee.is_valid() && arg_pointee.id == pointee.id) { continue; }
+                                if (allow_subclass && arg_pointee.is_valid()
+                                        && this.checker.is_subclass_of(arg_pointee, pointee)) { continue; }
+                            }
+                            if (allow_subclass && pointee.is_valid()
+                                    && this.checker.is_subclass_of(arg_types[pi], pointee)) { continue; }
+                        }
+                        compat = false;
+                        break;
+                    }
+                    if (compat) {
+                        call.set_resolved_method(m.ast_node as ASTNode*);
+                        this.pin_method_resolved_callee(call, owner_t, m);
+                        return;
+                    }
+                }
+                if (walk == null) { break; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                walk = parent_t as ClassType*;
+                cur_methods = walk.methods.as_slice();
+                owner_t = parent_t;
+                depth += 1;
+            }
+        }
+
+        // Pass 3: converter-aware match (lowest priority).
+        if (!call.resolved_callee.is_valid() && !this.state.in_implicit_conversion) {
+            walk = start_cls;
+            depth = 0;
+            cur_methods = methods_ref;
+            owner_t = base_t;
+            while (depth < 16) {
+                for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
+                    const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
+                    if (!m.name.equals(member.member)) { continue; }
+                    if (m.param_types.length != arg_types.length) { continue; }
+                    mut ok: boolean = true;
+                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                        if (m.param_types[pi].id == arg_types[pi].id) { continue; }
+                        if (this.checker.can_implicit_convert(arg_types[pi], m.param_types[pi])) { continue; }
+                        if (pi < call.arguments.length && call.arguments[pi] != null
+                                && this.literals.int_literal_fits_target(call.arguments[pi], m.param_types[pi])) { continue; }
+                        if (this.has_implicit_converter(arg_types[pi], m.param_types[pi])) { continue; }
+                        ok = false;
+                        break;
+                    }
+                    if (ok) {
+                        call.set_resolved_method(m.ast_node as ASTNode*);
+                        this.pin_method_resolved_callee(call, owner_t, m);
+                        return;
+                    }
+                }
+                if (walk == null) { break; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                walk = parent_t as ClassType*;
+                cur_methods = walk.methods.as_slice();
+                owner_t = parent_t;
+                depth += 1;
+            }
+        }
+
+        this.try_match_trait_impl_method(call, member, base_t, arg_types);
+    }
+
+    try_match_trait_impl_method(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+                                base_t: Type*, arg_types: TypeRef[]) -> void {
+        if (call.resolved_callee.is_valid()) { return; }
+        if (this.ctx.generic_registry == null) { return; }
+        if (base_t == null) { return; }
+        mut target_name: SymbolStr = SymbolStr::empty();
+        mut target_str:  string    = "";
+        match (base_t.kind) {
+            TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
+            TypeKind::Struct => { target_name = (base_t as StructType*).qualified_name; }
+            TypeKind::Enum   => { target_name = (base_t as EnumType*).qualified_name; }
+            TypeKind::Int | TypeKind::Float | TypeKind::Bool
+            | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
+                target_str  = base_t.display_name();
+                target_name = this.intern.intern(target_str);
+            }
+            _ => { return; }
+        }
+        if (!target_name.is_valid()) { return; }
+        if (strlen(target_str) == 0) { target_str = this.intern.resolve(target_name); }
+        if (strlen(target_str) == 0) { return; }
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
+        for (mut ti: i64 = 0; ti < traits.length; ti++) {
+            const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], target_name);
+            if (block == null) { continue; }
+            if (this.match_methods_on_impl_block(call, member, block, target_str, arg_types)) { return; }
+        }
+    }
+
+    match_methods_on_impl_block(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+                                block: ImplBlockNode*, owner_str: string, arg_types: &TypeRef[]) -> boolean {
+        if (block == null) { return false; }
+        const this_amp: SymbolStr = this.intern.intern("&this");
+        const this_val: SymbolStr = this.intern.intern("this");
+        mut has_concrete_sibling: boolean = false;
+        for (mut ci: i64 = 0; ci < block.methods.length; ci++) {
+            const cm: MethodNode* = block.methods[ci];
+            if (cm != null && cm.func != null && cm.func.name.equals(member.member)
+                    && !cm.func.is_self_returning_default) {
+                has_concrete_sibling = true;
+                break;
+            }
+        }
+        for (mut sub_pass: i32 = 0; sub_pass < 3; sub_pass++) {
+            const allow_implicit:  boolean = (sub_pass >= 1);
+            const allow_converter: boolean = (sub_pass == 2) && !this.state.in_implicit_conversion;
+            if (sub_pass == 2 && this.state.in_implicit_conversion) { break; }
+            for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
+                const mn: MethodNode* = block.methods[mi];
+                if (mn == null || mn.func == null) { continue; }
+                const fn_node: FunctionDeclNode* = mn.func;
+                if (!fn_node.name.equals(member.member)) { continue; }
+                if (fn_node.is_self_returning_default && has_concrete_sibling) { continue; }
+                mut params: TypeRef[] = [];
+                for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                    const pp: VarDeclNode* = fn_node.parameters[pi];
+                    if (pp == null) { continue; }
+                    if (pp.name.equals(this_amp)) { continue; }
+                    if (pp.name.equals(this_val)) { continue; }
+                    params.push(pp.resolved_type);
+                }
+                if (params.length != arg_types.length) { continue; }
+                mut compat: boolean = true;
+                for (mut pi: i64 = 0; pi < params.length; pi++) {
+                    if (params[pi].id == arg_types[pi].id) { continue; }
+                    if (allow_implicit && this.checker.can_implicit_convert(arg_types[pi], params[pi])) { continue; }
+                    if (allow_converter && this.has_implicit_converter(arg_types[pi], params[pi])) { continue; }
+                    compat = false;
+                    break;
+                }
+                if (compat) {
+                    call.set_resolved_method(mn as ASTNode*);
+                    this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Find an inherent method named `name` on a generic template's AST.
+    find_template_method(&this, ast_node: ASTNode*, name: SymbolStr) -> FunctionDeclNode* {
+        if (ast_node == null) { return null; }
+        if (ast_node.kind == NodeKind::StructDeclaration) {
+            const d: StructDeclNode* = ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                const m: MethodNode* = d.methods[i];
+                if (m != null && m.func != null && m.func.name.equals(name)) { return m.func; }
+            }
+        } else if (ast_node.kind == NodeKind::ClassDeclaration) {
+            const d: ClassDeclNode* = ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                const m: MethodNode* = d.methods[i];
+                if (m != null && m.func != null && m.func.name.equals(name)) { return m.func; }
+            }
+        }
+        return null;
+    }
+
+
+    // -- Method call return typing --
+
+    resolve_method_call(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
+                        call: CallExprNode*) -> TypeRef {
+        const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
+        if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+        if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+            const mret: TypeRef = this.symbolic.symbolic_resolve_owner_method_return(obj_type, member.member);
+            if (mret.is_valid()) { member.set_resolved_type(mret); return mret; }
+            return TypeRef::invalid();
+        }
+        if (this.symbolic.symbolic_type_unresolved(obj_type)) {
+            this.binding.stash_abstract_receiver_method(obj_type, member, call);
+            return TypeRef::invalid();
+        }
+        this.binding.stash_method_call_bindings(obj_type, member, call);
+
+        mut lookup_ref: TypeRef = obj_type;
+        mut base_t: Type* = this.arena.lookup(obj_type.id);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                lookup_ref = (base_t as PointerType*).pointee;
+                base_t = this.arena.lookup(lookup_ref.id);
+            } else if (base_t.kind == TypeKind::Reference) {
+                lookup_ref = (base_t as ReferenceType*).referent;
+                base_t = this.arena.lookup(lookup_ref.id);
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                lookup_ref = inst.resolved_type;
+                base_t = this.arena.lookup(lookup_ref.id);
+            } else {
+                break;
+            }
+            unwrap_depth += 1;
+        }
+
+        const type_sym: SymbolStr = this.types.lookup_type_sym(lookup_ref);
+        if (!type_sym.is_valid()) {
+            if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
+                const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
+                    base_t as BoundedParamType*, member.member);
+                if (trait_ret.is_valid()) { member.set_resolved_type(trait_ret); return trait_ret; }
+            }
+            if (base_t != null && base_t.kind == TypeKind::InstantiatedType) {
+                const gret: TypeRef = this.binding.resolve_generic_method_return(
+                    obj_type, member, call, TypeRef::invalid());
+                if (gret.is_valid()) { member.set_resolved_type(gret); return gret; }
+                const tmpl_ret: TypeRef = this.binding.resolve_method_return_via_template(lookup_ref, member.member);
+                if (tmpl_ret.is_valid()) {
+                    const fin: TypeRef = this.binding.finalize_assoc_return(obj_type, member, tmpl_ret);
+                    member.set_resolved_type(fin);
+                    return fin;
+                }
+            }
+            return TypeRef::invalid();
+        }
+
+        const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, type_sym, member.member);
+        if (ret.is_valid()) {
+            const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+            this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
+            const refined: TypeRef = if (member.generic_args.length > 0) {
+                this.binding.resolve_method_return_with_explicit_args(obj_type, member, ret)
+            } else {
+                this.binding.subst_method_return_from_receiver(obj_type, ret)
+            };
+            mut final_ret: TypeRef =
+                if (refined.is_valid() && this.types.contains_generic_param(refined)) {
+                    this.binding.resolve_generic_method_return(obj_type, member, call, refined)
+                } else {
+                    refined
+                };
+            final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
+            member.set_resolved_type(final_ret);
+            return final_ret;
+        }
+
+        if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
+            const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
+                base_t as BoundedParamType*, member.member);
+            if (trait_ret.is_valid()) { member.set_resolved_type(trait_ret); return trait_ret; }
+        }
+
+        const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, member.member);
+        if (inherited.is_valid()) {
+            const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
+            mut fin_inherited: TypeRef = subst_inherited;
+            if (fin_inherited.is_valid() && this.types.contains_generic_param(fin_inherited)) {
+                fin_inherited = this.binding.resolve_generic_method_return(obj_type, member, call, fin_inherited);
+            }
+            fin_inherited = this.binding.finalize_assoc_return(obj_type, member, fin_inherited);
+            member.set_resolved_type(fin_inherited);
+            return fin_inherited;
+        }
+
+        const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member.member, member);
+        if (field_ret.is_valid()) { return field_ret; }
+
+        if (member.member.equals(this.intern.intern("drop"))
+                && OwnershipQuery::is_copy(this.arena, this.ctx.get_generic_registry(), this.intern, lookup_ref)) {
+            member.set_resolved_type(this.arena.get_void());
+            return this.arena.get_void();
+        }
+
+        const method_name: string = this.intern.resolve(member.member);
+        const recv_t: Type* = this.arena.lookup(lookup_ref.id);
+        const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+
+        if (this.ctx.generic_registry != null) {
+            const failed_trait: SymbolStr = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
+            if (failed_trait.is_valid()) {
+                const trait_str: string = this.intern.resolve(failed_trait);
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                    format("the trait `%s` is not implemented for `%s`", trait_str, type_display));
+                diag = diag.at(primary_span);
+                diag = diag.with_note(format(
+                    "the impl of `%s` for this type has a where-clause that this specialization does not satisfy", trait_str));
+                diag = diag.help(format(
+                    "method `%s` belongs to trait `%s`; ensure the type arguments satisfy the impl's bounds", method_name, trait_str));
+                this.ctx.emit_diagnostic(diag);
+                return TypeRef::invalid();
+            }
+        }
+        if (this.try_diagnose_method_bound_failure(obj_type, member)) { return TypeRef::invalid(); }
+        if (this.try_diagnose_forin_noncopy(obj_type, member, primary_span)) { return TypeRef::invalid(); }
+
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            format("no method named `%s` found on type `%s`", method_name, type_display));
+        diag = diag.at(primary_span);
+        const owning_trait: SymbolStr = this.binding.lookup_trait_defining_method(member.member);
+        if (owning_trait.is_valid()) {
+            const trait_str: string = this.intern.resolve(owning_trait);
+            diag = diag.with_note(format("the method `%s` is defined on trait `%s`", method_name, trait_str));
+            diag = diag.help(format("implement `%s` for `%s`, or change the receiver to a type that already does", trait_str, type_display));
+        } else {
+            const suggestion: SymbolStr = this.diag.suggest_similar_method(type_sym, member.member);
+            if (suggestion.is_valid()) {
+                const sug_str: string = this.intern.resolve(suggestion);
+                diag = diag.help(format("a method with a similar name exists: `%s`", sug_str));
+                if (member.member_span.has_location()) {
+                    diag = diag.suggest(Suggestion::machine_applicable(member.member_span, sug_str,
+                        format("did you mean `%s`?", sug_str)));
+                }
+            }
+        }
+        const resolved_qname: SymbolStr = this.arena.get_qualified_name(lookup_ref);
+        if (resolved_qname.is_valid()) {
+            const resolved_qname_str: string = this.intern.resolve(resolved_qname);
+            const simple: string = extract_leaf_segment(resolved_qname_str);
+            if (simple != "") {
+                const simple_sym: SymbolStr = this.intern.intern(simple);
+                const shadows: SymbolStr[] = this.diag.find_shadowed_type_candidates(simple_sym, member.member, lookup_ref);
+                if (shadows.length > 0) {
+                    diag = this.diag.attach_shadow_import_suggestions(diag, simple, shadows);
+                } else {
+                    shadows.drop();
+                }
+            }
+        }
+        this.ctx.emit_diagnostic(diag);
+        return TypeRef::invalid();
+    }
+
+    /// E0358: a method gated behind a `where` bound the concrete type args don't satisfy.
+    try_diagnose_method_bound_failure(mut &this, obj_type: TypeRef, member: MemberAccessNode*) -> boolean {
+        const reg: GenericRegistry* = this.ctx.get_generic_registry();
+        if (reg == null) { return false; }
+        mut t: Type* = this.arena.lookup(obj_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::InstantiatedType) { break; }
+            if (t.kind == TypeKind::Reference) { t = this.arena.lookup((t as ReferenceType*).referent.id); }
+            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup((t as PointerType*).pointee.id); }
+            else { break; }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        const tmpl: TemplateEntry* = reg.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return false; }
+        if (tmpl.param_names.length != inst.type_args.length) { return false; }
+        const func: FunctionDeclNode* = this.find_template_method(tmpl.ast_node, member.member);
+        if (func == null || func.trait_bounds.length == 0) { return false; }
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
+            const bound: &TraitBound = &func.trait_bounds[bi];
+            mut concrete: TypeRef = TypeRef::invalid();
+            for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
+                if (tmpl.param_names[pi].equals(bound.type_parameter)) { concrete = inst.type_args[pi]; break; }
+            }
+            if (!concrete.is_valid()) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: &TraitRef = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (this.trait_checker().type_implements_trait(concrete, trait_name, 0)) { continue; }
+                const method_str: string = this.intern.resolve(member.member);
+                const trait_str:  string = this.intern.resolve(trait_name);
+                const param_str:  string = this.intern.resolve(bound.type_parameter);
+                const conc_str:   string = this.types.type_display_name(concrete);
+                const primary: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                    format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str));
+                d = d.at(primary);
+                d = d.with_note(format("method `%s` requires `%s: %s`", method_str, param_str, trait_str));
+                if (strcmp(trait_str, "Copy") == 0) {
+                    d = d.help(format(
+                        "`%s` owns resources, so it isn't `Copy`; borrow the element in place with `get_ref` instead of copying it out with `%s`",
+                        conc_str, method_str));
+                }
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// E0358: for-in over a non-Copy collection (Copy-gated `iter`).
+    try_diagnose_forin_noncopy(mut &this, obj_type: TypeRef, member: MemberAccessNode*,
+                               primary_span: SourceSpan) -> boolean {
+        const is_next: boolean = member.member.equals(this.intern.intern("next"));
+        const is_iter: boolean = member.member.equals(this.intern.intern("iter"));
+        if (!is_next && !is_iter) { return false; }
+        const reg: GenericRegistry* = this.ctx.get_generic_registry();
+        if (reg == null) { return false; }
+        mut t: Type* = this.arena.lookup(obj_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::InstantiatedType) { break; }
+            if (t.kind == TypeKind::Reference) { t = this.arena.lookup((t as ReferenceType*).referent.id); }
+            else if (t.kind == TypeKind::Pointer) { t = this.arena.lookup((t as PointerType*).pointee.id); }
+            else { break; }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        const tmpl: TemplateEntry* = reg.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return false; }
+        if (tmpl.param_names.length != inst.type_args.length) { return false; }
+        const iter_fn: FunctionDeclNode* = this.find_template_method(tmpl.ast_node, this.intern.intern("iter"));
+        if (iter_fn == null || iter_fn.trait_bounds.length == 0) { return false; }
+        for (mut bi: i64 = 0; bi < iter_fn.trait_bounds.length; bi++) {
+            const bound: &TraitBound = &iter_fn.trait_bounds[bi];
+            mut concrete: TypeRef = TypeRef::invalid();
+            for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
+                if (tmpl.param_names[pi].equals(bound.type_parameter)) { concrete = inst.type_args[pi]; break; }
+            }
+            if (!concrete.is_valid()) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: &TraitRef = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (strcmp(this.intern.resolve(trait_name), "Copy") != 0) { continue; }
+                if (OwnershipQuery::is_copy(this.arena, reg, this.intern, concrete)) { continue; }
+                const coll_str: string = this.types.type_display_name(obj_type);
+                const elem_str: string = this.types.type_display_name(concrete);
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                    format("cannot iterate `%s` with `for-in`: its element type `%s` is not `Copy`", coll_str, elem_str));
+                d = d.at(primary_span);
+                d = d.with_note("`for (x in xs)` lowers to `xs.iter()`, but `iter` is gated `where T: Copy` because it yields elements by value");
+                d = d.help(format(
+                    "iterate by index and borrow each element in place instead, e.g. `for (mut i: u64 = 0; i < xs.length(); i++) { const x: %s* = ... xs.get_ref(i); }`",
+                    elem_str));
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    // -- Scope-resolution call resolution (Type::method / Module::func / variant) --
+
+    resolve_scope_call(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
+        mut lookup_sym: SymbolStr = scope.scope_name;
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+        }
+        const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
+        if (method_ret.is_valid()) { return method_ret; }
+        const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, call);
+        if (type_ret.is_valid()) { return type_ret; }
+        const fn_ret: TypeRef = this.try_resolve_module_function(scope, call);
+        if (fn_ret.is_valid()) { return fn_ret; }
+        const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
+        if (cimport_ret.is_valid()) { return cimport_ret; }
+
+        if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return TypeRef::invalid(); }
+
+        const scope_str: string = this.intern.resolve(scope.scope_name);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0233_UNDEFINED_SYMBOL,
+            format("cannot find `%s::%s`: no matching static method, variant, or type", scope_str, member_str));
+        diag = diag.at(scope.span);
+        const shadows: SymbolStr[] = this.diag.find_shadowed_type_candidates(scope.scope_name, scope.member_name, TypeRef::invalid());
+        if (shadows.length > 0) {
+            diag = this.diag.attach_shadow_import_suggestions(diag, scope_str, shadows);
+        } else {
+            shadows.drop();
+        }
+        this.ctx.emit_diagnostic(diag);
+        return TypeRef::invalid();
+    }
+
+    /// GATED (R2): true when the scope/method resolves to a generic template (so
+    /// sema pinning the template form would shadow mono's spec pin).
+    scope_is_generic_template(&this, scope_sym: SymbolStr, member_sym: SymbolStr) -> boolean {
+        if (this.ctx.generic_registry == null) { return false; }
+        const scope_entry: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
+        if (scope_entry != null) { return true; }
+        if (this.ctx.decl_index != null) {
+            const qscope: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+            if (qscope.is_valid() && !qscope.equals(scope_sym)) {
+                if (this.ctx.generic_registry.get_template(qscope) != null) { return true; }
+            }
+        }
+        if (member_sym.is_valid()) {
+            const scope_str: string = this.intern.resolve(scope_sym);
+            const member_str: string = this.intern.resolve(member_sym);
+            const csym: SymbolStr = this.intern.intern(format("%s::%s", scope_str, member_str));
+            if (this.ctx.generic_registry.get_template(csym) != null) { return true; }
+            if (this.ctx.decl_index != null) {
+                const qscope2: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+                if (qscope2.is_valid() && !qscope2.equals(scope_sym)) {
+                    const qcsym: SymbolStr = this.intern.intern(format("%s::%s", this.intern.resolve(qscope2), member_str));
+                    if (this.ctx.generic_registry.get_template(qcsym) != null) { return true; }
+                }
+            }
+        }
+        if (this.ctx.decl_index != null) {
+            const type_ref: TypeRef = this.ctx.decl_index.lookup_type(scope_sym);
+            if (type_ref.is_valid()) {
+                const t: Type* = this.arena.lookup(type_ref.id);
+                if (t != null && t.kind == TypeKind::InstantiatedType) { return true; }
+            }
+        }
+        return false;
+    }
+
+    pin_scope_callee_combined(mut &this, call: CallExprNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
+        if (call == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
+        if (this.scope_is_generic_template(scope_sym, member_sym)) { return; }
+        const scope_str: string = this.intern.resolve(scope_sym);
+        const member_str: string = this.intern.resolve(member_sym);
+        if (strlen(scope_str) == 0 || strlen(member_str) == 0) { return; }
+        const sym: SymbolStr = this.intern.intern(format("%s::%s", scope_str, member_str));
+        if (this.try_pin_static_method_overload(call, sym)) { return; }
+        call.set_resolved_callee(sym);
+    }
+
+    try_pin_static_method_overload(mut &this, call: CallExprNode*, combined_sym: SymbolStr) -> boolean {
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const overloads: TypeRef[] = di.lookup_func_type_overloads(combined_sym);
+        if (overloads.length < 2) { return false; }
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return false; }
+            arg_types.push(arg.resolved_type);
+        }
+        mut matched: i64 = -1;
+        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+            const ot: Type* = this.arena.lookup(overloads[oi].id);
+            if (ot == null || ot.kind != TypeKind::Function) { continue; }
+            const fn_ty: FunctionType* = ot as FunctionType*;
+            if (fn_ty.param_types.length != arg_types.length) { continue; }
+            mut all_match: boolean = true;
+            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
+                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) { all_match = false; break; }
+            }
+            if (!all_match) { continue; }
+            if (matched != -1) { return false; }
+            matched = oi;
+        }
+        if (matched < 0) { return false; }
+        const mangled: SymbolStr = di.lookup_overload_mangled(combined_sym, overloads[matched]);
+        if (!mangled.is_valid()) { return false; }
+        call.set_resolved_callee(mangled);
+        return true;
+    }
+
+    pin_scope_callee_qsym(mut &this, call: CallExprNode*, q_sym: SymbolStr) -> void {
+        if (call == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (!q_sym.is_valid()) { return; }
+        call.set_resolved_callee(q_sym);
+    }
+
+    /// GATED (R1): try Scope::Member as a static method (specialized -> base -> DI
+    /// -> template).  The template path carries pre-mono re-derivation.
+    try_resolve_static_method(mut &this, scope: ScopeResolutionNode*, lookup_sym: SymbolStr,
+                              call: CallExprNode*) -> TypeRef {
+        const method_ret: TypeRef = this.types.lookup_method_return(lookup_sym, scope.member_name);
+        if (method_ret.is_valid()) {
+            mut resolved: TypeRef = this.try_resolve_generic_return(method_ret, scope.scope_name, scope.member_name, scope);
+            if (this.types.contains_generic_param(resolved)) {
+                const inferred: TypeRef = this.resolve_static_method_return_via_template(scope, call);
+                if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { resolved = inferred; }
+            }
+            scope.set_resolved_type(resolved);
+            this.pin_scope_callee_combined(call, lookup_sym, scope.member_name);
+            return resolved;
+        }
+        if (scope.scope_generic_args.length > 0) {
+            const spec_ref: TypeRef = this.types.lookup_type_by_sym(lookup_sym);
+            if (spec_ref.is_valid()) {
+                const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(spec_ref);
+                if (spec_qn.is_valid() && !spec_qn.equals(lookup_sym)) {
+                    const qn_ret: TypeRef = this.ctx.decl_index.lookup_method_return(spec_qn, scope.member_name);
+                    if (qn_ret.is_valid()) {
+                        scope.set_resolved_type(qn_ret);
+                        this.pin_scope_callee_combined(call, spec_qn, scope.member_name);
+                        return qn_ret;
+                    }
+                }
+            }
+        }
+        if (lookup_sym.id != scope.scope_name.id) {
+            const base_ret: TypeRef = this.types.lookup_method_return(scope.scope_name, scope.member_name);
+            if (base_ret.is_valid()) {
+                const resolved: TypeRef = this.try_resolve_generic_return(base_ret, scope.scope_name, scope.member_name, scope);
+                scope.set_resolved_type(resolved);
+                this.pin_scope_callee_combined(call, scope.scope_name, scope.member_name);
+                return resolved;
+            }
+        }
+        const tmpl_ret: TypeRef = this.resolve_static_method_return_via_template(scope, call);
+        if (tmpl_ret.is_valid()) {
+            scope.set_resolved_type(tmpl_ret);
+            return tmpl_ret;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// GATED (R1): resolve a static method's return off a generic owner TEMPLATE
+    /// pre-mono, substituting inferred / default / expected owner args.
+    resolve_static_method_return_via_template(mut &this, scope: ScopeResolutionNode*,
+                                              call: CallExprNode*) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope.scope_name);
+        if (tmpl == null && this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
+            if (q.is_valid() && !q.equals(scope.scope_name)) { tmpl = this.ctx.generic_registry.get_template(q); }
+        }
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.node_kind == NodeKind::StructDeclaration) { methods = &(tmpl.ast_node as StructDeclNode*).methods; }
+        else if (tmpl.node_kind == NodeKind::ClassDeclaration) { methods = &(tmpl.ast_node as ClassDeclNode*).methods; }
+        else { return TypeRef::invalid(); }
+        mut found_count: i64 = 0;
+        mut abstract_ret: TypeRef = TypeRef::invalid();
+        mut matched: MethodNode* = null;
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.is_static) { continue; }
+            if (!m.func.name.equals(scope.member_name)) { continue; }
+            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            found_count += 1;
+            abstract_ret = m.func.resolved_return_type;
+            matched = m;
+        }
+        if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
+        // Stash the owner's concrete type args (declaration order, all-concrete) so
+        // the monomorphizer specializes the owner WITHOUT re-deriving them — sema is
+        // the sole source of truth for resolved types (mono-after-sema).  Additive:
+        // the return-type resolution below is unchanged; absence of a stash means
+        // mono cannot specialize this owner-generic static call.
+        this.stash_static_owner_bindings(scope, call, tmpl, matched);
+        if (!this.types.contains_generic_param(abstract_ret)) { return abstract_ret; }
+
+        if (call != null) {
+            const inferred: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call);
+            if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { return inferred; }
+        }
+        const ret_inst: InstantiatedType* = this.types.peel_to_instantiation(abstract_ret);
+        if (this.state.expected_type.is_valid() && ret_inst != null) {
+            const exp_inst: InstantiatedType* = this.types.peel_to_instantiation(this.state.expected_type);
+            if (exp_inst != null && exp_inst.generic_base.id == ret_inst.generic_base.id
+                    && !this.types.contains_generic_param(this.state.expected_type)) {
+                return this.state.expected_type;
+            }
+        }
+        mut owner_concrete: TypeRef = TypeRef::invalid();
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(spec_sym); }
+        }
+        if (!owner_concrete.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(scope.scope_name); }
+        if (!owner_concrete.is_valid()) { return TypeRef::invalid(); }
+        return this.binding.subst_method_return_from_receiver(owner_concrete, abstract_ret);
+    }
+
+    /// GATED (R1, literal-default trap): infer a generic static-constructor's owner
+    /// type args by unifying its params against the call args.  Returns the owner
+    /// bindings (declaration order, all-concrete) or `[]` if any param stays
+    /// unbound/abstract.  The literal fallback (`Atomic::new(0)`/`Range::new`) is
+    /// gated to a single diagnostic site (`emit_static_owner_literal_default`).
+    infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
+                                          call: CallExprNode*) -> TypeRef[] {
+        if (method == null || method.func == null) { return []; }
+        if (tmpl.param_type_ids.length == 0) { return []; }
+        if (method.func.parameters.length != call.arguments.length) { return []; }
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) { pids.push(tmpl.param_type_ids[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        // Pass 1: bind from concrete (non-literal) argument types.
+        for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+            const p: VarDeclNode* = method.func.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const actual: TypeRef = arg.resolved_type;
+            if (!actual.is_valid()) { continue; }
+            ictx.unify(p.resolved_type, actual);
+        }
+        // Pass 2 (THE SINGLE GATED LITERAL-DEFAULT SITE): any owner param still
+        // unbound falls back to a polymorphic literal's default type (`0` -> i32).
+        // This is the `Atomic<u64>::new(0)` miscompile trap, so emit one diagnostic
+        // before guessing (see emit_static_owner_literal_default).
+        mut used_literal_default: boolean = false;
+        for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+            const p2: VarDeclNode* = method.func.parameters[i];
+            if (p2 == null || !p2.resolved_type.is_valid()) { continue; }
+            const arg2: ExpressionNode* = call.arguments[i];
+            if (arg2 == null || !this.sema_arg_is_polymorphic_literal(arg2)) { continue; }
+            const f_idx: i64 = ictx.binding_index(p2.resolved_type.id);
+            if (f_idx >= 0 && !ictx.bindings[f_idx].is_valid()) {
+                const lit_actual: TypeRef = arg2.resolved_type;
+                if (lit_actual.is_valid()) {
+                    used_literal_default = true;
+                    ictx.unify(p2.resolved_type, lit_actual);
+                }
+            }
+        }
+        if (used_literal_default) { this.emit_static_owner_literal_default(call, tmpl); }
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return []; }
+            if (this.types.contains_generic_param(bindings[i])) { return []; }
+        }
+        return bindings;
+    }
+
+    /// Substitute a generic static-constructor's return type using owner bindings
+    /// inferred from the call args.  Invalid if the owner args can't be inferred.
+    infer_static_owner_return_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
+                                        abstract_ret: TypeRef, call: CallExprNode*) -> TypeRef {
+        const bindings: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call);
+        if (bindings.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, bindings);
+        return subst.apply(abstract_ret, this.arena);
+    }
+
+    /// Compute a generic static-method call's owner type args (declaration order,
+    /// all-concrete) from the highest-priority available source.  Priority mirrors
+    /// the return-type resolution in `resolve_static_method_return_via_template`:
+    /// inferred-from-args -> expected type -> explicit scope turbofish.  Each source
+    /// builds and returns its OWN array (no owning-array reassignment/aliasing);
+    /// `[]` when no source yields a complete set.
+    compute_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
+                                  tmpl: TemplateEntry*, method: MethodNode*) -> TypeRef[] {
+        const want: i64 = tmpl.param_type_ids.length;
+        if (want == 0) { return []; }
+
+        // 1. Inferred from concrete argument types (+ the gated literal default).
+        // The helper returns either a length-`want` all-concrete set or `[]`.
+        const ib: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call);
+        if (ib.length == want) { return ib; }
+
+        // 2. Expected-type derived (e.g. `const s: Slice<i32> = Slice::from_raw(..)`).
+        if (this.state.expected_type.is_valid()) {
+            const exp_inst: InstantiatedType* = this.types.peel_to_instantiation(this.state.expected_type);
+            if (exp_inst != null && exp_inst.generic_base.id == tmpl.base_type.id
+                    && exp_inst.type_args.length == want
+                    && !this.types.contains_generic_param(this.state.expected_type)) {
+                mut eb: TypeRef[] = [];
+                for (mut i: i64 = 0; i < exp_inst.type_args.length; i++) { eb.push(exp_inst.type_args[i]); }
+                return eb;
+            }
+        }
+
+        // 3. Explicit scope turbofish (`Slice<i32>::from_raw(..)`) — authoritative.
+        if (scope.scope_generic_args.length > 0 && this.ctx.type_resolver != null) {
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            mut sb: TypeRef[] = [];
+            mut ok: boolean = true;
+            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &rc);
+                if (!tr.is_valid()) { ok = false; break; }
+                sb.push(tr);
+            }
+            // expand_default_type_args takes `sb` by value (move) and returns the
+            // backfilled array; reassigning `sb` to its own move-result is safe.
+            if (ok && sb.length < want) {
+                sb = this.ctx.type_resolver.expand_default_type_args(tmpl, sb, &rc);
+            }
+            if (ok && sb.length == want) { return sb; }
+        }
+        return [];
+    }
+
+    /// Stash a generic static-method call's owner type args on the call node so the
+    /// monomorphizer specializes the owner WITHOUT re-deriving them — sema is the
+    /// sole source of truth (mono-after-sema).  Best-effort: stashes only a
+    /// length-matched, all-concrete set; otherwise leaves the stash empty.
+    stash_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
+                                tmpl: TemplateEntry*, method: MethodNode*) -> void {
+        if (call == null || scope == null || tmpl == null) { return; }
+        if (call.resolved_type_args.length > 0) { return; }
+        const want: i64 = tmpl.param_type_ids.length;
+        if (want == 0) { return; }
+        // `binds` owns a fresh buffer; `set_resolved_type_args` takes it by value
+        // (move), so there is no aliasing/double-free.
+        mut binds: TypeRef[] = this.compute_static_owner_bindings(scope, call, tmpl, method);
+        if (binds.length != want) { return; }
+        for (mut i: i64 = 0; i < binds.length; i++) {
+            if (!binds[i].is_valid()) { return; }
+            if (this.types.contains_generic_param(binds[i])) { return; }
+        }
+        call.set_resolved_type_args(binds);
+    }
+
+    /// The single gated diagnostic for the owner-type literal-default fallback.
+    /// `Atomic::new(0)` infers the owner arg from `0`'s default (i32); warn so the
+    /// `Atomic<u64>` miscompile surfaces and the user can annotate explicitly.
+    emit_static_owner_literal_default(mut &this, call: CallExprNode*, tmpl: TemplateEntry*) -> void {
+        const owner: string = this.intern.resolve(tmpl.name);
+        mut d: Diagnostic = Diagnostic::warning(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            format("type argument for `%s` inferred from a default literal type", owner));
+        d = d.at(call.span);
+        d = d.with_note(
+            "the owner type argument was guessed from a literal's default type and may be wrong");
+        d = d.help(format(
+            "specify it explicitly, e.g. `%s<T>::...`, or annotate the binding's type", owner));
+        this.ctx.diagnostics.emit(d);
+    }
+
+    try_resolve_type_or_variant(mut &this, scope: ScopeResolutionNode*, lookup_sym: SymbolStr,
+                                call: CallExprNode*) -> TypeRef {
+        const type_ref: TypeRef = this.types.lookup_type_by_sym(lookup_sym);
+        if (!type_ref.is_valid()) { return TypeRef::invalid(); }
+        const di_name: SymbolStr = this.ctx.decl_index.lookup_type_name(type_ref);
+        if (di_name.is_valid()) {
+            const di_method_ret: TypeRef = this.types.lookup_method_return(di_name, scope.member_name);
+            if (di_method_ret.is_valid()) {
+                const resolved: TypeRef = this.try_resolve_generic_return(di_method_ret, scope.scope_name, scope.member_name, scope);
+                scope.set_resolved_type(resolved);
+                this.pin_scope_callee_combined(call, di_name, scope.member_name);
+                return resolved;
+            }
+        }
+        mut concrete_t: Type* = this.arena.lookup(type_ref.id);
+        if (concrete_t != null && concrete_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = concrete_t as InstantiatedType*;
+            if (inst.has_resolved_type()) { concrete_t = this.arena.lookup(inst.resolved_type.id); }
+        }
+        if (concrete_t == null || concrete_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
+        const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
+        scope.set_resolved_type(promoted);
+        return promoted;
+    }
+
+    try_resolve_module_function(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
+        const q_ret: TypeRef = this.resolve_module_qualified_function(scope.scope_name, scope.member_name, call, scope);
+        if (q_ret.is_valid()) { scope.set_resolved_type(q_ret); return q_ret; }
+        return TypeRef::invalid();
+    }
+
+    try_resolve_cimport_function(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
+        const scope_str: string = this.intern.resolve(scope.scope_name);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        const q_sym: SymbolStr = this.ctx.intern(scope_str + "::" + member_str);
+        const ret: TypeRef = this.ctx.decl_index.lookup_func_return(q_sym);
+        if (ret.is_valid()) {
+            scope.set_resolved_type(ret);
+            this.pin_scope_callee_qsym(call, q_sym);
+            return ret;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve a module-qualified function (`intrinsics::frexp`) via the module
+    /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
+    resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
+                                      call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
+        const scope_str: string = this.intern.resolve(scope_name);
+        const member_str: string = this.intern.resolve(member_name);
+        const scope_len: i64 = strlen(scope_str) as i64;
+        if (scope_len == 0) { return TypeRef::invalid(); }
+        const mg: ModuleGraph* = this.ctx.module_graph;
+        const modules: &ModuleInfo[] = &mg.modules;
+        const call_arity: i64 = if (call != null) { call.arguments.length } else { -1 };
+        const cur_ns: string = this.current_module_name();
+
+        mut first_i: i64 = -1;
+        mut arity_i: i64 = -1;
+        mut arity_count: i64 = 0;
+        mut prefix_i: i64 = -1;
+        mut prefix_best: i64 = -1;
+        mut prefix_ties: i64 = 0;
+
+        for (mut i: i64 = 0; i < modules.length; i++) {
+            const ns_str: string = this.intern.resolve(modules[i].namespace_name);
+            const ns_len: i64 = strlen(ns_str) as i64;
+            mut is_match: boolean = false;
+            if (ns_len == scope_len) {
+                is_match = strcmp(ns_str, scope_str) == 0;
+            } else if (ns_len > scope_len + 1) {
+                const suffix_start: i64 = ns_len - scope_len;
+                if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
+                    is_match = strcmp(ns_str + suffix_start, scope_str) == 0;
+                }
+            }
+            if (!is_match) { continue; }
+            const q_sym: SymbolStr = this.ctx.intern(ns_str + "::" + member_str);
+            if (!this.types.lookup_func_return(q_sym).is_valid()) { continue; }
+            if (first_i < 0) { first_i = i; }
+            if (call_arity >= 0 && this.types.scope_fn_arity(q_sym) == call_arity) {
+                arity_i = i;
+                arity_count = arity_count + 1;
+            }
+            const shared: i64 = ns_shared_prefix_len(cur_ns, ns_str);
+            if (shared > prefix_best) { prefix_best = shared; prefix_i = i; prefix_ties = 1; }
+            else if (shared == prefix_best) { prefix_ties = prefix_ties + 1; }
+        }
+
+        mut chosen_i: i64 = first_i;
+        if (arity_count == 1) { chosen_i = arity_i; }
+        else if (prefix_ties == 1 && prefix_i >= 0) { chosen_i = prefix_i; }
+        if (chosen_i < 0) { return TypeRef::invalid(); }
+
+        const chosen_ns: string = this.intern.resolve(modules[chosen_i].namespace_name);
+        const q_sym: SymbolStr = this.ctx.intern(chosen_ns + "::" + member_str);
+        const ret: TypeRef = this.types.lookup_func_return(q_sym);
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
+
+        mut is_fn_template: boolean = false;
+        mut tmpl: TemplateEntry* = null;
+        if (this.ctx.generic_registry != null) {
+            tmpl = this.ctx.generic_registry.get_template(q_sym);
+            if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
+        }
+        if (is_fn_template && call != null) {
+            // GATED (R1): prefer mono's pin; recompute the spec return as fallback.
+            mut spec_sym: SymbolStr = call.resolved_callee;
+            if (!spec_sym.is_valid()) {
+                const base: SymbolStr = tmpl.spec_base_name(this.intern);
+                if (scope != null && scope.generic_args.length > 0) {
+                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args);
+                } else if (call.generic_args.length > 0) {
+                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args);
+                }
+            }
+            if (spec_sym.is_valid()) {
+                const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
+                if (spec_ret.is_valid()) { call.set_resolved_callee(spec_sym); return spec_ret; }
+            }
+            const no_turbofish: boolean =
+                (scope == null || scope.generic_args.length == 0) && call.generic_args.length == 0;
+            if (no_turbofish) {
+                const tfn: FunctionDeclNode* = tmpl.ast_node as FunctionDeclNode*;
+                if (tfn != null) {
+                    mut binds: TypeRef[] = this.infer_free_call_bindings(call, tmpl, tfn);
+                    if (binds.length > 0) {
+                        mut stash: TypeRef[] = [];
+                        for (mut i: i64 = 0; i < binds.length; i++) { stash.push(binds[i]); }
+                        call.set_resolved_type_args(stash);
+                        const cret: TypeRef = this.subst_free_call_return(tmpl, &binds, ret);
+                        if (cret.is_valid()) { return cret; }
+                    }
+                }
+            }
+            mut subst_ret: TypeRef = TypeRef::invalid();
+            if (scope != null && scope.generic_args.length > 0) {
+                subst_ret = this.subst_return_from_call_args(call, tmpl, &scope.generic_args, ret);
+            } else if (call.generic_args.length > 0) {
+                subst_ret = this.subst_return_from_call_args(call, tmpl, &call.generic_args, ret);
+            }
+            if (subst_ret.is_valid()) { return subst_ret; }
+        }
+        if (!is_fn_template) { this.pin_scope_callee_qsym(call, q_sym); }
+        return ret;
+    }
+
+    /// Substitute a generic function's explicit turbofish args into its template
+    /// return (concrete return BEFORE mono creates the spec).  Stashes the args.
+    subst_return_from_call_args(mut &this, call: CallExprNode*, tmpl: TemplateEntry*,
+                                generic_args: &TypeAnnotation*[], tmpl_ret: TypeRef) -> TypeRef {
+        if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
+        if (generic_args.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&rc);
+        mut arg_refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < generic_args.length; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &rc);
+            if (!tr.is_valid()) { arg_refs.drop(); return TypeRef::invalid(); }
+            arg_refs.push(tr);
+        }
+        if (call != null) {
+            mut stash: TypeRef[] = [];
+            for (mut i: i64 = 0; i < arg_refs.length; i++) { stash.push(arg_refs[i]); }
+            call.set_resolved_type_args(stash);
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, arg_refs);
+        const out: TypeRef = subst.apply(tmpl_ret, this.arena);
+        if (!out.is_valid() || this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
+        return out;
+    }
+
+    resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[]) -> SymbolStr {
+        if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&res_ctx);
+        mut arg_refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < generic_args.length; i++) {
+            const arg_ref: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &res_ctx);
+            if (!arg_ref.is_valid()) { return SymbolStr::empty(); }
+            arg_refs.push(arg_ref);
+        }
+        if (this.ctx.generic_registry != null) {
+            mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
+            if (entry == null) {
+                const di_qual: SymbolStr = this.ctx.decl_index.resolve_qualified(base_name);
+                if (di_qual.is_valid() && !di_qual.equals(base_name)) {
+                    entry = this.ctx.generic_registry.get_template(di_qual);
+                }
+            }
+            if (entry == null) {
+                const qualified: SymbolStr = this.ctx.qualify_symbol_sym(base_name);
+                if (!qualified.equals(base_name)) { entry = this.ctx.generic_registry.get_template(qualified); }
+            }
+            if (entry == null) {
+                const cross_sym: SymbolStr = this.types.resolve_cross_module_name(base_name);
+                if (cross_sym.is_valid()) { entry = this.ctx.generic_registry.get_template(cross_sym); }
+            }
+            if (entry != null && arg_refs.length < entry.param_count) {
+                arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
+            }
+        }
+        const base_qname: QualifiedName = QualifiedName::from_symbol(base_name);
+        return MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
+    }
+
+    /// Resolve a generic scope-call return (`Result::ok`) to the concrete
+    /// specialization, from explicit scope args or the expected type.
+    try_resolve_generic_return(mut &this, ret: TypeRef, scope_name: SymbolStr,
+                               member_name: SymbolStr, scope: ScopeResolutionNode*) -> TypeRef {
+        const ret_t: Type* = this.arena.lookup(ret.id);
+        if (ret_t == null || ret_t.kind != TypeKind::InstantiatedType) { return ret; }
+        const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
+        if (ret_inst.is_resolved()) { return ret; }
+        if (scope != null && scope.scope_generic_args.length > 0
+                && scope.scope_generic_args.length == ret_inst.type_args.length) {
+            mut resolved_args: TypeRef[] = [];
+            mut all_valid: boolean = true;
+            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+                const arg_ref: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &res_ctx);
+                if (!arg_ref.is_valid()) { all_valid = false; break; }
+                resolved_args.push(arg_ref);
+            }
+            if (all_valid) {
+                return this.ctx.generic_registry.instantiate(ret_inst.generic_base, resolved_args);
+            }
+        }
+        if (!this.state.expected_type.is_valid()) { return ret; }
+        mut exp_ref: TypeRef = this.state.expected_type;
+        mut exp_t: Type* = this.arena.lookup(exp_ref.id);
+        if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
+            const alias: TypeAliasType* = exp_t as TypeAliasType*;
+            if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
+        }
+        if (exp_t == null || exp_t.kind != TypeKind::InstantiatedType) { return ret; }
+        const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+        if (ret_inst.generic_base.id != exp_inst.generic_base.id) { return ret; }
+        const scope_qname: QualifiedName = QualifiedName::from_symbol(scope_name);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(this.intern, this.arena, scope_qname, exp_inst.type_args);
+        const spec_ret: TypeRef = this.types.lookup_method_return(spec_sym, member_name);
+        if (spec_ret.is_valid()) { return spec_ret; }
+        return this.state.expected_type;
+    }
+
+    /// Promote an enum-variant constructor's base-type return to the matching
+    /// concrete specialization from `expected_type`.
+    promote_to_expected_instantiation(&this, found: TypeRef) -> TypeRef {
+        if (!this.state.expected_type.is_valid()) { return found; }
+        mut exp_ref: TypeRef = this.state.expected_type;
+        mut exp_t: Type* = this.arena.lookup(exp_ref.id);
+        if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
+            const alias: TypeAliasType* = exp_t as TypeAliasType*;
+            if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
+        }
+        if (exp_t == null) { return found; }
+        if (exp_t.kind == TypeKind::InstantiatedType) {
+            const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
+            if (exp_inst.generic_base.equals(found)) { return exp_ref; }
+            return found;
+        }
+        if (exp_t.kind == TypeKind::Enum || exp_t.kind == TypeKind::Struct || exp_t.kind == TypeKind::Class) {
+            const count: i64 = this.arena.type_count();
+            for (mut i: i64 = 0; i < count; i++) {
+                const t: Type* = this.arena.types[i];
+                if (t == null || t.kind != TypeKind::InstantiatedType) { continue; }
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.generic_base.equals(found)) { continue; }
+                if (!inst.has_resolved_type()) { continue; }
+                if (inst.resolved_type.id == exp_ref.id) { return exp_ref; }
+            }
+        }
+        return found;
+    }
+
+
+    // -- Scope-call argument type checking --
+
+    /// Argument type-check for a `Type::method(args)` / `Module::func(args)`
+    /// scope-resolution call: checks only when exactly ONE function-typed overload
+    /// is registered, else defers to the inherent static-method gather.
+    check_scope_call_arg_types(mut &this, visitor: ASTVisitor*, scope: ScopeResolutionNode*,
+                               call: CallExprNode*) -> void {
+        if (this.ctx.decl_index == null) { return; }
+        mut lookup_sym: SymbolStr = scope.scope_name;
+        if (scope.scope_generic_args.length > 0) {
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
+            if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+        }
+        if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
+        const scope_str:  string = this.intern.resolve(lookup_sym);
+        const member_str: string = this.intern.resolve(scope.member_name);
+        if (strlen(scope_str) == 0 || strlen(member_str) == 0) { return; }
+        const combined: SymbolStr = this.intern.intern(format("%s::%s", scope_str, member_str));
+        const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(combined);
+        if (overloads.length == 1) {
+            const ot: Type* = this.arena.lookup(overloads[0].id);
+            if (ot != null && ot.kind == TypeKind::Function) {
+                const ft: FunctionType* = ot as FunctionType*;
+                if (!ft.is_variadic) {
+                    if (ft.param_types.length == call.arguments.length) {
+                        this.check_args_against_params(visitor, call, ft.param_types.as_slice());
+                    } else {
+                        this.diag.emit_method_arity_error(call, scope.member_name, "function",
+                            ft.param_types.length, call.arguments.length);
+                    }
+                }
+            }
+            return;
+        }
+        this.check_static_scope_method_args(visitor, lookup_sym, scope, call);
+    }
+
+    /// Argument type-check for a `Type::method(args)` static call whose callee is
+    /// an inherent static method (registered as MethodInfo); checks only when a
+    /// single static signature of the call's arity is found.
+    check_static_scope_method_args(mut &this, visitor: ASTVisitor*, lookup_sym: SymbolStr,
+                                   scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
+        mut type_ref: TypeRef = this.types.lookup_type_by_sym(lookup_sym);
+        if (!type_ref.is_valid() && !lookup_sym.equals(scope.scope_name)) {
+            type_ref = this.types.lookup_type_by_sym(scope.scope_name);
+        }
+        if (!type_ref.is_valid()) { return; }
+        mut t: Type* = this.arena.lookup(type_ref.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return; }
+            t = this.arena.lookup(inst.resolved_type.id);
+        }
+        if (t == null) { return; }
+        mut methods: MethodInfo[] = [];
+        match (t.kind) {
+            TypeKind::Struct => { methods = (t as StructType*).methods; }
+            TypeKind::Class  => { methods = (t as ClassType*).methods; }
+            TypeKind::Enum   => { methods = (t as EnumType*).methods; }
+            _ => { return; }
+        }
+        const argc: i64 = call.arguments.length;
+        mut found:     boolean = false;
+        mut ambiguous: boolean = false;
+        mut variadic_ok: boolean = false;
+        mut chosen:    TypeRef[] = [];
+        mut name_seen:  i64 = 0;
+        mut uniq_arity: i64 = -1;
+        for (mut mi: i64 = 0; mi < methods.length; mi++) {
+            const m: &MethodInfo = &methods[mi];
+            if (!m.is_static) { continue; }
+            if (!m.name.equals(scope.member_name)) { continue; }
+            if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
+            name_seen  += 1;
+            uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
+            if (m.param_types.length != argc) { continue; }
+            if (!found) {
+                found = true;
+                chosen = [];
+                for (mut ci: i64 = 0; ci < m.param_types.length; ci++) { chosen.push(m.param_types[ci]); }
+            } else if (!this.types.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
+                ambiguous = true;
+            }
+        }
+        if (ambiguous) {
+            mut fit_count:  i64 = 0;
+            mut fit_params: TypeRef[] = [];
+            for (mut mi: i64 = 0; mi < methods.length; mi++) {
+                const m: &MethodInfo = &methods[mi];
+                if (!m.is_static) { continue; }
+                if (!m.name.equals(scope.member_name)) { continue; }
+                if (this.method_type_is_variadic(m.function_type)) { continue; }
+                if (m.param_types.length != argc) { continue; }
+                if (this.args_fit_params_loosely(call, m.param_types.as_slice())) {
+                    fit_count += 1;
+                    fit_params = [];
+                    for (mut ci: i64 = 0; ci < m.param_types.length; ci++) { fit_params.push(m.param_types[ci]); }
+                }
+            }
+            if (fit_count == 1) { this.check_args_against_params(visitor, call, fit_params.as_slice()); }
+            return;
+        }
+        if (found) { this.check_args_against_params(visitor, call, chosen.as_slice()); return; }
+        if (variadic_ok) { return; }
+        if (name_seen > 0) {
+            this.diag.emit_method_arity_error(call, scope.member_name, "static method", uniq_arity, argc);
+        }
+    }
+}

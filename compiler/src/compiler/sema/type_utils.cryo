@@ -1,0 +1,491 @@
+/// TypeUtils
+///
+/// Pure type-system queries and declaration-index lookup delegates shared across
+/// the Sema collaborators: structural probes (contains-generic-param, peel /
+/// unwrap, projection accessors), small relational predicates (reference?,
+/// ptr-or-ref?, indirection-compatible?), display naming, and the thin
+/// DeclarationIndex delegates that the call/member resolvers build on.
+///
+/// Holds the immutable environment by pointer (`arena`, `intern`, `ctx`,
+/// `checker`); no per-pass state.
+///
+/// R4 NOTE: the name-lookup methods here still carry the historic
+/// `bare -> qualified -> cross-module -> arena-leaf` widen cascades (tagged
+/// `// R4:` below).  They are ported faithfully for now; once every consumer
+/// (call_resolver / member_resolver / identifier resolution) exists, these
+/// collapse into a single `resolve(SymbolKey, ctx)` over the existing
+/// `widen_to_*` ladder.  See the plan's R4 disposition.
+
+namespace Compiler::Sema::TypeUtils;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Types::Checker;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::Resolver;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::AST;
+import Compiler::AST::Node;
+import std::core::slice;
+
+type struct TypeUtils {
+    arena:   TypeArena*;
+    intern:  InternTable*;
+    ctx:     CompilationContext*;
+    checker: TypeChecker*;
+
+    static null() -> TypeUtils {
+        return TypeUtils { arena: null, intern: null, ctx: null, checker: null };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*,
+                    ctx: CompilationContext*, checker: TypeChecker*) -> void {
+        this.arena   = arena;
+        this.intern  = intern;
+        this.ctx     = ctx;
+        this.checker = checker;
+    }
+
+
+    // -- DeclarationIndex lookup delegates --
+
+    lookup_func_return(&this, name: SymbolStr) -> TypeRef {
+        return this.ctx.decl_index.lookup_func_return(name);
+    }
+
+    lookup_global_var(&this, name: SymbolStr) -> TypeRef {
+        return this.ctx.decl_index.lookup_global(name);
+    }
+
+    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        return this.canonicalize_method_return(
+            this.lookup_method_return_raw(type_sym, method_sym));
+    }
+
+    /// Fold a method's stored return annotation to its canonical instantiation
+    /// (e.g. bare `String` -> `String<GlobalAlloc>`) so a call's resolved type
+    /// matches every other path; otherwise an inline `Box::new(String::from_str)`
+    /// mints a bogus bare-`String` clone whose method is never emitted.
+    canonicalize_method_return(&this, ty: TypeRef) -> TypeRef {
+        if (this.ctx.type_resolver == null) { return ty; }
+        return this.ctx.type_resolver.canonicalize_default_generic_type(ty);
+    }
+
+    // R4: bare -> qualified -> cross-module widen cascade; fold into resolve(SymbolKey).
+    lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        // As-is (already-qualified names from monomorphized types).
+        const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
+        if (bare_ret.is_valid()) { return bare_ret; }
+        // Module-qualified (local/same-module types registered under qualified names).
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
+        if (!qualified.equals(type_sym)) {
+            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
+            if (q_ret.is_valid()) { return q_ret; }
+        }
+        // Cross-module: resolve the type's original module via the scope chain.
+        const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
+        if (cross_sym.is_valid()) {
+            return this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
+        }
+        return TypeRef::invalid();
+    }
+
+    // R4: qualified -> direct -> cross-module -> arena-leaf cascade; fold into resolve(SymbolKey).
+    lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
+        // Current module's qualified name FIRST so module-local types are
+        // preferred over bare-name aliases from other modules.
+        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
+        if (!qualified.equals(name)) {
+            const q_ty: TypeRef = this.ctx.decl_index.lookup_type(qualified);
+            if (q_ty.is_valid()) { return q_ty; }
+        }
+        // Already-qualified names (specialized impl target_type) + cross-module aliases.
+        const direct: TypeRef = this.ctx.decl_index.lookup_type(name);
+        if (direct.is_valid()) { return direct; }
+        // Cross-module via scope chain.
+        const cross_sym: SymbolStr = this.resolve_cross_module_name(name);
+        if (cross_sym.is_valid()) {
+            const cross_ty: TypeRef = this.ctx.decl_index.lookup_type(cross_sym);
+            if (cross_ty.is_valid()) { return cross_ty; }
+        }
+        // Arena leaf-index: types visible via the TypeResolver fallback chain but
+        // not in the Resolver's scope chain (indirectly-imported submodule types).
+        const leaf_ref: TypeRef = this.arena.lookup_by_leaf(name);
+        if (leaf_ref.is_valid()) { return leaf_ref; }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve a bare name to its original module-qualified form via the
+    /// Resolver's scope chain, or empty if not found.
+    resolve_cross_module_name(&this, name: SymbolStr) -> SymbolStr {
+        const resolver: Resolver* = this.ctx.get_resolver();
+        if (resolver == null) { return SymbolStr::empty(); }
+        return resolver.resolve_type_qualified_name(name);
+    }
+
+    /// The registry name for a type: direct, else (for an InstantiatedType) its
+    /// resolved concrete type, else the generic base (pre-mono fallback so
+    /// method-by-type probes resolve identically pre- and post-mono).
+    lookup_type_sym(&this, ty: TypeRef) -> SymbolStr {
+        const direct: SymbolStr = this.ctx.decl_index.lookup_type_name(ty);
+        if (direct.is_valid()) { return direct; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                return this.ctx.decl_index.lookup_type_name(inst.resolved_type);
+            }
+            const base: SymbolStr = this.ctx.decl_index.lookup_type_name(inst.generic_base);
+            if (base.is_valid()) { return base; }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Non-receiver parameter count of a qualified free function, or -1.
+    scope_fn_arity(&this, q_sym: SymbolStr) -> i64 {
+        if (this.ctx.decl_index == null) { return -1; }
+        const ft_ref: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+        if (!ft_ref.is_valid()) { return -1; }
+        const t: Type* = this.arena.lookup(ft_ref.id);
+        if (t == null || t.kind != TypeKind::Function) { return -1; }
+        return (t as FunctionType*).param_types.length;
+    }
+
+    /// The template module recorded for an injected specialization (side table
+    /// populated during GenericExpressionResolution injection).
+    find_template_module(&this, node: ASTNode*) -> SymbolStr {
+        if (node == null) { return SymbolStr::empty(); }
+        return this.ctx.lookup_injected_origin(node as u64);
+    }
+
+
+    // -- Structural type probes --
+
+    /// Any unsubstituted generic parameter (GenericParam / BoundedParam) anywhere
+    /// in the type's structure.  Gates type-mismatch diagnostics that would fire
+    /// spuriously on a leftover template-form signature type inside a
+    /// monomorphized caller.
+    contains_generic_param(&this, tref: TypeRef) -> boolean {
+        if (!tref.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(tref.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::BoundedParam) {
+            return true;
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.contains_generic_param((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.contains_generic_param((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.contains_generic_param((t as ArrayType*).element);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.contains_generic_param((t as OptionalType*).wrapped);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.contains_generic_param(tup.elements[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.contains_generic_param(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// An associated-type projection not yet reduced to a concrete member type.
+    /// Distinct from `contains_generic_param`: a projection's base may be fully
+    /// concrete (`Range<i32>::Item`) yet the type stays abstract until reduced.
+    contains_unresolved_projection(&this, tref: TypeRef) -> boolean {
+        if (!tref.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(tref.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::AssocProjection) {
+            return !(t as AssocProjectionType*).resolved_type.is_valid();
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.contains_unresolved_projection((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.contains_unresolved_projection((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.contains_unresolved_projection((t as ArrayType*).element);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.contains_unresolved_projection((t as OptionalType*).wrapped);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.contains_unresolved_projection(tup.elements[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.contains_unresolved_projection(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// Peel Reference / Pointer / resolved-InstantiatedType wrappers to the
+    /// underlying concrete type (caller checks for the kind it wants, e.g. Enum).
+    unwrap_to_enum(&this, ty: TypeRef) -> Type* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::Reference) {
+            return this.unwrap_to_enum((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.unwrap_to_enum((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return this.unwrap_to_enum(inst.resolved_type); }
+            return null;
+        }
+        return t;
+    }
+
+    /// Peel Reference / Pointer wrappers to the innermost InstantiatedType (even
+    /// when its `resolved_type` is still invalid), or null.
+    peel_to_instantiation(&this, ty: TypeRef) -> InstantiatedType* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::Reference) {
+            return this.peel_to_instantiation((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.peel_to_instantiation((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            return t as InstantiatedType*;
+        }
+        return null;
+    }
+
+    /// Peel Pointer / Reference / resolved-InstantiatedType wrappers (bounded
+    /// depth) to the underlying base `Type*`, or null if an instantiation is
+    /// still unresolved.
+    unwrap_to_base_type(&this, ty: TypeRef) -> Type* {
+        mut t: Type* = this.arena.lookup(ty.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            match (t.kind) {
+                TypeKind::Pointer => {
+                    t = this.arena.lookup((t as PointerType*).pointee.id);
+                }
+                TypeKind::Reference => {
+                    t = this.arena.lookup((t as ReferenceType*).referent.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { return null; }
+                    t = this.arena.lookup(it.resolved_type.id);
+                }
+                _ => { return t; }
+            }
+            depth += 1;
+        }
+        return t;
+    }
+
+    /// The generic base of an InstantiatedType, or invalid.
+    generic_base_of(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null || t.kind != TypeKind::InstantiatedType) {
+            return TypeRef::invalid();
+        }
+        return (t as InstantiatedType*).generic_base;
+    }
+
+    /// Pointee of a concrete pointer TypeRef, or invalid if not a pointer.
+    proj_pointer_pointee(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty != null && ty.kind == TypeKind::Pointer) {
+            return (ty as PointerType*).pointee;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Referent of a concrete reference TypeRef, or invalid if not a ref.
+    proj_reference_referent(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty != null && ty.kind == TypeKind::Reference) {
+            return (ty as ReferenceType*).referent;
+        }
+        return TypeRef::invalid();
+    }
+
+
+    // -- Relational predicates --
+
+    /// True when one side is an Enum and the other an Int (enum<->discriminant).
+    enum_int_compatible(&this, a: TypeRef, b: TypeRef) -> boolean {
+        const at: Type* = this.arena.lookup(a.id);
+        const bt: Type* = this.arena.lookup(b.id);
+        if (at == null || bt == null) { return false; }
+        if (at.kind == TypeKind::Enum && bt.kind == TypeKind::Int) { return true; }
+        if (at.kind == TypeKind::Int && bt.kind == TypeKind::Enum) { return true; }
+        return false;
+    }
+
+    /// True when `t` resolves to a reference (`&T`) type.
+    is_reference_type(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        return ty != null && ty.kind == TypeKind::Reference;
+    }
+
+    /// True when `t` resolves to a reference OR pointer — the value is already an
+    /// address and must not be auto-ref'd again.
+    is_ref_or_ptr_type(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        return ty.kind == TypeKind::Reference || ty.kind == TypeKind::Pointer;
+    }
+
+    /// One level of pointer/reference indirection peeled off `t`, or invalid when
+    /// `t` is neither a pointer nor a reference.
+    peel_indirection(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return TypeRef::invalid(); }
+        if (ty.kind == TypeKind::Pointer)   { return (ty as PointerType*).pointee; }
+        if (ty.kind == TypeKind::Reference) { return (ty as ReferenceType*).referent; }
+        return TypeRef::invalid();
+    }
+
+    /// True when `arg` and `param` describe the same underlying type up to one
+    /// level of pointer/reference spelling — `&T`<->`&mut T`, `&T`<->`T*`, and
+    /// value<->`&T`/`T*` (call-site auto-ref).  At least one side must be an
+    /// indirection; the underlying types must be non-`Incompatible`.
+    indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        const a_peeled: TypeRef = this.peel_indirection(arg_ty);
+        const p_peeled: TypeRef = this.peel_indirection(param_ty);
+        if (!a_peeled.is_valid() && !p_peeled.is_valid()) { return false; }
+        const a_in: TypeRef = if (a_peeled.is_valid()) { a_peeled } else { arg_ty };
+        const p_in: TypeRef = if (p_peeled.is_valid()) { p_peeled } else { param_ty };
+        if (a_in.equals(p_in)) { return true; }
+        // Derived -> Base upcast through the indirection (value-form receiver
+        // forwarded to a `Base*`/`&Base` parameter), which check_compatibility
+        // only models for `Derived*`->`Base*`.
+        if (this.checker.is_subclass_of(a_in, p_in)) { return true; }
+        const c: TypeCompatibility = this.checker.check_compatibility(a_in, p_in);
+        return c != TypeCompatibility::Incompatible;
+    }
+
+    /// Whether `t` is concrete enough for argument type-checking to judge.  False
+    /// for generic/bounded params, function (template) types, and unresolved
+    /// instantiations; recurses through pointer/reference/array/optional/tuple.
+    /// `()` and `void` are treated as never-a-mismatch (skip).
+    arg_type_is_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::GenericParam)     { return false; }
+        if (ty.kind == TypeKind::BoundedParam)     { return false; }
+        if (ty.kind == TypeKind::FunctionTemplate) { return false; }
+        if (ty.kind == TypeKind::Function)         { return false; }
+        if (ty.kind == TypeKind::Unit)             { return false; }
+        if (ty.kind == TypeKind::Void)             { return false; }
+        if (ty.kind == TypeKind::Pointer) {
+            return this.arg_type_is_concrete((ty as PointerType*).pointee);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            return this.arg_type_is_concrete((ty as ReferenceType*).referent);
+        }
+        if (ty.kind == TypeKind::Array) {
+            return this.arg_type_is_concrete((ty as ArrayType*).element);
+        }
+        if (ty.kind == TypeKind::Optional) {
+            return this.arg_type_is_concrete((ty as OptionalType*).wrapped);
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const tt: TupleType* = ty as TupleType*;
+            for (mut i: i64 = 0; i < tt.elements.length; i++) {
+                if (!this.arg_type_is_concrete(tt.elements[i])) { return false; }
+            }
+            return true;
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return false; }
+        }
+        return true;
+    }
+
+    /// Structural equality of two parameter-type lists by length and arena id;
+    /// collapses a base method and its identical override into one candidate.
+    same_param_sig(&this, a: Slice<TypeRef>, b: Slice<TypeRef>) -> boolean {
+        if (a.length != b.length) { return false; }
+        for (mut i: i64 = 0; i < a.length as i64; i++) {
+            if (a.get(i as u64).unwrap().id != b.get(i as u64).unwrap().id) { return false; }
+        }
+        return true;
+    }
+
+    /// Type identity tolerant of arena-id differences for the same named type:
+    /// under single-file `check`, a generic instantiation can carry a nominal
+    /// whose arena id differs from the one a binding resolves to.  Falls back to
+    /// comparing qualified names for struct/class/enum.
+    types_equivalent(&this, a: TypeRef, b: TypeRef) -> boolean {
+        if (a.id == b.id) { return true; }
+        const ta: Type* = this.arena.lookup(a.id);
+        const tb: Type* = this.arena.lookup(b.id);
+        if (ta == null || tb == null) { return false; }
+        if (ta.kind != tb.kind) { return false; }
+        if (ta.kind == TypeKind::Struct || ta.kind == TypeKind::Class ||
+            ta.kind == TypeKind::Enum) {
+            const qa: SymbolStr = this.arena.get_qualified_name(a);
+            const qb: SymbolStr = this.arena.get_qualified_name(b);
+            return qa.is_valid() && qb.is_valid() && qa.equals(qb);
+        }
+        return false;
+    }
+
+    /// True when `t` is a pointer/reference whose pointee is the same type as `v`
+    /// (by id or, robustly, by qualified name).
+    is_ptr_or_ref_to(&this, t: TypeRef, v: TypeRef) -> boolean {
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::Pointer) {
+            return this.types_equivalent((ty as PointerType*).pointee, v);
+        }
+        if (ty.kind == TypeKind::Reference) {
+            return this.types_equivalent((ty as ReferenceType*).referent, v);
+        }
+        return false;
+    }
+
+    /// Display name for a TypeRef (re-interned so it doesn't outlive the
+    /// formatter's static buffer).  Returns "?" for invalid refs.
+    type_display_name(&this, ty: TypeRef) -> string {
+        if (!ty.is_valid()) { return "?"; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return "?"; }
+        const sym: SymbolStr = this.intern.intern(this.arena.format_display(t));
+        return this.intern.resolve(sym);
+    }
+}

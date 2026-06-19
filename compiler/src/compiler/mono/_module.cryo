@@ -1,0 +1,51 @@
+/// Mono Module  (Compiler::Mono)
+///
+/// Clean, decomposed monomorphization subsystem — the from-scratch replacement
+/// for the monolithic `types/monomorphizer.cryo` (7,040-line `type struct
+/// Monomorphizer`).  Structured after the codegen `IRGeneratorVisitor` pattern:
+/// one thin orchestrator (`Monomorphizer`, a plain `type struct` — no vtable)
+/// plus `type struct` collaborators wired by back-pointer (`static null()` +
+/// `wire()`).
+///
+/// This is PRIMARILY A DELETION: roughly half of the old file was type-inference
+/// machinery the mono-after-sema reorder makes dead.  Built under the post-reorder
+/// assumption — semantic analysis is authoritative, runs first, pins generic type
+/// arguments onto `CallExprNode.resolved_type_args`, and types every literal at its
+/// real slot width.  This monomorphizer CONSUMES sema's pinned bindings; it NEVER
+/// derives them.  The dead inference engine is simply not written.
+///
+/// ⚠ BUILD-DARK: this folder is intentionally NOT registered in the parent
+/// `compiler/src/compiler/_module.cryo` (no `public module Mono;` there), so the
+/// compiler never compiles it.  It stays invisible until the entire refactor is
+/// complete, at which point the parent registration is added and importers
+/// (`compilation_context.cryo`, `passes/specialization.cryo`, `instance.cryo`) are
+/// repointed from `Compiler::Types::Monomorphizer` to `Compiler::Mono`.  Until then
+/// the live engine remains `types/monomorphizer.cryo`.
+///
+/// `mono/` depends DOWNWARD only: `GenericRegistry`/`TypeSubstitution` stay in
+/// `types/`, `ASTCloner`/`ASTTypeSubstituter` stay in `AST/`, `SpecializationPasses`
+/// stay in `passes/`.  The free predicate `mono_type_contains_generic_param` stays
+/// at `Compiler::Types::Monomorphizer` (a thin shim after flip-on) so sema's import
+/// keeps resolving without a `mono/`->sema edge.
+///
+/// The main orchestrator (`monomorphizer.cryo`) is declared LAST: it imports every
+/// collaborator, whereas collaborators import only what they need (never the
+/// orchestrator concretely if it would cycle).
+
+namespace Compiler::Mono;
+
+// -- Shared mutable state (declared first: collaborators + orchestrator import it) --
+public module State;             // MonoState + MonomorphRequest + SpecializationEntry
+
+// -- Moved collaborator (mono-exclusive; was AST/specializer.cryo) --
+public module Specializer;       // ASTSpecializer + SpecializationResult
+
+// -- Decomposed collaborators (back-ptr type structs) --
+public module DispatchAnnotator; // MonoDispatchAnnotator — bound-directed fmt dispatch (survives reorder)
+public module TraitSpecializer;  // MonoTraitSpecializer — trait-impl conditional inst + where-bounds + assoc-proj
+public module TypePopulator;     // MonoTypePopulator — spec'd AST -> concrete arena types
+public module AstResolver;       // MonoAstResolver — post-clone re-resolution + static-match arm pruning
+public module CallSpecializer;   // MonoCallSpecializer — sema-stash consumer: free/method per-call specialization + DI
+
+// -- Orchestrator (declared LAST: imports every collaborator) --
+public module Monomorphizer;     // type struct Monomorphizer
