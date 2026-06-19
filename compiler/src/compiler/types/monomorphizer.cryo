@@ -5905,46 +5905,6 @@ type struct Monomorphizer {
             method_param_names.push(gp.name);
         }
 
-        // Build the explicit-parameter list (skip `&this`/`this`) so we
-        // can pair them against `call.arguments` 1:1.  The receiver isn't
-        // an explicit arg at the call site; codegen prepends it later.
-        const this_amp: SymbolStr = this.intern_table.intern("&this");
-        const this_val: SymbolStr = this.intern_table.intern("this");
-        mut explicit_params: VarDeclNode*[] = [];
-        for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
-            const p: VarDeclNode* = orig_func.parameters[i];
-            if (p == null) { continue; }
-            if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
-            explicit_params.push(p);
-        }
-        if (explicit_params.length != call.arguments.length) { return; }
-
-        // Build a resolution context that binds the method's own generic
-        // params to their TypeRefs.  Used to fill `resolved_type` on the
-        // template method's params on demand; sema skips generic-method
-        // bodies, so `resolve_methods` left them invalid.
-        mut method_ctx: ResolutionContext = ResolutionContext::new("", "");
-        for (mut i: i64 = 0; i < n_method_params; i++) {
-            method_ctx.add_binding(method_param_names[i],
-                TypeRef::new(this.inference_param_ids[i], this.arena));
-        }
-        if (recv_type.is_valid()) {
-            method_ctx.set_this_type(recv_type);
-        }
-        // Seed the concrete trait-element bindings cached at impl-spec time
-        // (e.g. `A -> i32` for a `TakeIter` receiver, whose element lives only
-        // in the where-bound).  An own-generic combinator default cloned into
-        // such an impl (`map<B>`, returning `MapIter<This, A, B>` with formal
-        // `f: (A) -> B`) must resolve `A` here so the formal/actual unification
-        // below can bind the method generic `B`; without it the formal's `A`
-        // stays unresolved, unification fails, and the spec is never minted.
-        if (impl_node != null) {
-            for (mut di: i64 = 0; di < impl_node.derived_param_names.length; di++) {
-                method_ctx.add_binding(impl_node.derived_param_names[di],
-                                       impl_node.derived_param_types[di]);
-            }
-        }
-
         // M1 (mono reads sema's method stash): sema's
         // `resolve_generic_method_return` already inferred this method's own
         // generic params (turbofish or formal/actual unify) and stashed them on
@@ -5971,88 +5931,16 @@ type struct Monomorphizer {
             }
         }
 
-        // Two paths to populate `inference_bindings` (when not read from stash):
-        //   - Explicit method-level generic args at the call site
-        //     (`obj.method<U>(...)`): resolve them in `method_ctx` and bind
-        //     directly.  Skips unification entirely; the args ARE the answer.
-        //   - Inference from formal/actual arg unification: used when the
-        //     user didn't write explicit args, so `U` has to fall out of the
-        //     pairing between each formal type and the call's actual.
-        if (m_from_stash) {
-            // bindings already seeded from the stash; nothing to infer.
-        } else if (call.generic_args.length > 0
-                && call.generic_args.length == n_method_params
-                && this.type_resolver != null) {
-            mut all_resolved: boolean = true;
-            for (mut i: i64 = 0; i < n_method_params; i++) {
-                const arg_ref: TypeRef = this.type_resolver.resolve(
-                    call.generic_args[i], &method_ctx);
-                if (!arg_ref.is_valid()) {
-                    all_resolved = false;
-                    break;
-                }
-                this.inference_bindings[i] = arg_ref;
-            }
-            if (!all_resolved) { return; }
-        } else {
-            // Unify each formal explicit param against the call's actual arg.
-            mut ok: boolean = true;
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const param: VarDeclNode* = explicit_params[i];
-                if (param == null) { ok = false; break; }
-                mut formal: TypeRef = param.resolved_type;
-                if (!formal.is_valid() && param.type_annotation != null
-                        && this.type_resolver != null) {
-                    formal = this.type_resolver.resolve(param.type_annotation, &method_ctx);
-                }
-                if (!formal.is_valid()) { ok = false; break; }
-                const arg: ExpressionNode* = call.arguments[i];
-                mut actual: TypeRef = this.resolve_arg_type_for_inference(arg, names, types);
-                if (!actual.is_valid()) { ok = false; break; }
-                if (subst != null) {
-                    actual = subst.apply(actual, this.arena);
-                }
-                if (!this.unify_for_inference(formal, actual)) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) { return; }
-
-            // Return-type-driven inference for `![implicit]` methods: a
-            // method-level generic still unbound after arg unification is
-            // recovered by unifying the declared return type against the
-            // call's expected type.  Needed for receiver-only reads like
-            // `const v: T = args.next()` where the method takes no args and
-            // `T` appears solely in the return position.  Resolve the return
-            // annotation in `method_ctx` so its generic params carry the same
-            // fresh ids as `inference_param_ids`.
-            if (orig_func.is_implicit && this.current_expected_type.is_valid()) {
-                mut ret_ty: TypeRef = TypeRef::invalid();
-                if (orig_func.return_type_annotation != null
-                        && this.type_resolver != null) {
-                    ret_ty = this.type_resolver.resolve(
-                        orig_func.return_type_annotation, &method_ctx);
-                }
-                if (!ret_ty.is_valid()) {
-                    ret_ty = orig_func.resolved_return_type;
-                }
-                if (ret_ty.is_valid()) {
-                    this.unify_for_inference(ret_ty, this.current_expected_type);
-                }
-            }
-
-            mut m_all_bound: boolean = true;
-            for (mut i: i64 = 0; i < this.inference_bindings.length; i++) {
-                if (!this.inference_bindings[i].is_valid()) { m_all_bound = false; break; }
-            }
-            if (!m_all_bound) {
-                if (orig_func.is_implicit && call.generic_args.length == 0) {
-                    this.emit_cannot_infer(call, orig_func.name);
-                }
-                return;
-            }
-        }
+        // Mono-after-sema: sema (the source of truth) stashes every method-level
+        // generic binding it resolves - turbofish, arg-only (`hash<H>`/`fmt<W>`),
+        // combinator, AND the abstract-receiver case (cont.18, `value.fmt(f)`
+        // inside a generic body, stashed off the receiver's trait bound).  Mono
+        // no longer re-derives them: a call that reaches here WITHOUT a stash is
+        // outside sema's visibility and is left unspecialized (it was deferred
+        // pre-flip too).  The old explicit-args / formal-actual-unify inference
+        // engine that lived here has been removed; only the stash seeding above
+        // populates `inference_bindings`.
+        if (!m_from_stash) { return; }
 
         // Defer when a binding isn't concrete.  Inference can bind a method
         // generic to ANOTHER generic param when this call is walked inside a
