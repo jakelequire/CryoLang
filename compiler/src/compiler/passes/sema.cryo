@@ -226,6 +226,21 @@ public:
     // read by `symbolic_bind_params`. Kept separate from the owner list because
     // each has its own 0-based index space.
     symbolic_method_param_nodes: GenericParamNode*[];
+    // The impl block whose method body is currently being symbolically walked
+    // (non-owning; the AST outlives the visitor). Set/restored by
+    // `visit(ImplBlockNode*)`. Read by `find_generic_method_on_receiver_bounds`
+    // to recover an in-scope param's where-clause trait bounds (`T: Display`),
+    // which - unlike a `<T: Bound>` struct-decl constraint - are NOT carried on
+    // the abstract receiver type, so an abstract-receiver method call
+    // (`value.fmt(f)`) can still locate its generic method off the bound trait.
+    symbolic_impl_node: ImplBlockNode*;
+    // The function/method whose body is currently being symbolically walked
+    // (non-owning). Set/restored by `symbolic_check_body`. Read by
+    // `find_generic_method_on_receiver_bounds`: a method/free-fn `where T: Display`
+    // clause lands in `FunctionDeclNode.trait_bounds` (not on the impl block, and
+    // not folded onto the param's struct-decl `constraints`), so an inline-method
+    // or free-function abstract receiver recovers its bound trait from here.
+    symbolic_current_func: FunctionDeclNode*;
     // Telemetry (debug-only cumulative line): generic bodies walked and the
     // number of real errors those symbolic walks emitted.
     symbolic_bodies_walked:   i64;
@@ -282,6 +297,8 @@ public:
         this.symbolic_owner_is_generic   = false;
         this.symbolic_owner_param_nodes  = [];
         this.symbolic_method_param_nodes = [];
+        this.symbolic_impl_node          = null;
+        this.symbolic_current_func       = null;
         this.symbolic_bodies_walked      = 0;
         this.symbolic_total_would_emit   = 0;
     }
@@ -1996,8 +2013,11 @@ public:
             // the impl's params exposed as abstract; otherwise skip as before.
             if (this.sema_symbolic_check_enabled()) {
                 const impl_target: TypeRef = this.lookup_type_by_sym(node.target_type);
+                const saved_impl: ImplBlockNode* = this.symbolic_impl_node;
+                this.symbolic_impl_node = node;
                 this.symbolic_check_owner_methods(node.methods, impl_target,
                                                   node.generic_params);
+                this.symbolic_impl_node = saved_impl;
             }
             return;
         }
@@ -2184,6 +2204,8 @@ public:
         const snap: DiagnosticSnapshot = sink.snapshot();
         const saved_owner:    TypeRef = this.current_owner_type;
         const saved_symbolic: boolean = this.in_symbolic_check;
+        const saved_cur_func: FunctionDeclNode* = this.symbolic_current_func;
+        this.symbolic_current_func = func;
         // Owning-array fields: swap out to an empty so the later reassignment
         // doesn't leak (Cryo field reassignment does not drop the old value),
         // and restore by swapping back after the walk.
@@ -2242,6 +2264,7 @@ public:
         swap(&this.symbolic_method_param_nodes, &saved_method_nodes);
         this.in_symbolic_check  = saved_symbolic;
         this.current_owner_type = saved_owner;
+        this.symbolic_current_func = saved_cur_func;
 
         // Telemetry only (the diagnostics above are already real). Counts errors
         // this body's symbolic walk contributed, for the debug cumulative line.
@@ -9046,7 +9069,14 @@ public:
         // Symbolic generic-body walk: an abstract / `void` (unresolved) receiver
         // can't drive concrete method resolution (which would spuriously report
         // "no method" or "ambiguous call"); defer to the concrete instantiation.
-        if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
+        if (this.symbolic_type_unresolved(obj_type)) {
+            // The concrete return type can't be resolved off an abstract receiver
+            // (defer that to mono), but the method-level generic bindings CAN be
+            // stashed now - off the receiver param's trait bound - so mono reads
+            // them instead of re-inferring.  See `stash_abstract_receiver_method`.
+            this.stash_abstract_receiver_method(obj_type, member, call);
+            return TypeRef::invalid();
+        }
 
         // M1 (sema is the source of truth for method-level bindings): stash this
         // call's concrete method-level generic bindings for the monomorphizer to
@@ -10214,6 +10244,152 @@ public:
             }
         }
         return null;
+    }
+
+    /// Abstract-receiver method lookup (symbolic walk only): the receiver is a
+    /// bare generic param - `value.fmt(f)` where `value: T` inside
+    /// `Wrapper<T>::fmt<W>`, or behind a `&`/`*` wrapper.  The param's trait
+    /// bound (`T: Display`) lives in the enclosing impl's WHERE clause, not on
+    /// the abstract receiver type (a `<T>` struct-decl param yields a bare
+    /// `GenericParam`, never a `BoundedParamType`), so `find_generic_method_for_call`'s
+    /// instantiation/impl/trait searches all miss it.  Recover the bound trait
+    /// from `symbolic_impl_node.where_bounds` (and any `<T: Bound>` constraint on
+    /// the in-scope param nodes), then locate the generic method by name on the
+    /// bound trait's decl.  Returns a context binding `This` -> the (abstract)
+    /// receiver; `*out_func` is null when there's nothing to find.  Meaningful
+    /// only while `in_symbolic_check`.
+    find_generic_method_on_receiver_bounds(mut &this, recv_type: TypeRef,
+                                           member: MemberAccessNode*,
+                                           out_func: FunctionDeclNode**) -> ResolutionContext {
+        *out_func = null;
+        mut ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        if (!this.in_symbolic_check)            { return ctx; }
+        if (this.ctx.generic_registry == null)  { return ctx; }
+        if (member == null)                     { return ctx; }
+
+        // Peel `&`/`*` wrappers to the bare param (`&T` / `*T` receivers).
+        mut peeled: TypeRef = recv_type;
+        mut t: Type* = this.arena.lookup(peeled.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::Reference) {
+                peeled = (t as ReferenceType*).referent;
+                t = this.arena.lookup(peeled.id);
+            } else if (t.kind == TypeKind::Pointer) {
+                peeled = (t as PointerType*).pointee;
+                t = this.arena.lookup(peeled.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (t == null) { return ctx; }
+
+        mut pname: SymbolStr = SymbolStr::from_id(0);
+        mut have_pname: boolean = false;
+        if (t.kind == TypeKind::GenericParam) {
+            pname = (t as GenericParamType*).param_name;
+            have_pname = true;
+        } else if (t.kind == TypeKind::BoundedParam) {
+            pname = (t as BoundedParamType*).param_name;
+            have_pname = true;
+        }
+        if (!have_pname || !pname.is_valid()) { return ctx; }
+
+        // Collect the trait leaves `pname` is bounded by: the enclosing impl's
+        // where clause first, then any `<T: Bound>` constraint on the in-scope
+        // owner/method param nodes.
+        mut bound_leaves: SymbolStr[] = [];
+        if (this.symbolic_impl_node != null) {
+            for (mut bi: i64 = 0; bi < this.symbolic_impl_node.where_bounds.length; bi++) {
+                const bound: TraitBound* = &this.symbolic_impl_node.where_bounds[bi];
+                if (!bound.type_parameter.equals(pname)) { continue; }
+                for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                    const tr: TraitRef* = &bound.trait_refs[ti];
+                    if (tr.path.length == 0) { continue; }
+                    bound_leaves.push(tr.path[tr.path.length - 1]);
+                }
+            }
+        }
+        // A method/free-fn `where T: Display` clause lands on the function's own
+        // `trait_bounds` (the inline-method / generic-free-fn case, where there's
+        // no impl block to carry it).
+        if (this.symbolic_current_func != null) {
+            for (mut wi: i64 = 0; wi < this.symbolic_current_func.trait_bounds.length; wi++) {
+                const wb: TraitBound* = &this.symbolic_current_func.trait_bounds[wi];
+                if (!wb.type_parameter.equals(pname)) { continue; }
+                for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
+                    const tr: TraitRef* = &wb.trait_refs[ti];
+                    if (tr.path.length == 0) { continue; }
+                    bound_leaves.push(tr.path[tr.path.length - 1]);
+                }
+            }
+        }
+        // For an inline struct/class method (no impl block) the param's bound
+        // lives on its declaration node's `constraints` (`<T: Display>`, or a
+        // method-level `where T: Display` folded onto the param at parse time).
+        for (mut oi: i64 = 0; oi < this.symbolic_owner_param_nodes.length; oi++) {
+            const onode: GenericParamNode* = this.symbolic_owner_param_nodes[oi];
+            if (onode == null || !onode.name.equals(pname)) { continue; }
+            for (mut ci: i64 = 0; ci < onode.constraints.length; ci++) {
+                bound_leaves.push(onode.constraints[ci]);
+            }
+        }
+        for (mut mi: i64 = 0; mi < this.symbolic_method_param_nodes.length; mi++) {
+            const mnode: GenericParamNode* = this.symbolic_method_param_nodes[mi];
+            if (mnode == null || !mnode.name.equals(pname)) { continue; }
+            for (mut ci: i64 = 0; ci < mnode.constraints.length; ci++) {
+                bound_leaves.push(mnode.constraints[ci]);
+            }
+        }
+
+        // Find the generic method (name + own generics) on any bound trait decl.
+        mut found: FunctionDeclNode* = null;
+        for (mut i: i64 = 0; i < bound_leaves.length && found == null; i++) {
+            const td: TraitDeclNode* =
+                this.ctx.generic_registry.get_trait_decl(bound_leaves[i]);
+            if (td == null) { continue; }
+            for (mut k: i64 = 0; k < td.methods.length; k++) {
+                const f: FunctionDeclNode* = td.methods[k];
+                if (f == null) { continue; }
+                if (!f.name.equals(member.member)) { continue; }
+                if (f.generic_params.length == 0) { continue; }
+                found = f;
+                break;
+            }
+        }
+        if (found != null) {
+            ctx.set_this_type(recv_type);
+            *out_func = found;
+        }
+        return ctx;
+    }
+
+    /// M1 abstract-receiver companion to `stash_method_call_bindings`: a method
+    /// call whose receiver is still abstract (`value.fmt(f)` inside a generic
+    /// body) bails the concrete return-type resolution at the
+    /// `symbolic_type_unresolved` guard BEFORE the normal stash runs, so its
+    /// method-level bindings would never be stashed and the monomorphizer would
+    /// re-infer them.  Stash them here, off the receiver param's trait bound.
+    /// The bindings are necessarily abstract (the method generic - `fmt`'s `W` -
+    /// binds to one of the enclosing template's own params); the ASTTypeSubstituter
+    /// concretizes `resolved_type_args` when mono clones the body, so mono reads
+    /// this exact instantiation WITHOUT re-inferring.  No-op outside a symbolic
+    /// walk or when no bound trait carries the generic method.
+    stash_abstract_receiver_method(mut &this, recv_type: TypeRef,
+                                   member: MemberAccessNode*,
+                                   call: CallExprNode*) -> void {
+        if (call == null || member == null)  { return; }
+        if (!this.in_symbolic_check)          { return; }
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.find_generic_method_on_receiver_bounds(recv_type, member, &orig_func);
+        if (orig_func == null) { return; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        mut bindings: TypeRef[] =
+            this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (bindings.length != n_method_params) { return; }
+        call.set_resolved_type_args(bindings);
     }
 
     /// Locate the generic method targeted by `member` on `recv_type` and build
