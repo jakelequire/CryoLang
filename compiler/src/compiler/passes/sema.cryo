@@ -9048,6 +9048,15 @@ public:
         // "no method" or "ambiguous call"); defer to the concrete instantiation.
         if (this.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
 
+        // M1 (sema is the source of truth for method-level bindings): stash this
+        // call's concrete method-level generic bindings for the monomorphizer to
+        // read, BEFORE the return-type resolution paths below.  One chokepoint
+        // covers every generic method shape - turbofish (`cast<U>`), arg-only
+        // (`hash<H>`, `fmt<W>`), and the return-carrying combinators - several of
+        // which the return-resolution paths route around.  A no-op for
+        // non-generic methods or when any binding stays abstract.
+        this.stash_method_call_bindings(obj_type, member, call);
+
         // Unwrap Pointer / Reference / InstantiatedType so method lookup
         // works on `this.intern_table.resolve(name)` where `intern_table`
         // is declared as `InternTable*`.  Without this the type-symbol
@@ -10207,35 +10216,24 @@ public:
         return null;
     }
 
-    /// Mono-after-sema (method path): resolve the CONCRETE return type of a call
-    /// to a GENERIC method - one carrying its own type params, like
-    /// `Option<T>::map<U>(f: (T) -> U) -> Option<U>` - by inferring `U` from the
-    /// call arguments (or reading the explicit turbofish `some.map<i32>(...)`)
-    /// and substituting BOTH the receiver's type args (`T -> i32`) and the
-    /// method args (`U -> i32`) into the return annotation, yielding
-    /// `Option<i32>` BEFORE mono runs.
-    ///
-    /// This mirrors the monomorphizer's `try_infer_method_call` inference but
-    /// computes ONLY the return type; `resolved_callee` / `resolved_method` stay
-    /// UNPINNED so mono still specializes the method body and back-fills.  It is
-    /// the method-call analogue of `check_generic_free_call`'s keystone: neither
-    /// the bare method lookup (which returns `Option<U>` with `U` free) nor
-    /// `subst_method_return_from_receiver` (which only knows the receiver's `T`)
-    /// can bind a method-LEVEL generic, so without this the abstract `Option<U>`
-    /// reaches codegen and breaks (mono used to backstop it by inferring here).
-    ///
-    /// Returns `fallback` (the caller's prior, possibly-abstract resolution)
-    /// when the receiver isn't a concrete instantiation, any receiver arg is
-    /// abstract (a symbolic generic-body walk), the method has no own generics,
-    /// it can't be located, or any binding stays abstract - so concrete-only
-    /// calls and nested-generic bodies are left untouched.
-    resolve_generic_method_return(mut &this, recv_type: TypeRef,
-                                  member: MemberAccessNode*,
-                                  call: CallExprNode*,
-                                  fallback: TypeRef) -> TypeRef {
-        if (this.ctx.generic_registry == null) { return fallback; }
-        if (this.ctx.type_resolver == null)    { return fallback; }
-        if (call == null || member == null)    { return fallback; }
+    /// Locate the generic method targeted by `member` on `recv_type` and build
+    /// the owner-binding `ResolutionContext` (receiver type params -> concrete
+    /// args, plus `This`).  Writes the method's `FunctionDeclNode` through
+    /// `out_func` - null when there is nothing to infer: no generic registry /
+    /// type resolver, no match, a still-abstract receiver type arg (a symbolic
+    /// generic-body walk), or a method with no own generic params (the receiver
+    /// substitution is then authoritative).  The returned context is meaningful
+    /// only when `*out_func != null`.  Shared by `resolve_generic_method_return`
+    /// and `stash_method_call_bindings`.
+    find_generic_method_for_call(mut &this, recv_type: TypeRef,
+                                 member: MemberAccessNode*,
+                                 out_func: FunctionDeclNode**) -> ResolutionContext {
+        *out_func = null;
+        mut owner_ctx: ResolutionContext = ResolutionContext::new(
+            this.ctx.source_file, "");
+        if (this.ctx.generic_registry == null) { return owner_ctx; }
+        if (this.ctx.type_resolver == null)    { return owner_ctx; }
+        if (member == null)                    { return owner_ctx; }
 
         // The receiver is either a concrete generic instantiation (`Option<i32>`,
         // owner params bound from its args) or a non-generic owner carrying an
@@ -10245,7 +10243,9 @@ public:
         // generic body; the method return legitimately stays abstract until mono.
         if (inst != null) {
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-                if (this.contains_generic_param(inst.type_args[i])) { return fallback; }
+                if (this.contains_generic_param(inst.type_args[i])) {
+                    return owner_ctx;
+                }
             }
         }
 
@@ -10322,18 +10322,13 @@ public:
         } else {
             orig_func = this.find_generic_trait_default(recv_type, member.member);
         }
-        if (orig_func == null) { return fallback; }
+        if (orig_func == null) { return owner_ctx; }
         // No method-level generics: the caller's receiver substitution is
         // authoritative; nothing here to infer.
-        if (orig_func.generic_params.length == 0) { return fallback; }
-        const ret_ann: TypeAnnotation* = orig_func.return_type_annotation;
-        if (ret_ann == null) { return fallback; }
-        const n_method_params: i64 = orig_func.generic_params.length;
+        if (orig_func.generic_params.length == 0) { return owner_ctx; }
 
         // Owner-binding context: receiver type params -> concrete args.  Shared
         // by both the turbofish and the inference paths.
-        mut owner_ctx: ResolutionContext = ResolutionContext::new(
-            this.ctx.source_file, "");
         if (inst != null) {
             const n_owner: i64 = if (owner_params.length < inst.type_args.length) {
                 owner_params.length
@@ -10350,7 +10345,26 @@ public:
         // defaults) or `This` (self-returning combinators) resolves concretely.
         owner_ctx.set_this_type(recv_type);
 
-        // Solve each method-level generic param to a concrete type.
+        *out_func = orig_func;
+        return owner_ctx;
+    }
+
+    /// Solve every method-level generic param of `orig_func` to a concrete type
+    /// for this call: explicit turbofish args when present, else formal/actual
+    /// argument unification (with `![implicit]` return-type recovery).
+    /// `owner_ctx` binds the receiver's type params + `This`.  Returns the
+    /// bindings in `orig_func.generic_params` declaration order, or an empty
+    /// array when any param stays unbound / abstract (so the caller leaves the
+    /// call to the monomorphizer).
+    solve_method_bindings(mut &this, orig_func: FunctionDeclNode*,
+                          owner_ctx: ResolutionContext*,
+                          member: MemberAccessNode*,
+                          call: CallExprNode*) -> TypeRef[] {
+        if (this.ctx.type_resolver == null) { return []; }
+        if (orig_func == null || call == null || member == null) { return []; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return []; }
+
         mut method_bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < n_method_params; i++) {
             method_bindings.push(TypeRef::invalid());
@@ -10358,12 +10372,39 @@ public:
 
         if (member.generic_args.length == n_method_params
                 && member.generic_args.length > 0) {
-            // Explicit method turbofish (`some.map<i32>(...)`) is authoritative.
+            // Explicit method turbofish (`some.map<i32>(...)`, `raw.cast<U>()`) is
+            // authoritative.  CRITICAL: the turbofish args are type expressions in
+            // the CALLER's lexical scope, so they must NOT be resolved through
+            // `owner_ctx` (the RECEIVER's param bindings).  When the receiver and
+            // the enclosing function share a param name - e.g. `NonNull<u8>`'s own
+            // `T` vs the enclosing `Box<T>`'s `T` in `raw.cast<T>()` - `owner_ctx`
+            // shadows the enclosing `T` and binds it to a wrong-but-CONCRETE type
+            // (u8), poisoning the stash.  Inside a generic body (the symbolic walk)
+            // resolve them in the ENCLOSING scope's symbolic-param context instead:
+            // an enclosing param `T` becomes its abstract `GenericParam`, which the
+            // ASTTypeSubstituter concretizes (`T` -> `i32`) when mono clones the
+            // body - so mono enqueues `cast<i32>` from sema's stash WITHOUT
+            // re-inferring (the method analogue of `check_generic_free_call`'s
+            // abstract stash; removes the turbofish specialization-time residual).
+            // A concrete arg (`cast<i32>`) resolves concretely in either context.
+            mut tf_ctx_buf: ResolutionContext = ResolutionContext::new(
+                this.ctx.source_file, "");
+            mut use_symbolic: boolean = false;
+            if (this.in_symbolic_check) {
+                this.symbolic_bind_params(&tf_ctx_buf);
+                use_symbolic = true;
+            }
             for (mut i: i64 = 0; i < n_method_params; i++) {
+                const tf_ctx: ResolutionContext* =
+                    if (use_symbolic) { &tf_ctx_buf } else { owner_ctx };
                 const tr: TypeRef = this.ctx.type_resolver.resolve(
-                    member.generic_args[i], &owner_ctx);
-                if (!tr.is_valid() || this.contains_generic_param(tr)) {
-                    return fallback;
+                    member.generic_args[i], tf_ctx);
+                if (!tr.is_valid()) { return []; }
+                // Outside the symbolic walk an abstract turbofish is a genuine
+                // failure (defer to mono); inside it is an enclosing param the
+                // substituter will concretize, so keep it.
+                if (this.contains_generic_param(tr) && !this.in_symbolic_check) {
+                    return [];
                 }
                 method_bindings[i] = tr;
             }
@@ -10377,7 +10418,7 @@ public:
             mut method_param_ids: u64[] = [];
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const gp: GenericParamNode* = orig_func.generic_params[i];
-                if (gp == null) { return fallback; }
+                if (gp == null) { return []; }
                 const gp_ref: TypeRef =
                     this.arena.create_generic_param(gp.name, i as u64);
                 infer_ctx.add_binding(gp.name, gp_ref);
@@ -10393,27 +10434,27 @@ public:
                 if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
                 explicit_params.push(p);
             }
-            if (explicit_params.length != call.arguments.length) { return fallback; }
+            if (explicit_params.length != call.arguments.length) { return []; }
 
             mut ictx: InferCtx =
                 InferCtx::for_template(this.arena, method_param_ids);
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const param: VarDeclNode* = explicit_params[i];
                 if (param == null || param.type_annotation == null) {
-                    return fallback;
+                    return [];
                 }
                 mut formal: TypeRef = this.ctx.type_resolver.resolve(
                     param.type_annotation, &infer_ctx);
-                if (!formal.is_valid()) { return fallback; }
+                if (!formal.is_valid()) { return []; }
                 // Reduce concrete-base projections in the formal (`(This::Item)
                 // -> B` over a concrete receiver becomes `(i32) -> B`) so the
                 // unifier doesn't bail on an unreduced `This::Item` param before
                 // reaching the `B` in the return position.
                 formal = this.reduce_assoc_projections(formal);
                 const arg: ExpressionNode* = call.arguments[i];
-                if (arg == null) { return fallback; }
+                if (arg == null) { return []; }
                 const actual: TypeRef = arg.resolved_type;
-                if (!actual.is_valid()) { return fallback; }
+                if (!actual.is_valid()) { return []; }
                 ictx.unify(formal, actual);
             }
             // Return-type-driven inference for `![implicit]` methods: a method
@@ -10426,9 +10467,10 @@ public:
                 if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
             }
             if (any_unbound && orig_func.is_implicit
-                    && this.expected_type.is_valid()) {
+                    && this.expected_type.is_valid()
+                    && orig_func.return_type_annotation != null) {
                 mut ret_formal: TypeRef = this.ctx.type_resolver.resolve(
-                    ret_ann, &infer_ctx);
+                    orig_func.return_type_annotation, &infer_ctx);
                 if (ret_formal.is_valid()) {
                     ret_formal = this.reduce_assoc_projections(ret_formal);
                     ictx.unify(ret_formal, this.expected_type);
@@ -10436,12 +10478,102 @@ public:
             }
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];
-                if (!b.is_valid() || this.contains_generic_param(b)) {
-                    return fallback;
+                if (!b.is_valid()) { return []; }
+                // An UNBOUND param is invalid (rejected above).  A bound param may
+                // still be ABSTRACT when we're inside a generic template body (the
+                // symbolic walk): inference binds it to one of the enclosing
+                // template's own params (e.g. `hash<H>` where the actual is a
+                // value of the enclosing `H`).  Stash it anyway - the ASTTypeSubstituter
+                // concretizes `resolved_type_args` by applying the spec's subst when
+                // mono clones the body (`H` -> `DefaultHasher`), so mono enqueues the
+                // call's instantiation from sema's bindings WITHOUT re-inferring.
+                // This mirrors `check_generic_free_call`'s abstract-stash and is the
+                // method analogue that removes the specialization-time residual.
+                // Outside the symbolic walk an abstract binding means a genuine
+                // inference failure, so reject it there (defer to mono).
+                if (this.contains_generic_param(b) && !this.in_symbolic_check) {
+                    return [];
                 }
                 method_bindings[i] = b;
             }
         }
+        return method_bindings;
+    }
+
+    /// M1 (sema is the source of truth for method-level bindings): stash the
+    /// method's own concrete generic-param bindings (declaration order) on the
+    /// call so the monomorphizer's `try_infer_method_call` reads them instead of
+    /// re-inferring.  Called once for EVERY method call in `resolve_method_call`;
+    /// a no-op for non-generic methods or when any binding stays abstract.  This
+    /// covers the turbofish (`cast<U>`, `spawn<T>`) and arg-only (`hash<H>`,
+    /// `fmt<W>`) generic methods whose return type is already concrete - so the
+    /// return-resolution paths route around `resolve_generic_method_return` - as
+    /// well as the return-carrying combinator family.  Mirrors the free-call C1d
+    /// stash; a CallExpr is free XOR method, so `resolved_type_args` is shared
+    /// safely.
+    stash_method_call_bindings(mut &this, recv_type: TypeRef,
+                               member: MemberAccessNode*,
+                               call: CallExprNode*) -> void {
+        if (call == null || member == null) { return; }
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.find_generic_method_for_call(recv_type, member, &orig_func);
+        if (orig_func == null) { return; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        mut bindings: TypeRef[] =
+            this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (bindings.length != n_method_params) { return; }
+        // Bindings are all BOUND (solve returns [] otherwise), in mono's expected
+        // order.  At a concrete call site they are concrete; inside a generic
+        // template body (the symbolic walk) they may be the enclosing template's
+        // own params, which the ASTTypeSubstituter concretizes when mono clones
+        // the body - so mono reads this exact instantiation without re-inferring.
+        call.set_resolved_type_args(bindings);
+    }
+
+    /// Mono-after-sema (method path): resolve the CONCRETE return type of a call
+    /// to a GENERIC method - one carrying its own type params, like
+    /// `Option<T>::map<U>(f: (T) -> U) -> Option<U>` - by inferring `U` from the
+    /// call arguments (or reading the explicit turbofish `some.map<i32>(...)`)
+    /// and substituting BOTH the receiver's type args (`T -> i32`) and the
+    /// method args (`U -> i32`) into the return annotation, yielding
+    /// `Option<i32>` BEFORE mono runs.
+    ///
+    /// This mirrors the monomorphizer's `try_infer_method_call` inference but
+    /// computes ONLY the return type; `resolved_callee` / `resolved_method` stay
+    /// UNPINNED so mono still specializes the method body and back-fills.  It is
+    /// the method-call analogue of `check_generic_free_call`'s keystone: neither
+    /// the bare method lookup (which returns `Option<U>` with `U` free) nor
+    /// `subst_method_return_from_receiver` (which only knows the receiver's `T`)
+    /// can bind a method-LEVEL generic, so without this the abstract `Option<U>`
+    /// reaches codegen and breaks (mono used to backstop it by inferring here).
+    ///
+    /// Returns `fallback` (the caller's prior, possibly-abstract resolution)
+    /// when the receiver isn't a concrete instantiation, any receiver arg is
+    /// abstract (a symbolic generic-body walk), the method has no own generics,
+    /// it can't be located, or any binding stays abstract - so concrete-only
+    /// calls and nested-generic bodies are left untouched.
+    resolve_generic_method_return(mut &this, recv_type: TypeRef,
+                                  member: MemberAccessNode*,
+                                  call: CallExprNode*,
+                                  fallback: TypeRef) -> TypeRef {
+        if (call == null || member == null) { return fallback; }
+
+        // Find the generic method + owner-binding context, then solve its
+        // method-level params (turbofish or formal/actual unify).  Shared with
+        // `stash_method_call_bindings` so sema infers each call's bindings once,
+        // identically, regardless of return shape.
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.find_generic_method_for_call(recv_type, member, &orig_func);
+        if (orig_func == null) { return fallback; }
+        const ret_ann: TypeAnnotation* = orig_func.return_type_annotation;
+        if (ret_ann == null) { return fallback; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+
+        mut method_bindings: TypeRef[] =
+            this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (method_bindings.length != n_method_params) { return fallback; }
 
         // Resolve the return annotation with owner params AND method params
         // concrete (by name), plus `This` for self-referential returns, so a
@@ -10459,19 +10591,9 @@ public:
                 || this.contains_unresolved_projection(refined)) {
             return fallback;
         }
-        // M1 (sema is the source of truth for method-level bindings): stash the
-        // method's own concrete generic-param bindings (declaration order) on the
-        // call so the monomorphizer's `try_infer_method_call` reads them instead
-        // of re-inferring.  Mirrors the free-call C1d stash in
-        // `check_generic_free_call`.  Every `method_bindings[i]` is concrete here
-        // - the inference/turbofish loops above returned `fallback` on any invalid
-        // or still-abstract binding - so the stash is always a complete, concrete
-        // set in mono's expected order (`orig_func.generic_params`).
-        mut m_stash: TypeRef[] = [];
-        for (mut si: i64 = 0; si < n_method_params; si++) {
-            m_stash.push(method_bindings[si]);
-        }
-        call.set_resolved_type_args(m_stash);
+        // The call's method-level bindings are stashed for the monomorphizer by
+        // `stash_method_call_bindings` (called once for every method call in
+        // `resolve_method_call`), so no stash is needed here.
         return refined;
     }
 
