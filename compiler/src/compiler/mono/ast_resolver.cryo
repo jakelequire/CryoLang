@@ -1,0 +1,706 @@
+/// Mono AST Resolver  (Compiler::Mono::AstResolver)
+///
+/// Post-clone re-resolution of a specialized AST: after `ASTSpecializer` clones a
+/// template and `ASTTypeSubstituter` rewrites its annotations to concrete names,
+/// every `resolved_type` field is invalid.  This collaborator fills them —
+/// resolving fields, method signatures, and body locals against a resolution
+/// context built from the template's module — and performs compile-time
+/// `static match` arm pruning (selecting the single live arm for the concrete
+/// substitution).
+///
+/// POST-REORDER: the old inference body-walk that this used to run after
+/// resolving each method body (`collect_locals_in_block` +
+/// `discover_inferred_calls_in_block`) is DELETED — sema already typed the bodies
+/// and stashed every generic call's bindings; `MonoCallSpecializer` consumes those.
+/// Body re-resolution here is now purely "fill resolved_type on local decls".
+///
+/// Holds a `MonoState*` (to discover nested instantiations from method return
+/// types + report static-match errors) and a `MonoTraitSpecializer*` (for
+/// where-bound derivation + associated-type projection reduction).
+
+namespace Compiler::Mono::AstResolver;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::AST::Pattern;
+import Compiler::Types::Generic;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Substitution;
+import Compiler::Types::Resolver;
+import Compiler::Diag;
+import Compiler::Diag::Sink;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Mono::State;
+import Compiler::Mono::TraitSpecializer;
+
+
+type struct MonoAstResolver {
+    arena:         TypeArena*;
+    intern_table:  InternTable*;
+    diagnostics:   DiagnosticSink*;
+    type_resolver: TypeResolver*;
+    state:         MonoState*;
+    trait_spec:    MonoTraitSpecializer*;
+
+    static null() -> MonoAstResolver {
+        return MonoAstResolver {
+            arena:         null,
+            intern_table:  null,
+            diagnostics:   null,
+            type_resolver: null,
+            state:         null,
+            trait_spec:    null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern_table: InternTable*,
+                    diagnostics: DiagnosticSink*, type_resolver: TypeResolver*,
+                    state: MonoState*, trait_spec: MonoTraitSpecializer*) -> void {
+        this.arena         = arena;
+        this.intern_table  = intern_table;
+        this.diagnostics   = diagnostics;
+        this.type_resolver = type_resolver;
+        this.state         = state;
+        this.trait_spec    = trait_spec;
+    }
+
+
+    /// Walk the specialized AST and resolve all type annotations into concrete
+    /// TypeRefs.  Uses the template entry's module name to build a resolution
+    /// context so cross-module and user-defined types resolve through the scope chain.
+    resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
+                            entry: TemplateEntry*, subst: TypeSubstitution*,
+                            this_type: TypeRef) -> void {
+        if (ast_node == null || this.type_resolver == null) { return; }
+
+        mut module_name: string = "";
+        if (entry != null && entry.module_name.is_valid()) {
+            module_name = this.intern_table.resolve(entry.module_name);
+        }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+
+        match (node_kind) {
+            NodeKind::StructDeclaration => {
+                const decl: StructDeclNode* = ast_node as StructDeclNode*;
+                if (decl == null) { return; }
+                this.type_resolver.resolve_fields(decl.fields, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+            }
+            NodeKind::ClassDeclaration => {
+                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
+                if (decl == null) { return; }
+                this.type_resolver.resolve_fields(decl.fields, &res_ctx);
+                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+            }
+            NodeKind::EnumDeclaration => {
+                // Enum variants use SymbolStr names; resolution handled in
+                // populate_enum_variants via name lookup.
+            }
+            NodeKind::FunctionDeclaration => {
+                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+                if (decl == null) { return; }
+                // Free functions have no `this`.
+                this.resolve_func_and_body(decl, &res_ctx, subst, TypeRef::invalid());
+            }
+            NodeKind::ImplementationBlock => {
+                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
+                if (decl == null) { return; }
+                // Bounds-violating impls/methods were already stripped pre-clone
+                // by filter_bounds_violating_* in specialize_with_entry.
+                //
+                // First derive any impl-introduced generic the Self type doesn't
+                // determine (e.g. `A` in `implement<I, A> Iterator<A> for TakeN<I>
+                // where I: Iterator<A>`) from the where-bounds, then bind the trait's
+                // outer generic params to the impl's concrete trait args, so cloned
+                // default-method bodies resolve their inner element names concretely.
+                this.trait_spec.derive_impl_where_generics(decl, subst, &res_ctx);
+                this.trait_spec.bind_trait_args_for_spec_impl(decl, &res_ctx);
+                // Persist the concrete trait-element bindings onto the spec'd impl
+                // (self-returning defaults are instantiated lazily and re-seed these).
+                this.trait_spec.cache_derived_trait_params(decl, &res_ctx);
+                // Rewrite where-bound-derived generics (`A`) inside the impl's method
+                // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
+                // body resolution.  Run before resolve_methods.
+                this.trait_spec.substitute_derived_params_in_method_bodies(decl);
+                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+            }
+            _ => {}
+        }
+    }
+
+    // ---- static match arm pruning (compile-time type dispatch) -----------
+
+    /// Entry point: prune `static match` arms throughout a freshly-substituted
+    /// specialized AST.  Reduces each static match to its single live arm.
+    prune_static_match_arms(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
+                            entry: TemplateEntry*, subst: TypeSubstitution*) -> void {
+        if (ast_node == null || this.type_resolver == null) { return; }
+        mut module_name: string = "";
+        if (entry != null && entry.module_name.is_valid()) {
+            module_name = this.intern_table.resolve(entry.module_name);
+        }
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+
+        match (node_kind) {
+            NodeKind::StructDeclaration => {
+                const decl: StructDeclNode* = ast_node as StructDeclNode*;
+                if (decl == null) { return; }
+                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            }
+            NodeKind::ClassDeclaration => {
+                const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
+                if (decl == null) { return; }
+                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            }
+            NodeKind::FunctionDeclaration => {
+                const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
+                if (decl == null || decl.body == null) { return; }
+                this.prune_static_match_in_block(decl.body, &res_ctx);
+            }
+            NodeKind::ImplementationBlock => {
+                const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
+                if (decl == null) { return; }
+                this.prune_static_match_in_methods(decl.methods, &res_ctx);
+            }
+            _ => {}
+        }
+    }
+
+    prune_static_match_in_methods(mut &this, methods: &MethodNode*[],
+                                  res_ctx: ResolutionContext*) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            if (method.func.body != null) {
+                this.prune_static_match_in_block(method.func.body, res_ctx);
+            }
+        }
+    }
+
+    prune_static_match_in_block(mut &this, block: BlockStmtNode*,
+                                res_ctx: ResolutionContext*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            this.prune_static_match_in_stmt(block.statements[i], res_ctx);
+        }
+    }
+
+    prune_static_match_in_stmt(mut &this, stmt: StatementNode*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        match (node.kind) {
+            NodeKind::BlockStatement => {
+                this.prune_static_match_in_block(stmt as BlockStmtNode*, res_ctx);
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const ub: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                this.prune_static_match_in_block(ub.block, res_ctx);
+            }
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.prune_static_match_in_expr(es.expression, res_ctx);
+            }
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                this.prune_static_match_in_expr(rs.expression, res_ctx);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null &&
+                    ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                    this.prune_static_match_in_expr(vd.initializer, res_ctx);
+                }
+            }
+            NodeKind::VariableDeclaration => {
+                const vd: VarDeclNode* = stmt as VarDeclNode*;
+                this.prune_static_match_in_expr(vd.initializer, res_ctx);
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                this.prune_static_match_in_expr(ifs.condition, res_ctx);
+                this.prune_static_match_in_stmt(ifs.then_stmt, res_ctx);
+                if (ifs.has_else()) {
+                    this.prune_static_match_in_stmt(ifs.else_stmt, res_ctx);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.prune_static_match_in_expr(ws.condition, res_ctx);
+                this.prune_static_match_in_stmt(ws.body, res_ctx);
+            }
+            NodeKind::DoWhileStatement => {
+                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                this.prune_static_match_in_stmt(dw.body, res_ctx);
+                this.prune_static_match_in_expr(dw.condition, res_ctx);
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                if (fs.init != null) { this.prune_static_match_in_stmt(fs.init, res_ctx); }
+                this.prune_static_match_in_expr(fs.condition, res_ctx);
+                this.prune_static_match_in_expr(fs.update, res_ctx);
+                this.prune_static_match_in_stmt(fs.body, res_ctx);
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                this.prune_static_match_in_stmt(ls.body, res_ctx);
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.prune_static_match_in_expr(ms.subject, res_ctx);
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                mut sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                const idx: i64 = this.select_static_match_arm(
+                    sms.scrutinee, sms.arms, sms.span, res_ctx);
+                if (idx >= 0) {
+                    mut reduced: StaticMatchArmNode*[] = [];
+                    reduced.push(sms.arms[idx]);
+                    sms.arms = reduced;
+                }
+                // Recurse into the surviving arm for nested static matches.
+                for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sms.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    prune_static_match_in_expr(mut &this, expr: ExpressionNode*,
+                               res_ctx: ResolutionContext*) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        match (node.kind) {
+            NodeKind::StaticMatchExpression => {
+                mut sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+                const idx: i64 = this.select_static_match_arm(
+                    sme.scrutinee, sme.arms, sme.span, res_ctx);
+                if (idx >= 0) {
+                    mut reduced: StaticMatchArmNode*[] = [];
+                    reduced.push(sme.arms[idx]);
+                    sme.arms = reduced;
+                }
+                for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sme.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = expr as BinaryExprNode*;
+                this.prune_static_match_in_expr(b.left, res_ctx);
+                this.prune_static_match_in_expr(b.right, res_ctx);
+            }
+            NodeKind::UnaryExpression => {
+                const u: UnaryExprNode* = expr as UnaryExprNode*;
+                this.prune_static_match_in_expr(u.operand, res_ctx);
+            }
+            NodeKind::TernaryExpression => {
+                const t: TernaryExprNode* = expr as TernaryExprNode*;
+                this.prune_static_match_in_expr(t.condition, res_ctx);
+                this.prune_static_match_in_expr(t.true_expr, res_ctx);
+                this.prune_static_match_in_expr(t.false_expr, res_ctx);
+            }
+            NodeKind::IfExpression => {
+                const ie: IfExprNode* = expr as IfExprNode*;
+                this.prune_static_match_in_expr(ie.condition, res_ctx);
+                this.prune_static_match_in_expr(ie.then_expr, res_ctx);
+                this.prune_static_match_in_expr(ie.else_expr, res_ctx);
+            }
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = expr as CallExprNode*;
+                this.prune_static_match_in_expr(c.callee, res_ctx);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                    this.prune_static_match_in_expr(c.arguments[i], res_ctx);
+                }
+            }
+            NodeKind::CastExpression => {
+                const ce: CastExprNode* = expr as CastExprNode*;
+                this.prune_static_match_in_expr(ce.expression, res_ctx);
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                this.prune_static_match_in_expr(ma.object, res_ctx);
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                this.prune_static_match_in_expr(aa.array, res_ctx);
+                this.prune_static_match_in_expr(aa.index, res_ctx);
+            }
+            NodeKind::MatchExpression => {
+                const me: MatchExprNode* = expr as MatchExprNode*;
+                this.prune_static_match_in_expr(me.subject, res_ctx);
+                for (mut i: i64 = 0; i < me.arms.length; i++) {
+                    const arm: MatchArmNode* = me.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.prune_static_match_in_stmt(arm.body, res_ctx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the scrutinee and each arm's type pattern, returning the index of
+    /// the single matching arm (first arm whose type equals the scrutinee, else
+    /// the `_` wildcard).  Returns -1 when nothing matches.  Emits E0645 on a hard
+    /// no-match and an internal error on an unresolved scrutinee.
+    select_static_match_arm(mut &this, scrutinee: TypeAnnotation*,
+                            arms: &StaticMatchArmNode*[], span: SourceSpan,
+                            res_ctx: ResolutionContext*) -> i64 {
+        if (arms.length == 0) { return -1; }
+        const scrut: TypeRef = this.type_resolver.resolve(scrutinee, res_ctx);
+        if (!scrut.is_valid()) {
+            this.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                "static match scrutinee did not resolve to a concrete type after substitution").at(span));
+            this.state.error_count += 1;
+            return -1;
+        }
+
+        if (arms.length == 1) {
+            // A single arm: a `_` default always applies; a single concrete type
+            // pattern must equal the scrutinee.  An originally single-arm match with
+            // a non-matching type is a genuine no-match sema's net never catches.
+            const only: StaticMatchArmNode* = arms[0];
+            if (only == null || only.type_pattern == null) { return -1; }
+            const arm0: TypeRef = this.type_resolver.resolve(only.type_pattern, res_ctx);
+            if (arm0.is_valid() && arm0.id == scrut.id) { return -1; }
+            const tn0: string = this.arena.format_display(this.arena.lookup(scrut.id));
+            this.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+                format("no `static match` arm matches type `%s`", tn0))
+                .at(span)
+                .with_note("add an arm for this type or a `_` default arm"));
+            this.state.error_count += 1;
+            return -1;
+        }
+
+        mut wildcard_idx: i64 = -1;
+        mut match_idx: i64 = -1;
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: StaticMatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            if (arm.type_pattern == null) {
+                if (wildcard_idx < 0) { wildcard_idx = i; }
+                continue;
+            }
+            const arm_ty: TypeRef = this.type_resolver.resolve(arm.type_pattern, res_ctx);
+            if (arm_ty.is_valid() && arm_ty.id == scrut.id) {
+                if (match_idx < 0) {
+                    match_idx = i;
+                } else {
+                    // A second arm with the same TypeID: ambiguous.  Keep the
+                    // deterministic first-wins selection but surface the ambiguity.
+                    const dn: string = this.arena.format_display(this.arena.lookup(scrut.id));
+                    this.diagnostics.emit(Diagnostic::error(
+                        ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+                        format("ambiguous `static match`: multiple arms match type `%s`", dn))
+                        .at(span)
+                        .with_note("remove the duplicate arm"));
+                    this.state.error_count += 1;
+                    return match_idx;
+                }
+            }
+        }
+        if (match_idx >= 0) { return match_idx; }
+        if (wildcard_idx >= 0) { return wildcard_idx; }
+
+        const ty_name: string = this.arena.format_display(this.arena.lookup(scrut.id));
+        this.diagnostics.emit(Diagnostic::error(
+            ErrorCode::E0645_NO_STATIC_MATCH_ARM,
+            format("no `static match` arm matches type `%s`", ty_name))
+            .at(span)
+            .with_note("add an arm for this type or a `_` default arm"));
+        this.state.error_count += 1;
+        return -1;
+    }
+
+    /// Resolve signatures on an array of methods; delegates core signature
+    /// resolution to TypeResolver, then resolves body locals.
+    resolve_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*,
+                    subst: TypeSubstitution*, this_type: TypeRef) -> void {
+        // Share `nested_visited` across all methods in this impl block so repeated
+        // return types only produce a single monomorphization request per impl.
+        this.state.nested_visited = [];
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            // Self-returning trait defaults (combinators returning an adapter over
+            // `This`) are instantiated lazily at call sites, never eagerly.
+            if (method.func.is_self_returning_default) { continue; }
+            // Static methods don't take `this`; pass invalid.
+            const m_this: TypeRef = if (method.is_static) {
+                TypeRef::invalid()
+            } else {
+                this_type
+            };
+            // If the method has its own generic params (e.g. `hash<H>`), bind them
+            // in a per-method resolution context before signature resolution so the
+            // Reference branch builds `Reference(GenericParam_H)` not `Reference(invalid)`.
+            if (method.func.is_generic()) {
+                mut method_ctx: ResolutionContext = res_ctx.clone();
+                for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
+                    const gp: GenericParamNode* = method.func.generic_params[j];
+                    if (gp == null) { continue; }
+                    const gp_ref: TypeRef = this.arena.create_generic_param(
+                        gp.name, j as u64);
+                    method_ctx.add_binding(gp.name, gp_ref);
+                }
+                this.resolve_func_and_body(method.func, &method_ctx, subst, m_this);
+            } else {
+                this.resolve_func_and_body(method.func, res_ctx, subst, m_this);
+            }
+        }
+    }
+
+    /// Resolve a function's signature (via TypeResolver) and then resolve local
+    /// variable types in its body (cloned AST bodies have cleared resolved_type).
+    ///
+    /// POST-REORDER: the inference body-walk (local-table build +
+    /// discover_inferred_calls_in_block) that used to run here is DELETED — sema
+    /// typed the body and stashed every generic call; MonoCallSpecializer consumes
+    /// the stash.  Only local-decl resolution + return-type nested discovery remain.
+    resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
+                          subst: TypeSubstitution*, this_type: TypeRef) -> void {
+        // Spec'd method clones have their `&this` parameter annotated as
+        // `Reference(ThisType)`; thread `this_type` onto a per-call copy of the
+        // context so `&this` resolves to `Reference(<spec'd_owner>)`.
+        mut sig_ctx: ResolutionContext = res_ctx.clone();
+        if (this_type.is_valid()) {
+            sig_ctx.set_this_type(this_type);
+        }
+        this.type_resolver.resolve_func_signature(func, &sig_ctx);
+
+        // Back-fill `&this` / `this` parameters when they have no explicit
+        // annotation (the parser leaves `type_annotation` null on the implicit
+        // receiver).  `&this` -> `Pointer(this_type)`; bare `this` -> the owner type.
+        if (this_type.is_valid()) {
+            const this_amp: SymbolStr = this.intern_table.intern("&this");
+            const this_val: SymbolStr = this.intern_table.intern("this");
+            for (mut bp: i64 = 0; bp < func.parameters.length; bp++) {
+                const param: VarDeclNode* = func.parameters[bp];
+                if (param == null || param.resolved_type.is_valid()) { continue; }
+                if (param.name.equals(this_amp)) {
+                    param.resolved_type = this.arena.get_pointer_to(this_type);
+                } else if (param.name.equals(this_val)) {
+                    param.resolved_type = this_type;
+                }
+            }
+        }
+        // Fallback resolution with substitution-derived bindings.  The
+        // ASTTypeSubstituter doesn't always reach every spot (virtual-dispatch gaps
+        // and some annotation kinds - Function, nested Generic - aren't walked), so
+        // a post-substitution annotation can still read `T` and the empty res_ctx
+        // can't resolve it.  Build a `gen_ctx` mapping every original generic-param
+        // SymbolStr to its concrete replacement and re-resolve still-invalid slots.
+        // (Phase 2 of the refactor closes the substituter's gaps so this collapses.)
+        if (subst != null) {
+            mut gen_ctx: ResolutionContext = res_ctx.clone();
+            if (this_type.is_valid()) { gen_ctx.set_this_type(this_type); }
+            for (mut si: i64 = 0; si < subst.param_ids.length; si++) {
+                const param_t: Type* = this.arena.lookup(subst.param_ids[si]);
+                if (param_t != null && param_t.kind == TypeKind::GenericParam) {
+                    const gp: GenericParamType* = param_t as GenericParamType*;
+                    gen_ctx.add_binding(gp.param_name, subst.replacements[si]);
+                }
+            }
+            // Return type fallback.
+            if (!func.has_resolved_return_type() && func.return_type_annotation != null) {
+                const resolved: TypeRef = this.type_resolver.resolve(
+                    func.return_type_annotation, &gen_ctx);
+                if (resolved.is_valid()) {
+                    func.resolved_return_type = resolved;
+                }
+            }
+            // Param fallback: every still-unresolved explicitly-annotated parameter
+            // gets one more shot via the concrete-binding context.  Skips `&this`/
+            // `this` (back-filled above from `this_type`).
+            for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+                const param: VarDeclNode* = func.parameters[pi];
+                if (param == null) { continue; }
+                if (param.resolved_type.is_valid()) { continue; }
+                if (param.type_annotation == null) { continue; }
+                const ptype: TypeRef = this.type_resolver.resolve(
+                    param.type_annotation, &gen_ctx);
+                if (ptype.is_valid()) {
+                    param.resolved_type = ptype;
+                }
+            }
+        }
+
+        // Reduce concrete-base associated-type projections in the spec signature
+        // (`P::Item` under `P := IntSeq` -> `i32`) so the signature is fully
+        // concrete before it is registered/mangled.
+        if (func.resolved_return_type.is_valid()) {
+            func.resolved_return_type =
+                this.trait_spec.reduce_projections(func.resolved_return_type);
+        }
+        for (mut rpi: i64 = 0; rpi < func.parameters.length; rpi++) {
+            const rpp: VarDeclNode* = func.parameters[rpi];
+            if (rpp != null && rpp.resolved_type.is_valid()) {
+                rpp.resolved_type = this.trait_spec.reduce_projections(rpp.resolved_type);
+            }
+        }
+
+        if (func.body != null) {
+            this.resolve_body_locals(func.body, res_ctx);
+        }
+
+        // Discover transitive instantiations from the method's return type, so
+        // methods that return another generic type (e.g. `IoResult<T>::ok() ->
+        // Option<T>`) trigger monomorphization of the referenced generic.  The
+        // caller (resolve_methods) owns `nested_visited` lifecycle so repeated
+        // return types across methods in the same impl block dedupe.
+        if (func.has_resolved_return_type()) {
+            this.state.request_nested_instantiations(func.resolved_return_type);
+        }
+    }
+
+    /// Walk a block statement and resolve type annotations on all local variable
+    /// declarations.  Recurses into nested blocks / control-flow bodies.
+    resolve_body_locals(mut &this, block: BlockStmtNode*, res_ctx: ResolutionContext*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const stmt: StatementNode* = block.statements[i];
+            if (stmt == null) { continue; }
+            const node: ASTNode* = stmt as ASTNode*;
+
+            if (node.kind == NodeKind::DeclarationStatement) {
+                const decl_stmt: DeclStmtNode* = stmt as DeclStmtNode*;
+                const inner_decl: DeclarationNode* = decl_stmt.declaration;
+                if (inner_decl != null) {
+                    const inner_node: ASTNode* = inner_decl as ASTNode*;
+                    if (inner_node.kind == NodeKind::VariableDeclaration) {
+                        const var_decl: VarDeclNode* = inner_decl as VarDeclNode*;
+                        if (var_decl.type_annotation != null && !var_decl.resolved_type.is_valid()) {
+                            const vtype: TypeRef = this.type_resolver.resolve(
+                                var_decl.type_annotation, res_ctx);
+                            if (vtype.is_valid()) {
+                                var_decl.resolved_type = vtype;
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into nested blocks / control-flow bodies.
+            if (node.kind == NodeKind::BlockStatement) {
+                this.resolve_body_locals(stmt as BlockStmtNode*, res_ctx);
+            }
+            if (node.kind == NodeKind::IfStatement) {
+                const if_stmt: IfStmtNode* = stmt as IfStmtNode*;
+                if (if_stmt.then_stmt != null) {
+                    const then_node: ASTNode* = if_stmt.then_stmt as ASTNode*;
+                    if (then_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(if_stmt.then_stmt as BlockStmtNode*, res_ctx);
+                    }
+                }
+                if (if_stmt.has_else() && if_stmt.else_stmt != null) {
+                    const else_node: ASTNode* = if_stmt.else_stmt as ASTNode*;
+                    if (else_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(if_stmt.else_stmt as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+            if (node.kind == NodeKind::WhileStatement) {
+                const while_stmt: WhileStmtNode* = stmt as WhileStmtNode*;
+                if (while_stmt.body != null) {
+                    const body_node: ASTNode* = while_stmt.body as ASTNode*;
+                    if (body_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(while_stmt.body as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+            if (node.kind == NodeKind::ForStatement) {
+                const for_stmt: ForStmtNode* = stmt as ForStmtNode*;
+                // Resolve the loop's init VarDecl (e.g. `mut i: int = 0`).  The init
+                // can be a bare VariableDeclaration or a DeclarationStatement.
+                if (for_stmt.init != null) {
+                    const init_node: ASTNode* = for_stmt.init;
+                    mut for_var: VarDeclNode* = null;
+                    if (init_node.kind == NodeKind::VariableDeclaration) {
+                        for_var = for_stmt.init as VarDeclNode*;
+                    } else if (init_node.kind == NodeKind::DeclarationStatement) {
+                        const init_decl: DeclStmtNode* = for_stmt.init as DeclStmtNode*;
+                        const inner_decl: DeclarationNode* = init_decl.declaration;
+                        if (inner_decl != null) {
+                            const inner_node: ASTNode* = inner_decl as ASTNode*;
+                            if (inner_node.kind == NodeKind::VariableDeclaration) {
+                                for_var = inner_decl as VarDeclNode*;
+                            }
+                        }
+                    }
+                    if (for_var != null && for_var.type_annotation != null
+                            && !for_var.resolved_type.is_valid()) {
+                        const vtype: TypeRef = this.type_resolver.resolve(
+                            for_var.type_annotation, res_ctx);
+                        if (vtype.is_valid()) {
+                            for_var.resolved_type = vtype;
+                        }
+                    }
+                }
+                if (for_stmt.body != null) {
+                    const body_node: ASTNode* = for_stmt.body as ASTNode*;
+                    if (body_node.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(for_stmt.body as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+            if (node.kind == NodeKind::MatchStatement) {
+                const match_stmt: MatchStmtNode* = stmt as MatchStmtNode*;
+                for (mut mi: i64 = 0; mi < match_stmt.arms.length; mi++) {
+                    const arm: MatchArmNode* = match_stmt.arms[mi];
+                    if (arm != null && arm.body != null) {
+                        const arm_body: ASTNode* = arm.body as ASTNode*;
+                        if (arm_body.kind == NodeKind::BlockStatement) {
+                            this.resolve_body_locals(arm.body as BlockStmtNode*, res_ctx);
+                        }
+                    }
+                }
+            }
+            if (node.kind == NodeKind::StaticMatchStatement) {
+                const sm_stmt: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut mi: i64 = 0; mi < sm_stmt.arms.length; mi++) {
+                    const arm: StaticMatchArmNode* = sm_stmt.arms[mi];
+                    if (arm != null && arm.body != null) {
+                        const arm_body: ASTNode* = arm.body as ASTNode*;
+                        if (arm_body.kind == NodeKind::BlockStatement) {
+                            this.resolve_body_locals(arm.body as BlockStmtNode*, res_ctx);
+                        }
+                    }
+                }
+            }
+            if (node.kind == NodeKind::LoopStatement) {
+                const loop_stmt: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (loop_stmt.body != null) {
+                    const loop_body: ASTNode* = loop_stmt.body as ASTNode*;
+                    if (loop_body.kind == NodeKind::BlockStatement) {
+                        this.resolve_body_locals(loop_stmt.body as BlockStmtNode*, res_ctx);
+                    }
+                }
+            }
+        }
+    }
+}

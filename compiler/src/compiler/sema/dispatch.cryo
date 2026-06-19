@@ -1,0 +1,65 @@
+/// SemaDispatch — the recursion seam
+///
+/// Collaborators (CallResolver, MemberResolver, PatternResolver, ...) frequently
+/// need to recurse back into expression resolution, but must NOT import the
+/// concrete `SemaVisitor` (that would make the module graph cyclic).  This is
+/// the seam that lets them, mirroring codegen's `ExprDispatch`.
+///
+/// The authoritative expression dispatch — the `match (expr.kind)` switch — lives
+/// on `SemaVisitor.resolve_expr`.  Each `SemaVisitor.override visit(SomeExpr*)` is
+/// a thin delegate that stashes `this.resolve_expr(node)` on
+/// `state.last_expr_type` (the Option-B side-channel).  A collaborator recurses
+/// via `this.dispatch.resolve_expr(visitor, child)`, which double-dispatches
+/// through the existing `ASTNode.accept(ASTVisitor*)` virtual and reads the
+/// channel back — so the collaborator only ever sees the abstract `ASTVisitor`.
+///
+/// (This deliberately differs from Option A — a virtual `resolve_expr_dyn` hook on
+/// `BaseASTVisitor` — which would grow the vtable of every visitor in the LIVE
+/// compiler.  The side-channel keeps the whole refactor contained in `sema/`.)
+
+namespace Compiler::Sema::Dispatch;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::Types::TypeRef;
+import Compiler::CompilationContext;
+import Compiler::Sema::State;
+
+type struct SemaDispatch {
+    ctx:   CompilationContext*;
+    state: SemaState*;
+
+    static null() -> SemaDispatch {
+        return SemaDispatch { ctx: null, state: null };
+    }
+
+    wire(mut &this, ctx: CompilationContext*, state: SemaState*) -> void {
+        this.ctx   = ctx;
+        this.state = state;
+    }
+
+    /// Recurse into an expression and return its resolved type.  Resets the
+    /// channel, double-dispatches to `SemaVisitor`'s matching `visit` override
+    /// (which writes the channel via `resolve_expr`), then reads it back.
+    resolve_expr(mut &this, visitor: ASTVisitor*, e: ExpressionNode*) -> TypeRef {
+        if (e == null) { return TypeRef::invalid(); }
+        this.state.last_expr_type = TypeRef::invalid();
+        e.accept(visitor);
+        return this.state.last_expr_type;
+    }
+
+    /// Recurse into a statement (statements carry no return channel).
+    dispatch_stmt(mut &this, visitor: ASTVisitor*, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        stmt.accept(visitor);
+    }
+
+    /// Recurse into a top-level node (function / impl / struct / decl-stmt / ...).
+    dispatch_top_level(mut &this, visitor: ASTVisitor*, node: ASTNode*) -> void {
+        if (node == null) { return; }
+        node.accept(visitor);
+    }
+}

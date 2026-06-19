@@ -1,0 +1,1213 @@
+/// MethodBinding
+///
+/// Generic method resolution: locating a generic method on a receiver (inline /
+/// inherent-impl / trait-impl / trait-default), solving its method-level type
+/// params (turbofish or argument unification), stashing the solved bindings on
+/// the call for the monomorphizer (`CallExprNode.resolved_type_args` — the frozen
+/// contract), substituting a receiver's type-args into an abstract method return,
+/// and reducing associated-type projections over a concrete base.
+///
+/// Env by pointer (arena/intern/ctx) + peers: `state` (symbolic_* + expected_type),
+/// `types` (TypeUtils — type queries + DI lookups), `symbolic` (SymbolicChecker —
+/// param binding).  A fresh `TraitChecker` is constructed on demand (it is just a
+/// 4-pointer view), mirroring the monolith's `trait_checker()`.
+///
+/// GATED (R1 — mono-after-sema): `resolve_method_return_with_explicit_args` and
+/// `resolve_generic_method_return` carry `return fallback` pre-mono re-derivation
+/// exits.  They are load-bearing while sema can still run before mono in some
+/// paths, so they are ported FAITHFULLY and tagged; they become deletable (keep
+/// only the symbolic-walk branch) once mono-after-sema fully lands.
+
+namespace Compiler::Sema::MethodBinding;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Types::Substitution;
+import Compiler::Types::Inference;
+import Compiler::Types::TraitChecker;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Resolver;
+import Compiler::Types::Monomorphizer;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::AST::Statement;
+import Compiler::AST::Declaration;
+import Compiler::CompilationContext;
+import Compiler::Sema::State;
+import Compiler::Sema::TypeUtils;
+import Compiler::Sema::SymbolicChecker;
+import std::fmt;
+
+type struct MethodBinding {
+    arena:    TypeArena*;
+    intern:   InternTable*;
+    ctx:      CompilationContext*;
+    state:    SemaState*;
+    types:    TypeUtils*;
+    symbolic: SymbolicChecker*;
+
+    static null() -> MethodBinding {
+        return MethodBinding {
+            arena: null, intern: null, ctx: null,
+            state: null, types: null, symbolic: null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+                    state: SemaState*, types: TypeUtils*, symbolic: SymbolicChecker*) -> void {
+        this.arena    = arena;
+        this.intern   = intern;
+        this.ctx      = ctx;
+        this.state    = state;
+        this.types    = types;
+        this.symbolic = symbolic;
+    }
+
+    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    trait_checker(&this) -> TraitChecker {
+        return TraitChecker::new(this.arena, this.ctx.generic_registry,
+                                 this.intern, this.ctx.diagnostics);
+    }
+
+
+    // -- Receiver/return substitution --
+
+    /// Substitute the receiver's bare nominal type for the `This` placeholder in
+    /// `ty` (used for trait-default returns like `take -> TakeIter<This>`).
+    subst_this_in_type(mut &this, ty: TypeRef, receiver: TypeRef) -> TypeRef {
+        if (!ty.is_valid() || !this.types.contains_generic_param(ty)) { return ty; }
+        mut recv: TypeRef = receiver;
+        mut rt: Type* = this.arena.lookup(recv.id);
+        mut depth: i32 = 0;
+        while (rt != null && depth < 5) {
+            if (rt.kind == TypeKind::Reference) {
+                recv = (rt as ReferenceType*).referent;
+                rt = this.arena.lookup(recv.id);
+            } else if (rt.kind == TypeKind::Pointer) {
+                recv = (rt as PointerType*).pointee;
+                rt = this.arena.lookup(recv.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (!recv.is_valid()) { return ty; }
+        const this_name: SymbolStr = this.intern.intern("This");
+        const this_ph: TypeRef = this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        subst.add(this_ph.id, recv);
+        const out: TypeRef = subst.apply(ty, this.arena);
+        if (!out.is_valid()) { return ty; }
+        return out;
+    }
+
+    /// Mono-after-sema keystone (method path): substitute a concrete receiver
+    /// instantiation's type_args into a method's still-abstract bare-lookup return
+    /// (`Slice<u8>::get -> Option<u8>`).  Returns `ret` unchanged when it's already
+    /// concrete, the receiver isn't a concrete instantiation, arity disagrees, or
+    /// any receiver arg is abstract (a symbolic walk).
+    subst_method_return_from_receiver(mut &this, recv_type: TypeRef,
+                                      ret: TypeRef) -> TypeRef {
+        if (!ret.is_valid()) { return ret; }
+        if (!this.types.contains_generic_param(ret)) { return ret; }   // already concrete
+        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+        if (inst == null) { return ret; }
+        const gr: GenericRegistry* = this.ctx.get_generic_registry();
+        if (gr == null) { return ret; }
+        const tmpl: TemplateEntry* = gr.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null) { return ret; }
+        if (tmpl.param_type_ids.length != inst.type_args.length) { return ret; }
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (this.types.contains_generic_param(inst.type_args[i])) { return ret; }
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(
+            tmpl.param_type_ids, inst.type_args);
+        const out: TypeRef = subst.apply(ret, this.arena);
+        if (!out.is_valid() || this.types.contains_generic_param(out)) { return ret; }
+        return out;
+    }
+
+    /// Mono-after-sema: resolve a method's return type when the receiver is an
+    /// unresolved generic instantiation (`Slice<u8>` pre-mono).  Walks the generic
+    /// BASE template's method list for an unambiguous non-static non-method-generic
+    /// match (then the DI / trait-default fallback), substituting the receiver's
+    /// type_args + `This`.  Invalid on 0/ambiguous/own-generic/abstract results.
+    resolve_method_return_via_template(mut &this, recv_type: TypeRef,
+                                       method_name: SymbolStr) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+        if (inst == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            methods = &(tmpl.ast_node as StructDeclNode*).methods;
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            methods = &(tmpl.ast_node as ClassDeclNode*).methods;
+        }
+        mut found_count: i64 = 0;
+        mut abstract_ret: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.is_static) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            if (m.func.generic_params.length > 0) { return TypeRef::invalid(); }
+            found_count += 1;
+            abstract_ret = m.func.resolved_return_type;
+        }
+
+        // Impl-block / enum methods: look the return up in the DI under the
+        // generic BASE's symbol (still-abstract; substituted concrete below).
+        if (found_count == 0) {
+            mut base_sym: SymbolStr = this.types.lookup_type_sym(inst.generic_base);
+            if (!base_sym.is_valid()) {
+                base_sym = this.arena.get_qualified_name(inst.generic_base);
+            }
+            if (base_sym.is_valid()) {
+                const di_ret: TypeRef = this.types.lookup_method_return(base_sym, method_name);
+                if (di_ret.is_valid()) {
+                    abstract_ret = di_ret;
+                    found_count = 1;
+                }
+                if (found_count == 0) {
+                    const tr_ret: TypeRef =
+                        this.lookup_method_through_trait_impls(base_sym, method_name);
+                    if (tr_ret.is_valid()) {
+                        abstract_ret = tr_ret;
+                        found_count = 1;
+                    }
+                }
+            }
+        }
+
+        if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
+        const recv_subst: TypeRef =
+            this.subst_method_return_from_receiver(recv_type, abstract_ret);
+        return this.subst_this_in_type(recv_subst, recv_type);
+    }
+
+
+    // -- Bound / trait-impl method lookup --
+
+    /// Bound-aware method dispatch: when the receiver is a `BoundedParamType`
+    /// (`T: Display`), the concrete impl isn't known but each bound trait's decl
+    /// determines the signature; return the first bound trait's method return.
+    lookup_method_through_bounds(&this, bp: BoundedParamType*,
+                                 method_name: SymbolStr) -> TypeRef {
+        if (bp == null) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < bp.bounds.length; i++) {
+            const bound_t: Type* = this.arena.lookup(bp.bounds[i].id);
+            if (bound_t == null || bound_t.kind != TypeKind::Trait) { continue; }
+            const ret: TypeRef = this.types.lookup_method_return(
+                (bound_t as TraitType*).qualified_name, method_name);
+            if (ret.is_valid()) { return ret; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// First matching trait-method return for `target_name` (qualified or bare),
+    /// for default trait methods on a concrete type that doesn't override them.
+    lookup_method_through_trait_impls(&this, target_name: SymbolStr,
+                                      method_name: SymbolStr) -> TypeRef {
+        if (!target_name.is_valid() || this.ctx.generic_registry == null) {
+            return TypeRef::invalid();
+        }
+        const direct: TypeRef = this.try_trait_impls_for(target_name, method_name);
+        if (direct.is_valid()) { return direct; }
+        const bare: SymbolStr = this.bare_leaf_of_qualified(target_name);
+        if (bare.is_valid() && !bare.equals(target_name)) {
+            return this.try_trait_impls_for(bare, method_name);
+        }
+        return TypeRef::invalid();
+    }
+
+    try_trait_impls_for(&this, target: SymbolStr, method_name: SymbolStr) -> TypeRef {
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const ret: TypeRef = this.types.lookup_method_return(traits[i], method_name);
+            if (ret.is_valid()) { return ret; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Leaf segment after the final `::`, or the input unchanged when unqualified.
+    bare_leaf_of_qualified(&this, name: SymbolStr) -> SymbolStr {
+        if (!name.is_valid()) { return name; }
+        const s: string = this.intern.resolve(name);
+        const n: i64 = strlen(s) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i + 2; }
+        }
+        if (last_sep < 0) { return name; }
+        mut tail: string = "";
+        for (mut i: i64 = last_sep; i < n; i++) {
+            tail = format("%s%c", tail, s[i] as i32);
+        }
+        return this.intern.intern(tail);
+    }
+
+    /// Scan registered trait decls for one that defines `method_name`; returns the
+    /// trait's bare name (or empty), for the "implement the owning trait" hint.
+    lookup_trait_defining_method(&this, method_name: SymbolStr) -> SymbolStr {
+        if (this.ctx.generic_registry == null) { return SymbolStr::empty(); }
+        return this.ctx.generic_registry.find_trait_defining_method(method_name);
+    }
+
+    /// Look up a method by walking the class inheritance chain (immediate type
+    /// first, then parent classes).
+    lookup_method_with_inheritance(&this, type_ref: TypeRef, type_sym: SymbolStr,
+                                   method_name: SymbolStr) -> TypeRef {
+        const direct: TypeRef = this.types.lookup_method_return(type_sym, method_name);
+        if (direct.is_valid()) { return direct; }
+
+        mut current_t: Type* = this.arena.lookup(type_ref.id);
+        if (current_t == null || current_t.kind != TypeKind::Class) {
+            return TypeRef::invalid();
+        }
+        mut current: ClassType* = current_t as ClassType*;
+        while (current.has_base && current.base_class.is_valid()) {
+            const parent_ref: TypeRef = current.base_class;
+            const parent_t: Type* = this.arena.lookup(parent_ref.id);
+            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+            const parent_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(parent_ref);
+            if (parent_sym.is_valid()) {
+                const parent_ret: TypeRef = this.types.lookup_method_return(parent_sym, method_name);
+                if (parent_ret.is_valid()) { return parent_ret; }
+            }
+            current = parent_t as ClassType*;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// GATED: mono-after-sema (R1). When `member.generic_args` carry explicit
+    /// method-level args (`obj.method<U>(...)`), re-resolve the method's template
+    /// return annotation with the receiver's + the explicit args bound.  Falls
+    /// back to `fallback` (the bare-lookup return) on any miss — these
+    /// `return fallback` exits are the pre-mono re-derivation; keep only the
+    /// symbolic-walk branch once sema is authoritative post-mono.
+    resolve_method_return_with_explicit_args(mut &this, recv_type: TypeRef,
+                                             member: MemberAccessNode*,
+                                             fallback: TypeRef) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return fallback; }
+        if (this.ctx.type_resolver == null)    { return fallback; }
+        if (member.generic_args.length == 0)   { return fallback; }
+
+        // Symbolic walk: an explicit arg referencing the enclosing body's abstract
+        // params can't select a concrete instantiation — detect in a FRESH context
+        // (no bindings) and defer the whole call.
+        if (this.state.in_symbolic_check) {
+            mut sym_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            for (mut i: i64 = 0; i < member.generic_args.length; i++) {
+                const a: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &sym_ctx);
+                if (!a.is_valid()
+                        || Monomorphizer::mono_type_contains_generic_param(this.arena, a)) {
+                    return TypeRef::invalid();
+                }
+            }
+        }
+
+        // Unwrap one layer of Pointer/Reference to the owning InstantiatedType /
+        // template Struct/Class.
+        mut owner_ref: TypeRef = recv_type;
+        mut owner_t: Type* = this.arena.lookup(owner_ref.id);
+        mut depth: i32 = 0;
+        while (owner_t != null && depth < 5) {
+            if (owner_t.kind == TypeKind::Pointer) {
+                owner_ref = (owner_t as PointerType*).pointee;
+                owner_t = this.arena.lookup(owner_ref.id);
+            } else if (owner_t.kind == TypeKind::Reference) {
+                owner_ref = (owner_t as ReferenceType*).referent;
+                owner_t = this.arena.lookup(owner_ref.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (owner_t == null) { return fallback; }
+
+        mut owner_ast: ASTNode* = null;
+        if (owner_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = owner_t as InstantiatedType*;
+            const tmpl: TemplateEntry* =
+                this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id);
+            if (tmpl != null) { owner_ast = tmpl.ast_node; }
+        }
+        if (owner_ast == null) {
+            const recv_qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
+            if (recv_qname.is_valid()) {
+                owner_ast = this.ctx.generic_registry.lookup_inherent_owner(recv_qname);
+                if (owner_ast == null) {
+                    const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(recv_qname);
+                    if (tmpl != null) { owner_ast = tmpl.ast_node; }
+                }
+            }
+        }
+        if (owner_ast == null) { return fallback; }
+
+        const empty_methods: MethodNode*[] = [];
+        const empty_params: GenericParamNode*[] = [];
+        mut owner_methods: &MethodNode*[] = &empty_methods;
+        mut owner_params:  &GenericParamNode*[] = &empty_params;
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = owner_ast as StructDeclNode*;
+            owner_methods = &sn.methods;
+            owner_params  = &sn.generic_params;
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = owner_ast as ClassDeclNode*;
+            owner_methods = &cn.methods;
+            owner_params  = &cn.generic_params;
+        } else {
+            return fallback;
+        }
+
+        mut found: MethodNode* = null;
+        for (mut k: i64 = 0; k < owner_methods.length; k++) {
+            const m: MethodNode* = owner_methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(member.member)) { continue; }
+            if (m.func.generic_params.length != member.generic_args.length) { continue; }
+            found = m;
+            break;
+        }
+        mut impl_block: ImplBlockNode* = null;
+        if (found == null) {
+            found = this.find_method_in_trait_impls(
+                owner_ref, member.member, member.generic_args.length, &impl_block);
+            if (found != null && impl_block != null) {
+                owner_params = &impl_block.generic_params;
+            }
+        }
+        if (found == null) { return fallback; }
+        const ret_ann: TypeAnnotation* = found.func.return_type_annotation;
+        if (ret_ann == null) { return fallback; }
+
+        mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        if (owner_t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = owner_t as InstantiatedType*;
+            const n: i64 = if (owner_params.length < inst.type_args.length) {
+                owner_params.length
+            } else {
+                inst.type_args.length
+            };
+            for (mut i: i64 = 0; i < n; i++) {
+                const gp: GenericParamNode* = owner_params[i];
+                if (gp == null) { continue; }
+                res_ctx.add_binding(gp.name, inst.type_args[i]);
+            }
+        }
+        for (mut i: i64 = 0; i < found.func.generic_params.length; i++) {
+            const gp: GenericParamNode* = found.func.generic_params[i];
+            if (gp == null) { continue; }
+            const arg_ref: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &res_ctx);
+            if (!arg_ref.is_valid()) { return fallback; }
+            res_ctx.add_binding(gp.name, arg_ref);
+        }
+        const refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &res_ctx);
+        if (!refined.is_valid()) { return fallback; }
+        return refined;
+    }
+
+    /// Search the trait impls for `owner_ref` for a method named `method_name`
+    /// whose own generic-param count matches `n_generic_args`; writes the owning
+    /// impl block through `out_impl`.  First match wins.
+    find_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
+                               n_generic_args: i64, out_impl: ImplBlockNode**) -> MethodNode* {
+        if (this.ctx.generic_registry == null) { return null; }
+        const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
+        const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            const matches_target: boolean =
+                impl_node.target_type.equals(bare)
+                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
+                || (qname.is_valid() && impl_node.target_type.equals(qname));
+            if (!matches_target) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length != n_generic_args) { continue; }
+                *out_impl = impl_node;
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /// First method named `name` in `methods` that has its OWN generic params.
+    find_generic_method_in(&this, methods: &MethodNode*[], name: SymbolStr) -> MethodNode* {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(name)) { continue; }
+            if (m.func.generic_params.length == 0) { continue; }
+            return m;
+        }
+        return null;
+    }
+
+    /// Generic trait DEFAULT method named `method_name` on any trait the receiver's
+    /// base implements (`map<B>`/`fold<Acc>` on `Iterator`), not yet cloned into
+    /// the impl block pre-mono.  Returns the trait decl's FunctionDeclNode, or null.
+    find_generic_trait_default(mut &this, recv_type: TypeRef,
+                               method_name: SymbolStr) -> FunctionDeclNode* {
+        if (this.ctx.generic_registry == null) { return null; }
+        const bare: SymbolStr = this.trait_checker().bare_name_of(recv_type);
+        if (!bare.is_valid()) { return null; }
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(bare);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(traits[i]);
+            if (td == null) { continue; }
+            for (mut k: i64 = 0; k < td.methods.length; k++) {
+                const f: FunctionDeclNode* = td.methods[k];
+                if (f == null) { continue; }
+                if (!f.name.equals(method_name)) { continue; }
+                if (f.generic_params.length == 0) { continue; }
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /// Like `find_method_in_trait_impls` but matches by name + has-own-generics
+    /// (the inferred no-turbofish path solves `<U>` from arguments).
+    find_generic_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
+                                       out_impl: ImplBlockNode**) -> MethodNode* {
+        if (this.ctx.generic_registry == null) { return null; }
+        const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
+        const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            const matches_target: boolean =
+                impl_node.target_type.equals(bare)
+                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
+                || (qname.is_valid() && impl_node.target_type.equals(qname));
+            if (!matches_target) { continue; }
+            const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
+            if (m != null) {
+                *out_impl = impl_node;
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /// Abstract-receiver method lookup (symbolic walk only): `value.fmt(f)` where
+    /// `value: T`.  Recovers the param's bound trait from the impl/method where
+    /// clause (and the in-scope param nodes' constraints), then finds the generic
+    /// method on the bound trait's decl.  Returns a context binding `This` -> the
+    /// abstract receiver; `*out_func` is null when nothing is found.
+    find_generic_method_on_receiver_bounds(mut &this, recv_type: TypeRef,
+                                           member: MemberAccessNode*,
+                                           out_func: FunctionDeclNode**) -> ResolutionContext {
+        *out_func = null;
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        if (!this.state.in_symbolic_check)      { return rc; }
+        if (this.ctx.generic_registry == null)  { return rc; }
+        if (member == null)                     { return rc; }
+
+        mut peeled: TypeRef = recv_type;
+        mut t: Type* = this.arena.lookup(peeled.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::Reference) {
+                peeled = (t as ReferenceType*).referent;
+                t = this.arena.lookup(peeled.id);
+            } else if (t.kind == TypeKind::Pointer) {
+                peeled = (t as PointerType*).pointee;
+                t = this.arena.lookup(peeled.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (t == null) { return rc; }
+
+        mut pname: SymbolStr = SymbolStr::from_id(0);
+        mut have_pname: boolean = false;
+        if (t.kind == TypeKind::GenericParam) {
+            pname = (t as GenericParamType*).param_name;
+            have_pname = true;
+        } else if (t.kind == TypeKind::BoundedParam) {
+            pname = (t as BoundedParamType*).param_name;
+            have_pname = true;
+        }
+        if (!have_pname || !pname.is_valid()) { return rc; }
+
+        mut bound_leaves: SymbolStr[] = [];
+        if (this.state.symbolic_impl_node != null) {
+            for (mut bi: i64 = 0; bi < this.state.symbolic_impl_node.where_bounds.length; bi++) {
+                const bound: TraitBound* = &this.state.symbolic_impl_node.where_bounds[bi];
+                if (!bound.type_parameter.equals(pname)) { continue; }
+                for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                    const tr: TraitRef* = &bound.trait_refs[ti];
+                    if (tr.path.length == 0) { continue; }
+                    bound_leaves.push(tr.path[tr.path.length - 1]);
+                }
+            }
+        }
+        if (this.state.symbolic_current_func != null) {
+            for (mut wi: i64 = 0; wi < this.state.symbolic_current_func.trait_bounds.length; wi++) {
+                const wb: TraitBound* = &this.state.symbolic_current_func.trait_bounds[wi];
+                if (!wb.type_parameter.equals(pname)) { continue; }
+                for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
+                    const tr: TraitRef* = &wb.trait_refs[ti];
+                    if (tr.path.length == 0) { continue; }
+                    bound_leaves.push(tr.path[tr.path.length - 1]);
+                }
+            }
+        }
+        for (mut oi: i64 = 0; oi < this.state.symbolic_owner_param_nodes.length; oi++) {
+            const onode: GenericParamNode* = this.state.symbolic_owner_param_nodes[oi];
+            if (onode == null || !onode.name.equals(pname)) { continue; }
+            for (mut ci: i64 = 0; ci < onode.constraints.length; ci++) {
+                bound_leaves.push(onode.constraints[ci]);
+            }
+        }
+        for (mut mi: i64 = 0; mi < this.state.symbolic_method_param_nodes.length; mi++) {
+            const mnode: GenericParamNode* = this.state.symbolic_method_param_nodes[mi];
+            if (mnode == null || !mnode.name.equals(pname)) { continue; }
+            for (mut ci: i64 = 0; ci < mnode.constraints.length; ci++) {
+                bound_leaves.push(mnode.constraints[ci]);
+            }
+        }
+
+        mut found: FunctionDeclNode* = null;
+        for (mut i: i64 = 0; i < bound_leaves.length && found == null; i++) {
+            const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(bound_leaves[i]);
+            if (td == null) { continue; }
+            for (mut k: i64 = 0; k < td.methods.length; k++) {
+                const f: FunctionDeclNode* = td.methods[k];
+                if (f == null) { continue; }
+                if (!f.name.equals(member.member)) { continue; }
+                if (f.generic_params.length == 0) { continue; }
+                found = f;
+                break;
+            }
+        }
+        if (found != null) {
+            rc.set_this_type(recv_type);
+            *out_func = found;
+        }
+        return rc;
+    }
+
+    /// Abstract-receiver companion to `stash_method_call_bindings`: stash the
+    /// method-level bindings of an abstract-receiver call (`value.fmt(f)`) off the
+    /// receiver param's trait bound, so mono doesn't re-infer.  No-op outside a
+    /// symbolic walk or when no bound trait carries the generic method.
+    stash_abstract_receiver_method(mut &this, recv_type: TypeRef,
+                                   member: MemberAccessNode*, call: CallExprNode*) -> void {
+        if (call == null || member == null) { return; }
+        if (!this.state.in_symbolic_check)  { return; }
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.find_generic_method_on_receiver_bounds(recv_type, member, &orig_func);
+        if (orig_func == null) { return; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        mut bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (bindings.length != n_method_params) { return; }
+        call.set_resolved_type_args(bindings);
+    }
+
+    /// Locate the generic method targeted by `member` on `recv_type` and build the
+    /// owner-binding context (receiver type params -> concrete args, plus `This`).
+    /// Writes the method's FunctionDeclNode through `out_func` (null when nothing
+    /// to infer).  Shared by `resolve_generic_method_return` + `stash_method_call_bindings`.
+    find_generic_method_for_call(mut &this, recv_type: TypeRef, member: MemberAccessNode*,
+                                 out_func: FunctionDeclNode**) -> ResolutionContext {
+        *out_func = null;
+        mut owner_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        if (this.ctx.generic_registry == null) { return owner_ctx; }
+        if (this.ctx.type_resolver == null)    { return owner_ctx; }
+        if (member == null)                    { return owner_ctx; }
+
+        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+        if (inst != null) {
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.types.contains_generic_param(inst.type_args[i])) { return owner_ctx; }
+            }
+        }
+
+        mut found: MethodNode* = null;
+        const empty_params: GenericParamNode*[] = [];
+        mut owner_params: &GenericParamNode*[] = &empty_params;
+
+        const tmpl: TemplateEntry* = if (inst != null) {
+            this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id)
+        } else {
+            null
+        };
+        if (tmpl != null && tmpl.ast_node != null) {
+            if (tmpl.node_kind == NodeKind::StructDeclaration) {
+                const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+                found = this.find_generic_method_in(&sn.methods, member.member);
+                if (found != null) { owner_params = &sn.generic_params; }
+            } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+                const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+                found = this.find_generic_method_in(&cn.methods, member.member);
+                if (found != null) { owner_params = &cn.generic_params; }
+            }
+            if (found == null) {
+                for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
+                    const ib: ImplBlockNode* = tmpl.impl_blocks[bi];
+                    if (ib == null) { continue; }
+                    const m: MethodNode* = this.find_generic_method_in(&ib.methods, member.member);
+                    if (m != null) {
+                        found = m;
+                        owner_params = &ib.generic_params;
+                        break;
+                    }
+                }
+            }
+        }
+        mut trait_impl_block: ImplBlockNode* = null;
+        if (found == null) {
+            found = this.find_generic_method_in_trait_impls(
+                recv_type, member.member, &trait_impl_block);
+            if (found != null && trait_impl_block != null) {
+                owner_params = &trait_impl_block.generic_params;
+            }
+        }
+        if (found == null) {
+            const recv_qname: SymbolStr = this.arena.get_qualified_name(recv_type);
+            if (recv_qname.is_valid()) {
+                const owner_ast: ASTNode* = this.ctx.generic_registry.lookup_inherent_owner(recv_qname);
+                if (owner_ast != null) {
+                    if (owner_ast.kind == NodeKind::StructDeclaration) {
+                        found = this.find_generic_method_in(
+                            &(owner_ast as StructDeclNode*).methods, member.member);
+                    } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+                        found = this.find_generic_method_in(
+                            &(owner_ast as ClassDeclNode*).methods, member.member);
+                    }
+                }
+            }
+        }
+        mut orig_func: FunctionDeclNode* = null;
+        if (found != null) {
+            orig_func = found.func;
+        } else {
+            orig_func = this.find_generic_trait_default(recv_type, member.member);
+        }
+        if (orig_func == null) { return owner_ctx; }
+        if (orig_func.generic_params.length == 0) { return owner_ctx; }
+
+        if (inst != null) {
+            const n_owner: i64 = if (owner_params.length < inst.type_args.length) {
+                owner_params.length
+            } else {
+                inst.type_args.length
+            };
+            for (mut i: i64 = 0; i < n_owner; i++) {
+                const gp: GenericParamNode* = owner_params[i];
+                if (gp == null) { continue; }
+                owner_ctx.add_binding(gp.name, inst.type_args[i]);
+            }
+        }
+        owner_ctx.set_this_type(recv_type);
+
+        *out_func = orig_func;
+        return owner_ctx;
+    }
+
+    /// Solve every method-level generic param of `orig_func` for this call:
+    /// explicit turbofish, else formal/actual unification (with `![implicit]`
+    /// return-type recovery).  Returns the bindings in declaration order, or `[]`
+    /// when any stays unbound/abstract (caller defers to mono).
+    solve_method_bindings(mut &this, orig_func: FunctionDeclNode*,
+                          owner_ctx: ResolutionContext*, member: MemberAccessNode*,
+                          call: CallExprNode*) -> TypeRef[] {
+        if (this.ctx.type_resolver == null) { return []; }
+        if (orig_func == null || call == null || member == null) { return []; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return []; }
+
+        mut method_bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            method_bindings.push(TypeRef::invalid());
+        }
+
+        if (member.generic_args.length == n_method_params && member.generic_args.length > 0) {
+            // Explicit turbofish is authoritative.  CRITICAL: resolve in the
+            // CALLER's scope, NOT through `owner_ctx` (which would shadow an
+            // enclosing param sharing the receiver's param name).  Inside a
+            // generic body, resolve in the enclosing symbolic-param context so an
+            // enclosing `T` stays abstract for the substituter to concretize.
+            mut tf_ctx_buf: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            mut use_symbolic: boolean = false;
+            if (this.state.in_symbolic_check) {
+                this.symbolic.symbolic_bind_params(&tf_ctx_buf);
+                use_symbolic = true;
+            }
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                const tf_ctx: ResolutionContext* =
+                    if (use_symbolic) { &tf_ctx_buf } else { owner_ctx };
+                const tr: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], tf_ctx);
+                if (!tr.is_valid()) { return []; }
+                if (this.types.contains_generic_param(tr) && !this.state.in_symbolic_check) {
+                    return [];
+                }
+                method_bindings[i] = tr;
+            }
+        } else {
+            // Infer from arguments: bind each method param to a fresh GenericParam
+            // for the unifier, resolve each formal in a context with owner args
+            // concrete + method params as those fresh refs, then unify vs actuals.
+            mut infer_ctx: ResolutionContext = owner_ctx.clone();
+            mut method_param_ids: u64[] = [];
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                const gp: GenericParamNode* = orig_func.generic_params[i];
+                if (gp == null) { return []; }
+                const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+                infer_ctx.add_binding(gp.name, gp_ref);
+                method_param_ids.push(gp_ref.id);
+            }
+            const this_amp: SymbolStr = this.intern.intern("&this");
+            const this_val: SymbolStr = this.intern.intern("this");
+            mut explicit_params: VarDeclNode*[] = [];
+            for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
+                const p: VarDeclNode* = orig_func.parameters[i];
+                if (p == null) { continue; }
+                if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
+                explicit_params.push(p);
+            }
+            if (explicit_params.length != call.arguments.length) { return []; }
+
+            mut ictx: InferCtx = InferCtx::for_template(this.arena, method_param_ids);
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const param: VarDeclNode* = explicit_params[i];
+                if (param == null || param.type_annotation == null) { return []; }
+                mut formal: TypeRef = this.ctx.type_resolver.resolve(param.type_annotation, &infer_ctx);
+                if (!formal.is_valid()) { return []; }
+                formal = this.reduce_assoc_projections(formal);
+                const arg: ExpressionNode* = call.arguments[i];
+                if (arg == null) { return []; }
+                const actual: TypeRef = arg.resolved_type;
+                if (!actual.is_valid()) { return []; }
+                ictx.unify(formal, actual);
+            }
+            // Return-driven inference for `![implicit]` methods whose generic
+            // appears ONLY in the return position.
+            mut any_unbound: boolean = false;
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
+            }
+            if (any_unbound && orig_func.is_implicit
+                    && this.state.expected_type.is_valid()
+                    && orig_func.return_type_annotation != null) {
+                mut ret_formal: TypeRef = this.ctx.type_resolver.resolve(
+                    orig_func.return_type_annotation, &infer_ctx);
+                if (ret_formal.is_valid()) {
+                    ret_formal = this.reduce_assoc_projections(ret_formal);
+                    ictx.unify(ret_formal, this.state.expected_type);
+                }
+            }
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                const b: TypeRef = ictx.bindings[i];
+                if (!b.is_valid()) { return []; }
+                if (this.types.contains_generic_param(b) && !this.state.in_symbolic_check) {
+                    return [];
+                }
+                method_bindings[i] = b;
+            }
+        }
+        return method_bindings;
+    }
+
+    /// M1: stash the method's concrete method-level bindings on the call so mono's
+    /// `try_infer_method_call` reads them instead of re-inferring.  Called for
+    /// every method call; no-op for non-generic methods / abstract bindings.
+    stash_method_call_bindings(mut &this, recv_type: TypeRef,
+                               member: MemberAccessNode*, call: CallExprNode*) -> void {
+        if (call == null || member == null) { return; }
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.find_generic_method_for_call(recv_type, member, &orig_func);
+        if (orig_func == null) { return; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        mut bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (bindings.length != n_method_params) { return; }
+        call.set_resolved_type_args(bindings);
+    }
+
+    /// GATED: mono-after-sema (R1).  Resolve the CONCRETE return type of a call to
+    /// a GENERIC method by inferring its method-level params and substituting both
+    /// receiver + method args into the return annotation BEFORE mono runs.
+    /// `resolved_callee`/`resolved_method` stay UNPINNED (mono still specializes).
+    /// Returns `fallback` (the caller's prior resolution) on any miss — these
+    /// exits are the pre-mono re-derivation; deletable once sema is authoritative.
+    resolve_generic_method_return(mut &this, recv_type: TypeRef, member: MemberAccessNode*,
+                                  call: CallExprNode*, fallback: TypeRef) -> TypeRef {
+        if (call == null || member == null) { return fallback; }
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.find_generic_method_for_call(recv_type, member, &orig_func);
+        if (orig_func == null) { return fallback; }
+        const ret_ann: TypeAnnotation* = orig_func.return_type_annotation;
+        if (ret_ann == null) { return fallback; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+
+        mut method_bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (method_bindings.length != n_method_params) { return fallback; }
+
+        mut ret_ctx: ResolutionContext = owner_ctx.clone();
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const gp: GenericParamNode* = orig_func.generic_params[i];
+            if (gp == null) { return fallback; }
+            ret_ctx.add_binding(gp.name, method_bindings[i]);
+        }
+        ret_ctx.set_this_type(recv_type);
+        mut refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &ret_ctx);
+        refined = this.reduce_assoc_projections(refined);
+        if (!refined.is_valid() || this.types.contains_generic_param(refined)
+                || this.types.contains_unresolved_projection(refined)) {
+            return fallback;
+        }
+        return refined;
+    }
+
+
+    // -- Associated-type projection reduction (ported from the monomorphizer) --
+
+    /// Concrete trait-arg list a base type binds for `trait_leaf`, including
+    /// associated-type bindings.  `Range<i32>` over `Iterator` yields `[i32]`.
+    proj_concrete_trait_args_for(mut &this, subject_in: TypeRef,
+                                 trait_leaf: SymbolStr) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
+        mut subject: TypeRef = subject_in;
+        const subj_t: Type* = this.arena.lookup(subject_in.id);
+        if (subj_t != null
+                && (subj_t.kind == TypeKind::Struct || subj_t.kind == TypeKind::Class
+                    || subj_t.kind == TypeKind::Enum)) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, subject_in);
+            if (wrapper.is_valid()) { subject = wrapper; }
+        }
+        const base_name: SymbolStr = this.trait_checker().bare_name_of(subject);
+        if (!base_name.is_valid()) { return out; }
+        const impl_node: ImplBlockNode* =
+            this.ctx.generic_registry.lookup_trait_impl(trait_leaf, base_name);
+        if (impl_node == null) { return out; }
+        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+        if (trait_ann == null) { return out; }
+
+        mut rc: ResolutionContext = ResolutionContext::new("", "");
+        const st: Type* = this.arena.lookup(subject.id);
+        if (st != null && st.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = st as InstantiatedType*;
+            mut subst: TypeSubstitution = TypeSubstitution::empty();
+            if (impl_node.target_args.length == inst.type_args.length) {
+                for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
+                    const ta: TypeAnnotation* = impl_node.target_args[i];
+                    if (ta == null) { continue; }
+                    match (*ta) {
+                        TypeAnnotation::Named(n) => {
+                            rc.add_binding(n.name, inst.type_args[i]);
+                            const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
+                            subst.add(gp_ref.id, inst.type_args[i]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            this.proj_derive_impl_where_generics(impl_node, &subst, &rc);
+        }
+
+        match (*trait_ann) {
+            TypeAnnotation::Generic(g) => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    out.push(this.ctx.type_resolver.resolve(g.args[i], &rc));
+                }
+            }
+            _ => {}
+        }
+        return out;
+    }
+
+    /// Bind impl-introduced generic params the Self type doesn't determine
+    /// (`A`/`O` in `ZipIter<I,J> where I: Iterator<A>, J: Iterator<O>`) into `res_ctx`.
+    proj_derive_impl_where_generics(mut &this, impl_node: ImplBlockNode*,
+                                    subst: TypeSubstitution*, res_ctx: ResolutionContext*) -> void {
+        if (impl_node == null || subst == null) { return; }
+        if (impl_node.where_bounds.length == 0) { return; }
+        for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
+            const bound: TraitBound* = &impl_node.where_bounds[bi];
+            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(
+                bound.type_parameter, subst);
+            if (!subject.is_valid()) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: TraitRef* = &bound.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const concrete_args: TypeRef[] = this.proj_concrete_trait_args_for(subject, trait_leaf);
+                if (concrete_args.length != tr.type_args.length) { continue; }
+                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                    const ta: TypeAnnotation* = tr.type_args[ai];
+                    if (ta == null) { continue; }
+                    this.proj_bind_where_arg_param(ta, concrete_args[ai], subst, res_ctx);
+                }
+            }
+        }
+    }
+
+    /// Bind a where-bound trait-arg annotation against a concrete trait arg,
+    /// descending through pointer/reference wrappers.
+    proj_bind_where_arg_param(mut &this, ta: TypeAnnotation*, concrete: TypeRef,
+                              subst: TypeSubstitution*, res_ctx: ResolutionContext*) -> void {
+        if (ta == null || !concrete.is_valid()) { return; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                if (this.trait_checker().lookup_subst_for_param(n.name, subst).is_invalid()
+                        && res_ctx.lookup_binding(n.name).is_invalid()) {
+                    res_ctx.add_binding(n.name, concrete);
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                const inner: TypeRef = this.types.proj_pointer_pointee(concrete);
+                if (inner.is_valid()) {
+                    this.proj_bind_where_arg_param(p.inner, inner, subst, res_ctx);
+                }
+            }
+            TypeAnnotation::Reference(r) => {
+                const inner: TypeRef = this.types.proj_reference_referent(concrete);
+                if (inner.is_valid()) {
+                    this.proj_bind_where_arg_param(r.inner, inner, subst, res_ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Reduce an associated-type projection over a CONCRETE base to its member
+    /// type (`Range<i32>::Item` -> `i32`).  Invalid when the base is still symbolic
+    /// or no impl/binding provides the member.
+    proj_resolve_concrete_projection(mut &this, base_ty: TypeRef, member: SymbolStr) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const bt: Type* = this.arena.lookup(base_ty.id);
+        if (bt == null) { return TypeRef::invalid(); }
+        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam
+                || bt.kind == TypeKind::AssocProjection) {
+            return TypeRef::invalid();
+        }
+        for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_decl_nodes.length; i++) {
+            const tdecl: TraitDeclNode* = this.ctx.generic_registry.trait_decl_nodes[i];
+            if (tdecl == null) { continue; }
+            mut assoc_pos: i64 = -1;
+            for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
+                if (tdecl.assoc_types[a] != null && tdecl.assoc_types[a].name.equals(member)) {
+                    assoc_pos = a;
+                    break;
+                }
+            }
+            if (assoc_pos < 0) { continue; }
+            const idx: i64 = tdecl.generic_params.length + assoc_pos;
+            const args: TypeRef[] = this.proj_concrete_trait_args_for(base_ty, tdecl.name);
+            if (idx < args.length && args[idx].is_valid()) { return args[idx]; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Recursively replace concrete-base associated-type projections in `ty` with
+    /// their member type, caching on each `AssocProjectionType`.  Symbolic
+    /// projections and projection-free types pass through unchanged.
+    reduce_assoc_projections(mut &this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return ty; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
+                const base: TypeRef = this.reduce_assoc_projections(proj.base);
+                const reduced: TypeRef = this.proj_resolve_concrete_projection(base, proj.member);
+                if (reduced.is_valid()) {
+                    proj.set_resolved_type(reduced);
+                    return reduced;
+                }
+                return ty;
+            }
+            TypeKind::Pointer => {
+                const p: PointerType* = t as PointerType*;
+                const inner: TypeRef = this.reduce_assoc_projections(p.pointee);
+                if (inner.equals(p.pointee)) { return ty; }
+                return this.arena.get_pointer_to(inner);
+            }
+            TypeKind::Reference => {
+                const r: ReferenceType* = t as ReferenceType*;
+                const inner: TypeRef = this.reduce_assoc_projections(r.referent);
+                if (inner.equals(r.referent)) { return ty; }
+                return this.arena.get_reference_to(inner, r.mutability);
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = t as ArrayType*;
+                const inner: TypeRef = this.reduce_assoc_projections(a.element);
+                if (inner.equals(a.element)) { return ty; }
+                return this.arena.get_array_of(inner, a.size);
+            }
+            TypeKind::Optional => {
+                const o: OptionalType* = t as OptionalType*;
+                const inner: TypeRef = this.reduce_assoc_projections(o.wrapped);
+                if (inner.equals(o.wrapped)) { return ty; }
+                return this.arena.get_optional_of(inner);
+            }
+            TypeKind::Function => {
+                const f: FunctionType* = t as FunctionType*;
+                const new_ret: TypeRef = this.reduce_assoc_projections(f.return_type);
+                mut changed: boolean = !new_ret.equals(f.return_type);
+                mut new_params: TypeRef[] = [];
+                for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                    const np: TypeRef = this.reduce_assoc_projections(f.param_types[i]);
+                    new_params.push(np);
+                    if (!np.equals(f.param_types[i])) { changed = true; }
+                }
+                if (!changed) { return ty; }
+                return this.arena.get_function(new_ret, new_params, f.is_variadic);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                mut changed_t: boolean = false;
+                mut new_elems: TypeRef[] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    const ne: TypeRef = this.reduce_assoc_projections(tup.elements[i]);
+                    new_elems.push(ne);
+                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
+                }
+                if (!changed_t) { return ty; }
+                return this.arena.get_tuple(new_elems);
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                mut changed_i: boolean = false;
+                mut new_args: TypeRef[] = [];
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    const na: TypeRef = this.reduce_assoc_projections(inst.type_args[i]);
+                    new_args.push(na);
+                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
+                }
+                if (!changed_i) { return ty; }
+                return this.arena.create_instantiation(inst.generic_base, new_args);
+            }
+            _ => { return ty; }
+        }
+    }
+
+    /// Mono-after-sema: resolve a trait-impl method's return for a CONCRETE
+    /// receiver by binding every impl param (struct params from the receiver's
+    /// args + where-clause-derived params), resolving the return annotation, and
+    /// reducing projections.  Invalid when not a concrete instantiation / no impl
+    /// / still abstract.  `resolved_callee`/`resolved_method` stay UNPINNED.
+    resolve_trait_impl_method_return(mut &this, recv_type: TypeRef,
+                                     method_name: SymbolStr) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        if (this.ctx.type_resolver == null)    { return TypeRef::invalid(); }
+        mut subject_ref: TypeRef = recv_type;
+        mut st: Type* = this.arena.lookup(subject_ref.id);
+        mut depth: i32 = 0;
+        while (st != null && depth < 5) {
+            if (st.kind == TypeKind::Reference) {
+                subject_ref = (st as ReferenceType*).referent;
+                st = this.arena.lookup(subject_ref.id);
+            } else if (st.kind == TypeKind::Pointer) {
+                subject_ref = (st as PointerType*).pointee;
+                st = this.arena.lookup(subject_ref.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (st == null) { return TypeRef::invalid(); }
+        if (st.kind == TypeKind::Struct || st.kind == TypeKind::Class
+                || st.kind == TypeKind::Enum) {
+            const wrapper: TypeRef = find_inst_wrapping(this.arena, subject_ref);
+            if (wrapper.is_valid()) {
+                subject_ref = wrapper;
+                st = this.arena.lookup(subject_ref.id);
+            }
+        }
+        if (st == null || st.kind != TypeKind::InstantiatedType) { return TypeRef::invalid(); }
+        const inst: InstantiatedType* = st as InstantiatedType*;
+        const base_name: SymbolStr = this.trait_checker().bare_name_of(subject_ref);
+        if (!base_name.is_valid()) { return TypeRef::invalid(); }
+
+        mut found_impl: ImplBlockNode* = null;
+        mut found_method: MethodNode* = null;
+        const qname: SymbolStr = this.arena.get_qualified_name(subject_ref);
+        for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            const matches_target: boolean =
+                impl_node.target_type.equals(base_name)
+                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
+                || (qname.is_valid() && impl_node.target_type.equals(qname));
+            if (!matches_target) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_name)) {
+                    found_impl = impl_node;
+                    found_method = m;
+                    break;
+                }
+            }
+            if (found_method != null) { break; }
+        }
+        if (found_method == null || found_impl == null) { return TypeRef::invalid(); }
+        const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
+        if (ret_ann == null) { return TypeRef::invalid(); }
+
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        if (found_impl.target_args.length == inst.type_args.length) {
+            for (mut i: i64 = 0; i < found_impl.target_args.length; i++) {
+                const ta: TypeAnnotation* = found_impl.target_args[i];
+                if (ta == null) { continue; }
+                match (*ta) {
+                    TypeAnnotation::Named(n) => {
+                        rc.add_binding(n.name, inst.type_args[i]);
+                        const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
+                        subst.add(gp_ref.id, inst.type_args[i]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        this.proj_derive_impl_where_generics(found_impl, &subst, &rc);
+        rc.set_this_type(subject_ref);
+        const resolved: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &rc);
+        if (!resolved.is_valid()) { return TypeRef::invalid(); }
+        const reduced: TypeRef = this.reduce_assoc_projections(resolved);
+        if (!reduced.is_valid() || this.types.contains_generic_param(reduced)) {
+            return TypeRef::invalid();
+        }
+        return reduced;
+    }
+
+    /// Finalize a method-call return off a CONCRETE receiver: reduce projections,
+    /// and if still abstract (an unbound where-clause impl param or an unreduced
+    /// projection) recompute through the trait impl.  Unchanged when already
+    /// concrete / unimprovable.
+    finalize_assoc_return(mut &this, recv_type: TypeRef, member: MemberAccessNode*,
+                          candidate: TypeRef) -> TypeRef {
+        if (!candidate.is_valid()) { return candidate; }
+        const reduced: TypeRef = this.reduce_assoc_projections(candidate);
+        if (this.types.contains_generic_param(reduced)
+                || this.types.contains_unresolved_projection(reduced)) {
+            const via_impl: TypeRef = this.resolve_trait_impl_method_return(recv_type, member.member);
+            if (via_impl.is_valid()) { return via_impl; }
+        }
+        return reduced;
+    }
+}

@@ -1,0 +1,776 @@
+///! Monomorphizer  (Compiler::Mono::Monomorphizer)
+///!
+///! Worklist-driven engine that processes all generic instantiations to completion.
+///! Repeatedly dequeues InstantiatedTypes, specializes them via ASTSpecializer,
+///! creates concrete types in the TypeArena, and discovers transitive dependencies.
+///!
+///! After process_all() completes, every InstantiatedType has a resolved_type
+///! pointing to a concrete Struct/Enum/Class, and get_all_specialized_asts()
+///! returns the full set of specialized declarations ready for injection into
+///! the program AST.
+///!
+///! POST-REORDER (mono-after-sema): semantic analysis is authoritative and runs
+///! FIRST.  It pins generic type arguments onto `CallExprNode.resolved_type_args`
+///! and types every expression/literal.  This monomorphizer CONSUMES those pinned
+///! bindings (via `MonoCallSpecializer`); it does NOT re-derive them — the old
+///! argument/receiver/literal inference engine is deleted.  Mono's job: materialize
+///! concrete arena types, discover nested instantiations, consume sema's stash to
+///! mint per-call free/method specializations, and handle cross-module naming.
+///!
+///! Thin orchestrator: it owns the specialization cache + the four AST/type
+///! collaborators + the shared `MonoState` (worklist/discovery/error) by value,
+///! wiring their back-pointers via `wire()` AFTER it reaches a stable heap address.
+
+namespace Compiler::Mono::Monomorphizer;
+
+import Compiler::AST;
+import std::collections::hashmap;
+import Compiler::Types::Generic;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Diag::Sink;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::AST::Pattern;
+import Compiler::Types::Substitution;
+import Compiler::Types::Checker;
+import Compiler::Types::Resolver;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
+import Compiler::Types::TraitChecker;
+import Compiler::Types::Monomorphizer;   // mono_* free helpers (types-rooted; thin shim after flip-on)
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::Resolver;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
+import Compiler::DeclIndex;
+import Compiler::Diag;
+import Compiler::Lex;
+import Utils::Logger;
+
+// Subsystem modules.
+import Compiler::Mono::State;            // MonoState + MonomorphRequest
+import Compiler::Mono::Specializer;
+import Compiler::Mono::DispatchAnnotator;
+import Compiler::Mono::TraitSpecializer;
+import Compiler::Mono::TypePopulator;
+import Compiler::Mono::AstResolver;
+import Compiler::Mono::CallSpecializer;
+
+
+// `SpecializationEntry` + `MonomorphRequest` live in `Compiler::Mono::State` so
+// the collaborators can see them without a cycle.
+
+
+// Monomorphizer: worklist engine
+
+type struct Monomorphizer {
+    // -- Shared environment (held by pointer/value; lent to collaborators) --
+    arena:             TypeArena*;
+    generic_registry:  GenericRegistry*;
+    intern_table:      InternTable*;
+    diagnostics:       DiagnosticSink*;
+    type_resolver:     TypeResolver*;
+    decl_index:        DeclarationIndex*;
+    specializer:       ASTSpecializer;
+
+    // Standalone trait-satisfaction query engine.  Read-only over the
+    // arena/registry/intern-table/diagnostics; lives here so semantic analysis
+    // can use it without depending on the monomorphizer having run.
+    trait_checker:     TraitChecker;
+
+    // -- Shared mutable state (worklist + discovery + error) --
+    state:             MonoState;
+
+    // -- Collaborators (owned by value; wired after the orchestrator is stable) --
+    dispatch_annotator: MonoDispatchAnnotator;  // bound-directed fmt dispatch (pre-mono AST pass)
+    trait_spec:         MonoTraitSpecializer;    // trait-impl conditional inst + bounds + assoc-proj
+    type_populator:     MonoTypePopulator;       // spec'd AST -> concrete arena types
+    ast_resolver:       MonoAstResolver;         // post-clone re-resolution + static-match arm pruning
+    call_specializer:   MonoCallSpecializer;     // sema-stash consumer: free/method per-call specialization
+
+    // -- Specialization cache (orchestrator-private; spec_entries live on state) --
+    spec_keys:         string[];
+    spec_index:        HashMap<string, i64>;   // key -> index in state.spec_entries
+
+    // -- Cycle detection --
+    in_progress:       HashMap<string, boolean>;
+
+    // -- Incremental injection tracking (for batch compilation) --
+    injection_cursor:  i64;
+
+    // Current module being processed (set by pass before calling process_all)
+    current_module:    SymbolStr;
+
+    // Per-module consumption tracking (flat parallel arrays).
+    consumer_spec_indices: i64[];
+    consumer_modules:      u32[];
+
+
+    /// Construct the orchestrator with its environment.  Collaborators + state are
+    /// `null()`-initialized here; their back-pointers are set later by `wire()`
+    /// once the Monomorphizer is at a stable heap address (the Box::leak dance).
+    /// The owning pass constructs this, leaks it, then wires.
+    static new(arena: TypeArena*, generic_registry: GenericRegistry*,
+               intern_table: InternTable*, diagnostics: DiagnosticSink*,
+               type_resolver: TypeResolver*,
+               decl_index: DeclarationIndex*) -> Monomorphizer {
+        return Monomorphizer {
+            arena:                 arena,
+            generic_registry:      generic_registry,
+            intern_table:          intern_table,
+            diagnostics:           diagnostics,
+            type_resolver:         type_resolver,
+            decl_index:            decl_index,
+            specializer:           ASTSpecializer::new(arena, intern_table),
+            trait_checker:         TraitChecker::new(arena, generic_registry,
+                                                     intern_table, diagnostics),
+            state:                 MonoState::null(),
+            dispatch_annotator:    MonoDispatchAnnotator::null(),
+            trait_spec:            MonoTraitSpecializer::null(),
+            type_populator:        MonoTypePopulator::null(),
+            ast_resolver:          MonoAstResolver::null(),
+            call_specializer:      MonoCallSpecializer::null(),
+            spec_keys:             [],
+            spec_index:            HashMap<string, i64>::new(),
+            in_progress:           HashMap<string, boolean>::new(),
+            injection_cursor:      0,
+            current_module:        SymbolStr::empty(),
+            consumer_spec_indices: [],
+            consumer_modules:      [],
+        };
+    }
+
+    /// Wire collaborator + state back-pointers.  MUST be called after the
+    /// orchestrator reaches a stable heap address (e.g.
+    /// `Box::new(Monomorphizer::new(..)).leak()`) because each collaborator
+    /// stores raw pointers into this struct's own by-value fields.
+    wire(mut &this) -> void {
+        this.state.wire(this.arena, this.generic_registry, this.intern_table,
+                        this.type_resolver);
+        this.dispatch_annotator.wire(this.arena, this.intern_table);
+        this.trait_spec.wire(this.arena, this.generic_registry, this.intern_table,
+                             this.diagnostics, this.type_resolver, &this.trait_checker);
+        this.type_populator.wire(this.arena, this.intern_table);
+        this.ast_resolver.wire(this.arena, this.intern_table, this.diagnostics,
+                               this.type_resolver, &this.state, &this.trait_spec);
+        this.call_specializer.wire(this.arena, this.generic_registry, this.intern_table,
+                                   this.diagnostics, this.type_resolver, this.decl_index,
+                                   &this.state, &this.trait_spec, &this.ast_resolver);
+    }
+
+
+    // Public per-pass API (called by passes/specialization.cryo)
+
+    /// Set the current module context for origin tracking.
+    set_current_module(mut &this, module: SymbolStr) -> void {
+        this.current_module = module;
+        this.call_specializer.set_current_module(module);
+    }
+
+    /// True if every queued specialization request has been drained.
+    worklist_empty(&this) -> boolean {
+        return this.state.worklist_empty();
+    }
+
+    /// Number of requests still queued (for diagnostic messages).
+    pending_count(&this) -> i64 {
+        return this.state.pending_count();
+    }
+
+    /// Total number of completed specialization entries.
+    spec_count(&this) -> i64 {
+        return this.state.spec_entries.length;
+    }
+
+    /// The resolved owner-module source path of spec entry `i`.
+    spec_owner_source_at(&this, i: i64) -> SymbolStr {
+        if (i < 0 || i >= this.state.spec_entries.length) {
+            return SymbolStr::empty();
+        }
+        return this.state.spec_entries[i].owner_source;
+    }
+
+    /// Bound-directed dispatch annotation (Display::fmt vs Debug::fmt).  Runs over
+    /// EVERY decl before mono clones any template.  See MonoDispatchAnnotator.
+    annotate_bound_dispatch_in_module(mut &this, root: ProgramNode*) -> void {
+        this.dispatch_annotator.annotate_bound_dispatch_in_module(root);
+    }
+
+    /// Consume sema's `resolved_type_args` stash across a module's call sites,
+    /// minting per-call free/method specializations (replaces the old
+    /// `discover_inferred_calls_in_module` inference walk).  New instantiations
+    /// it queues are drained by `drain_pending_worklist` (caller's responsibility).
+    specialize_calls_in_module(mut &this, root: ProgramNode*) -> void {
+        this.call_specializer.specialize_calls_in_module(root);
+    }
+
+
+    /// Process all pending monomorphization requests.
+    /// Returns true if all succeeded, false if any errors occurred.
+    process_all(mut &this) -> boolean {
+        // Flag same-leaf free functions in different modules before any
+        // specialization so their spec symbols don't collide (idempotent).
+        this.generic_registry.finalize_disambiguation(this.intern_table);
+
+        // Import all unmonomorphized instantiations from the generic registry
+        const unprocessed: TypeRef[] = this.generic_registry.collect_unmonomorphized();
+
+        // Nothing new to process; skip the worklist entirely.
+        if (unprocessed.length == 0) {
+            return true;
+        }
+
+        LOG_DEBUG(LogComponent::TypeChecker, "[Monomorphizer::process_all] %lld unmonomorphized instantiations",
+            unprocessed.length);
+
+        for (mut i: i64 = 0; i < unprocessed.length; i++) {
+            this.state.enqueue_from_type_ref(unprocessed[i]);
+        }
+
+        // Process worklist until empty
+        while (this.state.pending_cursor < this.state.pending.length) {
+            const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
+            this.state.pending_cursor += 1;
+
+            const key: string = this.make_key(request);
+
+            // Already cached; mark monomorphized + propagate the cached concrete
+            // type to this module's fresh InstantiatedType.
+            if (this.is_cached(key)) {
+                this.propagate_cached_resolution(key, request);
+                this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
+                continue;
+            }
+
+            // Cycle detection
+            if (this.is_in_progress(key)) {
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("monomorphization cycle detected for %s", key)));
+                this.state.error_count += 1;
+                continue;
+            }
+
+            // Mark as in-progress, specialize, then clear.
+            this.in_progress.insert(key, true);
+            const success: boolean = this.specialize_request(request, key);
+            this.remove_in_progress(key);
+
+            if (!success) {
+                this.state.error_count += 1;
+            }
+        }
+
+        // Second pass: discover Array<T> for standalone T[] usages.  The nested
+        // discovery above only catches arrays that appear as fields of other
+        // monomorphized types.  Standalone T[] creates ArrayType without
+        // InstantiatedType.  Scan the arena once for dynamic ArrayTypes with
+        // concrete elements and enqueue any missing Array<T> instantiations.
+        const array_sym: SymbolStr = this.intern_table.intern("std::collections::array::Array");
+        const array_entry: TemplateEntry* = this.generic_registry.get_template(array_sym);
+        if (array_entry != null) {
+            const array_base: TypeRef = array_entry.base_type;
+            const type_count: i64 = this.arena.type_count();
+            for (mut tid: u64 = 1; tid <= type_count as u64; tid++) {
+                const at: Type* = this.arena.lookup(tid);
+                if (at == null || at.kind != TypeKind::Array) { continue; }
+                const arr: ArrayType* = at as ArrayType*;
+                if (!arr.is_dynamic() || !arr.element.is_valid()) { continue; }
+                const elem_t: Type* = this.arena.lookup(arr.element.id);
+                if (elem_t == null) { continue; }
+                if (elem_t.kind == TypeKind::GenericParam ||
+                    elem_t.kind == TypeKind::BoundedParam) { continue; }
+                mut arr_args: TypeRef[] = [];
+                arr_args.push(arr.element);
+                const _mod_dummy: string = "";
+                mut arr_ctx: ResolutionContext = ResolutionContext::new(_mod_dummy, _mod_dummy);
+                arr_args = this.type_resolver.expand_default_type_args(array_entry, arr_args, &arr_ctx);
+                const inst_ref: TypeRef = this.generic_registry.instantiate(array_base, arr_args);
+                this.state.enqueue_from_type_ref(inst_ref);
+            }
+            // Process any newly enqueued Array<T> instantiations.
+            while (this.state.pending_cursor < this.state.pending.length) {
+                const req: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
+                this.state.pending_cursor += 1;
+                const rkey: string = this.make_key(req);
+                if (this.is_cached(rkey)) {
+                    this.propagate_cached_resolution(rkey, req);
+                    this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
+                    continue;
+                }
+                if (this.is_in_progress(rkey)) { continue; }
+                this.in_progress.insert(rkey, true);
+                const rsuccess: boolean = this.specialize_request(req, rkey);
+                this.remove_in_progress(rkey);
+                if (!rsuccess) { this.state.error_count += 1; }
+            }
+        }
+
+        // Mark ALL collected items as monomorphized, including those that
+        // enqueue_from_type_ref() filtered out, so collect_unmonomorphized()
+        // doesn't keep returning them on every subsequent module in a batch build.
+        for (mut i: i64 = 0; i < unprocessed.length; i++) {
+            const t: Type* = this.arena.lookup(unprocessed[i].id);
+            if (t != null && t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                this.generic_registry.mark_monomorphized(inst.generic_base, inst.type_args);
+            }
+        }
+
+        return this.state.error_count == 0;
+    }
+
+
+    /// Drain the pending instantiation worklist without the
+    /// `collect_unmonomorphized()` pre-pass that `process_all` runs.  Used after
+    /// `specialize_calls_in_module` queues new instantiations.  Returns true on success.
+    drain_pending_worklist(mut &this) -> boolean {
+        mut errors: i64 = 0;
+        while (this.state.pending_cursor < this.state.pending.length) {
+            const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
+            this.state.pending_cursor += 1;
+            const key: string = this.make_key(request);
+            if (this.is_cached(key)) {
+                this.propagate_cached_resolution(key, request);
+                this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
+                continue;
+            }
+            if (this.is_in_progress(key)) {
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("monomorphization cycle detected for %s", key)));
+                errors += 1;
+                continue;
+            }
+            this.in_progress.insert(key, true);
+            const ok: boolean = this.specialize_request(request, key);
+            this.remove_in_progress(key);
+            if (!ok) { errors += 1; }
+        }
+        if (errors > 0) {
+            this.state.error_count += errors;
+        }
+        return errors == 0;
+    }
+
+
+    // Single request specialization
+
+    specialize_request(mut &this, request: &MonomorphRequest, key: string) -> boolean {
+        cdebug("[Monomorphizer::specialize_request] key='%s' base_type.id=%llu\n", key, request.base_type.id);
+        const _base_dbg: Type* = this.arena.lookup(request.base_type.id);
+        if (_base_dbg != null) {
+            cdebug("  base type: kind=%s display='%s'\n", _base_dbg.kind.to_string(), _base_dbg.display_name());
+        } else {
+            cdebug("  base type: LOOKUP FAILED for id=%llu\n", request.base_type.id);
+        }
+        cdebug("  registered templates: %lld\n", this.generic_registry.template_count());
+        const entry: TemplateEntry* = this.generic_registry.get_template_by_type_id(request.base_type.id);
+        if (entry == null) {
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("no template found for type ID %llu", request.base_type.id)));
+            return false;
+        }
+
+        return this.specialize_with_entry(request, key, entry);
+    }
+
+    // `request` is BORROWED, not taken by value: it carries an owning
+    // `type_args: TypeRef[]`; a by-value parameter would bitwise-copy the struct
+    // (aliasing the caller's buffer) and the copy's drop would double-free.
+    specialize_with_entry(mut &this, request: &MonomorphRequest, key: string,
+                          entry: TemplateEntry*) -> boolean {
+        // Validate arg count
+        if (request.type_args.length != entry.param_count) {
+            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("arg count mismatch for %s: expected %lld, got %lld",
+                        qn_str, entry.param_count, request.type_args.length)));
+            return false;
+        }
+
+        // Build display names for type args.  Use the qualified name for
+        // user-defined types so cross-module resolution works.
+        mut type_arg_displays: string[] = [];
+        for (mut i: i64 = 0; i < request.type_args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(request.type_args[i].id);
+            if (arg_t != null) {
+                const qname: SymbolStr = this.arena.get_qualified_name(request.type_args[i]);
+                if (qname.is_valid()) {
+                    type_arg_displays.push(this.intern_table.resolve(qname));
+                } else {
+                    type_arg_displays.push(this.arena.format_display(arg_t));
+                }
+            } else {
+                type_arg_displays.push(format("unknown_%llu", request.type_args[i].id));
+            }
+        }
+
+        // Call AST specializer
+        const result: SpecializationResult = this.specializer.specialize(
+            entry, request.type_args, type_arg_displays
+        );
+        if (!result.success) {
+            const qn_str: string = this.intern_table.resolve(entry.qualified_name);
+            mut args_str: string = "";
+            for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
+                if (ai > 0) { args_str = format("%s,%s", args_str, type_arg_displays[ai]); }
+                else        { args_str = type_arg_displays[ai]; }
+            }
+            this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("specialization failed for %s<%s>: %s",
+                        qn_str, args_str, result.error_message)));
+            return false;
+        }
+
+        // Intern the specialized name for type system use
+        const spec_name_sym: SymbolStr = this.intern_table.intern(result.spec_name);
+
+        // Build the *qualified* specialized name for the arena.
+        const qualified_spec_sym: SymbolStr = this.qualify_spec_name(entry, result.spec_name);
+
+        // Create concrete type in arena based on node kind
+        const subst: TypeSubstitution = TypeSubstitution::from_params(
+            entry.param_type_ids, request.type_args
+        );
+
+        // Drop impls and methods whose where-bounds aren't satisfied for this
+        // substitution.  Removing them here means resolve_specialized_ast never
+        // sees an uncompilable body and DI never indexes a junk signature.
+        this.trait_spec.filter_bounds_violating_methods(result.specialized_ast, &subst);
+        const kept_impl_asts: ASTNode*[] = this.trait_spec.filter_bounds_violating_impls(
+            result.impl_asts, &subst);
+
+        const concrete_type: TypeRef = this.create_concrete_type(entry, qualified_spec_sym, &subst);
+
+        // Register the bare spec name as an alias so resolve_body_locals() can find
+        // the type (the substituter rewrites annotations to bare names).
+        if (concrete_type.is_valid() && !spec_name_sym.equals(qualified_spec_sym)) {
+            this.arena.add_name_alias(spec_name_sym, concrete_type);
+        }
+
+        // Set human-readable display name (e.g., "Pair<i32, string>") on the type.
+        if (concrete_type.is_valid()) {
+            const inst_for_name: Type* = this.arena.lookup(request.generic_type.id);
+            if (inst_for_name != null) {
+                const display: string = this.arena.format_display(inst_for_name);
+                const concrete_t: Type* = this.arena.lookup(concrete_type.id);
+                if (concrete_t != null) {
+                    if (concrete_t.kind == TypeKind::Struct) {
+                        (concrete_t as StructType*).set_display_name(display);
+                    } else if (concrete_t.kind == TypeKind::Enum) {
+                        (concrete_t as EnumType*).set_display_name(display);
+                    } else if (concrete_t.kind == TypeKind::Class) {
+                        (concrete_t as ClassType*).set_display_name(display);
+                    }
+                }
+            }
+        }
+
+        // SCOPE-SWITCHED REGION (see matching restore at end of region).
+        //
+        // Temporarily switch the Resolver to the template's module scope so that
+        // names imported by the template's module can be resolved.  !!! DO NOT add
+        // early returns or `panic` between this line and the matching restore: the
+        // resolver's scope state is process-global; bailing leaves the wrong scope
+        // active for every subsequent specialization.
+        mut saved_scope: u64 = 0;
+        if (this.type_resolver.name_resolver != null && entry.module_name.is_valid()) {
+            const mod_name: string = this.intern_table.resolve(entry.module_name);
+            saved_scope = this.type_resolver.name_resolver.get_current_scope_id();
+            const template_scope: u64 = this.type_resolver.name_resolver.find_module_scope(mod_name);
+            if (template_scope > 0) {
+                this.type_resolver.name_resolver.set_module_with_scope(
+                    entry.module_name, template_scope);
+            }
+        }
+
+        // Re-resolve type annotations on the specialized AST.  The InstantiatedType
+        // wrapper (request.generic_type) is passed as `this_type` for method bodies.
+        const this_type_for_methods: TypeRef = if (request.generic_type.is_valid()) {
+            request.generic_type
+        } else {
+            concrete_type
+        };
+        // Compile-time `static match` arm pruning.  Runs AFTER substitution but
+        // BEFORE resolve_specialized_ast, so dead arms are removed first.
+        this.ast_resolver.prune_static_match_arms(result.specialized_ast, entry.node_kind, entry, &subst);
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            this.ast_resolver.prune_static_match_arms(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst);
+        }
+        this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
+        }
+
+        // Populate the concrete type and set resolved_type on the InstantiatedType.
+        if (concrete_type.is_valid()) {
+            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
+
+            const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+            if (inst_t != null) {
+                (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
+            }
+            this.arena.propagate_instantiated_resolution(
+                request.base_type, request.type_args, concrete_type);
+        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+            // Function templates don't create named arena types, but still get a
+            // concrete FunctionType so the InstantiatedType has a valid resolved_type.
+            const func_type: TypeRef = this.type_populator.build_function_type_from_ast(result.specialized_ast);
+            if (func_type.is_valid()) {
+                const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+                if (inst_t != null) {
+                    (inst_t as InstantiatedType*).set_resolved_type(func_type);
+                }
+                this.arena.propagate_instantiated_resolution(
+                    request.base_type, request.type_args, func_type);
+            }
+        }
+
+        // Restore the Resolver's scope.  END SCOPE-SWITCHED REGION.
+        if (saved_scope > 0 && this.type_resolver.name_resolver != null) {
+            this.type_resolver.name_resolver.set_module_with_scope(
+                this.current_module, saved_scope);
+        }
+
+        // Mark as monomorphized
+        this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
+
+        // Cache the result.  origin_module is only a *fallback* owner; Phase 6a-iii
+        // routes each spec to its deterministic owner = template_module.
+        const origin: SymbolStr = this.current_module;
+        const spec_entry: SpecializationEntry = SpecializationEntry {
+            specialized_type:  concrete_type,
+            specialized_name:  spec_name_sym,
+            ast_node:          result.specialized_ast,
+            impl_nodes:        kept_impl_asts,
+            origin_module:     origin,
+            template_module:   entry.module_name,
+            instantiated_type: request.generic_type,
+            injected:          false,
+            owner_source:      SymbolStr::empty(),
+        };
+        const idx: i64 = this.state.spec_entries.length;
+        this.spec_keys.push(key);
+        this.state.spec_entries.push(spec_entry);
+        this.spec_index.insert(key, idx);
+
+        // Discover nested instantiations from the concrete type's fields, or the
+        // function type's param/return types (function templates).
+        if (concrete_type.is_valid()) {
+            this.state.nested_visited = [];
+            this.state.request_nested_instantiations(concrete_type);
+        } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
+            const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+            if (inst_t != null) {
+                const inst: InstantiatedType* = inst_t as InstantiatedType*;
+                if (inst.resolved_type.is_valid()) {
+                    this.state.nested_visited = [];
+                    this.state.request_nested_instantiations(inst.resolved_type);
+                }
+            }
+        }
+        return true;
+    }
+
+
+    // Concrete type creation
+
+    create_concrete_type(mut &this, entry: TemplateEntry*, spec_name: SymbolStr,
+                         subst: TypeSubstitution*) -> TypeRef {
+        return match (entry.node_kind) {
+            NodeKind::StructDeclaration => {
+                this.arena.create_struct(spec_name, entry.module_name)
+            }
+            NodeKind::EnumDeclaration => {
+                this.arena.create_enum(spec_name, entry.module_name)
+            }
+            NodeKind::ClassDeclaration => {
+                this.arena.create_class(spec_name, entry.module_name)
+            }
+            NodeKind::FunctionDeclaration => {
+                // Generic functions don't create arena types; they just produce
+                // specialized AST declarations.  Return invalid so
+                // specialize_with_entry skips type population.
+                TypeRef::invalid()
+            }
+            _ => {
+                this.arena.create_struct(spec_name, entry.module_name)
+            }
+        };
+    }
+
+
+    // Name qualification
+
+    /// Build a qualified specialized name from the template's qualified name and
+    /// the bare specialized name.  E.g. "BattleTest::Pair" + "Pair_string" ->
+    /// "BattleTest::Pair_string".  Bare spec name when the template has no namespace.
+    qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
+        const qualified_str: string = this.intern_table.resolve(entry.qualified_name);
+        const bare_str: string = this.intern_table.resolve(entry.name);
+
+        const q_len: i64 = strlen(qualified_str) as i64;
+        const b_len: i64 = strlen(bare_str) as i64;
+        if (q_len <= b_len) {
+            return this.intern_table.intern(spec_name);
+        }
+
+        const prefix_len: i64 = q_len - b_len;
+        const prefix: string = qualified_str.substr(0, prefix_len);
+        return this.intern_table.intern(prefix + spec_name);
+    }
+
+
+    // Batch compilation support
+
+    /// Reset transient per-module state while preserving the specialization cache
+    /// and injection cursor.  Called between modules in StdlibBatch mode.
+    reset_for_next_module(mut &this) -> void {
+        this.state.reset_worklist();
+        this.in_progress = HashMap<string, boolean>::new();
+    }
+
+    /// Get only the specialized ASTs produced since the last call to this method.
+    /// Advances the injection cursor so each module receives only its new specs.
+    get_new_specialized_asts(mut &this) -> ASTNode*[] {
+        mut result: ASTNode*[] = [];
+        for (mut i: i64 = this.injection_cursor; i < this.state.spec_entries.length; i++) {
+            if (this.state.spec_entries[i].ast_node != null) {
+                result.push(this.state.spec_entries[i].ast_node);
+            }
+            for (mut j: i64 = 0; j < this.state.spec_entries[i].impl_nodes.length; j++) {
+                result.push(this.state.spec_entries[i].impl_nodes[j]);
+            }
+        }
+        this.injection_cursor = this.state.spec_entries.length;
+        return result;
+    }
+
+
+    // Result access
+
+    /// Get all specialized AST declarations for injection into the program.
+    get_all_specialized_asts(&this) -> ASTNode*[] {
+        mut result: ASTNode*[] = [];
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            if (this.state.spec_entries[i].ast_node != null) {
+                result.push(this.state.spec_entries[i].ast_node);
+            }
+            for (mut j: i64 = 0; j < this.state.spec_entries[i].impl_nodes.length; j++) {
+                result.push(this.state.spec_entries[i].impl_nodes[j]);
+            }
+        }
+        return result;
+    }
+
+    /// Number of specializations completed.
+    specialization_count(&this) -> i64 {
+        return this.state.spec_entries.length;
+    }
+
+    /// Record that a module consumes (has injected) a specialization.
+    record_consuming_module(mut &this, spec_index: i64, module: SymbolStr) -> void {
+        if (spec_index >= 0 && spec_index < this.state.spec_entries.length) {
+            this.consumer_spec_indices.push(spec_index);
+            this.consumer_modules.push(module.id);
+        }
+    }
+
+    /// Count specializations not yet routed into an owner module by Phase 6a-iii.
+    uninjected_spec_count(&this) -> i64 {
+        mut n: i64 = 0;
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            if (!this.state.spec_entries[i].injected) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// Get all modules that consume a specific specialization.
+    get_consuming_modules(&this, spec_index: i64) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < this.consumer_spec_indices.length; i++) {
+            if (this.consumer_spec_indices[i] == spec_index) {
+                result.push(SymbolStr::from_id(this.consumer_modules[i]));
+            }
+        }
+        return result;
+    }
+
+
+    // -- Accessors for passes/specialization.cryo (SpecInjector + routing) --
+    // Replace the pass's former direct pokes at `spec_entries` / `injection_cursor`.
+
+    /// Borrow spec entry `i` for inspection/mutation.  Null for out-of-range.
+    spec_entry_at(mut &this, i: i64) -> SpecializationEntry* {
+        if (i < 0 || i >= this.state.spec_entries.length) { return null; }
+        return &this.state.spec_entries[i];
+    }
+
+    /// Current incremental injection cursor (first not-yet-emitted spec index).
+    get_injection_cursor(&this) -> i64 {
+        return this.injection_cursor;
+    }
+
+    /// Advance the injection cursor to the current spec count.
+    advance_injection_cursor(mut &this) -> void {
+        this.injection_cursor = this.state.spec_entries.length;
+    }
+
+
+    // Cache helpers (orchestrator-private)
+
+    /// Build a cache key from a request.  Mirrors GenericRegistry's
+    /// `make_cache_key` format (`base<arg,arg>`) but canonicalizes each arg id
+    /// through `canon_type_id` so equivalent instantiations dedup to one spec.
+    make_key(&this, request: &MonomorphRequest) -> string {
+        return this.make_key_for(request.base_type, request.type_args);
+    }
+
+    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> string {
+        mut key: string = format("%llu<", base.id);
+        for (mut i: i64 = 0; i < type_args.length; i++) {
+            if (i > 0) { key += ","; }
+            key += format("%llu", this.arena.canon_type_id(type_args[i]));
+        }
+        key += ">";
+        return key;
+    }
+
+    /// Check if a key is already in the specialization cache.
+    is_cached(&this, key: string) -> boolean {
+        return this.spec_index.get(&key).is_some();
+    }
+
+    /// Link a cache-hit request's InstantiatedType(s) to the previously computed
+    /// concrete type.  Sema creates a fresh InstantiatedType per call site, so a
+    /// later module revisiting an already-specialized pair stays unresolved unless
+    /// we explicitly propagate.
+    propagate_cached_resolution(mut &this, key: string, request: &MonomorphRequest) -> void {
+        const idx_opt: Option<i64> = this.spec_index.get(&key);
+        if (!idx_opt.is_some()) { return; }
+        const idx: i64 = idx_opt.unwrap();
+        if (idx < 0 || idx >= this.state.spec_entries.length) { return; }
+        const entry: SpecializationEntry* = &this.state.spec_entries[idx];
+        if (!entry.specialized_type.is_valid()) { return; }
+        this.arena.propagate_instantiated_resolution(
+            request.base_type, request.type_args, entry.specialized_type);
+    }
+
+    /// Check if a key is currently being processed (cycle detection).
+    is_in_progress(&this, key: string) -> boolean {
+        return this.in_progress.get(&key).is_some();
+    }
+
+    /// Remove a key from the in-progress set.
+    remove_in_progress(mut &this, key: string) -> void {
+        this.in_progress.remove(&key);
+    }
+}

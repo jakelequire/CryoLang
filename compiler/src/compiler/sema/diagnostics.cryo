@@ -1,0 +1,437 @@
+/// Diagnostics
+///
+/// Sema's diagnostic construction helpers: the rich "mismatched types"
+/// builder with literal-aware quickfixes, the did-you-mean candidate collectors
+/// + attachment, and the arity / payload-escape emitters.  Centralizing them
+/// keeps the resolvers focused on resolution and gives every code a uniform
+/// headline/label/suggestion shape.
+///
+/// Holds the env by pointer plus `state` (for the local-name collector) and a
+/// peer pointer to `TypeUtils` (for `type_display_name`).
+///
+/// TODO(port): the import-insertion machinery lives in the entangled core region
+/// of the monolith (find_import_insertion_span, suggest_similar_method,
+/// find_shadowed_*, emit_switch_subject_error, emit_free_* — sema.cryo ~9883+).
+/// They are ported here when that region is read for the core trio.  emit_free_*
+/// stays with CallResolver per the plan.
+
+namespace Compiler::Sema::Diagnostics;
+
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::Suggestion;
+import Compiler::Diag::SourceSpan;
+import Compiler::Diag::EditDistance;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::CompilationContext;
+import Compiler::DeclIndex;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::Lex;
+import Compiler::Sema::State;
+import Compiler::Sema::Helpers;
+import Compiler::Sema::TypeUtils;
+import std::collections::hashmap;
+import std::core::option;
+import std::fmt;
+
+type struct Diagnostics {
+    arena:  TypeArena*;
+    intern: InternTable*;
+    ctx:    CompilationContext*;
+    state:  SemaState*;
+    types:  TypeUtils*;
+
+    static null() -> Diagnostics {
+        return Diagnostics { arena: null, intern: null, ctx: null, state: null, types: null };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+                    state: SemaState*, types: TypeUtils*) -> void {
+        this.arena  = arena;
+        this.intern = intern;
+        this.ctx    = ctx;
+        this.state  = state;
+        this.types  = types;
+    }
+
+
+    // -- Did-you-mean candidate collectors --
+    //
+    // Each walks one symbol table and returns bare (non-`::`) names to feed
+    // `find_best_candidate` from a typo diagnostic.
+
+    /// Locals in the current function's scope (E0201 did-you-mean).
+    collect_local_names(&this) -> string[] {
+        mut out: string[] = [];
+        mut it: HashMapIter<u32, TypeRef> = this.state.locals.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    const s: string = this.intern.resolve(SymbolStr::from_id(pair.first));
+                    if (s != "" && strstr(s, "::") == null) { out.push(s); }
+                }
+                Option::None => { break; }
+            }
+        }
+        return out;
+    }
+
+    /// Every bare function name in the DeclarationIndex (E0202 did-you-mean).
+    collect_bare_callable_names(&this) -> string[] {
+        mut out: string[] = [];
+        const idx: DeclarationIndex* = this.ctx.decl_index;
+        for (mut i: i64 = 0; i < idx.module_funcs.length; i++) {
+            const name: string = this.intern.resolve(SymbolStr::from_id(idx.module_funcs[i].first));
+            if (name == "")                 { continue; }
+            if (strstr(name, "::") != null) { continue; }
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < out.length; j++) {
+                if (strcmp(out[j], name) == 0) { seen = true; break; }
+            }
+            if (!seen) { out.push(name); }
+        }
+        return out;
+    }
+
+    /// Every bare type name in the DeclarationIndex (E0203 did-you-mean).
+    collect_bare_type_names(&this) -> string[] {
+        mut out: string[] = [];
+        const idx: DeclarationIndex* = this.ctx.decl_index;
+        for (mut i: i64 = 0; i < idx.module_types.length; i++) {
+            const name: string = this.intern.resolve(SymbolStr::from_id(idx.module_types[i].first));
+            if (name == "")                 { continue; }
+            if (strstr(name, "::") != null) { continue; }
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < out.length; j++) {
+                if (strcmp(out[j], name) == 0) { seen = true; break; }
+            }
+            if (!seen) { out.push(name); }
+        }
+        return out;
+    }
+
+    /// Field + method names on a struct/class (E0204 did-you-mean).  Walks past
+    /// pointer/reference/instantiation wrappers like the member-access resolver.
+    collect_struct_or_class_member_names(&this, obj_type: TypeRef) -> string[] {
+        mut out: string[] = [];
+        mut walk_ty: TypeRef = obj_type;
+        mut walk_t:  Type*   = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            match (walk_t.kind) {
+                TypeKind::Pointer => {
+                    walk_ty = (walk_t as PointerType*).pointee;
+                    walk_t  = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::Reference => {
+                    walk_ty = (walk_t as ReferenceType*).referent;
+                    walk_t  = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { break; }
+                    walk_ty = it.resolved_type;
+                    walk_t  = this.arena.lookup(walk_ty.id);
+                }
+                _ => { break; }
+            }
+            depth += 1;
+        }
+        if (walk_t == null) { return out; }
+
+        match (walk_t.kind) {
+            TypeKind::Struct => {
+                const st: StructType* = walk_t as StructType*;
+                for (mut i: i64 = 0; i < st.fields.length; i++)  { out.push(this.intern.resolve(st.fields[i].name)); }
+                for (mut i: i64 = 0; i < st.methods.length; i++) { out.push(this.intern.resolve(st.methods[i].name)); }
+            }
+            TypeKind::Class => {
+                const cl: ClassType* = walk_t as ClassType*;
+                for (mut i: i64 = 0; i < cl.fields.length; i++)  { out.push(this.intern.resolve(cl.fields[i].name)); }
+                for (mut i: i64 = 0; i < cl.methods.length; i++) { out.push(this.intern.resolve(cl.methods[i].name)); }
+            }
+            _ => {}
+        }
+        return out;
+    }
+
+    /// Build a `did you mean `<best>`?` help + machine-applicable suggestion, or
+    /// return the diagnostic unchanged when no candidate clears the threshold
+    /// (so callers can chain unconditionally).  `kind` is the help-text noun.
+    attach_did_you_mean(&this, diag: Diagnostic, name: string,
+                        candidates: string[], kind: string,
+                        span: SourceSpan) -> Diagnostic {
+        const best: string = find_best_candidate(name, candidates);
+        if (best == "") { return diag; }
+        mut out: Diagnostic = diag.help(
+            format("a %s with a similar name exists: `%s`", kind, best));
+        out = out.suggest(Suggestion::machine_applicable(span, best,
+            format("did you mean `%s`?", best)));
+        return out;
+    }
+
+
+    // -- Mismatched-types builder --
+
+    /// Rich "mismatched types" diagnostic with the rustc-style `expected `<E>`,
+    /// found `<F>`` inline label.  `context_msg` becomes the explanatory note;
+    /// `context_span`, when set, attaches an "expected due to this" secondary.
+    emit_type_mismatch(mut &this, code: ErrorCode, span: SourceSpan,
+                       expected: TypeRef, found: TypeRef,
+                       context_msg: string, context_span: SourceSpan) -> void {
+        this.emit_type_mismatch_with_value(code, span, expected, found,
+            context_msg, context_span, null);
+    }
+
+    /// As `emit_type_mismatch`, plus the offending value expression so a
+    /// literal-aware quickfix can be attached.
+    emit_type_mismatch_with_value(mut &this, code: ErrorCode, span: SourceSpan,
+                                  expected: TypeRef, found: TypeRef,
+                                  context_msg: string, context_span: SourceSpan,
+                                  value_expr: ExpressionNode*) -> void {
+        const expected_name: string = this.types.type_display_name(expected);
+        const found_name:    string = this.types.type_display_name(found);
+
+        mut diag: Diagnostic = Diagnostic::error(code, "mismatched types");
+        diag = diag.at_with_label(span,
+            format("expected `%s`, found `%s`", expected_name, found_name));
+        if (context_span.has_location()) {
+            diag = diag.also_at(context_span, "expected due to this");
+        }
+        if (context_msg != "") {
+            diag = diag.with_note(context_msg);
+        }
+        diag = this.attach_type_coercion_suggestion(diag, span,
+            expected_name, found_name, value_expr);
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Attach a literal-aware quickfix when the (expected, found, value) triple
+    /// has an obvious bridge: bool<-`"true"`/`"false"`/`0`/`1`, string<-numeric
+    /// literal (wrap in quotes), numeric<-numeric-looking string (drop quotes).
+    /// All MachineApplicable; returns the diagnostic unchanged when none fit.
+    attach_type_coercion_suggestion(&this, diag: Diagnostic, span: SourceSpan,
+                                    expected_name: string, found_name: string,
+                                    value_expr: ExpressionNode*) -> Diagnostic {
+        if (value_expr == null || !span.has_location()) { return diag; }
+        const node: ASTNode* = value_expr as ASTNode*;
+        if (node.kind != NodeKind::Literal) { return diag; }
+
+        const lit: LiteralNode* = value_expr as LiteralNode*;
+        const want_bool: boolean = strcmp(expected_name, "boolean") == 0
+                                || strcmp(expected_name, "bool") == 0;
+        const want_string:  boolean = strcmp(expected_name, "string") == 0;
+        const found_string: boolean = strcmp(found_name, "string") == 0;
+
+        if (want_bool && lit.literal_kind == LiteralKind::String) {
+            if (strcmp(lit.value, "true") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "true", "drop the quotes to write a `boolean`"));
+            }
+            if (strcmp(lit.value, "false") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "false", "drop the quotes to write a `boolean`"));
+            }
+        }
+        if (want_bool && lit.literal_kind == LiteralKind::Integer) {
+            if (strcmp(lit.value, "0") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "false", "use the boolean literal"));
+            }
+            if (strcmp(lit.value, "1") == 0) {
+                return diag.suggest(Suggestion::machine_applicable(
+                    span, "true", "use the boolean literal"));
+            }
+        }
+        if (want_string &&
+            (lit.literal_kind == LiteralKind::Integer
+             || lit.literal_kind == LiteralKind::Float)) {
+            return diag.suggest(Suggestion::machine_applicable(
+                span, format("\"%s\"", lit.value),
+                "wrap the literal in quotes to make it a string"));
+        }
+        if (found_string && !want_bool && !want_string
+            && is_numeric_type_name(expected_name)
+            && lexeme_looks_like_number(lit.value)) {
+            return diag.suggest(Suggestion::machine_applicable(
+                span, lit.value,
+                format("drop the quotes to write a `%s`", expected_name)));
+        }
+
+        return diag;
+    }
+
+
+    // -- Arity / payload-escape emitters --
+
+    /// Arity diagnostic (E0215/E0216) for a method / static-method call whose
+    /// name resolved but argument count matched no overload.  `expected` < 0 when
+    /// candidates disagree on arity (overloaded), giving a generic message.
+    emit_method_arity_error(mut &this, call: CallExprNode*, name: SymbolStr,
+                            kind: string, expected: i64, got: i64) -> void {
+        const nm: string = this.intern.resolve(name);
+        if (expected < 0) {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0215_TOO_MANY_ARGS,
+                format("no overload of %s `%s` takes %lld argument(s)", kind, nm, got));
+            d = d.at_with_label(call.span, "no matching overload for this argument count");
+            this.ctx.diagnostics.emit(d);
+            return;
+        }
+        if (got < expected) {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0216_TOO_FEW_ARGS,
+                format("%s `%s` takes %lld argument(s) but %lld were supplied",
+                       kind, nm, expected, got));
+            d = d.at_with_label(call.span,
+                format("missing %lld argument%s", expected - got,
+                    if (expected - got == 1) { "" } else { "s" }));
+            this.ctx.diagnostics.emit(d);
+            return;
+        }
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0215_TOO_MANY_ARGS,
+            format("%s `%s` takes %lld argument(s) but %lld were supplied",
+                   kind, nm, expected, got));
+        d = d.at_with_label(call.span,
+            format("unexpected argument%s", if (got - expected == 1) { "" } else { "s" }));
+        this.ctx.diagnostics.emit(d);
+    }
+
+    /// Fold a same-named candidate's parameter count into a running unique-arity
+    /// tally for arity diagnostics.  `uniq` starts at -1 (none seen) and becomes
+    /// -2 once two candidates disagree on arity.
+    note_arity(&this, uniq: i64, param_count: i64) -> i64 {
+        if (uniq == -1)          { return param_count; }
+        if (uniq != param_count) { return -2; }
+        return uniq;
+    }
+
+    /// E0455 for returning a pointer/reference to a `match`-bound payload (lives
+    /// in a temporary freed at function return).
+    emit_payload_escape(mut &this, span: SourceSpan) -> void {
+        this.ctx.emit_error_at(
+            ErrorCode::E0455_DANGLING_POINTER,
+            "cannot return a pointer or reference to a value bound by `match`: the payload lives in a temporary that is freed when the function returns. Return it by value (move the payload out) instead.",
+            span);
+    }
+
+
+    // -- Method-not-found hints + import-shadow detection --
+
+    /// Closest method name on `type_sym` to `method_name` (edit-distance), or empty.
+    suggest_similar_method(&this, type_sym: SymbolStr, method_name: SymbolStr) -> SymbolStr {
+        if (!type_sym.is_valid() || !method_name.is_valid()) { return SymbolStr::empty(); }
+        const ty_ref: TypeRef = this.types.lookup_type_by_sym(type_sym);
+        if (!ty_ref.is_valid()) { return SymbolStr::empty(); }
+        const needle: string = this.intern.resolve(method_name);
+        const cands: string[] = this.collect_struct_or_class_member_names(ty_ref);
+        const best: string = find_best_candidate(needle, cands);
+        if (best == "") { return SymbolStr::empty(); }
+        return this.intern.intern(best);
+    }
+
+    /// Other user-defined types whose simple-name matches `simple_name` and that
+    /// own `member_name` (import-shadow detection); `resolved_type` is excluded.
+    /// Capped at 4 candidates.
+    find_shadowed_type_candidates(&this, simple_name: SymbolStr, member_name: SymbolStr,
+                                  resolved_type: TypeRef) -> SymbolStr[] {
+        mut results: SymbolStr[] = [];
+        if (!simple_name.is_valid()) { return results; }
+        const needle: string = this.intern.resolve(simple_name);
+        const filter_member: boolean = member_name.is_valid();
+        const n: i64 = this.arena.type_count();
+        for (mut i: i64 = 0; i < n; i++) {
+            const t: Type* = this.arena.types[i];
+            if (t == null) { continue; }
+            if (resolved_type.is_valid() && t.id == resolved_type.id) { continue; }
+            mut qname: SymbolStr = SymbolStr::empty();
+            mut has_member: boolean = !filter_member;
+            if (t.kind == TypeKind::Struct) {
+                const st: StructType* = t as StructType*;
+                qname = st.qualified_name;
+                if (filter_member) { has_member = st.get_method(member_name) != null; }
+            } else if (t.kind == TypeKind::Class) {
+                const ct: ClassType* = t as ClassType*;
+                qname = ct.qualified_name;
+                if (filter_member) { has_member = ct.get_method(member_name) != null; }
+            } else if (t.kind == TypeKind::Enum) {
+                const et: EnumType* = t as EnumType*;
+                qname = et.qualified_name;
+                if (filter_member) {
+                    has_member = et.get_method(member_name) != null || et.get_variant(member_name) != null;
+                }
+            } else {
+                continue;
+            }
+            if (!qname.is_valid() || !has_member) { continue; }
+            const qstr: string = this.intern.resolve(qname);
+            const leaf: string = extract_leaf_segment(qstr);
+            if (leaf != needle) { continue; }
+            mut dup: boolean = false;
+            for (mut j: i64 = 0; j < results.length; j++) {
+                if (results[j].equals(qname)) { dup = true; break; }
+            }
+            if (dup) { continue; }
+            results.push(qname);
+            if (results.length >= 4) { break; }
+        }
+        return results;
+    }
+
+    /// A zero-width span for inserting a new `import ...;` line (after the last
+    /// existing import, else the first non-import top-level node), or none.
+    find_import_insertion_span(&this) -> SourceSpan {
+        if (this.ctx == null) { return SourceSpan::none(); }
+        const root: ProgramNode* = this.ctx.artifacts.ast.root;
+        if (root == null) { return SourceSpan::none(); }
+        mut last_import_span: SourceSpan = SourceSpan::none();
+        mut fallback_span: SourceSpan = SourceSpan::none();
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            if (stmt.kind == NodeKind::ImportDeclaration) { last_import_span = stmt.span; }
+            else if (!fallback_span.has_location()) { fallback_span = stmt.span; }
+        }
+        const anchor: SourceSpan = if (last_import_span.has_location()) { last_import_span } else { fallback_span };
+        if (!anchor.has_location()) { return SourceSpan::none(); }
+        return SourceSpan::new(anchor.file, anchor.end_line, anchor.end_col, anchor.end_line, anchor.end_col);
+    }
+
+    /// Attach an "import the right type" note + quickfix for each shadowed
+    /// candidate (MachineApplicable for a single candidate, else MaybeIncorrect).
+    attach_shadow_import_suggestions(&this, diag: Diagnostic, simple_name_str: string,
+                                     candidates: SymbolStr[]) -> Diagnostic {
+        if (candidates.length == 0) { return diag; }
+        mut out: Diagnostic = diag;
+        const insert_span: SourceSpan = this.find_import_insertion_span();
+        const apply: Applicability = if (candidates.length == 1) {
+            Applicability::MachineApplicable
+        } else {
+            Applicability::MaybeIncorrect
+        };
+        for (mut i: i64 = 0; i < candidates.length; i++) {
+            const cand_str: string = this.intern.resolve(candidates[i]);
+            out = out.with_note(format("another `%s` exists: `%s`", simple_name_str, cand_str));
+            const import_path: string = extract_parent_path(cand_str);
+            if (import_path == "") { continue; }
+            if (insert_span.has_location()) {
+                const insertion: string = format("\nimport %s;", import_path);
+                const msg: string = format("import `%s`", import_path);
+                out = out.suggest(Suggestion::single(insert_span, insertion, msg, apply));
+            }
+        }
+        out = out.help(format(
+            "the unqualified name `%s` resolved to a different type than the one you meant; import the intended module to disambiguate",
+            simple_name_str));
+        return out;
+    }
+}

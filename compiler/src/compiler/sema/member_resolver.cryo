@@ -1,0 +1,548 @@
+/// MemberResolver
+///
+/// Member and index expression resolution: `obj.field` / `obj.0` / `obj.method`
+/// (field access, tuple index, method-as-value, field-typed-as-function), `arr[i]`
+/// / `tup[0]`, plus the field/method/type visibility enforcement (E0353/E0503).
+///
+/// `resolve_member_access` / `resolve_array_access` recurse into the receiver via
+/// the dispatch seam, so they take `visitor: ASTVisitor*`.  The visibility and
+/// template-field helpers are pure callbacks.
+///
+/// Env (arena/intern/ctx/checker) + peers: state, types (TypeUtils), symbolic
+/// (SymbolicChecker), binding (MethodBinding), diag (Diagnostics), dispatch.
+
+namespace Compiler::Sema::MemberResolver;
+
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Generic;
+import Compiler::Types::Checker;
+import Compiler::Types::Registry;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::InternTable;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Visitor;
+import Compiler::AST::Expression;
+import Compiler::AST::Declaration;
+import Compiler::Diag;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::CompilationContext;
+import Compiler::Sema::State;
+import Compiler::Sema::TypeUtils;
+import Compiler::Sema::SymbolicChecker;
+import Compiler::Sema::MethodBinding;
+import Compiler::Sema::Diagnostics;
+import Compiler::Sema::Dispatch;
+import Compiler::Sema::Helpers;
+import std::fmt;
+
+type struct MemberResolver {
+    arena:    TypeArena*;
+    intern:   InternTable*;
+    ctx:      CompilationContext*;
+    checker:  TypeChecker*;
+    state:    SemaState*;
+    types:    TypeUtils*;
+    symbolic: SymbolicChecker*;
+    binding:  MethodBinding*;
+    diag:     Diagnostics*;
+    dispatch: SemaDispatch*;
+
+    static null() -> MemberResolver {
+        return MemberResolver {
+            arena: null, intern: null, ctx: null, checker: null, state: null,
+            types: null, symbolic: null, binding: null, diag: null, dispatch: null,
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+                    checker: TypeChecker*, state: SemaState*, types: TypeUtils*,
+                    symbolic: SymbolicChecker*, binding: MethodBinding*,
+                    diag: Diagnostics*, dispatch: SemaDispatch*) -> void {
+        this.arena    = arena;
+        this.intern   = intern;
+        this.ctx      = ctx;
+        this.checker  = checker;
+        this.state    = state;
+        this.types    = types;
+        this.symbolic = symbolic;
+        this.binding  = binding;
+        this.diag     = diag;
+        this.dispatch = dispatch;
+    }
+
+
+    // -- Member access (`obj.field` / `obj.0` / `obj.method`) --
+
+    resolve_member_access(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*) -> TypeRef {
+        const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
+        if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+
+        // Access rooted at the abstract generic owner (`this.value` in a `Box<T>`
+        // method): resolve the field off the owner template's AST.  Checked BEFORE
+        // the unresolved bail (the owner self-instantiation carries abstract params).
+        if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+            const owner_field: TypeRef =
+                this.symbolic.symbolic_resolve_owner_field(obj_type, member.member);
+            if (owner_field.is_valid()) {
+                member.set_resolved_type(owner_field);
+                return owner_field;
+            }
+        }
+        // Symbolic walk: a `void`/abstract receiver is unresolved, not fieldless.
+        if (this.symbolic.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
+
+        // Tuple positional access (`t.0`); walks past pointer/reference/inst wrappers.
+        mut walk_ty: TypeRef = obj_type;
+        mut walk_t: Type* = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            match (walk_t.kind) {
+                TypeKind::Pointer => {
+                    walk_ty = (walk_t as PointerType*).pointee;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::Reference => {
+                    walk_ty = (walk_t as ReferenceType*).referent;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { break; }
+                    walk_ty = it.resolved_type;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                _ => { break; }
+            }
+            depth += 1;
+        }
+        if (walk_t != null && walk_t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = walk_t as TupleType*;
+            const member_str: string = this.intern.resolve(member.member);
+            const idx: i64 = parse_tuple_index(member_str);
+            const m_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            if (idx < 0) {
+                this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                    format("expected a tuple index after `.`, got `%s`", member_str), m_span);
+                return TypeRef::invalid();
+            }
+            if (idx >= tup.elements.length) {
+                this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                    format("tuple index %lld is out of bounds for tuple with %lld elements",
+                           idx, tup.elements.length), m_span);
+                return TypeRef::invalid();
+            }
+            return tup.elements[idx];
+        }
+
+        // Struct/class field access via TypeChecker.
+        const result: TypeCheckResult = this.checker.check_field_access(obj_type, member.member);
+        if (result.success) {
+            const acc_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            this.enforce_field_visibility(obj_type, member.member, acc_span);
+            // Mono-after-sema: substitute the receiver's type_args so a template
+            // field types concretely (`.second -> i64`).
+            return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
+        }
+
+        // Mono-after-sema: read the field off the generic BASE template's AST and
+        // substitute the receiver's type_args (`Pair<u32,i64>` pre-mono).
+        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member);
+        if (field_ret.is_valid()) { return field_ret; }
+
+        // Symbolic walk: an unwrapped `void`/abstract receiver — defer.
+        if (this.symbolic.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
+
+        // Method lookup with inheritance, from the *dereferenced* receiver symbol.
+        const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
+        if (type_sym.is_valid()) {
+            const method_ret: TypeRef =
+                this.binding.lookup_method_with_inheritance(walk_ty, type_sym, member.member);
+            if (method_ret.is_valid()) {
+                const acc_span: SourceSpan = if (member.member_span.has_location()) {
+                    member.member_span
+                } else {
+                    member.span
+                };
+                this.enforce_method_visibility(obj_type, member.member, acc_span);
+                return method_ret;
+            }
+
+            const type_name: string = this.intern.resolve(type_sym);
+            const member_name: string = this.intern.resolve(member.member);
+            const m_span: SourceSpan = if (member.member_span.has_location()) {
+                member.member_span
+            } else {
+                member.span
+            };
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0204_UNDEFINED_FIELD,
+                format("no field or method `%s` on type `%s`", member_name, type_name));
+            d = d.at_with_label(m_span, "unknown field or method");
+            const cands: string[] = this.diag.collect_struct_or_class_member_names(obj_type);
+            d = this.diag.attach_did_you_mean(d, member_name, cands, "field or method", m_span);
+            this.ctx.emit_diagnostic(d);
+        }
+
+        return TypeRef::invalid();
+    }
+
+    /// Mono-after-sema: resolve a FIELD off the generic BASE template's AST when
+    /// the receiver is an unresolved generic instantiation, substituting type_args.
+    resolve_field_via_template(mut &this, recv_type: TypeRef, field: SymbolStr) -> TypeRef {
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+        if (inst == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        mut abstract_field: TypeRef = TypeRef::invalid();
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.fields.length; i++) {
+                const f: FieldDeclNode* = sn.fields[i];
+                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                    abstract_field = f.resolved_type;
+                    break;
+                }
+            }
+        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.fields.length; i++) {
+                const f: FieldDeclNode* = cn.fields[i];
+                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                    abstract_field = f.resolved_type;
+                    break;
+                }
+            }
+        } else {
+            return TypeRef::invalid();
+        }
+        if (!abstract_field.is_valid()) { return TypeRef::invalid(); }
+        return this.binding.subst_method_return_from_receiver(recv_type, abstract_field);
+    }
+
+    /// If `field_name` on `obj_type` is a Function-typed field, tag the member with
+    /// that type (so codegen emits an indirect call) and return its return type.
+    try_field_function_call(&this, obj_type: TypeRef, field_name: SymbolStr,
+                            member: MemberAccessNode*) -> TypeRef {
+        const t: Type* = this.arena.lookup(obj_type.id);
+        if (t == null) { return TypeRef::invalid(); }
+        mut check_t: Type* = t;
+        if (check_t.kind == TypeKind::Reference) {
+            check_t = this.arena.lookup((check_t as ReferenceType*).referent.id);
+            if (check_t == null) { return TypeRef::invalid(); }
+        }
+        if (check_t.kind == TypeKind::Struct) {
+            const st: StructType* = check_t as StructType*;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                if (st.fields[i].name.id == field_name.id) {
+                    const f_type: TypeRef = st.fields[i].field_type;
+                    const ft: Type* = this.arena.lookup(f_type.id);
+                    if (ft != null && ft.kind == TypeKind::Function) {
+                        if (member != null) { member.set_resolved_type(f_type); }
+                        return (ft as FunctionType*).return_type;
+                    }
+                    return TypeRef::invalid();
+                }
+            }
+        } else if (check_t.kind == TypeKind::Class) {
+            const ct: ClassType* = check_t as ClassType*;
+            for (mut i: i64 = 0; i < ct.fields.length; i++) {
+                if (ct.fields[i].name.id == field_name.id) {
+                    const f_type: TypeRef = ct.fields[i].field_type;
+                    const ft: Type* = this.arena.lookup(f_type.id);
+                    if (ft != null && ft.kind == TypeKind::Function) {
+                        if (member != null) { member.set_resolved_type(f_type); }
+                        return (ft as FunctionType*).return_type;
+                    }
+                    return TypeRef::invalid();
+                }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+
+    // -- Index access (`arr[i]` / `tup[0]`) --
+
+    resolve_array_access(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*) -> TypeRef {
+        const array_type: TypeRef = this.dispatch.resolve_expr(visitor, access.array);
+        const index_type: TypeRef = this.dispatch.resolve_expr(visitor, access.index);
+        if (!array_type.is_valid()) { return TypeRef::invalid(); }
+        if (this.symbolic.symbolic_type_unresolved(array_type)) { return TypeRef::invalid(); }
+
+        // Tuple bracket indexing (`t[0]`): compile-time bounds-checked integer.
+        mut walk_ty: TypeRef = array_type;
+        mut walk_t: Type* = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            if (walk_t.kind == TypeKind::Pointer) {
+                walk_ty = (walk_t as PointerType*).pointee;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::Reference) {
+                walk_ty = (walk_t as ReferenceType*).referent;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else if (walk_t.kind == TypeKind::InstantiatedType) {
+                const it: InstantiatedType* = walk_t as InstantiatedType*;
+                if (!it.has_resolved_type()) { break; }
+                walk_ty = it.resolved_type;
+                walk_t = this.arena.lookup(walk_ty.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (walk_t != null && walk_t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = walk_t as TupleType*;
+            const idx: i64 = sema_const_int_index(access.index);
+            if (idx < 0) {
+                this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+                    "tuple index must be a non-negative integer literal; runtime indices are not supported on tuples",
+                    access.span);
+                return TypeRef::invalid();
+            }
+            if (idx >= tup.elements.length) {
+                this.ctx.emit_error_at(ErrorCode::E0204_UNDEFINED_FIELD,
+                    format("tuple index %lld is out of bounds for tuple with %lld elements",
+                           idx, tup.elements.length), access.span);
+                return TypeRef::invalid();
+            }
+            return tup.elements[idx];
+        }
+
+        const result: TypeCheckResult = this.checker.check_index_access(array_type, index_type);
+        if (result.success) { return result.result_type; }
+        if (result.error_message != null && strlen(result.error_message) > 0) {
+            this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH, result.error_message, access.span);
+        }
+        return TypeRef::invalid();
+    }
+
+
+    // -- Visibility enforcement --
+
+    /// True when `candidate` is `ancestor_id` or descends from it through the
+    /// class base chain (depth-guarded).  Permits `protected` access from subclasses.
+    is_subclass_of(mut &this, candidate: Type*, ancestor_id: u64) -> boolean {
+        mut cur: Type* = candidate;
+        mut depth: i32 = 0;
+        while (cur != null && depth < 32) {
+            if (cur.id == ancestor_id) { return true; }
+            if (cur.kind != TypeKind::Class) { return false; }
+            const cc: ClassType* = cur as ClassType*;
+            if (cc.has_base && cc.base_class.is_valid()) {
+                cur = this.arena.lookup(cc.base_class.id);
+            } else {
+                return false;
+            }
+            depth += 1;
+        }
+        return false;
+    }
+
+    /// Emit E0353 when a private/protected field is accessed outside its declaring
+    /// type (allowing `protected` from subclasses).  No-op for public/non-aggregate.
+    enforce_field_visibility(mut &this, recv_type: TypeRef,
+                             field_name: SymbolStr, span: SourceSpan) -> void {
+        const base: Type* = this.types.unwrap_to_base_type(recv_type);
+        if (base == null) { return; }
+
+        mut field: FieldInfo* = null;
+        mut declaring_t: Type* = null;
+        mut declaring_name: string = "";
+
+        if (base.kind == TypeKind::Struct) {
+            mut st: StructType* = base as StructType*;
+            field = st.get_field(field_name);
+            if (field != null) { declaring_t = base; declaring_name = st.display_name(); }
+        } else if (base.kind == TypeKind::Class) {
+            mut current: ClassType* = base as ClassType*;
+            while (current != null) {
+                field = current.get_field(field_name);
+                if (field != null) {
+                    declaring_t = current as Type*;
+                    declaring_name = current.display_name();
+                    break;
+                }
+                if (current.has_base && current.base_class.is_valid()) {
+                    const parent_t: Type* = this.arena.lookup(current.base_class.id);
+                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
+                        current = parent_t as ClassType*;
+                    } else {
+                        current = null;
+                    }
+                } else {
+                    current = null;
+                }
+            }
+        }
+
+        if (field == null) { return; }
+        if (field.is_public) { return; }
+
+        if (this.state.current_owner_type.is_valid()) {
+            const owner: Type* = this.types.unwrap_to_base_type(this.state.current_owner_type);
+            if (owner != null && declaring_t != null) {
+                if (owner.id == declaring_t.id) { return; }
+                if (field.is_protected && this.is_subclass_of(owner, declaring_t.id)) { return; }
+            }
+        }
+
+        const vis_word: string = if (field.is_protected) { "protected" } else { "private" };
+        const field_str: string = this.intern.resolve(field_name);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0353_PRIVATE_ACCESS,
+            format("field `%s` of `%s` is %s", field_str, declaring_name, vis_word));
+        d = d.at_with_label(span, format("%s field accessed outside `%s`", vis_word, declaring_name));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// Method-call counterpart to `enforce_field_visibility` (E0353).
+    enforce_method_visibility(mut &this, recv_type: TypeRef,
+                              method_name: SymbolStr, span: SourceSpan) -> void {
+        const base: Type* = this.types.unwrap_to_base_type(recv_type);
+        if (base == null) { return; }
+
+        mut method: MethodInfo* = null;
+        mut declaring_t: Type* = null;
+        mut declaring_name: string = "";
+
+        if (base.kind == TypeKind::Struct) {
+            mut st: StructType* = base as StructType*;
+            method = st.get_method(method_name);
+            if (method != null) { declaring_t = base; declaring_name = st.display_name(); }
+        } else if (base.kind == TypeKind::Class) {
+            mut current: ClassType* = base as ClassType*;
+            while (current != null) {
+                method = current.get_method(method_name);
+                if (method != null) {
+                    declaring_t = current as Type*;
+                    declaring_name = current.display_name();
+                    break;
+                }
+                if (current.has_base && current.base_class.is_valid()) {
+                    const parent_t: Type* = this.arena.lookup(current.base_class.id);
+                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
+                        current = parent_t as ClassType*;
+                    } else {
+                        current = null;
+                    }
+                } else {
+                    current = null;
+                }
+            }
+        }
+
+        if (method == null) { return; }
+        if (method.is_public) { return; }
+
+        if (this.state.current_owner_type.is_valid()) {
+            const owner: Type* = this.types.unwrap_to_base_type(this.state.current_owner_type);
+            if (owner != null && declaring_t != null) {
+                if (owner.id == declaring_t.id) { return; }
+                if (method.is_protected && this.is_subclass_of(owner, declaring_t.id)) { return; }
+            }
+        }
+
+        const vis_word: string = if (method.is_protected) { "protected" } else { "private" };
+        const method_str: string = this.intern.resolve(method_name);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0353_PRIVATE_ACCESS,
+            format("method `%s` of `%s` is %s", method_str, declaring_name, vis_word));
+        d = d.at_with_label(span, format("%s method called outside `%s`", vis_word, declaring_name));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// Module identity for the code currently being checked.
+    current_module_name(&this) -> string {
+        if (this.ctx.has_namespace()) { return this.ctx.namespace_display(); }
+        return this.ctx.source_file;
+    }
+
+    /// Bare leaf of a possibly-qualified type name (`a::b::Secret` -> `Secret`).
+    visibility_leaf_name(&this, name: SymbolStr) -> SymbolStr {
+        const s: string = this.intern.resolve(name);
+        const n: i64 = intrinsics::strlen(s) as i64;
+        mut last: i64 = 0;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last = i + 2; }
+        }
+        if (last == 0) { return name; }
+        mut tail: string = "";
+        for (mut i: i64 = last; i < n; i++) {
+            tail = format("%s%c", tail, s[i] as i32);
+        }
+        return this.intern.intern(tail);
+    }
+
+    /// Reject a user-written reference to a cross-module `private` type (E0503).
+    /// No-op unless the registry reports a cross-module private match.
+    check_type_name_visibility(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+        if (this.ctx.type_resolver == null) { return; }
+        const reg: ModuleTypeRegistry* = this.ctx.type_resolver.module_registry;
+        if (reg == null) { return; }
+        const leaf: SymbolStr = this.visibility_leaf_name(name);
+        const owner: string = reg.private_owner_module(leaf, this.current_module_name());
+        if (intrinsics::strcmp(owner, "") == 0) { return; }
+        const leaf_str: string = this.intern.resolve(leaf);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
+            format("type `%s` is private to module `%s`", leaf_str, owner));
+        d = d.at_with_label(span,
+            format("`%s` cannot be named outside its module `%s`", leaf_str, owner));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// Walk a user-written type annotation, checking every `Named` leaf for
+    /// cross-module private access.  Skips `pre_resolved` leaves (mangled specs).
+    check_annotation_visibility(mut &this, ann: TypeAnnotation*) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                if (n.pre_resolved.is_valid()) { return; }
+                this.check_type_name_visibility(n.name, n.span);
+            }
+            TypeAnnotation::Generic(g) => {
+                this.check_annotation_visibility(g.base);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    this.check_annotation_visibility(g.args[i]);
+                }
+            }
+            TypeAnnotation::Pointer(p)   => { this.check_annotation_visibility(p.inner); }
+            TypeAnnotation::Reference(r)  => { this.check_annotation_visibility(r.inner); }
+            TypeAnnotation::Array(a)     => { this.check_annotation_visibility(a.element); }
+            TypeAnnotation::Optional(o)  => { this.check_annotation_visibility(o.inner); }
+            TypeAnnotation::Tuple(t)     => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    this.check_annotation_visibility(t.elements[i]);
+                }
+            }
+            TypeAnnotation::Function(f)  => {
+                this.check_annotation_visibility(f.return_type);
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    this.check_annotation_visibility(f.parameters[i]);
+                }
+            }
+            TypeAnnotation::ImplTrait(imp) => {
+                for (mut i: i64 = 0; i < imp.bounds.length; i++) {
+                    this.check_annotation_visibility(imp.bounds[i]);
+                }
+            }
+            _ => {}
+        }
+    }
+}

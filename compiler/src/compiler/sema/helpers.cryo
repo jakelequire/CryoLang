@@ -1,0 +1,466 @@
+/// Sema Helpers
+///
+/// Free, pure helper functions and constants shared across the Sema
+/// collaborators — literal-text parsing/folding, numeric-shape predicates, and
+/// small AST/type probes.  None hold visitor state; they take only their
+/// operands (an `ExpressionNode*`, a text lexeme, or a `TypeArena*`).
+///
+/// The `SEMA_*` maxima are hoisted into typed `u64` consts (kept private to this
+/// module) so they adopt `u64` rather than wrapping negative when compared
+/// inline under the bootstrap compiler.  Callers that need the width bounds go
+/// through `sema_int_unsigned_bound` / `sema_default_int_type` so the
+/// width→magnitude mapping lives in exactly one place.
+
+namespace Compiler::Sema::Helpers;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Expression;
+import Compiler::Lex;
+import Compiler::Types;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::Compound;
+
+
+// -- Numeric maxima (private; reached via the accessors below) --
+
+/// u64 max (2^64-1).
+const SEMA_U64_MAX: u64 = 18446744073709551615;
+/// i32 / i64 positive maxima.
+const SEMA_I32_MAX_MAG: u64 = 2147483647;
+const SEMA_I64_MAX_MAG: u64 = 9223372036854775807;
+
+/// Unsigned magnitude bound for an N-bit integer width: 8/16/32/64 ->
+/// 255/65535/4294967295/u64max.  Returns 0 for unsupported widths (128-bit
+/// bounds exceed u64, left unchecked by the width-bound callers).
+public function sema_int_unsigned_bound(width: u64) -> u64 {
+    if (width == 8)  { return 255; }
+    if (width == 16) { return 65535; }
+    if (width == 32) { return 4294967295; }
+    if (width == 64) { return SEMA_U64_MAX; }
+    return 0;
+}
+
+/// i32 positive-magnitude bound (2^31-1), for the "force-wide constant fold"
+/// gate in resolve_binary (a folded constant exceeding this needs i64).
+public function sema_i32_max_mag() -> u64 {
+    return SEMA_I32_MAX_MAG;
+}
+
+/// The default integer type for a literal of magnitude `value` when no expected
+/// type is in scope: i32 if it fits, else i64, else u64.  Picking the narrowest
+/// type that holds the magnitude keeps ordinary code on i32 while preventing a
+/// wide bare literal (e.g. an i64::MIN magnitude at a variadic boundary) from
+/// silently truncating to its low 32 bits.
+public function sema_default_int_type(arena: TypeArena*, value: string) -> TypeRef {
+    if (!int_literal_exceeds(value, SEMA_I32_MAX_MAG)) { return arena.get_i32(); }
+    if (!int_literal_exceeds(value, SEMA_I64_MAX_MAG)) { return arena.get_i64(); }
+    return arena.get_u64();
+}
+
+
+// -- Numeric-shape predicates over AST nodes --
+
+/// A bare integer literal's value as a non-negative tuple index, or -1 if the
+/// expression is not a plain integer literal / not a valid index.
+public function sema_const_int_index(expr: ExpressionNode*) -> i64 {
+    if (expr == null) { return -1; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::Literal) { return -1; }
+    const lit: LiteralNode* = expr as LiteralNode*;
+    if (lit.literal_kind != LiteralKind::Integer) { return -1; }
+    return parse_tuple_index(lit.value);
+}
+
+/// True when `expr` is a bare integer or float literal node.  Negative literals
+/// (`-5`) parse as a UnaryExpression wrapping the literal and are NOT matched
+/// here — see `is_negative_numeric_literal_expr`.
+public function is_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::Literal) { return false; }
+    const lit: LiteralNode* = expr as LiteralNode*;
+    return lit.literal_kind == LiteralKind::Integer
+        || lit.literal_kind == LiteralKind::Float;
+}
+
+/// True when `expr` is a compile-time-constant numeric expression: a numeric
+/// literal, or arithmetic/bitwise/shift combinations of such (`1 << 40`,
+/// `~mask`, `-(1 << 20)`).  Like a bare literal these are width-polymorphic, but
+/// their operands default to i32 and the computation happens at that width
+/// *before* the result widens to the slot — so the slot's type must be pushed
+/// onto the whole expression.  Comparisons / logical ops are excluded: they
+/// produce bool, not a numeric the slot could adopt.
+public function is_constant_numeric_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        return lit.literal_kind == LiteralKind::Integer
+            || lit.literal_kind == LiteralKind::Float;
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+            return is_constant_numeric_expr(u.operand);
+        }
+        return false;
+    }
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        const op: string = b.op.lexeme;
+        const is_arith: boolean =
+            op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+            || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+        if (!is_arith) { return false; }
+        return is_constant_numeric_expr(b.left)
+            && is_constant_numeric_expr(b.right);
+    }
+    return false;
+}
+
+/// True when `ty` is a 64-bit-or-wider integer type.  Gates pushing a param
+/// slot's type onto a constant numeric argument: wide slots are where a value
+/// computed at the i32 default silently truncates, while narrow slots (i8..u32)
+/// keep defaulting to i32 so a genuine narrowing is still flagged.
+public function is_wide_int_type(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null || t.kind != TypeKind::Int) { return false; }
+    const it: IntType* = t as IntType*;
+    return it.int_kind.bit_width() >= 64;
+}
+
+/// True when `expr` is a negated numeric literal: a `-`-operator UnaryExpression
+/// wrapping an integer/float literal.  The inner magnitude needs the surrounding
+/// expected type pushed onto it — otherwise it defaults to i32 and a wide bit
+/// pattern (i64::MIN's 2^63 magnitude) truncates to its low 32 bits, which
+/// negate to 0.
+public function is_negative_numeric_literal_expr(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::UnaryExpression) { return false; }
+    const u: UnaryExprNode* = expr as UnaryExprNode*;
+    if (u.op.lexeme != "-") { return false; }
+    return is_numeric_literal_expr(u.operand);
+}
+
+/// True when `expr` is an integer literal whose value denotes zero in any radix,
+/// ignoring digit separators: `0`, `0x0`, `0b0`, `00`, `0_0`, ...
+public function is_zero_int_literal(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind != NodeKind::Literal) { return false; }
+    const lit: LiteralNode* = expr as LiteralNode*;
+    if (lit.literal_kind != LiteralKind::Integer) { return false; }
+    return int_literal_text_is_zero(lit.value);
+}
+
+
+// -- Literal-text parsing / folding --
+
+public function int_literal_text_is_zero(s: string) -> boolean {
+    if (s == null) { return false; }
+    const len: i64 = strlen(s) as i64;
+    mut i: i64 = 0;
+    if (len >= 2 && s[0] == '0') {
+        const c1: char = s[1];
+        if (c1 == 'x' || c1 == 'X' || c1 == 'b'
+            || c1 == 'B' || c1 == 'o' || c1 == 'O') { i = 2; }
+    }
+    mut saw_digit: boolean = false;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i = i + 1; continue; }
+        if (c != '0') { return false; }
+        saw_digit = true;
+        i = i + 1;
+    }
+    return saw_digit;
+}
+
+/// Parse an integer-literal lexeme (decimal or `0x`/`0o`/`0b`, `_` allowed) into
+/// a u64.  Returns false on a non-integer char or overflow past u64.  Sibling of
+/// `int_literal_exceeds`, but yields the value.
+public function parse_int_literal_u64(s: string, out: u64*) -> boolean {
+    if (s == null) { return false; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return false; }
+    mut i: i64 = 0;
+    mut radix: u64 = 10;
+    if (len >= 2 && s[0] == '0') {
+        const c1: char = s[1];
+        if (c1 == 'x' || c1 == 'X') { radix = 16; i = 2; }
+        else if (c1 == 'b' || c1 == 'B') { radix = 2; i = 2; }
+        else if (c1 == 'o' || c1 == 'O') { radix = 8; i = 2; }
+    }
+    mut acc: u64 = 0;
+    mut saw: boolean = false;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i = i + 1; continue; }
+        mut d: u64 = 0;
+        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
+        else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
+        else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
+        else { return false; }
+        if (d >= radix) { return false; }
+        saw = true;
+        if (acc > (SEMA_U64_MAX - d) / radix) { return false; }
+        acc = acc * radix + d;
+        i = i + 1;
+    }
+    if (!saw) { return false; }
+    *out = acc;
+    return true;
+}
+
+/// True when the integer-literal text `s` denotes a magnitude strictly greater
+/// than `max_mag` (or overflows u64).  Honors `0x`/`0b`/`0o` prefixes and `_`
+/// separators.  Returns false on malformed text so other passes own that error.
+public function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
+    if (s == null) { return false; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return false; }
+    mut i: i64 = 0;
+    mut radix: u64 = 10;
+    if (len >= 2 && s[0] == '0') {
+        const c1: char = s[1];
+        if (c1 == 'x' || c1 == 'X') { radix = 16; i = 2; }
+        else if (c1 == 'b' || c1 == 'B') { radix = 2; i = 2; }
+        else if (c1 == 'o' || c1 == 'O') { radix = 8; i = 2; }
+    }
+    mut acc: u64 = 0;
+    mut saw_digit: boolean = false;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i = i + 1; continue; }
+        mut d: u64 = 0;
+        if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
+        else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
+        else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
+        else { return false; }
+        if (d >= radix) { return false; }
+        saw_digit = true;
+        // Overflow-checked acc = acc*radix + d.  Past u64 it can only be larger
+        // than any in-range bound, so report "exceeds".
+        if (acc > (SEMA_U64_MAX - d) / radix) { return true; }
+        acc = acc * radix + d;
+        i = i + 1;
+    }
+    if (!saw_digit) { return false; }
+    return acc > max_mag;
+}
+
+/// Fold a compile-time-constant integer expression to its i64 value, for width
+/// selection only (the actual computation is left to codegen at the chosen
+/// width).  Accepts the same shapes as `is_constant_numeric_expr`.  Returns
+/// false (caller leaves width unchanged) for anything non-constant or whenever a
+/// step would overflow i64 or hit a constant divide-by-zero — bailing is always
+/// safe since it just preserves the existing default width.
+public function try_fold_const_i64(expr: ExpressionNode*, out: i64*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return false; }
+        mut v: u64 = 0;
+        if (!parse_int_literal_u64(lit.value, &v)) { return false; }
+        if (v > SEMA_I64_MAX_MAG) { return false; }   // needs > i64; bail
+        *out = v as i64;
+        return true;
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        mut a: i64 = 0;
+        if (!try_fold_const_i64(u.operand, &a)) { return false; }
+        if (u.op.lexeme == "-") { *out = 0 - a; return true; }
+        if (u.op.lexeme == "+") { *out = a; return true; }
+        if (u.op.lexeme == "~") { *out = ~a; return true; }
+        return false;
+    }
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        mut x: i64 = 0;
+        mut y: i64 = 0;
+        if (!try_fold_const_i64(b.left, &x)) { return false; }
+        if (!try_fold_const_i64(b.right, &y)) { return false; }
+        const op: string = b.op.lexeme;
+        const I64MAX: i64 = SEMA_I64_MAX_MAG as i64;
+        const I64MIN: i64 = (0 - I64MAX) - 1;
+        if (op == "+") {
+            if (y > 0 && x > I64MAX - y) { return false; }
+            if (y < 0 && x < I64MIN - y) { return false; }
+            *out = x + y; return true;
+        }
+        if (op == "-") {
+            if (y < 0 && x > I64MAX + y) { return false; }
+            if (y > 0 && x < I64MIN + y) { return false; }
+            *out = x - y; return true;
+        }
+        if (op == "*") {
+            if (x == 0 || y == 0) { *out = 0; return true; }
+            // Bail on the trap edge and on overflow (checked by re-division).
+            if (x == I64MIN || y == I64MIN) { return false; }
+            const p: i64 = x * y;
+            if (p / y != x) { return false; }
+            *out = p; return true;
+        }
+        if (op == "/" || op == "%") {
+            if (y == 0) { return false; }
+            if (x == I64MIN && y == 0 - 1) { return false; }
+            *out = if (op == "/") { x / y } else { x % y };
+            return true;
+        }
+        if (op == "<<") {
+            if (y < 0 || y >= 63 || x < 0) { return false; }
+            if (x > (I64MAX >> y)) { return false; }
+            *out = x << y; return true;
+        }
+        if (op == ">>") {
+            if (y < 0 || y >= 64) { return false; }
+            *out = x >> y; return true;
+        }
+        if (op == "&") { *out = x & y; return true; }
+        if (op == "|") { *out = x | y; return true; }
+        if (op == "^") { *out = x ^ y; return true; }
+        return false;
+    }
+    return false;
+}
+
+/// Parse a member-name as a non-negative tuple index.  Returns -1 for any
+/// non-digit character or empty input (callers distinguish "not a tuple index"
+/// from "out of bounds").  Plain decimal only.
+public function parse_tuple_index(s: string) -> i64 {
+    if (s == null) { return -1; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return -1; }
+    mut acc: i64 = 0;
+    for (mut i: i64 = 0; i < len; i++) {
+        const c: char = s[i];
+        if (c < '0' || c > '9') { return -1; }
+        acc = acc * 10 + ((c - '0') as i64);
+    }
+    return acc;
+}
+
+/// Decode a range-pattern bound's interned text into a signed value for the
+/// `lo <= hi` ordering check.  Kept here (not in codegen) so sema doesn't reach
+/// across layers.  Best-effort: a malformed lexeme decodes to 0 rather than
+/// raising a second error.
+public function sema_decode_range_bound(s: string, kind: LiteralKind) -> i64 {
+    if (s == null) { return 0; }
+    const len: i64 = strlen(s) as i64;
+    if (len == 0) { return 0; }
+
+    if (kind == LiteralKind::Char) {
+        // The lexer hands over the text *between* the quotes, so `'\n'` arrives
+        // as the two chars `\` `n`.  Resolve the C-style escapes.
+        if (len >= 2 && s[0] == '\\') {
+            const esc: char = s[1];
+            if (esc == 'n')  { return 10; }
+            if (esc == 't')  { return 9; }
+            if (esc == 'r')  { return 13; }
+            if (esc == '0')  { return 0; }
+            if (esc == '\\') { return 92; }
+            if (esc == '\'') { return 39; }
+            if (esc == '"')  { return 34; }
+            if (esc == 'a')  { return 7; }
+            if (esc == 'b')  { return 8; }
+            if (esc == 'f')  { return 12; }
+            if (esc == 'v')  { return 11; }
+            if (esc == 'x' && len >= 4) {
+                return sema_hex_digit(s[2]) * 16 + sema_hex_digit(s[3]);
+            }
+            return esc as i64;
+        }
+        return s[0] as i64;
+    }
+
+    // Integer bound: optional sign, then 0x/0o/0b/decimal, '_' separators.
+    mut i: i64 = 0;
+    mut negate: boolean = false;
+    if (s[0] == '-') { negate = true; i = 1; }
+    else if (s[0] == '+') { i = 1; }
+
+    mut base: i64 = 10;
+    if (i + 1 < len && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X')) { base = 16; i += 2; }
+    else if (i + 1 < len && s[i] == '0' && (s[i+1] == 'b' || s[i+1] == 'B')) { base = 2; i += 2; }
+    else if (i + 1 < len && s[i] == '0' && (s[i+1] == 'o' || s[i+1] == 'O')) { base = 8; i += 2; }
+
+    mut acc: i64 = 0;
+    while (i < len) {
+        const c: char = s[i];
+        if (c == '_') { i += 1; continue; }
+        const digit: i64 = sema_hex_digit(c);
+        if (digit < 0 || digit >= base) { break; }
+        acc = acc * base + digit;
+        i += 1;
+    }
+    if (negate) { return 0 - acc; }
+    return acc;
+}
+
+/// Value of a single hex digit (0-9, a-f, A-F), or -1 if not a hex digit.
+public function sema_hex_digit(c: char) -> i64 {
+    if (c >= '0' && c <= '9') { return (c - '0') as i64; }
+    if (c >= 'a' && c <= 'f') { return (c - 'a' + 10) as i64; }
+    if (c >= 'A' && c <= 'F') { return (c - 'A' + 10) as i64; }
+    return -1;
+}
+
+
+// -- Name / lexeme predicates (pure) --
+
+/// True when `name` is the spelling of a built-in numeric type.
+public function is_numeric_type_name(name: string) -> boolean {
+    return strcmp(name, "i8")  == 0 || strcmp(name, "i16") == 0
+        || strcmp(name, "i32") == 0 || strcmp(name, "i64") == 0
+        || strcmp(name, "i128") == 0
+        || strcmp(name, "u8")  == 0 || strcmp(name, "u16") == 0
+        || strcmp(name, "u32") == 0 || strcmp(name, "u64") == 0
+        || strcmp(name, "u128") == 0
+        || strcmp(name, "isize") == 0 || strcmp(name, "usize") == 0
+        || strcmp(name, "f32") == 0 || strcmp(name, "f64") == 0
+        || strcmp(name, "int") == 0;
+}
+
+/// True when `s` is the body of a numeric literal: an optional sign followed by
+/// decimal digits with at most one `.` (hex/octal/binary carry a `0x`/`0o`/`0b`
+/// prefix and won't appear inside a number-meant string literal).
+public function lexeme_looks_like_number(s: string) -> boolean {
+    if (s == null) { return false; }
+    const n: i64 = strlen(s) as i64;
+    if (n == 0) { return false; }
+    mut i: i64 = 0;
+    if (s[0] == '-' || s[0] == '+') { i = 1; }
+    if (i >= n) { return false; }
+    mut saw_dot: boolean = false;
+    while (i < n) {
+        const c: char = s[i];
+        if (c.is_digit()) { i += 1; continue; }
+        if (c == '.' && !saw_dot)  { saw_dot = true; i += 1; continue; }
+        return false;
+    }
+    return true;
+}
+
+/// Length of the common leading-character prefix of two namespace strings.  A
+/// longer shared prefix means the candidate module lives in the same subsystem
+/// as the caller (used to break module-proximity ties in call resolution).
+public function ns_shared_prefix_len(a: string, b: string) -> i64 {
+    if (a == null || b == null) { return 0; }
+    mut i: i64 = 0;
+    while (a[i] != 0 && b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return i;
+}
+
+/// Shallow copy of a TypeRef slice into a fresh owned array (TypeRef is Copy).
+public function sema_copy_type_refs(src: &TypeRef[]) -> TypeRef[] {
+    mut out: TypeRef[] = [];
+    for (mut i: i64 = 0; i < src.length; i++) { out.push(src[i]); }
+    return out;
+}

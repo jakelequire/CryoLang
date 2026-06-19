@@ -1,0 +1,1518 @@
+/// Mono Call Specializer  (Compiler::Mono::CallSpecializer)
+///
+/// The sema-stash CONSUMER.  Walks a module's call sites and, for each generic
+/// free-function / method / static call that sema already resolved, mints the
+/// per-call specialization: pins the specialized callee symbol on the call,
+/// queues the function-template instantiation, and (for generic methods) clones +
+/// re-resolves a concrete method sibling and registers it in the DeclarationIndex.
+///
+/// POST-REORDER (mono-after-sema): semantic analysis ran FIRST and stashed every
+/// generic call's concrete type arguments on `CallExprNode.resolved_type_args`,
+/// and typed every receiver/argument expression.  This collaborator READS those —
+/// it NEVER re-derives them.  The old argument/receiver/literal inference engine
+/// (`unify_for_inference`, `resolve_arg_type_for_inference`, the literal-default
+/// guess, the local-variable mini-sema tables) is GONE: bindings come from the
+/// stash, the receiver type from `ma.object.resolved_type`.  What remains is
+/// template/method LOOKUP, where-bound checking, and the clone+substitute+register
+/// mechanics — none of which is inference.
+///
+/// This replaces the monolith's `discover_inferred_calls_in_module` +
+/// `try_infer_function_call` + `try_infer_method_call` +
+/// `try_infer_static_method_on_generic_template`.
+
+namespace Compiler::Mono::CallSpecializer;
+
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::Statement;
+import Compiler::AST::Expression;
+import Compiler::AST::Pattern;
+import Compiler::Types::Generic;
+import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
+import Compiler::Types::Type;
+import Compiler::Types::Arena;
+import Compiler::Types::TypeRef;
+import Compiler::Types::Substitution;
+import Compiler::Types::Resolver;
+import Compiler::Types::GenericRegistry;
+import Compiler::Types::Ownership;
+import Compiler::Types::Monomorphizer;   // mono_str_ends_with / mono_shared_prefix_len (types-rooted)
+import Compiler::Diag;
+import Compiler::Diag::Sink;
+import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::DeclIndex;
+import Compiler::Resolver::InternTable;
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::QualifiedName;
+import Compiler::Resolver::MangledName;
+import Compiler::Mono::State;
+import Compiler::Mono::TraitSpecializer;
+import Compiler::Mono::AstResolver;
+
+
+type struct MonoCallSpecializer {
+    arena:            TypeArena*;
+    generic_registry: GenericRegistry*;
+    intern_table:     InternTable*;
+    diagnostics:      DiagnosticSink*;
+    type_resolver:    TypeResolver*;
+    decl_index:       DeclarationIndex*;
+    state:            MonoState*;
+    trait_spec:       MonoTraitSpecializer*;
+    ast_resolver:     MonoAstResolver*;
+    current_module:   SymbolStr;
+
+    static null() -> MonoCallSpecializer {
+        return MonoCallSpecializer {
+            arena:            null,
+            generic_registry: null,
+            intern_table:     null,
+            diagnostics:      null,
+            type_resolver:    null,
+            decl_index:       null,
+            state:            null,
+            trait_spec:       null,
+            ast_resolver:     null,
+            current_module:   SymbolStr::empty(),
+        };
+    }
+
+    wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,
+                    intern_table: InternTable*, diagnostics: DiagnosticSink*,
+                    type_resolver: TypeResolver*, decl_index: DeclarationIndex*,
+                    state: MonoState*, trait_spec: MonoTraitSpecializer*,
+                    ast_resolver: MonoAstResolver*) -> void {
+        this.arena            = arena;
+        this.generic_registry = generic_registry;
+        this.intern_table     = intern_table;
+        this.diagnostics      = diagnostics;
+        this.type_resolver    = type_resolver;
+        this.decl_index       = decl_index;
+        this.state            = state;
+        this.trait_spec       = trait_spec;
+        this.ast_resolver     = ast_resolver;
+    }
+
+    set_current_module(mut &this, module: SymbolStr) -> void {
+        this.current_module = module;
+    }
+
+
+    // -- Module walk (replaces discover_inferred_calls_in_module) --
+
+    /// Walk every non-generic top-level declaration's body and specialize each
+    /// generic free/method/static call from sema's stash.  Generic carriers are
+    /// skipped: their bodies are walked per-instantiation when their own spec is
+    /// materialized (the body-rewalk inside specialize_method).
+    specialize_calls_in_module(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        const _empty: string = "";
+        mut res_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    if (func.is_generic()) { continue; }
+                    this.walk_func_body(func, &res_ctx);
+                }
+                NodeKind::StructDeclaration => {
+                    const sn: StructDeclNode* = stmt as StructDeclNode*;
+                    if (sn.is_generic()) { continue; }
+                    this.walk_methods(sn.methods, &res_ctx);
+                }
+                NodeKind::ClassDeclaration => {
+                    const cn: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (cn.is_generic()) { continue; }
+                    this.walk_methods(cn.methods, &res_ctx);
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    if (ib.generic_params.length > 0) { continue; }
+                    this.walk_methods(ib.methods, &res_ctx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*) -> void {
+        for (mut k: i64 = 0; k < methods.length; k++) {
+            const m: MethodNode* = methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (m.func.is_generic()) { continue; }
+            this.walk_func_body(m.func, res_ctx);
+        }
+    }
+
+    walk_func_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
+        if (func == null || func.body == null) { return; }
+        // No local-variable table is built: sema typed every expression, so the
+        // receiver/argument types come from `resolved_type`, not a mono mini-sema.
+        this.walk_block(func.body, res_ctx, null);
+    }
+
+
+    // -- Body walk: find generic calls, dispatch to the per-call consumers --
+
+    walk_block(mut &this, block: BlockStmtNode*, res_ctx: ResolutionContext*,
+               subst: TypeSubstitution*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            this.walk_stmt(block.statements[i], res_ctx, subst);
+        }
+    }
+
+    walk_stmt(mut &this, stmt: StatementNode*, res_ctx: ResolutionContext*,
+              subst: TypeSubstitution*) -> void {
+        if (stmt == null) { return; }
+        const node: ASTNode* = stmt as ASTNode*;
+        match (node.kind) {
+            NodeKind::ExpressionStatement => {
+                const es: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.walk_expr(es.expression, res_ctx, subst);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                const inner: DeclarationNode* = ds.declaration;
+                if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    mut vd: VarDeclNode* = inner as VarDeclNode*;
+                    if (vd.initializer != null) {
+                        this.walk_expr(vd.initializer, res_ctx, subst);
+                        // Sema already typed this binding to a concrete
+                        // instantiation (e.g. an adapter CHAIN result
+                        // `CopiedIter<RefIter<i32>>` whose receiver is a
+                        // method-call temporary mono can't reconstruct).  Treat
+                        // sema's binding type as the demand and enqueue it
+                        // directly; enqueue_from_type_ref is a guarded no-op unless
+                        // it is a registered template with fully concrete args.
+                        if (vd.resolved_type.is_valid()) {
+                            mut bind_ty: TypeRef = vd.resolved_type;
+                            if (subst != null) { bind_ty = subst.apply(bind_ty, this.arena); }
+                            this.state.enqueue_from_type_ref(bind_ty);
+                        }
+                    }
+                }
+            }
+            NodeKind::ReturnStatement => {
+                const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                if (rs.expression != null) {
+                    this.walk_expr(rs.expression, res_ctx, subst);
+                }
+            }
+            NodeKind::BlockStatement => {
+                this.walk_block(stmt as BlockStmtNode*, res_ctx, subst);
+            }
+            NodeKind::IfStatement => {
+                const ifs: IfStmtNode* = stmt as IfStmtNode*;
+                this.walk_expr(ifs.condition, res_ctx, subst);
+                if (ifs.then_stmt != null) { this.walk_stmt(ifs.then_stmt, res_ctx, subst); }
+                if (ifs.has_else() && ifs.else_stmt != null) {
+                    this.walk_stmt(ifs.else_stmt, res_ctx, subst);
+                }
+            }
+            NodeKind::WhileStatement => {
+                const ws: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.walk_expr(ws.condition, res_ctx, subst);
+                if (ws.body != null) { this.walk_stmt(ws.body, res_ctx, subst); }
+            }
+            NodeKind::ForStatement => {
+                const fs: ForStmtNode* = stmt as ForStmtNode*;
+                if (fs.condition != null) { this.walk_expr(fs.condition, res_ctx, subst); }
+                if (fs.body != null) { this.walk_stmt(fs.body, res_ctx, subst); }
+            }
+            NodeKind::LoopStatement => {
+                const ls: LoopStmtNode* = stmt as LoopStmtNode*;
+                if (ls.body != null) { this.walk_stmt(ls.body, res_ctx, subst); }
+            }
+            NodeKind::MatchStatement => {
+                const ms: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.walk_expr(ms.subject, res_ctx, subst);
+                for (mut i: i64 = 0; i < ms.arms.length; i++) {
+                    const arm: MatchArmNode* = ms.arms[i];
+                    if (arm == null) { continue; }
+                    if (arm.guard != null) { this.walk_expr(arm.guard, res_ctx, subst); }
+                    if (arm.body != null) { this.walk_stmt(arm.body, res_ctx, subst); }
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.walk_stmt(arm.body, res_ctx, subst);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_expr(mut &this, expr: ExpressionNode*, res_ctx: ResolutionContext*,
+              subst: TypeSubstitution*) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        match (node.kind) {
+            NodeKind::CallExpression => {
+                const call: CallExprNode* = expr as CallExprNode*;
+                for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                    this.walk_expr(call.arguments[i], res_ctx, subst);
+                }
+                if (call.callee != null) {
+                    this.walk_expr(call.callee, res_ctx, subst);
+                }
+                this.specialize_free_call(call, res_ctx, subst);
+                this.specialize_method_call(call, subst);
+            }
+            NodeKind::BinaryExpression => {
+                const be: BinaryExprNode* = expr as BinaryExprNode*;
+                this.walk_expr(be.left, res_ctx, subst);
+                this.walk_expr(be.right, res_ctx, subst);
+            }
+            NodeKind::UnaryExpression => {
+                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                this.walk_expr(ue.operand, res_ctx, subst);
+            }
+            NodeKind::TryExpression => {
+                const te: TryExprNode* = expr as TryExprNode*;
+                this.walk_expr(te.operand, res_ctx, subst);
+            }
+            NodeKind::IfExpression => {
+                const ie: IfExprNode* = expr as IfExprNode*;
+                this.walk_expr(ie.condition, res_ctx, subst);
+                this.walk_expr(ie.then_expr, res_ctx, subst);
+                this.walk_expr(ie.else_expr, res_ctx, subst);
+            }
+            NodeKind::MatchExpression => {
+                const me: MatchExprNode* = expr as MatchExprNode*;
+                this.walk_expr(me.subject, res_ctx, subst);
+                for (mut i: i64 = 0; i < me.arms.length; i++) {
+                    const arm: MatchArmNode* = me.arms[i];
+                    if (arm == null) { continue; }
+                    if (arm.guard != null) { this.walk_expr(arm.guard, res_ctx, subst); }
+                    if (arm.body != null) { this.walk_stmt(arm.body, res_ctx, subst); }
+                }
+            }
+            NodeKind::StaticMatchExpression => {
+                const sme: StaticMatchExprNode* = expr as StaticMatchExprNode*;
+                for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sme.arms[i];
+                    if (arm != null && arm.body != null) {
+                        this.walk_stmt(arm.body, res_ctx, subst);
+                    }
+                }
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                this.walk_expr(ma.object, res_ctx, subst);
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                this.walk_expr(aa.array, res_ctx, subst);
+                this.walk_expr(aa.index, res_ctx, subst);
+            }
+            NodeKind::CastExpression => {
+                const ce: CastExprNode* = expr as CastExprNode*;
+                this.walk_expr(ce.expression, res_ctx, subst);
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = expr as StructLiteralNode*;
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    this.walk_expr(sl.field_inits[i].value, res_ctx, subst);
+                }
+            }
+            NodeKind::ArrayLiteral => {
+                const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
+                for (mut i: i64 = 0; i < al.elements.length; i++) {
+                    this.walk_expr(al.elements[i], res_ctx, subst);
+                }
+            }
+            NodeKind::Identifier => {
+                // A bare identifier carrying turbofish args is a generic
+                // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
+                this.specialize_fn_value_ref(expr as IdentifierNode*, res_ctx, subst);
+            }
+            _ => {}
+        }
+    }
+
+
+    // -- Free-function call specialization (consumes call.resolved_type_args) --
+
+    /// Pin a specialized callee on a generic free-function call so codegen can
+    /// resolve it, and queue the instantiation.  Bindings come from sema's stash
+    /// (`call.resolved_type_args`); a call without a stash is outside sema's
+    /// visibility and is left unspecialized.
+    specialize_free_call(mut &this, call: CallExprNode*, res_ctx: ResolutionContext*,
+                         subst: TypeSubstitution*) -> void {
+        if (call == null) { return; }
+        if (call.resolved_callee.is_valid()) { return; }
+        if (call.callee == null) { return; }
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+
+        // Extract the bare callee name and any qualifying scope.
+        mut callee_name:  SymbolStr = SymbolStr::empty();
+        mut callee_scope: SymbolStr = SymbolStr::empty();
+        if (callee_node.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = call.callee as IdentifierNode*;
+            callee_name = ident.name;
+        } else if (callee_node.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            callee_name  = sr.member_name;
+            callee_scope = sr.scope_name;
+        } else {
+            return;
+        }
+
+        // Look up the function template (same precedence ladder sema uses, so the
+        // instantiated spec and the call's resolved callee agree).
+        mut entry: TemplateEntry* = null;
+        if (callee_scope.is_valid()) {
+            const member_str: string = this.intern_table.resolve(callee_name);
+            const qualified_scope: SymbolStr = if (this.decl_index != null) {
+                this.decl_index.resolve_qualified(callee_scope)
+            } else {
+                callee_scope
+            };
+            const qscope_str: string = this.intern_table.resolve(qualified_scope);
+            const qualified_str: string = qscope_str + "::" + member_str;
+            const qsym: SymbolStr = this.intern_table.intern(qualified_str);
+            const call_arity_di: i64 = call.arguments.length;
+            const qe: TemplateEntry* = this.generic_registry.get_template(qsym);
+            if (qe != null && qe.node_kind == NodeKind::FunctionDeclaration
+                    && this.fn_template_arity_compatible(qe, call_arity_di)) {
+                entry = qe;
+            }
+            if (entry == null && !qualified_scope.equals(callee_scope)) {
+                const bscope_str: string = this.intern_table.resolve(callee_scope);
+                const bare_str: string = bscope_str + "::" + member_str;
+                const bsym: SymbolStr = this.intern_table.intern(bare_str);
+                const be: TemplateEntry* = this.generic_registry.get_template(bsym);
+                if (be != null && be.node_kind == NodeKind::FunctionDeclaration
+                        && this.fn_template_arity_compatible(be, call_arity_di)) {
+                    entry = be;
+                }
+            }
+            if (entry == null && this.decl_index != null) {
+                const scope_as_type: TypeRef = this.decl_index.lookup_type(callee_scope);
+                const qscope_as_type: TypeRef =
+                    if (qualified_scope.equals(callee_scope)) {
+                        scope_as_type
+                    } else {
+                        this.decl_index.lookup_type(qualified_scope)
+                    };
+                if (!scope_as_type.is_valid() && !qscope_as_type.is_valid()) {
+                    // Scope-qualified call to a non-type (module-alias) scope:
+                    // only accept a free-function template that lives in that module.
+                    entry = this.find_scoped_function_template(
+                        callee_name, callee_scope, call.arguments.length);
+                } else {
+                    // Scope resolves to a TYPE: this may be a non-generic static
+                    // method on a GENERIC owner (`Slice<T>::from_raw`,
+                    // `String<GA>::from_cstr`).  Sema stashed the owner's type args;
+                    // consume them.  When handled (callee pinned + owner enqueued),
+                    // stop — there is no free-function template to instantiate.
+                    const sr2: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+                    if (this.specialize_static_method_on_generic_owner(call, sr2, subst)) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            entry = this.find_function_template_for_call(callee_name);
+        }
+        if (entry == null) { return; }
+        const tmpl_func: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl_func == null) { return; }
+
+        // Seed bindings from sema's stash (the source of truth).  Apply the active
+        // specialization `subst`: a stash on a template body holds the enclosing
+        // template's params; this spec concretizes them (no-op on a concrete stash).
+        if (entry.param_type_ids.length == 0) { return; }
+        if (call.resolved_type_args.length != entry.param_type_ids.length) {
+            // No (or partial) stash: outside sema's visibility; leave unspecialized.
+            // (Invariant #2 candidate to HARDEN to an ICE once the reorder is
+            // validated end-to-end — left as a soft return during bring-up.)
+            return;
+        }
+        mut bindings: TypeRef[] = [];
+        mut all_bound: boolean = true;
+        for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
+            mut b: TypeRef = call.resolved_type_args[i];
+            if (subst != null) { b = subst.apply(b, this.arena); }
+            if (!b.is_valid()) { all_bound = false; break; }
+            bindings.push(b);
+        }
+        if (!all_bound) { return; }
+
+        // Where-clause bound check at the call site.  If the bindings don't satisfy
+        // the function's `where T: Trait` clauses, emit a diagnostic and skip
+        // pin + queue (which suppresses the cascade from the rejected body).
+        if (!this.check_function_bounds_at_call(call, tmpl_func, entry, &bindings)) {
+            return;
+        }
+
+        // Pin the specialized callee symbol + queue the instantiation.
+        const base_sym: SymbolStr = entry.spec_base_name(this.intern_table);
+        const base_qname: QualifiedName = QualifiedName::from_symbol(base_sym);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern_table, this.arena, base_qname, bindings);
+        if (!spec_sym.is_valid()) { return; }
+        call.set_resolved_callee(spec_sym);
+        const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
+            entry.base_type, bindings, this.current_module);
+        // Seed mono's pending worklist directly: the registry only tracks
+        // cache_keys, and drain_pending_worklist iterates `pending`.
+        this.state.enqueue_from_type_ref(new_inst);
+    }
+
+    /// Resolve a generic function-reference value `name<Args>` used as a
+    /// first-class value: resolve the explicit turbofish args, pin the specialized
+    /// callee symbol on the identifier, and queue the instantiation.  No-op for
+    /// ordinary identifiers (no turbofish).  This reads explicit turbofish args
+    /// directly (not a stash) — it is not inference.
+    specialize_fn_value_ref(mut &this, ident: IdentifierNode*,
+                            res_ctx: ResolutionContext*,
+                            subst: TypeSubstitution*) -> void {
+        if (ident == null) { return; }
+        if (ident.generic_args.length == 0) { return; }
+        if (ident.resolved_callee.is_valid()) { return; }
+        if (this.type_resolver == null || res_ctx == null) { return; }
+        if (this.generic_registry == null) { return; }
+
+        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name);
+        if (entry == null) { return; }
+        if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+
+        mut seeded: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ident.generic_args.length; i++) {
+            mut tr: TypeRef = this.type_resolver.resolve(ident.generic_args[i], res_ctx);
+            if (!tr.is_valid()) { return; }
+            if (subst != null) { tr = subst.apply(tr, this.arena); }
+            seeded.push(tr);
+        }
+        seeded = this.type_resolver.expand_default_type_args(entry, seeded, res_ctx);
+        if (seeded.length != entry.param_type_ids.length) { return; }
+
+        const base_sym: SymbolStr = entry.spec_base_name(this.intern_table);
+        const base_qname: QualifiedName = QualifiedName::from_symbol(base_sym);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern_table, this.arena, base_qname, seeded);
+        if (!spec_sym.is_valid()) { return; }
+        ident.set_resolved_callee(spec_sym);
+        const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
+            entry.base_type, seeded, this.current_module);
+        this.state.enqueue_from_type_ref(new_inst);
+    }
+
+
+    // -- Method-call specialization (consumes call.resolved_type_args) --
+
+    /// Specialize a generic method call from sema's method-level binding stash.
+    /// Ported from the monolith `try_infer_method_call` (5500-5909), DEINFERENCED:
+    ///   * RECEIVER: `ma.object.resolved_type` (sema-pinned) replaces the deleted
+    ///     resolve_arg_type_for_inference + static-call / fluent-builder recovery.
+    ///   * BINDINGS: the method's own generics come from `call.resolved_type_args`
+    ///     (sema's stash); the formal/actual unify engine is gone.
+    ///   * ADAPTER RECEIVERS: there is no synchronous `ensure_receiver_inst_resolved`
+    ///     (it needed the orchestrator's spec cache).  Instead the unwrap loop leaves
+    ///     an unresolved adapter inst alone; `find_spec_inline_method` enqueues it, and
+    ///     the run_monomorphization walk/drain FIXPOINT resolves the chained call on a
+    ///     later iteration (sema pre-types adapter returns as concrete InstantiatedTypes).
+    specialize_method_call(mut &this, call: CallExprNode*, subst: TypeSubstitution*) -> void {
+        if (call == null) { return; }
+        // An already-concrete (non-generic, or already-minted spec) resolved method
+        // needs no work; mono pins the spec back into resolved_method at the end, so
+        // a re-walk over the same call (fixpoint) lands here and short-circuits.
+        if (call.resolved_method != null) {
+            const rm: MethodNode* = call.resolved_method as MethodNode*;
+            if (rm == null || rm.func == null || rm.func.generic_params.length == 0) {
+                return;
+            }
+        }
+        if (call.callee == null) { return; }
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind != NodeKind::MemberAccess) { return; }
+        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+
+        // RECEIVER from sema (invariant #1): sema typed every receiver.  Apply the
+        // active spec subst (the call may be walked inside a still-generic spec body).
+        mut recv_type: TypeRef = ma.object.resolved_type;
+        if (!recv_type.is_valid()) { return; }
+        if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
+
+        // Unwrap Reference/Pointer/InstantiatedType to a concrete Struct/Class/Enum
+        // (what spec_entries.specialized_type points at).  An unresolved adapter inst
+        // is left as-is for the is_unresolved_inst path + fixpoint re-walk.
+        mut t: Type* = this.arena.lookup(recv_type.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 8) {
+            if (t.kind == TypeKind::Pointer) {
+                recv_type = (t as PointerType*).pointee;
+                t = this.arena.lookup(recv_type.id);
+            } else if (t.kind == TypeKind::Reference) {
+                recv_type = (t as ReferenceType*).referent;
+                t = this.arena.lookup(recv_type.id);
+            } else if (t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                recv_type = inst.resolved_type;
+                t = this.arena.lookup(recv_type.id);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (t == null) { return; }
+        const tk: TypeKind = t.kind;
+        const is_user_kind: boolean = tk == TypeKind::Struct
+                                   || tk == TypeKind::Class
+                                   || tk == TypeKind::Enum;
+        const is_primitive_kind: boolean = tk == TypeKind::Int
+                                        || tk == TypeKind::Float
+                                        || tk == TypeKind::Bool
+                                        || tk == TypeKind::Char
+                                        || tk == TypeKind::String;
+        const is_unresolved_inst: boolean = tk == TypeKind::InstantiatedType;
+        if (!is_user_kind && !is_primitive_kind && !is_unresolved_inst) { return; }
+
+        // Zero-own-generic self-returning combinator defaults (take/filter) are
+        // instantiated lazily here; own-generic ones (map<B>) fall through.
+        if (this.try_instantiate_self_returning_default(call, ma, recv_type)) {
+            return;
+        }
+
+        // Method-lookup ladder (LOOKUP, not inference; precedence is load-bearing).
+        mut impl_node: ImplBlockNode* = null;
+        mut inherent_owner_ast: ASTNode* = null;
+        mut orig_method: MethodNode* = null;
+        if (is_user_kind || is_unresolved_inst) {
+            orig_method = this.find_spec_impl_method(recv_type, ma.member, ma.resolved_trait, &impl_node);
+            if (orig_method == null) {
+                orig_method = this.find_inherent_method(recv_type, ma.member, &inherent_owner_ast);
+            }
+            if (orig_method == null) {
+                orig_method = this.find_spec_inline_method(recv_type, ma.member, &inherent_owner_ast);
+            }
+            if (orig_method == null) {
+                // Synthesized/hand-written generic trait method on a non-generic
+                // user type (e.g. a `Display::fmt<W>` keyed by the bare target).
+                const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+                mut cand_impl: ImplBlockNode* = null;
+                const cand: MethodNode* = this.find_trait_impl_method_for_target(
+                    bare, ma.member, ma.resolved_trait, &cand_impl);
+                if (cand != null && cand.func != null
+                        && (cand.func.is_synth_default || cand.func.is_generic())) {
+                    orig_method = cand;
+                    impl_node = cand_impl;
+                }
+            }
+        } else {
+            const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+            orig_method = this.find_trait_impl_method_for_target(
+                bare, ma.member, ma.resolved_trait, &impl_node);
+        }
+        if (orig_method == null) { return; }
+        if (impl_node == null && inherent_owner_ast == null) { return; }
+        const orig_func: FunctionDeclNode* = orig_method.func;
+        if (orig_func == null) { return; }
+
+        // The method's OWN generic params (e.g. <H> on hash<H>).
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return; }
+        mut bindings: TypeRef[] = [];
+        mut method_param_names: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const gp: GenericParamNode* = orig_func.generic_params[i];
+            if (gp == null) { return; }
+            bindings.push(TypeRef::invalid());
+            method_param_names.push(gp.name);
+        }
+
+        // Method-level bindings come SOLELY from sema's stash (declaration order).
+        // A call without a length-matched stash is outside sema's visibility and is
+        // left unspecialized (it was deferred pre-flip too).
+        mut m_from_stash: boolean = false;
+        if (call.resolved_type_args.length == n_method_params && n_method_params > 0) {
+            m_from_stash = true;
+            for (mut i: i64 = 0; i < n_method_params; i++) {
+                mut sv: TypeRef = call.resolved_type_args[i];
+                if (subst != null) { sv = subst.apply(sv, this.arena); }
+                if (!sv.is_valid()) { m_from_stash = false; break; }
+                bindings[i] = sv;
+            }
+        }
+        if (!m_from_stash) { return; }
+
+        // Defer when a binding isn't concrete: this call is being walked inside a
+        // still-generic context (e.g. `value.fmt(f)` in a template body binds W to
+        // the enclosing W).  Minting now would emit a bogus still-generic spec
+        // (E0636); the concrete spec is minted when the enclosing method is itself
+        // specialized with a concrete binding and its body re-walked (Shape-4 guard).
+        for (mut bi: i64 = 0; bi < bindings.length; bi++) {
+            if (this.state.type_contains_generic_param(bindings[bi])) {
+                return;
+            }
+        }
+
+        const spec_method: MethodNode* = this.specialize_method(
+            orig_method, method_param_names, &bindings, recv_type, impl_node);
+        if (spec_method == null) { return; }
+        // The clone is a concrete specialization, not a deferred template.
+        spec_method.func.set_self_returning_default(false);
+
+        // Route the spec'd sibling onto the right AST array.
+        if (inherent_owner_ast != null) {
+            mut target_ast: ASTNode* = inherent_owner_ast;
+            mut from_template: boolean = false;
+            if (this.generic_registry != null) {
+                const recv_t: Type* = this.arena.lookup(recv_type.id);
+                if (recv_t != null && recv_t.kind == TypeKind::InstantiatedType) {
+                    const inst_recv: InstantiatedType* = recv_t as InstantiatedType*;
+                    const tmpl_recv: TemplateEntry* =
+                        this.generic_registry.get_template_by_type_id(inst_recv.generic_base.id);
+                    if (tmpl_recv != null && tmpl_recv.ast_node == inherent_owner_ast) {
+                        from_template = true;
+                    }
+                }
+            }
+            if (from_template) {
+                // find_spec_inline_method fell back to the template AST; route to the
+                // receiver's spec entry instead so the sibling doesn't leak across
+                // every instantiation.
+                for (mut si: i64 = 0; si < this.state.spec_entries.length; si++) {
+                    const e: SpecializationEntry* = &this.state.spec_entries[si];
+                    if (e.specialized_type.id == recv_type.id && e.ast_node != null) {
+                        target_ast = e.ast_node;
+                        break;
+                    }
+                }
+            }
+            if (target_ast.kind == NodeKind::StructDeclaration) {
+                (target_ast as StructDeclNode*).methods.push(spec_method);
+            } else if (target_ast.kind == NodeKind::ClassDeclaration) {
+                (target_ast as ClassDeclNode*).methods.push(spec_method);
+            }
+        } else {
+            impl_node.methods.push(spec_method);
+        }
+        call.set_resolved_method(spec_method as ASTNode*);
+
+        // DI registration + symbol pin.  Inherent generic methods on a fixed
+        // receiver get the precise mangle pinned (disambiguates Inner::relay<A> vs
+        // <B>); trait-impl / combinator specs stay unpinned (their DI mangle can
+        // diverge from the emitted definition symbol).
+        if (inherent_owner_ast != null) {
+            this.register_spec_method_in_di_inherent(spec_method, recv_type, inherent_owner_ast);
+            const spec_callee: SymbolStr = this.mangled_symbol_for_spec_method(
+                spec_method, this.arena.get_qualified_name(recv_type));
+            if (spec_callee.is_valid()) {
+                call.set_resolved_callee(spec_callee);
+            }
+        } else {
+            this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+        }
+
+        // Re-walk the spec'd body for its own generic calls.  specialize_method ran
+        // ASTTypeSubstituter over the clone, which rewrites nested resolved_type_args
+        // stashes too (substituter.cryo:620), so they are already concrete -> subst=null.
+        if (spec_method.func != null && spec_method.func.body != null) {
+            const _empty: string = "";
+            mut rw_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+            this.walk_block(spec_method.func.body, &rw_ctx, null);
+        }
+    }
+
+    /// Lazily instantiate a zero-own-generic self-returning trait default
+    /// (take/filter) for the concrete receiver.  Own-generic defaults (map<B>)
+    /// return false and fall through to specialize_method_call's main path.
+    /// DEINFERENCED: the receiver type is passed in (read from resolved_type by the
+    /// caller); the old ensure_receiver_inst_resolved re-find is gone (the fixpoint
+    /// re-walk resolves an adapter receiver on a later iteration).
+    try_instantiate_self_returning_default(mut &this, call: CallExprNode*,
+                                           ma: MemberAccessNode*,
+                                           recv_type: TypeRef) -> boolean {
+        mut impl_node: ImplBlockNode* = null;
+        const orig: MethodNode* = this.find_self_returning_default(
+            recv_type, ma.member, &impl_node);
+        if (orig == null || orig.func == null || impl_node == null) { return false; }
+        if (orig.func.generic_params.length > 0) { return false; }
+        // Reuse an already-instantiated sibling rather than minting a duplicate.
+        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+            const m: MethodNode* = impl_node.methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (m == orig) { continue; }
+            if (m.func.name.equals(ma.member)
+                    && !m.func.is_self_returning_default
+                    && m.func.generic_params.length == 0) {
+                call.set_resolved_method(m as ASTNode*);
+                return true;
+            }
+        }
+        mut empty_names: SymbolStr[] = [];
+        mut empty_args: TypeRef[] = [];
+        const spec_method: MethodNode* = this.specialize_method(
+            orig, empty_names, &empty_args, recv_type, impl_node);
+        if (spec_method == null || spec_method.func == null) { return false; }
+        spec_method.func.set_self_returning_default(false);
+        impl_node.methods.push(spec_method);
+        call.set_resolved_method(spec_method as ASTNode*);
+        this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+        if (spec_method.func.body != null) {
+            const _empty: string = "";
+            mut rw_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+            this.walk_block(spec_method.func.body, &rw_ctx, null);
+        }
+        return true;
+    }
+
+
+    // -- Static method on a GENERIC owner (Slice<T>::from_raw, String<GA>::from_cstr) --
+
+    /// Specialize a non-generic static method on a generic owner from sema's owner
+    /// stash.  Replaces the monolith's inference-driven
+    /// `try_infer_static_method_on_generic_template` (4710-5007): sema now stashes the
+    /// owner's concrete type args on the call (resolve_static_method_return_via_template
+    /// -> stash_static_owner_bindings), so this just instantiates the owner, enqueues
+    /// it (the worklist drain materializes + DI-registers its methods), and pins the
+    /// combined `<spec-owner>::<method>` callee.  Returns true when handled.
+    specialize_static_method_on_generic_owner(mut &this, call: CallExprNode*,
+                                              scope: ScopeResolutionNode*,
+                                              subst: TypeSubstitution*) -> boolean {
+        if (call == null || scope == null) { return false; }
+        if (call.resolved_callee.is_valid()) { return false; }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return false; }
+        mut entry: TemplateEntry* = registry.get_template(scope.scope_name);
+        if (entry == null && this.decl_index != null) {
+            const q: SymbolStr = this.decl_index.resolve_qualified(scope.scope_name);
+            if (q.is_valid() && !q.equals(scope.scope_name)) {
+                entry = registry.get_template(q);
+            }
+        }
+        if (entry == null) { return false; }
+        if (entry.node_kind != NodeKind::StructDeclaration
+                && entry.node_kind != NodeKind::ClassDeclaration) { return false; }
+        if (entry.param_count == 0 || entry.ast_node == null) { return false; }
+
+        // The owner's type args come from sema's stash (declaration order).
+        if (call.resolved_type_args.length != entry.param_type_ids.length) { return false; }
+        mut binds: TypeRef[] = [];
+        for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
+            mut b: TypeRef = call.resolved_type_args[i];
+            if (subst != null) { b = subst.apply(b, this.arena); }
+            if (!b.is_valid() || this.state.type_contains_generic_param(b)) { return false; }
+            binds.push(b);
+        }
+
+        // Confirm a matching non-generic static method on the owner (instance
+        // methods route through specialize_method_call instead).
+        mut found_static: boolean = false;
+        if (entry.node_kind == NodeKind::StructDeclaration) {
+            const sn: StructDeclNode* = entry.ast_node as StructDeclNode*;
+            for (mut i: i64 = 0; i < sn.methods.length; i++) {
+                const m: MethodNode* = sn.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(scope.member_name)) { continue; }
+                if (m.func.generic_params.length > 0) { continue; }
+                if (m.is_static) { found_static = true; }
+                break;
+            }
+        } else {
+            const cn: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < cn.methods.length; i++) {
+                const m: MethodNode* = cn.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(scope.member_name)) { continue; }
+                if (m.func.generic_params.length > 0) { continue; }
+                if (m.is_static) { found_static = true; }
+                break;
+            }
+        }
+        if (!found_static) { return false; }
+
+        // Build the spec'd owner name (bare entry.name so it matches how
+        // ASTSpecializer registers the spec'd struct) + the combined callee key.
+        const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
+        const spec_name_sym: SymbolStr = MangledName::specialized_identifier(
+            this.intern_table, this.arena, base_qname, binds);
+        if (!spec_name_sym.is_valid()) { return false; }
+        const spec_name_str: string = this.intern_table.resolve(spec_name_sym);
+        const qualified_owner: SymbolStr = this.qualify_spec_name(entry, spec_name_str);
+        const owner_str: string = this.intern_table.resolve(qualified_owner);
+        const member_str: string = this.intern_table.resolve(scope.member_name);
+        const combined_sym: SymbolStr = this.intern_table.intern(
+            format("%s::%s", owner_str, member_str));
+
+        // Instantiate the owner + enqueue (the drain materializes its methods).
+        const inst_ref: TypeRef = registry.instantiate_for_module(
+            entry.base_type, binds, this.current_module);
+        if (!inst_ref.is_valid()) { return false; }
+        this.state.enqueue_from_type_ref(inst_ref);
+        call.set_resolved_callee(combined_sym);
+        return true;
+    }
+
+
+    // -- Method-lookup ladder (LOOKUP, not inference; ported verbatim) --
+
+    /// Spec'd struct/class own `methods[]` lookup for an inline generic method
+    /// (e.g. `NonNull<u8>::cast<U>`).  Two-step fallback when no spec entry exists:
+    /// enqueue the receiver and return the TEMPLATE's method (caller detects this by
+    /// `*out_owner_ast == tmpl.ast_node` and routes the spec to the receiver's entry).
+    find_spec_inline_method(mut &this, target_type: TypeRef, method_name: SymbolStr,
+                            out_owner_ast: ASTNode**) -> MethodNode* {
+        const empty_methods: MethodNode*[] = [];
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (entry.specialized_type.id != target_type.id) { continue; }
+            if (entry.ast_node == null) { continue; }
+            mut owner_methods: &MethodNode*[] = &empty_methods;
+            if (entry.ast_node.kind == NodeKind::StructDeclaration) {
+                owner_methods = &(entry.ast_node as StructDeclNode*).methods;
+            } else if (entry.ast_node.kind == NodeKind::ClassDeclaration) {
+                owner_methods = &(entry.ast_node as ClassDeclNode*).methods;
+            } else {
+                continue;
+            }
+            for (mut k: i64 = 0; k < owner_methods.length; k++) {
+                const m: MethodNode* = owner_methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length == 0) { continue; }
+                *out_owner_ast = entry.ast_node;
+                return m;
+            }
+        }
+        if (this.generic_registry == null) { return null; }
+        const recv_t: Type* = this.arena.lookup(target_type.id);
+        if (recv_t == null || recv_t.kind != TypeKind::InstantiatedType) { return null; }
+        this.state.enqueue_from_type_ref(target_type);
+        const inst: InstantiatedType* = recv_t as InstantiatedType*;
+        const tmpl: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return null; }
+        mut tmpl_methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
+            tmpl_methods = &(tmpl.ast_node as StructDeclNode*).methods;
+        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
+            tmpl_methods = &(tmpl.ast_node as ClassDeclNode*).methods;
+        } else {
+            return null;
+        }
+        for (mut k: i64 = 0; k < tmpl_methods.length; k++) {
+            const m: MethodNode* = tmpl_methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            if (m.func.generic_params.length == 0) { continue; }
+            *out_owner_ast = tmpl.ast_node;
+            return m;
+        }
+        return null;
+    }
+
+    /// Spec'd impl-block method lookup, with bound-directed dispatch (prefer the
+    /// impl of `preferred_trait`; else first match).
+    find_spec_impl_method(&this, target_type: TypeRef, method_name: SymbolStr,
+                          preferred_trait: SymbolStr,
+                          out_impl: ImplBlockNode**) -> MethodNode* {
+        mut first_m: MethodNode* = null;
+        mut first_impl: ImplBlockNode* = null;
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (entry.specialized_type.id != target_type.id) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                if (impl_node == null) { continue; }
+                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                    const m: MethodNode* = impl_node.methods[k];
+                    if (m == null || m.func == null) { continue; }
+                    if (!m.func.name.equals(method_name)) { continue; }
+                    if (m.func.generic_params.length == 0) { continue; }
+                    if (preferred_trait.is_valid() && impl_node.is_trait_impl()) {
+                        const tl: SymbolStr = this.trait_leaf_of_ann(impl_node.trait_annotation);
+                        if (tl.is_valid() && tl.equals(preferred_trait)) {
+                            *out_impl = impl_node;
+                            return m;
+                        }
+                    }
+                    if (first_m == null) { first_m = m; first_impl = impl_node; }
+                }
+            }
+        }
+        if (first_m != null) { *out_impl = first_impl; }
+        return first_m;
+    }
+
+    /// Inline generic method on a NON-generic struct/class, via the registry's
+    /// inherent-owner index (qualified name first, then bare).
+    find_inherent_method(&this, recv_type: TypeRef, method_name: SymbolStr,
+                         out_owner_ast: ASTNode**) -> MethodNode* {
+        if (!recv_type.is_valid()) { return null; }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        mut owner_ast: ASTNode* = null;
+        const qname: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (qname.is_valid()) { owner_ast = registry.lookup_inherent_owner(qname); }
+        if (owner_ast == null) {
+            const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+            if (bare.is_valid()) { owner_ast = registry.lookup_inherent_owner(bare); }
+        }
+        if (owner_ast == null) { return null; }
+        const empty_methods: MethodNode*[] = [];
+        mut owner_methods: &MethodNode*[] = &empty_methods;
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            owner_methods = &(owner_ast as StructDeclNode*).methods;
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            owner_methods = &(owner_ast as ClassDeclNode*).methods;
+        } else {
+            return null;
+        }
+        for (mut k: i64 = 0; k < owner_methods.length; k++) {
+            const m: MethodNode* = owner_methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            if (m.func.generic_params.length == 0) { continue; }
+            *out_owner_ast = owner_ast;
+            return m;
+        }
+        return null;
+    }
+
+    /// Trait-impl-registry method lookup keyed by the bare target name (primitive
+    /// receivers + the synthesized-default fourth path).  Bound-directed dispatch.
+    find_trait_impl_method_for_target(&this, bare_target_name: SymbolStr,
+                                      method_name: SymbolStr,
+                                      preferred_trait: SymbolStr,
+                                      out_impl: ImplBlockNode**) -> MethodNode* {
+        if (!bare_target_name.is_valid()) { return null; }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        mut first_m: MethodNode* = null;
+        mut first_impl: ImplBlockNode* = null;
+        for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            if (!impl_node.target_type.equals(bare_target_name)) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (m.func.generic_params.length == 0) { continue; }
+                if (preferred_trait.is_valid() && impl_node.is_trait_impl()) {
+                    const tl: SymbolStr = this.trait_leaf_of_ann(impl_node.trait_annotation);
+                    if (tl.is_valid() && tl.equals(preferred_trait)) {
+                        *out_impl = impl_node;
+                        return m;
+                    }
+                }
+                if (first_m == null) { first_m = m; first_impl = impl_node; }
+            }
+        }
+        if (first_m != null) { *out_impl = first_impl; }
+        return first_m;
+    }
+
+    /// Find a self-returning trait default (combinator) regardless of own-generic
+    /// count: receiver's spec'd impls first, then the bare-name trait-impl registry.
+    find_self_returning_default(&this, recv_type: TypeRef, method_name: SymbolStr,
+                                out_impl: ImplBlockNode**) -> MethodNode* {
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (entry.specialized_type.id != recv_type.id) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                if (impl_node == null) { continue; }
+                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                    const m: MethodNode* = impl_node.methods[k];
+                    if (m == null || m.func == null) { continue; }
+                    if (!m.func.name.equals(method_name)) { continue; }
+                    if (!m.func.is_self_returning_default) { continue; }
+                    *out_impl = impl_node;
+                    return m;
+                }
+            }
+        }
+        if (this.generic_registry == null) { return null; }
+        const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+        if (!bare.is_valid()) { return null; }
+        for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
+            const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
+            if (impl_node == null) { continue; }
+            if (!impl_node.target_type.equals(bare)) { continue; }
+            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                const m: MethodNode* = impl_node.methods[k];
+                if (m == null || m.func == null) { continue; }
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (!m.func.is_self_returning_default) { continue; }
+                *out_impl = impl_node;
+                return m;
+            }
+        }
+        return null;
+    }
+
+
+    // -- The spec CORE: clone + substitute + re-resolve (deinferenced) --
+
+    /// Clone a generic method's func, substitute its own generic params with `args`,
+    /// clear generic_params, and re-resolve the signature against the owner type.
+    /// Returns the spec'd MethodNode, or null if the signature didn't fully resolve.
+    specialize_method(mut &this, original: MethodNode*,
+                      param_names: SymbolStr[], args: &TypeRef[],
+                      owner_type: TypeRef, owner_impl: ImplBlockNode*) -> MethodNode* {
+        if (original == null || original.func == null) { return null; }
+        if (param_names.length != args.length) { return null; }
+
+        mut arg_displays: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            const arg_t: Type* = this.arena.lookup(args[i].id);
+            mut display: string = "";
+            if (arg_t != null) {
+                const qname: SymbolStr = this.arena.get_qualified_name(args[i]);
+                if (qname.is_valid()) {
+                    display = this.intern_table.resolve(qname);
+                } else {
+                    display = this.arena.format_display(arg_t);
+                }
+            } else {
+                display = format("unknown_%llu", args[i].id);
+            }
+            arg_displays.push(this.intern_table.intern(display));
+        }
+
+        mut param_ids: u64[] = [];
+        for (mut i: i64 = 0; i < param_names.length; i++) {
+            const gp_ref: TypeRef = this.arena.create_generic_param(param_names[i], i as u64);
+            param_ids.push(gp_ref.id);
+        }
+        const subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
+        const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
+        *subst_ptr = subst_val;
+
+        mut cloner: ASTCloner = ASTCloner();
+        (original as ASTNode*).accept(cloner);
+        mut spec_method: MethodNode* = cloner.result as MethodNode*;
+        if (spec_method == null || spec_method.func == null) { return null; }
+        const cloned_node: ASTNode* = spec_method as ASTNode*;
+        spec_method.func.generic_params = [];
+        spec_method.func.set_resolved_return_type(TypeRef::invalid());
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const p: VarDeclNode* = spec_method.func.parameters[i];
+            if (p != null) { p.set_resolved_type(TypeRef::invalid()); }
+        }
+
+        const empty_sym: SymbolStr = SymbolStr::empty();
+        mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
+            subst_ptr, this.arena, this.intern_table,
+            empty_sym, empty_sym, param_names, arg_displays);
+        cloned_node.accept(substituter);
+
+        if (this.type_resolver != null) {
+            mut module_name: string = "";
+            mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+            if (owner_type.is_valid()) { res_ctx.set_this_type(owner_type); }
+            if (owner_impl != null) {
+                for (mut di: i64 = 0; di < owner_impl.derived_param_names.length; di++) {
+                    res_ctx.add_binding(owner_impl.derived_param_names[di],
+                                        owner_impl.derived_param_types[di]);
+                }
+            }
+            this.type_resolver.resolve_func_signature(spec_method.func, &res_ctx);
+            for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+                const p: VarDeclNode* = spec_method.func.parameters[i];
+                if (p == null) { continue; }
+                if (p.resolved_type.is_valid()) { continue; }
+                const this_amp: SymbolStr = this.intern_table.intern("&this");
+                const this_val: SymbolStr = this.intern_table.intern("this");
+                if (p.name.equals(this_amp)) {
+                    if (owner_type.is_valid()) {
+                        p.set_resolved_type(this.arena.get_reference_to(
+                            owner_type, RefMutability::Immutable));
+                    }
+                } else if (p.name.equals(this_val)) {
+                    if (owner_type.is_valid()) { p.set_resolved_type(owner_type); }
+                }
+            }
+        }
+
+        // Fallback: re-derive an unresolved slot from `original`'s resolved signature
+        // (which already carries the concrete where-clause element binding).
+        if (this.type_has_unresolved(spec_method.func.resolved_return_type, 0)
+                && original.func.resolved_return_type.is_valid()) {
+            const cand: TypeRef = subst_ptr.apply(original.func.resolved_return_type, this.arena);
+            if (!this.type_has_unresolved(cand, 0)) {
+                spec_method.func.set_resolved_return_type(cand);
+            }
+        }
+        const n_clone_params: i64 = spec_method.func.parameters.length;
+        const n_orig_params: i64 = original.func.parameters.length;
+        if (n_clone_params == n_orig_params) {
+            for (mut i: i64 = 0; i < n_clone_params; i++) {
+                const p: VarDeclNode* = spec_method.func.parameters[i];
+                const op: VarDeclNode* = original.func.parameters[i];
+                if (p == null || op == null) { continue; }
+                if (!this.type_has_unresolved(p.resolved_type, 0)) { continue; }
+                if (!op.resolved_type.is_valid()) { continue; }
+                const cand: TypeRef = subst_ptr.apply(op.resolved_type, this.arena);
+                if (!this.type_has_unresolved(cand, 0)) { p.set_resolved_type(cand); }
+            }
+        }
+
+        // Substitution sweep: reach a method generic NESTED in an instantiated
+        // annotation (the W in `f: mut &Formatter<W>`) that the AST substituter left.
+        if (spec_method.func.resolved_return_type.is_valid()) {
+            spec_method.func.set_resolved_return_type(
+                subst_ptr.apply(spec_method.func.resolved_return_type, this.arena));
+        }
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const sp: VarDeclNode* = spec_method.func.parameters[i];
+            if (sp != null && sp.resolved_type.is_valid()) {
+                sp.set_resolved_type(subst_ptr.apply(sp.resolved_type, this.arena));
+            }
+        }
+
+        // Reduce concrete-base associated-type projections (`IntSeq::Item` -> i32).
+        if (spec_method.func.resolved_return_type.is_valid()) {
+            spec_method.func.set_resolved_return_type(
+                this.trait_spec.reduce_projections(spec_method.func.resolved_return_type));
+        }
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const sp2: VarDeclNode* = spec_method.func.parameters[i];
+            if (sp2 != null && sp2.resolved_type.is_valid()) {
+                sp2.set_resolved_type(this.trait_spec.reduce_projections(sp2.resolved_type));
+            }
+        }
+
+        // Refuse a half-resolved spec (the mangler aborts on an invalid TypeRef).
+        if (this.type_has_unresolved(spec_method.func.resolved_return_type, 0)) {
+            return null;
+        }
+        for (mut i: i64 = 0; i < spec_method.func.parameters.length; i++) {
+            const p: VarDeclNode* = spec_method.func.parameters[i];
+            if (p != null && this.type_has_unresolved(p.resolved_type, 0)) {
+                return null;
+            }
+        }
+        return spec_method;
+    }
+
+    /// True when `ty` is invalid or contains an invalid TypeRef at any depth.
+    type_has_unresolved(&this, ty: TypeRef, depth: i32) -> boolean {
+        if (!ty.is_valid()) { return true; }
+        if (depth > 16) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return true; }
+        if (t.kind == TypeKind::Function) {
+            const f: FunctionType* = t as FunctionType*;
+            if (this.type_has_unresolved(f.return_type, depth + 1)) { return true; }
+            for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                if (this.type_has_unresolved(f.param_types[i], depth + 1)) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.type_has_unresolved((t as PointerType*).pointee, depth + 1);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.type_has_unresolved((t as ReferenceType*).referent, depth + 1);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.type_has_unresolved((t as ArrayType*).element, depth + 1);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.type_has_unresolved((t as OptionalType*).wrapped, depth + 1);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.type_has_unresolved(tup.elements[i], depth + 1)) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.type_has_unresolved(inst.type_args[i], depth + 1)) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+
+    // -- DI registration + symbol pinning (re-homed; Phase-0 keystone) --
+
+    /// Register an impl-block-owned spec method in the DeclarationIndex under the
+    /// receiver's canonical name so codegen/linker find the right func_type/mangle.
+    register_spec_method_in_di(mut &this, spec_method: MethodNode*,
+                               recv_type: TypeRef, impl_node: ImplBlockNode*) -> void {
+        if (this.decl_index == null) { return; }
+        if (spec_method == null || impl_node == null) { return; }
+        mut qualified_target: SymbolStr = impl_node.qualified_target_name;
+        if (!qualified_target.is_valid()) { qualified_target = impl_node.target_type; }
+        mut bare_alias: SymbolStr = SymbolStr::empty();
+        if (!qualified_target.equals(impl_node.target_type)) {
+            bare_alias = impl_node.target_type;
+        }
+        mut owning_module: SymbolStr = SymbolStr::empty();
+        if (impl_node.source_module != "") {
+            owning_module = this.intern_table.intern(impl_node.source_module);
+        } else {
+            owning_module = this.current_module;
+        }
+        mut spec_methods: MethodNode*[] = [];
+        spec_methods.push(spec_method);
+        if (bare_alias.is_valid()) {
+            this.decl_index.register_methods_with_module_aliased(
+                qualified_target, bare_alias, spec_methods, owning_module,
+                this.intern_table, this.arena);
+        } else {
+            this.decl_index.register_methods_with_module(
+                qualified_target, spec_methods, owning_module,
+                this.intern_table, this.arena);
+        }
+    }
+
+    /// Register a spec method whose owner is a non-generic struct/class (no impl
+    /// block): key off the receiver's arena qualified name + the owner's source module.
+    register_spec_method_in_di_inherent(mut &this, spec_method: MethodNode*,
+                                        recv_type: TypeRef, owner_ast: ASTNode*) -> void {
+        if (this.decl_index == null) { return; }
+        if (spec_method == null || owner_ast == null) { return; }
+        mut qualified_target: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (!qualified_target.is_valid()) { return; }
+        mut source_module_str: string = "";
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            source_module_str = (owner_ast as StructDeclNode*).source_module;
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            source_module_str = (owner_ast as ClassDeclNode*).source_module;
+        }
+        mut owning_module: SymbolStr = SymbolStr::empty();
+        if (source_module_str != "") {
+            owning_module = this.intern_table.intern(source_module_str);
+        } else {
+            owning_module = this.current_module;
+        }
+        mut spec_methods: MethodNode*[] = [];
+        spec_methods.push(spec_method);
+        this.decl_index.register_methods_with_module(
+            qualified_target, spec_methods, owning_module,
+            this.intern_table, this.arena);
+    }
+
+    /// Compute the exact LLVM-mangled symbol a spec'd method will be emitted under,
+    /// so the call can pin `resolved_callee` straight to it (disambiguates
+    /// same-receiver/different-method-generic specs that share a fallback key).
+    mangled_symbol_for_spec_method(mut &this, spec_method: MethodNode*,
+                                   qualified_target: SymbolStr) -> SymbolStr {
+        if (spec_method == null || spec_method.func == null) { return SymbolStr::empty(); }
+        if (!qualified_target.is_valid()) { return SymbolStr::empty(); }
+        const func: FunctionDeclNode* = spec_method.func;
+        const type_qname: QualifiedName = QualifiedName::from_symbol(qualified_target);
+        const method_param_refs: TypeRef[] = method_non_receiver_params(func, this.intern_table);
+        const mangled: MangledName = MangledName::for_method_or_trait_impl(
+            this.intern_table, this.arena, type_qname, func.origin_trait, func.name,
+            method_receiver_kind(func, spec_method.is_static, this.intern_table),
+            method_param_refs, func.resolved_return_type, func.is_variadic);
+        return mangled.value;
+    }
+
+
+    // -- Small pure helpers (re-homed copies) --
+
+    /// Peel a type annotation to its head Named name (for bound-directed dispatch).
+    trait_leaf_of_ann(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(na)     => { na.name }
+            TypeAnnotation::Generic(ga)   => { this.trait_leaf_of_ann(ga.base) }
+            TypeAnnotation::Reference(ra) => { this.trait_leaf_of_ann(ra.inner) }
+            TypeAnnotation::Pointer(pa)   => { this.trait_leaf_of_ann(pa.inner) }
+            TypeAnnotation::Optional(oa)  => { this.trait_leaf_of_ann(oa.inner) }
+            _                             => { SymbolStr::empty() }
+        };
+    }
+
+    /// Build a qualified specialized name from the template's qualified name + the
+    /// bare spec name (copy of the orchestrator's helper; pure, no shared state).
+    qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
+        const qualified_str: string = this.intern_table.resolve(entry.qualified_name);
+        const bare_str: string = this.intern_table.resolve(entry.name);
+        const q_len: i64 = strlen(qualified_str) as i64;
+        const b_len: i64 = strlen(bare_str) as i64;
+        if (q_len <= b_len) { return this.intern_table.intern(spec_name); }
+        const prefix_len: i64 = q_len - b_len;
+        const prefix: string = qualified_str.substr(0, prefix_len);
+        return this.intern_table.intern(prefix + spec_name);
+    }
+
+
+    // -- Template lookup helpers (LOOKUP, not inference) --
+
+    fn_template_arity_compatible(&this, entry: TemplateEntry*, call_arity: i64) -> boolean {
+        if (call_arity < 0) { return true; }
+        if (entry == null || entry.ast_node == null) { return true; }
+        if (entry.node_kind != NodeKind::FunctionDeclaration) { return true; }
+        const fd: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (fd.is_variadic) { return true; }
+        return fd.parameters.length == call_arity;
+    }
+
+    /// Find a scoped free-function template by qualified-name suffix against the
+    /// scope as written, disambiguating same-leaf modules by call arity then by
+    /// the namespace prefix shared with the calling module (matches sema's
+    /// `resolve_module_qualified_function`).
+    find_scoped_function_template(mut &this, name: SymbolStr,
+                                  scope: SymbolStr, call_arity: i64) -> TemplateEntry* {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null || !scope.is_valid()) { return null; }
+        const scope_str: string = this.intern_table.resolve(scope);
+        const name_str: string  = this.intern_table.resolve(name);
+        const tail: string      = format("%s::%s", scope_str, name_str);
+        const sep_tail: string  = format("::%s", tail);
+        const tail_len: i64     = strlen(tail) as i64;
+        const cur_ns: string    = this.intern_table.resolve(this.current_module);
+        const total: i64 = registry.template_count();
+
+        mut first: TemplateEntry* = null;
+        mut arity_match: TemplateEntry* = null;
+        mut arity_count: i64 = 0;
+        mut prefix_match: TemplateEntry* = null;
+        mut prefix_best: i64 = -1;
+        mut prefix_ties: i64 = 0;
+
+        for (mut i: i64 = 0; i < total; i++) {
+            const cand: TemplateEntry* = &registry.entries[i];
+            if (cand == null) { continue; }
+            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (!cand.name.equals(name)) { continue; }
+            const qn: string = this.intern_table.resolve(cand.qualified_name);
+            mut is_match: boolean = mono_str_ends_with(qn, sep_tail);
+            if (!is_match && strlen(qn) as i64 == tail_len && mono_str_ends_with(qn, tail)) {
+                is_match = true;
+            }
+            if (!is_match) { continue; }
+
+            if (first == null) { first = cand; }
+            if (call_arity >= 0 && cand.ast_node != null) {
+                const fd: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
+                if (fd.parameters.length == call_arity) {
+                    arity_match = cand;
+                    arity_count = arity_count + 1;
+                }
+            }
+            const shared: i64 = mono_shared_prefix_len(cur_ns, qn);
+            if (shared > prefix_best) {
+                prefix_best = shared; prefix_match = cand; prefix_ties = 1;
+            } else if (shared == prefix_best) {
+                prefix_ties = prefix_ties + 1;
+            }
+        }
+
+        mut chosen: TemplateEntry* = first;
+        if (arity_count == 1) { chosen = arity_match; }
+        else if (prefix_ties == 1 && prefix_match != null) { chosen = prefix_match; }
+        return chosen;
+    }
+
+    find_function_template_for_call(mut &this, name: SymbolStr) -> TemplateEntry* {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        // Try current module's qualified form first.
+        const name_str: string = this.intern_table.resolve(name);
+        const cur_mod_str: string = this.intern_table.resolve(this.current_module);
+        if (strlen(cur_mod_str) > 0) {
+            const q1_str: string = cur_mod_str + "::" + name_str;
+            const q1: SymbolStr = this.intern_table.intern(q1_str);
+            const e1: TemplateEntry* = registry.get_template(q1);
+            if (e1 != null && e1.node_kind == NodeKind::FunctionDeclaration) { return e1; }
+        }
+        const e2: TemplateEntry* = registry.get_template(name);
+        if (e2 != null && e2.node_kind == NodeKind::FunctionDeclaration) { return e2; }
+        // Linear scan by bare name: the call site's current_module is the consuming
+        // module, not where the function was defined.
+        const total: i64 = registry.template_count();
+        for (mut i: i64 = 0; i < total; i++) {
+            const cand: TemplateEntry* = &registry.entries[i];
+            if (cand == null) { continue; }
+            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
+            if (cand.name.equals(name)) { return cand; }
+        }
+        return null;
+    }
+
+
+    // -- Where-clause bound checking at the call site --
+
+    /// Verify the function template's `where`-clause bounds hold for the stashed
+    /// type args in `bindings`.  On the first failing bound, emits a rich
+    /// diagnostic and returns false so the caller skips pin + enqueue.
+    check_function_bounds_at_call(mut &this, call: CallExprNode*,
+                                  tmpl_func: FunctionDeclNode*,
+                                  entry: TemplateEntry*,
+                                  bindings: &TypeRef[]) -> boolean {
+        if (tmpl_func == null || entry == null) { return true; }
+        if (tmpl_func.trait_bounds.length == 0) { return true; }
+        for (mut bi: i64 = 0; bi < tmpl_func.trait_bounds.length; bi++) {
+            const bound: TraitBound* = &tmpl_func.trait_bounds[bi];
+            // Position of this bound's type parameter = index into `bindings`.
+            mut idx: i64 = -1;
+            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
+                if (entry.param_names[pi].equals(bound.type_parameter)) {
+                    idx = pi;
+                    break;
+                }
+            }
+            if (idx < 0 || idx >= bindings.length) { continue; }
+            const concrete: TypeRef = bindings[idx];
+            if (!concrete.is_valid()) { continue; }
+            // Defer when the binding is still abstract (re-checked when a concrete
+            // spec pins it).  Mirrors sema's check_generic_free_call guard.
+            if (this.state.type_contains_generic_param(concrete)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef* = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.trait_spec.type_implements_trait(concrete, trait_name, 0)) {
+                    this.emit_call_bound_failure(call, tmpl_func, tref, concrete, trait_name);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Emit a "the trait bound `X: Y` is not satisfied" diagnostic at the call site.
+    emit_call_bound_failure(mut &this, call: CallExprNode*,
+                            tmpl_func: FunctionDeclNode*,
+                            tref: TraitRef*, concrete: TypeRef,
+                            trait_name: SymbolStr) -> void {
+        const trait_str: string = this.intern_table.resolve(trait_name);
+        const fn_str: string = this.intern_table.resolve(tmpl_func.name);
+        const concrete_t: Type* = this.arena.lookup(concrete.id);
+        const concrete_str: string = if (concrete_t != null) {
+            this.arena.format_display(concrete_t)
+        } else {
+            "?"
+        };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            format("the trait bound `%s: %s` is not satisfied",
+                concrete_str, trait_str));
+        diag = diag.at(call.span);
+        diag = diag.also_at(tref.span, format(
+            "required by this bound in `%s`", fn_str));
+        diag = diag.with_note(format(
+            "the trait `%s` is not implemented for `%s`",
+            trait_str, concrete_str));
+        diag = diag.help(format(
+            "implement `%s` for `%s`, or pass an argument of a type that already does",
+            trait_str, concrete_str));
+        this.diagnostics.emit(diag);
+    }
+}
