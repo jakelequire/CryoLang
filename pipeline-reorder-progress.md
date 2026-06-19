@@ -1883,3 +1883,378 @@ calls is proven by the FULL GREEN suite (a wrong-method stash → miscompile →
 ### State
 Clean tree (zero probe residue). Changed vs HEAD: `monomorphizer.cryo` (C1d + #8 + M1 reader),
 `sema.cryo` (#8 + M1 producer), `pipeline-reorder-progress.md`. UNCOMMITTED, NOT repinned (Jake owns).
+
+## 2026-06-18 (cont. 15) — M1-rest: unified shared producer + single-chokepoint stash (Windows host)
+
+**GREEN + FIXED POINT. Suite O0+O2 (unit 1234/0, cf 99/0) + full `cd tests && cryo test` PASS.**
+Self-host byte-identical fixed point IR md5 `3b053e2c74110dcdd1281fe463b5f8b6` (differs from cont.14's
+`27d3ca4a…` as EXPECTED — the compiler's own source changed and its self-build now stashes a few
+arg-only method calls). Cont.13–14 (#8 + M1 step1+2) are now COMMITTED at HEAD `2c24d1c4`; this work is
+UNCOMMITTED on top, in `sema.cryo` ONLY (+148/−62). First session on the native Windows PC.
+
+### What landed — the shared-helper refactor (the architectural deliverable)
+Extracted the method-binding machinery out of `resolve_generic_method_return` into two shared helpers
+so sema computes a call's bindings ONCE, identically, regardless of return shape:
+- **`find_generic_method_for_call(recv, member, out_func) -> ResolutionContext`** — the method-finding
+  (struct/class/impl/trait-impl/inherent-owner/trait-default) + owner-binding context (receiver type
+  params → concrete args, `This`).  Writes the `FunctionDeclNode` via an out-param pointer (the
+  established `**` idiom), returns the owner ctx by value (the proven-safe `clone()` path — avoids the
+  Windows by-value-owning-aggregate hazard; no owning struct is returned).
+- **`solve_method_bindings(func, owner_ctx*, member, call) -> TypeRef[]`** — turbofish OR
+  formal/actual unify (+ `![implicit]` return recovery).  Returns concrete bindings in decl order, or
+  `[]`.
+- **`resolve_generic_method_return`** now just calls the two helpers + resolves the return; its inline
+  ~210-line find+owner_ctx+solve body and its private stash are GONE (no duplication).
+- **`stash_method_call_bindings(recv, member, call)`** — new; calls the same two helpers and stashes.
+  Invoked ONCE for EVERY method call in `resolve_method_call` (right after the symbolic-unresolved
+  guard), the single chokepoint that subsumes the old per-path stash.  Covers the return-carrying
+  combinators AND the arg-only family (`hash`/`fmt`/`run`/`sample`/`write_to`) that the
+  return-resolution paths route around.
+
+### Coverage (TEMP `MSTASH`/`MABSENT` probe at the specialize point, since STRIPPED — tree clean)
+- **Full `cryo test` corpus: MSTASH 56 → 70, MABSENT 119 → 106.**  NEW stashes (arg-only):
+  `sample` 6, `hash` 5, `run` 4, `write_to` 1 (≈16 concrete-site calls).
+- **Compiler self-build: MSTASH 0, MABSENT 87** (71 `cast`, 8 `hash`, 6 `fmt`) — the arg-only stash
+  added nothing here because those calls are all inside generic bodies (see residual finding below).
+
+### Two findings that scope the rest of the mission (surface to Jake)
+1. **Turbofish (`cast<U>`, `spawn`/`try_spawn`) is a REAL gap, currently GUARDED OUT, not a residual.**
+   First attempt stashed turbofish too → `E0900 NonNull` (5×).  Root cause: mono's turbofish branch
+   `type_resolver.resolve(call.generic_args[i], &method_ctx)` registers the instantiation demand for
+   the type args (a `cast<U> -> NonNull<U>` needs `NonNull<concrete>` in the registry CACHE, which
+   `collect_unmonomorphized` walks); the stash-read `m_from_stash` path skips that resolve → the demand
+   is lost → E0900.  Reverted to a one-line guard in `stash_method_call_bindings`
+   (`if member.generic_args.length > 0 return`) so `cast` stays mono-inferred (its prior working state).
+   This is ~37 (tests) + 71 (compiler) = ~108 calls — the single biggest deletable bucket, blocked on
+   making sema's solve register the same demand mono's resolve does (or moving demand discovery off the
+   inference path).  `instantiate_for_module` (generic_registry.cryo:673) is the machinery:
+   `instantiate()` caches → `collect_unmonomorphized` is the worklist; `symbolic_no_demand_active`
+   skips caching.
+   ⚠ REFINED (investigated cont.15): the first guess "sema doesn't cache the demand" is WRONG.  The
+   failing call is `raw.cast<BarrierInner>()` -> return `NonNull<BarrierInner>` (the E0900 type is the
+   RETURN, not the turbofish arg — `BarrierInner` is a concrete struct).  Sema's
+   `resolve_method_return_with_explicit_args` (still runs at sema.cryo ~9145) resolves+registers that
+   `NonNull<BarrierInner>` demand REGARDLESS of my stash, so caching is NOT the gap.  The regression is
+   specifically mono's `m_from_stash` path skipping its turbofish
+   `resolve(call.generic_args[i], &method_ctx)` — and that skipped resolve is of `BarrierInner` (a
+   concrete type that creates no NonNull), so the mechanism is NOT obvious by reasoning.  Likely a
+   subtler interaction (specialize_method seeing differently-sourced inference_bindings, or a
+   method_ctx side effect).  NEXT: instrument mono — un-guard turbofish, eprintf the seeded-vs-fresh
+   bindings AND which NonNull insts `collect_unmonomorphized` returns, on a Box/Barrier scratch repro
+   (`cryo build foo.cryo --stdlib=stdlib`); diff m_from_stash vs non-stash.  Deferred rather than risk
+   a miscompile.
+2. **`fmt` (38, all absent) + the residual `hash`/`run`/`next` are SPECIALIZATION-TIME residuals,
+   NOT redundant re-derivation** — exactly what the handoff predicted.  `fmt<W>(&this, f: mut
+   &Formatter<W>)` and `key.hash(h)` calls live INSIDE generic bodies (`Vec<T>::fmt`, `HashMap<K,V>::
+   insert`); their receiver is abstract at sema time, so the concrete call only EXISTS after mono
+   clones the body — sema never sees it to stash it.  **Implication for C2:** mono's inference cannot be
+   *fully* deleted; the narrow specialization-time discovery must stay.  What's deletable is the
+   REDUNDANT re-derivation of calls sema already typed concretely (the stash path).  An option worth
+   weighing: have `specialize_method` stash bindings on the cloned calls at clone time (sema-equivalent
+   computation), which would let mono read its own stash and shrink the residual further.
+
+### Validation loop notes (Windows host)
+- `make cryo; if($?){make test}` once reported a transient `unit: failed` that a plain re-run of
+  `make test` (same binary) turned to PASS — a build-cache artifact of the combined recipe, not a real
+  failure.  Lesson: run `make cryo` and `make test` as SEPARATE invocations; trust a clean standalone
+  `make test`.
+- `Select-Object -Last N` truncates the unit-test section — pipe full output to a file for the summary.
+
+### State
+Clean tree (probe fully stripped — `monomorphizer.cryo` reverted to HEAD; only `sema.cryo` +
+this log changed). UNCOMMITTED, NOT repinned (Jake owns).  Next, in order: turbofish demand-registration
+(unblocks ~108 `cast`) → #9 same-leaf → #7 C2-free → C2/C3 (delete the REDUNDANT inference, keep the
+narrow specialization-time residual) → C4 + Windows + repin.
+
+## 2026-06-18 (cont. 16) — TURBOFISH SOLVED: real root cause was a symbolic-walk name collision, not demand
+
+**GREEN + FIXED POINT.** Suite O0+O2 (unit 1234/0, cf 99/0) + full `cd tests && cryo test` PASS.
+Self-host byte-identical fixed point IR md5 `2f9a0039e5355cdbc6f2465d1bfc3782`.  Still `sema.cryo` ONLY
+(the cont.15 refactor + this fix), UNCOMMITTED on HEAD `2c24d1c4`.  Builds on cont.15.
+
+### The turbofish guard from cont.15 is REMOVED — turbofish casts now stash correctly
+cont.15 deferred turbofish on a WRONG hypothesis ("mono's turbofish resolve registers a demand the
+stash skips → E0900").  An instrumented repro (CASTCMP probe comparing the stashed binding id vs mono's
+fresh resolve id, on a Box/Arc/Mutex scratch project) DISPROVED it and found the real cause:
+
+- **Root cause: a name collision when sema's solve resolves a turbofish arg DURING THE SYMBOLIC WALK.**
+  For `raw.cast<T>()` inside `Box<T>::new` (or `cast<RcInner<T,A>>()` inside `Rc`), `solve_method_bindings`
+  resolved the turbofish `T` through `owner_ctx`, which binds the RECEIVER's params by name — and the
+  receiver `NonNull<u8>` has its OWN param named `T` (= u8).  So the enclosing Box's `T` got shadowed
+  and bound to a wrong-but-CONCRETE `u8` (id 12), which passed the `contains_generic_param` check and
+  was STASHED.  mono then correctly inferred `i32` (id 9) for the cloned `cast<i32>` → `stash_id != mono_id`
+  → the spec'd `NonNull` slot used the wrong arg id → `propagate_instantiated_resolution` couldn't match
+  it → its `resolved_type` stayed invalid → E0900.  (CASTCMP showed exactly `stash=12 mono=9`, etc.)
+- **Fix (the correct, established pattern — NOT a fallback):** `solve_method_bindings`'s turbofish branch
+  now mirrors the guard `resolve_method_return_with_explicit_args` already has — when `in_symbolic_check`,
+  resolve each turbofish arg in a FRESH `ResolutionContext` (no owner bindings); if any is invalid or
+  still-abstract there, the arg references an enclosing-body param, so return `[]` (defer; mono handles
+  the cloned, concretized call).  A genuinely concrete arg (`cast<i32>`, `cast<BarrierInner>`) still
+  resolves in the fresh ctx → stashes normally.
+- **Verified:** full `make test` with an unguarded probe → **CASTCMP total 25, ZERO mismatches**
+  (every stashed turbofish agrees with mono), **no E0900**, suite green.  So the stash is now provably
+  correct for turbofish, not just "green".
+
+### Coverage (probe, since STRIPPED)
+- **Tests: MSTASH 70 → 90, MABSENT 106 → 86.**  Turbofish combinators (`map<i32>`) + concrete-site
+  casts (`Barrier`) now stash; only 3 `cast` stash in the test corpus (most casts are in generic bodies).
+- **Compiler: MSTASH 0, MABSENT 87** (71 `cast`, 8 `hash`, 6 `fmt`) — UNCHANGED.  EVERY compiler cast is
+  inside a generic body (`Box`/`Arc`/`Rc`/`Mutex`/`RwLock`), so all correctly DEFER.
+
+### Refined residual picture (the deletable-vs-residual boundary for C2/C3)
+The remaining MABSENT — `cast`-in-generic-body (34 tests + 71 compiler), `fmt` (38), `hash`-in-container
+— are ALL **specialization-time residuals**: the call's receiver/turbofish only becomes concrete when
+mono CLONES the enclosing generic body, which happens after sema.  Sema never sees those concrete calls,
+so it cannot stash them — they are mono's legitimate job, NOT redundant re-derivation.  **Conclusion for
+C2: mono's inference engine cannot be fully deleted; what's deletable is the REDUNDANT re-derivation of
+calls sema already stashed concretely.**  An optional future lever to shrink the residual further: teach
+`specialize_method` to stash bindings on cloned calls at clone time (sema-equivalent computation), so
+mono reads its own stash even for cloned bodies.
+
+### State
+Clean tree (all probes stripped — `monomorphizer.cryo` + `specialization.cryo` reverted to HEAD; only
+`sema.cryo` + this log changed).  UNCOMMITTED, NOT repinned (Jake owns).  Next: #9 same-leaf → #7
+C2-free (free-call engine delete) → C2/C3 (delete the redundant method+free inference, keep the narrow
+specialization-time residual) → C4 + Windows + repin.
+
+## 2026-06-18 (cont. 17) — RESIDUAL WAS NOT FUNDAMENTAL: abstract method/turbofish stash kills the cast residual
+
+**GREEN + FIXED POINT.** Suite O0+O2 (unit 1234/0, cf 99/0) PASS, **0 E0900**.  Self-host byte-identical
+fixed point IR md5 `06b5bb40b7aa1ebf383a99c7cb129cf1`.  Still `sema.cryo` ONLY, UNCOMMITTED on HEAD
+`2c24d1c4`.  Builds on cont.16.
+
+### The cont.15/16 "residual is fundamental" conclusion was WRONG — corrected here
+While answering Jake's question about the sema(6a-i.5)→mono(6a)→sema(6b) dual pass, I traced the
+substituter and found the residual-kill mechanism was ALREADY BUILT and proven for FREE calls:
+- `ASTTypeSubstituter` (substituter.cryo:612-626) substitutes `resolved_type_args` element-wise when
+  mono clones a body — its comment: "sema's stash... expressed in the TEMPLATE's params (`H`/`W`)...
+  only sema writes it, always abstractly... applying THIS spec's subst concretizes it... Lets the
+  monomorphizer enqueue the call's instantiation from sema's bindings WITHOUT re-inferring."
+- `check_generic_free_call` (sema.cryo:6585) already stashes free-call bindings "whenever every binding
+  is BOUND, EVEN IF STILL ABSTRACT" (the enclosing template's own params), which the substituter
+  concretizes on the clone.  So FREE calls inside generic bodies have NO residual.
+- My M1 METHOD producer was the gap: it returned `[]` on abstract bindings instead of stashing them.
+
+So the cloned-body calls are NOT a fundamental residual — sema CAN stash the abstract binding on the
+TEMPLATE call (during the symbolic walk), and the substituter concretizes it on every clone.
+
+### What landed — the method analogue of the free-call abstract stash (two parts)
+- **PART A (inference branch, arg-only `hash`/`fmt`/`relay`):** `solve_method_bindings` now keeps a
+  bound-but-ABSTRACT binding when `in_symbolic_check` (inside a generic body), instead of rejecting it.
+  The binding is one of the enclosing template's own params; the substituter concretizes it on clone.
+  Outside the symbolic walk an abstract binding is still a genuine failure (rejected → defer).
+- **PART B (turbofish branch, `cast`/`spawn`):** the turbofish args are CALLER-scope type expressions,
+  so resolving them through `owner_ctx` (the RECEIVER's params) was the cont.16 name-collision bug
+  (NonNull's `T` shadowing Box's `T` → wrong u8).  Now, inside the symbolic walk, resolve them in the
+  ENCLOSING scope's symbolic-param context (`ResolutionContext::new` + `symbolic_bind_params`), so
+  `cast<T>` → `GenericParam(Box's T)` → substituter concretizes to `cast<i32>` on the clone.  The
+  cont.16 fresh-ctx DEFER is REPLACED by this correct resolution (no longer deferring; now stashing).
+  Concrete call sites still resolve in `owner_ctx` (unchanged, proven).
+
+### Coverage (probe, since STRIPPED) — the cast residual is GONE
+- **Tests: MABSENT 119 (M1 start) → 42.**  `cast` 34 → **0**, `relay`/`sample`/etc. covered.  MSTASH 56 → 134.
+- **Compiler: MABSENT 87 → 14.**  `cast` 71 → **0**.  MSTASH **0 → 73** (the compiler now stashes its
+  own cast calls; the substituter concretizes them, and self-host stays byte-identical — strong proof
+  the abstract stashes are correct, since a wrong one would miscompile the compiler).
+- **Remaining MABSENT = `fmt` 44 + `hash` 12**, both the abstract-RECEIVER case: `value.fmt(f)` /
+  `key.hash(h)` where the receiver is a bare generic param, so `find_generic_method_for_call` can't
+  locate the method off a template (it needs to go through the param's trait bounds).  That is the
+  next, smaller blocker (separate from the binding-stash mechanism, which now fully works).
+
+### Why this matters for the mission
+The cast residual being killed means mono's inference no longer re-derives ANY cast call — sema stashes
+it (abstractly on the template, concretely on each clone via the substituter) and mono READS it.  The
+"specialization-time residual" is now only the abstract-receiver `fmt`/`hash` family, and even that is
+likely closable via trait-bound method lookup.  This reopens the path to actually DELETING mono's
+method inference (C2), not just narrowing it.
+
+### fmt/hash abstract-receiver: attempted + REVERTED (no effect) — the blocker is elsewhere
+Hypothesis: `value.fmt(f)`/`key.hash(h)` MABSENT are bare-param receivers (`T: Display`) whose generic
+method lives on the BOUND trait's decl, missed by all of `find_generic_method_for_call`'s searches.
+Added an additive `find_generic_method_on_bounds` (walk `BoundedParamType.bounds` → `get_trait_decl` →
+match generic method) wired as a fallback.  **Measured: ZERO change** (tests MABSENT 42, compiler 14 —
+fmt/hash unchanged).  So the receiver is NOT a `BoundedParamType` at the point this fires, OR these
+calls don't reach `find_generic_method_for_call` during the symbolic walk, OR the stash doesn't
+survive.  Reverted the dead branch (no speculative code).  NEXT SESSION: instrument
+`find_generic_method_for_call` / `resolve_method_call` on a `Vec<T>::fmt` or `HashMap::insert` repro to
+learn (a) is the fmt/hash call even VISITED during sema #1's symbolic walk, and (b) what
+`recv_type.kind` is there.  Only then design the fix.  The fmt/hash residual is ~50 calls; the cast
+residual (105, the big one) is already DONE.
+
+### State
+Clean tree (probe + abstract-receiver experiment both reverted — only `sema.cryo` + this log changed;
+`monomorphizer.cryo`/`specialization.cryo` at HEAD).  Validated state: O0+O2 green, self-host fixed
+point md5 `06b5bb40b7aa1ebf383a99c7cb129cf1` (re-confirmed after a host crash mid-run).  UNCOMMITTED,
+NOT repinned (Jake owns).  Next: diagnose fmt/hash abstract-receiver (above) → C2 (delete mono's
+now-dead method *cast* inference + narrow the rest) → #9 → #7 (free side) → C3/C4 + Windows + repin.
+
+## 2026-06-18 (cont. 18) — fmt/hash abstract-receiver residual CLOSED: method MABSENT 42/14 → 0/0
+
+**GREEN + FIXED POINT.**  Suite O0 (unit 1234/0, cf 99/0) and O2 (unit 1234/0, cf 99/0) PASS.  Self-host
+byte-identical fixed point, IR md5 `8aa56e2200f3ca3a05ab1d4f4810e020` (was `06b5bb40…`; the md5 MOVED
+because the compiler now stashes its OWN fmt/hash abstract-receiver calls — the substituter concretizes
+them per clone, and the fixed point holding is strong proof those abstract stashes are correct, since a
+wrong one would miscompile the compiler).  `sema.cryo` ONLY (mono/specialization at HEAD).  UNCOMMITTED
+on HEAD `2e26780a`, NOT repinned (Jake owns).  Windows host (gnu + CRYO_CC=gcc; self-host via WSL).
+
+### Root cause (instrumented first, per the handoff — the cont.17 hypothesis was incomplete)
+Two independent reasons the fmt/hash residual survived, BOTH confirmed by probes (not guessed):
+1. **The stash was never reached.**  `resolve_method_call` bails at the `symbolic_type_unresolved(obj_type)`
+   guard (sema.cryo ~9049) BEFORE `stash_method_call_bindings` whenever the receiver is abstract
+   (`value.fmt(f)` with `value: T`).  An MBAIL probe showed every abstract-receiver method call returning
+   there.  cont.17's `find_generic_method_on_bounds` was wired into the post-bail stash path, so it could
+   not have had any effect — that's why it measured ZERO.
+2. **The receiver is a bare `GenericParam` (kind 19), never a `BoundedParamType` (kind 20)** — often
+   behind `&`/`*` (kind 9/8).  The bound (`T: Display`) is NOT carried on the receiver type, because it
+   lives in a WHERE clause, not a `<T: Bound>` struct-decl constraint.  So walking `BoundedParamType.bounds`
+   (cont.17) could never find it even if reached.
+
+### The fix (all in `sema.cryo`, shared layer — no call-site special-casing)
+- New `find_generic_method_on_receiver_bounds`: peel `&`/`*` to the bare param, recover the param's
+  bound-trait leaves from THREE where-bound sources, then locate the named generic method on the bound
+  trait's decl.  The three sources (discovered by instrumenting `nbounds=0` failures one tier at a time):
+  - the enclosing impl block's `where_bounds` (new field `symbolic_impl_node`, threaded in `visit(ImplBlockNode*)`),
+  - the current method/free-fn's own `trait_bounds` (new field `symbolic_current_func`, threaded in
+    `symbolic_check_body`) — this is where an inline-method / generic-free-fn `where T: Display` lands
+    (`FunctionDeclNode.trait_bounds`, NOT `where_bounds`),
+  - the in-scope owner/method param NODES' `constraints` (the `<T: Bound>` struct-decl form).
+- New `stash_abstract_receiver_method`: called at the 9049 guard BEFORE the bail.  Finds the method off
+  the receiver bounds, runs the EXISTING `solve_method_bindings` (which already keeps bound-but-abstract
+  bindings during the symbolic walk — PART A from cont.17), and stashes.  The binding is the enclosing
+  template's own param (`fmt`'s `W` → the enclosing `W`); the `ASTTypeSubstituter` concretizes it per
+  clone, so mono READS the stash instead of re-inferring.  Return type still legitimately deferred to mono.
+
+### Measured (MSTASH/MABSENT probe in mono, since STRIPPED) — staged to 0
+- Step 1 (impl where_bounds only): tests fmt 38→25, compiler unchanged.  Probe showed remaining were
+  `impl=0` (no impl block) and concrete-recv MABSENT (= the abstract template stash had FAILED, so the
+  clone re-inferred concretely).
+- Step 2 (+ func `trait_bounds`): **tests MABSENT 25→0, compiler 14→0.**  ALL fmt/hash covered.
+- No `ABSFAIL-NOSOLVE` ever — `solve_method_bindings` is reliable once the method is found.
+
+### Why this matters for the mission
+Method-side MABSENT is now **0** over BOTH `cd tests` and `cd compiler`.  Sema stashes every method-call
+binding it can see; mono reads all of them.  This UNBLOCKS Step 1 (C2): mono's `try_infer_method_call`
+inference body (the `else if`/`else` under `if (m_from_stash){}`) is now dead for every sema-visible
+method call and can be deleted incrementally.
+
+### Probes (all STRIPPED; tree verified clean — `git diff` of mono empty, no eprintf/DBG in sema diff)
+MBAIL (at 9049 guard), MSTASH/MABSENT+recv-kind (mono ~6080), ABSOK/ABSFAIL-NOFUNC/NOSOLVE +
+PEELDBG/FINDDBG (in the two new sema helpers).  These cracked it tier by tier; none remain.
+
+### Next
+Step 1 (C2 method-side): delete mono's now-dead `try_infer_method_call` inference body incrementally
+(rebuild → suite → self-host after each removal; a red names a call the stash isn't covering → fix in
+sema, don't restore).  Then #9 → #7 (free side) → C3 → C4 → Windows+Linux cross-validate → repin.
+
+## 2026-06-18 (cont. 19) — C2 method-side DONE: mono's `try_infer_method_call` inference body DELETED
+
+**GREEN + FIXED POINT.**  Suite O0 (unit 1234/0, cf 99/0) and O2 (unit 1234/0, cf 99/0) PASS.  Self-host
+byte-identical fixed point, IR md5 `7bc06a903e43fb8fbdcb8aa144d75fa4` (moved from `8aa56e22…` — expected,
+compiler source changed).  `monomorphizer.cryo` ONLY (−122/+10).  Builds on cont.18 (committed HEAD
+`19820b66`).  UNCOMMITTED, NOT repinned (Jake owns).  Windows host.
+
+### What was deleted
+With method MABSENT == 0 (cont.18), mono's `try_infer_method_call` no longer needs to re-derive any
+binding.  Removed:
+- the `explicit_params` build + `explicit_params.length != call.arguments.length` guard,
+- the `method_ctx` construction + `impl_node.derived_param_names` seeding,
+- the three-way `if (m_from_stash) {} else if (turbofish args) {} else { formal/actual unify +
+  ![implicit] return recovery + m_all_bound + emit_cannot_infer }` block.
+Replaced with a single `if (!m_from_stash) { return; }` guard: a call reaching mono without a sema stash
+is outside sema's visibility and is left unspecialized (deferred pre-flip too).  The stash-seeding block
+(reads `call.resolved_type_args`, applies `subst`) and the not-concrete defer loop + `specialize_method`
+tail are unchanged.  No helper was orphaned (`emit_cannot_infer` still called by the FREE path at ~4437;
+`unify_for_inference`/`resolve_arg_type_for_inference`/`current_expected_type` all have other callers).
+
+### Validation notes
+- All 99 compile-fail negatives still green → removing the method-path `emit_cannot_infer` call broke no
+  E0306/E0307 oracle (sema and/or the free path own those now).  C3 (delete the diagnostic FUNCTIONS) is
+  still future work, but the method-path CALL is gone with no regression.
+- `inference_param_ids` is still populated by the per-param loop but no longer READ in this function
+  (the field is shared scratch the free path resets itself).  Harmless; fold into the full scratch
+  removal later (handoff lists it under the engine-deletion cleanup).
+
+### #7 free-call stash coverage MEASURED (FBPROBE, this session — probe since STRIPPED)
+Added FBPROBE/FBSTASH in `try_infer_function_call` just before `set_resolved_callee` (`!from_stash` →
+FBPROBE).  Result:
+- **COMPILER: FBPROBE 0 / FBSTASH 9277** — free calls 100% stash-covered already.
+- **TESTS: FBPROBE 7 / FBSTASH 2938** — only 7 fallback calls, across 3 callees:
+  - `expect_eq` (4) + `litexpr_box` (1) = **5 calls, ONE root cause**: the generic arg is a CALL
+    EXPRESSION (`expect_eq(take_i64(1<<40), …)`, `litexpr_box(take_i64(…))`).  `free_infer_arg_reliable`
+    (`sema.cryo` ~6396) DEFERS call-expr args, so sema doesn't infer `T` from them and doesn't stash;
+    mono recovers `T` from the callee's concrete return type.  Fix = relax `free_infer_arg_reliable` to
+    trust a CONCRETE call-expr `resolved_type` (handoff Step 3).
+  - `from_iter` (2) = the **where-clause case** `from_iter<I,T>(it: I) -> Array<T> where I: Iterator<T>`
+    (`stdlib/collections/array.cryo:567`): `T` is NOT in any parameter, only in the where-bound, so it
+    can't be inferred from args at all — needs dedicated sema where-clause-driven inference.
+So the free-call inference engine is **~99.7% redundant**; deleting PASS A/B/C is gated on stashing these
+7 (all-or-nothing — partial coverage breaks the uncovered calls).
+
+### Next (the deep, interconnected #7 — scoped for a fresh push, NOT started)
+1. Relax `free_infer_arg_reliable` to trust concrete call-expr `resolved_type` → closes the 5
+   `expect_eq`/`litexpr_box` calls.  **This UNMASKS #9** (cross-module same-leaf: a bare leaf existing in
+   two modules can mis-resolve in the inference path) — must fix #9's bare-name resolution to prefer the
+   in-scope/local def at the same time.
+2. Add sema where-clause-driven inference for `from_iter` (resolve `T` from `I`'s `Iterator<T>` impl).
+3. Re-measure FBPROBE → must hit 0 over tests AND compiler, THEN delete `try_infer_function_call`'s
+   PASS A/B/C body (+ its `emit_infer_conflict`/`emit_cannot_infer` free-path calls).
+Then C3 (delete the now-unused diagnostic FUNCTIONS, oracle = E0214/E0306/E0307 negatives) → C4 (collapse
+the dual sema pass; make mono emit already-typed clones) → Windows+Linux cross-validate → repin.
+
+## 2026-06-19 (cont. 20) — #7 (C2-free) DONE: free-call inference DELETED + #9 cross-module bug FIXED
+
+**GREEN + FIXED POINT.**  Suite O0 (unit 1234/0, cf 99/0) and O2 PASS.  Self-host byte-identical fixed
+point IR md5 `753845fb563e5a37edf5dcef495ed858` (then a trailing dead-fn cleanup moved it again — see
+end).  Builds on committed HEAD `f2b9bc0a` (cont.19).  UNCOMMITTED, NOT repinned (Jake owns).  Windows
+host (gnu + CRYO_CC=gcc; self-host via WSL).
+
+### Step 1 — relaxed `free_infer_arg_reliable` (sema)
+A `CallExpression` argument was unconditionally deferred (`return false`).  Relaxed to trust it when its
+`resolved_type` is already CONCRETE (args resolve before the enclosing call, post-order).  This lets sema
+infer + stash the 5 `expect_eq`/`litexpr_box(take_i64(...))` stragglers.  `from_iter` (the where-clause
+`I: Iterator<T>` case) was ALSO covered incidentally: its call sites pass a call-expr arg (so `I` now
+binds) and PASS B recovers `T` from the concrete expected `Array<i32>` — no dedicated where-clause
+inference needed.
+
+### Step 2 — #9 cross-module same-leaf bug FIXED (sema, the real find this session)
+Relaxing Step 1 UNMASKED #9 exactly as predicted: 12 × E0306 `Sign: Eq not satisfied` in
+enum_discriminant_base / nested_patterns / pattern_guards.  Root-caused by instrumentation (NOT guessed):
+`expect_eq(classify(...), N)` — the arg `classify(...)` was resolving to the WRONG module's overload.
+There are 4 `classify` free fns across test modules (Color→i32, Outer→i32, i32→i32, **Option<i32>→Sign**).
+`resolve_direct_call` (`sema.cryo` ~8196) looked the callee up by the BARE name via
+`lookup_func_return(bare)`, a single-slot LAST-WRITE-WINS map → returned the Sign overload regardless of
+the caller's module.  A DIRDBG probe proved `lookup_func_return(qualified)` returns the correct local
+overload for every module (incl. PatternMatching→Sign correctly).  **Fix:** `resolve_direct_call` now
+tries the current-module-qualified name first, falling back to bare only for a genuinely-imported
+function.  This is the handoff's #9 prescription ("prefer the in-scope/local definition").  (Note:
+`try_pin_overload_mangled_callee` already preferred qualified; the bug was purely in the
+`resolve_direct_call` FALLBACK that fires when try-pin can't pin — e.g. across the dual sema passes.)
+
+### Step 3 — FBPROBE re-measured → 0/0, then DELETED mono's free-call inference
+With Steps 1+2 in, FBPROBE = **0 tests / 0 compiler** (every free call stash-covered).  Deleted
+`try_infer_function_call`'s explicit-args branch + PASS A + PASS B + PASS C + the `fn_all_bound` /
+`emit_cannot_infer` block, replaced with `if (!from_stash) { return; }`.  The stash-seeding (reads
+`call.resolved_type_args`, applies `subst`), the where-bound check (`check_function_bounds_at_call`), and
+the pin/queue tail are unchanged.  `monomorphizer.cryo` −167 lines.
+
+### C3 (partial) — removed now-dead `emit_cannot_infer` (E0307)
+No call sites remained (method path deleted cont.19, free path deleted this session); sema's
+`emit_free_cannot_infer` owns E0307 (negatives green).  Removed the function.  `emit_infer_conflict`
+(E0214) and `emit_call_bound_failure` (E0306) are STILL live — used by mono's THIRD inference site,
+`try_infer_static_call`'s owner-param inference for constructor/static calls (`Box<T>::new(99)` infers
+`T`; `monomorphizer.cryo` ~4830).  That site is a separate residual (NOT in #7's scope) and needs its own
+sema-stash coverage before its inference + those two diagnostics can go.
+
+### Validation
+O0 + O2 green at each landing; self-host fixed point held after Steps 1-3 (md5 `753845fb…`) and re-run
+after the `emit_cannot_infer` removal (md5 `44398b30587764d6365f17f03fd33785`, the current tree).  All
+probes (FBPROBE/FBSTASH, OVLDBG, EQDBG, DIRDBG) STRIPPED; tree verified clean (no eprintf/DBG in the
+diff).
+
+### Remaining mission
+- **3rd inference site:** `try_infer_static_call` owner-param inference (constructor/static calls).
+  Measure its stash coverage (analogue of FBPROBE), get sema to stash owner params for scope-resolution
+  calls, delete it + the last `emit_infer_conflict`/`emit_call_bound_failure` mono call sites (full C3).
+- **C4:** collapse the dual sema pass (mono emits already-typed clones so sema #2's FunctionBodyTypeCheck
+  is unnecessary; remove it from 6b in `instance.cryo`).
+- Windows + Linux cross-validate; repin.
