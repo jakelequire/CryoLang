@@ -7,11 +7,11 @@ import Compiler::Diag::Diagnostic;
 import Compiler::Diag::Suggestion;
 import Compiler::Diag::Sink;
 import Utils::Logger;
-import Utils::File;
 
 type struct Lexer {
 private:
-    file:             File;
+    path:             string;
+    source:           string;
     buffer:           string;
     current:          string;
     buffer_start:     string;
@@ -24,15 +24,20 @@ private:
     sink:             DiagnosticSink*;
 
 public:
-    static new(file: File, sink: DiagnosticSink*) -> Lexer {
+    /// `source` is the already-loaded, NUL-terminated source text.  The
+    /// caller owns the read: on-disk files come from
+    /// `fs::file::read_to_string(...).into_raw()`, in-memory buffers
+    /// (LSP overrides, f-string sub-lexing) are passed through verbatim.
+    static new(path: string, source: string, sink: DiagnosticSink*) -> Lexer {
         return Lexer {
-            file:             file,
+            path:             path,
+            source:           source,
             buffer:           "",
             current:          "",
             buffer_start:     "",
             buffer_end:       "",
             spot_content:     "",
-            current_location: SourceLocation::new(file, 1, 1),
+            current_location: SourceLocation::new(path, 1, 1),
             current_token:    Token::new(TokenType::Unknown, "", 1, 1),
             previous_token:   Token::new(TokenType::Unknown, "", 1, 1),
             token_count:      0,
@@ -41,20 +46,14 @@ public:
     }
 
     lex(&this) -> Token[] {
-        LOG_DEBUG(LogComponent::Lexer, "[Lexer] lex() entry: file=%s", this.file.path());
-        match (this.file.load()) {
-            Result::Ok(_) => { /* File loaded successfully */ }
-            Result::Err(err) => {
-                LOG_DEBUG(LogComponent::Lexer, "[Lexer] Error loading file: %s", err);
-                return [];
-            }
-        }
+        LOG_DEBUG(LogComponent::Lexer, "[Lexer] lex() entry: file=%s", this.path);
 
-        LOG_DEBUG(LogComponent::Lexer, "[Lexer] File loaded, size=%d bytes", this.file.size());
+        const size: u64 = intrinsics::strlen(this.source) as u64;
+        LOG_DEBUG(LogComponent::Lexer, "[Lexer] Source ready, size=%d bytes", size);
 
-        this.buffer       = this.file.content();
+        this.buffer       = this.source;
         this.buffer_start = this.buffer;
-        this.buffer_end   = intrinsics::ptr_add(this.buffer as void*, this.file.size() as i64) as string;
+        this.buffer_end   = intrinsics::ptr_add(this.buffer as void*, size as i64) as string;
         this.current      = this.buffer_start;
 
         mut tokens: Token[] = [];
@@ -782,7 +781,7 @@ private:
     emit_error(&this, code: ErrorCode, message: string) -> Token {
         if (this.sink != null) {
             const span: SourceSpan = SourceSpan::new(
-                this.file.path(),
+                this.path,
                 this.current_location.line as u32,
                 this.current_location.column as u32,
                 this.current_location.line as u32,
@@ -813,7 +812,7 @@ private:
                               insertion: string) -> Token {
         if (this.sink != null) {
             const span: SourceSpan = SourceSpan::new(
-                this.file.path(),
+                this.path,
                 this.current_location.line as u32,
                 this.current_location.column as u32,
                 this.current_location.line as u32,
@@ -822,7 +821,7 @@ private:
             mut diag: Diagnostic = Diagnostic::error(code, message);
             diag = diag.at(span);
             const ins_span: SourceSpan = SourceSpan::new(
-                this.file.path(),
+                this.path,
                 this.current_location.line as u32,
                 this.current_location.column as u32,
                 this.current_location.line as u32,
@@ -848,7 +847,7 @@ private:
         const msg: string = "character literal may only contain one codepoint";
         if (this.sink != null) {
             const span: SourceSpan = SourceSpan::new(
-                this.file.path(),
+                this.path,
                 this.current_location.line as u32,
                 this.current_location.column as u32,
                 this.current_location.line as u32,

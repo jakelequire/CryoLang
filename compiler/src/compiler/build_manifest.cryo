@@ -44,7 +44,10 @@
 namespace Compiler::BuildManifest;
 
 import Compiler::ProjectConfig;
-import Utils::{ File, Logger };
+import Utils::Logger;
+import std::fs::file;
+import std::fs::metadata;
+import std::fs::path;
 import std::fmt;
 import std::env;
 import std::core::{ hash, primitives };
@@ -99,21 +102,24 @@ function fnv_u64(state: u64, v: u64) -> u64 {
 /// the fingerprint. The byte count is mixed in last as a length guard.
 function fnv_file(state: u64, path: string) -> u64 {
     mut h: u64 = state;
-    if (!File::exists(path)) {
+    if (!metadata::exists(Path::from_cstr(path))) {
         return fnv_str(h, "<missing>");
     }
-    mut f: File = File::new(path);
-    f.load();
-    if (!f.is_loaded()) {
-        return fnv_str(h, "<unreadable>");
+    match (file::read(Path::from_cstr(path))) {
+        Result::Ok(data) => {
+            mut bytes: Array<u8> = data;
+            const n: u64 = bytes.length();
+            const d: u8* = bytes.as_ptr();
+            for (mut i: u64 = 0; i < n; i++) {
+                h = fnv_byte(h, d[i]);
+            }
+            bytes.drop();
+            return fnv_u64(h, n);
+        }
+        Result::Err(_) => {
+            return fnv_str(h, "<unreadable>");
+        }
     }
-    const n: u64 = f.size();
-    const d: i8* = f.data();
-    for (mut i: u64 = 0; i < n; i++) {
-        h = fnv_byte(h, d[i] as u8);
-    }
-    f.close();
-    return fnv_u64(h, n);
 }
 
 
@@ -193,11 +199,11 @@ function toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
 /// Read a file's content with trailing whitespace/newlines stripped, or ""
 /// when the file is absent or unreadable.
 function read_file_trimmed(path: string) -> string {
-    if (!File::exists(path)) { return ""; }
-    mut f: File = File::new(path);
-    f.load();
-    if (!f.is_loaded()) { return ""; }
-    const raw: string = f.content();
+    mut raw: string = "";
+    match (file::read_to_string(Path::from_cstr(path))) {
+        Result::Ok(s)  => { raw = s.into_raw(); }
+        Result::Err(_) => { return ""; }
+    }
     mut len: i64 = intrinsics::strlen(raw) as i64;
     while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
                        || raw[len - 1] == 32 || raw[len - 1] == 9)) {
@@ -279,12 +285,14 @@ type struct ModuleKeyTable {
 /// function sidesteps both.
 function read_module_keys(path: string) -> ModuleKeyTable {
     mut t: ModuleKeyTable = ModuleKeyTable::empty();
-    if (!File::exists(path)) { return t; }
-    mut f: File = File::new(path);
-    f.load();
-    if (!f.is_loaded()) { return t; }
-    const data: i8* = f.data();
-    const n: u64 = f.size();
+    if (!metadata::exists(Path::from_cstr(path))) { return t; }
+    mut content: string = "";
+    match (file::read_to_string(Path::from_cstr(path))) {
+        Result::Ok(s)  => { content = s.into_raw(); }
+        Result::Err(_) => { return t; }
+    }
+    const data: i8* = content as i8*;
+    const n: u64 = intrinsics::strlen(content) as u64;
     mut i: u64 = 0;
     while (i < n) {
         const name_start: u64 = i;
@@ -307,7 +315,6 @@ function read_module_keys(path: string) -> ModuleKeyTable {
             t.keys.push(keyh);
         }
     }
-    f.close();
     return t;
 }
 
@@ -395,7 +402,7 @@ type struct Manifest {
         if (intrinsics::strlen(saved) == 0) { return false; }
         if (intrinsics::strcmp(saved, fp_hex) != 0) { return false; }
         for (mut i: i64 = 0; i < artifacts.length; i++) {
-            if (!File::exists(artifacts[i])) { return false; }
+            if (!metadata::exists(Path::from_cstr(artifacts[i]))) { return false; }
         }
         return true;
     }

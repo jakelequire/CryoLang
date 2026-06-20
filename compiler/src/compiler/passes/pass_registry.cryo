@@ -31,7 +31,10 @@ import Compiler::Resolver::{ SymbolStr, InternTable, NameResolution };
 import Compiler::Sema::Sema;
 import Compiler::Codegen::Passes;
 import Utils;
-import Utils::{ File, Logger };
+import Utils::Logger;
+import std::fs::file;
+import std::fs::metadata;
+import std::fs::path;
 
 
 // PassStats: Per-pass execution statistics
@@ -498,8 +501,10 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
     //       parsed and analysed normally, only the active buffer is
     //       overridden.
     //
-    // `File::from_content` returns a `loaded`-flagged File so the
-    // lexer's `file.load()` call short-circuits past the disk read.
+    // In-memory content (LSP override / single-buffer entry) is fed to
+    // the lexer verbatim; otherwise the source is read from disk and
+    // leaked as a NUL-terminated `string` (via `into_raw`) so token
+    // lexemes pointing into it stay valid for the rest of compilation.
     mut inmem_content: string = "";
     if (intrinsics::strlen(ctx.lsp_override_path) > 0
             && intrinsics::strcmp(ctx.lsp_override_path, source_path) == 0) {
@@ -510,18 +515,25 @@ function run_lexing_pass(ctx: CompilationContext*) -> PassResult {
     const inmem_mode: boolean =
         (inmem_content != "" && intrinsics::strlen(inmem_content) > 0 as u64);
 
-    mut file: File = File::from_content("", "", "");
+    mut source: string = "";
     if (inmem_mode) {
-        file = File::from_content(source_path, "cryo", inmem_content);
+        source = inmem_content;
     } else {
-        if (!File::exists(source_path)) {
+        if (!metadata::exists(Path::from_cstr(source_path))) {
             ctx.emit_error(ErrorCode::E0800_FILE_NOT_FOUND,
                 format("Source file not found: %s", source_path));
             return PassResult::failure(1);
         }
-        file = File::new(source_path);
+        match (file::read_to_string(Path::from_cstr(source_path))) {
+            Result::Ok(s)  => { source = s.into_raw(); }
+            Result::Err(_) => {
+                ctx.emit_error(ErrorCode::E0801_FILE_READ_ERROR,
+                    format("Could not read source file: %s", source_path));
+                return PassResult::failure(1);
+            }
+        }
     }
-    const lexer: Lexer    = Lexer::new(file, ctx.diagnostics);
+    const lexer: Lexer    = Lexer::new(source_path, source, ctx.diagnostics);
     const tokens: Token[] = lexer.lex();
 
     if (tokens.length == 0) {
