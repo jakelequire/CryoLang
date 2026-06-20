@@ -38,10 +38,17 @@ type struct SpecializationResult {
     success:         boolean;
     error_message:   string;
 
-    static ok(ast: ASTNode*, impls: ASTNode*[], name: string) -> SpecializationResult {
+    static ok(ast: ASTNode*, impls: &ASTNode*[], name: string) -> SpecializationResult {
+        // Own an INDEPENDENT copy of the impl-node pointer array.  `impls` is
+        // borrowed (the caller's local buffer); taking it by value would alias
+        // that buffer, which the caller frees on return — leaving this struct's
+        // `impl_asts` dangling.  The elements are heap-stable node pointers; only
+        // the array buffer is duplicated.
+        mut impls_owned: ASTNode*[] = [];
+        for (mut i: i64 = 0; i < impls.length; i++) { impls_owned.push(impls[i]); }
         return SpecializationResult {
             specialized_ast: ast,
-            impl_asts:       impls,
+            impl_asts:       impls_owned,
             spec_name:       name,
             success:         true,
             error_message:   "",
@@ -175,7 +182,14 @@ type struct ASTSpecializer {
                     }
                     kept.push(mthd);
                 }
-                impl_node.methods = kept;
+                // Reassign the owning-array field by SWAP, not `=`: a plain
+                // assignment shallow-copies, leaving `impl_node.methods` aliasing
+                // the local `kept` buffer, which is freed when `kept` drops at
+                // scope exit — so the placed impl node would later read a freed
+                // methods array (garbage MethodNode* -> a bare-scope / template-
+                // shaped body leaking into codegen).  Swap hands the field `kept`'s
+                // buffer and lets `kept` drop the old (pre-filter) one.
+                swap(&impl_node.methods, &kept);
 
                 cloned_impl.accept(substituter);
                 // Rename impl block target to specialized name and
@@ -187,7 +201,7 @@ type struct ASTSpecializer {
         }
 
         // 7. Return
-        return SpecializationResult::ok(cloned_ast, impl_asts, spec_name);
+        return SpecializationResult::ok(cloned_ast, &impl_asts, spec_name);
     }
 
 

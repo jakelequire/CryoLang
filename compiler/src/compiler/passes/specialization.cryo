@@ -35,7 +35,11 @@ import Compiler::Types::UserDefined;
 import Compiler::Types::Generic;
 import Compiler::Types::Compound;
 import Compiler::Types::GenericRegistry;
-import Compiler::Types::Monomorphizer;
+// The `Monomorphizer` engine lives in `Compiler::Mono::Monomorphizer`; its
+// `SpecializationEntry` in `Compiler::Mono::State`.  (The generic-param predicate
+// is now `TypeArena::contains_generic_param`, a type-system method.)
+import Compiler::Mono::Monomorphizer;
+import Compiler::Mono::State;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
 import Utils::Logger;
@@ -537,6 +541,10 @@ type struct SpecializationPasses {
                 Monomorphizer::new(arena, generic_reg, ctx.intern_table, ctx.diagnostics,
                                    ctx.type_resolver, ctx.decl_index));
             mono_ptr = _box_mono.leak();
+            // The new orchestrator does NOT auto-wire its collaborators; their
+            // back-pointers must be set AFTER the leak puts it at a stable heap
+            // address (the old monolith had no wire() step).
+            mono_ptr.wire();
             mono_ptr.set_current_module(module_sym);
             ctx.monomorphizer = mono_ptr;
         }
@@ -553,36 +561,37 @@ type struct SpecializationPasses {
         mut success: boolean = mono_ptr.process_all();
 
         // Walk this module's non-generic free functions and inline
-        // struct/class methods to discover inferred-arg generic calls
-        // (e.g. `Request::parse(stream)` inside `handle_connection`).
-        // Without this, inference only fires inside SPEC'D bodies and
-        // calls from non-generic carriers leave their resolved_callee /
-        // resolved_method null; codegen then mangles against the bare
-        // template, leaking the unsubstituted generic param into the
-        // LLVM symbol.
-        // Force-instantiate `![implicit]` static-method converters whose
-        // owner is generic (e.g. `String<GlobalAlloc>::from_cstr`).  These
-        // are never called in source — only synthesized in sema after this
-        // pass — so the monomorphizer must eagerly emit their default
-        // instantiation here.  Enqueues onto the worklist drained below;
-        // idempotent across modules via the spec cache.
-        const gconv: &Pair<u32, u32>[] = &ctx.decl_index.generic_converter_methods;
-        for (mut gi: i64 = 0; gi < gconv.length; gi++) {
-            mono_ptr.force_instantiate_static_converter(
-                SymbolStr::from_id(gconv[gi].first),
-                SymbolStr::from_id(gconv[gi].second));
-        }
-
+        // struct/class method bodies to specialize every generic call sema
+        // pinned a binding stash onto (free calls, instance/static generic
+        // methods, e.g. `Request::parse(stream)` inside `handle_connection`).
+        // This CONSUMES sema's `CallExprNode.resolved_type_args`; it never
+        // re-derives bindings.  (Owner-generic `![implicit]` static converters
+        // like `String<GlobalAlloc>::from_cstr` are now synthesized by sema
+        // with `scope_generic_args` pre-mono, so the normal stash path covers
+        // them — the old eager `force_instantiate_static_converter` loop is
+        // gone.)
+        //
+        // WALK/DRAIN FIXPOINT: re-walking is idempotent (each call is guarded
+        // by its `resolved_callee` / non-generic `resolved_method`), so iterate
+        // walk + drain until no new specialization entries appear.  This is
+        // what resolves adapter-chain receivers (`r.map(f).fold()`) now that
+        // the monolith's synchronous `ensure_receiver_inst_resolved` is gone:
+        // the first pass types+specializes `.map(f)`, the next pass sees the
+        // now-resolved receiver of `.fold()`, and so on to a fixpoint.
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root != null) {
-            mono_ptr.discover_inferred_calls_in_module(root);
-            // Drain the pending worklist for any new instantiations queued by
-            // the walk.  We deliberately don't re-enter `process_all` here
-            // because its `collect_unmonomorphized` pre-pass would re-feed
-            // already-filtered partial specs (those containing GenericParam at
-            // depth) and re-run post-pass marking.
-            const post_success: boolean = mono_ptr.drain_pending_worklist();
-            if (success) { success = post_success; }
+            loop {
+                const before: i64 = mono_ptr.spec_count();
+                mono_ptr.specialize_calls_in_module(root);
+                // Drain the pending worklist for any new instantiations queued
+                // by the walk.  We deliberately don't re-enter `process_all`
+                // here because its `collect_unmonomorphized` pre-pass would
+                // re-feed already-filtered partial specs (those containing
+                // GenericParam at depth) and re-run post-pass marking.
+                const post_success: boolean = mono_ptr.drain_pending_worklist();
+                if (success) { success = post_success; }
+                if (mono_ptr.spec_count() == before) { break; }
+            }
         }
 
         LOG_DEBUG(LogComponent::General, "[Monomorphization] Completed: %lld specializations",
@@ -621,18 +630,18 @@ type struct SpecializationPasses {
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
         mono.set_current_module(module_sym);
 
-        const reg_start: i64 = mono.injection_cursor;
-        const reg_end: i64 = mono.spec_entries.length;
+        const reg_start: i64 = mono.get_injection_cursor();
+        const reg_end: i64 = mono.spec_count();
         if (reg_start >= reg_end) {
-            mono.injection_cursor = reg_end;
+            mono.advance_injection_cursor();
             return PassResult::ok();
         }
 
         for (mut i: i64 = reg_start; i < reg_end; i++) {
-            const entry: SpecializationEntry* = &mono.spec_entries[i];
+            const entry: SpecializationEntry* = mono.spec_entry_at(i);
             SpecializationPasses::register_spec(ctx, mono, entry, i);
         }
-        mono.injection_cursor = reg_end;
+        mono.advance_injection_cursor();
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
@@ -829,10 +838,10 @@ type struct SpecializationPasses {
 
         const my_src: SymbolStr = ctx.intern(ctx.source_file);
 
-        const total: i64 = mono.spec_entries.length;
+        const total: i64 = mono.spec_count();
         mut place_count: i64 = 0;
         for (mut i: i64 = 0; i < total; i++) {
-            mut entry: SpecializationEntry* = &mono.spec_entries[i];
+            mut entry: SpecializationEntry* = mono.spec_entry_at(i);
             if (entry.injected) { continue; }
             if (!entry.owner_source.is_valid()) { continue; }
             if (!entry.owner_source.equals(my_src)) { continue; }
@@ -878,17 +887,6 @@ type struct SpecializationPasses {
 //   - inst.generic_base.id           (plain u64 field)
 //   - inst.type_args.length          (array length, no vtable)
 
-/// Recursively check whether a type contains any GenericParam or BoundedParam
-/// at any depth.  Thin delegator to the single shared implementation
-/// `Monomorphizer::mono_type_contains_generic_param` so the validator and the
-/// monomorphizer can never drift out of sync and silently under-recurse.  The
-/// shared helper is a plain free function using only non-virtual `Type*` field
-/// access, so calling it here keeps the original vtable-offset-SIGSEGV
-/// workaround intact (no virtual method dispatch on `Type*` from this pass's
-/// compilation unit).
-function type_contains_generic_param_v(arena: TypeArena*, ty: TypeRef) -> boolean {
-    return Monomorphizer::mono_type_contains_generic_param(arena, ty);
-}
 
 function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
     const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
@@ -928,10 +926,11 @@ function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
         // until the *outer* template is specialized.  The shallow direct-arg
         // check used to miss nested cases like Option<Result<T,E>> where the
         // direct arg is an InstantiatedType, not a GenericParam.  Mirrors
-        // the recursive filter in Monomorphizer::type_contains_generic_param.
+        // the recursive filter in `TypeArena::contains_generic_param`, which is
+        // the single authority every consumer (mono, sema, this validator) shares.
         mut has_generic_arg: boolean = false;
         for (mut j: i64 = 0; j < inst.type_args.length; j++) {
-            if (type_contains_generic_param_v(arena, inst.type_args[j])) {
+            if (arena.contains_generic_param(inst.type_args[j])) {
                 has_generic_arg = true;
             }
         }
@@ -946,9 +945,17 @@ function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
         const base_qname: SymbolStr = arena.get_qualified_name(inst.generic_base);
         mut base_name: string = "<no-qname>";
         if (base_qname.is_valid()) { base_name = ctx.intern_table.resolve(base_qname); }
+        mut args_disp: string = "";
+        for (mut ai: i64 = 0; ai < inst.type_args.length; ai++) {
+            const aqn: SymbolStr = arena.get_qualified_name(inst.type_args[ai]);
+            mut an: string = "?";
+            if (aqn.is_valid()) { an = ctx.intern_table.resolve(aqn); }
+            if (ai > 0) { args_disp = args_disp + ", "; }
+            args_disp = args_disp + an;
+        }
         ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-            format("unresolved generic instantiation after monomorphization: '%s' (inst_id=%lu, base_id=%lu, n_args=%lld)",
-                    base_name, inst.id, base_id, n_args));
+            format("unresolved generic instantiation after monomorphization: '%s<%s>' (inst_id=%lu, base_id=%lu, n_args=%lld)",
+                    base_name, args_disp, inst.id, base_id, n_args));
     }
 
     if (unresolved_count > 0) {

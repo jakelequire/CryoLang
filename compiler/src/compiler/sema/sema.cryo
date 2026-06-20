@@ -54,7 +54,6 @@ import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Substitution;
 import Compiler::Types::TraitChecker;
-import Compiler::Types::Monomorphizer;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::QualifiedName;
@@ -349,7 +348,7 @@ public:
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
             const item_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(impl_this, adecl.name, &rc);
             if (!item_ty.is_valid()) { continue; }
-            if (Monomorphizer::mono_type_contains_generic_param(this.arena, item_ty)) { continue; }
+            if (this.arena.contains_generic_param(item_ty)) { continue; }
             const item_name: string = this.intern.resolve(adecl.name);
             const item_t: Type* = this.arena.lookup(item_ty.id);
             const item_disp: string = if (item_t != null) { this.arena.format_display(item_t) } else { "?" };
@@ -2210,7 +2209,11 @@ type struct SemanticPasses {
 
         // Leak to a stable heap address, THEN wire (collaborators take back-
         // pointers into the visitor's fields), mirroring codegen/passes.cryo.
-        const v: SemaVisitor* = Box<SemaVisitor>::new(SemaVisitor::build(ctx)).leak();
+        // Bind the Box to a typed local first so `.leak()`'s generic `T*` return
+        // is inferred as `SemaVisitor*` (an inline `Box<..>::new(..).leak()`
+        // leaves `T` unbound — see codegen's `_box_gen` two-step).
+        const _box_v: Box<SemaVisitor> = Box<SemaVisitor>::new(SemaVisitor::build(ctx));
+        const v: SemaVisitor* = _box_v.leak();
         v.state.post_mono_verify = ctx.provisions.has(Provision::MonomorphizationComplete);
         v.wire();
         v.visit(root);

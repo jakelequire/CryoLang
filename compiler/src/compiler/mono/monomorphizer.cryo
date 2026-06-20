@@ -45,7 +45,6 @@ import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Ownership;
 import Compiler::Types::TraitChecker;
-import Compiler::Types::Monomorphizer;   // mono_* free helpers (types-rooted; thin shim after flip-on)
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Resolver;
@@ -508,6 +507,21 @@ type struct Monomorphizer {
         this.ast_resolver.resolve_specialized_ast(result.specialized_ast, entry.node_kind, entry, &subst, this_type_for_methods);
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
+        }
+
+        // Specialize the generic CALLS inside the freshly-resolved spec'd bodies
+        // (e.g. `mem::offset<T>` inside `NonNull<i32>`'s methods, or a nested
+        // generic free call inside a spec'd function).  These bodies are never in
+        // the module root that `specialize_calls_in_module` traverses, and AST
+        // re-resolution does not consume their call stashes — so this is the one
+        // place a spec'd body's inner generic calls get pinned + enqueued.  The
+        // `subst` concretizes any template-param binding the ASTTypeSubstituter
+        // didn't reach in the clone (no-op on an already-concrete stash).  Each
+        // queued function/type spec is itself drained + walked by the worklist
+        // loop, so this is fully transitive.
+        this.call_specializer.specialize_calls_in_spec_decl(result.specialized_ast, &subst);
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            this.call_specializer.specialize_calls_in_spec_decl(kept_impl_asts[ri], &subst);
         }
 
         // Populate the concrete type and set resolved_type on the InstantiatedType.
