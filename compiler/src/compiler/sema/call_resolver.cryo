@@ -534,6 +534,20 @@ type struct CallResolver {
         return false;
     }
 
+    /// A `null` literal argument carries NO pointee-type information: it adopts
+    /// whatever pointer type the call site binds.  It must not constrain a
+    /// generic owner/param during inference.  `null` is typed `void*`, so
+    /// unifying a `T*` parameter against it would wrongly pin `T = void`
+    /// (e.g. `Slice<MethodInfo>::from_raw(null, 0)` overriding the explicit
+    /// `<MethodInfo>` turbofish, monomorphizing `Slice<void>` and emitting an
+    /// invalid `getelementptr(void, ..)` that crashes LLVM instruction selection).
+    sema_arg_is_null_literal(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind != NodeKind::Literal) { return false; }
+        return (expr as LiteralNode*).literal_kind == LiteralKind::Null;
+    }
+
     /// True when `t` bottoms out fully concrete (no open generic/bounded param,
     /// not void/unit) — mirrors mono's `infer_type_is_concrete` for the E0214 gate.
     free_infer_type_concrete(&this, t: TypeRef) -> boolean {
@@ -2284,8 +2298,10 @@ type struct CallResolver {
         this.stash_static_owner_bindings(scope, call, tmpl, matched);
         if (!this.types.contains_generic_param(abstract_ret)) { return abstract_ret; }
 
+        // CONCRETE args only here — the literal-default guess is demoted to the
+        // last resort below so it can't preempt the expected type / turbofish.
         if (call != null) {
-            const inferred: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call);
+            const inferred: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, false);
             if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { return inferred; }
         }
         const ret_inst: InstantiatedType* = this.types.peel_to_instantiation(abstract_ret);
@@ -2302,54 +2318,76 @@ type struct CallResolver {
             if (spec_sym.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(spec_sym); }
         }
         if (!owner_concrete.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(scope.scope_name); }
-        if (!owner_concrete.is_valid()) { return TypeRef::invalid(); }
-        return this.binding.subst_method_return_from_receiver(owner_concrete, abstract_ret);
+        if (owner_concrete.is_valid()) {
+            const via_recv: TypeRef = this.binding.subst_method_return_from_receiver(owner_concrete, abstract_ret);
+            if (via_recv.is_valid() && !this.types.contains_generic_param(via_recv)) { return via_recv; }
+        }
+        // LAST RESORT: the literal-default GUESS (emits E0307).  Only reached when
+        // turbofish, concrete args, expected type, and owner-scope lookup all failed
+        // to pin a concrete return (e.g. unannotated `Atomic::new(0)`).
+        if (call != null) {
+            const guessed: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, true);
+            if (guessed.is_valid() && !this.types.contains_generic_param(guessed)) { return guessed; }
+        }
+        return TypeRef::invalid();
     }
 
-    /// GATED (R1, literal-default trap): infer a generic static-constructor's owner
-    /// type args by unifying its params against the call args.  Returns the owner
-    /// bindings (declaration order, all-concrete) or `[]` if any param stays
-    /// unbound/abstract.  The literal fallback (`Atomic::new(0)`/`Range::new`) is
-    /// gated to a single diagnostic site (`emit_static_owner_literal_default`).
+    /// Infer a generic static-constructor's owner type args by unifying its params
+    /// against the call args.  Returns the owner bindings (declaration order,
+    /// all-concrete) or `[]` if any param stays unbound/abstract.
+    ///
+    /// `allow_literal_default` gates Pass 2 — the GUESS that pins a still-unbound
+    /// owner param from a polymorphic literal's default type (`0` -> i32, the
+    /// `Atomic<u64>::new(0)` miscompile trap).  Because it is a guess, callers pass
+    /// `false` for the authoritative pass and only run it (`true`) as a LAST RESORT,
+    /// AFTER turbofish + concrete args + the expected type have all failed — otherwise
+    /// `RwLock<i32> = RwLock::new(0)` would guess+warn (E0307) instead of taking the
+    /// owner arg from the `<i32>` annotation.  The guess emits one diagnostic
+    /// (`emit_static_owner_literal_default`).
     infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
-                                          call: CallExprNode*) -> TypeRef[] {
+                                          call: CallExprNode*, allow_literal_default: boolean) -> TypeRef[] {
         if (method == null || method.func == null) { return []; }
         if (tmpl.param_type_ids.length == 0) { return []; }
         if (method.func.parameters.length != call.arguments.length) { return []; }
         mut pids: u64[] = [];
         for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) { pids.push(tmpl.param_type_ids[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
-        // Pass 1: bind from concrete (non-literal) argument types.
+        // Pass 1: bind from concrete (non-literal, non-null) argument types.
         for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
             const p: VarDeclNode* = method.func.parameters[i];
             if (p == null || !p.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null) { continue; }
             if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            if (this.sema_arg_is_null_literal(arg)) { continue; }
             const actual: TypeRef = arg.resolved_type;
             if (!actual.is_valid()) { continue; }
             ictx.unify(p.resolved_type, actual);
         }
-        // Pass 2 (THE SINGLE GATED LITERAL-DEFAULT SITE): any owner param still
-        // unbound falls back to a polymorphic literal's default type (`0` -> i32).
-        // This is the `Atomic<u64>::new(0)` miscompile trap, so emit one diagnostic
-        // before guessing (see emit_static_owner_literal_default).
-        mut used_literal_default: boolean = false;
-        for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
-            const p2: VarDeclNode* = method.func.parameters[i];
-            if (p2 == null || !p2.resolved_type.is_valid()) { continue; }
-            const arg2: ExpressionNode* = call.arguments[i];
-            if (arg2 == null || !this.sema_arg_is_polymorphic_literal(arg2)) { continue; }
-            const f_idx: i64 = ictx.binding_index(p2.resolved_type.id);
-            if (f_idx >= 0 && !ictx.bindings[f_idx].is_valid()) {
-                const lit_actual: TypeRef = arg2.resolved_type;
-                if (lit_actual.is_valid()) {
-                    used_literal_default = true;
-                    ictx.unify(p2.resolved_type, lit_actual);
+        // Pass 2 (GATED literal-default — last resort only): a still-unbound owner
+        // param adopts a polymorphic literal's default type (`0` -> i32).  This runs
+        // ONLY after turbofish + concrete args + the expected type all failed, so by
+        // the time we reach it there is no other information and i32 IS the language-
+        // defined default for an unsuffixed literal (`0..5` -> `Range<i32>`).  The
+        // dangerous `Atomic<u64>::new(0)` case is bound by the expected-type/turbofish
+        // sources BEFORE this guess, so applying the standard default here is correct
+        // and NOT warned about (it was previously a spurious E0307 on idiomatic code;
+        // see emit_static_owner_literal_default, now intentionally uncalled).
+        if (allow_literal_default) {
+            for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+                const p2: VarDeclNode* = method.func.parameters[i];
+                if (p2 == null || !p2.resolved_type.is_valid()) { continue; }
+                const arg2: ExpressionNode* = call.arguments[i];
+                if (arg2 == null || !this.sema_arg_is_polymorphic_literal(arg2)) { continue; }
+                const f_idx: i64 = ictx.binding_index(p2.resolved_type.id);
+                if (f_idx >= 0 && !ictx.bindings[f_idx].is_valid()) {
+                    const lit_actual: TypeRef = arg2.resolved_type;
+                    if (lit_actual.is_valid()) {
+                        ictx.unify(p2.resolved_type, lit_actual);
+                    }
                 }
             }
         }
-        if (used_literal_default) { this.emit_static_owner_literal_default(call, tmpl); }
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
@@ -2390,28 +2428,59 @@ type struct CallResolver {
 
     /// Substitute a generic static-constructor's return type using owner bindings
     /// inferred from the call args.  Invalid if the owner args can't be inferred.
+    /// `allow_literal_default` forwards to the binding inference (see that method):
+    /// the caller passes `false` for the authoritative attempt and `true` only as a
+    /// last resort, so the literal-default guess never preempts the expected type.
     infer_static_owner_return_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
-                                        abstract_ret: TypeRef, call: CallExprNode*) -> TypeRef {
-        const bindings: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call);
+                                        abstract_ret: TypeRef, call: CallExprNode*,
+                                        allow_literal_default: boolean) -> TypeRef {
+        const bindings: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, allow_literal_default);
         if (bindings.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
         mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, bindings);
         return subst.apply(abstract_ret, this.arena);
     }
 
     /// Compute a generic static-method call's owner type args (declaration order,
-    /// all-concrete) from the highest-priority available source.  Priority mirrors
-    /// the return-type resolution in `resolve_static_method_return_via_template`:
-    /// inferred-from-args -> expected type -> explicit scope turbofish.  Each source
-    /// builds and returns its OWN array (no owning-array reassignment/aliasing);
-    /// `[]` when no source yields a complete set.
+    /// all-concrete) from the highest-priority available source.  Priority:
+    /// explicit scope turbofish (authoritative) -> inferred-from-args -> expected
+    /// type.  The turbofish leads: when the programmer pinned the owner args, no
+    /// inference should run (a non-constraining arg must not override them).  Each
+    /// source builds and returns its OWN array (no owning-array reassignment/
+    /// aliasing); `[]` when no source yields a complete set.
     compute_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
                                   tmpl: TemplateEntry*, method: MethodNode*) -> TypeRef[] {
         const want: i64 = tmpl.param_type_ids.length;
         if (want == 0) { return []; }
 
-        // 1. Inferred from concrete argument types (+ the gated literal default).
-        // The helper returns either a length-`want` all-concrete set or `[]`.
-        const ib: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call);
+        // 0. Explicit scope turbofish (`Slice<MethodInfo>::from_raw(..)`,
+        // `Atomic<u64>::new(0)`) — AUTHORITATIVE.  When the programmer pinned the
+        // owner args, they ARE the answer: no inference is wanted and none should
+        // run.  Consulting args-inference first would let a non-constraining
+        // argument override the turbofish — a `null` arg pinning `T = void`
+        // (LLVM-illegal `getelementptr(void,..)`) or a polymorphic-literal arg
+        // tripping the literal-default diagnostic (a spurious E0307 on an
+        // explicitly-typed `Atomic<u64>::new(0)`).
+        if (scope.scope_generic_args.length > 0 && this.ctx.type_resolver != null) {
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            mut sb: TypeRef[] = [];
+            mut ok: boolean = true;
+            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &rc);
+                if (!tr.is_valid()) { ok = false; break; }
+                sb.push(tr);
+            }
+            // expand_default_type_args takes `sb` by value (move) and returns the
+            // backfilled array; reassigning `sb` to its own move-result is safe.
+            if (ok && sb.length < want) {
+                sb = this.ctx.type_resolver.expand_default_type_args(tmpl, sb, &rc);
+            }
+            if (ok && sb.length == want) { return sb; }
+        }
+
+        // 1. Inferred from CONCRETE argument types (no literal-default guess yet).
+        // Returns a length-`want` all-concrete set or `[]`.
+        const ib: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, false);
         if (ib.length == want) { return ib; }
 
         // 1b. Unify the method's ABSTRACT return type against the expected type to
@@ -2436,24 +2505,12 @@ type struct CallResolver {
             }
         }
 
-        // 3. Explicit scope turbofish (`Slice<i32>::from_raw(..)`) — authoritative.
-        if (scope.scope_generic_args.length > 0 && this.ctx.type_resolver != null) {
-            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
-            this.symbolic.symbolic_bind_params(&rc);
-            mut sb: TypeRef[] = [];
-            mut ok: boolean = true;
-            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
-                const tr: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &rc);
-                if (!tr.is_valid()) { ok = false; break; }
-                sb.push(tr);
-            }
-            // expand_default_type_args takes `sb` by value (move) and returns the
-            // backfilled array; reassigning `sb` to its own move-result is safe.
-            if (ok && sb.length < want) {
-                sb = this.ctx.type_resolver.expand_default_type_args(tmpl, sb, &rc);
-            }
-            if (ok && sb.length == want) { return sb; }
-        }
+        // 3. LAST RESORT: the literal-default GUESS (`Atomic::new(0)` with no turbofish
+        // and no expected type -> i32).  Runs only after every authoritative source
+        // failed, and emits the E0307 diagnostic.  Demoting it here is what stops a
+        // spurious E0307 on `RwLock<i32> = RwLock::new(0)` (step 2 binds it from `<i32>`).
+        const lb: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, true);
+        if (lb.length == want) { return lb; }
         return [];
     }
 
