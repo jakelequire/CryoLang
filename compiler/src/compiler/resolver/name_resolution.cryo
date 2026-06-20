@@ -921,16 +921,64 @@ public:
                 }
             }
         } else {
-            // ImportStyle::Specific: bring only named symbols
+            // ImportStyle::Specific: each entry is either
+            //   (a) a direct exported symbol from `module_path`, e.g.
+            //       `import std::fmt::{ println }`, OR
+            //   (b) a sub-module of `module_path`, e.g.
+            //       `import Compiler::{ CompileMode, Codegen }`.
+            // Try (a) first; if no direct symbol is found, build
+            // `<resolved_module>::<name>`, locate that sub-module in the graph,
+            // and wildcard-import its exports — exactly what
+            // `import Compiler::CompileMode;` does in Wildcard mode.
             for (mut i: int = 0; i < node.specific_imports.length; i++) {
                 const name: SymbolStr = node.specific_imports[i];
                 const found: SymbolID = this.resolver.lookup_in_module(module_sym, name);
                 if (found.is_valid()) {
+                    // (a) direct symbol in parent module
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, name, this.resolver.current_scope,
                         node.span, resolved_module);
                     this.resolver.declare_import(import_sym);
+                } else {
+                    // (b) sub-module: "<resolved_module>::<name>"
+                    const name_str: string = this.resolver.intern_table.resolve(name);
+                    const sub_path: string = format("%s::%s", resolved_module, name_str);
+                    mut sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
+                    // Direct graph lookup first, then suffix-match fallback
+                    // (mirrors the module_sym resolution at the top of process_import).
+                    const sub_idx: i64 = this.ctx.module_graph.find_module_index(sub_sym);
+                    if (sub_idx < 0) {
+                        const _sub_mod_count: i64 = this.ctx.module_graph.module_count() as i64;
+                        for (mut sk: i64 = 0; sk < _sub_mod_count; sk++) {
+                            const sub_cand: ModuleInfo* = this.ctx.module_graph.get_module(sk);
+                            const sub_cand_name: string = this.resolver.intern_table.resolve(sub_cand.name);
+                            const sub_cand_len: i64 = strlen(sub_cand_name) as i64;
+                            const sub_path_len: i64 = strlen(sub_path) as i64;
+                            if (sub_cand_len >= sub_path_len) {
+                                const sub_suffix: string = sub_cand_name + (sub_cand_len - sub_path_len);
+                                if (strcmp(sub_suffix, sub_path) == 0) {
+                                    if (sub_cand_len == sub_path_len || sub_cand_name[sub_cand_len - sub_path_len - 2] == ':') {
+                                        sub_sym = sub_cand.name;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Import all public exports from the resolved sub-module.
+                    const sub_exports: SymbolID[] = this.resolver.get_exports(sub_sym);
+                    const sub_resolved: string = this.resolver.intern_table.resolve(sub_sym);
+                    for (mut j: i64 = 0; j < sub_exports.length; j++) {
+                        const sub_export_sym: Symbol = this.resolver.get_symbol(sub_exports[j]);
+                        if (sub_export_sym.visibility.is_public()) {
+                            const id: SymbolID = this.resolver.alloc_symbol_id();
+                            const import_sym: Symbol = Symbol::import_sym(
+                                id, sub_export_sym.name, this.resolver.current_scope,
+                                node.span, sub_resolved);
+                            this.resolver.declare_import(import_sym);
+                        }
+                    }
                 }
             }
         }
