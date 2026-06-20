@@ -15,7 +15,10 @@ import Compiler::ModuleGraph;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Compiler::ProjectConfig;
-import Utils::{ File, Logger };
+import Utils::Logger;
+import std::fs::file;
+import std::fs::metadata;
+import std::fs::path;
 import std::collections::{ hashmap, pair };
 import std::core::option;
 
@@ -80,15 +83,21 @@ type struct ModuleLoader {
         this.lsp_override_content = content;
     }
 
-    /// Build a `File` for `file_path`, substituting the LSP editor
+    /// Load the source text for `file_path`, substituting the LSP editor
     /// buffer when the path matches the configured override.  Mirrors
     /// the same gate the Lexing pass uses (see `pass_registry.cryo`).
-    file_for(&this, file_path: string) -> File {
+    /// On-disk reads are leaked as a NUL-terminated `string` (via
+    /// `into_raw`) so token lexemes pointing into it stay valid; an
+    /// unreadable file yields "" (the lexer then produces only EOF).
+    source_for(&this, file_path: string) -> string {
         if (strlen(this.lsp_override_path) > 0
                 && strcmp(this.lsp_override_path, file_path) == 0) {
-            return File::from_content(file_path, "cryo", this.lsp_override_content);
+            return this.lsp_override_content;
         }
-        return File::new(file_path);
+        match (file::read_to_string(Path::from_cstr(file_path))) {
+            Result::Ok(s)  => { return s.into_raw(); }
+            Result::Err(_) => { return ""; }
+        }
     }
 
 
@@ -250,11 +259,11 @@ type struct ModuleLoader {
         const is_override: boolean =
             (strlen(this.lsp_override_path) > 0
                 && strcmp(this.lsp_override_path, file_path) == 0);
-        if (!is_override && !File::exists(file_path)) { return; }
+        if (!is_override && !metadata::exists(Path::from_cstr(file_path))) { return; }
 
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
-        const file: File = this.file_for(file_path);
-        const lexer: Lexer = Lexer::new(file, &scan_sink);
+        const source: string = this.source_for(file_path);
+        const lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
         const tokens: Token[] = lexer.lex();
 
         // Extract just the namespace; scan_tokens gives us everything
@@ -364,7 +373,7 @@ type struct ModuleLoader {
         const is_override: boolean =
             (strlen(this.lsp_override_path) > 0
                 && strcmp(this.lsp_override_path, file_path) == 0);
-        if (!is_override && !File::exists(file_path)) {
+        if (!is_override && !metadata::exists(Path::from_cstr(file_path))) {
             const msg: string = format("module file not found: '%s'", file_path);
             sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
             return false;
@@ -379,8 +388,8 @@ type struct ModuleLoader {
 
         // Quick-scan the file: lex only, extract namespace and import paths
         mut scan_sink: DiagnosticSink = DiagnosticSink::new();
-        const file: File = this.file_for(file_path);
-        const lexer: Lexer = Lexer::new(file, &scan_sink);
+        const source: string = this.source_for(file_path);
+        const lexer: Lexer = Lexer::new(file_path, source, &scan_sink);
         const tokens: Token[] = lexer.lex();
 
         // Extract namespace and imports from token stream
@@ -537,23 +546,23 @@ type struct ModuleLoader {
     search_location(&this, base_dir: string, fs_path: string) -> string {
         // 1. Directory module: base_dir/fs_path/_module.cryo
         const dir_module: string = format("%s/%s/_module.cryo", base_dir, fs_path);
-        if (File::exists(dir_module)) { return dir_module; }
+        if (metadata::exists(Path::from_cstr(dir_module))) { return dir_module; }
 
         // 2. Exact case: base_dir/fs_path.cryo
         const exact: string = format("%s/%s.cryo", base_dir, fs_path);
-        if (File::exists(exact)) { return exact; }
+        if (metadata::exists(Path::from_cstr(exact))) { return exact; }
 
         // 3. Lowercase: base_dir/lowercase.cryo
         const lower: string = format("%s/%s.cryo", base_dir, to_lowercase(fs_path));
-        if (File::exists(lower)) { return lower; }
+        if (metadata::exists(Path::from_cstr(lower))) { return lower; }
 
         // 4. Snake case: base_dir/snake_case.cryo
         const snake: string = format("%s/%s.cryo", base_dir, to_snake_case(fs_path));
-        if (File::exists(snake)) { return snake; }
+        if (metadata::exists(Path::from_cstr(snake))) { return snake; }
 
         // 5. Lowercase directory module
         const lower_dir: string = format("%s/%s/_module.cryo", base_dir, to_lowercase(fs_path));
-        if (File::exists(lower_dir)) { return lower_dir; }
+        if (metadata::exists(Path::from_cstr(lower_dir))) { return lower_dir; }
 
         return "";
     }
