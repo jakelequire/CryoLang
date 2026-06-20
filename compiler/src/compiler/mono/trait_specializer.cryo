@@ -27,7 +27,6 @@ import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
 import Compiler::Types::Ownership;
 import Compiler::Types::TraitChecker;
-import Compiler::Types::Monomorphizer;   // mono_type_contains_generic_param (types-rooted)
 import Compiler::AST::Substituter;
 import Compiler::Diag::Sink;
 import Compiler::Resolver::InternTable;
@@ -333,7 +332,7 @@ type struct MonoTraitSpecializer {
             const name: SymbolStr = res_ctx.generic_bindings[i].first;
             const ty: TypeRef = res_ctx.generic_bindings[i].second;
             if (!ty.is_valid()) { continue; }
-            if (mono_type_contains_generic_param(this.arena, ty)) { continue; }
+            if (this.arena.contains_generic_param(ty)) { continue; }
             if (impl_node.lookup_derived_param(name).is_valid()) { continue; }
             impl_node.add_derived_param(name, ty);
         }
@@ -454,12 +453,20 @@ type struct MonoTraitSpecializer {
     filter_bounds_violating_methods(mut &this, ast_node: ASTNode*,
                                      subst: TypeSubstitution*) -> void {
         if (ast_node == null) { return; }
+        // Reassign the owning-array field by SWAP, not `=`: a plain assignment
+        // of a fresh array to an owning-array field leaves the field aliasing the
+        // temporary's buffer, which is freed on drop — so the spec'd decl's
+        // `methods` (e.g. `Array<X>::with_capacity`) would later read a freed
+        // array (garbage -> a bare-scope/template-shaped body at codegen).  Swap
+        // gives the field the filtered buffer and drops the old one via the local.
         if (ast_node.kind == NodeKind::StructDeclaration) {
             const decl: StructDeclNode* = ast_node as StructDeclNode*;
-            decl.methods = this.filter_methods(decl.methods, subst);
+            mut filtered: MethodNode*[] = this.filter_methods(decl.methods, subst);
+            swap(&decl.methods, &filtered);
         } else if (ast_node.kind == NodeKind::ClassDeclaration) {
             const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
-            decl.methods = this.filter_methods(decl.methods, subst);
+            mut filtered: MethodNode*[] = this.filter_methods(decl.methods, subst);
+            swap(&decl.methods, &filtered);
         }
     }
 
@@ -475,7 +482,8 @@ type struct MonoTraitSpecializer {
             if (!this.bounds_satisfied(impl_node.where_bounds, subst)) {
                 continue;
             }
-            impl_node.methods = this.filter_methods(impl_node.methods, subst);
+            mut impl_filtered: MethodNode*[] = this.filter_methods(impl_node.methods, subst);
+            swap(&impl_node.methods, &impl_filtered);
             kept.push(impl_ast);
         }
         return kept;

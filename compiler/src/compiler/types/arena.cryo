@@ -782,6 +782,73 @@ type struct TypeArena {
         }
     }
 
+    /// Recursively check whether a type contains any GenericParam or
+    /// BoundedParam at any depth.  THE single authority for this query —
+    /// monomorphization, the live sema symbolic walk, and the generic-validation
+    /// pass all call it, so they can never drift out of sync and silently
+    /// under-recurse.  It lives on the arena because the arena owns every Type
+    /// and this is a pure structural question about one.
+    ///
+    /// Uses only non-virtual access on `Type*` subclass pointers: `t.kind` (plain
+    /// enum field) and plain compound fields reached via `t as XType*`.  No
+    /// virtual method is ever dispatched on a `Type*`, which is why even the
+    /// generic-validation pass (historically prone to a vtable-offset SIGSEGV on
+    /// `Type*` virtual dispatch) can call this directly.
+    contains_generic_param(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.lookup(ty.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::GenericParam) { return true; }
+        if (t.kind == TypeKind::BoundedParam) { return true; }
+        if (t.kind == TypeKind::AssocProjection) {
+            // An unresolved associated-type projection (`I::Item`, or `This::Item`
+            // in a trait-decl signature) is not yet concrete — treat it like a
+            // generic param so the monomorphizer defers any instantiation that
+            // contains it (e.g. `Option<This::Item>`) until the projection's base
+            // is specialized and `resolved_type` is filled.  A resolved
+            // projection is concrete via its base; recurse so a still-generic
+            // base surfaces.
+            const proj: AssocProjectionType* = t as AssocProjectionType*;
+            if (!proj.resolved_type.is_valid()) { return true; }
+            return this.contains_generic_param(proj.base);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.contains_generic_param((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.contains_generic_param((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.contains_generic_param((t as ArrayType*).element);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.contains_generic_param((t as OptionalType*).wrapped);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.contains_generic_param(tup.elements[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (this.contains_generic_param(func.return_type)) { return true; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (this.contains_generic_param(func.param_types[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.contains_generic_param(inst.type_args[i])) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
     /// Get the qualified name for a user-defined type by TypeRef.
     /// Returns the name the type was registered under in the arena.
     /// Doing the `as StructType*` / `as ClassType*` cast and field read

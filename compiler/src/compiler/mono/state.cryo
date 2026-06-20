@@ -26,10 +26,10 @@ import Compiler::Types::Arena;
 import Compiler::Types::TypeRef;
 import Compiler::Types::Resolver;
 import Compiler::Types::GenericRegistry;
-import Compiler::Types::Monomorphizer;   // mono_type_contains_generic_param + mono_copy_type_refs (types-rooted)
 import Compiler::Diag::SourceSpan;
 import Compiler::Resolver::InternTable;
 import Compiler::Resolver::SymbolStr;
+import std::collections::hashmap;
 
 
 // MonomorphRequest: a pending instantiation to specialize
@@ -106,6 +106,18 @@ type struct MonoState {
     // emit diagnostics both bump this; process_all returns error_count == 0).
     error_count:      i64;
 
+    // Generic-method specialization registry, keyed by the spec method's mangled
+    // symbol.  A generic method call is specialized once per (owner, method,
+    // bindings); the same logical spec can be requested again from multiple call
+    // sites — notably an in-source `arr.fmt(f)` AND a clone of that same call in a
+    // specialized body (whose `resolved_callee`/`resolved_method` the substituter
+    // clears, forcing re-resolution).  Without dedup the second request
+    // materializes a DUPLICATE spec method (double AST push + double DI entry),
+    // which corrupts the owner spec's method set.  This set persists across the
+    // batch (it is NOT cleared by `reset_worklist`): the spec, once emitted, is
+    // shared by every module.
+    method_specs:     HashMap<string, boolean>;
+
     static null() -> MonoState {
         return MonoState {
             arena:            null,
@@ -117,7 +129,24 @@ type struct MonoState {
             spec_entries:     [],
             nested_visited:   [],
             error_count:      0,
+            method_specs:     HashMap<string, boolean>::new(),
         };
+    }
+
+    /// True if a generic-method spec with this mangled symbol was already
+    /// materialized (AST-pushed + DI-registered) earlier in the build.
+    method_spec_seen(&this, mangled: SymbolStr) -> boolean {
+        if (!mangled.is_valid()) { return false; }
+        const key: string = this.intern_table.resolve(mangled);
+        return this.method_specs.contains_key(&key);
+    }
+
+    /// Record that a generic-method spec with this mangled symbol has been
+    /// materialized, so later requests for the same spec reuse it.
+    mark_method_spec(mut &this, mangled: SymbolStr) -> void {
+        if (!mangled.is_valid()) { return; }
+        const key: string = this.intern_table.resolve(mangled);
+        this.method_specs.insert(key, true);
     }
 
     wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,
@@ -187,7 +216,7 @@ type struct MonoState {
         // GenericParam at any depth is not yet concrete.  Mono should only
         // process fully-concrete specs.
         for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-            if (this.type_contains_generic_param(inst.type_args[i])) {
+            if (this.arena.contains_generic_param(inst.type_args[i])) {
                 return;
             }
         }
@@ -195,17 +224,17 @@ type struct MonoState {
         this.enqueue_from_inst(ty, inst);
     }
 
-    /// Delegate to the shared `mono_type_contains_generic_param` free function
-    /// (types-rooted) so this and the generic-validation pass share one
-    /// implementation and cannot drift.
-    type_contains_generic_param(&this, ty: TypeRef) -> boolean {
-        return mono_type_contains_generic_param(this.arena, ty);
-    }
-
     enqueue_from_inst(mut &this, ty: TypeRef, inst: InstantiatedType*) -> void {
+        // Copy the instantiation's `type_args` into an independent buffer: it is
+        // a heap array of Copy `TypeRef` handles owned by the InstantiatedType, so
+        // aliasing it into the request would double-free on drop.
+        mut args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            args.push(inst.type_args[i]);
+        }
         const request: MonomorphRequest = MonomorphRequest {
             generic_type: ty,
-            type_args:    mono_copy_type_refs(&inst.type_args),
+            type_args:    args,
             base_type:    inst.generic_base,
             span:         SourceSpan::none(),
         };
