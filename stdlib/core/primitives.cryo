@@ -911,10 +911,26 @@ implement string {
     /// Float parsing is deliberately not here — string→float needs libc and
     /// `core` stays libc-free (see module header).
     ///
-    /// Dispatch is via the `FromRadix` trait (one impl per integer width), the
-    /// same compile-time type-directed pattern as `VaArg`/`VaArgs::next<T>`.
-    parse_int<T>(&this) -> T where T: FromRadix {
-        return T::from_radix(this);
+    /// `T` is dispatched at compile time via `static match (T)`: each call keeps
+    /// only the arm for the concrete `T` (the rest are pruned before
+    /// type-checking), so the body is exactly the right-width parser and nothing
+    /// else. Unsigned widths read the magnitude directly; signed widths go
+    /// through `string_parse_radix_i64` (which sign-negates + wraps). The absence
+    /// of a matching arm IS the type bound: `"1".parse_int<f32>()` is a compile
+    /// error (E0645), no trait constraint needed.
+    parse_int<T>(&this) -> T {
+        return static match (T) {
+            u8    => { string_parse_radix_u64(this, 0) as u8 }
+            u16   => { string_parse_radix_u64(this, 0) as u16 }
+            u32   => { string_parse_radix_u64(this, 0) as u32 }
+            u64   => { string_parse_radix_u64(this, 0) }
+            usize => { string_parse_radix_u64(this, 0) as usize }
+            i8    => { string_parse_radix_i64(this) as i8 }
+            i16   => { string_parse_radix_i64(this) as i16 }
+            i32   => { string_parse_radix_i64(this) as i32 }
+            i64   => { string_parse_radix_i64(this) }
+            isize => { string_parse_radix_i64(this) as isize }
+        };
     }
 
     /// Strip one pair of surrounding ASCII double quotes if both are
@@ -1236,22 +1252,3 @@ private function string_parse_radix_u64(s: string, start: i64) -> u64 {
 private function string_parse_radix_i64(s: string) -> i64 {
     return string_parse_radix_u64(s, 0) as i64;
 }
-
-/// Type-directed integer parse, one impl per width, dispatched at compile time
-/// by `string::parse_int<T>`.  `from_radix` parses `s` (with optional sign /
-/// `0x`/`0o`/`0b` prefix / `_` separators) into `This`.  The unsigned widths go
-/// through the unsigned core; the signed widths through the signed core; both
-/// narrow with a checked-free `as` (overflow wraps — see `parse_int`).
-type trait FromRadix {
-    static from_radix(s: string) -> This;
-}
-implement trait FromRadix for u8    { static from_radix(s: string) -> u8    { return string_parse_radix_u64(s, 0) as u8; } }
-implement trait FromRadix for u16   { static from_radix(s: string) -> u16   { return string_parse_radix_u64(s, 0) as u16; } }
-implement trait FromRadix for u32   { static from_radix(s: string) -> u32   { return string_parse_radix_u64(s, 0) as u32; } }
-implement trait FromRadix for u64   { static from_radix(s: string) -> u64   { return string_parse_radix_u64(s, 0); } }
-implement trait FromRadix for usize { static from_radix(s: string) -> usize { return string_parse_radix_u64(s, 0) as usize; } }
-implement trait FromRadix for i8    { static from_radix(s: string) -> i8    { return string_parse_radix_i64(s) as i8; } }
-implement trait FromRadix for i16   { static from_radix(s: string) -> i16   { return string_parse_radix_i64(s) as i16; } }
-implement trait FromRadix for i32   { static from_radix(s: string) -> i32   { return string_parse_radix_i64(s) as i32; } }
-implement trait FromRadix for i64   { static from_radix(s: string) -> i64   { return string_parse_radix_i64(s); } }
-implement trait FromRadix for isize { static from_radix(s: string) -> isize { return string_parse_radix_i64(s) as isize; } }
