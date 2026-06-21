@@ -115,3 +115,91 @@ function static_match_statement_side_effect() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+
+/// `static match` over a METHOD's OWN generic param (not the owner's). The
+/// owner is non-generic, so each `m<T>` spec exists only because a call site
+/// demands it; the monomorphizer prunes each spec body to its live arm and
+/// gives it a distinct mangled symbol even when the method's SIGNATURE doesn't
+/// mention `T` (`code<T>() -> i32`), so coexisting instantiations don't collapse
+/// onto the first.
+type struct MethodTag {
+    marker: u8;
+
+    static new() -> MethodTag {
+        return MethodTag { marker: 0u8 };
+    }
+
+    /// Return type (`i32`) does NOT depend on `T`: every spec shares a
+    /// signature, so only the method type args disambiguate the symbols.
+    code<T>(&this) -> i32 {
+        return static match (T) {
+            u8      => { 8 }
+            u32     => { 32 }
+            i64     => { 64 }
+            boolean => { 1 }
+            _       => { 0 }
+        };
+    }
+
+    /// Return type IS `T`: exercises a method-level static match whose live arm
+    /// yields a `T`-typed value.
+    zero<T>(&this) -> T {
+        return static match (T) {
+            i64 => { 0i64 }
+            u32 => { 0u32 }
+            _   => { 0 as T }
+        };
+    }
+}
+
+![test]
+function method_static_match_coexisting_codes() -> Result<(), TestError> {
+    // All four instantiations coexist in one program: the regression guard for
+    // the spec-mangle collision (each `code<T>` must keep its own body).
+    const d: MethodTag = MethodTag::new();
+    match (expect_eq(d.code<u8>(), 8)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(d.code<u32>(), 32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(d.code<i64>(), 64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(d.code<boolean>(), 1)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function method_static_match_wildcard_default() -> Result<(), TestError> {
+    // f32 hits no explicit arm -> the `_` default (0).
+    const d: MethodTag = MethodTag::new();
+    match (expect_eq(d.code<f32>(), 0)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function method_static_match_return_is_t() -> Result<(), TestError> {
+    const d: MethodTag = MethodTag::new();
+    const a: i64 = d.zero<i64>();
+    const b: u32 = d.zero<u32>();
+    match (expect_eq(a, 0i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b, 0u32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

@@ -790,6 +790,30 @@ type struct MonoCallSpecializer {
         // The clone is a concrete specialization, not a deferred template.
         spec_method.func.set_self_returning_default(false);
 
+        // Whether this spec is resolved through a PINNED `resolved_callee` (the
+        // precise mangled symbol) rather than the trait-impl/combinator DI path.
+        // Only the pinned (inherent) regime gets the `$MG…` method-spec-args
+        // disambiguator: there the call pin, the codegen definition, and the DI
+        // registration all fold `func.spec_type_args` in and so agree.  Trait-impl
+        // specs stay unpinned and are disambiguated by their existing machinery
+        // (owner-spec name / where-bound element); stamping them would make their
+        // suffixed definition diverge from their unsuffixed combined-key
+        // resolution (collapsing coexisting combinator specs onto the first).
+        const inherent_pin: boolean = inherent_owner_ast != null
+            || (impl_node != null && !impl_node.is_trait_impl());
+        if (inherent_pin) {
+            // Stamp the concrete method type args so the spec's mangled symbol
+            // carries the `$MG…` disambiguator (MangledName::with_method_spec_args).
+            // Two specs of one inherent method whose signature doesn't mention the
+            // method param (`name<T>() -> string`) would otherwise mangle
+            // identically and collapse onto the first emitted spec.
+            mut spec_args_owned: TypeRef[] = [];
+            for (mut ai: i64 = 0; ai < bindings.length; ai++) {
+                spec_args_owned.push(bindings[ai]);
+            }
+            spec_method.func.set_spec_type_args(spec_args_owned);
+        }
+
         // Dedup: a generic-method spec is materialized once per (owner, method,
         // bindings).  The same logical call can arrive from more than one site —
         // an in-source `arr.fmt(f)` AND a clone of that call in a specialized body
@@ -818,8 +842,6 @@ type struct MonoCallSpecializer {
             // Inherent specs pin the precise symbol; trait-impl specs rely on the
             // already-present DI entry (their mangle can diverge from the emitted
             // symbol), exactly as the first materialization did below.
-            const inherent_pin: boolean = inherent_owner_ast != null
-                || (impl_node != null && !impl_node.is_trait_impl());
             if (inherent_pin && spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
@@ -885,6 +907,26 @@ type struct MonoCallSpecializer {
             if (!impl_node.is_trait_impl() && spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
+        }
+
+        // Compile-time `static match` arm pruning on the freshly-minted spec body.
+        // A method-level `static match (T)` (e.g. `string::parse_int<T>`) was cloned
+        // with all arms intact; the substituter rewrote each scrutinee to the
+        // concrete binding (`T` -> `i64`).  Reduce every static match to its single
+        // live arm now — exactly as the owner-template path does
+        // (monomorphizer.cryo:480).  Without this the spec'd clone keeps >1 arm and a
+        // later normal-mode walk of the concrete body reports E0645 ("static match
+        // outside a generic context").  Done before the call re-walk so it only
+        // descends the live arm.  Method-level params bind from the call's turbofish
+        // stash, so the bindings are concrete here (the still-generic case returned
+        // at the contains_generic_param guard above).
+        if (spec_method.func != null && spec_method.func.body != null
+                && this.ast_resolver != null) {
+            const _pm: string = "";
+            mut prune_ctx: ResolutionContext = ResolutionContext::new(_pm, _pm);
+            if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
+            this.ast_resolver.prune_static_match_in_block(
+                spec_method.func.body, &prune_ctx);
         }
 
         // Re-walk the spec'd body for its own generic calls.  specialize_method ran
@@ -1513,7 +1555,12 @@ type struct MonoCallSpecializer {
             this.intern_table, this.arena, type_qname, func.origin_trait, func.name,
             method_receiver_kind(func, spec_method.is_static, this.intern_table),
             method_param_refs, func.resolved_return_type, func.is_variadic);
-        return mangled.value;
+        // Disambiguate generic-method specs whose signature doesn't depend on the
+        // method param (must match the codegen definition site, which folds the
+        // same `func.spec_type_args` in).
+        const disambig: MangledName = mangled.with_method_spec_args(
+            this.intern_table, this.arena, func.spec_type_args);
+        return disambig.value;
     }
 
 

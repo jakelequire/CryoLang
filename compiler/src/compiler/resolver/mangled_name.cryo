@@ -460,6 +460,31 @@ type struct MangledName {
         return MangledName { value: table.intern(buf_o) };
     }
 
+    /// Append `$MG<arg>{_<arg>}*$` encoding the concrete type arguments of a
+    /// generic METHOD specialization (`m<T>` with `T = i64`).  A generic method
+    /// whose own signature does not mention `T` (e.g. `name<T>() -> string`)
+    /// would otherwise mangle identically for every `T`, collapsing every
+    /// instantiation onto the first emitted spec (`m<i64>` and `m<u64>` share
+    /// one LLVM symbol).  The owner-template path disambiguates via the spec'd
+    /// owner name (`Atomic_u64`), but a method-level spec on a fixed owner has
+    /// no such carrier — so the method's own type args go here.  No-op for an
+    /// empty arg list, so every non-generic-method symbol is byte-unchanged.
+    /// The mono call-site pin and the codegen definition both feed
+    /// `func.spec_type_args` through this, so the two always agree.
+    with_method_spec_args(&this, table: InternTable*, arena: TypeArena*,
+                          args: &TypeRef[]) -> MangledName {
+        if (args.length == 0) { return MangledName { value: this.value }; }
+        mut buf_m: string = table.resolve(this.value);
+        buf_m += "$MG";
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (i > 0) { buf_m += "_"; }
+            buf_m += encode_type_ref(table, arena, args[i],
+                                     "with_method_spec_args.arg");
+        }
+        buf_m += "$";
+        return MangledName { value: table.intern(buf_m) };
+    }
+
     is_empty(&this) -> boolean { return this.value.is_empty(); }
     is_valid(&this) -> boolean { return this.value.is_valid(); }
     equals(&this, other: MangledName) -> boolean { return this.value.equals(other.value); }
