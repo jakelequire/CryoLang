@@ -697,6 +697,22 @@ type struct MonoCallSpecializer {
             const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
             orig_method = this.find_trait_impl_method_for_target(
                 bare, ma.member, ma.resolved_trait, &impl_node);
+            // Inherent (non-trait) generic method on a primitive receiver
+            // (`"42".parse_int<u64>()` on `implement string`).  Not in the
+            // trait-impl registry; consult the inherent-impl registry, keyed by
+            // the receiver's bare name, and route the spec through the impl_node
+            // path below (push onto impl_node.methods + DI-register).
+            if (orig_method == null && this.generic_registry != null) {
+                orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                    bare, ma.member, &impl_node);
+                if (orig_method == null) {
+                    const qbare: SymbolStr = this.arena.get_qualified_name(recv_type);
+                    if (qbare.is_valid() && !qbare.equals(bare)) {
+                        orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                            qbare, ma.member, &impl_node);
+                    }
+                }
+            }
         }
         if (orig_method == null) { return; }
         if (impl_node == null && inherent_owner_ast == null) { return; }
@@ -715,7 +731,16 @@ type struct MonoCallSpecializer {
         //     then fails to resolve).  Reconstruction therefore serves ONLY the
         //     non-generic-owner regime; for a generic-type-spec receiver we leave
         //     the call to the established path.
-        if (recv_derived && inherent_owner_ast == null) { return; }
+        // An inherent (non-trait) impl on a NON-generic / primitive receiver
+        // (e.g. `string::parse_int<T>`) is the same non-generic-owner regime as
+        // `inherent_owner_ast`: reconstruction is safe and, crucially, this is
+        // the path that PINS `resolved_callee` to the return-distinct spec
+        // symbol.  Without allowing it, a reconstructed receiver (string-literal
+        // calls reset `resolved_type`) skips the pin and codegen collapses every
+        // instantiation onto the first via the unmangled `Type::method` fallback.
+        const inherent_primitive_owner: boolean =
+            impl_node != null && !impl_node.is_trait_impl();
+        if (recv_derived && inherent_owner_ast == null && !inherent_primitive_owner) { return; }
 
         const orig_func: FunctionDeclNode* = orig_method.func;
         if (orig_func == null) { return; }
@@ -775,14 +800,27 @@ type struct MonoCallSpecializer {
         // `Array::try_with_capacity_in` then fails to resolve at codegen).  If this
         // exact spec was already emitted, reuse it: pin the call the same way the
         // first materialization did and stop.
+        // The pin symbol must match the symbol the spec is REGISTERED + EMITTED
+        // under, or `resolve_function_by_mangled` misses it and codegen falls
+        // back to the unmangled `Type::method` lookup (collapsing every spec
+        // onto the first).  For an inherent (non-trait) impl the registration
+        // target is `impl_node.qualified_target_name` (e.g. bare `string`),
+        // which can differ from `recv_qname` for a primitive receiver; use it.
+        mut pin_target: SymbolStr = recv_qname;
+        if (impl_node != null && !impl_node.is_trait_impl()
+                && impl_node.qualified_target_name.is_valid()) {
+            pin_target = impl_node.qualified_target_name;
+        }
         const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(
-            spec_method, recv_qname);
+            spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
             // Inherent specs pin the precise symbol; trait-impl specs rely on the
             // already-present DI entry (their mangle can diverge from the emitted
             // symbol), exactly as the first materialization did below.
-            if (inherent_owner_ast != null && spec_sym.is_valid()) {
+            const inherent_pin: boolean = inherent_owner_ast != null
+                || (impl_node != null && !impl_node.is_trait_impl());
+            if (inherent_pin && spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
             return;
@@ -837,6 +875,16 @@ type struct MonoCallSpecializer {
             }
         } else {
             this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+            // Inherent (non-trait) generic method on a primitive/fixed receiver
+            // (`string::parse_int<u64>` vs `<i64>`): like the inherent-owner case
+            // above, pin the precise return-distinct mangle.  Without this,
+            // codegen falls back to the unmangled `Type::method` key and every
+            // instantiation collapses onto whichever spec was emitted first.
+            // Trait-impl / combinator specs stay unpinned (their DI mangle can
+            // diverge from the emitted definition symbol).
+            if (!impl_node.is_trait_impl() && spec_sym.is_valid()) {
+                call.set_resolved_callee(spec_sym);
+            }
         }
 
         // Re-walk the spec'd body for its own generic calls.  specialize_method ran

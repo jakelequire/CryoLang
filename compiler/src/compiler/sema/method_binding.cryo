@@ -338,6 +338,36 @@ type struct MethodBinding {
                 }
             }
         }
+        // Primitive / non-generic receiver whose generic method lives in an
+        // inherent `implement T { ... }` block (e.g. `"42".parse_int<u64>()` on
+        // `implement string`).  There is no Struct/Class/InstantiatedType AST to
+        // walk, but the inherent-impl registry holds the block.  Bind the
+        // method's OWN generic params from the explicit args and resolve its
+        // return annotation directly.
+        if (owner_ast == null) {
+            mut impl_name: SymbolStr = this.types.lookup_type_sym(owner_ref);
+            if (!impl_name.is_valid()) {
+                impl_name = this.arena.get_qualified_name(owner_ref);
+            }
+            if (impl_name.is_valid()) {
+                const im: MethodNode* = this.ctx.generic_registry.find_inherent_impl_method(
+                    impl_name, member.member, member.generic_args.length);
+                if (im != null && im.func != null
+                        && im.func.return_type_annotation != null) {
+                    mut imp_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                    for (mut i: i64 = 0; i < im.func.generic_params.length; i++) {
+                        const gp: GenericParamNode* = im.func.generic_params[i];
+                        if (gp == null) { continue; }
+                        const ar: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &imp_ctx);
+                        if (!ar.is_valid()) { return fallback; }
+                        imp_ctx.add_binding(gp.name, ar);
+                    }
+                    const ir: TypeRef = this.ctx.type_resolver.resolve(
+                        im.func.return_type_annotation, &imp_ctx);
+                    if (ir.is_valid()) { return ir; }
+                }
+            }
+        }
         if (owner_ast == null) { return fallback; }
 
         const empty_methods: MethodNode*[] = [];
@@ -681,6 +711,27 @@ type struct MethodBinding {
                     }
                 }
             }
+        }
+        // Generic method declared in an inherent `implement T { ... }` block on a
+        // NON-generic / primitive receiver (`"42".parse_int<u64>()` on
+        // `implement string`).  These live in the inherent-impl registry, not the
+        // inherent-owner index; without this the call's method-arg bindings are
+        // never stashed and the monomorphizer can't specialize it (codegen E0636).
+        if (found == null) {
+            mut impl_blk: ImplBlockNode* = null;
+            mut nm: SymbolStr = this.types.lookup_type_sym(recv_type);
+            if (nm.is_valid()) {
+                found = this.ctx.generic_registry.find_inherent_impl_generic_method(
+                    nm, member.member, &impl_blk);
+            }
+            if (found == null) {
+                const q: SymbolStr = this.arena.get_qualified_name(recv_type);
+                if (q.is_valid() && (!nm.is_valid() || !q.equals(nm))) {
+                    found = this.ctx.generic_registry.find_inherent_impl_generic_method(
+                        q, member.member, &impl_blk);
+                }
+            }
+            if (found != null && impl_blk != null) { owner_params = &impl_blk.generic_params; }
         }
         mut orig_func: FunctionDeclNode* = null;
         if (found != null) {
