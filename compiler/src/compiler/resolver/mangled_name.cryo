@@ -68,19 +68,6 @@ public function set_lsp_safe(enabled: boolean) -> void {
     g_mangler_lsp_safe = enabled;
 }
 
-/// Internal: report an unrecoverable mangler state.  In CLI mode this
-/// calls `intrinsics::panic` (which aborts).  In LSP-safe mode it
-/// writes a diagnostic to stderr and returns the poison sentinel so
-/// the daemon survives.
-function mangler_ice(msg: string) -> string {
-    if (g_mangler_lsp_safe) {
-        fmt::eprintln(f"warning: mangler internal error in LSP mode: {msg}");
-        return MANGLER_POISON;
-    }
-    intrinsics::panic(msg, FILE, LINE);
-    return MANGLER_POISON;
-}
-
 
 // ReceiverKind: first-parameter receiver shape for non-static methods
 
@@ -219,8 +206,9 @@ type struct MangledName {
                              qname: QualifiedName,
                              params: &TypeRef[], ret: TypeRef,
                              is_variadic: boolean) -> MangledName {
-        return mangle_function_like(
-            table, arena, "", qname, SymbolStr::empty(), false,
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        return ctx.mangle_function_like(
+            "", qname, SymbolStr::empty(), false,
             params, ret, ReceiverKind::None, is_variadic);
     }
 
@@ -230,10 +218,11 @@ type struct MangledName {
                                      qname: QualifiedName, generic_args: &TypeRef[],
                                      params: &TypeRef[], ret: TypeRef,
                                      is_variadic: boolean) -> MangledName {
-        const path: string = encode_path_with_leaf_generics(
-            table, arena, qname, generic_args, SymbolStr::empty(), false);
-        return mangle_with_path(
-            table, arena, "", path, params, ret,
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        const path: string = ctx.encode_path_with_leaf_generics(
+            qname, generic_args, SymbolStr::empty(), false);
+        return ctx.mangle_with_path(
+            "", path, params, ret,
             ReceiverKind::None, is_variadic, true);
     }
 
@@ -244,8 +233,9 @@ type struct MangledName {
                       receiver: ReceiverKind,
                       params: &TypeRef[], ret: TypeRef,
                       is_variadic: boolean) -> MangledName {
-        return mangle_function_like(
-            table, arena, "", owner_qname, method, true,
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        return ctx.mangle_function_like(
+            "", owner_qname, method, true,
             params, ret, receiver, is_variadic);
     }
 
@@ -255,10 +245,11 @@ type struct MangledName {
                               method: SymbolStr, receiver: ReceiverKind,
                               params: &TypeRef[], ret: TypeRef,
                               is_variadic: boolean) -> MangledName {
-        const path: string = encode_path_with_leaf_generics(
-            table, arena, owner_qname, owner_generics, method, true);
-        return mangle_with_path(
-            table, arena, "", path, params, ret, receiver, is_variadic, true);
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        const path: string = ctx.encode_path_with_leaf_generics(
+            owner_qname, owner_generics, method, true);
+        return ctx.mangle_with_path(
+            "", path, params, ret, receiver, is_variadic, true);
     }
 
     /// Mangle a constructor: `C$ct$<owner>-<owner_leaf>$F<params>$Rv`.
@@ -268,9 +259,10 @@ type struct MangledName {
                            owner_qname: QualifiedName,
                            params: &TypeRef[], ret: TypeRef,
                            is_variadic: boolean) -> MangledName {
-        const leaf: SymbolStr = owner_qname_leaf_or_intern(table, owner_qname);
-        return mangle_function_like(
-            table, arena, "ct", owner_qname, leaf, true,
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        const leaf: SymbolStr = MangleContext::owner_qname_leaf_or_intern(table, owner_qname);
+        return ctx.mangle_function_like(
+            "ct", owner_qname, leaf, true,
             params, ret, ReceiverKind::None, is_variadic);
     }
 
@@ -278,9 +270,10 @@ type struct MangledName {
     static for_destructor(table: InternTable*, arena: TypeArena*,
                           owner_qname: QualifiedName,
                           params: &TypeRef[], ret: TypeRef) -> MangledName {
-        const leaf: SymbolStr = owner_qname_leaf_or_intern(table, owner_qname);
-        return mangle_function_like(
-            table, arena, "dt", owner_qname, leaf, true,
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        const leaf: SymbolStr = MangleContext::owner_qname_leaf_or_intern(table, owner_qname);
+        return ctx.mangle_function_like(
+            "dt", owner_qname, leaf, true,
             params, ret, ReceiverKind::ImmutRef, false);
     }
 
@@ -289,9 +282,10 @@ type struct MangledName {
                         owner_qname: QualifiedName, op: OperatorKind,
                         receiver: ReceiverKind,
                         params: &TypeRef[], ret: TypeRef) -> MangledName {
+        mut ctx: MangleContext = MangleContext::new(table, arena);
         const code_sym: SymbolStr = table.intern(op.code());
-        return mangle_function_like(
-            table, arena, "op", owner_qname, code_sym, true,
+        return ctx.mangle_function_like(
+            "op", owner_qname, code_sym, true,
             params, ret, receiver, false);
     }
 
@@ -303,14 +297,15 @@ type struct MangledName {
                           params: &TypeRef[], ret: TypeRef,
                           is_variadic: boolean) -> MangledName {
         // C$tr$<trait_path>$f<owner_path>-<method>$F<params>$R<ret>
+        mut ctx: MangleContext = MangleContext::new(table, arena);
         mut buf: string = "C$tr$";
-        buf += encode_path(table, trait_qname, SymbolStr::empty(), false);
+        buf += MangleContext::encode_path(table, trait_qname, SymbolStr::empty(), false);
         buf += "$f";
-        buf += encode_path(table, owner_qname, method, true);
+        buf += MangleContext::encode_path(table, owner_qname, method, true);
         buf += "$F";
-        buf += encode_params(table, arena, params, receiver, is_variadic);
+        buf += ctx.encode_params(params, receiver, is_variadic);
         buf += "$R";
-        buf += encode_type_ref(table, arena, ret, "for_trait_impl.ret");
+        buf += ctx.encode_type_ref(ret, "for_trait_impl.ret");
         return MangledName { value: table.intern(buf) };
     }
 
@@ -346,26 +341,26 @@ type struct MangledName {
 
     /// Vtable for a class: `C$vt$<path>`.
     static for_vtable(table: InternTable*, owner_qname: QualifiedName) -> MangledName {
-        const path: string = encode_path(table, owner_qname, SymbolStr::empty(), false);
+        const path: string = MangleContext::encode_path(table, owner_qname, SymbolStr::empty(), false);
         return MangledName { value: table.intern("C$vt$" + path) };
     }
 
     /// Type info for a class: `C$ti$<path>`.
     static for_type_info(table: InternTable*, owner_qname: QualifiedName) -> MangledName {
-        const path: string = encode_path(table, owner_qname, SymbolStr::empty(), false);
+        const path: string = MangleContext::encode_path(table, owner_qname, SymbolStr::empty(), false);
         return MangledName { value: table.intern("C$ti$" + path) };
     }
 
     /// Module initializer: `C$mi$<namespace_path>`.
     static for_module_init(table: InternTable*, ns_qname: QualifiedName) -> MangledName {
-        const path: string = encode_path(table, ns_qname, SymbolStr::empty(), false);
+        const path: string = MangleContext::encode_path(table, ns_qname, SymbolStr::empty(), false);
         return MangledName { value: table.intern("C$mi$" + path) };
     }
 
     /// Compiler-generated closure: `C$cl$<enclosing_path>$O<index>`.
     static for_closure(table: InternTable*, enclosing_qname: QualifiedName,
                        index: u32) -> MangledName {
-        const path: string = encode_path(table, enclosing_qname, SymbolStr::empty(), false);
+        const path: string = MangleContext::encode_path(table, enclosing_qname, SymbolStr::empty(), false);
         const idx_u: u64 = index as u64;
         const idx_str: string = idx_u.to_decimal_str();
         mut buf_cl: string = "C$cl$";
@@ -398,7 +393,7 @@ type struct MangledName {
             full = table.resolve(name);
         }
         const qname: QualifiedName = QualifiedName::single(table, full);
-        const path: string = encode_path(table, qname, SymbolStr::empty(), false);
+        const path: string = MangleContext::encode_path(table, qname, SymbolStr::empty(), false);
         return MangledName { value: table.intern("C$" + path) };
     }
 
@@ -406,7 +401,7 @@ type struct MangledName {
     /// Same shape as `for_global` since LLVM type and value namespaces
     /// are distinct; the `C$` prefix unambiguously marks Cryo origin.
     static for_struct_type(table: InternTable*, qname: QualifiedName) -> MangledName {
-        const path: string = encode_path(table, qname, SymbolStr::empty(), false);
+        const path: string = MangleContext::encode_path(table, qname, SymbolStr::empty(), false);
         return MangledName { value: table.intern("C$" + path) };
     }
 
@@ -416,8 +411,9 @@ type struct MangledName {
     static for_generic_path(table: InternTable*, arena: TypeArena*,
                             base_qname: QualifiedName,
                             type_args: &TypeRef[]) -> MangledName {
-        const path: string = encode_path_with_leaf_generics(
-            table, arena, base_qname, type_args, SymbolStr::empty(), false);
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        const path: string = ctx.encode_path_with_leaf_generics(
+            base_qname, type_args, SymbolStr::empty(), false);
         mut buf: string = "C$";
         buf += path;
         return MangledName { value: table.intern(buf) };
@@ -440,8 +436,9 @@ type struct MangledName {
     static specialized_identifier(table: InternTable*, arena: TypeArena*,
                                   base_qname: QualifiedName,
                                   type_args: &TypeRef[]) -> SymbolStr {
-        const encoded: string = encode_path_with_leaf_generics(
-            table, arena, base_qname, type_args, SymbolStr::empty(), false);
+        mut ctx: MangleContext = MangleContext::new(table, arena);
+        const encoded: string = ctx.encode_path_with_leaf_generics(
+            base_qname, type_args, SymbolStr::empty(), false);
         return table.intern(encoded);
     }
 
@@ -474,12 +471,12 @@ type struct MangledName {
     with_method_spec_args(&this, table: InternTable*, arena: TypeArena*,
                           args: &TypeRef[]) -> MangledName {
         if (args.length == 0) { return MangledName { value: this.value }; }
+        mut ctx: MangleContext = MangleContext::new(table, arena);
         mut buf_m: string = table.resolve(this.value);
         buf_m += "$MG";
         for (mut i: i64 = 0; i < args.length; i++) {
             if (i > 0) { buf_m += "_"; }
-            buf_m += encode_type_ref(table, arena, args[i],
-                                     "with_method_spec_args.arg");
+            buf_m += ctx.encode_type_ref(args[i], "with_method_spec_args.arg");
         }
         buf_m += "$";
         return MangledName { value: table.intern(buf_m) };
@@ -492,438 +489,469 @@ type struct MangledName {
 }
 
 
-// Internal mangling helpers
+// MangleContext: bundles the InternTable + TypeArena the encoders thread
+// through, so the encoding routines are methods rather than free functions
+// that pass `(table, arena)` to one another by hand.  Table-only encoders
+// (paths don't recurse into the arena) and the pure code tables are statics.
 
-/// Common spine for function-like symbols:
-///   C$[<kind>$]<path>[-<member>]$F<params>$R<ret>
-function mangle_function_like(table: InternTable*, arena: TypeArena*,
-                              kind_code: string,
-                              owner_qname: QualifiedName,
-                              member: SymbolStr, has_member: boolean,
-                              params: &TypeRef[], ret: TypeRef,
-                              receiver: ReceiverKind,
-                              is_variadic: boolean) -> MangledName {
-    const path: string = encode_path(table, owner_qname, member, has_member);
-    return mangle_with_path(table, arena, kind_code, path, params, ret,
-                            receiver, is_variadic, true);
-}
+type struct MangleContext {
+    table: InternTable*;
+    arena: TypeArena*;
 
-/// Same as above but with a pre-built path string (for callers that
-/// need leaf-generic encoding).
-function mangle_with_path(table: InternTable*, arena: TypeArena*,
-                          kind_code: string, path: string,
-                          params: &TypeRef[], ret: TypeRef,
-                          receiver: ReceiverKind, is_variadic: boolean,
-                          emit_signature: boolean) -> MangledName {
-    mut buf: string = "C$";
-    if (libc::strlen(kind_code) > 0) {
-        buf += kind_code;
-        buf += "$";
+    static new(table: InternTable*, arena: TypeArena*) -> MangleContext {
+        return MangleContext { table: table, arena: arena };
     }
-    buf += path;
-    if (emit_signature) {
-        buf += "$F";
-        buf += encode_params(table, arena, params, receiver, is_variadic);
-        buf += "$R";
-        buf += encode_type_ref(table, arena, ret, "mangle_with_path.ret");
+
+
+    // Function-like spines
+
+    /// Common spine for function-like symbols:
+    ///   C$[<kind>$]<path>[-<member>]$F<params>$R<ret>
+    mangle_function_like(&this, kind_code: string,
+                         owner_qname: QualifiedName,
+                         member: SymbolStr, has_member: boolean,
+                         params: &TypeRef[], ret: TypeRef,
+                         receiver: ReceiverKind,
+                         is_variadic: boolean) -> MangledName {
+        const path: string = MangleContext::encode_path(this.table, owner_qname, member, has_member);
+        return this.mangle_with_path(kind_code, path, params, ret,
+                                     receiver, is_variadic, true);
     }
-    return MangledName { value: table.intern(buf) };
-}
 
-/// Encode a QualifiedName as `<seg>{.<seg>}*[-<member>]`.  Each segment
-/// is length-prefixed (`<byte_len><raw>`).  If the qname is a single
-/// part containing `::` sequences (the common case from
-/// QualifiedName::from_symbol on a pre-joined string), it is split into
-/// multiple segments.
-function encode_path(table: InternTable*, qname: QualifiedName,
-                     member: SymbolStr, has_member: boolean) -> string {
-    mut buf: string = "";
+    /// Same as above but with a pre-built path string (for callers that
+    /// need leaf-generic encoding).
+    mangle_with_path(&this, kind_code: string, path: string,
+                     params: &TypeRef[], ret: TypeRef,
+                     receiver: ReceiverKind, is_variadic: boolean,
+                     emit_signature: boolean) -> MangledName {
+        mut buf: string = "C$";
+        if (libc::strlen(kind_code) > 0) {
+            buf += kind_code;
+            buf += "$";
+        }
+        buf += path;
+        if (emit_signature) {
+            buf += "$F";
+            buf += this.encode_params(params, receiver, is_variadic);
+            buf += "$R";
+            buf += this.encode_type_ref(ret, "mangle_with_path.ret");
+        }
+        return MangledName { value: this.table.intern(buf) };
+    }
 
-    if (qname.is_empty()) {
-        // Defensive: emit a single empty segment so the result is still
-        // structurally well-formed.
-        buf = "0";
-    } else if (qname.depth() == 1) {
-        const raw: string = table.resolve(qname.part_at(0));
-        const segs: string[] = raw.split_nonempty("::");
-        if (segs.length == 0) {
-            buf = encode_ident(raw);
+
+    // Path encoders
+
+    /// Encode a QualifiedName as `<seg>{.<seg>}*[-<member>]`.  Each segment
+    /// is length-prefixed (`<byte_len><raw>`).  If the qname is a single
+    /// part containing `::` sequences (the common case from
+    /// QualifiedName::from_symbol on a pre-joined string), it is split into
+    /// multiple segments.  Table-only (no arena recursion) -> static.
+    static encode_path(table: InternTable*, qname: QualifiedName,
+                       member: SymbolStr, has_member: boolean) -> string {
+        mut buf: string = "";
+
+        if (qname.is_empty()) {
+            // Defensive: emit a single empty segment so the result is still
+            // structurally well-formed.
+            buf = "0";
+        } else if (qname.depth() == 1) {
+            const raw: string = table.resolve(qname.part_at(0));
+            const segs: string[] = raw.split_nonempty("::");
+            if (segs.length == 0) {
+                buf = MangleContext::encode_ident(raw);
+            } else {
+                for (mut i: i64 = 0; i < segs.length; i++) {
+                    if (i > 0) { buf += "."; }
+                    buf += MangleContext::encode_ident(segs[i]);
+                }
+            }
         } else {
-            for (mut i: i64 = 0; i < segs.length; i++) {
+            for (mut i: i64 = 0; i < qname.depth(); i++) {
                 if (i > 0) { buf += "."; }
-                buf += encode_ident(segs[i]);
+                buf += MangleContext::encode_ident(table.resolve(qname.part_at(i)));
             }
         }
-    } else {
-        for (mut i: i64 = 0; i < qname.depth(); i++) {
-            if (i > 0) { buf += "."; }
-            buf += encode_ident(table.resolve(qname.part_at(i)));
+
+        if (has_member && member.is_valid()) {
+            buf += "-";
+            buf += MangleContext::encode_ident(table.resolve(member));
         }
+        return buf;
     }
 
-    if (has_member && member.is_valid()) {
-        buf += "-";
-        buf += encode_ident(table.resolve(member));
-    }
-    return buf;
-}
-
-/// Encode a path where the LAST segment carries a generic arg list.
-///   Pair<int>           -> 4Pair$Li$G
-///   Pair<int>::new      -> 4Pair$Li$G-3new
-///   Math::Vec2<int>     -> 4Math.4Vec2$Li$G
-function encode_path_with_leaf_generics(table: InternTable*, arena: TypeArena*,
-                                        qname: QualifiedName, generic_args: &TypeRef[],
-                                        member: SymbolStr, has_member: boolean) -> string {
-    // First produce the segment list (split on "::" if needed).
-    mut segs: string[] = [];
-    if (qname.is_empty()) {
-        segs.push("");
-    } else if (qname.depth() == 1) {
-        const raw: string = table.resolve(qname.part_at(0));
-        const split: string[] = raw.split_nonempty("::");
-        if (split.length == 0) {
-            segs.push(raw);
+    /// Encode a path where the LAST segment carries a generic arg list.
+    ///   Pair<int>           -> 4Pair$Li$G
+    ///   Pair<int>::new      -> 4Pair$Li$G-3new
+    ///   Math::Vec2<int>     -> 4Math.4Vec2$Li$G
+    encode_path_with_leaf_generics(&this, qname: QualifiedName, generic_args: &TypeRef[],
+                                   member: SymbolStr, has_member: boolean) -> string {
+        // First produce the segment list (split on "::" if needed).
+        mut segs: string[] = [];
+        if (qname.is_empty()) {
+            segs.push("");
+        } else if (qname.depth() == 1) {
+            const raw: string = this.table.resolve(qname.part_at(0));
+            const split: string[] = raw.split_nonempty("::");
+            if (split.length == 0) {
+                segs.push(raw);
+            } else {
+                for (mut i: i64 = 0; i < split.length; i++) {
+                    segs.push(split[i]);
+                }
+            }
         } else {
-            for (mut i: i64 = 0; i < split.length; i++) {
-                segs.push(split[i]);
+            for (mut i: i64 = 0; i < qname.depth(); i++) {
+                segs.push(this.table.resolve(qname.part_at(i)));
             }
         }
-    } else {
-        for (mut i: i64 = 0; i < qname.depth(); i++) {
-            segs.push(table.resolve(qname.part_at(i)));
-        }
-    }
 
-    // Build the path, attaching $L<args>$G to the last segment if any.
-    mut buf: string = "";
-    const last_idx: i64 = segs.length - 1;
-    for (mut i: i64 = 0; i < segs.length; i++) {
-        if (i > 0) { buf += "."; }
-        buf += encode_ident(segs[i]);
-        if (i == last_idx && generic_args.length > 0) {
-            buf += "$L";
-            for (mut j: i64 = 0; j < generic_args.length; j++) {
-                if (j > 0) { buf += "_"; }
-                buf += encode_type_ref(table, arena, generic_args[j], "leaf_generics.arg");
+        // Build the path, attaching $L<args>$G to the last segment if any.
+        mut buf: string = "";
+        const last_idx: i64 = segs.length - 1;
+        for (mut i: i64 = 0; i < segs.length; i++) {
+            if (i > 0) { buf += "."; }
+            buf += MangleContext::encode_ident(segs[i]);
+            if (i == last_idx && generic_args.length > 0) {
+                buf += "$L";
+                for (mut j: i64 = 0; j < generic_args.length; j++) {
+                    if (j > 0) { buf += "_"; }
+                    buf += this.encode_type_ref(generic_args[j], "leaf_generics.arg");
+                }
+                buf += "$G";
             }
-            buf += "$G";
         }
-    }
 
-    if (has_member && member.is_valid()) {
-        buf += "-";
-        buf += encode_ident(table.resolve(member));
-    }
-    return buf;
-}
-
-/// Encode a parameter list with optional receiver and variadic marker.
-/// Empty list with no receiver and no variadic -> literal "v".
-function encode_params(table: InternTable*, arena: TypeArena*,
-                       params: &TypeRef[], receiver: ReceiverKind,
-                       is_variadic: boolean) -> string {
-    if (params.length == 0 && receiver.is_none() && !is_variadic) {
-        return "v";
-    }
-
-    mut buf: string = "";
-    mut first: boolean = true;
-
-    if (!receiver.is_none()) {
-        buf += receiver.encode();
-        first = false;
-    }
-
-    for (mut i: i64 = 0; i < params.length; i++) {
-        if (!first) { buf += "_"; }
-        buf += encode_type_ref(table, arena, params[i], "encode_params.param");
-        first = false;
-    }
-
-    if (is_variadic) {
-        buf += "$V";
-    }
-    return buf;
-}
-
-/// Encode a type by TypeRef, recursing into compound shapes via the arena.
-///
-/// An invalid TypeRef or a null arena lookup at this point is an
-/// internal compiler error: by the time the mangler runs, every type
-/// referenced by a declaration MUST have been resolved.  Earlier
-/// versions emitted a build-survivable warning + `v` fallback while
-/// the upstream resolution gaps were being closed off; the gaps are
-/// now closed (see commits in `new-stdlib`), so reaching this state
-/// indicates a NEW resolution gap and we panic with the caller-site
-/// label so the regression is loud rather than producing a junk
-/// symbol whose `$R` slot is `v`.
-function encode_type_ref(table: InternTable*, arena: TypeArena*,
-                         ty: TypeRef, caller: string) -> string {
-    if (!ty.is_valid()) {
-        return mangler_ice(format(
-            "encode_type_ref: invalid TypeRef (id=0) at %s; upstream resolution gap",
-            caller));
-    }
-    const t: Type* = arena.lookup(ty.id);
-    if (t == null) {
-        return mangler_ice(format(
-            "encode_type_ref: arena lookup returned null for TypeRef id=%llu at %s",
-            ty.id, caller));
-    }
-    return encode_type(table, arena, t);
-}
-
-/// Encode a Type* directly.  Compound types recurse via encode_type_ref.
-function encode_type(table: InternTable*, arena: TypeArena*, ty: Type*) -> string {
-    if (ty == null) {
-        return mangler_ice("encode_type: null Type* (internal compiler error, caller passed null)");
-    }
-
-    if (ty.kind == TypeKind::Void)   { return "v"; }
-    if (ty.kind == TypeKind::Unit)   { return "u"; }
-    if (ty.kind == TypeKind::Bool)   { return "b"; }
-    if (ty.kind == TypeKind::Char)   { return "c"; }
-    if (ty.kind == TypeKind::String) { return "S"; }
-    if (ty.kind == TypeKind::Never)  { return "v"; }   // no spec code; map to void
-
-    if (ty.kind == TypeKind::Int) {
-        const it: IntType* = ty as IntType*;
-        return encode_int_kind(it.int_kind);
-    }
-    if (ty.kind == TypeKind::Float) {
-        const ft: FloatType* = ty as FloatType*;
-        return encode_float_kind(ft.float_kind);
-    }
-
-    if (ty.kind == TypeKind::Pointer) {
-        const p: PointerType* = ty as PointerType*;
-        return "P" + encode_type_ref(table, arena, p.pointee, "Pointer.pointee");
-    }
-    if (ty.kind == TypeKind::Reference) {
-        const r: ReferenceType* = ty as ReferenceType*;
-        return "R" + encode_type_ref(table, arena, r.referent, "Reference.referent");
-    }
-    if (ty.kind == TypeKind::Array) {
-        const a: ArrayType* = ty as ArrayType*;
-        return "A" + encode_type_ref(table, arena, a.element, "Array.element");
-    }
-    if (ty.kind == TypeKind::Optional) {
-        // Optional<T>: encode as a synthetic named generic so the form
-        // is round-trippable through the demangler.
-        const o: OptionalType* = ty as OptionalType*;
-        const inner_o: string = encode_type_ref(table, arena, o.wrapped, "Optional.wrapped");
-        mut buf_o: string = "N$L8Optional$L";
-        buf_o += inner_o;
-        buf_o += "$G$G";
-        return buf_o;
-    }
-
-    if (ty.kind == TypeKind::Function) {
-        const f: FunctionType* = ty as FunctionType*;
-        const inner_params: string = encode_params(
-            table, arena, f.param_types, ReceiverKind::None, f.is_variadic);
-        const inner_ret: string = encode_type_ref(table, arena, f.return_type, "FunctionType.ret");
-        mut buf_f: string = "F$L";
-        buf_f += inner_params;
-        buf_f += "$G";
-        buf_f += inner_ret;
-        return buf_f;
-    }
-
-    if (ty.kind == TypeKind::Struct
-     || ty.kind == TypeKind::Class
-     || ty.kind == TypeKind::Enum
-     || ty.kind == TypeKind::Trait
-     || ty.kind == TypeKind::TypeAlias
-     || ty.kind == TypeKind::FunctionTemplate) {
-        const inner_n: string = encode_named_type_path(table, ty);
-        mut buf_n: string = "N$L";
-        buf_n += inner_n;
-        buf_n += "$G";
-        return buf_n;
-    }
-
-    if (ty.kind == TypeKind::InstantiatedType) {
-        const inst: InstantiatedType* = ty as InstantiatedType*;
-        return encode_instantiated(table, arena, inst);
-    }
-
-    if (ty.kind == TypeKind::GenericParam) {
-        const gp: GenericParamType* = ty as GenericParamType*;
-        // Should be resolved before mangling; emit the param name so any
-        // leaks are easy to spot in IR rather than a silent collision.
-        return "N$L" + encode_ident(table.resolve(gp.param_name)) + "$G";
-    }
-    if (ty.kind == TypeKind::BoundedParam) {
-        const bp: BoundedParamType* = ty as BoundedParamType*;
-        return "N$L" + encode_ident(table.resolve(bp.param_name)) + "$G";
-    }
-    if (ty.kind == TypeKind::AssocProjection) {
-        // Symbolic associated-type projection (`I::Item`). Like GenericParam,
-        // it appears only in TEMPLATE signatures and is resolved to its concrete
-        // member type before a real (codegen'd) spec is mangled — so emit a
-        // stable, distinct placeholder (`base` + `::` + `member`) rather than
-        // ICE. A leak into an emitted symbol stays visible (never collides with
-        // a genuine named type), matching the GenericParam policy above.
-        const proj: AssocProjectionType* = ty as AssocProjectionType*;
-        mut buf_pj: string = "N$L";
-        buf_pj += encode_type_ref(table, arena, proj.base, "AssocProjection.base");
-        buf_pj += "_";   // `::` escape
-        buf_pj += encode_ident(table.resolve(proj.member));
-        buf_pj += "$G";
-        return buf_pj;
-    }
-
-    // Tuple<T0, T1, ...>: encode as a synthetic named generic so distinct
-    // element shapes produce distinct mangled names. Must include element
-    // types: collapsing all tuples to a single placeholder caused
-    // generic specs like `Option<(i32, i32)>` and `Option<(String, String)>`
-    // to share a spec name, with the second registration overwriting the
-    // first in the type registry.
-    if (ty.kind == TypeKind::Tuple) {
-        const tup: TupleType* = ty as TupleType*;
-        mut buf_t: string = "N$L5Tuple$L";
-        for (mut i: i64 = 0; i < tup.elements.length; i++) {
-            if (i > 0) { buf_t += "_"; }
-            buf_t += encode_type_ref(table, arena, tup.elements[i], "Tuple.element");
+        if (has_member && member.is_valid()) {
+            buf += "-";
+            buf += MangleContext::encode_ident(this.table.resolve(member));
         }
-        buf_t += "$G$G";
-        return buf_t;
+        return buf;
     }
 
-    // Unhandled type kind.  Reaching here means either:
-    //   1. A new TypeKind was added without updating the mangler, or
-    //   2. A type that should have been substituted/resolved earlier
-    //      survived to mangling (e.g. an Error sentinel or a leak from
-    //      an upstream pass).
-    // Either way, falling back to "v" silently produces a symbol that
-    // collides with genuine void-typed declarations; panic so the
-    // offending site is loud rather than silently miscompiled.
-    return mangler_ice(format("encode_type: unhandled type kind %s; extend the mangler or close the upstream resolution gap",
-                 ty.kind.to_string()));
-}
 
-/// Encode the qualified path of a named type for use INSIDE `N$L...$G`.
-function encode_named_type_path(table: InternTable*, ty: Type*) -> string {
-    if (ty.kind == TypeKind::Struct) {
-        const s: StructType* = ty as StructType*;
-        return encode_named_qname(table, s.qualified_name);
-    }
-    if (ty.kind == TypeKind::Class) {
-        const c: ClassType* = ty as ClassType*;
-        return encode_named_qname(table, c.qualified_name);
-    }
-    if (ty.kind == TypeKind::Enum) {
-        const e: EnumType* = ty as EnumType*;
-        return encode_named_qname(table, e.qualified_name);
-    }
-    if (ty.kind == TypeKind::Trait) {
-        const tr: TraitType* = ty as TraitType*;
-        return encode_named_qname(table, tr.qualified_name);
-    }
-    if (ty.kind == TypeKind::TypeAlias) {
-        const ta: TypeAliasType* = ty as TypeAliasType*;
-        return encode_named_qname(table, ta.alias_name);
-    }
-    if (ty.kind == TypeKind::FunctionTemplate) {
-        const ft: FunctionTemplateType* = ty as FunctionTemplateType*;
-        return encode_named_qname(table, ft.qualified_name);
-    }
-    return encode_ident("?");
-}
+    // Parameter + type encoders
 
-/// Encode a single SymbolStr that may contain `::` separators as a
-/// length-prefixed segment chain (`4Math.6Vector.4Vec2`).
-function encode_named_qname(table: InternTable*, sym: SymbolStr) -> string {
-    const raw: string = table.resolve(sym);
-    const segs: string[] = raw.split_nonempty("::");
-    if (segs.length == 0) {
-        return encode_ident(raw);
+    /// Encode a parameter list with optional receiver and variadic marker.
+    /// Empty list with no receiver and no variadic -> literal "v".
+    encode_params(&this, params: &TypeRef[], receiver: ReceiverKind,
+                  is_variadic: boolean) -> string {
+        if (params.length == 0 && receiver.is_none() && !is_variadic) {
+            return "v";
+        }
+
+        mut buf: string = "";
+        mut first: boolean = true;
+
+        if (!receiver.is_none()) {
+            buf += receiver.encode();
+            first = false;
+        }
+
+        for (mut i: i64 = 0; i < params.length; i++) {
+            if (!first) { buf += "_"; }
+            buf += this.encode_type_ref(params[i], "encode_params.param");
+            first = false;
+        }
+
+        if (is_variadic) {
+            buf += "$V";
+        }
+        return buf;
     }
-    mut buf: string = "";
-    for (mut i: i64 = 0; i < segs.length; i++) {
-        if (i > 0) { buf += "."; }
-        buf += encode_ident(segs[i]);
+
+    /// Encode a type by TypeRef, recursing into compound shapes via the arena.
+    ///
+    /// An invalid TypeRef or a null arena lookup at this point is an
+    /// internal compiler error: by the time the mangler runs, every type
+    /// referenced by a declaration MUST have been resolved.  Earlier
+    /// versions emitted a build-survivable warning + `v` fallback while
+    /// the upstream resolution gaps were being closed off; the gaps are
+    /// now closed (see commits in `new-stdlib`), so reaching this state
+    /// indicates a NEW resolution gap and we panic with the caller-site
+    /// label so the regression is loud rather than producing a junk
+    /// symbol whose `$R` slot is `v`.
+    encode_type_ref(&this, ty: TypeRef, caller: string) -> string {
+        if (!ty.is_valid()) {
+            return MangleContext::ice(format(
+                "encode_type_ref: invalid TypeRef (id=0) at %s; upstream resolution gap",
+                caller));
+        }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) {
+            return MangleContext::ice(format(
+                "encode_type_ref: arena lookup returned null for TypeRef id=%llu at %s",
+                ty.id, caller));
+        }
+        return this.encode_type(t);
     }
-    return buf;
-}
 
-/// Encode an InstantiatedType as a named generic instance:
-///   Pair<int>       -> 4Pair$Li$G
-///   Result<T, U>    -> 6Result$L<T>_<U>$G
-function encode_instantiated(table: InternTable*, arena: TypeArena*,
-                             inst: InstantiatedType*) -> string {
-    const base_t: Type* = arena.lookup(inst.generic_base.id);
-    mut buf: string = "N$L";
-    if (base_t == null) {
-        buf += encode_ident("?");
-    } else {
-        buf += encode_named_type_path(table, base_t);
+    /// Encode a Type* directly.  Compound types recurse via encode_type_ref.
+    encode_type(&this, ty: Type*) -> string {
+        if (ty == null) {
+            return MangleContext::ice("encode_type: null Type* (internal compiler error, caller passed null)");
+        }
+
+        if (ty.kind == TypeKind::Void)   { return "v"; }
+        if (ty.kind == TypeKind::Unit)   { return "u"; }
+        if (ty.kind == TypeKind::Bool)   { return "b"; }
+        if (ty.kind == TypeKind::Char)   { return "c"; }
+        if (ty.kind == TypeKind::String) { return "S"; }
+        if (ty.kind == TypeKind::Never)  { return "v"; }   // no spec code; map to void
+
+        if (ty.kind == TypeKind::Int) {
+            const it: IntType* = ty as IntType*;
+            return MangleContext::int_code(it.int_kind);
+        }
+        if (ty.kind == TypeKind::Float) {
+            const ft: FloatType* = ty as FloatType*;
+            return MangleContext::float_code(ft.float_kind);
+        }
+
+        if (ty.kind == TypeKind::Pointer) {
+            const p: PointerType* = ty as PointerType*;
+            return "P" + this.encode_type_ref(p.pointee, "Pointer.pointee");
+        }
+        if (ty.kind == TypeKind::Reference) {
+            const r: ReferenceType* = ty as ReferenceType*;
+            return "R" + this.encode_type_ref(r.referent, "Reference.referent");
+        }
+        if (ty.kind == TypeKind::Array) {
+            const a: ArrayType* = ty as ArrayType*;
+            return "A" + this.encode_type_ref(a.element, "Array.element");
+        }
+        if (ty.kind == TypeKind::Optional) {
+            // Optional<T>: encode as a synthetic named generic so the form
+            // is round-trippable through the demangler.
+            const o: OptionalType* = ty as OptionalType*;
+            const inner_o: string = this.encode_type_ref(o.wrapped, "Optional.wrapped");
+            mut buf_o: string = "N$L8Optional$L";
+            buf_o += inner_o;
+            buf_o += "$G$G";
+            return buf_o;
+        }
+
+        if (ty.kind == TypeKind::Function) {
+            const f: FunctionType* = ty as FunctionType*;
+            const inner_params: string = this.encode_params(
+                f.param_types, ReceiverKind::None, f.is_variadic);
+            const inner_ret: string = this.encode_type_ref(f.return_type, "FunctionType.ret");
+            mut buf_f: string = "F$L";
+            buf_f += inner_params;
+            buf_f += "$G";
+            buf_f += inner_ret;
+            return buf_f;
+        }
+
+        if (ty.kind == TypeKind::Struct
+         || ty.kind == TypeKind::Class
+         || ty.kind == TypeKind::Enum
+         || ty.kind == TypeKind::Trait
+         || ty.kind == TypeKind::TypeAlias
+         || ty.kind == TypeKind::FunctionTemplate) {
+            const inner_n: string = MangleContext::encode_named_type_path(this.table, ty);
+            mut buf_n: string = "N$L";
+            buf_n += inner_n;
+            buf_n += "$G";
+            return buf_n;
+        }
+
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+            return this.encode_instantiated(inst);
+        }
+
+        if (ty.kind == TypeKind::GenericParam) {
+            const gp: GenericParamType* = ty as GenericParamType*;
+            // Should be resolved before mangling; emit the param name so any
+            // leaks are easy to spot in IR rather than a silent collision.
+            return "N$L" + MangleContext::encode_ident(this.table.resolve(gp.param_name)) + "$G";
+        }
+        if (ty.kind == TypeKind::BoundedParam) {
+            const bp: BoundedParamType* = ty as BoundedParamType*;
+            return "N$L" + MangleContext::encode_ident(this.table.resolve(bp.param_name)) + "$G";
+        }
+        if (ty.kind == TypeKind::AssocProjection) {
+            // Symbolic associated-type projection (`I::Item`). Like GenericParam,
+            // it appears only in TEMPLATE signatures and is resolved to its concrete
+            // member type before a real (codegen'd) spec is mangled — so emit a
+            // stable, distinct placeholder (`base` + `::` + `member`) rather than
+            // ICE. A leak into an emitted symbol stays visible (never collides with
+            // a genuine named type), matching the GenericParam policy above.
+            const proj: AssocProjectionType* = ty as AssocProjectionType*;
+            mut buf_pj: string = "N$L";
+            buf_pj += this.encode_type_ref(proj.base, "AssocProjection.base");
+            buf_pj += "_";   // `::` escape
+            buf_pj += MangleContext::encode_ident(this.table.resolve(proj.member));
+            buf_pj += "$G";
+            return buf_pj;
+        }
+
+        // Tuple<T0, T1, ...>: encode as a synthetic named generic so distinct
+        // element shapes produce distinct mangled names. Must include element
+        // types: collapsing all tuples to a single placeholder caused
+        // generic specs like `Option<(i32, i32)>` and `Option<(String, String)>`
+        // to share a spec name, with the second registration overwriting the
+        // first in the type registry.
+        if (ty.kind == TypeKind::Tuple) {
+            const tup: TupleType* = ty as TupleType*;
+            mut buf_t: string = "N$L5Tuple$L";
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (i > 0) { buf_t += "_"; }
+                buf_t += this.encode_type_ref(tup.elements[i], "Tuple.element");
+            }
+            buf_t += "$G$G";
+            return buf_t;
+        }
+
+        // Unhandled type kind.  Reaching here means either:
+        //   1. A new TypeKind was added without updating the mangler, or
+        //   2. A type that should have been substituted/resolved earlier
+        //      survived to mangling (e.g. an Error sentinel or a leak from
+        //      an upstream pass).
+        // Either way, falling back to "v" silently produces a symbol that
+        // collides with genuine void-typed declarations; panic so the
+        // offending site is loud rather than silently miscompiled.
+        return MangleContext::ice(format("encode_type: unhandled type kind %s; extend the mangler or close the upstream resolution gap",
+                     ty.kind.to_string()));
     }
-    buf += "$L";
-    for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-        if (i > 0) { buf += "_"; }
-        buf += encode_type_ref(table, arena, inst.type_args[i], "InstantiatedType.arg");
+
+    /// Encode the qualified path of a named type for use INSIDE `N$L...$G`.
+    /// Table-only -> static.
+    static encode_named_type_path(table: InternTable*, ty: Type*) -> string {
+        if (ty.kind == TypeKind::Struct) {
+            const s: StructType* = ty as StructType*;
+            return MangleContext::encode_named_qname(table, s.qualified_name);
+        }
+        if (ty.kind == TypeKind::Class) {
+            const c: ClassType* = ty as ClassType*;
+            return MangleContext::encode_named_qname(table, c.qualified_name);
+        }
+        if (ty.kind == TypeKind::Enum) {
+            const e: EnumType* = ty as EnumType*;
+            return MangleContext::encode_named_qname(table, e.qualified_name);
+        }
+        if (ty.kind == TypeKind::Trait) {
+            const tr: TraitType* = ty as TraitType*;
+            return MangleContext::encode_named_qname(table, tr.qualified_name);
+        }
+        if (ty.kind == TypeKind::TypeAlias) {
+            const ta: TypeAliasType* = ty as TypeAliasType*;
+            return MangleContext::encode_named_qname(table, ta.alias_name);
+        }
+        if (ty.kind == TypeKind::FunctionTemplate) {
+            const ft: FunctionTemplateType* = ty as FunctionTemplateType*;
+            return MangleContext::encode_named_qname(table, ft.qualified_name);
+        }
+        return MangleContext::encode_ident("?");
     }
-    buf += "$G";
-    buf += "$G";
-    return buf;
-}
 
-/// Length-prefix an identifier: `<byte_len><raw>` (spec section 5, counts bytes,
-/// not code points).
-function encode_ident(text: string) -> string {
-    return format("%lld%s", libc::strlen(text) as i64, text);
-}
-
-
-function encode_int_kind(k: IntegerKind) -> string {
-    return match (k) {
-        IntegerKind::I8   => { "a" }
-        IntegerKind::I16  => { "s" }
-        IntegerKind::I32  => { "i" }
-        IntegerKind::I64  => { "l" }
-        // 128-bit ints use the Itanium builtin codes `n` (__int128) and
-        // `o` (unsigned __int128). These MUST be distinct from i64/u64 (`l`/`m`):
-        // sharing a code collapses `foo<u128>` and `foo<u64>` to one symbol, so
-        // a generic instantiated for both (e.g. `format_to_string`) binds the
-        // u128 call to the u64 body and silently truncates to 64 bits.
-        IntegerKind::I128 => { "n" }
-        IntegerKind::U8   => { "h" }
-        IntegerKind::U16  => { "t" }
-        IntegerKind::U32  => { "j" }
-        IntegerKind::U64  => { "m" }
-        IntegerKind::U128 => { "o" }
-        // Platform-width ints. No Itanium builtin code exists for size types
-        // (they're typedefs there), so we use distinct scheme-local codes.
-        // MUST differ from i64/u64 (`l`/`m`) for the same reason i128/u128 do:
-        // a shared code collapses `foo<usize>` and `foo<u64>` to one symbol.
-        IntegerKind::Isize => { "x" }
-        IntegerKind::Usize => { "y" }
-    };
-}
-
-function encode_float_kind(k: FloatKind) -> string {
-    return match (k) {
-        FloatKind::F32 => { "f" }
-        FloatKind::F64 => { "d" }
-    };
-}
-
-/// Returns the leaf SymbolStr of a QualifiedName.  If the qname is a
-/// single part containing "::", returns the substring after the last "::"
-/// re-interned.
-function owner_qname_leaf_or_intern(table: InternTable*,
-                                    qname: &QualifiedName) -> SymbolStr {
-    if (qname.is_empty()) { return SymbolStr::empty(); }
-    if (qname.depth() == 1) {
-        const raw: string = table.resolve(qname.part_at(0));
+    /// Encode a single SymbolStr that may contain `::` separators as a
+    /// length-prefixed segment chain (`4Math.6Vector.4Vec2`).  Table-only -> static.
+    static encode_named_qname(table: InternTable*, sym: SymbolStr) -> string {
+        const raw: string = table.resolve(sym);
         const segs: string[] = raw.split_nonempty("::");
         if (segs.length == 0) {
-            return qname.part_at(0);
+            return MangleContext::encode_ident(raw);
         }
-        return table.intern(segs[segs.length - 1]);
+        mut buf: string = "";
+        for (mut i: i64 = 0; i < segs.length; i++) {
+            if (i > 0) { buf += "."; }
+            buf += MangleContext::encode_ident(segs[i]);
+        }
+        return buf;
     }
-    return qname.part_at(qname.depth() - 1);
+
+    /// Encode an InstantiatedType as a named generic instance:
+    ///   Pair<int>       -> 4Pair$Li$G
+    ///   Result<T, U>    -> 6Result$L<T>_<U>$G
+    encode_instantiated(&this, inst: InstantiatedType*) -> string {
+        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
+        mut buf: string = "N$L";
+        if (base_t == null) {
+            buf += MangleContext::encode_ident("?");
+        } else {
+            buf += MangleContext::encode_named_type_path(this.table, base_t);
+        }
+        buf += "$L";
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (i > 0) { buf += "_"; }
+            buf += this.encode_type_ref(inst.type_args[i], "InstantiatedType.arg");
+        }
+        buf += "$G";
+        buf += "$G";
+        return buf;
+    }
+
+
+    // Pure code tables + identifier primitive (no table/arena) -> statics
+
+    /// Length-prefix an identifier: `<byte_len><raw>` (spec section 5,
+    /// counts bytes, not code points).
+    static encode_ident(text: string) -> string {
+        return format("%lld%s", libc::strlen(text) as i64, text);
+    }
+
+    static int_code(k: IntegerKind) -> string {
+        return match (k) {
+            IntegerKind::I8   => { "a" }
+            IntegerKind::I16  => { "s" }
+            IntegerKind::I32  => { "i" }
+            IntegerKind::I64  => { "l" }
+            // 128-bit ints use the Itanium builtin codes `n` (__int128) and
+            // `o` (unsigned __int128). These MUST be distinct from i64/u64 (`l`/`m`):
+            // sharing a code collapses `foo<u128>` and `foo<u64>` to one symbol, so
+            // a generic instantiated for both (e.g. `format_to_string`) binds the
+            // u128 call to the u64 body and silently truncates to 64 bits.
+            IntegerKind::I128 => { "n" }
+            IntegerKind::U8   => { "h" }
+            IntegerKind::U16  => { "t" }
+            IntegerKind::U32  => { "j" }
+            IntegerKind::U64  => { "m" }
+            IntegerKind::U128 => { "o" }
+            // Platform-width ints. No Itanium builtin code exists for size types
+            // (they're typedefs there), so we use distinct scheme-local codes.
+            // MUST differ from i64/u64 (`l`/`m`) for the same reason i128/u128 do:
+            // a shared code collapses `foo<usize>` and `foo<u64>` to one symbol.
+            IntegerKind::Isize => { "x" }
+            IntegerKind::Usize => { "y" }
+        };
+    }
+
+    static float_code(k: FloatKind) -> string {
+        return match (k) {
+            FloatKind::F32 => { "f" }
+            FloatKind::F64 => { "d" }
+        };
+    }
+
+    /// Returns the leaf SymbolStr of a QualifiedName.  If the qname is a
+    /// single part containing "::", returns the substring after the last "::"
+    /// re-interned.  Table-only -> static.
+    static owner_qname_leaf_or_intern(table: InternTable*,
+                                      qname: &QualifiedName) -> SymbolStr {
+        if (qname.is_empty()) { return SymbolStr::empty(); }
+        if (qname.depth() == 1) {
+            const raw: string = table.resolve(qname.part_at(0));
+            const segs: string[] = raw.split_nonempty("::");
+            if (segs.length == 0) {
+                return qname.part_at(0);
+            }
+            return table.intern(segs[segs.length - 1]);
+        }
+        return qname.part_at(qname.depth() - 1);
+    }
+
+    /// Internal: report an unrecoverable mangler state.  In CLI mode this
+    /// calls `intrinsics::panic` (which aborts).  In LSP-safe mode it
+    /// writes a diagnostic to stderr and returns the poison sentinel so
+    /// the daemon survives.
+    static ice(msg: string) -> string {
+        if (g_mangler_lsp_safe) {
+            fmt::eprintln(f"warning: mangler internal error in LSP mode: {msg}");
+            return MANGLER_POISON;
+        }
+        intrinsics::panic(msg, FILE, LINE);
+        return MANGLER_POISON;
+    }
 }
