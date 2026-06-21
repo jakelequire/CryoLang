@@ -362,7 +362,7 @@ function resolve_stdlib_root(cli_override: string,
 
 /// Path to the lockfile next to a given cryoconfig.
 function lock_path_for(consumer_root: string) -> string {
-    if (libc::strlen(consumer_root) == 0 || libc::strcmp(consumer_root, ".") == 0) {
+    if (libc::strlen(consumer_root) == 0 || consumer_root.eq(".")) {
         return "cryoconfig.lock";
     }
     return format("%s/cryoconfig.lock", consumer_root);
@@ -440,36 +440,6 @@ function timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
     }
     fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
         label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
-}
-
-/// Transitive import closure of module `root` (including `root` itself),
-/// returned as a per-module-index boolean set of length `n`.  Follows
-/// `ModuleInfo.dependencies` edges via the name index; dependencies that
-/// resolve to no module (external / unresolved) are simply skipped.  Used by
-/// the per-module incremental cache to fold exactly the source hashes whose
-/// type layouts a non-spec-owning module's object file can depend on.
-function compute_import_closure(mg: ModuleGraph*, root: u32, n: u32) -> boolean[] {
-    mut visited: boolean[] = [];
-    for (mut i: u32 = 0; i < n; i++) { visited.push(false); }
-    if (root >= n) { return visited; }
-    // BFS over a queue with a cursor (no pop needed).
-    mut queue: u32[] = [];
-    queue.push(root);
-    visited[root as i64] = true;
-    mut head: i64 = 0;
-    while (head < queue.length) {
-        const cur: u32 = queue[head];
-        head = head + 1;
-        const info: ModuleInfo* = &mg.modules[cur];
-        for (mut d: i64 = 0; d < info.dependencies.length; d++) {
-            const didx: i64 = mg.find_module_index(info.dependencies[d]);
-            if (didx >= 0 && didx < n as i64 && !visited[didx]) {
-                visited[didx] = true;
-                queue.push(didx as u32);
-            }
-        }
-    }
-    return visited;
 }
 
 /// Build a ProjectConfig view that compiles the `[lib]` half of a
@@ -632,7 +602,7 @@ type struct CompilerInstance {
         // sub/hello.cryo` would scatter its build tree away from the
         // file it belongs to.
         if (libc::strlen(config.project_root) > 0
-                && libc::strcmp(config.project_root, ".") != 0) {
+                && !config.project_root.eq(".")) {
             config.output_dir = format("%s/build", config.project_root);
         }
         // CLI `--target=TRIPLE`; `--opt-level` / `-g` / profile flags
@@ -781,7 +751,7 @@ type struct CompilerInstance {
             for (mut bi: int = 0; bi < config.bins.length; bi++) {
                 const bin_full: string = format("%s/%s",
                     config.project_root, config.bins[bi].entry_point);
-                if (libc::strcmp(bin_full, override_path) == 0) {
+                if (bin_full.eq(override_path)) {
                     chosen = bi;
                     break;
                 }
@@ -1274,7 +1244,7 @@ type struct CompilerInstance {
                 const dr_path: string = dep_outcome.roots[drc].path;
                 const dr_base: string =
                     if (libc::strlen(config.project_root) == 0
-                        || libc::strcmp(config.project_root, ".") == 0) {
+                        || config.project_root.eq(".")) {
                         dr_path
                     } else {
                         format("%s/%s", config.project_root, dr_path)
@@ -1879,7 +1849,7 @@ type struct CompilerInstance {
                 } else {
                     k = BuildManifest::fnv_str(k, "leaf");
                     const clos: boolean[] =
-                        compute_import_closure(ctx.module_graph, m, n);
+                        ctx.module_graph.compute_import_closure(m, n);
                     for (mut i: u32 = 0; i < n; i++) {
                         if (clos[order[i] as i64]) {
                             k = BuildManifest::fnv_u64(k, pm_src_h[order[i] as i64]);

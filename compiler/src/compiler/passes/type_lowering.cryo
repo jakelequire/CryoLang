@@ -25,18 +25,7 @@ import Compiler::CompilationContext;
 import Compiler::Types;
 import Compiler::Types::{ TypeRef, Arena };
 import Utils::Logger;
-
-
-// Alignment helper
-
-/// Round `value` up to the next multiple of `align`.
-/// Returns `value` unchanged if already aligned or if align is 0.
-function align_up(value: u64, align: u64) -> u64 {
-    if (align <= 1) { return value; }
-    const remainder: u64 = value % align;
-    if (remainder == 0) { return value; }
-    return value + (align - remainder);
-}
+import std::math;
 
 
 // TypeLoweringPasses: public entry point
@@ -324,7 +313,7 @@ function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
         }
 
         if (!packed && f_align > 0) {
-            offset = align_up(offset, f_align);
+            offset = math::align_up(offset, f_align);
             if (f_align > max_align) { max_align = f_align; }
         }
 
@@ -357,7 +346,7 @@ function compute_struct_layout(st: StructType*, arena: TypeArena*) -> boolean {
 
     // Pad total size to struct alignment (alignment is 1 for packed
     // structs, so no padding is added in that case).
-    const total: u64 = align_up(offset, max_align);
+    const total: u64 = math::align_up(offset, max_align);
     st.set_layout(total, max_align);
     return true;
 }
@@ -389,7 +378,7 @@ function compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
             // Base class fields start after vtable pointer (if any)
             // For simplicity, we add base size directly (base already has its own vptr accounted for)
             if (base_align > max_align) { max_align = base_align; }
-            offset = align_up(offset, base_align) + base_size;
+            offset = math::align_up(offset, base_align) + base_size;
         }
     }
 
@@ -404,7 +393,7 @@ function compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
         if (f_size == 0 && needs_layout(field_ty)) { return false; }
 
         if (f_align > 0) {
-            offset = align_up(offset, f_align);
+            offset = math::align_up(offset, f_align);
             if (f_align > max_align) { max_align = f_align; }
         }
 
@@ -422,7 +411,7 @@ function compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
         return true;
     }
 
-    const total: u64 = align_up(offset, max_align);
+    const total: u64 = math::align_up(offset, max_align);
     cl.set_layout(total, max_align);
     return true;
 }
@@ -440,7 +429,7 @@ function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
     if (en.variants.length == 0) {
         mut a: u64 = ENUM_TAG_ALIGN;
         if (en.min_alignment > a) { a = en.min_alignment; }
-        en.set_layout(align_up(ENUM_TAG_SIZE, a), a);
+        en.set_layout(math::align_up(ENUM_TAG_SIZE, a), a);
         return true;
     }
 
@@ -461,7 +450,7 @@ function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
         }
         mut a: u64 = tag_align;
         if (en.min_alignment > a) { a = en.min_alignment; }
-        en.set_layout(align_up(tag_size, a), a);
+        en.set_layout(math::align_up(tag_size, a), a);
         return true;
     }
 
@@ -488,13 +477,13 @@ function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
             if (p_size == 0 && needs_layout(pt)) { return false; }
 
             if (p_align > 0) {
-                v_offset = align_up(v_offset, p_align);
+                v_offset = math::align_up(v_offset, p_align);
                 if (p_align > v_align) { v_align = p_align; }
             }
             v_offset += p_size;
         }
 
-        const v_total: u64 = align_up(v_offset, v_align);
+        const v_total: u64 = math::align_up(v_offset, v_align);
         if (v_total > max_payload_size)  { max_payload_size  = v_total; }
         if (v_align > max_payload_align) { max_payload_align = v_align; }
     }
@@ -507,8 +496,8 @@ function compute_enum_layout(en: EnumType*, arena: TypeArena*) -> boolean {
     if (en.min_alignment > overall_align) { overall_align = en.min_alignment; }
 
     // Payload starts after tag, aligned to payload alignment
-    const payload_offset: u64 = align_up(ENUM_TAG_SIZE, max_payload_align);
-    const total: u64 = align_up(payload_offset + max_payload_size, overall_align);
+    const payload_offset: u64 = math::align_up(ENUM_TAG_SIZE, max_payload_align);
+    const total: u64 = math::align_up(payload_offset + max_payload_size, overall_align);
 
     en.set_layout(total, overall_align);
     return true;
@@ -537,13 +526,13 @@ function compute_tuple_layout(tup: TupleType*, arena: TypeArena*) -> boolean {
         if (e_size == 0 && needs_layout(elem_ty)) { return false; }
 
         if (e_align > 0) {
-            offset = align_up(offset, e_align);
+            offset = math::align_up(offset, e_align);
             if (e_align > max_align) { max_align = e_align; }
         }
         offset += e_size;
     }
 
-    const total: u64 = align_up(offset, max_align);
+    const total: u64 = math::align_up(offset, max_align);
     tup.set_layout(total, max_align);
     return true;
 }
@@ -573,7 +562,7 @@ function compute_optional_layout(opt: OptionalType*, arena: TypeArena*) -> boole
 
     // Tag goes after wrapped value (1 byte, align 1)
     const tag_offset: u64 = inner_size;
-    const total: u64 = align_up(tag_offset + 1, max_align);
+    const total: u64 = math::align_up(tag_offset + 1, max_align);
 
     opt.set_layout(total, max_align);
     return true;
@@ -597,7 +586,7 @@ function compute_fixed_array_layout(arr: ArrayType*, arena: TypeArena*) -> boole
     if (elem_size == 0 && needs_layout(elem)) { return false; }
 
     // Each element is naturally aligned, so element size must be a multiple of alignment
-    const padded_elem_size: u64 = align_up(elem_size, elem_align);
+    const padded_elem_size: u64 = math::align_up(elem_size, elem_align);
     const total: u64 = padded_elem_size * (arr.size as u64);
 
     mut align: u64 = elem_align;
