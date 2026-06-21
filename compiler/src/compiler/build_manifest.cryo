@@ -45,6 +45,7 @@ namespace Compiler::BuildManifest;
 
 import Compiler::ProjectConfig;
 import Utils::Logger;
+import ffi::libc;
 import std::fs::file;
 import std::fs::metadata;
 import std::fs::path;
@@ -78,7 +79,7 @@ function fnv_byte(state: u64, b: u8) -> u64 {
 /// adjacent concatenations can't collide ("ab"+"c" vs "a"+"bc").
 function fnv_str(state: u64, s: string) -> u64 {
     mut h: u64 = state;
-    const len: u64 = intrinsics::strlen(s);
+    const len: u64 = libc::strlen(s);
     const b: i8* = s as i8*;
     for (mut i: u64 = 0; i < len; i++) {
         h = fnv_byte(h, b[i] as u8);
@@ -140,7 +141,7 @@ function self_exe_path() -> string {
 function compiler_fingerprint() -> u64 {
     const exe: string = self_exe_path();
     mut h: u64 = DefaultHasher::offset_basis();
-    if (intrinsics::strlen(exe) == 0) {
+    if (libc::strlen(exe) == 0) {
         return fnv_str(h, "<unknown-compiler>");
     }
     return fnv_file(h, exe);
@@ -204,7 +205,7 @@ function read_file_trimmed(path: string) -> string {
         Result::Ok(s)  => { raw = s.into_raw(); }
         Result::Err(_) => { return ""; }
     }
-    mut len: i64 = intrinsics::strlen(raw) as i64;
+    mut len: i64 = libc::strlen(raw) as i64;
     while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
                        || raw[len - 1] == 32 || raw[len - 1] == 9)) {
         len -= 1;
@@ -219,7 +220,7 @@ function read_file_trimmed(path: string) -> string {
 /// Mangle a namespace to its object-file stem (`::` -> `_`), matching
 /// `CodegenPasses::legacy_obj_path`.
 function mangle_module(ns: string) -> string {
-    const len: u64 = intrinsics::strlen(ns);
+    const len: u64 = libc::strlen(ns);
     const buf: i8* = intrinsics::malloc(len + 1) as i8*;
     intrinsics::memcpy(buf as void*, ns as void*, len);
     buf[len] = 0;
@@ -232,11 +233,11 @@ function mangle_module(ns: string) -> string {
 /// File size in bytes via `fseek`/`ftell`, without reading the contents.
 /// Returns -1 when the file can't be opened.
 function file_size_bytes(path: string) -> i64 {
-    const h: void* = intrinsics::fopen(path, "rb");
+    const h: void* = libc::fopen(path, "rb");
     if (h == null) { return -1 as i64; }
-    intrinsics::fseek(h, 0 as i64, 2);   // SEEK_END
-    const n: i64 = intrinsics::ftell(h);
-    intrinsics::fclose(h);
+    libc::fseek(h, 0 as i64, 2);   // SEEK_END
+    const n: i64 = libc::ftell(h);
+    libc::fclose(h);
     return n;
 }
 
@@ -266,7 +267,7 @@ type struct ModuleKeyTable {
 
     lookup(&this, name: string) -> string {
         for (mut i: i64 = 0; i < this.names.length; i++) {
-            if (intrinsics::strcmp(this.names[i], name) == 0) {
+            if (libc::strcmp(this.names[i], name) == 0) {
                 return this.keys[i];
             }
         }
@@ -292,7 +293,7 @@ function read_module_keys(path: string) -> ModuleKeyTable {
         Result::Err(_) => { return t; }
     }
     const data: i8* = content as i8*;
-    const n: u64 = intrinsics::strlen(content) as u64;
+    const n: u64 = libc::strlen(content) as u64;
     mut i: u64 = 0;
     while (i < n) {
         const name_start: u64 = i;
@@ -310,7 +311,7 @@ function read_module_keys(path: string) -> ModuleKeyTable {
             while (i < n && data[i] != 10) { i = i + 1; }
         }
         if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
-        if (intrinsics::strlen(name) > 0 && intrinsics::strlen(keyh) > 0) {
+        if (libc::strlen(name) > 0 && libc::strlen(keyh) > 0) {
             t.names.push(name);
             t.keys.push(keyh);
         }
@@ -323,7 +324,7 @@ function read_module_keys(path: string) -> ModuleKeyTable {
 /// which always runs alongside this on the success path).
 function write_module_keys(path: string, names: &string[],
                            keys: &string[]) -> void {
-    const f: void* = intrinsics::fopen(path, "w");
+    const f: void* = libc::fopen(path, "w");
     if (f == null) {
         fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
         return;
@@ -331,7 +332,7 @@ function write_module_keys(path: string, names: &string[],
     for (mut i: i64 = 0; i < names.length; i++) {
         intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
     }
-    intrinsics::fclose(f);
+    libc::fclose(f);
 }
 
 
@@ -379,7 +380,7 @@ type struct Manifest {
         for (mut i: i64 = 0; i < this.cfg.link_search.length; i++) { h = fnv_str(h, this.cfg.link_search[i]); }
         for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h = fnv_str(h, this.cfg.link_static[i]); }
         // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
-        if (intrinsics::strlen(this.stdlib_archive) > 0) {
+        if (libc::strlen(this.stdlib_archive) > 0) {
             h = fnv_file(h, this.stdlib_archive);
         }
         // Every source module, in topo order: namespace + origin (output
@@ -399,8 +400,8 @@ type struct Manifest {
     /// a build.
     is_up_to_date(&this, fp_hex: string, artifacts: &string[]) -> boolean {
         const saved: string = read_file_trimmed(this.cfg.fingerprint_path());
-        if (intrinsics::strlen(saved) == 0) { return false; }
-        if (intrinsics::strcmp(saved, fp_hex) != 0) { return false; }
+        if (libc::strlen(saved) == 0) { return false; }
+        if (libc::strcmp(saved, fp_hex) != 0) { return false; }
         for (mut i: i64 = 0; i < artifacts.length; i++) {
             if (!metadata::exists(Path::from_cstr(artifacts[i]))) { return false; }
         }
@@ -412,13 +413,13 @@ type struct Manifest {
     write_fingerprint(&this, fp_hex: string) -> void {
         ProjectConfig::mkdir_p(this.cfg.incremental_dir());
         const path: string = this.cfg.fingerprint_path();
-        const f: void* = intrinsics::fopen(path, "w");
+        const f: void* = libc::fopen(path, "w");
         if (f == null) {
             fmt::eprintln(f"warning: cannot write build fingerprint to {path}");
             return;
         }
         intrinsics::fprintf(f, "%s\n", fp_hex);
-        intrinsics::fclose(f);
+        libc::fclose(f);
     }
 
     /// Write the human/tooling-facing per-profile `build-manifest.json` at
@@ -427,7 +428,7 @@ type struct Manifest {
                    artifacts: &string[]) -> void {
         ProjectConfig::mkdir_p(this.cfg.profile_dir());
         const path: string = this.cfg.manifest_path();
-        const f: void* = intrinsics::fopen(path, "w");
+        const f: void* = libc::fopen(path, "w");
         if (f == null) {
             fmt::eprintln(f"warning: cannot write build manifest to {path}");
             return;
@@ -485,9 +486,9 @@ type struct Manifest {
         mut text: String = serializer::stringify_pretty(&doc);
         doc.drop();
 
-        intrinsics::fwrite(text.as_ptr() as void*, 1, text.length(), f);
-        intrinsics::fputs("\n", f);
+        libc::fwrite(text.as_ptr(), 1, text.length(), f);
+        libc::fputs("\n", f);
         text.drop();
-        intrinsics::fclose(f);
+        libc::fclose(f);
     }
 }
