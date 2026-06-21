@@ -190,40 +190,47 @@ type enum DirectiveTarget {
     Other;
 }
 
-function classify_target(decl: DeclarationNode*) -> DirectiveTarget {
-    if (decl == null) { return DirectiveTarget::Module; }
-    return match (decl.kind) {
-        NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
-        NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
-        NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
-        NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
-        NodeKind::EnumDeclaration       => { DirectiveTarget::Enum     }
-        NodeKind::TraitDeclaration      => { DirectiveTarget::Trait    }
-        NodeKind::TypeAliasDeclaration  => { DirectiveTarget::TypeAlias }
-        NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
-        NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
-        NodeKind::ExternBlock           => { DirectiveTarget::Extern   }
-        NodeKind::ImportDeclaration     => { DirectiveTarget::Import   }
-        _                               => { DirectiveTarget::Other    }
-    };
-}
+implement enum DirectiveTarget {
+    /// Map a declaration's `NodeKind` to the target category a directive
+    /// is attached to.  `ModuleDeclaration` (and a null/absent owner)
+    /// classify as `Module`; anything not in the declaration vocabulary
+    /// falls through to `Other`.
+    static from_kind(k: NodeKind) -> DirectiveTarget {
+        return match (k) {
+            NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
+            NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
+            NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
+            NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
+            NodeKind::EnumDeclaration       => { DirectiveTarget::Enum     }
+            NodeKind::TraitDeclaration      => { DirectiveTarget::Trait    }
+            NodeKind::TypeAliasDeclaration  => { DirectiveTarget::TypeAlias }
+            NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
+            NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
+            NodeKind::ExternBlock           => { DirectiveTarget::Extern   }
+            NodeKind::ImportDeclaration     => { DirectiveTarget::Import   }
+            NodeKind::ModuleDeclaration     => { DirectiveTarget::Module   }
+            _                               => { DirectiveTarget::Other    }
+        };
+    }
 
-function target_label(t: DirectiveTarget) -> string {
-    return match (t) {
-        DirectiveTarget::Module    => { "module" }
-        DirectiveTarget::Function  => { "function" }
-        DirectiveTarget::Method    => { "method" }
-        DirectiveTarget::Struct    => { "struct" }
-        DirectiveTarget::Class     => { "class" }
-        DirectiveTarget::Enum      => { "enum" }
-        DirectiveTarget::Trait     => { "trait" }
-        DirectiveTarget::TypeAlias => { "type alias" }
-        DirectiveTarget::Variable  => { "variable" }
-        DirectiveTarget::Impl      => { "impl block" }
-        DirectiveTarget::Extern    => { "extern block" }
-        DirectiveTarget::Import    => { "import" }
-        DirectiveTarget::Other     => { "declaration" }
-    };
+    /// Human-readable noun for diagnostics ("function", "impl block", …).
+    label(&this) -> string {
+        return match (this) {
+            DirectiveTarget::Module    => { "module" }
+            DirectiveTarget::Function  => { "function" }
+            DirectiveTarget::Method    => { "method" }
+            DirectiveTarget::Struct    => { "struct" }
+            DirectiveTarget::Class     => { "class" }
+            DirectiveTarget::Enum      => { "enum" }
+            DirectiveTarget::Trait     => { "trait" }
+            DirectiveTarget::TypeAlias => { "type alias" }
+            DirectiveTarget::Variable  => { "variable" }
+            DirectiveTarget::Impl      => { "impl block" }
+            DirectiveTarget::Extern    => { "extern block" }
+            DirectiveTarget::Import    => { "import" }
+            DirectiveTarget::Other     => { "declaration" }
+        };
+    }
 }
 
 
@@ -937,7 +944,7 @@ function emit_placement_error(ctx: CompilationContext*, dir: DirectiveNode*,
     const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
     const msg: string = format(
         "directive `![%s]` only applies to %s, not %s",
-        name, expected_target, target_label(actual));
+        name, expected_target, actual.label());
     mut diag: Diagnostic = Diagnostic::error(code, msg);
     diag = diag.at(dir.span);
     diag = diag.suggest(Suggestion::machine_applicable(
@@ -1011,7 +1018,7 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
         }
 
         // Attached directives on declarations.
-        const t: DirectiveTarget = classify_target_from_kind(stmt.kind);
+        const t: DirectiveTarget = DirectiveTarget::from_kind(stmt.kind);
         if (t == DirectiveTarget::Other) { continue; }
 
         const decl: DeclarationNode* = stmt as DeclarationNode*;
@@ -1069,7 +1076,7 @@ function run_directive_processing(ctx: CompilationContext*) -> PassResult {
                 mut tag: string = "custom ";
                 if (is_known_builtin(d.directive_kind)) { tag = "builtin"; }
                 cdebug("[DirectiveProcessing] %s '%s' on %s (%lld args) at %s:%u:%u\n",
-                    tag, d.directive_kind, target_label(t), d.args.length,
+                    tag, d.directive_kind, t.label(), d.args.length,
                     d.span.file, d.span.start_line, d.span.start_col);
             }
         }
@@ -1419,23 +1426,4 @@ function validate_test_module_placement(ctx: CompilationContext*,
         diag = diag.at(first_test_dir_span);
         ctx.emit_diagnostic(diag);
     }
-}
-
-/// classify_target by NodeKind alone (no DeclarationNode* needed).
-function classify_target_from_kind(k: NodeKind) -> DirectiveTarget {
-    return match (k) {
-        NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
-        NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
-        NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
-        NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
-        NodeKind::EnumDeclaration       => { DirectiveTarget::Enum     }
-        NodeKind::TraitDeclaration      => { DirectiveTarget::Trait    }
-        NodeKind::TypeAliasDeclaration  => { DirectiveTarget::TypeAlias }
-        NodeKind::VariableDeclaration   => { DirectiveTarget::Variable }
-        NodeKind::ImplementationBlock   => { DirectiveTarget::Impl     }
-        NodeKind::ExternBlock           => { DirectiveTarget::Extern   }
-        NodeKind::ImportDeclaration     => { DirectiveTarget::Import   }
-        NodeKind::ModuleDeclaration     => { DirectiveTarget::Module   }
-        _                               => { DirectiveTarget::Other    }
-    };
 }
