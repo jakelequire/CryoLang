@@ -275,7 +275,7 @@ type struct ModuleGraph {
     /// Returns -1 if not found.
     find_module_by_path(&this, path: string) -> i64 {
         for (mut i: i64 = 0; i < this.modules.length; i++) {
-            if (paths_equal_ignore_case(this.modules[i].file_path, path)) {
+            if (ModuleGraph::paths_equal_ignore_case(this.modules[i].file_path, path)) {
                 return i;
             }
         }
@@ -329,7 +329,7 @@ type struct ModuleGraph {
 
             for (mut i: u32 = 0; i < n; i++) {
                 // Skip if already in order
-                if (topo_contains(order, i)) { continue; }
+                if (ModuleGraph::topo_contains(order, i)) { continue; }
 
                 // Check if all dependencies are already placed.  Borrow the
                 // deps in place; moving them into a local would alias the
@@ -338,7 +338,7 @@ type struct ModuleGraph {
                 mut all_ready: boolean = true;
                 for (mut d: i64 = 0; d < deps.length; d++) {
                     const dep_idx: i64 = this.find_module_index(deps[d]);
-                    if (dep_idx >= 0 && !topo_contains(order, dep_idx as u32)) {
+                    if (dep_idx >= 0 && !ModuleGraph::topo_contains(order, dep_idx as u32)) {
                         all_ready = false;
                     }
                 }
@@ -356,14 +356,14 @@ type struct ModuleGraph {
                     order.length, n);
                 cdebug("[TopSort] Unplaced modules and their unresolved deps:\n");
                 for (mut ci: u32 = 0; ci < n; ci++) {
-                    if (topo_contains(order, ci)) { continue; }
+                    if (ModuleGraph::topo_contains(order, ci)) { continue; }
                     const cinfo: ModuleInfo* = &this.modules[ci];
                     cdebug("  [%u] %s\n", ci, cinfo.file_path);
                     // Read deps in place - a value copy of `cinfo` would alias
                     // its owning arrays and double-free at scope exit.
                     for (mut cd: i64 = 0; cd < cinfo.dependencies.length; cd++) {
                         const cdep_idx: i64 = this.find_module_index(cinfo.dependencies[cd]);
-                        if (cdep_idx >= 0 && !topo_contains(order, cdep_idx as u32)) {
+                        if (cdep_idx >= 0 && !ModuleGraph::topo_contains(order, cdep_idx as u32)) {
                             cdebug("    -> blocked by [%lld] %s\n",
                                 cdep_idx, this.modules[cdep_idx].file_path);
                         }
@@ -422,88 +422,90 @@ type struct ModuleGraph {
         }
         return visited;
     }
-}
 
 
-// Free helper for topological sort (avoids method-in-complex-function issues)
 
-/// Check if a value is in the order array (linear scan).
-function topo_contains(order: &u32[], val: u32) -> boolean {
-    for (mut i: u32 = 0; i < order.length; i++) {
-        if (order[i] == val) {
-            return true;
-        }
-    }
-    return false;
-}
+    // Free helper for topological sort (avoids method-in-complex-function issues)
 
-
-// Cross-module function descriptor helpers
-
-/// Case-insensitive path comparison for Windows filesystem dedup.
-/// Compares byte-by-byte, treating A-Z the same as a-z and \ the same as /.
-function paths_equal_ignore_case(a: string, b: string) -> boolean {
-    const a_len: i64 = strlen(a) as i64;
-    const b_len: i64 = strlen(b) as i64;
-    if (a_len != b_len) { return false; }
-    for (mut i: i64 = 0; i < a_len; i++) {
-        mut ca: i32 = a[i] as i32;
-        mut cb: i32 = b[i] as i32;
-        // Uppercase -> lowercase
-        if (ca >= 65 && ca <= 90) { ca += 32; }
-        if (cb >= 65 && cb <= 90) { cb += 32; }
-        // Backslash -> forward slash
-        if (ca == 92) { ca = 47; }
-        if (cb == 92) { cb = 47; }
-        if (ca != cb) { return false; }
-    }
-    return true;
-}
-
-/// Build cross-module function descriptors for a specific module.
-/// Looks up each function's FunctionType in the DeclIndex -> arena to get
-/// the full signature (return type, param types, variadic flag).
-function build_cross_module_descriptors(
-    graph: ModuleGraph*, module_sym: SymbolStr,
-    decl_index: DeclarationIndex*, arena: TypeArena*) -> void {
-    if (graph == null || decl_index == null || arena == null) { return; }
-
-    const funcs: SymbolStr[] = decl_index.get_functions_in_module(module_sym);
-    for (mut i: i64 = 0; i < funcs.length; i++) {
-        const fn_name: SymbolStr = funcs[i];
-        const func_type_ref: TypeRef = decl_index.lookup_func_type(fn_name);
-
-        if (func_type_ref.is_invalid()) {
-            // No FunctionType registered; use return-type-only fallback
-            const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-            if (ret_type.is_valid()) {
-                graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
+    /// Check if a value is in the order array (linear scan).
+    static topo_contains(order: &u32[], val: u32) -> boolean {
+        for (mut i: u32 = 0; i < order.length; i++) {
+            if (order[i] == val) {
+                return true;
             }
-            continue;
         }
-
-        // Look up the FunctionType in the arena to get full signature
-        const ty: Type* = arena.lookup(func_type_ref.id);
-        if (ty == null || ty.kind != TypeKind::Function) {
-            const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-            if (ret_type.is_valid()) {
-                graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
-            }
-            continue;
-        }
-
-        const ft: FunctionType* = ty as FunctionType*;
-        // Independent copy of `param_types` (TypeRef is Copy): the descriptor
-        // owns its array, so aliasing `ft.param_types` here would free the
-        // FunctionType's buffer twice.
-        mut pt_copy: TypeRef[] = [];
-        for (mut i: i64 = 0; i < ft.param_types.length; i++) { pt_copy.push(ft.param_types[i]); }
-        const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor {
-            name:        fn_name,
-            return_type: ft.return_type,
-            param_types: pt_copy,
-            is_var_arg:  ft.is_variadic,
-        };
-        graph.register_cross_module_fn(desc);
+        return false;
     }
+
+
+    // Cross-module function descriptor helpers
+
+    /// Case-insensitive path comparison for Windows filesystem dedup.
+    /// Compares byte-by-byte, treating A-Z the same as a-z and \ the same as /.
+    static paths_equal_ignore_case(a: string, b: string) -> boolean {
+        const a_len: i64 = strlen(a) as i64;
+        const b_len: i64 = strlen(b) as i64;
+        if (a_len != b_len) { return false; }
+        for (mut i: i64 = 0; i < a_len; i++) {
+            mut ca: i32 = a[i] as i32;
+            mut cb: i32 = b[i] as i32;
+            // Uppercase -> lowercase
+            if (ca >= 65 && ca <= 90) { ca += 32; }
+            if (cb >= 65 && cb <= 90) { cb += 32; }
+            // Backslash -> forward slash
+            if (ca == 92) { ca = 47; }
+            if (cb == 92) { cb = 47; }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    /// Build cross-module function descriptors for a specific module.
+    /// Looks up each function's FunctionType in the DeclIndex -> arena to get
+    /// the full signature (return type, param types, variadic flag).
+    static build_cross_module_descriptors(
+        graph: ModuleGraph*, module_sym: SymbolStr,
+        decl_index: DeclarationIndex*, arena: TypeArena*) -> void {
+        if (graph == null || decl_index == null || arena == null) { return; }
+
+        const funcs: SymbolStr[] = decl_index.get_functions_in_module(module_sym);
+        for (mut i: i64 = 0; i < funcs.length; i++) {
+            const fn_name: SymbolStr = funcs[i];
+            const func_type_ref: TypeRef = decl_index.lookup_func_type(fn_name);
+
+            if (func_type_ref.is_invalid()) {
+                // No FunctionType registered; use return-type-only fallback
+                const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
+                if (ret_type.is_valid()) {
+                    graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
+                }
+                continue;
+            }
+
+            // Look up the FunctionType in the arena to get full signature
+            const ty: Type* = arena.lookup(func_type_ref.id);
+            if (ty == null || ty.kind != TypeKind::Function) {
+                const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
+                if (ret_type.is_valid()) {
+                    graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
+                }
+                continue;
+            }
+
+            const ft: FunctionType* = ty as FunctionType*;
+            // Independent copy of `param_types` (TypeRef is Copy): the descriptor
+            // owns its array, so aliasing `ft.param_types` here would free the
+            // FunctionType's buffer twice.
+            mut pt_copy: TypeRef[] = [];
+            for (mut i: i64 = 0; i < ft.param_types.length; i++) { pt_copy.push(ft.param_types[i]); }
+            const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor {
+                name:        fn_name,
+                return_type: ft.return_type,
+                param_types: pt_copy,
+                is_var_arg:  ft.is_variadic,
+            };
+            graph.register_cross_module_fn(desc);
+        }
+    }
+
 }

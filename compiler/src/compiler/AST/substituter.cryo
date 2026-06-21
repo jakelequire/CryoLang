@@ -21,89 +21,6 @@ import Compiler::Types::{ Arena, Substitution };
 import Compiler::Resolver::{ SymbolStr, InternTable };
 
 
-/// Check if a type name string is a primitive type name.
-/// Used by the substituter to produce Primitive annotations instead of
-/// Named("i32") when a generic param is substituted with a primitive.
-function is_primitive_type_name(name: string) -> boolean {
-    return name.eq("void")
-        || name.eq("boolean")
-        || name.eq("char")
-        || name.eq("string")
-        || name.eq("i8")
-        || name.eq("i16")
-        || name.eq("i32")
-        || name.eq("i64")
-        || name.eq("i128")
-        || name.eq("u8")
-        || name.eq("u16")
-        || name.eq("u32")
-        || name.eq("u64")
-        || name.eq("u128")
-        || name.eq("isize")
-        || name.eq("usize")
-        || name.eq("f32")
-        || name.eq("f64")
-        || name.eq("never");
-}
-
-/// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
-function rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
-    const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
-    *ann = TypeAnnotation::Primitive(prim);
-}
-
-/// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
-/// `inner_pre_resolved` is the inner type's TypeRef when known (the
-/// substituter has it from `subst.replacements[i]`'s pointee). Without it,
-/// `resolve_sizeof_operand_type` resolves the inner Named by name with a
-/// fresh empty ResolutionContext, which fails for any user-defined type
-/// the call-site can't reach by bare name (e.g. `Entry<K,V>` from inside
-/// the `Layout::array<Entry<K,V>*>` spec'd body (no scope, no imports),
-/// and `codegen_sizeof` then falls through to 0.
-function rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
-                            inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
-    const inner_named: NamedAnnotation* = new NamedAnnotation {
-        name: inner_name,
-        span: span,
-        pre_resolved: inner_pre_resolved,
-    };
-    const inner_ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
-    *inner_ann = TypeAnnotation::Named(inner_named);
-    const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, span: span };
-    *ann = TypeAnnotation::Pointer(ptr);
-}
-
-/// Rewrite a TypeAnnotation* in-place from Named to Array(Named(inner), -1).
-/// `inner_pre_resolved` is the element type's TypeRef when known (the
-/// substituter has it from `subst.replacements[i]`'s array element). Mirrors
-/// `rewrite_to_pointer`: without it, the inner Named is resolved by bare name
-/// in a fresh empty ResolutionContext, which fails for any element that isn't a
-/// bare-name-resolvable type — e.g. a pointer element (`i32*[]`, the inner
-/// display `i32*` names no type) or a user-defined type out of scope at the
-/// spec site — yielding an `Array<invalid>` that later ICEs the mangler.
-function rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr,
-                          inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
-    const inner_named: NamedAnnotation* = new NamedAnnotation {
-        name: inner_name,
-        span: span,
-        pre_resolved: inner_pre_resolved,
-    };
-    const inner_ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
-    *inner_ann = TypeAnnotation::Named(inner_named);
-    const arr: ArrayAnnotation* = new ArrayAnnotation {
-        element: inner_ann, size: ArrayAnnotation::heap_dynamic_size(), span: span };
-    *ann = TypeAnnotation::Array(arr);
-}
-
-/// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
-/// Used when a generic param is substituted with `()`, which is not a Named
-/// type and cannot survive as Named("()") through the resolver.
-function rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
-    mut empty_elems: TypeAnnotation*[] = [];
-    const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
-    *ann = TypeAnnotation::Tuple(tup);
-}
-
 type class ASTTypeSubstituter : BaseASTVisitor {
 public:
     subst:             TypeSubstitution*;
@@ -303,12 +220,12 @@ public:
                 // Unit type `()` has no Named form; it must become an empty Tuple
                 // annotation so resolve_tuple produces a valid unit TypeRef.
                 if (display_len == 2 && display[0] == '(' && display[1] == ')') {
-                    rewrite_to_unit(ann, named.span);
+                    ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
                     return ann;
                 }
                 // Primitive type? -> Primitive annotation
-                if (is_primitive_type_name(display)) {
-                    rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
+                if (ASTTypeSubstituter::is_primitive_type_name(display)) {
+                    ASTTypeSubstituter::rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
                     return ann;
                 }
                 // Pointer suffix? -> Pointer(Named(inner))
@@ -322,7 +239,7 @@ public:
                     // any user-defined type not in scope at the spec site.
                     const inner_pre: TypeRef = this.unwrap_pointer_pointee(
                         this.resolved_arg_typeref(i));
-                    rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
+                    ASTTypeSubstituter::rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
                     return ann;
                 }
                 // Array suffix? -> Array(Named(inner), -1)
@@ -336,7 +253,7 @@ public:
                     // invalid and produces an Array<invalid> that ICEs mangling.
                     const inner_pre: TypeRef = this.arena.array_element_of(
                         this.resolved_arg_typeref(i).id);
-                    rewrite_to_array(ann, inner_sym, inner_pre, named.span);
+                    ASTTypeSubstituter::rewrite_to_array(ann, inner_sym, inner_pre, named.span);
                     return ann;
                 }
                 // User-defined type: keep as Named with new name, and attach
@@ -987,4 +904,88 @@ public:
             node.default_value.accept(this);
         }
     }
+
+    /// Check if a type name string is a primitive type name.
+    /// Used by the substituter to produce Primitive annotations instead of
+    /// Named("i32") when a generic param is substituted with a primitive.
+    static is_primitive_type_name(name: string) -> boolean {
+        return name.eq("void")
+            || name.eq("boolean")
+            || name.eq("char")
+            || name.eq("string")
+            || name.eq("i8")
+            || name.eq("i16")
+            || name.eq("i32")
+            || name.eq("i64")
+            || name.eq("i128")
+            || name.eq("u8")
+            || name.eq("u16")
+            || name.eq("u32")
+            || name.eq("u64")
+            || name.eq("u128")
+            || name.eq("isize")
+            || name.eq("usize")
+            || name.eq("f32")
+            || name.eq("f64")
+            || name.eq("never");
+    }
+
+    /// Rewrite a TypeAnnotation* in-place from Named to Primitive variant.
+    static rewrite_to_primitive(ann: TypeAnnotation*, name: SymbolStr, span: SourceSpan) -> void {
+        const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: name, span: span };
+        *ann = TypeAnnotation::Primitive(prim);
+    }
+
+    /// Rewrite a TypeAnnotation* in-place from Named to Pointer(Named(inner)).
+    /// `inner_pre_resolved` is the inner type's TypeRef when known (the
+    /// substituter has it from `subst.replacements[i]`'s pointee). Without it,
+    /// `resolve_sizeof_operand_type` resolves the inner Named by name with a
+    /// fresh empty ResolutionContext, which fails for any user-defined type
+    /// the call-site can't reach by bare name (e.g. `Entry<K,V>` from inside
+    /// the `Layout::array<Entry<K,V>*>` spec'd body (no scope, no imports),
+    /// and `codegen_sizeof` then falls through to 0.
+    static rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
+                                inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
+        const inner_named: NamedAnnotation* = new NamedAnnotation {
+            name: inner_name,
+            span: span,
+            pre_resolved: inner_pre_resolved,
+        };
+        const inner_ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        *inner_ann = TypeAnnotation::Named(inner_named);
+        const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner_ann, span: span };
+        *ann = TypeAnnotation::Pointer(ptr);
+    }
+
+    /// Rewrite a TypeAnnotation* in-place from Named to Array(Named(inner), -1).
+    /// `inner_pre_resolved` is the element type's TypeRef when known (the
+    /// substituter has it from `subst.replacements[i]`'s array element). Mirrors
+    /// `rewrite_to_pointer`: without it, the inner Named is resolved by bare name
+    /// in a fresh empty ResolutionContext, which fails for any element that isn't a
+    /// bare-name-resolvable type — e.g. a pointer element (`i32*[]`, the inner
+    /// display `i32*` names no type) or a user-defined type out of scope at the
+    /// spec site — yielding an `Array<invalid>` that later ICEs the mangler.
+    static rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr,
+                              inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
+        const inner_named: NamedAnnotation* = new NamedAnnotation {
+            name: inner_name,
+            span: span,
+            pre_resolved: inner_pre_resolved,
+        };
+        const inner_ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        *inner_ann = TypeAnnotation::Named(inner_named);
+        const arr: ArrayAnnotation* = new ArrayAnnotation {
+            element: inner_ann, size: ArrayAnnotation::heap_dynamic_size(), span: span };
+        *ann = TypeAnnotation::Array(arr);
+    }
+
+    /// Rewrite a TypeAnnotation* in-place to the empty-tuple (unit) annotation.
+    /// Used when a generic param is substituted with `()`, which is not a Named
+    /// type and cannot survive as Named("()") through the resolver.
+    static rewrite_to_unit(ann: TypeAnnotation*, span: SourceSpan) -> void {
+        mut empty_elems: TypeAnnotation*[] = [];
+        const tup: TupleAnnotation* = new TupleAnnotation { elements: empty_elems, span: span };
+        *ann = TypeAnnotation::Tuple(tup);
+    }
+
 }

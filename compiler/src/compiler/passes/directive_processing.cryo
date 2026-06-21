@@ -128,46 +128,6 @@ public:
 }
 
 
-// Directive kinds: recognised built-ins
-
-/// True if `name` is a built-in directive recognised by the compiler.
-/// Unknown names are accepted by the pass but get no validation or
-/// side-effects; they're still registered so user tooling can read them.
-function is_known_builtin(name: string) -> boolean {
-    return match (name) {
-        "inline" | "noinline" | "entry" | "test" | "ignore"
-        | "should_panic" | "config" | "deprecated" | "align"
-        | "repr" | "link" | "target" | "allow" | "warn" | "deny"
-        | "derive"
-        // `![sink]`: marks a method as consuming its receiver.
-        // Tells move-check / drop-insertion to treat the call as moving
-        // the receiver, even when the receiver is syntactically `&this`
-        // or `mut &this`.  Used for methods that semantically take
-        // ownership but want the borrow-style call ergonomics.
-        | "sink"
-        // `![implicit]`: lets the inference engine recover omitted generic
-        // type args at a call site by unifying the callee's return type
-        // against the call's expected type (return-type-driven inference).
-        | "implicit"
-        // Bare-atom forms of the cfg/config gate.  These are sugar for
-        // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
-        | "windows" | "linux" | "macos" | "unix"
-        // Top-level negation form: `![not(<atom>)]`.  Mirrors the
-        // nested `not(...)` form recognised inside `config(...)`.
-        | "not" => { true }
-        _       => { false }
-    };
-}
-
-/// Local copy of the OS-atom predicate so the validator can extend
-/// `config(...)` arg-shape checking without cross-importing the
-/// ConfigGating pass.  Kept in sync with config_gating.cryo's atom set.
-function is_cfg_os_atom(name: string) -> boolean {
-    return match (name) {
-        "windows" | "linux" | "macos" | "unix" => { true }
-        _                                      => { false }
-    };
-}
 
 
 // Validation helpers: built-in shape checks
@@ -234,1196 +194,1243 @@ implement enum DirectiveTarget {
 }
 
 
-// Validation: per-directive checks
+// All directive-processing pass routines are static methods on this
+// stateless struct (peer convention: TypeResolutionPasses, etc.).
+type struct DirectiveProcessingPasses {
+    // Directive kinds: recognised built-ins
 
-/// Validate a single observed directive.  Emits diagnostics for arity or
-/// placement violations.  Returns void; severity is encoded in the
-/// emitted diagnostics.
-function validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
-                          target: DirectiveTarget) -> void {
-    const name: string = dir.directive_kind;
-    const argc: i64 = dir.args.length;
+    /// True if `name` is a built-in directive recognised by the compiler.
+    /// Unknown names are accepted by the pass but get no validation or
+    /// side-effects; they're still registered so user tooling can read them.
+    static is_known_builtin(name: string) -> boolean {
+        return match (name) {
+            "inline" | "noinline" | "entry" | "test" | "ignore"
+            | "should_panic" | "config" | "deprecated" | "align"
+            | "repr" | "link" | "target" | "allow" | "warn" | "deny"
+            | "derive"
+            // `![sink]`: marks a method as consuming its receiver.
+            // Tells move-check / drop-insertion to treat the call as moving
+            // the receiver, even when the receiver is syntactically `&this`
+            // or `mut &this`.  Used for methods that semantically take
+            // ownership but want the borrow-style call ergonomics.
+            | "sink"
+            // `![implicit]`: lets the inference engine recover omitted generic
+            // type args at a call site by unifying the callee's return type
+            // against the call's expected type (return-type-driven inference).
+            | "implicit"
+            // Bare-atom forms of the cfg/config gate.  These are sugar for
+            // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
+            | "windows" | "linux" | "macos" | "unix"
+            // Top-level negation form: `![not(<atom>)]`.  Mirrors the
+            // nested `not(...)` form recognised inside `config(...)`.
+            | "not" => { true }
+            _       => { false }
+        };
+    }
 
-    match (name) {
-        // Zero args, function-target.  `![ignore]` / `![should_panic]` are
-        // siblings of `![test]`; cross-directive coupling (e.g. requiring
-        // `![test]` alongside `![ignore]`) is enforced later by the
-        // test-mode validator - directive_processing only checks each
-        // directive's own shape and target.
-        // `![inline]` / `![noinline]`: zero args; function- or method-target.
-        // Both apply to anything that lowers to an LLVM function body, so a
-        // method (whose body is a function too) is a valid target.
-        "inline" | "noinline" => {
-            if (argc != 0) {
-                emit_arity_error(ctx, dir, name, 0, argc);
-            }
-            if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                emit_placement_error(ctx, dir, name, "function or method", target);
-            }
-        }
+    /// Local copy of the OS-atom predicate so the validator can extend
+    /// `config(...)` arg-shape checking without cross-importing the
+    /// ConfigGating pass.  Kept in sync with config_gating.cryo's atom set.
+    static is_cfg_os_atom(name: string) -> boolean {
+        return match (name) {
+            "windows" | "linux" | "macos" | "unix" => { true }
+            _                                      => { false }
+        };
+    }
 
-        "entry" | "test" | "ignore" | "should_panic" => {
-            if (argc != 0) {
-                emit_arity_error(ctx, dir, name, 0, argc);
-            }
-            if (target != DirectiveTarget::Function) {
-                emit_placement_error(ctx, dir, name, "function", target);
-            }
-        }
 
-        // `![sink]`: zero args; method-target only.  Static-method
-        // and missing-receiver checks need the MethodNode and its
-        // FunctionDeclNode, so they live in the per-decl loop in
-        // run_directive_processing where we already have the decl pointer.
-        "sink" => {
-            if (argc != 0) {
-                emit_arity_error(ctx, dir, name, 0, argc);
-            }
-            if (target != DirectiveTarget::Method) {
-                emit_placement_error(ctx, dir, name, "method", target);
-            }
-        }
+    // Validation: per-directive checks
 
-        // `![implicit]`: zero args; function- or method-target.  Whether the
-        // generic params are actually recoverable from the return type is
-        // proven (or rejected with E0307) at the call site by the inference
-        // engine, so no deeper shape check is needed here.
-        "implicit" => {
-            if (argc != 0) {
-                emit_arity_error(ctx, dir, name, 0, argc);
-            }
-            if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                emit_placement_error(ctx, dir, name, "function or method", target);
-            }
-        }
+    /// Validate a single observed directive.  Emits diagnostics for arity or
+    /// placement violations.  Returns void; severity is encoded in the
+    /// emitted diagnostics.
+    static validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
+                              target: DirectiveTarget) -> void {
+        const name: string = dir.directive_kind;
+        const argc: i64 = dir.args.length;
 
-        // `![config(<flavor>)]` marks an entire file's namespace as a special
-        // build mode.  Today the only recognised flavor is `testing`, which
-        // gates the file in/out under `cryo test`.  Future flavors (e.g. a
-        // `bench` flavor for benchmarks) plug in here.
-        "config" => {
-            if (argc < 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
+        match (name) {
+            // Zero args, function-target.  `![ignore]` / `![should_panic]` are
+            // siblings of `![test]`; cross-directive coupling (e.g. requiring
+            // `![test]` alongside `![ignore]`) is enforced later by the
+            // test-mode validator - directive_processing only checks each
+            // directive's own shape and target.
+            // `![inline]` / `![noinline]`: zero args; function- or method-target.
+            // Both apply to anything that lowers to an LLVM function body, so a
+            // method (whose body is a function too) is a valid target.
+            "inline" | "noinline" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
             }
-            const a: DirectiveArg = dir.args[0];
 
-            // Nested call shape: `config(not(<atom>))` etc.  Only `not(...)`
-            // is recognised today; vocabulary expansion (any/all) plugs in
-            // here.  Placement is unrestricted; platform gates can attach
-            // to any decl.  Single-arg form.
-            if (a.kind == DirectiveArgKind::Nested) {
+            "entry" | "test" | "ignore" | "should_panic" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Function) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function", target);
+                }
+            }
+
+            // `![sink]`: zero args; method-target only.  Static-method
+            // and missing-receiver checks need the MethodNode and its
+            // FunctionDeclNode, so they live in the per-decl loop in
+            // run_directive_processing where we already have the decl pointer.
+            "sink" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "method", target);
+                }
+            }
+
+            // `![implicit]`: zero args; function- or method-target.  Whether the
+            // generic params are actually recoverable from the return type is
+            // proven (or rejected with E0307) at the call site by the inference
+            // engine, so no deeper shape check is needed here.
+            "implicit" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
+            }
+
+            // `![config(<flavor>)]` marks an entire file's namespace as a special
+            // build mode.  Today the only recognised flavor is `testing`, which
+            // gates the file in/out under `cryo test`.  Future flavors (e.g. a
+            // `bench` flavor for benchmarks) plug in here.
+            "config" => {
+                if (argc < 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                const a: DirectiveArg = dir.args[0];
+
+                // Nested call shape: `config(not(<atom>))` etc.  Only `not(...)`
+                // is recognised today; vocabulary expansion (any/all) plugs in
+                // here.  Placement is unrestricted; platform gates can attach
+                // to any decl.  Single-arg form.
+                if (a.kind == DirectiveArgKind::Nested) {
+                    if (argc != 1) {
+                        DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                        return;
+                    }
+                    if (a.nested == null
+                            || !a.nested.directive_kind.eq("not")) {
+                        const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                        const msg: string =
+                            "directive `![config(...)]`: nested calls must be `not(<atom>)`";
+                        mut diag: Diagnostic = Diagnostic::error(code, msg);
+                        diag = diag.at(dir.span);
+                        ctx.emit_diagnostic(diag);
+                    }
+                    return;
+                }
+
+                if (a.kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    return;
+                }
+
+                // Compile-fail flavor: `config(negative, <CODE>)` marks a whole
+                // file as a compile-fail test.  `cryo test` skips these files in
+                // the shared test build and instead compiles each on its own,
+                // asserting it fails with `<CODE>`.  Must sit on a namespace,
+                // like `config(testing)`.
+                if (a.name.eq("negative")) {
+                    if (argc != 2) {
+                        const code: ErrorCode = ErrorCode::E0150_DIRECTIVE_BAD_ARITY;
+                        const msg: string =
+                            "directive `![config(negative, <code>)]` takes exactly one expected error code";
+                        mut diag: Diagnostic = Diagnostic::error(code, msg);
+                        diag = diag.at(dir.span);
+                        ctx.emit_diagnostic(diag);
+                        return;
+                    }
+                    if (target != DirectiveTarget::Module) {
+                        DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "namespace", target);
+                    }
+                    return;
+                }
+
+                // Every remaining flavor is single-arg.
                 if (argc != 1) {
-                    emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
                     return;
                 }
-                if (a.nested == null
-                        || !a.nested.directive_kind.eq("not")) {
-                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-                    const msg: string =
-                        "directive `![config(...)]`: nested calls must be `not(<atom>)`";
-                    mut diag: Diagnostic = Diagnostic::error(code, msg);
-                    diag = diag.at(dir.span);
-                    ctx.emit_diagnostic(diag);
-                }
-                return;
-            }
 
-            if (a.kind != DirectiveArgKind::Ident) {
-                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-                return;
-            }
-
-            // Compile-fail flavor: `config(negative, <CODE>)` marks a whole
-            // file as a compile-fail test.  `cryo test` skips these files in
-            // the shared test build and instead compiles each on its own,
-            // asserting it fails with `<CODE>`.  Must sit on a namespace,
-            // like `config(testing)`.
-            if (a.name.eq("negative")) {
-                if (argc != 2) {
-                    const code: ErrorCode = ErrorCode::E0150_DIRECTIVE_BAD_ARITY;
-                    const msg: string =
-                        "directive `![config(negative, <code>)]` takes exactly one expected error code";
-                    mut diag: Diagnostic = Diagnostic::error(code, msg);
-                    diag = diag.at(dir.span);
-                    ctx.emit_diagnostic(diag);
+                // OS-atom flavor: `config(windows)` etc.  No placement
+                // restriction; these gate any declaration.
+                if (DirectiveProcessingPasses::is_cfg_os_atom(a.name)) {
                     return;
                 }
-                if (target != DirectiveTarget::Module) {
-                    emit_placement_error(ctx, dir, name, "namespace", target);
+
+                // Build-mode flavor: `testing`, which must live on a namespace.
+                // Misspelled flavors fall through to the catch-all error.
+                if (a.name.eq("testing")) {
+                    if (target != DirectiveTarget::Module) {
+                        DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "namespace", target);
+                    }
+                    return;
                 }
-                return;
-            }
 
-            // Every remaining flavor is single-arg.
-            if (argc != 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-
-            // OS-atom flavor: `config(windows)` etc.  No placement
-            // restriction; these gate any declaration.
-            if (is_cfg_os_atom(a.name)) {
-                return;
-            }
-
-            // Build-mode flavor: `testing`, which must live on a namespace.
-            // Misspelled flavors fall through to the catch-all error.
-            if (a.name.eq("testing")) {
-                if (target != DirectiveTarget::Module) {
-                    emit_placement_error(ctx, dir, name, "namespace", target);
-                }
-                return;
-            }
-
-            const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-            const msg: string = format(
-                "directive `![config]`: unknown flavor `%s` (expected `testing`, `negative`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
-                a.name);
-            mut diag: Diagnostic = Diagnostic::error(code, msg);
-            diag = diag.at(dir.span);
-            ctx.emit_diagnostic(diag);
-        }
-
-        // Bare-atom forms: `![windows]`, `![linux]`, `![macos]`, `![unix]`.
-        // Sugar for `![config(<atom>)]`; identical semantics, evaluated by
-        // the ConfigGating pass.  Zero args, unrestricted placement.
-        "windows" | "linux" | "macos" | "unix" => {
-            if (argc != 0) {
-                emit_arity_error(ctx, dir, name, 0, argc);
-            }
-        }
-
-        // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
-        // form recognised inside `config(...)`.
-        "not" => {
-            if (argc != 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            const a: DirectiveArg = dir.args[0];
-            if (a.kind != DirectiveArgKind::Ident) {
-                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-                return;
-            }
-            if (!is_cfg_os_atom(a.name)) {
                 const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
                 const msg: string = format(
-                    "directive `![not]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, or `unix`)",
+                    "directive `![config]`: unknown flavor `%s` (expected `testing`, `negative`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
                     a.name);
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
                 ctx.emit_diagnostic(diag);
             }
-        }
 
-        "deprecated" => {
-            // Optional single string-literal message.
-            if (argc > 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
+            // Bare-atom forms: `![windows]`, `![linux]`, `![macos]`, `![unix]`.
+            // Sugar for `![config(<atom>)]`; identical semantics, evaluated by
+            // the ConfigGating pass.  Zero args, unrestricted placement.
+            "windows" | "linux" | "macos" | "unix" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
             }
-            if (argc == 1) {
+
+            // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
+            // form recognised inside `config(...)`.
+            "not" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                const a: DirectiveArg = dir.args[0];
+                if (a.kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    return;
+                }
+                if (!DirectiveProcessingPasses::is_cfg_os_atom(a.name)) {
+                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                    const msg: string = format(
+                        "directive `![not]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, or `unix`)",
+                        a.name);
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                }
+            }
+
+            "deprecated" => {
+                // Optional single string-literal message.
+                if (argc > 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                }
+                if (argc == 1) {
+                    const a: DirectiveArg = dir.args[0];
+                    if (a.kind != DirectiveArgKind::StringLit) {
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                    }
+                }
+            }
+
+            "align" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                const a: DirectiveArg = dir.args[0];
+                if (a.kind != DirectiveArgKind::IntLit) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an integer literal");
+                    return;
+                }
+                // Enforce power-of-two and a sane upper bound.  The bound
+                // (65536) mirrors LLVM's MaximumAlignment for object-file
+                // sections and is comfortably beyond what any real target
+                // demands.  Zero, negative, or non-power-of-two values are
+                // meaningless as alignments.
+                const n: i64 = a.int_value;
+                if (n <= 0 || n > 65536 || ((n & (n - 1)) != 0)) {
+                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                    const msg: string = format(
+                        "directive `![align]`: alignment must be a power of two between 1 and 65536, got %lld",
+                        n);
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                    return;
+                }
+                if (target != DirectiveTarget::Struct
+                    && target != DirectiveTarget::Class
+                    && target != DirectiveTarget::Enum
+                    && target != DirectiveTarget::Variable) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum/variable", target);
+                }
+            }
+
+            "repr" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                const a: DirectiveArg = dir.args[0];
+                if (a.kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    return;
+                }
+                // Recognised repr kinds.  Anything else is rejected explicitly
+                // so a typo like `repr(Packed)` doesn't silently no-op.
+                // `repr(<int_type>)` is reserved (see docs/cryo.md section 21); use
+                // `type enum Foo : i32 { ... }` instead.
+                const repr_known: boolean = match (a.name) {
+                    "C" | "packed" | "transparent" => { true }
+                    _                              => { false }
+                };
+                if (!repr_known) {
+                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                    const msg: string = format(
+                        "directive `![repr]`: unknown layout `%s` (expected `C`, `packed`, or `transparent`)",
+                        a.name);
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                    return;
+                }
+                if (target != DirectiveTarget::Struct
+                    && target != DirectiveTarget::Class
+                    && target != DirectiveTarget::Enum) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+                    return;
+                }
+                // Per-flavor placement.  `repr(packed)` and `repr(transparent)`
+                // only make sense on plain structs:
+                //   - Classes have vtables / inheritance / fixed-offset
+                //     conventions that don't compose with packing or
+                //     newtype-style flattening.
+                //   - Enums have a tag-plus-payload layout; `packed` and
+                //     `transparent` don't have a meaningful semantics there.
+                // `repr(C)` is accepted on all three kinds.
+                const is_packed:      boolean = a.name == "packed";
+                const is_transparent: boolean = a.name == "transparent";
+                if ((is_packed || is_transparent)
+                        && target != DirectiveTarget::Struct) {
+                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+                    const msg: string = format(
+                        "directive `![repr(%s)]` only applies to structs",
+                        a.name);
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                }
+            }
+
+            "link" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind != DirectiveArgKind::StringLit) {
-                    emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
                 }
             }
-        }
 
-        "align" => {
-            if (argc != 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            const a: DirectiveArg = dir.args[0];
-            if (a.kind != DirectiveArgKind::IntLit) {
-                emit_arg_kind_error(ctx, dir, name, 0, "an integer literal");
-                return;
-            }
-            // Enforce power-of-two and a sane upper bound.  The bound
-            // (65536) mirrors LLVM's MaximumAlignment for object-file
-            // sections and is comfortably beyond what any real target
-            // demands.  Zero, negative, or non-power-of-two values are
-            // meaningless as alignments.
-            const n: i64 = a.int_value;
-            if (n <= 0 || n > 65536 || ((n & (n - 1)) != 0)) {
-                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-                const msg: string = format(
-                    "directive `![align]`: alignment must be a power of two between 1 and 65536, got %lld",
-                    n);
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
-                diag = diag.at(dir.span);
-                ctx.emit_diagnostic(diag);
-                return;
-            }
-            if (target != DirectiveTarget::Struct
-                && target != DirectiveTarget::Class
-                && target != DirectiveTarget::Enum
-                && target != DirectiveTarget::Variable) {
-                emit_placement_error(ctx, dir, name, "struct/class/enum/variable", target);
-            }
-        }
-
-        "repr" => {
-            if (argc != 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            const a: DirectiveArg = dir.args[0];
-            if (a.kind != DirectiveArgKind::Ident) {
-                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-                return;
-            }
-            // Recognised repr kinds.  Anything else is rejected explicitly
-            // so a typo like `repr(Packed)` doesn't silently no-op.
-            // `repr(<int_type>)` is reserved (see docs/cryo.md section 21); use
-            // `type enum Foo : i32 { ... }` instead.
-            const repr_known: boolean = match (a.name) {
-                "C" | "packed" | "transparent" => { true }
-                _                              => { false }
-            };
-            if (!repr_known) {
-                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-                const msg: string = format(
-                    "directive `![repr]`: unknown layout `%s` (expected `C`, `packed`, or `transparent`)",
-                    a.name);
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
-                diag = diag.at(dir.span);
-                ctx.emit_diagnostic(diag);
-                return;
-            }
-            if (target != DirectiveTarget::Struct
-                && target != DirectiveTarget::Class
-                && target != DirectiveTarget::Enum) {
-                emit_placement_error(ctx, dir, name, "struct/class/enum", target);
-                return;
-            }
-            // Per-flavor placement.  `repr(packed)` and `repr(transparent)`
-            // only make sense on plain structs:
-            //   - Classes have vtables / inheritance / fixed-offset
-            //     conventions that don't compose with packing or
-            //     newtype-style flattening.
-            //   - Enums have a tag-plus-payload layout; `packed` and
-            //     `transparent` don't have a meaningful semantics there.
-            // `repr(C)` is accepted on all three kinds.
-            const is_packed:      boolean = a.name == "packed";
-            const is_transparent: boolean = a.name == "transparent";
-            if ((is_packed || is_transparent)
-                    && target != DirectiveTarget::Struct) {
-                const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                const msg: string = format(
-                    "directive `![repr(%s)]` only applies to structs",
-                    a.name);
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
-                diag = diag.at(dir.span);
-                ctx.emit_diagnostic(diag);
-            }
-        }
-
-        "link" => {
-            if (argc != 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            const a: DirectiveArg = dir.args[0];
-            if (a.kind != DirectiveArgKind::StringLit) {
-                emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
-            }
-        }
-
-        // `![target(<atom>)]` is an alias for `![config(<atom>)]` for
-        // platform-gate purposes.  Accepts the same vocabulary: bare OS
-        // atom or `not(<atom>)`.  The legacy `![cfg]` spelling has been
-        // retired in favor of `config`.
-        "target" => {
-            if (argc != 1) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            const a: DirectiveArg = dir.args[0];
-            if (a.kind == DirectiveArgKind::Nested) {
-                if (a.nested == null
-                        || !a.nested.directive_kind.eq("not")) {
+            // `![target(<atom>)]` is an alias for `![config(<atom>)]` for
+            // platform-gate purposes.  Accepts the same vocabulary: bare OS
+            // atom or `not(<atom>)`.  The legacy `![cfg]` spelling has been
+            // retired in favor of `config`.
+            "target" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                const a: DirectiveArg = dir.args[0];
+                if (a.kind == DirectiveArgKind::Nested) {
+                    if (a.nested == null
+                            || !a.nested.directive_kind.eq("not")) {
+                        const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                        const msg: string =
+                            "directive `![target(...)]`: nested calls must be `not(<atom>)`";
+                        mut diag: Diagnostic = Diagnostic::error(code, msg);
+                        diag = diag.at(dir.span);
+                        ctx.emit_diagnostic(diag);
+                    }
+                    return;
+                }
+                if (a.kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    return;
+                }
+                if (!DirectiveProcessingPasses::is_cfg_os_atom(a.name)) {
                     const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-                    const msg: string =
-                        "directive `![target(...)]`: nested calls must be `not(<atom>)`";
+                    const msg: string = format(
+                        "directive `![target]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
+                        a.name);
                     mut diag: Diagnostic = Diagnostic::error(code, msg);
                     diag = diag.at(dir.span);
                     ctx.emit_diagnostic(diag);
                 }
-                return;
             }
-            if (a.kind != DirectiveArgKind::Ident) {
-                emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
-                return;
+
+            "allow" | "warn" | "deny" => {
+                if (argc == 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                for (mut i: i64 = 0; i < argc; i++) {
+                    const a: DirectiveArg = dir.args[i];
+                    if (a.kind != DirectiveArgKind::Ident) {
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i, "an identifier");
+                    }
+                }
             }
-            if (!is_cfg_os_atom(a.name)) {
-                const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+
+            "derive" => {
+                if (argc == 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                for (mut i: i64 = 0; i < argc; i++) {
+                    const a: DirectiveArg = dir.args[i];
+                    if (a.kind != DirectiveArgKind::Ident) {
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i, "a trait name (identifier)");
+                    }
+                }
+                if (target != DirectiveTarget::Struct
+                    && target != DirectiveTarget::Class
+                    && target != DirectiveTarget::Enum) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+                }
+            }
+
+            // Unrecognised directive name: warn so that typos like `![packed]`
+            // (a directive documented in `docs/cryo.md` section 17.1 but never implemented)
+            // surface instead of silently no-opping.  Warning, not error, so user
+            // tooling that registers custom inert directives keeps compiling.
+            _ => {
+                const code: ErrorCode = ErrorCode::E0153_DIRECTIVE_UNKNOWN;
                 const msg: string = format(
-                    "directive `![target]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
-                    a.name);
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    "unknown directive `![%s]`: no built-in with that name; the directive is recorded but has no effect",
+                    name);
+                mut diag: Diagnostic = Diagnostic::warning(code, msg);
                 diag = diag.at(dir.span);
+
+                // Did-you-mean: pick the closest known builtin by edit
+                // distance.  The full directive list is short and stable
+                // enough to embed inline here; updating it tracks
+                // `is_known_builtin` above.
+                mut cands: string[] = [
+                    "inline", "noinline", "entry", "test", "ignore",
+                    "should_panic", "config", "deprecated", "align",
+                    "repr", "link", "target", "allow", "warn", "deny",
+                    "derive", "sink",
+                    "windows", "linux", "macos", "unix", "not"
+                ];
+                const best: string = find_best_candidate(name, cands);
+                if (best != "") {
+                    diag = diag.help(format(
+                        "a directive with a similar name exists: `%s`", best));
+                    // The parser stamps `dir.span` over the whole `![name(args)]`
+                    // slice with `![` at start_col.  The directive name starts
+                    // exactly 2 bytes later and has the length of `name`.  No
+                    // whitespace is allowed between `![` and the identifier,
+                    // so this byte arithmetic is safe.
+                    const name_len: u32 = strlen(name) as u32;
+                    const ns: SourceSpan = SourceSpan::new(
+                        dir.span.file,
+                        dir.span.start_line, dir.span.start_col + 2,
+                        dir.span.start_line, dir.span.start_col + 2 + name_len);
+                    diag = diag.suggest(Suggestion::machine_applicable(
+                        ns, best,
+                        format("did you mean `%s`?", best)));
+                }
                 ctx.emit_diagnostic(diag);
             }
         }
-
-        "allow" | "warn" | "deny" => {
-            if (argc == 0) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            for (mut i: i64 = 0; i < argc; i++) {
-                const a: DirectiveArg = dir.args[i];
-                if (a.kind != DirectiveArgKind::Ident) {
-                    emit_arg_kind_error(ctx, dir, name, i, "an identifier");
-                }
-            }
-        }
-
-        "derive" => {
-            if (argc == 0) {
-                emit_arity_error(ctx, dir, name, 1, argc);
-                return;
-            }
-            for (mut i: i64 = 0; i < argc; i++) {
-                const a: DirectiveArg = dir.args[i];
-                if (a.kind != DirectiveArgKind::Ident) {
-                    emit_arg_kind_error(ctx, dir, name, i, "a trait name (identifier)");
-                }
-            }
-            if (target != DirectiveTarget::Struct
-                && target != DirectiveTarget::Class
-                && target != DirectiveTarget::Enum) {
-                emit_placement_error(ctx, dir, name, "struct/class/enum", target);
-            }
-        }
-
-        // Unrecognised directive name: warn so that typos like `![packed]`
-        // (a directive documented in `docs/cryo.md` section 17.1 but never implemented)
-        // surface instead of silently no-opping.  Warning, not error, so user
-        // tooling that registers custom inert directives keeps compiling.
-        _ => {
-            const code: ErrorCode = ErrorCode::E0153_DIRECTIVE_UNKNOWN;
-            const msg: string = format(
-                "unknown directive `![%s]`: no built-in with that name; the directive is recorded but has no effect",
-                name);
-            mut diag: Diagnostic = Diagnostic::warning(code, msg);
-            diag = diag.at(dir.span);
-
-            // Did-you-mean: pick the closest known builtin by edit
-            // distance.  The full directive list is short and stable
-            // enough to embed inline here; updating it tracks
-            // `is_known_builtin` above.
-            mut cands: string[] = [
-                "inline", "noinline", "entry", "test", "ignore",
-                "should_panic", "config", "deprecated", "align",
-                "repr", "link", "target", "allow", "warn", "deny",
-                "derive", "sink",
-                "windows", "linux", "macos", "unix", "not"
-            ];
-            const best: string = find_best_candidate(name, cands);
-            if (best != "") {
-                diag = diag.help(format(
-                    "a directive with a similar name exists: `%s`", best));
-                // The parser stamps `dir.span` over the whole `![name(args)]`
-                // slice with `![` at start_col.  The directive name starts
-                // exactly 2 bytes later and has the length of `name`.  No
-                // whitespace is allowed between `![` and the identifier,
-                // so this byte arithmetic is safe.
-                const name_len: u32 = strlen(name) as u32;
-                const ns: SourceSpan = SourceSpan::new(
-                    dir.span.file,
-                    dir.span.start_line, dir.span.start_col + 2,
-                    dir.span.start_line, dir.span.start_col + 2 + name_len);
-                diag = diag.suggest(Suggestion::machine_applicable(
-                    ns, best,
-                    format("did you mean `%s`?", best)));
-            }
-            ctx.emit_diagnostic(diag);
-        }
     }
-}
 
 
-// Side-effect application: layout directives
-//
-// `apply_layout_effects_{struct,class,enum}` mirror `![repr(...)]` /
-// `![align(N)]` onto the decl node and emit a diagnostic when two
-// directives on the same decl conflict.  Conflicts:
-//   * `repr(packed)` + `align(N)` (mutually exclusive)
-//   * Two different `repr(...)` flavours on the same decl
-//   * Two `![align]` directives on the same decl
-//
-// The diagnostic span is the *second* directive (the one being applied
-// when the conflict is observed); the message names both directives so
-// the user can tell which one to remove.
+    // Side-effect application: layout directives
+    //
+    // `apply_layout_effects_{struct,class,enum}` mirror `![repr(...)]` /
+    // `![align(N)]` onto the decl node and emit a diagnostic when two
+    // directives on the same decl conflict.  Conflicts:
+    //   * `repr(packed)` + `align(N)` (mutually exclusive)
+    //   * Two different `repr(...)` flavours on the same decl
+    //   * Two `![align]` directives on the same decl
+    //
+    // The diagnostic span is the *second* directive (the one being applied
+    // when the conflict is observed); the message names both directives so
+    // the user can tell which one to remove.
 
-function emit_layout_conflict(ctx: CompilationContext*, dir: DirectiveNode*,
-                              this_name: string, other_name: string) -> void {
-    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-    const msg: string = format(
-        "directive `![%s]` conflicts with `![%s]` on the same declaration",
-        this_name, other_name);
-    mut diag: Diagnostic = Diagnostic::error(code, msg);
-    diag = diag.at(dir.span);
-    diag = diag.suggest(Suggestion::machine_applicable(
-        dir.span, "",
-        format("remove `![%s]` or `![%s]`", this_name, other_name)));
-    ctx.emit_diagnostic(diag);
-}
+    static emit_layout_conflict(ctx: CompilationContext*, dir: DirectiveNode*,
+                                  this_name: string, other_name: string) -> void {
+        const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+        const msg: string = format(
+            "directive `![%s]` conflicts with `![%s]` on the same declaration",
+            this_name, other_name);
+        mut diag: Diagnostic = Diagnostic::error(code, msg);
+        diag = diag.at(dir.span);
+        diag = diag.suggest(Suggestion::machine_applicable(
+            dir.span, "",
+            format("remove `![%s]` or `![%s]`", this_name, other_name)));
+        ctx.emit_diagnostic(diag);
+    }
 
-function apply_layout_effects_struct(ctx: CompilationContext*,
-                                     dir: DirectiveNode*,
-                                     sd: StructDeclNode*,
-                                     name: string) -> void {
-    match (name) {
-        "repr" => {
-            if (dir.args.length != 1) { return; }
-            // Reject a second `![repr]` on the same decl.
-            if (sd.repr_c || sd.repr_packed || sd.repr_transparent) {
-                emit_layout_conflict(ctx, dir, "repr", "repr");
-                return;
-            }
-            match (dir.args[0].name) {
-                "C"           => { sd.repr_c = true; }
-                "packed"      => {
-                    if (sd.min_alignment != 0) {
-                        emit_layout_conflict(ctx, dir, "repr(packed)", "align");
-                        return;
+    static apply_layout_effects_struct(ctx: CompilationContext*,
+                                         dir: DirectiveNode*,
+                                         sd: StructDeclNode*,
+                                         name: string) -> void {
+        match (name) {
+            "repr" => {
+                if (dir.args.length != 1) { return; }
+                // Reject a second `![repr]` on the same decl.
+                if (sd.repr_c || sd.repr_packed || sd.repr_transparent) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    return;
+                }
+                match (dir.args[0].name) {
+                    "C"           => { sd.repr_c = true; }
+                    "packed"      => {
+                        if (sd.min_alignment != 0) {
+                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                            return;
+                        }
+                        sd.repr_packed = true;
                     }
-                    sd.repr_packed = true;
-                }
-                "transparent" => { sd.repr_transparent = true; }
-                _             => { }
-            }
-        }
-        "align" => {
-            if (dir.args.length != 1) { return; }
-            if (sd.repr_packed) {
-                emit_layout_conflict(ctx, dir, "align", "repr(packed)");
-                return;
-            }
-            if (sd.min_alignment != 0) {
-                emit_layout_conflict(ctx, dir, "align", "align");
-                return;
-            }
-            sd.min_alignment = dir.args[0].int_value as u64;
-        }
-        _ => { }
-    }
-}
-
-function apply_layout_effects_class(ctx: CompilationContext*,
-                                    dir: DirectiveNode*,
-                                    cd: ClassDeclNode*,
-                                    name: string) -> void {
-    match (name) {
-        "repr" => {
-            if (dir.args.length != 1) { return; }
-            if (cd.repr_c || cd.repr_packed || cd.repr_transparent) {
-                emit_layout_conflict(ctx, dir, "repr", "repr");
-                return;
-            }
-            match (dir.args[0].name) {
-                "C"           => { cd.repr_c = true; }
-                "packed"      => {
-                    if (cd.min_alignment != 0) {
-                        emit_layout_conflict(ctx, dir, "repr(packed)", "align");
-                        return;
-                    }
-                    cd.repr_packed = true;
-                }
-                "transparent" => { cd.repr_transparent = true; }
-                _             => { }
-            }
-        }
-        "align" => {
-            if (dir.args.length != 1) { return; }
-            if (cd.repr_packed) {
-                emit_layout_conflict(ctx, dir, "align", "repr(packed)");
-                return;
-            }
-            if (cd.min_alignment != 0) {
-                emit_layout_conflict(ctx, dir, "align", "align");
-                return;
-            }
-            cd.min_alignment = dir.args[0].int_value as u64;
-        }
-        _ => { }
-    }
-}
-
-function apply_layout_effects_enum(ctx: CompilationContext*,
-                                   dir: DirectiveNode*,
-                                   ed: EnumDeclNode*,
-                                   name: string) -> void {
-    // Enums accept only `repr(C)` and `![align(N)]` today; the validator
-    // has already rejected `repr(packed)` / `repr(transparent)` on
-    // enums, and a non-`C` `repr` argument would have been rejected
-    // before reaching this function.
-    match (name) {
-        "repr" => {
-            if (dir.args.length != 1) { return; }
-            if (ed.repr_c) {
-                emit_layout_conflict(ctx, dir, "repr", "repr");
-                return;
-            }
-            if (dir.args[0].name == "C") {
-                ed.repr_c = true;
-            }
-        }
-        "align" => {
-            if (dir.args.length != 1) { return; }
-            if (ed.min_alignment != 0) {
-                emit_layout_conflict(ctx, dir, "align", "align");
-                return;
-            }
-            ed.min_alignment = dir.args[0].int_value as u64;
-        }
-        _ => { }
-    }
-}
-
-
-// Side-effect application: known directives that mutate the AST
-
-/// Apply known semantic side-effects of a directive to its target decl.
-/// Currently:
-///   ![inline]         -> sets FunctionDeclNode.is_inline = true
-///   ![noinline]       -> sets FunctionDeclNode.is_noinline = true
-///   ![sink]           -> sets MethodNode.is_sink = true
-///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/class/enum decl
-///   ![align(N)]       -> sets min_alignment on struct/class/enum decl
-function apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
-                       decl: DeclarationNode*) -> void {
-    if (decl == null) { return; }
-    const name: string = dir.directive_kind;
-
-    if (decl.kind == NodeKind::FunctionDeclaration) {
-        const fn: FunctionDeclNode* = decl as FunctionDeclNode*;
-        if (name.eq("inline")) {
-            fn.is_inline   = true;
-            fn.is_noinline = false;
-            return;
-        }
-        if (name.eq("noinline")) {
-            fn.is_noinline = true;
-            fn.is_inline   = false;
-            return;
-        }
-        if (name.eq("implicit")) {
-            // Converter registration (for single-param `![implicit]`
-            // functions / static methods) happens in a dedicated walk after
-            // all directives are applied, where the owning type name is in
-            // hand; see `register_implicit_converters`.
-            fn.is_implicit = true;
-            return;
-        }
-        if (name.eq("link")) {
-            // The validator already checked arity (1) and that the arg is
-            // a string literal; record the override for codegen.
-            if (dir.args.length == 1
-                    && dir.args[0].kind == DirectiveArgKind::StringLit) {
-                fn.link_name     = dir.args[0].str_value;
-                fn.has_link_name = true;
-            }
-            return;
-        }
-    }
-
-    // Layout effects on user-defined types.  The validator above has
-    // already rejected malformed args; here we just mirror the directive
-    // onto the decl node so TypeResolution / TypeLowering / codegen can
-    // observe it.  Conflict detection (e.g. `repr(packed)` + `align`,
-    // duplicate `repr`) lives in the same place so a stable diagnostic
-    // is produced regardless of source order.
-    if (decl.kind == NodeKind::StructDeclaration) {
-        const sd: StructDeclNode* = decl as StructDeclNode*;
-        apply_layout_effects_struct(ctx, dir, sd, name);
-        return;
-    }
-    if (decl.kind == NodeKind::ClassDeclaration) {
-        const cd: ClassDeclNode* = decl as ClassDeclNode*;
-        apply_layout_effects_class(ctx, dir, cd, name);
-        return;
-    }
-    if (decl.kind == NodeKind::EnumDeclaration) {
-        const ed: EnumDeclNode* = decl as EnumDeclNode*;
-        apply_layout_effects_enum(ctx, dir, ed, name);
-        return;
-    }
-
-    if (decl.kind == NodeKind::MethodDeclaration) {
-        const m: MethodNode* = decl as MethodNode*;
-        if (name.eq("sink")) {
-            // Reject placement on a static method: static methods have
-            // no receiver, so "consumes the receiver" is meaningless.
-            if (m.is_static) {
-                const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                const msg: string =
-                    "directive `![sink]` cannot be applied to a static method (no receiver)";
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
-                diag = diag.at(dir.span);
-                diag = diag.suggest(Suggestion::machine_applicable(
-                    dir.span, "",
-                    "remove the `![sink]` directive"));
-                ctx.emit_diagnostic(diag);
-                return;
-            }
-            // Reject placement on a method with zero parameters.  Sema
-            // enforces that the first parameter is named `this` for
-            // non-static methods, so a zero-parameter method is missing
-            // its receiver entirely.
-            if (m.func == null || m.func.parameters.length == 0) {
-                const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                const msg: string =
-                    "directive `![sink]` requires a method with a `this` receiver";
-                mut diag: Diagnostic = Diagnostic::error(code, msg);
-                diag = diag.at(dir.span);
-                diag = diag.suggest(Suggestion::machine_applicable(
-                    dir.span, "",
-                    "remove the `![sink]` directive"));
-                ctx.emit_diagnostic(diag);
-                return;
-            }
-            m.is_sink = true;
-            return;
-        }
-        if (name.eq("implicit")) {
-            if (m.func != null) { m.func.is_implicit = true; }
-            return;
-        }
-        // `![inline]` / `![noinline]` on a method: record on the wrapped
-        // FunctionDeclNode, which is what codegen's declare_method reads.
-        if (name.eq("inline")) {
-            if (m.func != null) {
-                m.func.is_inline   = true;
-                m.func.is_noinline = false;
-            }
-            return;
-        }
-        if (name.eq("noinline")) {
-            if (m.func != null) {
-                m.func.is_noinline = true;
-                m.func.is_inline   = false;
-            }
-            return;
-        }
-    }
-}
-
-
-// Diagnostic helpers
-
-function emit_arity_error(ctx: CompilationContext*, dir: DirectiveNode*,
-                          name: string, expected: i64, got: i64) -> void {
-    const code: ErrorCode = ErrorCode::E0150_DIRECTIVE_BAD_ARITY;
-    const msg: string = format(
-        "directive `![%s]` expects %lld argument(s) but got %lld",
-        name, expected, got);
-    mut diag: Diagnostic = Diagnostic::error(code, msg);
-    diag = diag.at(dir.span);
-    ctx.emit_diagnostic(diag);
-}
-
-function emit_arg_kind_error(ctx: CompilationContext*, dir: DirectiveNode*,
-                             name: string, idx: i64, expected_kind: string) -> void {
-    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
-    const msg: string = format(
-        "directive `![%s]`: argument %lld must be %s",
-        name, idx + 1, expected_kind);
-    mut diag: Diagnostic = Diagnostic::error(code, msg);
-    diag = diag.at(dir.span);
-    ctx.emit_diagnostic(diag);
-}
-
-function emit_placement_error(ctx: CompilationContext*, dir: DirectiveNode*,
-                              name: string, expected_target: string,
-                              actual: DirectiveTarget) -> void {
-    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-    const msg: string = format(
-        "directive `![%s]` only applies to %s, not %s",
-        name, expected_target, actual.label());
-    mut diag: Diagnostic = Diagnostic::error(code, msg);
-    diag = diag.at(dir.span);
-    diag = diag.suggest(Suggestion::machine_applicable(
-        dir.span, "",
-        format("remove the misplaced `![%s]` directive", name)));
-    ctx.emit_diagnostic(diag);
-}
-
-
-// Pass entry point
-
-/// Walk the AST once: validate each directive, apply known effects, and
-/// register every observed directive in the context's DirectiveRegistry.
-/// Pass entry point.  Named `run_directive_processing` rather than bare
-/// `run` to keep stage-2 dispatch unambiguous until codegen's
-/// module-graph-walk fix (which lives in this same change set) ships in
-/// the pinned compiler binary.  After the next pin refresh, this can be
-/// renamed back to `run`.
-function run_directive_processing(ctx: CompilationContext*) -> PassResult {
-    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
-
-    const root: ProgramNode* = ctx.artifacts.ast.root;
-    if (root == null) {
-        return PassResult::ok();
-    }
-
-    // Lazy-init the registry.  We store a `DirectiveRegistry*` cast to
-    // `void*` on the context so adding the field-type required no
-    // cross-cutting edits to compilation_context.cryo's imports.
-    if (ctx.directive_registry == null) {
-        ctx.directive_registry = DirectiveRegistry::new() as void*;
-    }
-    mut registry: DirectiveRegistry* = ctx.directive_registry as DirectiveRegistry*;
-
-    mut count: i64 = 0;
-
-    // Cross-cutting tracking for the testing-mode validation below.
-    // `has_config_testing` records whether this module's namespace
-    // declaration carries `![config(testing)]`.  `first_test_dir` is
-    // the source span of the first `![test]`/`![ignore]`/`![should_panic]`
-    // directive seen, used to point the diagnostic at a real spot when
-    // a test directive lives in a non-testing module.
-    mut has_config_testing: boolean = false;
-    mut has_test_directive: boolean = false;
-    mut first_test_dir_span: SourceSpan = SourceSpan::none();
-    mut first_test_dir_name: string = "";
-
-    for (mut i: i64 = 0; i < root.statements.length; i++) {
-        const stmt: ASTNode* = root.statements[i];
-        if (stmt == null) { continue; }
-
-        // Standalone (module-level) directives: no owner decl.
-        if (stmt.kind == NodeKind::Directive) {
-            const d: DirectiveNode* = stmt as DirectiveNode*;
-            validate_builtin(ctx, d, DirectiveTarget::Module);
-            const rec: DirectiveRecord = DirectiveRecord {
-                kind: d.directive_kind,
-                node: d,
-                decl: null,
-                qualified_name: SymbolStr::empty(),
-                span: d.span,
-            };
-            registry.add(rec);
-            count += 1;
-            if (ctx.debug_mode) {
-                cdebug("[DirectiveProcessing] module-level '%s' (%lld args) at %s:%u:%u\n",
-                    d.directive_kind, d.args.length,
-                    d.span.file, d.span.start_line, d.span.start_col);
-            }
-            continue;
-        }
-
-        // Attached directives on declarations.
-        const t: DirectiveTarget = DirectiveTarget::from_kind(stmt.kind);
-        if (t == DirectiveTarget::Other) { continue; }
-
-        const decl: DeclarationNode* = stmt as DeclarationNode*;
-        const ad_count: i64 = decl.attached_directives.length;
-        // Note: do NOT `continue` when ad_count == 0; the method
-        // descent below still needs to run for struct/class/impl decls
-        // whose own attached_directives are empty but whose method
-        // members carry their own (e.g. `![sink]`).
-
-        for (mut j: i64 = 0; j < ad_count; j++) {
-            const d: DirectiveNode* = decl.attached_directives[j];
-            if (d == null) { continue; }
-
-            validate_builtin(ctx, d, t);
-            apply_effects(ctx, d, decl);
-
-            // Cross-cutting flags for the test-mode validation below.
-            if (t == DirectiveTarget::Module
-                    && d.directive_kind.eq("config")
-                    && d.args.length == 1
-                    && d.args[0].kind == DirectiveArgKind::Ident
-                    && d.args[0].name.eq("testing")) {
-                has_config_testing = true;
-            }
-            if (t == DirectiveTarget::Function
-                    && (d.directive_kind.eq("test")
-                     || d.directive_kind.eq("ignore")
-                     || d.directive_kind.eq("should_panic"))) {
-                if (!has_test_directive) {
-                    first_test_dir_span = d.span;
-                    first_test_dir_name = d.directive_kind;
-                }
-                has_test_directive = true;
-            }
-
-            // Capture the qualified name now while ctx.namespace is
-            // correct for this module.  Late passes (TestMainCodegen)
-            // need the qualifier to look up DI mangled names.
-            mut qualified: SymbolStr = SymbolStr::empty();
-            if (decl.kind == NodeKind::FunctionDeclaration) {
-                const fn_decl: FunctionDeclNode* = decl as FunctionDeclNode*;
-                qualified = ctx.qualify_symbol_sym(fn_decl.name);
-            }
-            const rec: DirectiveRecord = DirectiveRecord {
-                kind: d.directive_kind,
-                node: d,
-                decl: decl,
-                qualified_name: qualified,
-                span: d.span,
-            };
-            registry.add(rec);
-            count += 1;
-
-            if (ctx.debug_mode) {
-                mut tag: string = "custom ";
-                if (is_known_builtin(d.directive_kind)) { tag = "builtin"; }
-                cdebug("[DirectiveProcessing] %s '%s' on %s (%lld args) at %s:%u:%u\n",
-                    tag, d.directive_kind, t.label(), d.args.length,
-                    d.span.file, d.span.start_line, d.span.start_col);
-            }
-        }
-
-        // Descend into method lists on structs/classes/impls.  The
-        // top-level loop above only sees the container; per-method
-        // directives like `![sink]` live on each MethodNode
-        // and must be validated + applied here.  Methods on traits
-        // are FunctionDeclNode*[] (no MethodNode wrapper) and don't
-        // currently carry directives; if that changes, fold them in.
-        // Borrow the decl's method array — aliasing it into an owning local
-        // would free the decl node's buffer when the local drops.
-        const empty_methods: MethodNode*[] = [];
-        mut method_list: &MethodNode*[] = &empty_methods;
-        if (decl.kind == NodeKind::StructDeclaration) {
-            const sn: StructDeclNode* = decl as StructDeclNode*;
-            method_list = &sn.methods;
-        } else if (decl.kind == NodeKind::ClassDeclaration) {
-            const cn: ClassDeclNode* = decl as ClassDeclNode*;
-            method_list = &cn.methods;
-        } else if (decl.kind == NodeKind::ImplementationBlock) {
-            const ib: ImplBlockNode* = decl as ImplBlockNode*;
-            method_list = &ib.methods;
-        }
-        for (mut mi: i64 = 0; mi < method_list.length; mi++) {
-            const m: MethodNode* = method_list[mi];
-            if (m == null) { continue; }
-            const m_count: i64 = m.attached_directives.length;
-            if (m_count == 0) { continue; }
-            for (mut mj: i64 = 0; mj < m_count; mj++) {
-                const md: DirectiveNode* = m.attached_directives[mj];
-                if (md == null) { continue; }
-                validate_builtin(ctx, md, DirectiveTarget::Method);
-                apply_effects(ctx, md, m as DeclarationNode*);
-                const m_rec: DirectiveRecord = DirectiveRecord {
-                    kind: md.directive_kind,
-                    node: md,
-                    decl: m as DeclarationNode*,
-                    qualified_name: SymbolStr::empty(),
-                    span: md.span,
-                };
-                registry.add(m_rec);
-                count += 1;
-                if (ctx.debug_mode) {
-                    mut mtag: string = "custom ";
-                    if (is_known_builtin(md.directive_kind)) { mtag = "builtin"; }
-                    cdebug("[DirectiveProcessing] %s '%s' on method (%lld args) at %s:%u:%u\n",
-                        mtag, md.directive_kind, md.args.length,
-                        md.span.file, md.span.start_line, md.span.start_col);
+                    "transparent" => { sd.repr_transparent = true; }
+                    _             => { }
                 }
             }
-        }
-
-        // Descend into extern-block functions so per-function directives
-        // like `![link("sym")]` are validated + applied; the block is the
-        // top-level statement, its functions aren't otherwise visited here.
-        if (decl.kind == NodeKind::ExternBlock) {
-            const eb: ExternBlockNode* = decl as ExternBlockNode*;
-            for (mut ei: i64 = 0; ei < eb.functions.length; ei++) {
-                const ef: FunctionDeclNode* = eb.functions[ei];
-                if (ef == null) { continue; }
-                for (mut ej: i64 = 0; ej < ef.attached_directives.length; ej++) {
-                    const ed: DirectiveNode* = ef.attached_directives[ej];
-                    if (ed == null) { continue; }
-                    validate_builtin(ctx, ed, DirectiveTarget::Extern);
-                    apply_effects(ctx, ed, ef as DeclarationNode*);
-                    const e_rec: DirectiveRecord = DirectiveRecord {
-                        kind: ed.directive_kind,
-                        node: ed,
-                        decl: ef as DeclarationNode*,
-                        qualified_name: SymbolStr::empty(),
-                        span: ed.span,
-                    };
-                    registry.add(e_rec);
-                    count += 1;
+            "align" => {
+                if (dir.args.length != 1) { return; }
+                if (sd.repr_packed) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                    return;
                 }
-            }
-        }
-    }
-
-    // Cross-cutting placement validation: enforce that `![config(testing)]`,
-    // `![test]`, `![ignore]`, and `![should_panic]` only appear in files
-    // under `<project_root>/tests/`, and that every file in `tests/` has
-    // `![config(testing)]` on its namespace.
-    validate_test_module_placement(ctx,
-        has_config_testing, has_test_directive,
-        first_test_dir_span, first_test_dir_name);
-
-    // Propagate `![repr(...)]` / `![align(N)]` from AST decls onto the
-    // corresponding Type* objects in the arena.  This must happen after
-    // the per-decl walk above (which sets the AST flags) and before
-    // TypeLowering reads the Type-side flags.  StructFieldTypeSync
-    // populated `fields` already at this point; here we just stamp the
-    // layout intent on top.
-    propagate_layout_attrs_to_types(ctx);
-
-    // Register implicit converters now that every `![implicit]` flag has
-    // been applied above (and TypeResolution, which ran earlier, has
-    // resolved the parameter / return types).
-    register_implicit_converters(ctx, root);
-
-    if (ctx.debug_mode) {
-        cdebug("[DirectiveProcessing] Processed %lld directives in this module (%lld cumulative)\n",
-            count, registry.count());
-    }
-
-    return PassResult::from_snapshot(ctx.diagnostics, snap);
-}
-
-/// Scan top-level declarations for `![implicit]` converters and register
-/// each in the DeclarationIndex keyed on `(param_type, return_type)`.
-///
-/// A converter is a single-parameter, non-generic `![implicit]`:
-///   - free function `f(x: T) -> U`              -> `Type::method` = (0, f)
-///   - static method `static M(x: T) -> U` on S  -> (S, M)
-///
-/// Sema synthesizes a call to the recorded converter (`Str::new(arg)` or
-/// `f(arg)`) at any coercion site where a `T` value must become a `U`.
-/// Static-method resolution is global through the DeclarationIndex, so the
-/// synthesized `Type::method` call resolves regardless of imports.
-function register_implicit_converters(ctx: CompilationContext*,
-                                      root: ProgramNode*) -> void {
-    if (root == null) { return; }
-    for (mut i: i64 = 0; i < root.statements.length; i++) {
-        const stmt: ASTNode* = root.statements[i];
-        if (stmt == null) { continue; }
-        match (stmt.kind) {
-            NodeKind::FunctionDeclaration => {
-                register_converter_fn(ctx, stmt as FunctionDeclNode*,
-                    SymbolStr::empty(), false);
-            }
-            NodeKind::StructDeclaration => {
-                const sd: StructDeclNode* = stmt as StructDeclNode*;
-                register_converter_methods(ctx, sd.name, &sd.methods,
-                    sd.generic_params.length > 0);
-            }
-            NodeKind::ClassDeclaration => {
-                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                register_converter_methods(ctx, cd.name, &cd.methods,
-                    cd.generic_params.length > 0);
-            }
-            NodeKind::ImplementationBlock => {
-                // Static methods in `implement` blocks (e.g. enum or
-                // primitive constructors) register under the impl's target
-                // type name.  Generic targets aren't force-instantiated
-                // here (the impl head's generics don't pin the target's);
-                // such converters work for the non-generic case.
-                const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                register_converter_methods(ctx, ib.target_type, &ib.methods,
-                    false);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Register a `![implicit]` static method as a converter under its owning
-/// type's bare name.  Instance methods are skipped: a converter needs no
-/// receiver.
-function register_converter_methods(ctx: CompilationContext*,
-                                    owner: SymbolStr,
-                                    methods: &MethodNode*[],
-                                    owner_is_generic: boolean) -> void {
-    for (mut i: i64 = 0; i < methods.length; i++) {
-        const m: MethodNode* = methods[i];
-        if (m == null || m.func == null) { continue; }
-        if (!m.is_static) { continue; }
-        register_converter_fn(ctx, m.func, owner, owner_is_generic);
-    }
-}
-
-/// Register a single `![implicit]` function/static-method as a converter,
-/// if it qualifies (one resolved parameter, no generic params, resolved
-/// return type).  `owner` is the static method's owning type, or empty for
-/// a free function.
-function register_converter_fn(ctx: CompilationContext*,
-                               fn: FunctionDeclNode*,
-                               owner: SymbolStr,
-                               owner_is_generic: boolean) -> void {
-    if (fn == null || !fn.is_implicit) { return; }
-    if (fn.parameters.length != 1) { return; }
-    if (fn.generic_params.length != 0) { return; }
-    if (!fn.resolved_return_type.is_valid()) { return; }
-    const p: VarDeclNode* = fn.parameters[0];
-    if (p == null || !p.resolved_type.is_valid()) { return; }
-    const type_name_id: u32 = if (owner.is_valid()) { owner.id } else { 0 };
-    ctx.decl_index.register_implicit_converter(
-        p.resolved_type.id,
-        fn.resolved_return_type.id,
-        type_name_id,
-        fn.name.id);
-    // A static-method converter on a generic owner can't be conjured by the
-    // post-mono sema rewrite; record it so the monomorphizer eagerly emits
-    // the default instantiation (`String<GlobalAlloc>::from_cstr`).
-    if (owner.is_valid() && owner_is_generic) {
-        ctx.decl_index.register_generic_converter_method(owner.id, fn.name.id);
-    }
-}
-
-// Layout-attr propagation: AST -> Type
-
-/// After the per-decl walk has set `repr_*` and `min_alignment` on each
-/// `{Struct,Class,Enum}DeclNode`, walk the AST again and mirror those
-/// flags onto the corresponding `{Struct,Class,Enum}Type*` in the arena
-/// so TypeLowering and codegen see the chosen layout.
-///
-/// Lookup path: qualify the decl's bare name with the current module's
-/// namespace via `ctx.qualify_symbol_sym`, then ask the decl index for
-/// the type's TypeRef.  This matches what StructFieldTypeSync does to
-/// find the same Type, so a name that resolves there resolves here.
-function propagate_layout_attrs_to_types(ctx: CompilationContext*) -> void {
-    const root: ProgramNode* = ctx.artifacts.ast.root;
-    if (root == null) { return; }
-
-    const arena: TypeArena* = ctx.type_arena;
-    if (arena == null) { return; }
-
-    for (mut i: i64 = 0; i < root.statements.length; i++) {
-        const stmt: ASTNode* = root.statements[i];
-        if (stmt == null) { continue; }
-
-        match (stmt.kind) {
-            NodeKind::StructDeclaration => {
-                const node: StructDeclNode* = stmt as StructDeclNode*;
-                if (node.is_generic()) {
-                    // Generic struct definitions have no concrete Type yet;
-                    // each specialization stamps its own layout in the
-                    // monomorphizer (`populate_struct_fields`), which copies
-                    // the repr/align flags the cloner carried over from this
-                    // template. Nothing to do for the template itself.
-                    continue;
+                if (sd.min_alignment != 0) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    return;
                 }
-                if (!node.repr_c && !node.repr_packed
-                        && !node.repr_transparent && node.min_alignment == 0) {
-                    continue;
-                }
-                const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
-                if (!tref.is_valid()) { continue; }
-                const ty: Type* = arena.lookup(tref.id);
-                if (ty == null || ty.kind != TypeKind::Struct) { continue; }
-                mut st: StructType* = ty as StructType*;
-                st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                st.set_min_alignment(node.min_alignment);
-            }
-            NodeKind::ClassDeclaration => {
-                const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                if (node.is_generic()) { continue; }
-                if (!node.repr_c && !node.repr_packed
-                        && !node.repr_transparent && node.min_alignment == 0) {
-                    continue;
-                }
-                const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
-                if (!tref.is_valid()) { continue; }
-                const ty: Type* = arena.lookup(tref.id);
-                if (ty == null || ty.kind != TypeKind::Class) { continue; }
-                mut ct: ClassType* = ty as ClassType*;
-                ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
-                ct.set_min_alignment(node.min_alignment);
-            }
-            NodeKind::EnumDeclaration => {
-                const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                if (node.is_generic()) { continue; }
-                if (!node.repr_c && node.min_alignment == 0) { continue; }
-                const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
-                if (!tref.is_valid()) { continue; }
-                const ty: Type* = arena.lookup(tref.id);
-                if (ty == null || ty.kind != TypeKind::Enum) { continue; }
-                mut et: EnumType* = ty as EnumType*;
-                et.set_repr_c(node.repr_c);
-                et.set_min_alignment(node.min_alignment);
+                sd.min_alignment = dir.args[0].int_value as u64;
             }
             _ => { }
         }
     }
-}
 
-// Test-module placement validation
-
-/// True if `path` lies under `<project_root>/tests/` (recursively).
-/// Computes the prefix once and does a byte-wise compare; matches the
-/// path style cryoc uses internally (always project-relative or absolute,
-/// never with `..`).
-function file_is_under_tests_dir(project_root: string, file_path: string) -> boolean {
-    if (strlen(project_root) == 0) { return false; }
-    const prefix: string = format("%s/tests/", project_root);
-    const plen: u64 = strlen(prefix);
-    const flen: u64 = strlen(file_path);
-    if (flen < plen) { return false; }
-    return strncmp(file_path, prefix, plen) == 0;
-}
-
-/// Enforce the locked design's three placement rules.  Run once per
-/// module after the walk has populated `has_config_testing` and
-/// `has_test_directive`.
-function validate_test_module_placement(ctx: CompilationContext*,
-                                        has_config_testing: boolean,
-                                        has_test_directive: boolean,
-                                        first_test_dir_span: SourceSpan,
-                                        first_test_dir_name: string) -> void {
-    if (ctx.project_config == null) { return; }
-    const project_root: string = ctx.project_config.project_root;
-    const file_path:    string = ctx.source_file;
-
-    // The stdlib lives outside the project tree but still parses through
-    // this pass; never apply test-mode rules to stdlib files.
-    if (strlen(ctx.stdlib_root) > 0
-            && strncmp(file_path, ctx.stdlib_root, strlen(ctx.stdlib_root)) == 0) {
-        return;
+    static apply_layout_effects_class(ctx: CompilationContext*,
+                                        dir: DirectiveNode*,
+                                        cd: ClassDeclNode*,
+                                        name: string) -> void {
+        match (name) {
+            "repr" => {
+                if (dir.args.length != 1) { return; }
+                if (cd.repr_c || cd.repr_packed || cd.repr_transparent) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    return;
+                }
+                match (dir.args[0].name) {
+                    "C"           => { cd.repr_c = true; }
+                    "packed"      => {
+                        if (cd.min_alignment != 0) {
+                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                            return;
+                        }
+                        cd.repr_packed = true;
+                    }
+                    "transparent" => { cd.repr_transparent = true; }
+                    _             => { }
+                }
+            }
+            "align" => {
+                if (dir.args.length != 1) { return; }
+                if (cd.repr_packed) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                    return;
+                }
+                if (cd.min_alignment != 0) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    return;
+                }
+                cd.min_alignment = dir.args[0].int_value as u64;
+            }
+            _ => { }
+        }
     }
 
-    const in_tests_dir: boolean = file_is_under_tests_dir(project_root, file_path);
+    static apply_layout_effects_enum(ctx: CompilationContext*,
+                                       dir: DirectiveNode*,
+                                       ed: EnumDeclNode*,
+                                       name: string) -> void {
+        // Enums accept only `repr(C)` and `![align(N)]` today; the validator
+        // has already rejected `repr(packed)` / `repr(transparent)` on
+        // enums, and a non-`C` `repr` argument would have been rejected
+        // before reaching this function.
+        match (name) {
+            "repr" => {
+                if (dir.args.length != 1) { return; }
+                if (ed.repr_c) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    return;
+                }
+                if (dir.args[0].name == "C") {
+                    ed.repr_c = true;
+                }
+            }
+            "align" => {
+                if (dir.args.length != 1) { return; }
+                if (ed.min_alignment != 0) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    return;
+                }
+                ed.min_alignment = dir.args[0].int_value as u64;
+            }
+            _ => { }
+        }
+    }
 
-    // Rule 1: `![config(testing)]` must live under `tests/`.
-    if (has_config_testing && !in_tests_dir) {
-        const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+
+    // Side-effect application: known directives that mutate the AST
+
+    /// Apply known semantic side-effects of a directive to its target decl.
+    /// Currently:
+    ///   ![inline]         -> sets FunctionDeclNode.is_inline = true
+    ///   ![noinline]       -> sets FunctionDeclNode.is_noinline = true
+    ///   ![sink]           -> sets MethodNode.is_sink = true
+    ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/class/enum decl
+    ///   ![align(N)]       -> sets min_alignment on struct/class/enum decl
+    static apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
+                           decl: DeclarationNode*) -> void {
+        if (decl == null) { return; }
+        const name: string = dir.directive_kind;
+
+        if (decl.kind == NodeKind::FunctionDeclaration) {
+            const fn: FunctionDeclNode* = decl as FunctionDeclNode*;
+            if (name.eq("inline")) {
+                fn.is_inline   = true;
+                fn.is_noinline = false;
+                return;
+            }
+            if (name.eq("noinline")) {
+                fn.is_noinline = true;
+                fn.is_inline   = false;
+                return;
+            }
+            if (name.eq("implicit")) {
+                // Converter registration (for single-param `![implicit]`
+                // functions / static methods) happens in a dedicated walk after
+                // all directives are applied, where the owning type name is in
+                // hand; see `register_implicit_converters`.
+                fn.is_implicit = true;
+                return;
+            }
+            if (name.eq("link")) {
+                // The validator already checked arity (1) and that the arg is
+                // a string literal; record the override for codegen.
+                if (dir.args.length == 1
+                        && dir.args[0].kind == DirectiveArgKind::StringLit) {
+                    fn.link_name     = dir.args[0].str_value;
+                    fn.has_link_name = true;
+                }
+                return;
+            }
+        }
+
+        // Layout effects on user-defined types.  The validator above has
+        // already rejected malformed args; here we just mirror the directive
+        // onto the decl node so TypeResolution / TypeLowering / codegen can
+        // observe it.  Conflict detection (e.g. `repr(packed)` + `align`,
+        // duplicate `repr`) lives in the same place so a stable diagnostic
+        // is produced regardless of source order.
+        if (decl.kind == NodeKind::StructDeclaration) {
+            const sd: StructDeclNode* = decl as StructDeclNode*;
+            DirectiveProcessingPasses::apply_layout_effects_struct(ctx, dir, sd, name);
+            return;
+        }
+        if (decl.kind == NodeKind::ClassDeclaration) {
+            const cd: ClassDeclNode* = decl as ClassDeclNode*;
+            DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, name);
+            return;
+        }
+        if (decl.kind == NodeKind::EnumDeclaration) {
+            const ed: EnumDeclNode* = decl as EnumDeclNode*;
+            DirectiveProcessingPasses::apply_layout_effects_enum(ctx, dir, ed, name);
+            return;
+        }
+
+        if (decl.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = decl as MethodNode*;
+            if (name.eq("sink")) {
+                // Reject placement on a static method: static methods have
+                // no receiver, so "consumes the receiver" is meaningless.
+                if (m.is_static) {
+                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+                    const msg: string =
+                        "directive `![sink]` cannot be applied to a static method (no receiver)";
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    diag = diag.suggest(Suggestion::machine_applicable(
+                        dir.span, "",
+                        "remove the `![sink]` directive"));
+                    ctx.emit_diagnostic(diag);
+                    return;
+                }
+                // Reject placement on a method with zero parameters.  Sema
+                // enforces that the first parameter is named `this` for
+                // non-static methods, so a zero-parameter method is missing
+                // its receiver entirely.
+                if (m.func == null || m.func.parameters.length == 0) {
+                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+                    const msg: string =
+                        "directive `![sink]` requires a method with a `this` receiver";
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    diag = diag.suggest(Suggestion::machine_applicable(
+                        dir.span, "",
+                        "remove the `![sink]` directive"));
+                    ctx.emit_diagnostic(diag);
+                    return;
+                }
+                m.is_sink = true;
+                return;
+            }
+            if (name.eq("implicit")) {
+                if (m.func != null) { m.func.is_implicit = true; }
+                return;
+            }
+            // `![inline]` / `![noinline]` on a method: record on the wrapped
+            // FunctionDeclNode, which is what codegen's declare_method reads.
+            if (name.eq("inline")) {
+                if (m.func != null) {
+                    m.func.is_inline   = true;
+                    m.func.is_noinline = false;
+                }
+                return;
+            }
+            if (name.eq("noinline")) {
+                if (m.func != null) {
+                    m.func.is_noinline = true;
+                    m.func.is_inline   = false;
+                }
+                return;
+            }
+        }
+    }
+
+
+    // Diagnostic helpers
+
+    static emit_arity_error(ctx: CompilationContext*, dir: DirectiveNode*,
+                              name: string, expected: i64, got: i64) -> void {
+        const code: ErrorCode = ErrorCode::E0150_DIRECTIVE_BAD_ARITY;
         const msg: string = format(
-            "directive `![config(testing)]` may only appear on a namespace inside `tests/`; this file is at `%s`",
-            file_path);
+            "directive `![%s]` expects %lld argument(s) but got %lld",
+            name, expected, got);
         mut diag: Diagnostic = Diagnostic::error(code, msg);
-        // Span the file's namespace decl if we can find it; otherwise
-        // fall back to a span-less error so the renderer still shows
-        // the file path from the message body.
+        diag = diag.at(dir.span);
         ctx.emit_diagnostic(diag);
     }
 
-    // Rule 2: every file in `tests/` must carry `![config(testing)]`.
-    if (in_tests_dir && !has_config_testing) {
-        const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+    static emit_arg_kind_error(ctx: CompilationContext*, dir: DirectiveNode*,
+                                 name: string, idx: i64, expected_kind: string) -> void {
+        const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
         const msg: string = format(
-            "file under `tests/` is missing the `![config(testing)]` namespace marker (`%s`)",
-            file_path);
+            "directive `![%s]`: argument %lld must be %s",
+            name, idx + 1, expected_kind);
         mut diag: Diagnostic = Diagnostic::error(code, msg);
+        diag = diag.at(dir.span);
         ctx.emit_diagnostic(diag);
     }
 
-    // Rule 3: `![test]`/`![ignore]`/`![should_panic]` require an
-    // enclosing `![config(testing)]` namespace.
-    if (has_test_directive && !has_config_testing) {
+    static emit_placement_error(ctx: CompilationContext*, dir: DirectiveNode*,
+                                  name: string, expected_target: string,
+                                  actual: DirectiveTarget) -> void {
         const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
         const msg: string = format(
-            "directive `![%s]` is only allowed inside a namespace marked `![config(testing)]`",
-            first_test_dir_name);
+            "directive `![%s]` only applies to %s, not %s",
+            name, expected_target, actual.label());
         mut diag: Diagnostic = Diagnostic::error(code, msg);
-        diag = diag.at(first_test_dir_span);
+        diag = diag.at(dir.span);
+        diag = diag.suggest(Suggestion::machine_applicable(
+            dir.span, "",
+            format("remove the misplaced `![%s]` directive", name)));
         ctx.emit_diagnostic(diag);
     }
+
+
+    // Pass entry point
+
+    /// Walk the AST once: validate each directive, apply known effects, and
+    /// register every observed directive in the context's DirectiveRegistry.
+    /// Pass entry point.  Named `run_directive_processing` rather than bare
+    /// `run` to keep stage-2 dispatch unambiguous until codegen's
+    /// module-graph-walk fix (which lives in this same change set) ships in
+    /// the pinned compiler binary.  After the next pin refresh, this can be
+    /// renamed back to `run`.
+    static run_directive_processing(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) {
+            return PassResult::ok();
+        }
+
+        // Lazy-init the registry.  We store a `DirectiveRegistry*` cast to
+        // `void*` on the context so adding the field-type required no
+        // cross-cutting edits to compilation_context.cryo's imports.
+        if (ctx.directive_registry == null) {
+            ctx.directive_registry = DirectiveRegistry::new() as void*;
+        }
+        mut registry: DirectiveRegistry* = ctx.directive_registry as DirectiveRegistry*;
+
+        mut count: i64 = 0;
+
+        // Cross-cutting tracking for the testing-mode validation below.
+        // `has_config_testing` records whether this module's namespace
+        // declaration carries `![config(testing)]`.  `first_test_dir` is
+        // the source span of the first `![test]`/`![ignore]`/`![should_panic]`
+        // directive seen, used to point the diagnostic at a real spot when
+        // a test directive lives in a non-testing module.
+        mut has_config_testing: boolean = false;
+        mut has_test_directive: boolean = false;
+        mut first_test_dir_span: SourceSpan = SourceSpan::none();
+        mut first_test_dir_name: string = "";
+
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+
+            // Standalone (module-level) directives: no owner decl.
+            if (stmt.kind == NodeKind::Directive) {
+                const d: DirectiveNode* = stmt as DirectiveNode*;
+                DirectiveProcessingPasses::validate_builtin(ctx, d, DirectiveTarget::Module);
+                const rec: DirectiveRecord = DirectiveRecord {
+                    kind: d.directive_kind,
+                    node: d,
+                    decl: null,
+                    qualified_name: SymbolStr::empty(),
+                    span: d.span,
+                };
+                registry.add(rec);
+                count += 1;
+                if (ctx.debug_mode) {
+                    cdebug("[DirectiveProcessing] module-level '%s' (%lld args) at %s:%u:%u\n",
+                        d.directive_kind, d.args.length,
+                        d.span.file, d.span.start_line, d.span.start_col);
+                }
+                continue;
+            }
+
+            // Attached directives on declarations.
+            const t: DirectiveTarget = DirectiveTarget::from_kind(stmt.kind);
+            if (t == DirectiveTarget::Other) { continue; }
+
+            const decl: DeclarationNode* = stmt as DeclarationNode*;
+            const ad_count: i64 = decl.attached_directives.length;
+            // Note: do NOT `continue` when ad_count == 0; the method
+            // descent below still needs to run for struct/class/impl decls
+            // whose own attached_directives are empty but whose method
+            // members carry their own (e.g. `![sink]`).
+
+            for (mut j: i64 = 0; j < ad_count; j++) {
+                const d: DirectiveNode* = decl.attached_directives[j];
+                if (d == null) { continue; }
+
+                DirectiveProcessingPasses::validate_builtin(ctx, d, t);
+                DirectiveProcessingPasses::apply_effects(ctx, d, decl);
+
+                // Cross-cutting flags for the test-mode validation below.
+                if (t == DirectiveTarget::Module
+                        && d.directive_kind.eq("config")
+                        && d.args.length == 1
+                        && d.args[0].kind == DirectiveArgKind::Ident
+                        && d.args[0].name.eq("testing")) {
+                    has_config_testing = true;
+                }
+                if (t == DirectiveTarget::Function
+                        && (d.directive_kind.eq("test")
+                         || d.directive_kind.eq("ignore")
+                         || d.directive_kind.eq("should_panic"))) {
+                    if (!has_test_directive) {
+                        first_test_dir_span = d.span;
+                        first_test_dir_name = d.directive_kind;
+                    }
+                    has_test_directive = true;
+                }
+
+                // Capture the qualified name now while ctx.namespace is
+                // correct for this module.  Late passes (TestMainCodegen)
+                // need the qualifier to look up DI mangled names.
+                mut qualified: SymbolStr = SymbolStr::empty();
+                if (decl.kind == NodeKind::FunctionDeclaration) {
+                    const fn_decl: FunctionDeclNode* = decl as FunctionDeclNode*;
+                    qualified = ctx.qualify_symbol_sym(fn_decl.name);
+                }
+                const rec: DirectiveRecord = DirectiveRecord {
+                    kind: d.directive_kind,
+                    node: d,
+                    decl: decl,
+                    qualified_name: qualified,
+                    span: d.span,
+                };
+                registry.add(rec);
+                count += 1;
+
+                if (ctx.debug_mode) {
+                    mut tag: string = "custom ";
+                    if (DirectiveProcessingPasses::is_known_builtin(d.directive_kind)) { tag = "builtin"; }
+                    cdebug("[DirectiveProcessing] %s '%s' on %s (%lld args) at %s:%u:%u\n",
+                        tag, d.directive_kind, t.label(), d.args.length,
+                        d.span.file, d.span.start_line, d.span.start_col);
+                }
+            }
+
+            // Descend into method lists on structs/classes/impls.  The
+            // top-level loop above only sees the container; per-method
+            // directives like `![sink]` live on each MethodNode
+            // and must be validated + applied here.  Methods on traits
+            // are FunctionDeclNode*[] (no MethodNode wrapper) and don't
+            // currently carry directives; if that changes, fold them in.
+            // Borrow the decl's method array — aliasing it into an owning local
+            // would free the decl node's buffer when the local drops.
+            const empty_methods: MethodNode*[] = [];
+            mut method_list: &MethodNode*[] = &empty_methods;
+            if (decl.kind == NodeKind::StructDeclaration) {
+                const sn: StructDeclNode* = decl as StructDeclNode*;
+                method_list = &sn.methods;
+            } else if (decl.kind == NodeKind::ClassDeclaration) {
+                const cn: ClassDeclNode* = decl as ClassDeclNode*;
+                method_list = &cn.methods;
+            } else if (decl.kind == NodeKind::ImplementationBlock) {
+                const ib: ImplBlockNode* = decl as ImplBlockNode*;
+                method_list = &ib.methods;
+            }
+            for (mut mi: i64 = 0; mi < method_list.length; mi++) {
+                const m: MethodNode* = method_list[mi];
+                if (m == null) { continue; }
+                const m_count: i64 = m.attached_directives.length;
+                if (m_count == 0) { continue; }
+                for (mut mj: i64 = 0; mj < m_count; mj++) {
+                    const md: DirectiveNode* = m.attached_directives[mj];
+                    if (md == null) { continue; }
+                    DirectiveProcessingPasses::validate_builtin(ctx, md, DirectiveTarget::Method);
+                    DirectiveProcessingPasses::apply_effects(ctx, md, m as DeclarationNode*);
+                    const m_rec: DirectiveRecord = DirectiveRecord {
+                        kind: md.directive_kind,
+                        node: md,
+                        decl: m as DeclarationNode*,
+                        qualified_name: SymbolStr::empty(),
+                        span: md.span,
+                    };
+                    registry.add(m_rec);
+                    count += 1;
+                    if (ctx.debug_mode) {
+                        mut mtag: string = "custom ";
+                        if (DirectiveProcessingPasses::is_known_builtin(md.directive_kind)) { mtag = "builtin"; }
+                        cdebug("[DirectiveProcessing] %s '%s' on method (%lld args) at %s:%u:%u\n",
+                            mtag, md.directive_kind, md.args.length,
+                            md.span.file, md.span.start_line, md.span.start_col);
+                    }
+                }
+            }
+
+            // Descend into extern-block functions so per-function directives
+            // like `![link("sym")]` are validated + applied; the block is the
+            // top-level statement, its functions aren't otherwise visited here.
+            if (decl.kind == NodeKind::ExternBlock) {
+                const eb: ExternBlockNode* = decl as ExternBlockNode*;
+                for (mut ei: i64 = 0; ei < eb.functions.length; ei++) {
+                    const ef: FunctionDeclNode* = eb.functions[ei];
+                    if (ef == null) { continue; }
+                    for (mut ej: i64 = 0; ej < ef.attached_directives.length; ej++) {
+                        const ed: DirectiveNode* = ef.attached_directives[ej];
+                        if (ed == null) { continue; }
+                        DirectiveProcessingPasses::validate_builtin(ctx, ed, DirectiveTarget::Extern);
+                        DirectiveProcessingPasses::apply_effects(ctx, ed, ef as DeclarationNode*);
+                        const e_rec: DirectiveRecord = DirectiveRecord {
+                            kind: ed.directive_kind,
+                            node: ed,
+                            decl: ef as DeclarationNode*,
+                            qualified_name: SymbolStr::empty(),
+                            span: ed.span,
+                        };
+                        registry.add(e_rec);
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        // Cross-cutting placement validation: enforce that `![config(testing)]`,
+        // `![test]`, `![ignore]`, and `![should_panic]` only appear in files
+        // under `<project_root>/tests/`, and that every file in `tests/` has
+        // `![config(testing)]` on its namespace.
+        DirectiveProcessingPasses::validate_test_module_placement(ctx,
+            has_config_testing, has_test_directive,
+            first_test_dir_span, first_test_dir_name);
+
+        // Propagate `![repr(...)]` / `![align(N)]` from AST decls onto the
+        // corresponding Type* objects in the arena.  This must happen after
+        // the per-decl walk above (which sets the AST flags) and before
+        // TypeLowering reads the Type-side flags.  StructFieldTypeSync
+        // populated `fields` already at this point; here we just stamp the
+        // layout intent on top.
+        DirectiveProcessingPasses::propagate_layout_attrs_to_types(ctx);
+
+        // Register implicit converters now that every `![implicit]` flag has
+        // been applied above (and TypeResolution, which ran earlier, has
+        // resolved the parameter / return types).
+        DirectiveProcessingPasses::register_implicit_converters(ctx, root);
+
+        if (ctx.debug_mode) {
+            cdebug("[DirectiveProcessing] Processed %lld directives in this module (%lld cumulative)\n",
+                count, registry.count());
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Scan top-level declarations for `![implicit]` converters and register
+    /// each in the DeclarationIndex keyed on `(param_type, return_type)`.
+    ///
+    /// A converter is a single-parameter, non-generic `![implicit]`:
+    ///   - free function `f(x: T) -> U`              -> `Type::method` = (0, f)
+    ///   - static method `static M(x: T) -> U` on S  -> (S, M)
+    ///
+    /// Sema synthesizes a call to the recorded converter (`Str::new(arg)` or
+    /// `f(arg)`) at any coercion site where a `T` value must become a `U`.
+    /// Static-method resolution is global through the DeclarationIndex, so the
+    /// synthesized `Type::method` call resolves regardless of imports.
+    static register_implicit_converters(ctx: CompilationContext*,
+                                          root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    DirectiveProcessingPasses::register_converter_fn(ctx, stmt as FunctionDeclNode*,
+                        SymbolStr::empty(), false);
+                }
+                NodeKind::StructDeclaration => {
+                    const sd: StructDeclNode* = stmt as StructDeclNode*;
+                    DirectiveProcessingPasses::register_converter_methods(ctx, sd.name, &sd.methods,
+                        sd.generic_params.length > 0);
+                }
+                NodeKind::ClassDeclaration => {
+                    const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                    DirectiveProcessingPasses::register_converter_methods(ctx, cd.name, &cd.methods,
+                        cd.generic_params.length > 0);
+                }
+                NodeKind::ImplementationBlock => {
+                    // Static methods in `implement` blocks (e.g. enum or
+                    // primitive constructors) register under the impl's target
+                    // type name.  Generic targets aren't force-instantiated
+                    // here (the impl head's generics don't pin the target's);
+                    // such converters work for the non-generic case.
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    DirectiveProcessingPasses::register_converter_methods(ctx, ib.target_type, &ib.methods,
+                        false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Register a `![implicit]` static method as a converter under its owning
+    /// type's bare name.  Instance methods are skipped: a converter needs no
+    /// receiver.
+    static register_converter_methods(ctx: CompilationContext*,
+                                        owner: SymbolStr,
+                                        methods: &MethodNode*[],
+                                        owner_is_generic: boolean) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!m.is_static) { continue; }
+            DirectiveProcessingPasses::register_converter_fn(ctx, m.func, owner, owner_is_generic);
+        }
+    }
+
+    /// Register a single `![implicit]` function/static-method as a converter,
+    /// if it qualifies (one resolved parameter, no generic params, resolved
+    /// return type).  `owner` is the static method's owning type, or empty for
+    /// a free function.
+    static register_converter_fn(ctx: CompilationContext*,
+                                   fn: FunctionDeclNode*,
+                                   owner: SymbolStr,
+                                   owner_is_generic: boolean) -> void {
+        if (fn == null || !fn.is_implicit) { return; }
+        if (fn.parameters.length != 1) { return; }
+        if (fn.generic_params.length != 0) { return; }
+        if (!fn.resolved_return_type.is_valid()) { return; }
+        const p: VarDeclNode* = fn.parameters[0];
+        if (p == null || !p.resolved_type.is_valid()) { return; }
+        const type_name_id: u32 = if (owner.is_valid()) { owner.id } else { 0 };
+        ctx.decl_index.register_implicit_converter(
+            p.resolved_type.id,
+            fn.resolved_return_type.id,
+            type_name_id,
+            fn.name.id);
+        // A static-method converter on a generic owner can't be conjured by the
+        // post-mono sema rewrite; record it so the monomorphizer eagerly emits
+        // the default instantiation (`String<GlobalAlloc>::from_cstr`).
+        if (owner.is_valid() && owner_is_generic) {
+            ctx.decl_index.register_generic_converter_method(owner.id, fn.name.id);
+        }
+    }
+
+    // Layout-attr propagation: AST -> Type
+
+    /// After the per-decl walk has set `repr_*` and `min_alignment` on each
+    /// `{Struct,Class,Enum}DeclNode`, walk the AST again and mirror those
+    /// flags onto the corresponding `{Struct,Class,Enum}Type*` in the arena
+    /// so TypeLowering and codegen see the chosen layout.
+    ///
+    /// Lookup path: qualify the decl's bare name with the current module's
+    /// namespace via `ctx.qualify_symbol_sym`, then ask the decl index for
+    /// the type's TypeRef.  This matches what StructFieldTypeSync does to
+    /// find the same Type, so a name that resolves there resolves here.
+    static propagate_layout_attrs_to_types(ctx: CompilationContext*) -> void {
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return; }
+
+        const arena: TypeArena* = ctx.type_arena;
+        if (arena == null) { return; }
+
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    const node: StructDeclNode* = stmt as StructDeclNode*;
+                    if (node.is_generic()) {
+                        // Generic struct definitions have no concrete Type yet;
+                        // each specialization stamps its own layout in the
+                        // monomorphizer (`populate_struct_fields`), which copies
+                        // the repr/align flags the cloner carried over from this
+                        // template. Nothing to do for the template itself.
+                        continue;
+                    }
+                    if (!node.repr_c && !node.repr_packed
+                            && !node.repr_transparent && node.min_alignment == 0) {
+                        continue;
+                    }
+                    const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                    if (!tref.is_valid()) { continue; }
+                    const ty: Type* = arena.lookup(tref.id);
+                    if (ty == null || ty.kind != TypeKind::Struct) { continue; }
+                    mut st: StructType* = ty as StructType*;
+                    st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                    st.set_min_alignment(node.min_alignment);
+                }
+                NodeKind::ClassDeclaration => {
+                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (node.is_generic()) { continue; }
+                    if (!node.repr_c && !node.repr_packed
+                            && !node.repr_transparent && node.min_alignment == 0) {
+                        continue;
+                    }
+                    const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                    if (!tref.is_valid()) { continue; }
+                    const ty: Type* = arena.lookup(tref.id);
+                    if (ty == null || ty.kind != TypeKind::Class) { continue; }
+                    mut ct: ClassType* = ty as ClassType*;
+                    ct.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                    ct.set_min_alignment(node.min_alignment);
+                }
+                NodeKind::EnumDeclaration => {
+                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
+                    if (node.is_generic()) { continue; }
+                    if (!node.repr_c && node.min_alignment == 0) { continue; }
+                    const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                    if (!tref.is_valid()) { continue; }
+                    const ty: Type* = arena.lookup(tref.id);
+                    if (ty == null || ty.kind != TypeKind::Enum) { continue; }
+                    mut et: EnumType* = ty as EnumType*;
+                    et.set_repr_c(node.repr_c);
+                    et.set_min_alignment(node.min_alignment);
+                }
+                _ => { }
+            }
+        }
+    }
+
+    // Test-module placement validation
+
+    /// True if `path` lies under `<project_root>/tests/` (recursively).
+    /// Computes the prefix once and does a byte-wise compare; matches the
+    /// path style cryoc uses internally (always project-relative or absolute,
+    /// never with `..`).
+    static file_is_under_tests_dir(project_root: string, file_path: string) -> boolean {
+        if (strlen(project_root) == 0) { return false; }
+        const prefix: string = format("%s/tests/", project_root);
+        const plen: u64 = strlen(prefix);
+        const flen: u64 = strlen(file_path);
+        if (flen < plen) { return false; }
+        return strncmp(file_path, prefix, plen) == 0;
+    }
+
+    /// Enforce the locked design's three placement rules.  Run once per
+    /// module after the walk has populated `has_config_testing` and
+    /// `has_test_directive`.
+    static validate_test_module_placement(ctx: CompilationContext*,
+                                            has_config_testing: boolean,
+                                            has_test_directive: boolean,
+                                            first_test_dir_span: SourceSpan,
+                                            first_test_dir_name: string) -> void {
+        if (ctx.project_config == null) { return; }
+        const project_root: string = ctx.project_config.project_root;
+        const file_path:    string = ctx.source_file;
+
+        // The stdlib lives outside the project tree but still parses through
+        // this pass; never apply test-mode rules to stdlib files.
+        if (strlen(ctx.stdlib_root) > 0
+                && strncmp(file_path, ctx.stdlib_root, strlen(ctx.stdlib_root)) == 0) {
+            return;
+        }
+
+        const in_tests_dir: boolean = DirectiveProcessingPasses::file_is_under_tests_dir(project_root, file_path);
+
+        // Rule 1: `![config(testing)]` must live under `tests/`.
+        if (has_config_testing && !in_tests_dir) {
+            const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+            const msg: string = format(
+                "directive `![config(testing)]` may only appear on a namespace inside `tests/`; this file is at `%s`",
+                file_path);
+            mut diag: Diagnostic = Diagnostic::error(code, msg);
+            // Span the file's namespace decl if we can find it; otherwise
+            // fall back to a span-less error so the renderer still shows
+            // the file path from the message body.
+            ctx.emit_diagnostic(diag);
+        }
+
+        // Rule 2: every file in `tests/` must carry `![config(testing)]`.
+        if (in_tests_dir && !has_config_testing) {
+            const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+            const msg: string = format(
+                "file under `tests/` is missing the `![config(testing)]` namespace marker (`%s`)",
+                file_path);
+            mut diag: Diagnostic = Diagnostic::error(code, msg);
+            ctx.emit_diagnostic(diag);
+        }
+
+        // Rule 3: `![test]`/`![ignore]`/`![should_panic]` require an
+        // enclosing `![config(testing)]` namespace.
+        if (has_test_directive && !has_config_testing) {
+            const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+            const msg: string = format(
+                "directive `![%s]` is only allowed inside a namespace marked `![config(testing)]`",
+                first_test_dir_name);
+            mut diag: Diagnostic = Diagnostic::error(code, msg);
+            diag = diag.at(first_test_dir_span);
+            ctx.emit_diagnostic(diag);
+        }
+    }
+
 }
