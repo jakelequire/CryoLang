@@ -182,6 +182,298 @@ implement enum PassID {
             _                             => { false }
         };
     }
+
+    /// Returns the static metadata for this pass.  This is the single source
+    /// of truth for what each pass requires and provides.
+    metadata(&this) -> PassMetadata {
+        return match (this) {
+            PassID::Lexing => {
+                PassMetadata {
+                    id:               PassID::Lexing,
+                    name:             "Lexing",
+                    stage:            PassStage::Frontend,
+                    order:            0,
+                    requirements:     [],
+                    provisions:       [Provision::Tokens],
+                }
+            }
+            PassID::Parsing => {
+                PassMetadata {
+                    id:               PassID::Parsing,
+                    name:             "Parsing",
+                    stage:            PassStage::Frontend,
+                    order:            1,
+                    requirements:     [PassRequirement::required(Provision::Tokens)],
+                    provisions:       [Provision::AST],
+                }
+            }
+            PassID::ConfigGating => {
+                PassMetadata {
+                    id:               PassID::ConfigGating,
+                    name:             "ConfigGating",
+                    stage:            PassStage::Frontend,
+                    order:            2,
+                    requirements:     [PassRequirement::required(Provision::AST)],
+                    provisions:       [Provision::ConfigsGated],
+                }
+            }
+            PassID::ASTValidation => {
+                PassMetadata {
+                    id:               PassID::ASTValidation,
+                    name:             "ASTValidation",
+                    stage:            PassStage::Frontend,
+                    order:            3,
+                    requirements:     [PassRequirement::required(Provision::AST),
+                                       PassRequirement::optional(Provision::ConfigsGated)],
+                    provisions:       [Provision::ASTValidated],
+                }
+            }
+            PassID::CHeaderImport => {
+                PassMetadata {
+                    id:               PassID::CHeaderImport,
+                    name:             "CHeaderImport",
+                    stage:            PassStage::Frontend,
+                    order:            3,
+                    requirements:     [PassRequirement::required(Provision::ASTValidated)],
+                    provisions:       [Provision::CHeadersImported],
+                }
+            }
+            PassID::AutoImport => {
+                PassMetadata {
+                    id:               PassID::AutoImport,
+                    name:             "AutoImport",
+                    stage:            PassStage::ModuleResolution,
+                    order:            4,
+                    requirements:     [PassRequirement::required(Provision::ASTValidated),
+                                       PassRequirement::optional(Provision::CHeadersImported)],
+                    provisions:       [Provision::ImportsDiscovered],
+                }
+            }
+            PassID::ImportResolution => {
+                PassMetadata {
+                    id:               PassID::ImportResolution,
+                    name:             "ImportResolution",
+                    stage:            PassStage::ModuleResolution,
+                    order:            5,
+                    requirements:     [PassRequirement::required(Provision::ImportsDiscovered)],
+                    provisions:       [Provision::ModulesLoaded, Provision::ModuleOrder],
+                }
+            }
+            PassID::NameResolution => {
+                PassMetadata {
+                    id:               PassID::NameResolution,
+                    name:             "NameResolution",
+                    stage:            PassStage::ModuleResolution,
+                    order:            6,
+                    requirements:     [PassRequirement::required(Provision::ASTValidated),
+                                       PassRequirement::optional(Provision::ModulesLoaded)],
+                    provisions:       [Provision::NamesResolved],
+                }
+            }
+            PassID::TypeDeclaration => {
+                PassMetadata {
+                    id:               PassID::TypeDeclaration,
+                    name:             "TypeDeclaration",
+                    stage:            PassStage::DeclarationCollection,
+                    order:            7,
+                    requirements:     [PassRequirement::required(Provision::ASTValidated),
+                                       PassRequirement::required(Provision::NamesResolved)],
+                    provisions:       [Provision::TypeDeclarations],
+                }
+            }
+            PassID::FunctionSignature => {
+                PassMetadata {
+                    id:               PassID::FunctionSignature,
+                    name:             "FunctionSignature",
+                    stage:            PassStage::DeclarationCollection,
+                    order:            8,
+                    requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
+                    provisions:       [Provision::FunctionSignatures],
+                }
+            }
+            PassID::TemplateRegistration => {
+                PassMetadata {
+                    id:               PassID::TemplateRegistration,
+                    name:             "TemplateRegistration",
+                    stage:            PassStage::DeclarationCollection,
+                    order:            9,
+                    // Only TypeDeclarations is needed: TR walks top-level
+                    // generic decls and registers them via the type arena.
+                    // It never consumes FunctionSignature output - the
+                    // previous "FunctionSignatures" requirement was overly
+                    // conservative and blocked running TR as a cross-module
+                    // pre-pass before DefaultExpansion (see instance.cryo's
+                    // Phase 4b.0), which is what makes the rewrite of bare
+                    // `String` to `String<GlobalAlloc>` in stdlib modules
+                    // robust against module-order perturbations.
+                    requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
+                    provisions:       [Provision::TemplatesRegistered],
+                }
+            }
+            PassID::DefaultExpansion => {
+                PassMetadata {
+                    id:               PassID::DefaultExpansion,
+                    name:             "DefaultExpansion",
+                    stage:            PassStage::DeclarationCollection,
+                    order:            10,
+                    // We don't require TemplatesRegistered because cross-module
+                    // templates are looked up through the shared GenericRegistry
+                    // (populated by earlier modules' TemplateRegistration runs)
+                    // and this-module templates are read from the local AST.
+                    // Running before FunctionSignature is critical so that
+                    // FuncSig resolves the rewritten annotations.
+                    requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
+                    provisions:       [Provision::DefaultsExpanded],
+                }
+            }
+            PassID::TypeResolution => {
+                PassMetadata {
+                    id:               PassID::TypeResolution,
+                    name:             "TypeResolution",
+                    stage:            PassStage::TypeResolution,
+                    order:            10,
+                    requirements:     [PassRequirement::required(Provision::TemplatesRegistered)],
+                    provisions:       [Provision::TypesResolved],
+                }
+            }
+            PassID::StructFieldTypeSync => {
+                PassMetadata {
+                    id:               PassID::StructFieldTypeSync,
+                    name:             "StructFieldTypeSync",
+                    stage:            PassStage::TypeResolution,
+                    order:            11,
+                    requirements:     [PassRequirement::required(Provision::TypesResolved)],
+                    provisions:       [Provision::StructFieldsSynced],
+                }
+            }
+            PassID::DirectiveProcessing => {
+                PassMetadata {
+                    id:               PassID::DirectiveProcessing,
+                    name:             "DirectiveProcessing",
+                    stage:            PassStage::SemanticAnalysis,
+                    order:            12,
+                    requirements:     [PassRequirement::required(Provision::TypesResolved)],
+                    provisions:       [Provision::DirectivesProcessed],
+                }
+            }
+            PassID::Monomorphization => {
+                PassMetadata {
+                    id:               PassID::Monomorphization,
+                    name:             "Monomorphization",
+                    stage:            PassStage::Specialization,
+                    order:            13,
+                    requirements:     [PassRequirement::required(Provision::StructFieldsSynced),
+                                       PassRequirement::optional(Provision::DirectivesProcessed)],
+                    provisions:       [Provision::MonomorphizationComplete],
+                }
+            }
+            PassID::GenericExpressionResolution => {
+                PassMetadata {
+                    id:               PassID::GenericExpressionResolution,
+                    name:             "GenericExpressionResolution",
+                    stage:            PassStage::Specialization,
+                    order:            14,
+                    requirements:     [PassRequirement::required(Provision::MonomorphizationComplete)],
+                    provisions:       [Provision::GenericExpressionsResolved],
+                }
+            }
+            PassID::GenericValidation => {
+                PassMetadata {
+                    id:               PassID::GenericValidation,
+                    name:             "GenericValidation",
+                    stage:            PassStage::Specialization,
+                    order:            15,
+                    requirements:     [PassRequirement::required(Provision::GenericExpressionsResolved)],
+                    provisions:       [Provision::GenericsValidated],
+                }
+            }
+            PassID::FunctionBodyTypeCheck => {
+                PassMetadata {
+                    id:               PassID::FunctionBodyTypeCheck,
+                    name:             "FunctionBodyTypeCheck",
+                    stage:            PassStage::SemanticAnalysis,
+                    order:            16,
+                    requirements:     [PassRequirement::required(Provision::StructFieldsSynced)],
+                    provisions:       [Provision::BodiesTypeChecked],
+                }
+            }
+            PassID::MoveCheck => {
+                PassMetadata {
+                    id:               PassID::MoveCheck,
+                    name:             "MoveCheck",
+                    stage:            PassStage::SemanticAnalysis,
+                    order:            17,
+                    requirements:     [PassRequirement::required(Provision::BodiesTypeChecked)],
+                    provisions:       [Provision::OwnershipChecked],
+                }
+            }
+            PassID::DropInsertion => {
+                PassMetadata {
+                    id:               PassID::DropInsertion,
+                    name:             "DropInsertion",
+                    stage:            PassStage::SemanticAnalysis,
+                    order:            18,
+                    requirements:     [PassRequirement::required(Provision::OwnershipChecked)],
+                    provisions:       [Provision::DropsInserted],
+                }
+            }
+            PassID::TypeLowering => {
+                PassMetadata {
+                    id:               PassID::TypeLowering,
+                    name:             "TypeLowering",
+                    stage:            PassStage::CodegenPreparation,
+                    order:            19,
+                    requirements:     [PassRequirement::required(Provision::BodiesTypeChecked),
+                                       PassRequirement::optional(Provision::OwnershipChecked),
+                                       PassRequirement::optional(Provision::DropsInserted)],
+                    provisions:       [Provision::TypesLowered],
+                }
+            }
+            PassID::IRGeneration => {
+                PassMetadata {
+                    id:               PassID::IRGeneration,
+                    name:             "IRGeneration",
+                    stage:            PassStage::IRGeneration,
+                    order:            20,
+                    // Functions are LLVM-declared inside IRGeneration itself (its
+                    // declare-functions phase), so this depends on TypesLowered.
+                    requirements:     [PassRequirement::required(Provision::TypesLowered)],
+                    provisions:       [Provision::IRGenerated],
+                }
+            }
+            PassID::Optimization => {
+                PassMetadata {
+                    id:               PassID::Optimization,
+                    name:             "Optimization",
+                    stage:            PassStage::Output,
+                    order:            21,
+                    requirements:     [PassRequirement::required(Provision::IRGenerated)],
+                    provisions:       [Provision::Optimized],
+                }
+            }
+            PassID::ObjectEmission => {
+                PassMetadata {
+                    id:               PassID::ObjectEmission,
+                    name:             "ObjectEmission",
+                    stage:            PassStage::Output,
+                    order:            22,
+                    requirements:     [PassRequirement::required(Provision::IRGenerated),
+                                       PassRequirement::optional(Provision::Optimized)],
+                    provisions:       [Provision::ObjectsEmitted],
+                }
+            }
+            PassID::Linking => {
+                PassMetadata {
+                    id:               PassID::Linking,
+                    name:             "Linking",
+                    stage:            PassStage::Output,
+                    order:            23,
+                    requirements:     [PassRequirement::required(Provision::ObjectsEmitted)],
+                    provisions:       [Provision::Linked],
+                }
+            }
+        };
+    }
 }
 
 
@@ -399,301 +691,6 @@ type struct PassMetadata {
     order:            u32;
     requirements:     PassRequirement[];
     provisions:       Provision[];
-}
-
-
-// get_pass_metadata: Pure function "vtable" for all passes
-
-/// Returns the static metadata for a given pass.  This is the single source
-/// of truth for what each pass requires and provides.
-function get_pass_metadata(id: PassID) -> PassMetadata {
-    return match (id) {
-        PassID::Lexing => {
-            PassMetadata {
-                id:               PassID::Lexing,
-                name:             "Lexing",
-                stage:            PassStage::Frontend,
-                order:            0,
-                requirements:     [],
-                provisions:       [Provision::Tokens],
-            }
-        }
-        PassID::Parsing => {
-            PassMetadata {
-                id:               PassID::Parsing,
-                name:             "Parsing",
-                stage:            PassStage::Frontend,
-                order:            1,
-                requirements:     [PassRequirement::required(Provision::Tokens)],
-                provisions:       [Provision::AST],
-            }
-        }
-        PassID::ConfigGating => {
-            PassMetadata {
-                id:               PassID::ConfigGating,
-                name:             "ConfigGating",
-                stage:            PassStage::Frontend,
-                order:            2,
-                requirements:     [PassRequirement::required(Provision::AST)],
-                provisions:       [Provision::ConfigsGated],
-            }
-        }
-        PassID::ASTValidation => {
-            PassMetadata {
-                id:               PassID::ASTValidation,
-                name:             "ASTValidation",
-                stage:            PassStage::Frontend,
-                order:            3,
-                requirements:     [PassRequirement::required(Provision::AST),
-                                   PassRequirement::optional(Provision::ConfigsGated)],
-                provisions:       [Provision::ASTValidated],
-            }
-        }
-        PassID::CHeaderImport => {
-            PassMetadata {
-                id:               PassID::CHeaderImport,
-                name:             "CHeaderImport",
-                stage:            PassStage::Frontend,
-                order:            3,
-                requirements:     [PassRequirement::required(Provision::ASTValidated)],
-                provisions:       [Provision::CHeadersImported],
-            }
-        }
-        PassID::AutoImport => {
-            PassMetadata {
-                id:               PassID::AutoImport,
-                name:             "AutoImport",
-                stage:            PassStage::ModuleResolution,
-                order:            4,
-                requirements:     [PassRequirement::required(Provision::ASTValidated),
-                                   PassRequirement::optional(Provision::CHeadersImported)],
-                provisions:       [Provision::ImportsDiscovered],
-            }
-        }
-        PassID::ImportResolution => {
-            PassMetadata {
-                id:               PassID::ImportResolution,
-                name:             "ImportResolution",
-                stage:            PassStage::ModuleResolution,
-                order:            5,
-                requirements:     [PassRequirement::required(Provision::ImportsDiscovered)],
-                provisions:       [Provision::ModulesLoaded, Provision::ModuleOrder],
-            }
-        }
-        PassID::NameResolution => {
-            PassMetadata {
-                id:               PassID::NameResolution,
-                name:             "NameResolution",
-                stage:            PassStage::ModuleResolution,
-                order:            6,
-                requirements:     [PassRequirement::required(Provision::ASTValidated),
-                                   PassRequirement::optional(Provision::ModulesLoaded)],
-                provisions:       [Provision::NamesResolved],
-            }
-        }
-        PassID::TypeDeclaration => {
-            PassMetadata {
-                id:               PassID::TypeDeclaration,
-                name:             "TypeDeclaration",
-                stage:            PassStage::DeclarationCollection,
-                order:            7,
-                requirements:     [PassRequirement::required(Provision::ASTValidated),
-                                   PassRequirement::required(Provision::NamesResolved)],
-                provisions:       [Provision::TypeDeclarations],
-            }
-        }
-        PassID::FunctionSignature => {
-            PassMetadata {
-                id:               PassID::FunctionSignature,
-                name:             "FunctionSignature",
-                stage:            PassStage::DeclarationCollection,
-                order:            8,
-                requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
-                provisions:       [Provision::FunctionSignatures],
-            }
-        }
-        PassID::TemplateRegistration => {
-            PassMetadata {
-                id:               PassID::TemplateRegistration,
-                name:             "TemplateRegistration",
-                stage:            PassStage::DeclarationCollection,
-                order:            9,
-                // Only TypeDeclarations is needed: TR walks top-level
-                // generic decls and registers them via the type arena.
-                // It never consumes FunctionSignature output - the
-                // previous "FunctionSignatures" requirement was overly
-                // conservative and blocked running TR as a cross-module
-                // pre-pass before DefaultExpansion (see instance.cryo's
-                // Phase 4b.0), which is what makes the rewrite of bare
-                // `String` to `String<GlobalAlloc>` in stdlib modules
-                // robust against module-order perturbations.
-                requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
-                provisions:       [Provision::TemplatesRegistered],
-            }
-        }
-        PassID::DefaultExpansion => {
-            PassMetadata {
-                id:               PassID::DefaultExpansion,
-                name:             "DefaultExpansion",
-                stage:            PassStage::DeclarationCollection,
-                order:            10,
-                // We don't require TemplatesRegistered because cross-module
-                // templates are looked up through the shared GenericRegistry
-                // (populated by earlier modules' TemplateRegistration runs)
-                // and this-module templates are read from the local AST.
-                // Running before FunctionSignature is critical so that
-                // FuncSig resolves the rewritten annotations.
-                requirements:     [PassRequirement::required(Provision::TypeDeclarations)],
-                provisions:       [Provision::DefaultsExpanded],
-            }
-        }
-        PassID::TypeResolution => {
-            PassMetadata {
-                id:               PassID::TypeResolution,
-                name:             "TypeResolution",
-                stage:            PassStage::TypeResolution,
-                order:            10,
-                requirements:     [PassRequirement::required(Provision::TemplatesRegistered)],
-                provisions:       [Provision::TypesResolved],
-            }
-        }
-        PassID::StructFieldTypeSync => {
-            PassMetadata {
-                id:               PassID::StructFieldTypeSync,
-                name:             "StructFieldTypeSync",
-                stage:            PassStage::TypeResolution,
-                order:            11,
-                requirements:     [PassRequirement::required(Provision::TypesResolved)],
-                provisions:       [Provision::StructFieldsSynced],
-            }
-        }
-        PassID::DirectiveProcessing => {
-            PassMetadata {
-                id:               PassID::DirectiveProcessing,
-                name:             "DirectiveProcessing",
-                stage:            PassStage::SemanticAnalysis,
-                order:            12,
-                requirements:     [PassRequirement::required(Provision::TypesResolved)],
-                provisions:       [Provision::DirectivesProcessed],
-            }
-        }
-        PassID::Monomorphization => {
-            PassMetadata {
-                id:               PassID::Monomorphization,
-                name:             "Monomorphization",
-                stage:            PassStage::Specialization,
-                order:            13,
-                requirements:     [PassRequirement::required(Provision::StructFieldsSynced),
-                                   PassRequirement::optional(Provision::DirectivesProcessed)],
-                provisions:       [Provision::MonomorphizationComplete],
-            }
-        }
-        PassID::GenericExpressionResolution => {
-            PassMetadata {
-                id:               PassID::GenericExpressionResolution,
-                name:             "GenericExpressionResolution",
-                stage:            PassStage::Specialization,
-                order:            14,
-                requirements:     [PassRequirement::required(Provision::MonomorphizationComplete)],
-                provisions:       [Provision::GenericExpressionsResolved],
-            }
-        }
-        PassID::GenericValidation => {
-            PassMetadata {
-                id:               PassID::GenericValidation,
-                name:             "GenericValidation",
-                stage:            PassStage::Specialization,
-                order:            15,
-                requirements:     [PassRequirement::required(Provision::GenericExpressionsResolved)],
-                provisions:       [Provision::GenericsValidated],
-            }
-        }
-        PassID::FunctionBodyTypeCheck => {
-            PassMetadata {
-                id:               PassID::FunctionBodyTypeCheck,
-                name:             "FunctionBodyTypeCheck",
-                stage:            PassStage::SemanticAnalysis,
-                order:            16,
-                requirements:     [PassRequirement::required(Provision::StructFieldsSynced)],
-                provisions:       [Provision::BodiesTypeChecked],
-            }
-        }
-        PassID::MoveCheck => {
-            PassMetadata {
-                id:               PassID::MoveCheck,
-                name:             "MoveCheck",
-                stage:            PassStage::SemanticAnalysis,
-                order:            17,
-                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked)],
-                provisions:       [Provision::OwnershipChecked],
-            }
-        }
-        PassID::DropInsertion => {
-            PassMetadata {
-                id:               PassID::DropInsertion,
-                name:             "DropInsertion",
-                stage:            PassStage::SemanticAnalysis,
-                order:            18,
-                requirements:     [PassRequirement::required(Provision::OwnershipChecked)],
-                provisions:       [Provision::DropsInserted],
-            }
-        }
-        PassID::TypeLowering => {
-            PassMetadata {
-                id:               PassID::TypeLowering,
-                name:             "TypeLowering",
-                stage:            PassStage::CodegenPreparation,
-                order:            19,
-                requirements:     [PassRequirement::required(Provision::BodiesTypeChecked),
-                                   PassRequirement::optional(Provision::OwnershipChecked),
-                                   PassRequirement::optional(Provision::DropsInserted)],
-                provisions:       [Provision::TypesLowered],
-            }
-        }
-        PassID::IRGeneration => {
-            PassMetadata {
-                id:               PassID::IRGeneration,
-                name:             "IRGeneration",
-                stage:            PassStage::IRGeneration,
-                order:            20,
-                // Functions are LLVM-declared inside IRGeneration itself (its
-                // declare-functions phase), so this depends on TypesLowered.
-                requirements:     [PassRequirement::required(Provision::TypesLowered)],
-                provisions:       [Provision::IRGenerated],
-            }
-        }
-        PassID::Optimization => {
-            PassMetadata {
-                id:               PassID::Optimization,
-                name:             "Optimization",
-                stage:            PassStage::Output,
-                order:            21,
-                requirements:     [PassRequirement::required(Provision::IRGenerated)],
-                provisions:       [Provision::Optimized],
-            }
-        }
-        PassID::ObjectEmission => {
-            PassMetadata {
-                id:               PassID::ObjectEmission,
-                name:             "ObjectEmission",
-                stage:            PassStage::Output,
-                order:            22,
-                requirements:     [PassRequirement::required(Provision::IRGenerated),
-                                   PassRequirement::optional(Provision::Optimized)],
-                provisions:       [Provision::ObjectsEmitted],
-            }
-        }
-        PassID::Linking => {
-            PassMetadata {
-                id:               PassID::Linking,
-                name:             "Linking",
-                stage:            PassStage::Output,
-                order:            23,
-                requirements:     [PassRequirement::required(Provision::ObjectsEmitted)],
-                provisions:       [Provision::Linked],
-            }
-        }
-    };
 }
 
 

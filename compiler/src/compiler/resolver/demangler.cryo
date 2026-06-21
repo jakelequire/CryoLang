@@ -91,77 +91,296 @@ implement Cursor {
         }
         return value;
     }
-}
 
+    // Parsing.  Each parse_* method consumes input via the cursor and
+    // returns already-rendered strings; there's no intermediate AST.
 
-// Operator-code -> source symbol (inverse of OperatorKind::code()).
+    /// Identifier: `<decimal length><raw bytes>`.
+    parse_ident(mut &this) -> string {
+        const n: i64 = this.read_decimal();
+        if (!this.ok) { return ""; }
+        return this.take(n);
+    }
 
-/// `match` on a string subject lowers to a `strcmp` content comparison,
-/// which is what's wanted here: `code` is substr-derived, so a
-/// pointer-compare string `==` would be wrong.
-function op_code_to_symbol(code: string) -> string {
-    return match (code) {
-        "add"  => { "+"  }
-        "sub"  => { "-"  }
-        "mul"  => { "*"  }
-        "div"  => { "/"  }
-        "mod"  => { "%"  }
-        "band" => { "&"  }
-        "bor"  => { "|"  }
-        "xor"  => { "^"  }
-        "shl"  => { "<<" }
-        "shr"  => { ">>" }
-        "eq"   => { "==" }
-        "ne"   => { "!=" }
-        "lt"   => { "<"  }
-        "le"   => { "<=" }
-        "gt"   => { ">"  }
-        "ge"   => { ">=" }
-        "land" => { "&&" }
-        "lor"  => { "||" }
-        "lnot" => { "!"  }
-        "idx"  => { "[]" }
-        "call" => { "()" }
-        "neg"  => { "-"  }
-        _      => { code }
-    };
-}
+    /// Segment: `<ident>` optionally followed by `$L <type-list> $G`.
+    parse_segment(mut &this) -> string {
+        const name: string = this.parse_ident();
+        if (!this.ok) { return ""; }
+        if (!this.starts_with2('$', 'L')) { return name; }
+        this.advance(2);
+        mut buf: string = name;
+        buf += "<";
+        mut first: boolean = true;
+        while (this.ok) {
+            if (this.starts_with2('$', 'G')) { this.advance(2); break; }
+            if (!first) { this.expect_char('_'); }
+            const t: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            if (!first) { buf += ", "; }
+            buf += t;
+            first = false;
+        }
+        if (!this.ok) { return ""; }
+        buf += ">";
+        return buf;
+    }
 
+    /// Path: `<seg>{ . <seg> }*[ - <member-seg> ]`.
+    parse_path(mut &this) -> ParsedPath {
+        mut segs: string[] = [];
+        const first_seg: string = this.parse_segment();
+        if (!this.ok) {
+            return ParsedPath { segments: segs, member: "", has_member: false };
+        }
+        segs.push(first_seg);
+        while (this.ok && this.peek() == '.') {
+            this.advance(1);
+            const s: string = this.parse_segment();
+            if (!this.ok) { break; }
+            segs.push(s);
+        }
+        mut member: string = "";
+        mut has_member: boolean = false;
+        if (this.ok && this.peek() == '-') {
+            this.advance(1);
+            member = this.parse_segment();
+            has_member = true;
+        }
+        return ParsedPath {
+            segments:   segs,
+            member:     member,
+            has_member: has_member,
+        };
+    }
 
-// Primitive type code -> spelling (mirror of encode_int_kind / encode_float_kind
-// and the primitive table in mangled_name.cryo).
+    /// Type: primitive | P/R/A<T> | N$L<path>$G | F$L<params>$G<ret> | K$L<params>$G<ret>.
+    parse_type(mut &this) -> string {
+        if (!this.ok || this.eof()) { this.ok = false; return ""; }
+        const head: char = this.peek();
 
-function prim_code_to_name(c: char) -> string {
-    return match (c) {
-        'a' => { "i8"      }
-        's' => { "i16"     }
-        'i' => { "int"     }
-        'l' => { "i64"     }
-        'n' => { "i128"    }
-        'h' => { "u8"      }
-        't' => { "u16"     }
-        'j' => { "u32"     }
-        'm' => { "u64"     }
-        'o' => { "u128"    }
-        'x' => { "isize"   }
-        'y' => { "usize"   }
-        'f' => { "f32"     }
-        'd' => { "f64"     }
-        'b' => { "boolean" }
-        'c' => { "char"    }
-        'S' => { "string"  }
-        'v' => { "void"    }
-        'u' => { "()"      }
-        _   => { ""        }
-    };
-}
+        if (Cursor::is_prim_code(head)) {
+            this.advance(1);
+            return Cursor::prim_code_to_name(head);
+        }
 
-function is_prim_code(c: char) -> boolean {
-    return match (c) {
-        'a' | 's' | 'i' | 'l' | 'n' | 'h' | 't' | 'j' | 'm' | 'o'
-        | 'x' | 'y' | 'f' | 'd' | 'b' | 'c' | 'S' | 'v' | 'u' => { true }
-        _ => { false }
-    };
+        if (head == 'P') {
+            this.advance(1);
+            const inner: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            return inner + "*";
+        }
+        if (head == 'R') {
+            this.advance(1);
+            const inner: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            return "&" + inner;
+        }
+        if (head == 'A') {
+            this.advance(1);
+            const inner: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            return inner + "[]";
+        }
+        if (head == 'N') {
+            this.advance(1);
+            this.expect2('$', 'L');
+            if (!this.ok) { return ""; }
+            const inner_path: ParsedPath = this.parse_path();
+            this.expect2('$', 'G');
+            if (!this.ok) { return ""; }
+            return inner_path.render_inline();
+        }
+        if (head == 'F') {
+            this.advance(1);
+            this.expect2('$', 'L');
+            if (!this.ok) { return ""; }
+            const params: string = this.parse_param_list();
+            this.expect2('$', 'G');
+            if (!this.ok) { return ""; }
+            const ret: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            return "fn(" + params + ") -> " + ret;
+        }
+        if (head == 'K') {
+            this.advance(1);
+            this.expect2('$', 'L');
+            if (!this.ok) { return ""; }
+            const params: string = this.parse_param_list();
+            this.expect2('$', 'G');
+            if (!this.ok) { return ""; }
+            const ret: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            return "|" + params + "| -> " + ret;
+        }
+
+        this.ok = false;
+        return "";
+    }
+
+    /// Parameter list: literal `v` for empty, otherwise `Param { _ Param }* [$V]`.
+    /// Param ::= $s | $m | Type.  Receiver tokens are only valid in the first
+    /// position; we render them verbatim either way and let the caller decide.
+    parse_param_list(mut &this) -> string {
+        if (!this.ok) { return ""; }
+
+        // Empty list: literal 'v' that isn't the start of a Type tail (Type 'v'
+        // means void, but as a *param* a bare leading 'v' with nothing else is
+        // the empty marker per spec section 7).
+        if (this.peek() == 'v') {
+            const next: char = this.peek_at(1);
+            // 'v' followed by a separator / end-of-list closer is the empty marker.
+            if (next == 0 as char || next == '$' || next == ')') {
+                this.advance(1);
+                return "";
+            }
+        }
+
+        mut buf: string = "";
+        mut first: boolean = true;
+        while (this.ok) {
+            if (!first) {
+                if (this.peek() != '_') { break; }
+                this.advance(1);
+                buf += ", ";
+            }
+            // Receiver markers
+            if (this.starts_with2('$', 's')) {
+                this.advance(2);
+                buf += "&this";
+                first = false;
+                continue;
+            }
+            if (this.starts_with2('$', 'm')) {
+                this.advance(2);
+                buf += "mut &this";
+                first = false;
+                continue;
+            }
+            // Stop conditions: hit a structural marker that isn't a type or `_`.
+            const a: char = this.peek();
+            if (a == '$') { break; }
+            if (a == 0 as char) { break; }
+
+            const t: string = this.parse_type();
+            if (!this.ok) { return ""; }
+            buf += t;
+            first = false;
+        }
+
+        // Variadic marker
+        if (this.ok && this.starts_with2('$', 'V')) {
+            this.advance(2);
+            if (libc::strlen(buf) > 0) { buf += ", ..."; }
+            else { buf = "..."; }
+        }
+        return buf;
+    }
+
+    // Mangling-code decode tables and demangle glue (no cursor state; kept
+    // here as statics so the demangling vocabulary lives on one type).
+
+    /// Operator-code -> source symbol (inverse of OperatorKind::code()).
+    ///
+    /// `match` on a string subject lowers to a `strcmp` content comparison,
+    /// which is what's wanted here: `code` is substr-derived, so a
+    /// pointer-compare string `==` would be wrong.
+    static op_code_to_symbol(code: string) -> string {
+        return match (code) {
+            "add"  => { "+"  }
+            "sub"  => { "-"  }
+            "mul"  => { "*"  }
+            "div"  => { "/"  }
+            "mod"  => { "%"  }
+            "band" => { "&"  }
+            "bor"  => { "|"  }
+            "xor"  => { "^"  }
+            "shl"  => { "<<" }
+            "shr"  => { ">>" }
+            "eq"   => { "==" }
+            "ne"   => { "!=" }
+            "lt"   => { "<"  }
+            "le"   => { "<=" }
+            "gt"   => { ">"  }
+            "ge"   => { ">=" }
+            "land" => { "&&" }
+            "lor"  => { "||" }
+            "lnot" => { "!"  }
+            "idx"  => { "[]" }
+            "call" => { "()" }
+            "neg"  => { "-"  }
+            _      => { code }
+        };
+    }
+
+    /// Primitive type code -> spelling (mirror of encode_int_kind /
+    /// encode_float_kind and the primitive table in mangled_name.cryo).
+    static prim_code_to_name(c: char) -> string {
+        return match (c) {
+            'a' => { "i8"      }
+            's' => { "i16"     }
+            'i' => { "int"     }
+            'l' => { "i64"     }
+            'n' => { "i128"    }
+            'h' => { "u8"      }
+            't' => { "u16"     }
+            'j' => { "u32"     }
+            'm' => { "u64"     }
+            'o' => { "u128"    }
+            'x' => { "isize"   }
+            'y' => { "usize"   }
+            'f' => { "f32"     }
+            'd' => { "f64"     }
+            'b' => { "boolean" }
+            'c' => { "char"    }
+            'S' => { "string"  }
+            'v' => { "void"    }
+            'u' => { "()"      }
+            _   => { ""        }
+        };
+    }
+
+    static is_prim_code(c: char) -> boolean {
+        return match (c) {
+            'a' | 's' | 'i' | 'l' | 'n' | 'h' | 't' | 'j' | 'm' | 'o'
+            | 'x' | 'y' | 'f' | 'd' | 'b' | 'c' | 'S' | 'v' | 'u' => { true }
+            _ => { false }
+        };
+    }
+
+    /// Two-char kind-tag recognizer (vt/ti/ct/dt/op/mi/cl/tr).
+    static is_kind_tag(a: char, b: char) -> boolean {
+        if (a == 'v' && b == 't') { return true; }
+        if (a == 't' && b == 'i') { return true; }
+        if (a == 'c' && b == 't') { return true; }
+        if (a == 'd' && b == 't') { return true; }
+        if (a == 'o' && b == 'p') { return true; }
+        if (a == 'm' && b == 'i') { return true; }
+        if (a == 'c' && b == 'l') { return true; }
+        if (a == 't' && b == 'r') { return true; }
+        return false;
+    }
+
+    /// Glue the rendered head together with the parameter list, return type,
+    /// and any trailing overload / LLVM-suffix annotations.
+    static finalize(head: string, params: string, ret: string,
+                    overload: i64, llvm_suffix: i64) -> string {
+        mut out: string = head;
+        out += "(" + params + ")";
+        if (libc::strlen(ret) > 0) {
+            out += " -> " + ret;
+        }
+        if (overload >= 0) {
+            out += " [overload ";
+            out += overload.to_decimal_str();
+            out += "]";
+        }
+        if (llvm_suffix >= 0) {
+            out += " [.";
+            out += llvm_suffix.to_decimal_str();
+            out += "]";
+        }
+        return out;
+    }
 }
 
 
@@ -173,225 +392,47 @@ type struct ParsedPath {
     /// Pretty-rendered member, or "" if the path has no `-<member>` tail.
     member:   string;
     has_member: boolean;
-}
 
-
-// Parsing.  Each parse_* function consumes input via the cursor and returns
-// already-rendered strings; there's no intermediate AST.
-
-/// Identifier: `<decimal length><raw bytes>`.
-function parse_ident(c: Cursor*) -> string {
-    const n: i64 = c.read_decimal();
-    if (!c.ok) { return ""; }
-    return c.take(n);
-}
-
-/// Segment: `<ident>` optionally followed by `$L <type-list> $G`.
-function parse_segment(c: Cursor*) -> string {
-    const name: string = parse_ident(c);
-    if (!c.ok) { return ""; }
-    if (!c.starts_with2('$', 'L')) { return name; }
-    c.advance(2);
-    mut buf: string = name;
-    buf += "<";
-    mut first: boolean = true;
-    while (c.ok) {
-        if (c.starts_with2('$', 'G')) { c.advance(2); break; }
-        if (!first) { c.expect_char('_'); }
-        const t: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        if (!first) { buf += ", "; }
-        buf += t;
-        first = false;
-    }
-    if (!c.ok) { return ""; }
-    buf += ">";
-    return buf;
-}
-
-/// Path: `<seg>{ . <seg> }*[ - <member-seg> ]`.
-function parse_path(c: Cursor*) -> ParsedPath {
-    mut segs: string[] = [];
-    const first_seg: string = parse_segment(c);
-    if (!c.ok) {
-        return ParsedPath { segments: segs, member: "", has_member: false };
-    }
-    segs.push(first_seg);
-    while (c.ok && c.peek() == '.') {
-        c.advance(1);
-        const s: string = parse_segment(c);
-        if (!c.ok) { break; }
-        segs.push(s);
-    }
-    mut member: string = "";
-    mut has_member: boolean = false;
-    if (c.ok && c.peek() == '-') {
-        c.advance(1);
-        member = parse_segment(c);
-        has_member = true;
-    }
-    return ParsedPath {
-        segments:   segs,
-        member:     member,
-        has_member: has_member,
-    };
-}
-
-/// Type: primitive | P/R/A<T> | N$L<path>$G | F$L<params>$G<ret> | K$L<params>$G<ret>.
-function parse_type(c: Cursor*) -> string {
-    if (!c.ok || c.eof()) { c.ok = false; return ""; }
-    const head: char = c.peek();
-
-    if (is_prim_code(head)) {
-        c.advance(1);
-        return prim_code_to_name(head);
-    }
-
-    if (head == 'P') {
-        c.advance(1);
-        const inner: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        return inner + "*";
-    }
-    if (head == 'R') {
-        c.advance(1);
-        const inner: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        return "&" + inner;
-    }
-    if (head == 'A') {
-        c.advance(1);
-        const inner: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        return inner + "[]";
-    }
-    if (head == 'N') {
-        c.advance(1);
-        c.expect2('$', 'L');
-        if (!c.ok) { return ""; }
-        const inner_path: ParsedPath = parse_path(c);
-        c.expect2('$', 'G');
-        if (!c.ok) { return ""; }
-        return render_path_inline(inner_path);
-    }
-    if (head == 'F') {
-        c.advance(1);
-        c.expect2('$', 'L');
-        if (!c.ok) { return ""; }
-        const params: string = parse_param_list(c);
-        c.expect2('$', 'G');
-        if (!c.ok) { return ""; }
-        const ret: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        return "fn(" + params + ") -> " + ret;
-    }
-    if (head == 'K') {
-        c.advance(1);
-        c.expect2('$', 'L');
-        if (!c.ok) { return ""; }
-        const params: string = parse_param_list(c);
-        c.expect2('$', 'G');
-        if (!c.ok) { return ""; }
-        const ret: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        return "|" + params + "| -> " + ret;
-    }
-
-    c.ok = false;
-    return "";
-}
-
-/// Parameter list: literal `v` for empty, otherwise `Param { _ Param }* [$V]`.
-/// Param ::= $s | $m | Type.  Receiver tokens are only valid in the first
-/// position; we render them verbatim either way and let the caller decide.
-function parse_param_list(c: Cursor*) -> string {
-    if (!c.ok) { return ""; }
-
-    // Empty list: literal 'v' that isn't the start of a Type tail (Type 'v'
-    // means void, but as a *param* a bare leading 'v' with nothing else is
-    // the empty marker per spec section 7).
-    if (c.peek() == 'v') {
-        const next: char = c.peek_at(1);
-        // 'v' followed by a separator / end-of-list closer is the empty marker.
-        if (next == 0 as char || next == '$' || next == ')') {
-            c.advance(1);
-            return "";
+    /// Path used inline as a type: segments joined by `::`, member (if any)
+    /// appended via `::` (we have no receiver context here).
+    render_inline(&this) -> string {
+        mut buf: string = "";
+        for (mut i: i64 = 0; i < this.segments.length; i++) {
+            if (i > 0) { buf += "::"; }
+            buf += this.segments[i];
         }
-    }
-
-    mut buf: string = "";
-    mut first: boolean = true;
-    while (c.ok) {
-        if (!first) {
-            if (c.peek() != '_') { break; }
-            c.advance(1);
-            buf += ", ";
+        if (this.has_member) {
+            buf += "::";
+            buf += this.member;
         }
-        // Receiver markers
-        if (c.starts_with2('$', 's')) {
-            c.advance(2);
-            buf += "&this";
-            first = false;
-            continue;
+        return buf;
+    }
+
+    /// Path as the head of a function-like signature.  `is_method` flips the
+    /// member separator: `.` for instance methods, `::` for static methods and
+    /// free functions.
+    render_head(&this, is_method: boolean) -> string {
+        mut buf: string = "";
+        for (mut i: i64 = 0; i < this.segments.length; i++) {
+            if (i > 0) { buf += "::"; }
+            buf += this.segments[i];
         }
-        if (c.starts_with2('$', 'm')) {
-            c.advance(2);
-            buf += "mut &this";
-            first = false;
-            continue;
+        if (this.has_member) {
+            buf += (if (is_method) { "." } else { "::" });
+            buf += this.member;
         }
-        // Stop conditions: hit a structural marker that isn't a type or `_`.
-        const a: char = c.peek();
-        if (a == '$') { break; }
-        if (a == 0 as char) { break; }
-
-        const t: string = parse_type(c);
-        if (!c.ok) { return ""; }
-        buf += t;
-        first = false;
+        return buf;
     }
 
-    // Variadic marker
-    if (c.ok && c.starts_with2('$', 'V')) {
-        c.advance(2);
-        if (libc::strlen(buf) > 0) { buf += ", ..."; }
-        else { buf = "..."; }
+    /// Render the path's namespace + type chain WITHOUT the `-<member>` tail.
+    render_no_member(&this) -> string {
+        mut buf: string = "";
+        for (mut i: i64 = 0; i < this.segments.length; i++) {
+            if (i > 0) { buf += "::"; }
+            buf += this.segments[i];
+        }
+        return buf;
     }
-    return buf;
-}
-
-
-// Path rendering helpers.
-
-/// Path used inline as a type: segments joined by `::`, member (if any)
-/// appended via `::` (we have no receiver context here).
-function render_path_inline(p: &ParsedPath) -> string {
-    mut buf: string = "";
-    for (mut i: i64 = 0; i < p.segments.length; i++) {
-        if (i > 0) { buf += "::"; }
-        buf += p.segments[i];
-    }
-    if (p.has_member) {
-        buf += "::";
-        buf += p.member;
-    }
-    return buf;
-}
-
-/// Path as the head of a function-like signature.  `is_method` flips the
-/// member separator: `.` for instance methods, `::` for static methods and
-/// free functions.
-function render_path_head(p: &ParsedPath, is_method: boolean) -> string {
-    mut buf: string = "";
-    for (mut i: i64 = 0; i < p.segments.length; i++) {
-        if (i > 0) { buf += "::"; }
-        buf += p.segments[i];
-    }
-    if (p.has_member) {
-        buf += (if (is_method) { "." } else { "::" });
-        buf += p.member;
-    }
-    return buf;
 }
 
 
@@ -421,7 +462,7 @@ function demangle(input: string) -> string {
         const a: char = cur.peek_at(0);
         const b: char = cur.peek_at(1);
         const close: char = cur.peek_at(2);
-        if (close == '$' && is_kind_tag(a, b)) {
+        if (close == '$' && Cursor::is_kind_tag(a, b)) {
             kind_a = a;
             kind_b = b;
             cur.advance(2);            // consume code
@@ -434,11 +475,11 @@ function demangle(input: string) -> string {
     mut path: ParsedPath = ParsedPath { segments: [], member: "", has_member: false };
 
     if (kind_a == 't' && kind_b == 'r') {
-        trait_seg = parse_segment(&cur);
+        trait_seg = cur.parse_segment();
         if (cur.ok) { cur.expect2('$', 'f'); }
-        if (cur.ok) { path = parse_path(&cur); }
+        if (cur.ok) { path = cur.parse_path(); }
     } else {
-        path = parse_path(&cur);
+        path = cur.parse_path();
     }
 
     if (!cur.ok) { return input + " (malformed)"; }
@@ -457,11 +498,11 @@ function demangle(input: string) -> string {
         if (cur.starts_with2('$', 's') || cur.starts_with2('$', 'm')) {
             leads_with_receiver = true;
         }
-        params_str = parse_param_list(&cur);
+        params_str = cur.parse_param_list();
         if (!cur.ok) { return input + " (malformed)"; }
         cur.expect2('$', 'R');
         if (!cur.ok) { return input + " (malformed)"; }
-        return_str = parse_type(&cur);
+        return_str = cur.parse_type();
         if (!cur.ok) { return input + " (malformed)"; }
     }
 
@@ -495,7 +536,7 @@ function demangle(input: string) -> string {
     // Render the demangled symbol.  Branching on kind keeps the formatting
     // concerns (data symbols vs. function-like) cleanly separate.
 
-    const path_inline: string = render_path_inline(path);
+    const path_inline: string = path.render_inline();
 
     if (kind_a == 'v' && kind_b == 't') { return "<vtable for " + path_inline + ">"; }
     if (kind_a == 't' && kind_b == 'i') { return "<typeinfo for " + path_inline + ">"; }
@@ -538,83 +579,39 @@ function demangle(input: string) -> string {
     if (kind_a == 'c' && kind_b == 't') {
         // `Owner::Owner(args) -> Owner`; drop the `-Owner` tail and add it
         // back as the constructor name with `::`.
-        mut head: string = render_path_no_member(path);
+        mut head: string = path.render_no_member();
         if (path.has_member) {
             head += "::";
             head += path.member;
         }
-        return finalize(head, params_str, return_str, overload, llvm_suffix);
+        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
     }
     if (kind_a == 'd' && kind_b == 't') {
-        mut head: string = "~" + render_path_no_member(path);
+        mut head: string = "~" + path.render_no_member();
         if (path.has_member) {
             head += "::";
             head += path.member;
         }
-        return finalize(head, params_str, return_str, overload, llvm_suffix);
+        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
     }
     if (kind_a == 'o' && kind_b == 'p') {
-        mut head: string = render_path_no_member(path);
+        mut head: string = path.render_no_member();
         head += "::operator";
         if (path.has_member) {
-            head += op_code_to_symbol(path.member);
+            head += Cursor::op_code_to_symbol(path.member);
         }
-        return finalize(head, params_str, return_str, overload, llvm_suffix);
+        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
     }
     if (kind_a == 't' && kind_b == 'r') {
-        const owner: string = render_path_no_member(path);
+        const owner: string = path.render_no_member();
         mut head: string = "<" + trait_seg + " for " + owner + ">";
         if (path.has_member) {
             head += (if (leads_with_receiver) { "." } else { "::" }) + path.member;
         }
-        return finalize(head, params_str, return_str, overload, llvm_suffix);
+        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
     }
 
     // Plain function or method (no kind tag).
-    const head2: string = render_path_head(path, leads_with_receiver);
-    return finalize(head2, params_str, return_str, overload, llvm_suffix);
-}
-
-/// Render the path's namespace + type chain WITHOUT the `-<member>` tail.
-function render_path_no_member(p: &ParsedPath) -> string {
-    mut buf: string = "";
-    for (mut i: i64 = 0; i < p.segments.length; i++) {
-        if (i > 0) { buf += "::"; }
-        buf += p.segments[i];
-    }
-    return buf;
-}
-
-/// Glue the rendered head together with the parameter list, return type,
-/// and any trailing overload / LLVM-suffix annotations.
-function finalize(head: string, params: string, ret: string,
-                  overload: i64, llvm_suffix: i64) -> string {
-    mut out: string = head;
-    out += "(" + params + ")";
-    if (libc::strlen(ret) > 0) {
-        out += " -> " + ret;
-    }
-    if (overload >= 0) {
-        out += " [overload ";
-        out += overload.to_decimal_str();
-        out += "]";
-    }
-    if (llvm_suffix >= 0) {
-        out += " [.";
-        out += llvm_suffix.to_decimal_str();
-        out += "]";
-    }
-    return out;
-}
-
-function is_kind_tag(a: char, b: char) -> boolean {
-    if (a == 'v' && b == 't') { return true; }
-    if (a == 't' && b == 'i') { return true; }
-    if (a == 'c' && b == 't') { return true; }
-    if (a == 'd' && b == 't') { return true; }
-    if (a == 'o' && b == 'p') { return true; }
-    if (a == 'm' && b == 'i') { return true; }
-    if (a == 'c' && b == 'l') { return true; }
-    if (a == 't' && b == 'r') { return true; }
-    return false;
+    const head2: string = path.render_head(leads_with_receiver);
+    return Cursor::finalize(head2, params_str, return_str, overload, llvm_suffix);
 }
