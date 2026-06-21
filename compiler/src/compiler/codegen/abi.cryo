@@ -326,7 +326,7 @@ type struct AbiClassifier {
         }
 
         const sret: boolean = return_plan.cls == ArgClass::Indirect;
-        const llvm_fn_ty: LType = build_llvm_fn_type(
+        const llvm_fn_ty: LType = AbiClassifier::build_llvm_fn_type(
             return_plan, param_plans, is_variadic);
 
         return SignaturePlan {
@@ -393,7 +393,7 @@ type struct AbiClassifier {
         }
 
         const sret: boolean = return_plan.cls == ArgClass::Indirect;
-        const llvm_fn_ty: LType = build_llvm_fn_type(
+        const llvm_fn_ty: LType = AbiClassifier::build_llvm_fn_type(
             return_plan, param_plans, is_variadic);
 
         return SignaturePlan {
@@ -728,7 +728,7 @@ type struct AbiClassifier {
         }
 
         // Mixed / integer / empty bucket => INTEGER class.
-        return eightbyte_integer_type(bucket_size);
+        return AbiClassifier::eightbyte_integer_type(bucket_size);
     }
 
     /// Recursively flatten an aggregate into its scalar leaf fields,
@@ -840,7 +840,7 @@ type struct AbiClassifier {
                                  t: TypeRef, size_bytes: u64) -> ParamPlan {
         const tm: TypeMapper* = this.type_mapper;
         const orig: LType = tm.map_type(t);
-        const int_slot: LType = eightbyte_integer_type(size_bytes);
+        const int_slot: LType = AbiClassifier::eightbyte_integer_type(size_bytes);
         mut slots: LType[] = [];
         slots.push(int_slot);
         return ParamPlan {
@@ -1189,124 +1189,126 @@ type struct AbiClassifier {
             if (pp.cls == ArgClass::Indirect
                     && pp.attr == AbiAttr::ByVal
                     && pp.pointee_ty.is_valid()) {
-                const slot_i: u32 = llvm_slot_index_of_param(
+                const slot_i: u32 = AbiClassifier::llvm_slot_index_of_param(
                     plan.param_plans, plan.sret_slot, i);
                 this.apply_byval_call_attribute(call_val, slot_i, pp.pointee_ty);
             }
         }
     }
-}
 
 
-// Free-function helpers
-//
-// Pure helpers that need no `AbiClassifier` state; kept at module scope
-// so anyone with a `SignaturePlan*` / `ParamPlan*` / size in hand can
-// call them without routing through an instance.
 
-/// Pick the LLVM integer type for an INTEGER-class eightbyte of the
-/// given byte length.  Matches what clang emits for small struct
-/// returns/params (e.g. `{i32, i32}` of size 8 lowers to `i64`, a
-/// 5-byte struct to `i40` rounded - we use the smallest power-of-two
-/// container >= size_bytes to stay register-shaped: i8 / i16 / i32 / i64).
-function eightbyte_integer_type(size_bytes: u64) -> LType {
-    if (size_bytes == 0) { return LType::null(); }
-    if (size_bytes <= 1) { return LType::i8();  }
-    if (size_bytes <= 2) { return LType::i16(); }
-    if (size_bytes <= 4) { return LType::i32(); }
-    return LType::i64();
-}
+    // Free-function helpers
+    //
+    // Pure helpers that need no `AbiClassifier` state; kept at module scope
+    // so anyone with a `SignaturePlan*` / `ParamPlan*` / size in hand can
+    // call them without routing through an instance.
 
-/// LLVM slot index at which source parameter `param_idx` begins.
-/// Accounts for the hidden `sret` slot (slot 0 when present) and for any
-/// earlier parameters that expand to more than one LLVM slot - a
-/// DirectPair parameter occupies two slots, so every parameter after it
-/// is shifted.  Per-parameter attribute application (`byval`) MUST use
-/// this rather than the source ordinal `param_idx + sret_off`: with
-/// DirectPair params the ordinal no longer equals the LLVM slot index,
-/// and a `byval(%T)` attached at the wrong index lands on an incompatible
-/// (non-pointer) slot - an LLVM verifier failure.
-function llvm_slot_index_of_param(param_plans: &ParamPlan[],
-                                  sret: boolean, param_idx: i64) -> u32 {
-    mut idx: u32 = if (sret) { 1 } else { 0 } as u32;
-    mut i: i64 = 0;
-    while (i < param_idx && i < param_plans.length) {
-        idx += param_plans[i].llvm_slots.length as u32;
-        i += 1;
-    }
-    return idx;
-}
-
-/// Concatenate every plan's `llvm_slots` (return prepended when
-/// `Indirect`, parameters in order) into the slot array LLVM's
-/// `LLVMFunctionType` consumes.  Returns the assembled function type.
-///
-/// `return_plan` / `param_plans` are borrowed: this only reads the plans to
-/// assemble the LLVM type, so the caller keeps ownership for the SignaturePlan.
-function build_llvm_fn_type(return_plan:  &ParamPlan,
-                            param_plans:  &ParamPlan[],
-                            is_variadic:  boolean) -> LType {
-    // Step 1: pick the LLVM return type.  `Indirect` returns become
-    // `void` because the value is written through the hidden sret
-    // pointer; everything else uses the single Direct slot.  `DirectPair`
-    // wraps its two slots in an anonymous LLVM struct so the function
-    // signature reads e.g. `{i64, i32} f(...)` - the call site coerces
-    // back to the source struct via store-then-load.  Ignore returns
-    // also use `void` (their slots[0] was preset to void).
-    mut ret_ty: LType = LType::void_type();
-    if (return_plan.cls == ArgClass::DirectPair
-            && return_plan.llvm_slots.length == 2) {
-        const dp_buf: void* = intrinsics::malloc(2 * 8);
-        const dp_slots: void** = dp_buf as void**;
-        dp_slots[0] = return_plan.llvm_slots[0].raw;
-        dp_slots[1] = return_plan.llvm_slots[1].raw;
-        ret_ty = LType::literal_struct(dp_buf, 2, false);
-        intrinsics::free(dp_buf);
-    } else if (return_plan.cls != ArgClass::Indirect
-            && return_plan.llvm_slots.length > 0) {
-        ret_ty = return_plan.llvm_slots[0];
+    /// Pick the LLVM integer type for an INTEGER-class eightbyte of the
+    /// given byte length.  Matches what clang emits for small struct
+    /// returns/params (e.g. `{i32, i32}` of size 8 lowers to `i64`, a
+    /// 5-byte struct to `i40` rounded - we use the smallest power-of-two
+    /// container >= size_bytes to stay register-shaped: i8 / i16 / i32 / i64).
+    static eightbyte_integer_type(size_bytes: u64) -> LType {
+        if (size_bytes == 0) { return LType::null(); }
+        if (size_bytes <= 1) { return LType::i8();  }
+        if (size_bytes <= 2) { return LType::i16(); }
+        if (size_bytes <= 4) { return LType::i32(); }
+        return LType::i64();
     }
 
-    // Step 2: count parameter slots.  `Indirect` return contributes a
-    // hidden first ptr slot; each parameter contributes 0, 1, or 2.
-    mut total: u32 = 0;
-    if (return_plan.cls == ArgClass::Indirect) { total += 1; }
-    for (mut i: i64 = 0; i < param_plans.length; i++) {
-        total += param_plans[i].llvm_slots.length as u32;
+    /// LLVM slot index at which source parameter `param_idx` begins.
+    /// Accounts for the hidden `sret` slot (slot 0 when present) and for any
+    /// earlier parameters that expand to more than one LLVM slot - a
+    /// DirectPair parameter occupies two slots, so every parameter after it
+    /// is shifted.  Per-parameter attribute application (`byval`) MUST use
+    /// this rather than the source ordinal `param_idx + sret_off`: with
+    /// DirectPair params the ordinal no longer equals the LLVM slot index,
+    /// and a `byval(%T)` attached at the wrong index lands on an incompatible
+    /// (non-pointer) slot - an LLVM verifier failure.
+    static llvm_slot_index_of_param(param_plans: &ParamPlan[],
+                                      sret: boolean, param_idx: i64) -> u32 {
+        mut idx: u32 = if (sret) { 1 } else { 0 } as u32;
+        mut i: i64 = 0;
+        while (i < param_idx && i < param_plans.length) {
+            idx += param_plans[i].llvm_slots.length as u32;
+            i += 1;
+        }
+        return idx;
     }
 
-    if (total == 0) {
-        if (!ret_ty.is_valid()) { return LType::null(); }
-        return LType::function_type(ret_ty, null, 0, is_variadic);
-    }
+    /// Concatenate every plan's `llvm_slots` (return prepended when
+    /// `Indirect`, parameters in order) into the slot array LLVM's
+    /// `LLVMFunctionType` consumes.  Returns the assembled function type.
+    ///
+    /// `return_plan` / `param_plans` are borrowed: this only reads the plans to
+    /// assemble the LLVM type, so the caller keeps ownership for the SignaturePlan.
+    static build_llvm_fn_type(return_plan:  &ParamPlan,
+                                param_plans:  &ParamPlan[],
+                                is_variadic:  boolean) -> LType {
+        // Step 1: pick the LLVM return type.  `Indirect` returns become
+        // `void` because the value is written through the hidden sret
+        // pointer; everything else uses the single Direct slot.  `DirectPair`
+        // wraps its two slots in an anonymous LLVM struct so the function
+        // signature reads e.g. `{i64, i32} f(...)` - the call site coerces
+        // back to the source struct via store-then-load.  Ignore returns
+        // also use `void` (their slots[0] was preset to void).
+        mut ret_ty: LType = LType::void_type();
+        if (return_plan.cls == ArgClass::DirectPair
+                && return_plan.llvm_slots.length == 2) {
+            const dp_buf: void* = intrinsics::malloc(2 * 8);
+            const dp_slots: void** = dp_buf as void**;
+            dp_slots[0] = return_plan.llvm_slots[0].raw;
+            dp_slots[1] = return_plan.llvm_slots[1].raw;
+            ret_ty = LType::literal_struct(dp_buf, 2, false);
+            intrinsics::free(dp_buf);
+        } else if (return_plan.cls != ArgClass::Indirect
+                && return_plan.llvm_slots.length > 0) {
+            ret_ty = return_plan.llvm_slots[0];
+        }
 
-    const buf: void* = intrinsics::malloc(total as u64 * 8);
-    const slots: void** = buf as void**;
-    mut idx: u32 = 0;
-    mut all_valid: boolean = ret_ty.is_valid();
+        // Step 2: count parameter slots.  `Indirect` return contributes a
+        // hidden first ptr slot; each parameter contributes 0, 1, or 2.
+        mut total: u32 = 0;
+        if (return_plan.cls == ArgClass::Indirect) { total += 1; }
+        for (mut i: i64 = 0; i < param_plans.length; i++) {
+            total += param_plans[i].llvm_slots.length as u32;
+        }
 
-    // The hidden sret slot is always `ptr` (pointer to the return type).
-    if (return_plan.cls == ArgClass::Indirect) {
-        slots[idx] = LType::pointer_to(LType::i8()).raw;
-        idx += 1;
-    }
+        if (total == 0) {
+            if (!ret_ty.is_valid()) { return LType::null(); }
+            return LType::function_type(ret_ty, null, 0, is_variadic);
+        }
 
-    for (mut pi: i64 = 0; pi < param_plans.length; pi++) {
-        const pp: &ParamPlan = &param_plans[pi];
-        for (mut si: i64 = 0; si < pp.llvm_slots.length; si++) {
-            const slot: LType = pp.llvm_slots[si];
-            if (!slot.is_valid()) { all_valid = false; }
-            slots[idx] = slot.raw;
+        const buf: void* = intrinsics::malloc(total as u64 * 8);
+        const slots: void** = buf as void**;
+        mut idx: u32 = 0;
+        mut all_valid: boolean = ret_ty.is_valid();
+
+        // The hidden sret slot is always `ptr` (pointer to the return type).
+        if (return_plan.cls == ArgClass::Indirect) {
+            slots[idx] = LType::pointer_to(LType::i8()).raw;
             idx += 1;
         }
-    }
 
-    if (!all_valid) {
+        for (mut pi: i64 = 0; pi < param_plans.length; pi++) {
+            const pp: &ParamPlan = &param_plans[pi];
+            for (mut si: i64 = 0; si < pp.llvm_slots.length; si++) {
+                const slot: LType = pp.llvm_slots[si];
+                if (!slot.is_valid()) { all_valid = false; }
+                slots[idx] = slot.raw;
+                idx += 1;
+            }
+        }
+
+        if (!all_valid) {
+            intrinsics::free(buf);
+            return LType::null();
+        }
+
+        const fn_ty: LType = LType::function_type(ret_ty, buf, total, is_variadic);
         intrinsics::free(buf);
-        return LType::null();
+        return fn_ty;
     }
 
-    const fn_ty: LType = LType::function_type(ret_ty, buf, total, is_variadic);
-    intrinsics::free(buf);
-    return fn_ty;
 }

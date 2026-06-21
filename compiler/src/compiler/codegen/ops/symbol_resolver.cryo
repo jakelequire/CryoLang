@@ -141,7 +141,7 @@ type struct SymbolResolver {
                 if (xpp.cls == ArgClass::Indirect
                         && xpp.attr == AbiAttr::ByVal
                         && xpp.pointee_ty.is_valid()) {
-                    const xslot: u32 = llvm_slot_index_of_param(
+                    const xslot: u32 = AbiClassifier::llvm_slot_index_of_param(
                         xplan.param_plans, xplan.sret_slot, xi);
                     this.abi.apply_byval_attribute(fn_val, xslot, xpp.pointee_ty);
                 }
@@ -227,7 +227,7 @@ type struct SymbolResolver {
             const ft_ptr: Type* = arena.lookup(overloads[i].id);
             if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
             const ft: FunctionType* = ft_ptr as FunctionType*;
-            if (function_type_has_generic_params(arena, ft)) { continue; }
+            if (SymbolResolver::function_type_has_generic_params(arena, ft)) { continue; }
             const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
             if (!first.is_valid() && v.is_valid()) { first = v; }
         }
@@ -306,7 +306,7 @@ type struct SymbolResolver {
             if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
             const ft: FunctionType* = ft_ptr as FunctionType*;
             if (ft.param_types.length as u32 != arity) { continue; }
-            if (function_type_has_generic_params(arena, ft)) { continue; }
+            if (SymbolResolver::function_type_has_generic_params(arena, ft)) { continue; }
             const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
             if (v.is_valid()) { return v; }
         }
@@ -355,78 +355,80 @@ type struct SymbolResolver {
         this.globals.register(name, g_val);
         return g_val;
     }
-}
 
 
-// Free helpers used by resolver passes
 
-/// Returns true if the FunctionType reaches a GenericParam / BoundedParam
-/// anywhere in its return type or parameter types (walking through
-/// References, Pointers, Arrays, Optionals, Tuples, and InstantiatedTypes
-/// with no resolved_type).  Used by extern-overload declaration to filter
-/// out sema-time registrations of still-generic templates whose param
-/// signatures would otherwise lower to opaque `ptr` and produce a wrong
-/// mangled name.
-function type_ref_has_generic_params(arena: TypeArena*, ty: TypeRef) -> boolean {
-    if (!ty.is_valid()) { return false; }
-    return type_has_generic_params_walker(arena, ty, 0);
-}
+    // Free helpers used by resolver passes
 
-function type_has_generic_params_walker(arena: TypeArena*, ty: TypeRef, depth: i32) -> boolean {
-    if (depth > 8) { return false; }
-    if (!ty.is_valid()) { return false; }
-    const t: Type* = arena.lookup(ty.id);
-    if (t == null) { return false; }
-    const k: TypeKind = t.kind;
-    if (k == TypeKind::GenericParam || k == TypeKind::BoundedParam) {
-        return true;
+    /// Returns true if the FunctionType reaches a GenericParam / BoundedParam
+    /// anywhere in its return type or parameter types (walking through
+    /// References, Pointers, Arrays, Optionals, Tuples, and InstantiatedTypes
+    /// with no resolved_type).  Used by extern-overload declaration to filter
+    /// out sema-time registrations of still-generic templates whose param
+    /// signatures would otherwise lower to opaque `ptr` and produce a wrong
+    /// mangled name.
+    static type_ref_has_generic_params(arena: TypeArena*, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        return SymbolResolver::type_has_generic_params_walker(arena, ty, 0);
     }
-    if (k == TypeKind::Reference) {
-        const r: ReferenceType* = t as ReferenceType*;
-        return type_has_generic_params_walker(arena, r.referent, depth + 1);
-    }
-    if (k == TypeKind::Pointer) {
-        const p: PointerType* = t as PointerType*;
-        return type_has_generic_params_walker(arena, p.pointee, depth + 1);
-    }
-    if (k == TypeKind::Array) {
-        const a: ArrayType* = t as ArrayType*;
-        return type_has_generic_params_walker(arena, a.element, depth + 1);
-    }
-    if (k == TypeKind::Optional) {
-        const o: OptionalType* = t as OptionalType*;
-        return type_has_generic_params_walker(arena, o.wrapped, depth + 1);
-    }
-    if (k == TypeKind::Tuple) {
-        const tu: TupleType* = t as TupleType*;
-        for (mut i: i64 = 0; i < tu.elements.length; i++) {
-            if (type_has_generic_params_walker(arena, tu.elements[i], depth + 1)) {
-                return true;
+
+    static type_has_generic_params_walker(arena: TypeArena*, ty: TypeRef, depth: i32) -> boolean {
+        if (depth > 8) { return false; }
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = arena.lookup(ty.id);
+        if (t == null) { return false; }
+        const k: TypeKind = t.kind;
+        if (k == TypeKind::GenericParam || k == TypeKind::BoundedParam) {
+            return true;
+        }
+        if (k == TypeKind::Reference) {
+            const r: ReferenceType* = t as ReferenceType*;
+            return SymbolResolver::type_has_generic_params_walker(arena, r.referent, depth + 1);
+        }
+        if (k == TypeKind::Pointer) {
+            const p: PointerType* = t as PointerType*;
+            return SymbolResolver::type_has_generic_params_walker(arena, p.pointee, depth + 1);
+        }
+        if (k == TypeKind::Array) {
+            const a: ArrayType* = t as ArrayType*;
+            return SymbolResolver::type_has_generic_params_walker(arena, a.element, depth + 1);
+        }
+        if (k == TypeKind::Optional) {
+            const o: OptionalType* = t as OptionalType*;
+            return SymbolResolver::type_has_generic_params_walker(arena, o.wrapped, depth + 1);
+        }
+        if (k == TypeKind::Tuple) {
+            const tu: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tu.elements.length; i++) {
+                if (SymbolResolver::type_has_generic_params_walker(arena, tu.elements[i], depth + 1)) {
+                    return true;
+                }
             }
+            return false;
+        }
+        if (k == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                return SymbolResolver::type_has_generic_params_walker(arena, inst.resolved_type, depth + 1);
+            }
+            // Un-resolved InstantiatedType: walk its type_args for generic
+            // params (e.g. `Foo<T>` where T is still a template param).
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (SymbolResolver::type_has_generic_params_walker(arena, inst.type_args[i], depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
         }
         return false;
     }
-    if (k == TypeKind::InstantiatedType) {
-        const inst: InstantiatedType* = t as InstantiatedType*;
-        if (inst.has_resolved_type()) {
-            return type_has_generic_params_walker(arena, inst.resolved_type, depth + 1);
-        }
-        // Un-resolved InstantiatedType: walk its type_args for generic
-        // params (e.g. `Foo<T>` where T is still a template param).
-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-            if (type_has_generic_params_walker(arena, inst.type_args[i], depth + 1)) {
-                return true;
-            }
+
+    static function_type_has_generic_params(arena: TypeArena*, ft: FunctionType*) -> boolean {
+        if (SymbolResolver::type_ref_has_generic_params(arena, ft.return_type)) { return true; }
+        for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+            if (SymbolResolver::type_ref_has_generic_params(arena, ft.param_types[i])) { return true; }
         }
         return false;
     }
-    return false;
-}
 
-function function_type_has_generic_params(arena: TypeArena*, ft: FunctionType*) -> boolean {
-    if (type_ref_has_generic_params(arena, ft.return_type)) { return true; }
-    for (mut i: i64 = 0; i < ft.param_types.length; i++) {
-        if (type_ref_has_generic_params(arena, ft.param_types[i])) { return true; }
-    }
-    return false;
 }
