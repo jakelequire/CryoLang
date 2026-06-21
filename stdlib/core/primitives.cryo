@@ -107,6 +107,26 @@ implement char {
         }
         return this;
     }
+
+    /// Numeric value of a hex digit (`0`-`9`, `a`-`f`, `A`-`F`), or -1 when
+    /// `this` is not a hex digit. Consolidates the nibble-decode loops that
+    /// the compiler hand-rolls in literal/char parsing.
+    hex_value(&this) -> i32 {
+        if (this >= '0' && this <= '9') { return (this as u32 - ('0' as u32)) as i32; }
+        if (this >= 'a' && this <= 'f') { return (this as u32 - ('a' as u32) + 10) as i32; }
+        if (this >= 'A' && this <= 'F') { return (this as u32 - ('A' as u32) + 10) as i32; }
+        return -1;
+    }
+
+    /// True when `this` may begin a C identifier: an ASCII letter or `_`.
+    is_c_ident_start(&this) -> boolean {
+        return this.is_alpha() || this == '_';
+    }
+
+    /// True when `this` may continue a C identifier: letter, digit, or `_`.
+    is_c_ident_char(&this) -> boolean {
+        return this.is_alphanumeric() || this == '_';
+    }
 }
 
 // Range bounds + abs for the signed integer widths. `abs` wraps at the
@@ -879,20 +899,22 @@ implement string {
         return -1;
     }
 
-    /// Parse the leading run of ASCII decimal digits as an `i64` (stops at
-    /// the first non-digit; no sign handling).  Non-numeric input yields 0.
-    /// For strict, error-returning parsing use `i64::try_from(Str)`.
-    parse_int(&this) -> i64 {
-        const len: i64 = this.length() as i64;
-        mut acc: i64 = 0;
-        for (mut i: i64 = 0; i < len; i++) {
-            if (this[i] >= 48 && this[i] <= 57) {     // '0'..'9'
-                acc = acc * 10 + (this[i] - 48) as i64;
-            } else {
-                break;
-            }
-        }
-        return acc;
+    /// Parse `this` into an integer of the caller-chosen type `T`. Recognises
+    /// an optional leading sign (signed `T` only), a `0x`/`0o`/`0b` radix
+    /// prefix, and `_` digit separators; parsing stops at the first character
+    /// invalid for the detected base. `T` is dispatched at compile time via
+    /// `static match`, so each instantiation is exactly the right-width parser:
+    /// `lexeme.parse_int<u64>()`, `version.parse_int<i64>()`.
+    ///
+    /// INFALLIBLE / DEFENSIVE: malformed input yields 0 and overflow wraps.
+    /// When you need to *detect* bad input, use `T::try_from(Str)` (Result).
+    /// Float parsing is deliberately not here — string→float needs libc and
+    /// `core` stays libc-free (see module header).
+    ///
+    /// Dispatch is via the `FromRadix` trait (one impl per integer width), the
+    /// same compile-time type-directed pattern as `VaArg`/`VaArgs::next<T>`.
+    parse_int<T>(&this) -> T where T: FromRadix {
+        return T::from_radix(this);
     }
 
     /// Strip one pair of surrounding ASCII double quotes if both are
@@ -918,9 +940,318 @@ implement string {
         if (last_sep <= 0) { return "."; }
         return this.substr(0, last_sep);
     }
+
+    /// Byte-wise content equality, taking `other` BY VALUE so it accepts
+    /// string literals directly (`name.eq("void")`). This is the ergonomic
+    /// replacement for the `strcmp(a, b) == 0` idiom; the `Eq` trait's
+    /// `equals(&string)` needs an lvalue and can't take a literal. Two nulls
+    /// are equal; exactly one null is not.
+    eq(&this, other: string) -> boolean {
+        if (this == null) { return other == null; }
+        if (other == null) { return false; }
+        const la: u64 = strlen(this);
+        if (la != strlen(other)) { return false; }
+        return strncmp(this, other, la) == 0;
+    }
+
+    /// True when `this` begins with `prefix` (byte-wise). An empty prefix
+    /// always matches; a prefix longer than `this` never does.
+    starts_with(&this, prefix: string) -> boolean {
+        if (this == null || prefix == null) { return false; }
+        const plen: u64 = strlen(prefix);
+        if (plen == 0) { return true; }
+        if (strlen(this) < plen) { return false; }
+        return strncmp(this, prefix, plen) == 0;
+    }
+
+    /// Byte index of the first occurrence of `needle`, or -1 when absent.
+    /// An empty needle matches at 0.
+    find(&this, needle: string) -> i64 {
+        if (this == null || needle == null) { return -1; }
+        const hit: i8* = strstr(this, needle);
+        if (hit == null) { return -1; }
+        return ptr_diff(hit as void*, this as void*);
+    }
+
+    /// Byte index of the last occurrence of `needle`, or -1 when absent.
+    /// An empty needle matches at the end (the string's length).
+    rfind(&this, needle: string) -> i64 {
+        if (this == null || needle == null) { return -1; }
+        const nlen: i64 = strlen(needle) as i64;
+        const hlen: i64 = strlen(this) as i64;
+        if (nlen == 0) { return hlen; }
+        if (nlen > hlen) { return -1; }
+        mut i: i64 = hlen - nlen;
+        while (i >= 0) {
+            if (strncmp(ptr_add(this as void*, i as u64) as string, needle, nlen as u64) == 0) {
+                return i;
+            }
+            i -= 1;
+        }
+        return -1;
+    }
+
+    /// Split on a single byte separator, returning each piece as a freshly
+    /// allocated string. Adjacent separators yield empty pieces; the result
+    /// always has (separator-count + 1) entries.
+    split_char(&this, sep: i8) -> string[] {
+        mut parts: string[] = [];
+        if (this == null) { return parts; }
+        const len: i64 = this.length() as i64;
+        mut start: i64 = 0;
+        for (mut i: i64 = 0; i < len; i++) {
+            if (this[i] == sep) {
+                parts.push(this.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        parts.push(this.substr(start, len - start));
+        return parts;
+    }
+
+    /// Split on a multi-byte separator string. An empty separator yields the
+    /// whole string as a single piece. Covers `::`-style segmentation.
+    split(&this, sep: string) -> string[] {
+        mut parts: string[] = [];
+        if (this == null) { return parts; }
+        const total: i64 = this.length() as i64;
+        const slen: i64 = strlen(sep) as i64;
+        if (slen == 0) { parts.push(this.substr(0, total)); return parts; }
+        mut i: i64 = 0;
+        mut seg_start: i64 = 0;
+        while (i <= total - slen) {
+            if (strncmp(ptr_add(this as void*, i as u64) as string, sep, slen as u64) == 0) {
+                parts.push(this.substr(seg_start, i - seg_start));
+                i += slen;
+                seg_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        parts.push(this.substr(seg_start, total - seg_start));
+        return parts;
+    }
+
+    /// Like `split`, but drops empty pieces: leading, trailing, and
+    /// consecutive separators produce no entry, and empty input yields an
+    /// empty array. Useful for `::`-delimited names and `/`-delimited paths
+    /// where blank segments are meaningless.
+    split_nonempty(&this, sep: string) -> string[] {
+        mut out: string[] = [];
+        if (this == null) { return out; }
+        const total: i64 = this.length() as i64;
+        const slen: i64 = strlen(sep) as i64;
+        if (slen == 0) {
+            if (total > 0) { out.push(this.substr(0, total)); }
+            return out;
+        }
+        mut i: i64 = 0;
+        mut start: i64 = 0;
+        while (i <= total - slen) {
+            if (strncmp(ptr_add(this as void*, i as u64) as string, sep, slen as u64) == 0) {
+                if (i > start) { out.push(this.substr(start, i - start)); }
+                i += slen;
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        if (start < total) { out.push(this.substr(start, total - start)); }
+        return out;
+    }
+
+    /// Replace every non-overlapping occurrence of `from` with `to`, returning
+    /// a freshly allocated string. An empty `from` returns `this` unchanged.
+    replace(&this, from: string, to: string) -> string {
+        if (this == null) { return ""; }
+        const flen: i64 = strlen(from) as i64;
+        const total: i64 = this.length() as i64;
+        if (flen == 0) { return this.substr(0, total); }
+        mut result: string = "";
+        mut i: i64 = 0;
+        mut seg_start: i64 = 0;
+        while (i <= total - flen) {
+            if (strncmp(ptr_add(this as void*, i as u64) as string, from, flen as u64) == 0) {
+                result = result.append(this.substr(seg_start, i - seg_start));
+                result = result.append(to);
+                i += flen;
+                seg_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        return result.append(this.substr(seg_start, total - seg_start));
+    }
+
+    /// ASCII-fold to lowercase, returning a freshly allocated string.
+    to_ascii_lower(&this) -> string {
+        if (this == null) { return ""; }
+        const len: i64 = this.length() as i64;
+        mut buf: string = malloc((len + 1) as u64) as string;
+        if ((buf as void*) == null) {
+            intrinsics::panic("string::to_ascii_lower: allocation failed", FILE, LINE);
+        }
+        for (mut i: i64 = 0; i < len; i++) {
+            mut c: i8 = this[i];
+            if (c >= 65 && c <= 90) { c = c + 32; }     // 'A'..'Z' -> 'a'..'z'
+            buf[i] = c;
+        }
+        buf[len] = 0;
+        return buf;
+    }
+
+    /// ASCII-fold to uppercase, returning a freshly allocated string.
+    to_ascii_upper(&this) -> string {
+        if (this == null) { return ""; }
+        const len: i64 = this.length() as i64;
+        mut buf: string = malloc((len + 1) as u64) as string;
+        if ((buf as void*) == null) {
+            intrinsics::panic("string::to_ascii_upper: allocation failed", FILE, LINE);
+        }
+        for (mut i: i64 = 0; i < len; i++) {
+            mut c: i8 = this[i];
+            if (c >= 97 && c <= 122) { c = c - 32; }    // 'a'..'z' -> 'A'..'Z'
+            buf[i] = c;
+        }
+        buf[len] = 0;
+        return buf;
+    }
+
+    /// The final path component: everything after the last `/` or `\`.
+    basename(&this) -> string {
+        const len: i64 = this.length() as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i < len; i++) {
+            if (this[i] == 47 || this[i] == 92) { last_sep = i; }   // '/' or '\'
+        }
+        return this.substr(last_sep + 1, len - (last_sep + 1));
+    }
+
+    /// The file stem: `basename` with its final `.ext` removed. A leading-dot
+    /// name (e.g. `.gitignore`) is treated as having no extension.
+    stem(&this) -> string {
+        const base: string = this.basename();
+        const blen: i64 = base.length() as i64;
+        mut dot: i64 = -1;
+        for (mut i: i64 = 0; i < blen; i++) {
+            if (base[i] == 46) { dot = i; }     // '.'
+        }
+        if (dot <= 0) { return base; }
+        return base.substr(0, dot);
+    }
+
+    /// The file extension without the dot, or "" when there is none. A
+    /// leading-dot name (e.g. `.gitignore`) has no extension.
+    extension(&this) -> string {
+        const base: string = this.basename();
+        const blen: i64 = base.length() as i64;
+        mut dot: i64 = -1;
+        for (mut i: i64 = 0; i < blen; i++) {
+            if (base[i] == 46) { dot = i; }     // '.'
+        }
+        if (dot <= 0) { return ""; }
+        return base.substr(dot + 1, blen - (dot + 1));
+    }
+
+    /// Join `seg` onto `this` with a single `/` separator. An empty `this`
+    /// returns `seg`; an empty `seg` returns `this`; an absolute `seg`
+    /// (leading separator) replaces `this` entirely.
+    join(&this, seg: string) -> string {
+        if (this == null || this.is_empty()) { return seg; }
+        if (seg == null || seg.length() == 0) { return this; }
+        if (seg[0] == 47 || seg[0] == 92) { return seg; }       // absolute
+        const len: i64 = this.length() as i64;
+        const last: i8 = this[len - 1];
+        if (last == 47 || last == 92) { return this.append(seg); }
+        return this.append("/").append(seg);
+    }
+
+    /// True when `this` lies within directory `dir`: equal to `dir`, or
+    /// extending it across a path separator. Boundary-aware so `/a/bc` is
+    /// NOT under `/a/b`.
+    is_under(&this, dir: string) -> boolean {
+        if (this == null || dir == null) { return false; }
+        const dlen: i64 = dir.length() as i64;
+        if (dlen == 0) { return false; }
+        if (!this.starts_with(dir)) { return false; }
+        const tlen: i64 = this.length() as i64;
+        if (tlen == dlen) { return true; }
+        const last: i8 = dir[dlen - 1];
+        if (last == 47 || last == 92) { return true; }
+        const nxt: i8 = this[dlen];
+        return nxt == 47 || nxt == 92;
+    }
+
+    /// Append `suffix` unless it is empty or already present at the end.
+    /// Used to add a platform executable suffix (e.g. `.exe`) idempotently.
+    with_exe_suffix(&this, suffix: string) -> string {
+        if (suffix == null || suffix.length() == 0) { return this; }
+        if (this.ends_with(suffix)) { return this; }
+        return this.append(suffix);
+    }
 }
 
 /// ASCII whitespace test used by `string::trim`.
 private function string_is_ascii_ws(b: i8) -> boolean {
     return b == 32 || b == 9 || b == 10 || b == 13;
 }
+
+/// Radix-aware parse core backing `string::parse_int<T>`. Starting at byte
+/// `start`, accepts an optional leading sign, detects a `0x`/`0o`/`0b` prefix,
+/// skips `_` separators, and accumulates until the first character invalid for
+/// the detected base. A `-` negates and WRAPS into the unsigned result (so an
+/// `i*` width recovers the right two's-complement value, and a `u*` width
+/// recovers the wrapped magnitude — matching the historical literal parser).
+/// Overflow wraps; "" or garbage yields 0.
+private function string_parse_radix_u64(s: string, start: i64) -> u64 {
+    if (s == null) { return 0; }
+    mut i: i64 = start;
+    mut negate: boolean = false;
+    if (s[i] == 45) { negate = true; i += 1; }              // '-'
+    else if (s[i] == 43) { i += 1; }                        // '+'
+
+    mut base: u64 = 10;
+    if (s[i] == 48 && (s[i+1] == 120 || s[i+1] == 88))      { base = 16; i += 2; }  // 0x/0X
+    else if (s[i] == 48 && (s[i+1] == 98 || s[i+1] == 66))  { base = 2;  i += 2; }  // 0b/0B
+    else if (s[i] == 48 && (s[i+1] == 111 || s[i+1] == 79)) { base = 8;  i += 2; }  // 0o/0O
+
+    mut acc: u64 = 0;
+    while (s[i] != 0) {
+        const c: i8 = s[i];
+        if (c == 95) { i += 1; continue; }                  // '_'
+        mut digit: u64 = 0;
+        if (c >= 48 && c <= 57)        { digit = (c - 48) as u64; }
+        else if (c >= 97 && c <= 102)  { digit = (c - 97 + 10) as u64; }
+        else if (c >= 65 && c <= 70)   { digit = (c - 65 + 10) as u64; }
+        else { break; }
+        if (digit >= base) { break; }
+        acc = acc * base + digit;
+        i += 1;
+    }
+    if (negate) { return (0 - acc as i64) as u64; }
+    return acc;
+}
+
+/// Signed view of the parse core: parse as wrapped-unsigned, reinterpret.
+private function string_parse_radix_i64(s: string) -> i64 {
+    return string_parse_radix_u64(s, 0) as i64;
+}
+
+/// Type-directed integer parse, one impl per width, dispatched at compile time
+/// by `string::parse_int<T>`.  `from_radix` parses `s` (with optional sign /
+/// `0x`/`0o`/`0b` prefix / `_` separators) into `This`.  The unsigned widths go
+/// through the unsigned core; the signed widths through the signed core; both
+/// narrow with a checked-free `as` (overflow wraps — see `parse_int`).
+type trait FromRadix {
+    static from_radix(s: string) -> This;
+}
+implement trait FromRadix for u8    { static from_radix(s: string) -> u8    { return string_parse_radix_u64(s, 0) as u8; } }
+implement trait FromRadix for u16   { static from_radix(s: string) -> u16   { return string_parse_radix_u64(s, 0) as u16; } }
+implement trait FromRadix for u32   { static from_radix(s: string) -> u32   { return string_parse_radix_u64(s, 0) as u32; } }
+implement trait FromRadix for u64   { static from_radix(s: string) -> u64   { return string_parse_radix_u64(s, 0); } }
+implement trait FromRadix for usize { static from_radix(s: string) -> usize { return string_parse_radix_u64(s, 0) as usize; } }
+implement trait FromRadix for i8    { static from_radix(s: string) -> i8    { return string_parse_radix_i64(s) as i8; } }
+implement trait FromRadix for i16   { static from_radix(s: string) -> i16   { return string_parse_radix_i64(s) as i16; } }
+implement trait FromRadix for i32   { static from_radix(s: string) -> i32   { return string_parse_radix_i64(s) as i32; } }
+implement trait FromRadix for i64   { static from_radix(s: string) -> i64   { return string_parse_radix_i64(s); } }
+implement trait FromRadix for isize { static from_radix(s: string) -> isize { return string_parse_radix_i64(s) as isize; } }

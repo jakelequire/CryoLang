@@ -417,6 +417,59 @@ type struct GenericRegistry {
         return false;
     }
 
+    /// Find a method named `method_sym` declared in an inherent (non-trait)
+    /// `implement <name> { ... }` block, matching `n_targs` method-level
+    /// generic parameters.  Returns the `MethodNode*` so callers can read its
+    /// `func.generic_params` + `func.return_type_annotation` (used to refine a
+    /// generic method's return type on a NON-generic / primitive receiver,
+    /// e.g. `"42".parse_int<u64>()` on `implement string`).  Linear scan over
+    /// the small inherent-impl set; returns null when no block/method matches.
+    find_inherent_impl_method(&this, name: SymbolStr, method_sym: SymbolStr,
+                              n_targs: i64) -> MethodNode* {
+        if (!name.is_valid() || !method_sym.is_valid()) { return null; }
+        for (mut i: i64 = 0; i < this.inherent_impl_keys.length; i++) {
+            if (this.inherent_impl_keys[i] != name.id) { continue; }
+            const ib: ImplBlockNode* = this.inherent_impl_nodes[i];
+            if (ib == null) { continue; }
+            for (mut j: i64 = 0; j < ib.methods.length; j++) {
+                const m: MethodNode* = ib.methods[j];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_sym)
+                        && m.func.generic_params.length == n_targs) {
+                    return m;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Like `find_inherent_impl_method` but for the monomorphizer: matches any
+    /// method named `method_sym` that has at least one generic parameter (the
+    /// call's arity is checked later from sema's stash), and also reports the
+    /// owning `ImplBlockNode` via `out_impl` so the spec'd sibling can be pushed
+    /// onto it.  Used to specialize generic methods on primitive receivers
+    /// (`"42".parse_int<u64>()`), mirroring `find_trait_impl_method_for_target`
+    /// for the inherent (non-trait) case.
+    find_inherent_impl_generic_method(&this, name: SymbolStr, method_sym: SymbolStr,
+                                      out_impl: ImplBlockNode**) -> MethodNode* {
+        if (!name.is_valid() || !method_sym.is_valid()) { return null; }
+        for (mut i: i64 = 0; i < this.inherent_impl_keys.length; i++) {
+            if (this.inherent_impl_keys[i] != name.id) { continue; }
+            const ib: ImplBlockNode* = this.inherent_impl_nodes[i];
+            if (ib == null) { continue; }
+            for (mut j: i64 = 0; j < ib.methods.length; j++) {
+                const m: MethodNode* = ib.methods[j];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_sym)
+                        && m.func.generic_params.length > 0) {
+                    *out_impl = ib;
+                    return m;
+                }
+            }
+        }
+        return null;
+    }
+
     /// Pack a `(trait_name, target_name)` pair into a single u64 key. Both
     /// SymbolStr ids fit in the lower/upper 32-bit halves so collisions are
     /// only possible when two pairs alias both ids, which is practically zero.

@@ -369,34 +369,6 @@ function lock_path_for(consumer_root: string) -> string {
 }
 
 /// Final path component of `path` ("src/hello.cryo" -> "hello.cryo").
-/// Both separators are recognized so native Windows paths
-/// ("src\hello.cryo") split the same way.  Used by `compile_file` to
-/// synthesize the entry point of a single-file project.
-function file_basename(path: string) -> string {
-    const len: i64 = libc::strlen(path) as i64;
-    mut last_sep: i64 = -1;
-    for (mut i: i64 = 0; i < len; i++) {
-        if (path[i] == '/' || path[i] == '\\') { last_sep = i; }
-    }
-    if (last_sep < 0) { return path; }
-    return path.substr(last_sep + 1, len - last_sep - 1);
-}
-
-/// `file_basename` minus its extension ("src/hello.cryo" -> "hello").
-/// A leading dot is not treated as an extension separator, so a
-/// ".hidden" file keeps its full name.  Used by `compile_file` to
-/// derive the synthesized project (and therefore artifact) name.
-function file_stem(path: string) -> string {
-    const base: string = file_basename(path);
-    const len: i64 = libc::strlen(base) as i64;
-    mut last_dot: i64 = -1;
-    for (mut i: i64 = 0; i < len; i++) {
-        if (base[i] == '.') { last_dot = i; }
-    }
-    if (last_dot <= 0) { return base; }
-    return base.substr(0, last_dot);
-}
-
 // Self-contained monotonic clock for `CRYO_TIMINGS` phase profiling.
 //
 // Declared locally rather than importing `ffi::libc` / `std::time`: the
@@ -468,17 +440,6 @@ function timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
     }
     fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
         label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
-}
-
-/// True when `path` lies under directory `dir` (i.e. begins with `dir`
-/// followed by a `/` boundary).  Used by module-origin classification to
-/// avoid sibling-prefix false matches (e.g. `stdlibfoo` vs `stdlib`).
-function origin_path_under(path: string, dir: string) -> boolean {
-    const dlen: u64 = libc::strlen(dir);
-    if (dlen == 0) { return false; }
-    if (libc::strlen(path) <= dlen) { return false; }
-    if (libc::strncmp(path, dir, dlen) != 0) { return false; }
-    return path[dlen] == '/';
 }
 
 /// Transitive import closure of module `root` (including `root` itself),
@@ -660,8 +621,8 @@ type struct CompilerInstance {
 
         mut config: ProjectConfig = ProjectConfig::default();
         config.project_root = source.parent_dir();
-        config.entry_point  = file_basename(source);
-        config.project_name = file_stem(source);
+        config.entry_point  = source.basename();
+        config.project_name = source.stem();
         config.no_std       = this.config.no_std;
         config.emit_llvm    = this.config.emit_llvm;
         // Artifacts land NEXT TO THE SOURCE FILE, not in the invoking
@@ -1303,7 +1264,7 @@ type struct CompilerInstance {
             const mci_info: ModuleInfo* = &ctx.module_graph.modules[mci];
             const fpath: string = mci_info.file_path;
             if (!config.no_std && libc::strlen(stdlib_root) > 0
-                    && origin_path_under(fpath, stdlib_root)) {
+                    && fpath.is_under(stdlib_root)) {
                 mci_info.origin = ModuleOrigin::Stdlib;
                 mci_info.origin_name = "";
                 continue;
@@ -1318,7 +1279,7 @@ type struct CompilerInstance {
                     } else {
                         format("%s/%s", config.project_root, dr_path)
                     };
-                if (origin_path_under(fpath, dr_base)) {
+                if (fpath.is_under(dr_base)) {
                     mci_info.origin = ModuleOrigin::Dep;
                     mci_info.origin_name = dep_outcome.roots[drc].name;
                     matched_dep = true;
