@@ -52,16 +52,53 @@ type enum HostOS {
     Other;
 }
 
-/// Map an LLVM target triple substring to a HostOS atom.  Triples look
-/// like `x86_64-pc-linux-gnu`, `x86_64-pc-windows-gnu`,
-/// `x86_64-apple-darwin`; we just substring-match the OS field.
-function classify_triple(triple: string) -> HostOS {
-    if (strstr(triple, "windows") != null) { return HostOS::Windows; }
-    if (strstr(triple, "linux") != null)   { return HostOS::Linux; }
-    if (strstr(triple, "darwin") != null)  { return HostOS::Macos; }
-    if (strstr(triple, "macos") != null)   { return HostOS::Macos; }
-    if (strstr(triple, "apple") != null)   { return HostOS::Macos; }
-    return HostOS::Other;
+implement enum HostOS {
+    /// Map an LLVM target triple substring to a HostOS atom.  Triples look
+    /// like `x86_64-pc-linux-gnu`, `x86_64-pc-windows-gnu`,
+    /// `x86_64-apple-darwin`; we just substring-match the OS field.
+    static from_triple(triple: string) -> HostOS {
+        if (strstr(triple, "windows") != null) { return HostOS::Windows; }
+        if (strstr(triple, "linux") != null)   { return HostOS::Linux; }
+        if (strstr(triple, "darwin") != null)  { return HostOS::Macos; }
+        if (strstr(triple, "macos") != null)   { return HostOS::Macos; }
+        if (strstr(triple, "apple") != null)   { return HostOS::Macos; }
+        return HostOS::Other;
+    }
+
+    /// True if `atom` (case-sensitive lowercase) names this OS.  `unix`
+    /// matches when the OS is Linux or Macos.  Unknown atoms are treated
+    /// as inactive rather than crashing — the directive processor emits a
+    /// warning for unknown vocabulary so the user still sees a real
+    /// diagnostic.
+    matches(&this, atom: string) -> boolean {
+        if (atom.eq("windows")) {
+            return match (this) { HostOS::Windows => { true } _ => { false } };
+        }
+        if (atom.eq("linux")) {
+            return match (this) { HostOS::Linux => { true } _ => { false } };
+        }
+        if (atom.eq("macos")) {
+            return match (this) { HostOS::Macos => { true } _ => { false } };
+        }
+        if (atom.eq("unix")) {
+            return match (this) {
+                HostOS::Linux => { true }
+                HostOS::Macos => { true }
+                _             => { false }
+            };
+        }
+        return false;
+    }
+
+    /// True if `atom` is a recognized OS atom (one of windows/linux/macos/unix).
+    /// Used to distinguish `config(testing)` (not a platform gate; left alone)
+    /// from `config(windows)` (a platform gate; subject to evaluation).
+    static is_os_atom(atom: string) -> boolean {
+        return match (atom) {
+            "windows" | "linux" | "macos" | "unix" => { true }
+            _                                      => { false }
+        };
+    }
 }
 
 /// Resolve the active target OS from CompilationContext.  Honors
@@ -69,45 +106,7 @@ function classify_triple(triple: string) -> HostOS {
 /// falls back to the host triple from LLVM.
 function active_os(ctx: CompilationContext*) -> HostOS {
     const triple: string = resolve_effective_triple(ctx.target_triple);
-    return classify_triple(triple);
-}
-
-
-// Atom matching
-
-/// True if `atom` (case-sensitive lowercase) names the active OS.
-/// `unix` matches when the active OS is Linux or Macos.
-function atom_matches(atom: string, os: HostOS) -> boolean {
-    if (strcmp(atom, "windows") == 0) {
-        return match (os) { HostOS::Windows => { true } _ => { false } };
-    }
-    if (strcmp(atom, "linux") == 0) {
-        return match (os) { HostOS::Linux => { true } _ => { false } };
-    }
-    if (strcmp(atom, "macos") == 0) {
-        return match (os) { HostOS::Macos => { true } _ => { false } };
-    }
-    if (strcmp(atom, "unix") == 0) {
-        return match (os) {
-            HostOS::Linux => { true }
-            HostOS::Macos => { true }
-            _             => { false }
-        };
-    }
-    // Unknown atom: treat as inactive rather than crashing.  The
-    // directive processor emits a warning for unknown vocabulary so the
-    // user sees a real diagnostic.
-    return false;
-}
-
-/// True if `atom` is a recognized OS atom (one of windows/linux/macos/unix).
-/// Used to distinguish `config(testing)` (not a platform gate; left alone)
-/// from `config(windows)` (a platform gate; subject to evaluation).
-function is_os_atom(atom: string) -> boolean {
-    return match (atom) {
-        "windows" | "linux" | "macos" | "unix" => { true }
-        _                                      => { false }
-    };
+    return HostOS::from_triple(triple);
 }
 
 
@@ -139,10 +138,10 @@ function eval_not_call(inner: DirectiveNode*, os: HostOS) -> CfgEvalResult {
     if (a.kind != DirectiveArgKind::Ident) {
         return CfgEvalResult::NotAGate;
     }
-    if (!is_os_atom(a.name)) {
+    if (!HostOS::is_os_atom(a.name)) {
         return CfgEvalResult::NotAGate;
     }
-    if (atom_matches(a.name, os)) {
+    if (os.matches(a.name)) {
         return CfgEvalResult::Inactive;
     }
     return CfgEvalResult::Active;
@@ -160,10 +159,10 @@ function eval_config_args(d: DirectiveNode*, os: HostOS) -> CfgEvalResult {
 
     // Bare-ident form: `config(windows)`.
     if (a.kind == DirectiveArgKind::Ident) {
-        if (!is_os_atom(a.name)) {
+        if (!HostOS::is_os_atom(a.name)) {
             return CfgEvalResult::NotAGate;
         }
-        if (atom_matches(a.name, os)) {
+        if (os.matches(a.name)) {
             return CfgEvalResult::Active;
         }
         return CfgEvalResult::Inactive;
@@ -190,8 +189,8 @@ function eval_directive(d: DirectiveNode*, os: HostOS) -> CfgEvalResult {
     if (d == null) { return CfgEvalResult::NotAGate; }
 
     // Bare form: `![windows]`, `![linux]`, etc.
-    if (is_os_atom(d.directive_kind)) {
-        if (atom_matches(d.directive_kind, os)) {
+    if (HostOS::is_os_atom(d.directive_kind)) {
+        if (os.matches(d.directive_kind)) {
             return CfgEvalResult::Active;
         }
         return CfgEvalResult::Inactive;
