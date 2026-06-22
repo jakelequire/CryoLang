@@ -130,3 +130,48 @@ function connected_socket_send_recv() -> Result<(), TestError> {
     server.drop();
     return expect(ok, Str::new("connected send should deliver \"hello\""));
 }
+
+// Regression for the audit finding that the UDP entry points took a
+// 16-byte `sockaddr_buf` while `pack_sockaddr_in` writes 28 bytes for an
+// IPv6 address - a 12-byte stack overflow - despite a doc comment claiming
+// IPv6 was rejected. The socket is AF_INET, so `bind`/`connect`/`send_to`
+// now reject an `IpAddr::V6` destination up front with `Unsupported`
+// (and the buffers are 28 bytes as defense in depth). This must NOT crash
+// and must surface the documented error.
+![test]
+function ipv6_rejected_unsupported() -> Result<(), TestError> {
+    match (UdpSocket::bind(SocketAddr::localhost_v6(0))) {
+        Result::Ok(s)  => { mut sk: UdpSocket = s; sk.drop();
+                            return bail(Str::new("v6 bind should be rejected")); }
+        Result::Err(e) => {
+            match (expect(e.kind == IoErrorKind::Unsupported,
+                          Str::new("v6 bind should fail Unsupported"))) {
+                Result::Ok(_)  => { }
+                Result::Err(t) => { return Result::Err(t); }
+            }
+        }
+    }
+
+    mut client: UdpSocket = match (UdpSocket::unbound()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("unbound failed")); }
+    };
+    match (client.connect(SocketAddr::localhost_v6(9))) {
+        Result::Ok(_)  => { client.drop(); return bail(Str::new("v6 connect should be rejected")); }
+        Result::Err(e) => {
+            match (expect(e.kind == IoErrorKind::Unsupported,
+                          Str::new("v6 connect should fail Unsupported"))) {
+                Result::Ok(_)  => { }
+                Result::Err(t) => { client.drop(); return Result::Err(t); }
+            }
+        }
+    }
+    const v6: SocketAddr = SocketAddr::any_v6(9);
+    const send_res: Result<u64, IoError> = client.send_to(Str::new("x").as_bytes(), v6);
+    const sent_rejected: boolean = match (send_res) {
+        Result::Ok(_)  => { false }
+        Result::Err(e) => { e.kind == IoErrorKind::Unsupported }
+    };
+    client.drop();
+    return expect(sent_rejected, Str::new("v6 send_to should fail Unsupported"));
+}

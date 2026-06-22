@@ -919,7 +919,32 @@ public:
         c.high_value   = node.high_value;
         c.enum_name    = node.enum_name;
         c.variant_name = node.variant_name;
-        c.elements     = node.elements;  // PatternElement[] - value types, shallow copy is fine
+        // Deep-clone the elements. Leaf elements (Binding/Wildcard/Literal*)
+        // are immutable parse metadata, so sharing the inner pointer is safe;
+        // but a `Sub` element OWNS a nested PatternNode that the substituter
+        // rewrites in place, so two specializations must not alias it. Rebuild
+        // the array element-wise (also avoids aliasing the whole buffer) and
+        // recursively clone each nested sub-pattern. (Before this, nested
+        // patterns like `Some(Some(n))` aliased the template and skipped
+        // substitution -> a generic body miscompiled to invalid IR.)
+        mut new_elems: PatternElement[] = [];
+        for (mut i: i64 = 0; i < node.elements.length; i++) {
+            const el: PatternElement = node.elements[i];
+            match (el) {
+                PatternElement::Sub(sub) => {
+                    mut ns: PatternSub* = new PatternSub {
+                        pattern: null,
+                        span:    sub.span,
+                    };
+                    if (sub.pattern != null) {
+                        ns.pattern = this.clone_pattern(sub.pattern as PatternNode*) as void*;
+                    }
+                    new_elems.push(PatternElement::Sub(ns));
+                }
+                _ => { new_elems.push(el); }
+            }
+        }
+        c.elements     = new_elems;
         c.has_error    = node.has_error;
         this.result = c;
     }
@@ -1040,20 +1065,25 @@ public:
         return c;
     }
 
-    /// Clone a MatchArmNode.
+    /// Clone a single pattern node.
     /// Uses an explicit kind check instead of accept() virtual dispatch to
     /// avoid an overloaded-vtable miscompile (visit(PatternNode*) can be
     /// called instead of visit(EnumPatternNode*), losing binding data).
+    clone_pattern(pat: PatternNode*) -> PatternNode* {
+        if (pat == null) { return null; }
+        if (pat.pattern_kind == PatternKind::Enum) {
+            this.visit(pat as EnumPatternNode*);
+        } else {
+            this.visit(pat);
+        }
+        return this.result as PatternNode*;
+    }
+
+    /// Clone a MatchArmNode.
     clone_match_arm(node: MatchArmNode*) -> MatchArmNode* {
         mut c: MatchArmNode* = new MatchArmNode(node.span);
         for (mut i: i64 = 0; i < node.patterns.length; i++) {
-            const pat: PatternNode* = node.patterns[i];
-            if (pat.pattern_kind == PatternKind::Enum) {
-                this.visit(pat as EnumPatternNode*);
-            } else {
-                this.visit(pat);
-            }
-            c.add_pattern(this.result as PatternNode*);
+            c.add_pattern(this.clone_pattern(node.patterns[i]));
         }
         if (node.guard != null) {
             c.set_guard(this.clone_expr(node.guard));
