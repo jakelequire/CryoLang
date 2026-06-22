@@ -43,42 +43,62 @@ type struct Version {
         if (a.minor != b.minor) { return a.minor - b.minor; }
         return a.patch - b.patch;
     }
-}
 
-/// Parse `vX.Y.Z` or `X.Y.Z`.  Anything trailing the patch (e.g.
-/// `-rc.1` or `+build`) is accepted but discarded.  Returns
-/// `Version::invalid()` on malformed input.
-function parse_version(s: string) -> Version {
-    const len: i64 = libc::strlen(s) as i64;
-    if (len == 0) { return Version::invalid(); }
+    /// Parse `vX.Y.Z` or `X.Y.Z`.  Anything trailing the patch (e.g.
+    /// `-rc.1` or `+build`) is accepted but discarded.  Returns
+    /// `Version::invalid()` on malformed input.
+    static parse(s: string) -> Version {
+        const len: i64 = libc::strlen(s) as i64;
+        if (len == 0) { return Version::invalid(); }
 
-    mut i: i64 = 0;
-    if (s[0] == 'v' || s[0] == 'V') { i = 1; }
+        mut i: i64 = 0;
+        if (s[0] == 'v' || s[0] == 'V') { i = 1; }
 
-    mut major: i64 = -1;
-    mut minor: i64 = -1;
-    mut patch: i64 = -1;
+        mut major: i64 = -1;
+        mut minor: i64 = -1;
+        mut patch: i64 = -1;
 
-    const after_major: i64 = read_digits(s, i, len);
-    if (after_major == i) { return Version::invalid(); }
-    major = read_int(s, i, after_major);
-    i = after_major;
-    if (i >= len || s[i] != '.') { return Version::invalid(); }
-    i += 1;
+        const after_major: i64 = Version::read_digits(s, i, len);
+        if (after_major == i) { return Version::invalid(); }
+        major = Version::read_int(s, i, after_major);
+        i = after_major;
+        if (i >= len || s[i] != '.') { return Version::invalid(); }
+        i += 1;
 
-    const after_minor: i64 = read_digits(s, i, len);
-    if (after_minor == i) { return Version::invalid(); }
-    minor = read_int(s, i, after_minor);
-    i = after_minor;
-    if (i >= len || s[i] != '.') { return Version::invalid(); }
-    i += 1;
+        const after_minor: i64 = Version::read_digits(s, i, len);
+        if (after_minor == i) { return Version::invalid(); }
+        minor = Version::read_int(s, i, after_minor);
+        i = after_minor;
+        if (i >= len || s[i] != '.') { return Version::invalid(); }
+        i += 1;
 
-    const after_patch: i64 = read_digits(s, i, len);
-    if (after_patch == i) { return Version::invalid(); }
-    patch = read_int(s, i, after_patch);
-    // Trailing pre-release/build metadata is ignored for ordering.
+        const after_patch: i64 = Version::read_digits(s, i, len);
+        if (after_patch == i) { return Version::invalid(); }
+        patch = Version::read_int(s, i, after_patch);
+        // Trailing pre-release/build metadata is ignored for ordering.
 
-    return Version { major: major, minor: minor, patch: patch, valid: true };
+        return Version { major: major, minor: minor, patch: patch, valid: true };
+    }
+
+    /// Walk past the run of ASCII digits in `s` starting at `i`, capped
+    /// at `end`.  Returns the index of the first non-digit (or `end`).
+    static read_digits(s: string, i: i64, end: i64) -> i64 {
+        mut p: i64 = i;
+        while (p < end && s[p] >= '0' && s[p] <= '9') {
+            p += 1;
+        }
+        return p;
+    }
+
+    /// Parse `s[start..end)` as a non-negative decimal integer.  Caller
+    /// must have established the range is all-digits via `read_digits`.
+    static read_int(s: string, start: i64, end: i64) -> i64 {
+        mut acc: i64 = 0;
+        for (mut p: i64 = start; p < end; p++) {
+            acc = acc * 10 + (s[p] - '0') as i64;
+        }
+        return acc;
+    }
 }
 
 
@@ -102,94 +122,70 @@ type struct Constraint {
             valid: false,
         };
     }
-}
 
-/// Parse a constraint string: the value the user wrote in
-/// `version = "..."`.  The leading `^` selects caret semantics; absent
-/// it, exact match.
-function parse_constraint(s: string) -> Constraint {
-    if (libc::strlen(s) == 0) { return Constraint::invalid(); }
+    /// Parse a constraint string: the value the user wrote in
+    /// `version = "..."`.  The leading `^` selects caret semantics; absent
+    /// it, exact match.
+    static parse(s: string) -> Constraint {
+        if (libc::strlen(s) == 0) { return Constraint::invalid(); }
 
-    mut op:   ConstraintOp = ConstraintOp::Exact;
-    mut body: string       = s;
-    if (s[0] == '^') {
-        op = ConstraintOp::Caret;
-        body = s.substr(1, libc::strlen(s) as i64 - 1);
-    }
-
-    const v: Version = parse_version(body);
-    if (!v.valid) { return Constraint::invalid(); }
-    return Constraint { op: op, bound: v, valid: true };
-}
-
-/// Does `v` satisfy `c`?
-function satisfies(c: Constraint, v: Version) -> boolean {
-    if (!c.valid || !v.valid) { return false; }
-
-    return match (c.op) {
-        ConstraintOp::Exact => { Version::cmp(v, c.bound) == 0 }
-        ConstraintOp::Caret => { caret_satisfies(c.bound, v) }
-    };
-}
-
-/// Caret-range upper-bound check (cargo / npm convention):
-///   ^1.2.3 => <2.0.0
-///   ^0.2.3 => <0.3.0
-///   ^0.0.3 => <0.0.4
-function caret_satisfies(bound: Version, v: Version) -> boolean {
-    if (Version::cmp(v, bound) < 0) { return false; }
-    if (bound.major != 0) {
-        return v.major == bound.major;
-    }
-    if (bound.minor != 0) {
-        return v.major == 0 && v.minor == bound.minor;
-    }
-    return v.major == 0 && v.minor == 0 && v.patch == bound.patch;
-}
-
-
-// Selection
-
-/// Given a list of candidate tag strings, pick the highest-versioned
-/// one that satisfies `c`.  Returns "" when nothing matches.
-///
-/// Tags that fail to parse as semver are silently skipped; projects
-/// often have non-version refs like `latest` or `nightly` mixed in.
-function select_best_tag(c: Constraint, tags: string[]) -> string {
-    mut best_tag: string  = "";
-    mut best_v:   Version = Version::invalid();
-
-    for (mut i: int = 0; i < tags.length; i++) {
-        const tag: string = tags[i];
-        const v:   Version = parse_version(tag);
-        if (!v.valid) { continue; }
-        if (!satisfies(c, v)) { continue; }
-        if (!best_v.valid || Version::cmp(v, best_v) > 0) {
-            best_v   = v;
-            best_tag = tag;
+        mut op:   ConstraintOp = ConstraintOp::Exact;
+        mut body: string       = s;
+        if (s[0] == '^') {
+            op = ConstraintOp::Caret;
+            body = s.substr(1, libc::strlen(s) as i64 - 1);
         }
+
+        const v: Version = Version::parse(body);
+        if (!v.valid) { return Constraint::invalid(); }
+        return Constraint { op: op, bound: v, valid: true };
     }
 
-    return best_tag;
-}
+    /// Does `v` satisfy this constraint?
+    static satisfies(c: Constraint, v: Version) -> boolean {
+        if (!c.valid || !v.valid) { return false; }
 
-
-/// Walk past the run of ASCII digits in `s` starting at `i`, capped
-/// at `end`.  Returns the index of the first non-digit (or `end`).
-function read_digits(s: string, i: i64, end: i64) -> i64 {
-    mut p: i64 = i;
-    while (p < end && s[p] >= '0' && s[p] <= '9') {
-        p += 1;
+        return match (c.op) {
+            ConstraintOp::Exact => { Version::cmp(v, c.bound) == 0 }
+            ConstraintOp::Caret => { Constraint::caret_satisfies(c.bound, v) }
+        };
     }
-    return p;
-}
 
-/// Parse `s[start..end)` as a non-negative decimal integer.  Caller
-/// must have established the range is all-digits via `read_digits`.
-function read_int(s: string, start: i64, end: i64) -> i64 {
-    mut acc: i64 = 0;
-    for (mut p: i64 = start; p < end; p++) {
-        acc = acc * 10 + (s[p] - '0') as i64;
+    /// Caret-range upper-bound check (cargo / npm convention):
+    ///   ^1.2.3 => <2.0.0
+    ///   ^0.2.3 => <0.3.0
+    ///   ^0.0.3 => <0.0.4
+    static caret_satisfies(bound: Version, v: Version) -> boolean {
+        if (Version::cmp(v, bound) < 0) { return false; }
+        if (bound.major != 0) {
+            return v.major == bound.major;
+        }
+        if (bound.minor != 0) {
+            return v.major == 0 && v.minor == bound.minor;
+        }
+        return v.major == 0 && v.minor == 0 && v.patch == bound.patch;
     }
-    return acc;
+
+    /// Given a list of candidate tag strings, pick the highest-versioned
+    /// one that satisfies `c`.  Returns "" when nothing matches.
+    ///
+    /// Tags that fail to parse as semver are silently skipped; projects
+    /// often have non-version refs like `latest` or `nightly` mixed in.
+    static select_best_tag(c: Constraint, tags: string[]) -> string {
+        mut best_tag: string  = "";
+        mut best_v:   Version = Version::invalid();
+
+        for (mut i: int = 0; i < tags.length; i++) {
+            const tag: string = tags[i];
+            const v:   Version = Version::parse(tag);
+            if (!v.valid) { continue; }
+            if (!Constraint::satisfies(c, v)) { continue; }
+            if (!best_v.valid || Version::cmp(v, best_v) > 0) {
+                best_v   = v;
+                best_tag = tag;
+            }
+        }
+
+        return best_tag;
+    }
 }

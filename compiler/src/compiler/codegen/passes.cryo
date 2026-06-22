@@ -25,40 +25,6 @@ import Utils::Logger;
 
 // Shell-quoting helper
 
-/// POSIX-shell-safe quote a path or argument for use in `system()` /
-/// `sh -c` commands.  Wraps the input in single quotes and rewrites any
-/// embedded single quote as the four-byte sequence `'\''`; single-quoted
-/// strings are not interpreted by `/bin/sh` at all, so this neutralises
-/// every shell metacharacter (spaces, $, `, *, ;, !, &, etc).
-///
-/// libc's `system(3)` runs the command through `sh -c`, so any
-/// interpolated user-controlled path needs this treatment.  Without it,
-/// a working directory with a space breaks linking, and a path containing
-/// shell metacharacters is an arbitrary-command-execution hazard.
-function shell_quote(s: string) -> string {
-    const len: u64 = libc::strlen(s);
-    // Worst case: every byte is a single quote, expanding to 4 bytes,
-    // plus two outer quotes and a NUL terminator.
-    const cap: u64 = len * 4 + 3;
-    const buf: i8* = intrinsics::malloc(cap) as i8*;
-    mut o: u64 = 0;
-    buf[o] = '\''; o += 1;
-    const sb: i8* = s as i8*;
-    for (mut i: u64 = 0; i < len; i++) {
-        const ch: i8 = sb[i];
-        if (ch == '\'') {
-            buf[o] = '\''; o += 1;
-            buf[o] = '\\'; o += 1;
-            buf[o] = '\''; o += 1;
-            buf[o] = '\''; o += 1;
-        } else {
-            buf[o] = ch; o += 1;
-        }
-    }
-    buf[o] = '\''; o += 1;
-    buf[o] = 0;
-    return buf as string;
-}
 
 /// Shell redirect that discards stdout+stderr while probing a tool for
 /// existence.  Host-gated (`cmd` uses `>NUL`, POSIX `sh` uses
@@ -71,142 +37,6 @@ function probe_silence() -> string { return ">/dev/null 2>&1"; }
 ![target(windows)]
 function probe_silence() -> string { return ">NUL 2>&1"; }
 
-/// True iff `tool` can be launched, probed via `<tool> --version`.  A
-/// missing binary makes the shell exit non-zero (`sh`: 127; `cmd`: 9009)
-/// and `system(3)` reports that, so exit 0 means it's usable.  Mirrors
-/// `pick_c_preprocessor`'s `cc_available` probe.  The probe runs after IR
-/// is emitted (link/archive time), so the tool chosen never affects the
-/// `.ll` the selfhost gate compares.
-function tool_available(tool: string) -> boolean {
-    return system(format("%s --version %s", tool, probe_silence())) == 0;
-}
-
-/// Pick the static archiver binary.  `CRYO_AR` overrides everything,
-/// mirroring `pick_c_preprocessor`'s `CRYO_CC` knob - this is what lets a
-/// Windows-hosted `cryo.exe` under wine point at an `llvm-ar.exe` it can
-/// launch, since the host's ELF `ar` cannot run there.  With no override
-/// we AUTO-DETECT: the default `ar` wins whenever it's launchable (true on
-/// every POSIX host and on a mingw box, where binutils ships `ar`), so the
-/// historic choice and selfhost byte-identity are preserved and the probe
-/// only falls through to `llvm-ar` when `ar` is genuinely absent.
-function pick_archiver() -> string {
-    const env_raw: i8* = libc::getenv("CRYO_AR") as i8*;
-    if (env_raw != null) {
-        const env_val: string = env_raw as string;
-        if (libc::strlen(env_val) > 0) { return env_val; }
-    }
-    if (tool_available("ar"))         { return "ar"; }
-    if (tool_available("llvm-ar"))    { return "llvm-ar"; }
-    if (tool_available("llvm-ar-20")) { return "llvm-ar-20"; }
-    return "ar";
-}
-
-/// Pick the link driver (the `cc`/`gcc`/`clang` binary the link command
-/// invokes).  `CRYO_CC` overrides everything, mirroring `pick_archiver`'s
-/// `CRYO_AR` and `pick_c_preprocessor`'s use of the same knob for
-/// `#include` preprocessing (one C-toolchain driver serves both jobs).
-///
-/// With no override we AUTO-DETECT, the same way `pick_c_preprocessor`
-/// does, so a NATIVE Windows self-host needs no environment setup:
-///
-///   1. The per-target `default_driver` wins whenever it's launchable.
-///      This is the historic choice on every host where it exists - `cc`
-///      on a POSIX host, `x86_64-w64-mingw32-gcc` on a Linux->windows
-///      cross - so existing flows and selfhost byte-identity are unchanged
-///      (on Linux/CI `cc` is present, so the fallback never fires).
-///   2. Only when `default_driver` is ABSENT do we probe.  This is the
-///      native mingw/MSYS2 case: `host_linker_config` asks for `cc`, but a
-///      stock box ships `gcc`/`clang` instead.  `gcc` is tried before
-///      `clang` because on a mingw host `gcc` links gnu-ABI objects
-///      natively while a bare `clang` may default to the msvc target.
-///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
-///      substitute, so we DON'T fall back for it - the original name is
-///      kept so the link error names the absent cross toolchain.
-function pick_link_driver(default_driver: string) -> string {
-    const env_raw: i8* = libc::getenv("CRYO_CC") as i8*;
-    if (env_raw != null) {
-        const env_val: string = env_raw as string;
-        if (libc::strlen(env_val) > 0) { return env_val; }
-    }
-    if (tool_available(default_driver)) { return default_driver; }
-    if (strstr(default_driver, "mingw") == null) {
-        if (tool_available("gcc"))   { return "gcc"; }
-        if (tool_available("clang")) { return "clang"; }
-        if (tool_available("cc"))    { return "cc"; }
-    }
-    return default_driver;
-}
-
-/// Resolve the `llvm-config` binary used to derive the static-link lib set
-/// for `--release-static`.  `CRYO_LLVM_CONFIG` overrides; default
-/// `llvm-config-20` (matches the LLVM 20 the compiler is built against).
-/// Only consulted on the `--release-static` path, so a normal dev build
-/// never needs it present.  The env override is what lets a musl release
-/// build under Alpine point at its own `llvm-config` (which reports the
-/// musl-built static `.a` set) with no source change.
-function pick_llvm_config() -> string {
-    const env_raw: i8* = libc::getenv("CRYO_LLVM_CONFIG") as i8*;
-    if (env_raw != null) {
-        const env_val: string = env_raw as string;
-        if (libc::strlen(env_val) > 0) { return env_val; }
-    }
-    return "llvm-config-20";
-}
-
-/// Slurp `<llvm-config> --ldflags --libs --system-libs --link-static` and
-/// return it as one space-separated flag string (`-L<libdir> -lLLVMCore ...
-/// -lrt -ldl -lm -lz -lzstd -lxml2`) for splicing into the `--release-static`
-/// link line.  This is how the 200+ component `.a` set AND its search dir are
-/// obtained without hardcoding a list/path that would drift across LLVM
-/// packagings - the `-L` from `--ldflags` is what makes this portable to a
-/// musl/Alpine release where the static libs live elsewhere.  llvm-config
-/// emits the sections in flag order: `-L` first, then the component libs,
-/// then the system libs - the correct single-pass static link order.
-/// Returns "" on popen failure, empty output, or a non-zero exit so the
-/// caller can fail the link with a clear diagnostic.  Mirrors the
-/// popen/fgets/pclose pattern in `c_header_import`'s `run_preproc_pipe`.
-/// Runs at link time (after IR is emitted), so it never touches the `.ll`
-/// the selfhost gate compares.
-function static_llvm_link_flags(llvm_config: string) -> string {
-    const cmd: string = format("%s --ldflags --libs --system-libs --link-static", llvm_config);
-    const pipe: void* = intrinsics::popen(cmd, "r");
-    if (pipe == null) { return ""; }
-
-    mut out_buf: i8* = intrinsics::malloc(65536) as i8*;
-    mut out_len: u64 = 0;
-    mut out_cap: u64 = 65536;
-    mut line_buf: i8[4096];
-
-    while (libc::fgets(&line_buf[0], 4096, pipe) != null) {
-        const llen: u64 = libc::strlen(&line_buf[0] as string);
-        if (out_len + llen >= out_cap) {
-            out_cap *= 2;
-            const nb: i8* = intrinsics::malloc(out_cap) as i8*;
-            intrinsics::memcpy(nb as void*, out_buf as void*, out_len);
-            intrinsics::free(out_buf as void*);
-            out_buf = nb;
-        }
-        intrinsics::memcpy((out_buf + out_len) as void*, &line_buf[0] as void*, llen);
-        out_len += llen;
-    }
-    out_buf[out_len] = 0;
-    const exit_code: i32 = intrinsics::pclose(pipe);
-
-    if (exit_code != 0 || out_len == 0) {
-        intrinsics::free(out_buf as void*);
-        return "";
-    }
-
-    // llvm-config prints `--libs` and `--system-libs` on separate lines;
-    // flatten every newline to a space so the result is one flat argument
-    // string (libs first, then system libs - the correct static link order).
-    for (mut i: u64 = 0; i < out_len; i++) {
-        if (out_buf[i] == '\n' as i8 || out_buf[i] == '\r' as i8) {
-            out_buf[i] = ' ' as i8;
-        }
-    }
-    return out_buf as string;
-}
 
 // Host-shell-aware command construction
 //
@@ -227,7 +57,7 @@ function static_llvm_link_flags(llvm_config: string) -> string {
 /// an embedded `"` (same assumption the archiver's response-file paths make).
 ![target(unix)]
 function link_quote(s: string) -> string {
-    return shell_quote(s);
+    return CodegenPasses::shell_quote(s);
 }
 
 ![target(windows)]
@@ -257,35 +87,13 @@ function to_windows_path(s: string) -> string {
 /// stdout silenced via `>NUL`).  Returns the spawned command's exit code.
 ![target(unix)]
 function hoist_binary(src: string, dst: string) -> i32 {
-    return system(format("cp -f %s %s", shell_quote(src), shell_quote(dst)));
+    return system(format("cp -f %s %s", CodegenPasses::shell_quote(src), CodegenPasses::shell_quote(dst)));
 }
 
 ![target(windows)]
 function hoist_binary(src: string, dst: string) -> i32 {
     return system(format("copy /Y \"%s\" \"%s\" >NUL",
         to_windows_path(src), to_windows_path(dst)));
-}
-
-/// Byte-wise path equality that treats `/` and `\` as the same
-/// separator.  `ctx.source_file` and `discovery_root_path()` are built
-/// by different code paths and can disagree on separator style on a
-/// native Windows host even when they name the same file.
-function paths_equal_loose(a: string, b: string) -> boolean {
-    const la: i64 = libc::strlen(a) as i64;
-    const lb: i64 = libc::strlen(b) as i64;
-    if (la != lb) { return false; }
-    const ab: i8* = a as i8*;
-    const bb: i8* = b as i8*;
-    for (mut i: i64 = 0; i < la; i++) {
-        const ca: i8 = ab[i];
-        const cb: i8 = bb[i];
-        if (ca != cb) {
-            const ca_sep: boolean = (ca == '/' || ca == '\\');
-            const cb_sep: boolean = (cb == '/' || cb == '\\');
-            if (!ca_sep || !cb_sep) { return false; }
-        }
-    }
-    return true;
 }
 
 
@@ -298,7 +106,7 @@ function paths_equal_loose(a: string, b: string) -> boolean {
 function emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
     const ll_cmd: string = format(
         "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
-        shell_quote(profile_dir), shell_quote(ll_path));
+        CodegenPasses::shell_quote(profile_dir), CodegenPasses::shell_quote(ll_path));
     const ll_rc: i32 = system(ll_cmd);
     if (ll_rc == 0) {
         cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
@@ -380,7 +188,7 @@ type struct LinkerConfig {
                 && strstr(triple, "gnu") != null
                 && strstr(triple, "x86_64") != null) {
             return LinkerConfig {
-                driver:             pick_link_driver("x86_64-w64-mingw32-gcc"),
+                driver:             CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc"),
                 // `-lws2_32` for std::net (Winsock); mingw does NOT auto-link it
                 // the way it does kernel32/advapi32.  It's always present on
                 // Windows and tiny, so linking it unconditionally (like `-lm`)
@@ -422,7 +230,7 @@ type struct LinkerConfig {
 ![target(unix)]
 function host_linker_config() -> LinkerConfig {
     return LinkerConfig {
-        driver:             pick_link_driver("cc"),
+        driver:             CodegenPasses::pick_link_driver("cc"),
         exe_suffix:         "",
         extra_system_libs:  "-lm -lstdc++",
         use_stdlib_archive: true,
@@ -433,35 +241,12 @@ function host_linker_config() -> LinkerConfig {
 ![target(windows)]
 function host_linker_config() -> LinkerConfig {
     return LinkerConfig {
-        driver:             pick_link_driver("cc"),
+        driver:             CodegenPasses::pick_link_driver("cc"),
         exe_suffix:         ".exe",
         extra_system_libs:  "-lm -lws2_32",
         use_stdlib_archive: true,
         supported:          true,
     };
-}
-
-
-/// Per-profile link-target path for the active target, with `.exe`
-/// applied on Windows.  Wraps `ProjectConfig::profile_bin_path` so the
-/// suffix logic lives in one place; `run_linking` writes to this path
-/// and the incremental-build manifest in instance.cryo stats it.
-function profile_bin_path_for_target(cfg: ProjectConfig*,
-                                     ctx: CompilationContext*) -> string {
-    const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-    const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
-    return cfg.profile_bin_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
-}
-
-/// Hoisted (build-root) executable path for the active target, with
-/// `.exe` applied on Windows.  Same shape as
-/// `profile_bin_path_for_target` but lands the file at the user-facing
-/// `<output_dir>/<name>[.exe]` instead of the per-profile cache.
-function bin_artifact_path_for_target(cfg: ProjectConfig*,
-                                      ctx: CompilationContext*) -> string {
-    const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-    const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
-    return cfg.bin_artifact_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
 }
 
 
@@ -1070,7 +855,7 @@ type struct CodegenPasses {
         // a windows test binary is `<name>-test.exe`.  Routed through
         // `profile_bin_path_for_target` so the same suffix logic the
         // incremental-build manifest uses applies here.
-        const exe_path: string = profile_bin_path_for_target(cfg, ctx);
+        const exe_path: string = CodegenPasses::profile_bin_path_for_target(cfg, ctx);
 
         // Build the link command.  libc's system(3) runs `sh -c`, so
         // every interpolated path must be shell-quoted; without it, a
@@ -1163,7 +948,7 @@ type struct CodegenPasses {
         // Placed before the stdlib archive + system libs so the single-pass
         // static link order is objects -> LLVM -> libcryo.a -> libm/libstdc++.
         if (ctx.release_static) {
-            const llvm_static: string = static_llvm_link_flags(pick_llvm_config());
+            const llvm_static: string = CodegenPasses::static_llvm_link_flags(CodegenPasses::pick_llvm_config());
             if (libc::strlen(llvm_static) == 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     "could not obtain static LLVM link flags from llvm-config (is it installed? set CRYO_LLVM_CONFIG)");
@@ -1226,7 +1011,7 @@ type struct CodegenPasses {
         // as `build/<name>[.exe]` regardless of which profile produced
         // it.  libc's system(3) runs `sh -c`, so both paths are
         // shell-quoted.
-        const hoisted_exe: string = bin_artifact_path_for_target(cfg, ctx);
+        const hoisted_exe: string = CodegenPasses::bin_artifact_path_for_target(cfg, ctx);
         ProjectConfig::mkdir_p(output_dir);
         // `hoist_binary` is host-shell-aware: `cp -f` on a POSIX-hosted
         // compiler, `copy /Y` (backslash paths) on a native Windows one.
@@ -1405,7 +1190,7 @@ type struct CodegenPasses {
         // honours double quotes.  The tool token is left unquoted (as
         // `c_header_import` leaves `cc`) so a quoted-path first token can't
         // trip cmd's outer-quote-stripping rule.
-        const ar: string = pick_archiver();
+        const ar: string = CodegenPasses::pick_archiver();
         const rsp_path: string = format("%s.rsp", archive_path);
         const rf: void* = libc::fopen(rsp_path, "w");
         if (rf == null) {
@@ -1447,7 +1232,7 @@ type struct CodegenPasses {
     /// only the ENTRY module's artifact may honor the override.
     static is_entry_module_active(ctx: CompilationContext*) -> boolean {
         if (ctx.project_config == null) { return false; }
-        return paths_equal_loose(ctx.source_file,
+        return CodegenPasses::paths_equal_loose(ctx.source_file,
             ctx.project_config.discovery_root_path());
     }
 
@@ -1587,5 +1372,223 @@ type struct CodegenPasses {
             if (newly_stripped == 0) { break; }
             iterations += 1;
         }
+    }
+
+    // ---- Toolchain probing + path helpers (moved from module scope) ----
+
+    /// POSIX-shell-safe quote a path or argument for use in `system()` /
+    /// `sh -c` commands.  Wraps the input in single quotes and rewrites any
+    /// embedded single quote as the four-byte sequence `'\''`; single-quoted
+    /// strings are not interpreted by `/bin/sh` at all, so this neutralises
+    /// every shell metacharacter (spaces, $, `, *, ;, !, &, etc).
+    ///
+    /// libc's `system(3)` runs the command through `sh -c`, so any
+    /// interpolated user-controlled path needs this treatment.  Without it,
+    /// a working directory with a space breaks linking, and a path containing
+    /// shell metacharacters is an arbitrary-command-execution hazard.
+    static shell_quote(s: string) -> string {
+        const len: u64 = libc::strlen(s);
+        // Worst case: every byte is a single quote, expanding to 4 bytes,
+        // plus two outer quotes and a NUL terminator.
+        const cap: u64 = len * 4 + 3;
+        const buf: i8* = intrinsics::malloc(cap) as i8*;
+        mut o: u64 = 0;
+        buf[o] = '\''; o += 1;
+        const sb: i8* = s as i8*;
+        for (mut i: u64 = 0; i < len; i++) {
+            const ch: i8 = sb[i];
+            if (ch == '\'') {
+                buf[o] = '\''; o += 1;
+                buf[o] = '\\'; o += 1;
+                buf[o] = '\''; o += 1;
+                buf[o] = '\''; o += 1;
+            } else {
+                buf[o] = ch; o += 1;
+            }
+        }
+        buf[o] = '\''; o += 1;
+        buf[o] = 0;
+        return buf as string;
+    }
+
+    /// True iff `tool` can be launched, probed via `<tool> --version`.  A
+    /// missing binary makes the shell exit non-zero (`sh`: 127; `cmd`: 9009)
+    /// and `system(3)` reports that, so exit 0 means it's usable.  Mirrors
+    /// `pick_c_preprocessor`'s `cc_available` probe.  The probe runs after IR
+    /// is emitted (link/archive time), so the tool chosen never affects the
+    /// `.ll` the selfhost gate compares.
+    static tool_available(tool: string) -> boolean {
+        return system(format("%s --version %s", tool, probe_silence())) == 0;
+    }
+
+    /// Pick the static archiver binary.  `CRYO_AR` overrides everything,
+    /// mirroring `pick_c_preprocessor`'s `CRYO_CC` knob - this is what lets a
+    /// Windows-hosted `cryo.exe` under wine point at an `llvm-ar.exe` it can
+    /// launch, since the host's ELF `ar` cannot run there.  With no override
+    /// we AUTO-DETECT: the default `ar` wins whenever it's launchable (true on
+    /// every POSIX host and on a mingw box, where binutils ships `ar`), so the
+    /// historic choice and selfhost byte-identity are preserved and the probe
+    /// only falls through to `llvm-ar` when `ar` is genuinely absent.
+    static pick_archiver() -> string {
+        const env_raw: i8* = libc::getenv("CRYO_AR") as i8*;
+        if (env_raw != null) {
+            const env_val: string = env_raw as string;
+            if (libc::strlen(env_val) > 0) { return env_val; }
+        }
+        if (CodegenPasses::tool_available("ar"))         { return "ar"; }
+        if (CodegenPasses::tool_available("llvm-ar"))    { return "llvm-ar"; }
+        if (CodegenPasses::tool_available("llvm-ar-20")) { return "llvm-ar-20"; }
+        return "ar";
+    }
+
+    /// Pick the link driver (the `cc`/`gcc`/`clang` binary the link command
+    /// invokes).  `CRYO_CC` overrides everything, mirroring `pick_archiver`'s
+    /// `CRYO_AR` and `pick_c_preprocessor`'s use of the same knob for
+    /// `#include` preprocessing (one C-toolchain driver serves both jobs).
+    ///
+    /// With no override we AUTO-DETECT, the same way `pick_c_preprocessor`
+    /// does, so a NATIVE Windows self-host needs no environment setup:
+    ///
+    ///   1. The per-target `default_driver` wins whenever it's launchable.
+    ///      This is the historic choice on every host where it exists - `cc`
+    ///      on a POSIX host, `x86_64-w64-mingw32-gcc` on a Linux->windows
+    ///      cross - so existing flows and selfhost byte-identity are unchanged
+    ///      (on Linux/CI `cc` is present, so the fallback never fires).
+    ///   2. Only when `default_driver` is ABSENT do we probe.  This is the
+    ///      native mingw/MSYS2 case: `host_linker_config` asks for `cc`, but a
+    ///      stock box ships `gcc`/`clang` instead.  `gcc` is tried before
+    ///      `clang` because on a mingw host `gcc` links gnu-ABI objects
+    ///      natively while a bare `clang` may default to the msvc target.
+    ///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
+    ///      substitute, so we DON'T fall back for it - the original name is
+    ///      kept so the link error names the absent cross toolchain.
+    static pick_link_driver(default_driver: string) -> string {
+        const env_raw: i8* = libc::getenv("CRYO_CC") as i8*;
+        if (env_raw != null) {
+            const env_val: string = env_raw as string;
+            if (libc::strlen(env_val) > 0) { return env_val; }
+        }
+        if (CodegenPasses::tool_available(default_driver)) { return default_driver; }
+        if (strstr(default_driver, "mingw") == null) {
+            if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
+            if (CodegenPasses::tool_available("clang")) { return "clang"; }
+            if (CodegenPasses::tool_available("cc"))    { return "cc"; }
+        }
+        return default_driver;
+    }
+
+    /// Resolve the `llvm-config` binary used to derive the static-link lib set
+    /// for `--release-static`.  `CRYO_LLVM_CONFIG` overrides; default
+    /// `llvm-config-20` (matches the LLVM 20 the compiler is built against).
+    /// Only consulted on the `--release-static` path, so a normal dev build
+    /// never needs it present.  The env override is what lets a musl release
+    /// build under Alpine point at its own `llvm-config` (which reports the
+    /// musl-built static `.a` set) with no source change.
+    static pick_llvm_config() -> string {
+        const env_raw: i8* = libc::getenv("CRYO_LLVM_CONFIG") as i8*;
+        if (env_raw != null) {
+            const env_val: string = env_raw as string;
+            if (libc::strlen(env_val) > 0) { return env_val; }
+        }
+        return "llvm-config-20";
+    }
+
+    /// Slurp `<llvm-config> --ldflags --libs --system-libs --link-static` and
+    /// return it as one space-separated flag string (`-L<libdir> -lLLVMCore ...
+    /// -lrt -ldl -lm -lz -lzstd -lxml2`) for splicing into the `--release-static`
+    /// link line.  This is how the 200+ component `.a` set AND its search dir are
+    /// obtained without hardcoding a list/path that would drift across LLVM
+    /// packagings - the `-L` from `--ldflags` is what makes this portable to a
+    /// musl/Alpine release where the static libs live elsewhere.  llvm-config
+    /// emits the sections in flag order: `-L` first, then the component libs,
+    /// then the system libs - the correct single-pass static link order.
+    /// Returns "" on popen failure, empty output, or a non-zero exit so the
+    /// caller can fail the link with a clear diagnostic.  Mirrors the
+    /// popen/fgets/pclose pattern in `c_header_import`'s `run_preproc_pipe`.
+    /// Runs at link time (after IR is emitted), so it never touches the `.ll`
+    /// the selfhost gate compares.
+    static static_llvm_link_flags(llvm_config: string) -> string {
+        const cmd: string = format("%s --ldflags --libs --system-libs --link-static", llvm_config);
+        const pipe: void* = intrinsics::popen(cmd, "r");
+        if (pipe == null) { return ""; }
+
+        mut out_buf: i8* = intrinsics::malloc(65536) as i8*;
+        mut out_len: u64 = 0;
+        mut out_cap: u64 = 65536;
+        mut line_buf: i8[4096];
+
+        while (libc::fgets(&line_buf[0], 4096, pipe) != null) {
+            const llen: u64 = libc::strlen(&line_buf[0] as string);
+            if (out_len + llen >= out_cap) {
+                out_cap *= 2;
+                const nb: i8* = intrinsics::malloc(out_cap) as i8*;
+                intrinsics::memcpy(nb as void*, out_buf as void*, out_len);
+                intrinsics::free(out_buf as void*);
+                out_buf = nb;
+            }
+            intrinsics::memcpy((out_buf + out_len) as void*, &line_buf[0] as void*, llen);
+            out_len += llen;
+        }
+        out_buf[out_len] = 0;
+        const exit_code: i32 = intrinsics::pclose(pipe);
+
+        if (exit_code != 0 || out_len == 0) {
+            intrinsics::free(out_buf as void*);
+            return "";
+        }
+
+        // llvm-config prints `--libs` and `--system-libs` on separate lines;
+        // flatten every newline to a space so the result is one flat argument
+        // string (libs first, then system libs - the correct static link order).
+        for (mut i: u64 = 0; i < out_len; i++) {
+            if (out_buf[i] == '\n' as i8 || out_buf[i] == '\r' as i8) {
+                out_buf[i] = ' ' as i8;
+            }
+        }
+        return out_buf as string;
+    }
+
+    /// Byte-wise path equality that treats `/` and `\` as the same
+    /// separator.  `ctx.source_file` and `discovery_root_path()` are built
+    /// by different code paths and can disagree on separator style on a
+    /// native Windows host even when they name the same file.
+    static paths_equal_loose(a: string, b: string) -> boolean {
+        const la: i64 = libc::strlen(a) as i64;
+        const lb: i64 = libc::strlen(b) as i64;
+        if (la != lb) { return false; }
+        const ab: i8* = a as i8*;
+        const bb: i8* = b as i8*;
+        for (mut i: i64 = 0; i < la; i++) {
+            const ca: i8 = ab[i];
+            const cb: i8 = bb[i];
+            if (ca != cb) {
+                const ca_sep: boolean = (ca == '/' || ca == '\\');
+                const cb_sep: boolean = (cb == '/' || cb == '\\');
+                if (!ca_sep || !cb_sep) { return false; }
+            }
+        }
+        return true;
+    }
+
+    /// Per-profile link-target path for the active target, with `.exe`
+    /// applied on Windows.  Wraps `ProjectConfig::profile_bin_path` so the
+    /// suffix logic lives in one place; `run_linking` writes to this path
+    /// and the incremental-build manifest in instance.cryo stats it.
+    static profile_bin_path_for_target(cfg: ProjectConfig*,
+                                         ctx: CompilationContext*) -> string {
+        const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
+        return cfg.profile_bin_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
+    }
+
+    /// Hoisted (build-root) executable path for the active target, with
+    /// `.exe` applied on Windows.  Same shape as
+    /// `profile_bin_path_for_target` but lands the file at the user-facing
+    /// `<output_dir>/<name>[.exe]` instead of the per-profile cache.
+    static bin_artifact_path_for_target(cfg: ProjectConfig*,
+                                          ctx: CompilationContext*) -> string {
+        const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
+        return cfg.bin_artifact_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
     }
 }

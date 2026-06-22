@@ -51,446 +51,15 @@ public function find_innermost_node_at(root: ProgramNode*,
         const stmt: ASTNode* = root.statements[i];
         if (stmt == null) { continue; }
         if (!span_contains(stmt.span, line, character)) { continue; }
-        return walk_node(stmt, line, character);
+        return NodeLocator::walk_node(stmt, line, character);
     }
     return null;
-}
-
-
-/// Generic descent: given an `ASTNode*` known to cover the position,
-/// look for a child whose span ALSO covers it.  When one is found,
-/// recurse; otherwise return the input as the innermost match.
-function walk_node(node: ASTNode*, line: u32, character: u32) -> ASTNode* {
-    if (node == null) { return null; }
-
-    const child: ASTNode* = first_covering_child(node, line, character);
-    if (child == null) { return node; }
-    return walk_node(child, line, character);
-}
-
-
-/// Return the first child of `node` whose span covers (line, character),
-/// or `null` if no child does.  Per-kind dispatch: each branch knows
-/// the structural children of its node type.  Add new node kinds here
-/// when they need to participate in position lookup; leaving a kind
-/// out is harmless (the walk just stops at that node).
-function first_covering_child(node: ASTNode*,
-                               line: u32, character: u32) -> ASTNode* {
-    match (node.kind) {
-        // -- Expressions --
-        NodeKind::BinaryExpression => {
-            const e: BinaryExprNode* = node as BinaryExprNode*;
-            return pick(e.left as ASTNode*, e.right as ASTNode*, null, null,
-                        line, character);
-        }
-        NodeKind::UnaryExpression => {
-            const e: UnaryExprNode* = node as UnaryExprNode*;
-            return pick(e.operand as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::TernaryExpression => {
-            const e: TernaryExprNode* = node as TernaryExprNode*;
-            return pick(e.condition as ASTNode*, e.true_expr as ASTNode*,
-                        e.false_expr as ASTNode*, null, line, character);
-        }
-        NodeKind::IfExpression => {
-            const e: IfExprNode* = node as IfExprNode*;
-            return pick(e.condition as ASTNode*, e.then_expr as ASTNode*,
-                        e.else_expr as ASTNode*, null, line, character);
-        }
-        NodeKind::CallExpression => {
-            const e: CallExprNode* = node as CallExprNode*;
-            const callee_match: ASTNode* = pick_one(e.callee as ASTNode*, line, character);
-            if (callee_match != null) { return callee_match; }
-            return pick_array_expr(e.arguments, line, character);
-        }
-        NodeKind::NewExpression => {
-            const e: NewExprNode* = node as NewExprNode*;
-            return pick_array_expr(e.arguments, line, character);
-        }
-        NodeKind::CastExpression => {
-            const e: CastExprNode* = node as CastExprNode*;
-            return pick(e.expression as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::MemberAccess => {
-            const e: MemberAccessNode* = node as MemberAccessNode*;
-            return pick(e.object as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::ArrayAccess => {
-            const e: ArrayAccessNode* = node as ArrayAccessNode*;
-            return pick(e.array as ASTNode*, e.index as ASTNode*, null, null,
-                        line, character);
-        }
-        NodeKind::ArrayLiteral => {
-            const e: ArrayLiteralNode* = node as ArrayLiteralNode*;
-            return pick_array_expr(e.elements, line, character);
-        }
-        NodeKind::TupleLiteral => {
-            const e: TupleLiteralNode* = node as TupleLiteralNode*;
-            return pick_array_expr(e.elements, line, character);
-        }
-        NodeKind::StructLiteral => {
-            // StructLiteral fields are name=expr pairs.  Descend into
-            // each `FieldInit.value` so the cursor on a value
-            // expression (an identifier, a `Foo::Bar` ScopeResolution,
-            // a literal) reaches the inner node.  When the cursor is
-            // on the field name itself the descent finds nothing and
-            // the caller falls back to the StructLiteral hover branch
-            // which classifies cursor-on-name vs cursor-on-head.
-            const e: StructLiteralNode* = node as StructLiteralNode*;
-            for (mut i: i64 = 0; i < e.field_inits.length; i++) {
-                const v: ExpressionNode* = e.field_inits[i].value;
-                if (v != null && span_contains(v.span, line, character)) {
-                    return v as ASTNode*;
-                }
-            }
-            return null;
-        }
-        NodeKind::TypeofExpression => {
-            const e: TypeofExprNode* = node as TypeofExprNode*;
-            return pick(e.operand as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::DeleteExpression => {
-            const e: DeleteExprNode* = node as DeleteExprNode*;
-            return pick(e.operand as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::AwaitExpression => {
-            const e: AwaitExprNode* = node as AwaitExprNode*;
-            return pick(e.operand as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::TryExpression => {
-            // Descend into the source operand, not the synthetic desugar;
-            // hover/go-to-definition want the spans the user actually typed.
-            const e: TryExprNode* = node as TryExprNode*;
-            return pick(e.operand as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::YieldExpression => {
-            const e: YieldExprNode* = node as YieldExprNode*;
-            return pick(e.operand as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::LambdaExpression => {
-            const e: LambdaExprNode* = node as LambdaExprNode*;
-            return pick(e.body as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::MatchExpression => {
-            const e: MatchExprNode* = node as MatchExprNode*;
-            const subj: ASTNode* = pick_one(e.subject as ASTNode*, line, character);
-            if (subj != null) { return subj; }
-            return pick_array_arm(e.arms, line, character);
-        }
-        NodeKind::StaticMatchExpression => {
-            const e: StaticMatchExprNode* = node as StaticMatchExprNode*;
-            for (mut i: i64 = 0; i < e.arms.length; i++) {
-                const arm: StaticMatchArmNode* = e.arms[i];
-                if (arm == null || arm.body == null) { continue; }
-                const hit: ASTNode* = pick(arm.body as ASTNode*, null, null, null,
-                                           line, character);
-                if (hit != null) { return hit; }
-            }
-            return null;
-        }
-
-        // -- Statements --
-        NodeKind::BlockStatement => {
-            const s: BlockStmtNode* = node as BlockStmtNode*;
-            return pick_array_stmt(s.statements, line, character);
-        }
-        NodeKind::UnsafeBlockStatement => {
-            const s: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
-            return pick(s.block as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::ReturnStatement => {
-            const s: ReturnStmtNode* = node as ReturnStmtNode*;
-            return pick(s.expression as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::IfStatement => {
-            const s: IfStmtNode* = node as IfStmtNode*;
-            return pick(s.condition as ASTNode*, s.then_stmt as ASTNode*,
-                        s.else_stmt as ASTNode*, null, line, character);
-        }
-        NodeKind::WhileStatement => {
-            const s: WhileStmtNode* = node as WhileStmtNode*;
-            return pick(s.condition as ASTNode*, s.body as ASTNode*, null, null,
-                        line, character);
-        }
-        NodeKind::DoWhileStatement => {
-            const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
-            return pick(s.body as ASTNode*, s.condition as ASTNode*, null, null,
-                        line, character);
-        }
-        NodeKind::ForStatement => {
-            const s: ForStmtNode* = node as ForStmtNode*;
-            return pick(s.init, s.condition as ASTNode*,
-                        s.update as ASTNode*, s.body as ASTNode*,
-                        line, character);
-        }
-        NodeKind::LoopStatement => {
-            const s: LoopStmtNode* = node as LoopStmtNode*;
-            return pick(s.body as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::ExpressionStatement => {
-            const s: ExprStmtNode* = node as ExprStmtNode*;
-            return pick(s.expression as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::DeclarationStatement => {
-            const s: DeclStmtNode* = node as DeclStmtNode*;
-            return pick(s.declaration as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::MatchStatement => {
-            const s: MatchStmtNode* = node as MatchStmtNode*;
-            const subj: ASTNode* = pick_one(s.subject as ASTNode*, line, character);
-            if (subj != null) { return subj; }
-            return pick_array_arm(s.arms, line, character);
-        }
-        NodeKind::StaticMatchStatement => {
-            const s: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
-            for (mut i: i64 = 0; i < s.arms.length; i++) {
-                const arm: StaticMatchArmNode* = s.arms[i];
-                if (arm == null || arm.body == null) { continue; }
-                const hit: ASTNode* = pick(arm.body as ASTNode*, null, null, null,
-                                           line, character);
-                if (hit != null) { return hit; }
-            }
-            return null;
-        }
-        NodeKind::MatchArm => {
-            const a: MatchArmNode* = node as MatchArmNode*;
-            // Patterns first: `ENOENT` in `ENOENT => { ... }` is a
-            // PatternNode with `pattern_kind = Identifier`.  Hover
-            // dispatch resolves the pattern's `value` SymbolStr
-            // through the resolver to recover the const it names.
-            const pat_match: ASTNode* = pick_array_pattern(
-                a.patterns, line, character);
-            if (pat_match != null) { return pat_match; }
-            return pick(a.body as ASTNode*, null, null, null, line, character);
-        }
-
-        // -- Declarations --
-        NodeKind::VariableDeclaration => {
-            const d: VarDeclNode* = node as VarDeclNode*;
-            return pick(d.initializer as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::FunctionDeclaration => {
-            const d: FunctionDeclNode* = node as FunctionDeclNode*;
-            // Body almost always covers the cursor; parameters span the
-            // signature line so they're checked first.
-            const param_match: ASTNode* = pick_array_var(
-                d.parameters, line, character);
-            if (param_match != null) { return param_match; }
-            return pick(d.body as ASTNode*, null, null, null, line, character);
-        }
-        NodeKind::MethodDeclaration => {
-            const d: MethodNode* = node as MethodNode*;
-            if (d.func == null) { return null; }
-            // Stop at MethodNode when the cursor is on the method's
-            // name token; otherwise the walk descends into the inner
-            // FunctionDeclNode and the hover renders as a free
-            // function with a `function` keyword.  The method-name
-            // case is more useful, so let the MethodDeclaration
-            // hover branch handle it.
-            if (span_contains(d.func.name_span, line, character)) { return null; }
-            // Drive descent into the inner `FunctionDeclNode`'s
-            // params and body directly: parse_method leaves
-            // `func.span` covering only the method-name token, so a
-            // generic `pick(d.func)` span check would miss every
-            // position inside the params or body and the walk would
-            // stop at MethodNode (whole method) instead of the
-            // identifier under the cursor.
-            const f: FunctionDeclNode* = d.func;
-            const param_match: ASTNode* = pick_array_var(
-                f.parameters, line, character);
-            if (param_match != null) { return param_match; }
-            if (f.body != null && span_contains(f.body.span, line, character)) {
-                return f.body as ASTNode*;
-            }
-            return null;
-        }
-        NodeKind::StructDeclaration => {
-            const d: StructDeclNode* = node as StructDeclNode*;
-            const f: ASTNode* = pick_array_field(d.fields, line, character);
-            if (f != null) { return f; }
-            return pick_array_method(d.methods, line, character);
-        }
-        NodeKind::ClassDeclaration => {
-            const d: ClassDeclNode* = node as ClassDeclNode*;
-            const f: ASTNode* = pick_array_field(d.fields, line, character);
-            if (f != null) { return f; }
-            return pick_array_method(d.methods, line, character);
-        }
-        NodeKind::EnumDeclaration => {
-            // Descend into variants so a hover on `NotFound` inside
-            // `type enum X { NotFound; ... }` reaches the
-            // `EnumVariantNode` directly.  Without this descent the
-            // walk stops at `EnumDeclaration` and the hover renders
-            // the enum head instead of the specific variant.
-            const d: EnumDeclNode* = node as EnumDeclNode*;
-            return pick_array_variant(d.variants, line, character);
-        }
-        NodeKind::TraitDeclaration => {
-            // Trait methods are stored as bare `FunctionDeclNode*` (no
-            // `MethodNode` wrapper, since trait decls have no instance
-            // bodies in the inherent-method sense).  Without this
-            // descent the locator stops at TraitDeclaration and any
-            // hover inside a trait method's signature renders the
-            // trait head instead of the method.
-            const d: TraitDeclNode* = node as TraitDeclNode*;
-            return pick_array_function(d.methods, line, character);
-        }
-        NodeKind::ImplementationBlock => {
-            // `synthesize_default_trait_methods` (TypeResolution) clones
-            // default-bodied trait methods INTO this impl's `methods`
-            // array.  The clones retain spans from the trait decl's
-            // source file (e.g. `io/traits.cryo`), so a line-only match
-            // can land on a synthesized method whose line number
-            // happens to overlap the impl head in the impl's own file.
-            // Filter to methods whose span.file matches the impl
-            // block's span.file so position lookup only sees real
-            // source positions in the file we're walking.
-            const d: ImplBlockNode* = node as ImplBlockNode*;
-            return pick_array_method_in_file(
-                d.methods, d.span.file, line, character);
-        }
-        _ => { return null; }
-    }
 }
 
 
 // pick*: scan a small fixed set of children + return the first that
 // covers the cursor.  Avoids the boilerplate of writing the same
 // `if (a != null && contains) return a;` chain per node kind.
-
-function pick(a: ASTNode*, b: ASTNode*, c: ASTNode*, d: ASTNode*,
-              line: u32, character: u32) -> ASTNode* {
-    if (a != null && span_contains(a.span, line, character)) { return a; }
-    if (b != null && span_contains(b.span, line, character)) { return b; }
-    if (c != null && span_contains(c.span, line, character)) { return c; }
-    if (d != null && span_contains(d.span, line, character)) { return d; }
-    return null;
-}
-
-function pick_one(a: ASTNode*, line: u32, character: u32) -> ASTNode* {
-    if (a != null && span_contains(a.span, line, character)) { return a; }
-    return null;
-}
-
-function pick_array_expr(arr: &ExpressionNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: ExpressionNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-function pick_array_stmt(arr: &StatementNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: StatementNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-function pick_array_var(arr: &VarDeclNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: VarDeclNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-function pick_array_method(arr: &MethodNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: MethodNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-/// Bare-function variant: `TraitDeclNode.methods` is a
-/// `FunctionDeclNode*[]` rather than `MethodNode*[]`, so it can't go
-/// through `pick_array_method`.
-function pick_array_function(arr: &FunctionDeclNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: FunctionDeclNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-/// Like `pick_array_method`, but skips methods whose span.file differs
-/// from `expected_file`.  Used by the ImplementationBlock dispatch:
-/// `synthesize_default_trait_methods` clones default-bodied trait
-/// methods into the impl's `methods` array, and the clones retain
-/// spans from the trait decl's source file.  Without the file filter
-/// a line-only match can pick a synthesized method whose line range
-/// overlaps the impl head in the impl's own file.
-function pick_array_method_in_file(arr: &MethodNode*[], expected_file: string,
-                                    line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: MethodNode* = arr[i];
-        if (elem == null) { continue; }
-        if (!same_file(elem.span.file, expected_file)) { continue; }
-        if (span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-/// String equality on file paths.  Both args may be null; null/empty
-/// counts as "unknown" and never matches a known file.
-function same_file(a: string, b: string) -> boolean {
-    if (a == null || b == null) { return false; }
-    return a.eq(b);
-}
-
-function pick_array_field(arr: &FieldDeclNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: FieldDeclNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-function pick_array_arm(arr: &MatchArmNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: MatchArmNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-function pick_array_variant(arr: &EnumVariantNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: EnumVariantNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
-
-function pick_array_pattern(arr: &PatternNode*[], line: u32, character: u32) -> ASTNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const elem: PatternNode* = arr[i];
-        if (elem != null && span_contains(elem.span, line, character)) {
-            return elem as ASTNode*;
-        }
-    }
-    return null;
-}
 
 
 // Per-node-kind type extraction for hover.
@@ -595,15 +164,15 @@ public function find_method_in_modules(graph: ModuleGraph*,
                                         method_name: SymbolStr) -> MethodNode* {
     if (graph == null) { return null; }
     const type_leaf: string = if (intern != null) {
-        leaf_segment_str(intern.resolve(type_name))
+        NodeLocator::leaf_segment_str(intern.resolve(type_name))
     } else { "" };
     const n: u32 = graph.module_count();
     for (mut mi: u32 = 0; mi < n; mi++) {
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
-            const found: MethodNode* = match_methods_on_type(
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            const found: MethodNode* = NodeLocator::match_methods_on_type(
                 stmt, intern, type_name, type_leaf, method_name);
             if (found != null) { return found; }
         }
@@ -611,31 +180,6 @@ public function find_method_in_modules(graph: ModuleGraph*,
     return null;
 }
 
-/// Last segment after the final `::`, matching `extract_leaf_segment`
-/// in `Compiler::Types::Arena`.  Local copy because the locator
-/// avoids a cross-module dependency on the arena module.
-function leaf_segment_str(s: string) -> string {
-    const len: i64 = strlen(s) as i64;
-    mut last_sep: i64 = -1;
-    for (mut i: i64 = 0; i + 1 < len; i++) {
-        if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
-    }
-    if (last_sep < 0) { return s; }
-    const start: i64 = last_sep + 2;
-    if (start >= len) { return ""; }
-    return ptr_add(s as void*, start) as string;
-}
-
-/// True when `decl_name` matches `type_name` either by SymbolStr id
-/// (caller passed the bare name) or by string content vs. the
-/// pre-extracted leaf (caller passed a qualified name).
-function type_name_matches(intern: InternTable*, decl_name: SymbolStr,
-                            type_name: SymbolStr, type_leaf: string) -> boolean {
-    if (decl_name.equals(type_name)) { return true; }
-    if (intern == null || strlen(type_leaf) == 0) { return false; }
-    const dn: string = intern.resolve(decl_name);
-    return dn.eq(type_leaf);
-}
 
 /// Find a top-level free function named `name` anywhere in the
 /// module graph.  Used for `Module::function`-style scope-resolution
@@ -648,7 +192,7 @@ public function find_function_in_modules(graph: ModuleGraph*,
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
             if (stmt.kind != NodeKind::FunctionDeclaration) { continue; }
             const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
@@ -672,7 +216,7 @@ public function find_const_in_modules(graph: ModuleGraph*,
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
             if (stmt.kind != NodeKind::VariableDeclaration) { continue; }
             const v: VarDeclNode* = stmt as VarDeclNode*;
@@ -700,59 +244,6 @@ public function find_program_by_namespace(graph: ModuleGraph*,
     return null;
 }
 
-/// `ProgramNode.statements` mixes raw decl nodes and `DeclStmtNode`
-/// wrappers depending on how the parser shaped that file's top-level
-/// list.  Unwrap so callers can branch on the inner decl's `NodeKind`
-/// directly.
-function unwrap_decl_stmt(node: ASTNode*) -> ASTNode* {
-    if (node == null) { return null; }
-    if (node.kind != NodeKind::DeclarationStatement) { return node; }
-    const d: DeclStmtNode* = node as DeclStmtNode*;
-    return d.declaration as ASTNode*;
-}
-
-function match_methods_on_type(stmt: ASTNode*, intern: InternTable*,
-                                type_name: SymbolStr, type_leaf: string,
-                                method_name: SymbolStr) -> MethodNode* {
-    if (stmt == null) { return null; }
-    match (stmt.kind) {
-        NodeKind::StructDeclaration => {
-            const d: StructDeclNode* = stmt as StructDeclNode*;
-            if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
-            return method_by_name(d.methods, method_name);
-        }
-        NodeKind::ClassDeclaration => {
-            const d: ClassDeclNode* = stmt as ClassDeclNode*;
-            if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
-            return method_by_name(d.methods, method_name);
-        }
-        NodeKind::EnumDeclaration => {
-            const d: EnumDeclNode* = stmt as EnumDeclNode*;
-            if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
-            // EnumDeclNode currently has no methods array; methods
-            // for enums live in ImplBlockNode.  Match struct/class
-            // pattern when that changes.
-            return null;
-        }
-        NodeKind::ImplementationBlock => {
-            const d: ImplBlockNode* = stmt as ImplBlockNode*;
-            if (!type_name_matches(intern, d.target_type, type_name, type_leaf)) {
-                return null;
-            }
-            return method_by_name(d.methods, method_name);
-        }
-        _ => { return null; }
-    }
-}
-
-function method_by_name(methods: &MethodNode*[], name: SymbolStr) -> MethodNode* {
-    for (mut i: i64 = 0; i < methods.length; i++) {
-        const m: MethodNode* = methods[i];
-        if (m == null || m.func == null) { continue; }
-        if (m.func.name.equals(name)) { return m; }
-    }
-    return null;
-}
 
 /// Find the owner type-name for a `MethodNode` by reverse-walking
 /// every module's top-level decls.  Returns `SymbolStr::empty()` when
@@ -767,41 +258,13 @@ public function find_method_owner(graph: ModuleGraph*,
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
-            const owner: SymbolStr = owner_if_contains(stmt, method);
+            const owner: SymbolStr = NodeLocator::owner_if_contains(stmt, method);
             if (owner.is_valid()) { return owner; }
         }
     }
     return SymbolStr::empty();
-}
-
-function owner_if_contains(stmt: ASTNode*, method: MethodNode*) -> SymbolStr {
-    match (stmt.kind) {
-        NodeKind::StructDeclaration => {
-            const d: StructDeclNode* = stmt as StructDeclNode*;
-            if (methods_contains(d.methods, method)) { return d.name; }
-            return SymbolStr::empty();
-        }
-        NodeKind::ClassDeclaration => {
-            const d: ClassDeclNode* = stmt as ClassDeclNode*;
-            if (methods_contains(d.methods, method)) { return d.name; }
-            return SymbolStr::empty();
-        }
-        NodeKind::ImplementationBlock => {
-            const d: ImplBlockNode* = stmt as ImplBlockNode*;
-            if (methods_contains(d.methods, method)) { return d.target_type; }
-            return SymbolStr::empty();
-        }
-        _ => { return SymbolStr::empty(); }
-    }
-}
-
-function methods_contains(arr: &MethodNode*[], target: MethodNode*) -> boolean {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        if (arr[i] == target) { return true; }
-    }
-    return false;
 }
 
 
@@ -828,61 +291,12 @@ public function find_enclosing_method_owner(graph: ModuleGraph*,
     if (ast == null) { return SymbolStr::empty(); }
 
     for (mut si: i64 = 0; si < ast.statements.length; si++) {
-        const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+        const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
         if (stmt == null) { continue; }
-        const owner: SymbolStr = enclosing_owner_of(stmt, line, character);
+        const owner: SymbolStr = NodeLocator::enclosing_owner_of(stmt, line, character);
         if (owner.is_valid()) { return owner; }
     }
     return SymbolStr::empty();
-}
-
-function enclosing_owner_of(stmt: ASTNode*, line: u32, character: u32) -> SymbolStr {
-    match (stmt.kind) {
-        NodeKind::StructDeclaration => {
-            const d: StructDeclNode* = stmt as StructDeclNode*;
-            if (method_body_contains_at(d.methods, line, character)) {
-                return d.name;
-            }
-            return SymbolStr::empty();
-        }
-        NodeKind::ClassDeclaration => {
-            const d: ClassDeclNode* = stmt as ClassDeclNode*;
-            if (method_body_contains_at(d.methods, line, character)) {
-                return d.name;
-            }
-            return SymbolStr::empty();
-        }
-        NodeKind::ImplementationBlock => {
-            const d: ImplBlockNode* = stmt as ImplBlockNode*;
-            if (method_body_contains_at(d.methods, line, character)) {
-                return d.target_type;
-            }
-            return SymbolStr::empty();
-        }
-        NodeKind::TraitDeclaration => {
-            // Trait method bodies (default impls): for the `Self`
-            // hover case.  Trait methods are FunctionDeclNode here.
-            const d: TraitDeclNode* = stmt as TraitDeclNode*;
-            for (mut fi: i64 = 0; fi < d.methods.length; fi++) {
-                const f: FunctionDeclNode* = d.methods[fi];
-                if (f != null && f.body != null
-                        && span_contains(f.body.span, line, character)) {
-                    return d.name;
-                }
-            }
-            return SymbolStr::empty();
-        }
-        _ => { return SymbolStr::empty(); }
-    }
-}
-
-function method_body_contains_at(arr: &MethodNode*[], line: u32, character: u32) -> boolean {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const m: MethodNode* = arr[i];
-        if (m == null || m.func == null || m.func.body == null) { continue; }
-        if (span_contains(m.func.body.span, line, character)) { return true; }
-    }
-    return false;
 }
 
 
@@ -899,18 +313,18 @@ public function find_trait_method_in_modules(graph: ModuleGraph*,
                                               method_name: SymbolStr) -> FunctionDeclNode* {
     if (graph == null) { return null; }
     const trait_leaf: string = if (intern != null) {
-        leaf_segment_str(intern.resolve(trait_name))
+        NodeLocator::leaf_segment_str(intern.resolve(trait_name))
     } else { "" };
     const n: u32 = graph.module_count();
     for (mut mi: u32 = 0; mi < n; mi++) {
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
             if (stmt.kind != NodeKind::TraitDeclaration) { continue; }
             const td: TraitDeclNode* = stmt as TraitDeclNode*;
-            if (!type_name_matches(intern, td.name, trait_name, trait_leaf)) {
+            if (!NodeLocator::type_name_matches(intern, td.name, trait_name, trait_leaf)) {
                 continue;
             }
             for (mut fi: i64 = 0; fi < td.methods.length; fi++) {
@@ -945,57 +359,11 @@ public function find_enclosing_function(graph: ModuleGraph*,
     if (ast == null) { return null; }
 
     for (mut si: i64 = 0; si < ast.statements.length; si++) {
-        const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+        const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
         if (stmt == null) { continue; }
-        const found: FunctionDeclNode* = enclosing_function_in(
+        const found: FunctionDeclNode* = NodeLocator::enclosing_function_in(
             stmt, line, character);
         if (found != null) { return found; }
-    }
-    return null;
-}
-
-function enclosing_function_in(stmt: ASTNode*, line: u32, character: u32) -> FunctionDeclNode* {
-    if (stmt == null) { return null; }
-    if (stmt.kind == NodeKind::FunctionDeclaration) {
-        const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-        if (f.body != null && span_contains(f.body.span, line, character)) {
-            return f;
-        }
-        return null;
-    }
-    if (stmt.kind == NodeKind::StructDeclaration) {
-        const d: StructDeclNode* = stmt as StructDeclNode*;
-        return enclosing_function_in_methods(d.methods, line, character);
-    }
-    if (stmt.kind == NodeKind::ClassDeclaration) {
-        const d: ClassDeclNode* = stmt as ClassDeclNode*;
-        return enclosing_function_in_methods(d.methods, line, character);
-    }
-    if (stmt.kind == NodeKind::ImplementationBlock) {
-        const d: ImplBlockNode* = stmt as ImplBlockNode*;
-        return enclosing_function_in_methods(d.methods, line, character);
-    }
-    if (stmt.kind == NodeKind::TraitDeclaration) {
-        const d: TraitDeclNode* = stmt as TraitDeclNode*;
-        for (mut i: i64 = 0; i < d.methods.length; i++) {
-            const f: FunctionDeclNode* = d.methods[i];
-            if (f != null && f.body != null
-                    && span_contains(f.body.span, line, character)) {
-                return f;
-            }
-        }
-        return null;
-    }
-    return null;
-}
-
-function enclosing_function_in_methods(arr: &MethodNode*[], line: u32, character: u32) -> FunctionDeclNode* {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        const m: MethodNode* = arr[i];
-        if (m == null || m.func == null || m.func.body == null) { continue; }
-        if (span_contains(m.func.body.span, line, character)) {
-            return m.func;
-        }
     }
     return null;
 }
@@ -1023,238 +391,8 @@ public function is_member_access_callee(graph: ModuleGraph*,
     if (ast == null) { return false; }
 
     for (mut si: i64 = 0; si < ast.statements.length; si++) {
-        if (node_contains_callee(ast.statements[si], target)) { return true; }
+        if (NodeLocator::node_contains_callee(ast.statements[si], target)) { return true; }
     }
-    return false;
-}
-
-/// DFS over the AST looking for a `CallExprNode` whose `callee` is
-/// `target`.  Per-kind dispatch over the structural children; adding
-/// a new node kind that owns expression children means adding a case
-/// here, otherwise the search just stops at that branch.
-function node_contains_callee(node: ASTNode*, target: MemberAccessNode*) -> boolean {
-    if (node == null) { return false; }
-
-    if (node.kind == NodeKind::CallExpression) {
-        const c: CallExprNode* = node as CallExprNode*;
-        if (c.callee == target as ExpressionNode*) { return true; }
-        if (node_contains_callee(c.callee as ASTNode*, target)) { return true; }
-        for (mut i: i64 = 0; i < c.arguments.length; i++) {
-            if (node_contains_callee(c.arguments[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::MemberAccess) {
-        const m: MemberAccessNode* = node as MemberAccessNode*;
-        return node_contains_callee(m.object as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::ArrayAccess) {
-        const a: ArrayAccessNode* = node as ArrayAccessNode*;
-        if (node_contains_callee(a.array as ASTNode*, target)) { return true; }
-        return node_contains_callee(a.index as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::BinaryExpression) {
-        const b: BinaryExprNode* = node as BinaryExprNode*;
-        if (node_contains_callee(b.left as ASTNode*, target)) { return true; }
-        return node_contains_callee(b.right as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = node as UnaryExprNode*;
-        return node_contains_callee(u.operand as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::TernaryExpression) {
-        const t: TernaryExprNode* = node as TernaryExprNode*;
-        if (node_contains_callee(t.condition as ASTNode*, target))  { return true; }
-        if (node_contains_callee(t.true_expr as ASTNode*, target))  { return true; }
-        return node_contains_callee(t.false_expr as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::IfExpression) {
-        const i: IfExprNode* = node as IfExprNode*;
-        if (node_contains_callee(i.condition as ASTNode*, target)) { return true; }
-        if (node_contains_callee(i.then_expr as ASTNode*, target)) { return true; }
-        return node_contains_callee(i.else_expr as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::CastExpression) {
-        const e: CastExprNode* = node as CastExprNode*;
-        return node_contains_callee(e.expression as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::DeleteExpression) {
-        const e: DeleteExprNode* = node as DeleteExprNode*;
-        return node_contains_callee(e.operand as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::TypeofExpression) {
-        const e: TypeofExprNode* = node as TypeofExprNode*;
-        return node_contains_callee(e.operand as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::ArrayLiteral) {
-        const a: ArrayLiteralNode* = node as ArrayLiteralNode*;
-        for (mut i: i64 = 0; i < a.elements.length; i++) {
-            if (node_contains_callee(a.elements[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::TupleLiteral) {
-        const t: TupleLiteralNode* = node as TupleLiteralNode*;
-        for (mut i: i64 = 0; i < t.elements.length; i++) {
-            if (node_contains_callee(t.elements[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::StructLiteral) {
-        const s: StructLiteralNode* = node as StructLiteralNode*;
-        for (mut i: i64 = 0; i < s.field_inits.length; i++) {
-            if (node_contains_callee(s.field_inits[i].value as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::NewExpression) {
-        const n: NewExprNode* = node as NewExprNode*;
-        for (mut i: i64 = 0; i < n.arguments.length; i++) {
-            if (node_contains_callee(n.arguments[i] as ASTNode*, target)) { return true; }
-        }
-        if (n.array_size != null) {
-            if (node_contains_callee(n.array_size as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::MatchExpression) {
-        const m: MatchExprNode* = node as MatchExprNode*;
-        if (node_contains_callee(m.subject as ASTNode*, target)) { return true; }
-        for (mut i: i64 = 0; i < m.arms.length; i++) {
-            const arm: MatchArmNode* = m.arms[i];
-            if (arm != null && node_contains_callee(arm.body as ASTNode*, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::StaticMatchExpression) {
-        const sm: StaticMatchExprNode* = node as StaticMatchExprNode*;
-        for (mut i: i64 = 0; i < sm.arms.length; i++) {
-            const arm: StaticMatchArmNode* = sm.arms[i];
-            if (arm != null && node_contains_callee(arm.body as ASTNode*, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Statements that own expressions / nested blocks
-    if (node.kind == NodeKind::BlockStatement) {
-        const b: BlockStmtNode* = node as BlockStmtNode*;
-        for (mut i: i64 = 0; i < b.statements.length; i++) {
-            if (node_contains_callee(b.statements[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::UnsafeBlockStatement) {
-        const u: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
-        return node_contains_callee(u.block as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::ReturnStatement) {
-        const r: ReturnStmtNode* = node as ReturnStmtNode*;
-        return node_contains_callee(r.expression as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::IfStatement) {
-        const s: IfStmtNode* = node as IfStmtNode*;
-        if (node_contains_callee(s.condition as ASTNode*, target)) { return true; }
-        if (node_contains_callee(s.then_stmt as ASTNode*, target)) { return true; }
-        return node_contains_callee(s.else_stmt as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::WhileStatement) {
-        const s: WhileStmtNode* = node as WhileStmtNode*;
-        if (node_contains_callee(s.condition as ASTNode*, target)) { return true; }
-        return node_contains_callee(s.body as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::DoWhileStatement) {
-        const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
-        if (node_contains_callee(s.body as ASTNode*, target)) { return true; }
-        return node_contains_callee(s.condition as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::ForStatement) {
-        const s: ForStmtNode* = node as ForStmtNode*;
-        if (node_contains_callee(s.init, target)) { return true; }
-        if (node_contains_callee(s.condition as ASTNode*, target)) { return true; }
-        if (node_contains_callee(s.update as ASTNode*, target)) { return true; }
-        return node_contains_callee(s.body as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::LoopStatement) {
-        const s: LoopStmtNode* = node as LoopStmtNode*;
-        return node_contains_callee(s.body as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::ExpressionStatement) {
-        const s: ExprStmtNode* = node as ExprStmtNode*;
-        return node_contains_callee(s.expression as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::DeclarationStatement) {
-        const s: DeclStmtNode* = node as DeclStmtNode*;
-        return node_contains_callee(s.declaration as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::MatchStatement) {
-        const s: MatchStmtNode* = node as MatchStmtNode*;
-        if (node_contains_callee(s.subject as ASTNode*, target)) { return true; }
-        for (mut i: i64 = 0; i < s.arms.length; i++) {
-            const arm: MatchArmNode* = s.arms[i];
-            if (arm != null && node_contains_callee(arm.body as ASTNode*, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::StaticMatchStatement) {
-        const sm: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
-        for (mut i: i64 = 0; i < sm.arms.length; i++) {
-            const arm: StaticMatchArmNode* = sm.arms[i];
-            if (arm != null && node_contains_callee(arm.body as ASTNode*, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Declarations whose bodies own expressions
-    if (node.kind == NodeKind::VariableDeclaration) {
-        const v: VarDeclNode* = node as VarDeclNode*;
-        return node_contains_callee(v.initializer as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::FunctionDeclaration) {
-        const f: FunctionDeclNode* = node as FunctionDeclNode*;
-        return node_contains_callee(f.body as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::MethodDeclaration) {
-        const m: MethodNode* = node as MethodNode*;
-        if (m.func == null) { return false; }
-        return node_contains_callee(m.func.body as ASTNode*, target);
-    }
-    if (node.kind == NodeKind::StructDeclaration) {
-        const d: StructDeclNode* = node as StructDeclNode*;
-        for (mut i: i64 = 0; i < d.methods.length; i++) {
-            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::ClassDeclaration) {
-        const d: ClassDeclNode* = node as ClassDeclNode*;
-        for (mut i: i64 = 0; i < d.methods.length; i++) {
-            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::ImplementationBlock) {
-        const d: ImplBlockNode* = node as ImplBlockNode*;
-        for (mut i: i64 = 0; i < d.methods.length; i++) {
-            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-    if (node.kind == NodeKind::TraitDeclaration) {
-        const d: TraitDeclNode* = node as TraitDeclNode*;
-        for (mut i: i64 = 0; i < d.methods.length; i++) {
-            if (node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
-        }
-        return false;
-    }
-
     return false;
 }
 
@@ -1269,43 +407,19 @@ public function find_field_in_modules(graph: ModuleGraph*,
                                        field_name: SymbolStr) -> FieldDeclNode* {
     if (graph == null) { return null; }
     const type_leaf: string = if (intern != null) {
-        leaf_segment_str(intern.resolve(type_name))
+        NodeLocator::leaf_segment_str(intern.resolve(type_name))
     } else { "" };
     const n: u32 = graph.module_count();
     for (mut mi: u32 = 0; mi < n; mi++) {
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
-            const found: FieldDeclNode* = match_fields_on_type(
+            const found: FieldDeclNode* = NodeLocator::match_fields_on_type(
                 stmt, intern, type_name, type_leaf, field_name);
             if (found != null) { return found; }
         }
-    }
-    return null;
-}
-
-function match_fields_on_type(stmt: ASTNode*, intern: InternTable*,
-                               type_name: SymbolStr, type_leaf: string,
-                               field_name: SymbolStr) -> FieldDeclNode* {
-    if (stmt.kind == NodeKind::StructDeclaration) {
-        const d: StructDeclNode* = stmt as StructDeclNode*;
-        if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
-        for (mut i: i64 = 0; i < d.fields.length; i++) {
-            const f: FieldDeclNode* = d.fields[i];
-            if (f != null && f.name.equals(field_name)) { return f; }
-        }
-        return null;
-    }
-    if (stmt.kind == NodeKind::ClassDeclaration) {
-        const d: ClassDeclNode* = stmt as ClassDeclNode*;
-        if (!type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
-        for (mut i: i64 = 0; i < d.fields.length; i++) {
-            const f: FieldDeclNode* = d.fields[i];
-            if (f != null && f.name.equals(field_name)) { return f; }
-        }
-        return null;
     }
     return null;
 }
@@ -1325,7 +439,7 @@ public function find_trait_for_function(graph: ModuleGraph*,
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
             if (stmt.kind != NodeKind::TraitDeclaration) { continue; }
             const td: TraitDeclNode* = stmt as TraitDeclNode*;
@@ -1351,49 +465,21 @@ public function find_type_decl_in_modules(graph: ModuleGraph*,
                                            type_name: SymbolStr) -> ASTNode* {
     if (graph == null) { return null; }
     const type_leaf: string = if (intern != null) {
-        leaf_segment_str(intern.resolve(type_name))
+        NodeLocator::leaf_segment_str(intern.resolve(type_name))
     } else { "" };
     const n: u32 = graph.module_count();
     for (mut mi: u32 = 0; mi < n; mi++) {
         const ast: ProgramNode* = graph.get_module_ast(mi);
         if (ast == null) { continue; }
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_decl_stmt(ast.statements[si]);
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
-            if (decl_name_matches(stmt, intern, type_name, type_leaf)) {
+            if (NodeLocator::decl_name_matches(stmt, intern, type_name, type_leaf)) {
                 return stmt;
             }
         }
     }
     return null;
-}
-
-function decl_name_matches(stmt: ASTNode*, intern: InternTable*,
-                            type_name: SymbolStr, type_leaf: string) -> boolean {
-    match (stmt.kind) {
-        NodeKind::StructDeclaration => {
-            const d: StructDeclNode* = stmt as StructDeclNode*;
-            return type_name_matches(intern, d.name, type_name, type_leaf);
-        }
-        NodeKind::ClassDeclaration => {
-            const d: ClassDeclNode* = stmt as ClassDeclNode*;
-            return type_name_matches(intern, d.name, type_name, type_leaf);
-        }
-        NodeKind::EnumDeclaration => {
-            const d: EnumDeclNode* = stmt as EnumDeclNode*;
-            return type_name_matches(intern, d.name, type_name, type_leaf);
-        }
-        NodeKind::TraitDeclaration => {
-            const d: TraitDeclNode* = stmt as TraitDeclNode*;
-            return type_name_matches(intern, d.name, type_name, type_leaf);
-        }
-        NodeKind::TypeAliasDeclaration => {
-            const d: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-            return type_name_matches(intern, d.alias_name, type_name, type_leaf);
-        }
-        _ => { return false; }
-    }
-    return false;
 }
 
 
@@ -1453,4 +539,925 @@ public function find_named_annotation_at(ann: TypeAnnotation*,
         _ => { return null; }
     }
     return null;
+}
+
+
+/// Position/name lookup helpers for LSP (go-to-def, hover, enclosing-scope).
+/// Stateless `static`s over the AST + module graph; the `public function`
+/// API above dispatches into these.
+type struct NodeLocator {
+
+    /// Generic descent: given an `ASTNode*` known to cover the position,
+    /// look for a child whose span ALSO covers it.  When one is found,
+    /// recurse; otherwise return the input as the innermost match.
+    static walk_node(node: ASTNode*, line: u32, character: u32) -> ASTNode* {
+        if (node == null) { return null; }
+
+        const child: ASTNode* = NodeLocator::first_covering_child(node, line, character);
+        if (child == null) { return node; }
+        return NodeLocator::walk_node(child, line, character);
+    }
+
+    /// Return the first child of `node` whose span covers (line, character),
+    /// or `null` if no child does.  Per-kind dispatch: each branch knows
+    /// the structural children of its node type.  Add new node kinds here
+    /// when they need to participate in position lookup; leaving a kind
+    /// out is harmless (the walk just stops at that node).
+    static first_covering_child(node: ASTNode*,
+                                   line: u32, character: u32) -> ASTNode* {
+        match (node.kind) {
+            // -- Expressions --
+            NodeKind::BinaryExpression => {
+                const e: BinaryExprNode* = node as BinaryExprNode*;
+                return NodeLocator::pick(e.left as ASTNode*, e.right as ASTNode*, null, null,
+                            line, character);
+            }
+            NodeKind::UnaryExpression => {
+                const e: UnaryExprNode* = node as UnaryExprNode*;
+                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::TernaryExpression => {
+                const e: TernaryExprNode* = node as TernaryExprNode*;
+                return NodeLocator::pick(e.condition as ASTNode*, e.true_expr as ASTNode*,
+                            e.false_expr as ASTNode*, null, line, character);
+            }
+            NodeKind::IfExpression => {
+                const e: IfExprNode* = node as IfExprNode*;
+                return NodeLocator::pick(e.condition as ASTNode*, e.then_expr as ASTNode*,
+                            e.else_expr as ASTNode*, null, line, character);
+            }
+            NodeKind::CallExpression => {
+                const e: CallExprNode* = node as CallExprNode*;
+                const callee_match: ASTNode* = NodeLocator::pick_one(e.callee as ASTNode*, line, character);
+                if (callee_match != null) { return callee_match; }
+                return NodeLocator::pick_array_expr(e.arguments, line, character);
+            }
+            NodeKind::NewExpression => {
+                const e: NewExprNode* = node as NewExprNode*;
+                return NodeLocator::pick_array_expr(e.arguments, line, character);
+            }
+            NodeKind::CastExpression => {
+                const e: CastExprNode* = node as CastExprNode*;
+                return NodeLocator::pick(e.expression as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::MemberAccess => {
+                const e: MemberAccessNode* = node as MemberAccessNode*;
+                return NodeLocator::pick(e.object as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::ArrayAccess => {
+                const e: ArrayAccessNode* = node as ArrayAccessNode*;
+                return NodeLocator::pick(e.array as ASTNode*, e.index as ASTNode*, null, null,
+                            line, character);
+            }
+            NodeKind::ArrayLiteral => {
+                const e: ArrayLiteralNode* = node as ArrayLiteralNode*;
+                return NodeLocator::pick_array_expr(e.elements, line, character);
+            }
+            NodeKind::TupleLiteral => {
+                const e: TupleLiteralNode* = node as TupleLiteralNode*;
+                return NodeLocator::pick_array_expr(e.elements, line, character);
+            }
+            NodeKind::StructLiteral => {
+                // StructLiteral fields are name=expr pairs.  Descend into
+                // each `FieldInit.value` so the cursor on a value
+                // expression (an identifier, a `Foo::Bar` ScopeResolution,
+                // a literal) reaches the inner node.  When the cursor is
+                // on the field name itself the descent finds nothing and
+                // the caller falls back to the StructLiteral hover branch
+                // which classifies cursor-on-name vs cursor-on-head.
+                const e: StructLiteralNode* = node as StructLiteralNode*;
+                for (mut i: i64 = 0; i < e.field_inits.length; i++) {
+                    const v: ExpressionNode* = e.field_inits[i].value;
+                    if (v != null && span_contains(v.span, line, character)) {
+                        return v as ASTNode*;
+                    }
+                }
+                return null;
+            }
+            NodeKind::TypeofExpression => {
+                const e: TypeofExprNode* = node as TypeofExprNode*;
+                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::DeleteExpression => {
+                const e: DeleteExprNode* = node as DeleteExprNode*;
+                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::AwaitExpression => {
+                const e: AwaitExprNode* = node as AwaitExprNode*;
+                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::TryExpression => {
+                // Descend into the source operand, not the synthetic desugar;
+                // hover/go-to-definition want the spans the user actually typed.
+                const e: TryExprNode* = node as TryExprNode*;
+                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::YieldExpression => {
+                const e: YieldExprNode* = node as YieldExprNode*;
+                return NodeLocator::pick(e.operand as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::LambdaExpression => {
+                const e: LambdaExprNode* = node as LambdaExprNode*;
+                return NodeLocator::pick(e.body as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::MatchExpression => {
+                const e: MatchExprNode* = node as MatchExprNode*;
+                const subj: ASTNode* = NodeLocator::pick_one(e.subject as ASTNode*, line, character);
+                if (subj != null) { return subj; }
+                return NodeLocator::pick_array_arm(e.arms, line, character);
+            }
+            NodeKind::StaticMatchExpression => {
+                const e: StaticMatchExprNode* = node as StaticMatchExprNode*;
+                for (mut i: i64 = 0; i < e.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = e.arms[i];
+                    if (arm == null || arm.body == null) { continue; }
+                    const hit: ASTNode* = NodeLocator::pick(arm.body as ASTNode*, null, null, null,
+                                               line, character);
+                    if (hit != null) { return hit; }
+                }
+                return null;
+            }
+
+            // -- Statements --
+            NodeKind::BlockStatement => {
+                const s: BlockStmtNode* = node as BlockStmtNode*;
+                return NodeLocator::pick_array_stmt(s.statements, line, character);
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const s: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
+                return NodeLocator::pick(s.block as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::ReturnStatement => {
+                const s: ReturnStmtNode* = node as ReturnStmtNode*;
+                return NodeLocator::pick(s.expression as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::IfStatement => {
+                const s: IfStmtNode* = node as IfStmtNode*;
+                return NodeLocator::pick(s.condition as ASTNode*, s.then_stmt as ASTNode*,
+                            s.else_stmt as ASTNode*, null, line, character);
+            }
+            NodeKind::WhileStatement => {
+                const s: WhileStmtNode* = node as WhileStmtNode*;
+                return NodeLocator::pick(s.condition as ASTNode*, s.body as ASTNode*, null, null,
+                            line, character);
+            }
+            NodeKind::DoWhileStatement => {
+                const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
+                return NodeLocator::pick(s.body as ASTNode*, s.condition as ASTNode*, null, null,
+                            line, character);
+            }
+            NodeKind::ForStatement => {
+                const s: ForStmtNode* = node as ForStmtNode*;
+                return NodeLocator::pick(s.init, s.condition as ASTNode*,
+                            s.update as ASTNode*, s.body as ASTNode*,
+                            line, character);
+            }
+            NodeKind::LoopStatement => {
+                const s: LoopStmtNode* = node as LoopStmtNode*;
+                return NodeLocator::pick(s.body as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::ExpressionStatement => {
+                const s: ExprStmtNode* = node as ExprStmtNode*;
+                return NodeLocator::pick(s.expression as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::DeclarationStatement => {
+                const s: DeclStmtNode* = node as DeclStmtNode*;
+                return NodeLocator::pick(s.declaration as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::MatchStatement => {
+                const s: MatchStmtNode* = node as MatchStmtNode*;
+                const subj: ASTNode* = NodeLocator::pick_one(s.subject as ASTNode*, line, character);
+                if (subj != null) { return subj; }
+                return NodeLocator::pick_array_arm(s.arms, line, character);
+            }
+            NodeKind::StaticMatchStatement => {
+                const s: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < s.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = s.arms[i];
+                    if (arm == null || arm.body == null) { continue; }
+                    const hit: ASTNode* = NodeLocator::pick(arm.body as ASTNode*, null, null, null,
+                                               line, character);
+                    if (hit != null) { return hit; }
+                }
+                return null;
+            }
+            NodeKind::MatchArm => {
+                const a: MatchArmNode* = node as MatchArmNode*;
+                // Patterns first: `ENOENT` in `ENOENT => { ... }` is a
+                // PatternNode with `pattern_kind = Identifier`.  Hover
+                // dispatch resolves the pattern's `value` SymbolStr
+                // through the resolver to recover the const it names.
+                const pat_match: ASTNode* = NodeLocator::pick_array_pattern(
+                    a.patterns, line, character);
+                if (pat_match != null) { return pat_match; }
+                return NodeLocator::pick(a.body as ASTNode*, null, null, null, line, character);
+            }
+
+            // -- Declarations --
+            NodeKind::VariableDeclaration => {
+                const d: VarDeclNode* = node as VarDeclNode*;
+                return NodeLocator::pick(d.initializer as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::FunctionDeclaration => {
+                const d: FunctionDeclNode* = node as FunctionDeclNode*;
+                // Body almost always covers the cursor; parameters span the
+                // signature line so they're checked first.
+                const param_match: ASTNode* = NodeLocator::pick_array_var(
+                    d.parameters, line, character);
+                if (param_match != null) { return param_match; }
+                return NodeLocator::pick(d.body as ASTNode*, null, null, null, line, character);
+            }
+            NodeKind::MethodDeclaration => {
+                const d: MethodNode* = node as MethodNode*;
+                if (d.func == null) { return null; }
+                // Stop at MethodNode when the cursor is on the method's
+                // name token; otherwise the walk descends into the inner
+                // FunctionDeclNode and the hover renders as a free
+                // function with a `function` keyword.  The method-name
+                // case is more useful, so let the MethodDeclaration
+                // hover branch handle it.
+                if (span_contains(d.func.name_span, line, character)) { return null; }
+                // Drive descent into the inner `FunctionDeclNode`'s
+                // params and body directly: parse_method leaves
+                // `func.span` covering only the method-name token, so a
+                // generic `pick(d.func)` span check would miss every
+                // position inside the params or body and the walk would
+                // stop at MethodNode (whole method) instead of the
+                // identifier under the cursor.
+                const f: FunctionDeclNode* = d.func;
+                const param_match: ASTNode* = NodeLocator::pick_array_var(
+                    f.parameters, line, character);
+                if (param_match != null) { return param_match; }
+                if (f.body != null && span_contains(f.body.span, line, character)) {
+                    return f.body as ASTNode*;
+                }
+                return null;
+            }
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = node as StructDeclNode*;
+                const f: ASTNode* = NodeLocator::pick_array_field(d.fields, line, character);
+                if (f != null) { return f; }
+                return NodeLocator::pick_array_method(d.methods, line, character);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = node as ClassDeclNode*;
+                const f: ASTNode* = NodeLocator::pick_array_field(d.fields, line, character);
+                if (f != null) { return f; }
+                return NodeLocator::pick_array_method(d.methods, line, character);
+            }
+            NodeKind::EnumDeclaration => {
+                // Descend into variants so a hover on `NotFound` inside
+                // `type enum X { NotFound; ... }` reaches the
+                // `EnumVariantNode` directly.  Without this descent the
+                // walk stops at `EnumDeclaration` and the hover renders
+                // the enum head instead of the specific variant.
+                const d: EnumDeclNode* = node as EnumDeclNode*;
+                return NodeLocator::pick_array_variant(d.variants, line, character);
+            }
+            NodeKind::TraitDeclaration => {
+                // Trait methods are stored as bare `FunctionDeclNode*` (no
+                // `MethodNode` wrapper, since trait decls have no instance
+                // bodies in the inherent-method sense).  Without this
+                // descent the locator stops at TraitDeclaration and any
+                // hover inside a trait method's signature renders the
+                // trait head instead of the method.
+                const d: TraitDeclNode* = node as TraitDeclNode*;
+                return NodeLocator::pick_array_function(d.methods, line, character);
+            }
+            NodeKind::ImplementationBlock => {
+                // `synthesize_default_trait_methods` (TypeResolution) clones
+                // default-bodied trait methods INTO this impl's `methods`
+                // array.  The clones retain spans from the trait decl's
+                // source file (e.g. `io/traits.cryo`), so a line-only match
+                // can land on a synthesized method whose line number
+                // happens to overlap the impl head in the impl's own file.
+                // Filter to methods whose span.file matches the impl
+                // block's span.file so position lookup only sees real
+                // source positions in the file we're walking.
+                const d: ImplBlockNode* = node as ImplBlockNode*;
+                return NodeLocator::pick_array_method_in_file(
+                    d.methods, d.span.file, line, character);
+            }
+            _ => { return null; }
+        }
+    }
+
+    static pick(a: ASTNode*, b: ASTNode*, c: ASTNode*, d: ASTNode*,
+                  line: u32, character: u32) -> ASTNode* {
+        if (a != null && span_contains(a.span, line, character)) { return a; }
+        if (b != null && span_contains(b.span, line, character)) { return b; }
+        if (c != null && span_contains(c.span, line, character)) { return c; }
+        if (d != null && span_contains(d.span, line, character)) { return d; }
+        return null;
+    }
+
+    static pick_one(a: ASTNode*, line: u32, character: u32) -> ASTNode* {
+        if (a != null && span_contains(a.span, line, character)) { return a; }
+        return null;
+    }
+
+    static pick_array_expr(arr: &ExpressionNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: ExpressionNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    static pick_array_stmt(arr: &StatementNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: StatementNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    static pick_array_var(arr: &VarDeclNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: VarDeclNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    static pick_array_method(arr: &MethodNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: MethodNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    /// Bare-function variant: `TraitDeclNode.methods` is a
+    /// `FunctionDeclNode*[]` rather than `MethodNode*[]`, so it can't go
+    /// through `pick_array_method`.
+    static pick_array_function(arr: &FunctionDeclNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: FunctionDeclNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    /// Like `pick_array_method`, but skips methods whose span.file differs
+    /// from `expected_file`.  Used by the ImplementationBlock dispatch:
+    /// `synthesize_default_trait_methods` clones default-bodied trait
+    /// methods into the impl's `methods` array, and the clones retain
+    /// spans from the trait decl's source file.  Without the file filter
+    /// a line-only match can pick a synthesized method whose line range
+    /// overlaps the impl head in the impl's own file.
+    static pick_array_method_in_file(arr: &MethodNode*[], expected_file: string,
+                                        line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: MethodNode* = arr[i];
+            if (elem == null) { continue; }
+            if (!NodeLocator::same_file(elem.span.file, expected_file)) { continue; }
+            if (span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    /// String equality on file paths.  Both args may be null; null/empty
+    /// counts as "unknown" and never matches a known file.
+    static same_file(a: string, b: string) -> boolean {
+        if (a == null || b == null) { return false; }
+        return a.eq(b);
+    }
+
+    static pick_array_field(arr: &FieldDeclNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: FieldDeclNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    static pick_array_arm(arr: &MatchArmNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: MatchArmNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    static pick_array_variant(arr: &EnumVariantNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: EnumVariantNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    static pick_array_pattern(arr: &PatternNode*[], line: u32, character: u32) -> ASTNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const elem: PatternNode* = arr[i];
+            if (elem != null && span_contains(elem.span, line, character)) {
+                return elem as ASTNode*;
+            }
+        }
+        return null;
+    }
+
+    /// Last segment after the final `::`, matching `extract_leaf_segment`
+    /// in `Compiler::Types::Arena`.  Local copy because the locator
+    /// avoids a cross-module dependency on the arena module.
+    static leaf_segment_str(s: string) -> string {
+        const len: i64 = strlen(s) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
+        }
+        if (last_sep < 0) { return s; }
+        const start: i64 = last_sep + 2;
+        if (start >= len) { return ""; }
+        return ptr_add(s as void*, start) as string;
+    }
+
+    /// True when `decl_name` matches `type_name` either by SymbolStr id
+    /// (caller passed the bare name) or by string content vs. the
+    /// pre-extracted leaf (caller passed a qualified name).
+    static type_name_matches(intern: InternTable*, decl_name: SymbolStr,
+                                type_name: SymbolStr, type_leaf: string) -> boolean {
+        if (decl_name.equals(type_name)) { return true; }
+        if (intern == null || strlen(type_leaf) == 0) { return false; }
+        const dn: string = intern.resolve(decl_name);
+        return dn.eq(type_leaf);
+    }
+
+    /// `ProgramNode.statements` mixes raw decl nodes and `DeclStmtNode`
+    /// wrappers depending on how the parser shaped that file's top-level
+    /// list.  Unwrap so callers can branch on the inner decl's `NodeKind`
+    /// directly.
+    static unwrap_decl_stmt(node: ASTNode*) -> ASTNode* {
+        if (node == null) { return null; }
+        if (node.kind != NodeKind::DeclarationStatement) { return node; }
+        const d: DeclStmtNode* = node as DeclStmtNode*;
+        return d.declaration as ASTNode*;
+    }
+
+    static match_methods_on_type(stmt: ASTNode*, intern: InternTable*,
+                                    type_name: SymbolStr, type_leaf: string,
+                                    method_name: SymbolStr) -> MethodNode* {
+        if (stmt == null) { return null; }
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                if (!NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+                return NodeLocator::method_by_name(d.methods, method_name);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (!NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+                return NodeLocator::method_by_name(d.methods, method_name);
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                if (!NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+                // EnumDeclNode currently has no methods array; methods
+                // for enums live in ImplBlockNode.  Match struct/class
+                // pattern when that changes.
+                return null;
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (!NodeLocator::type_name_matches(intern, d.target_type, type_name, type_leaf)) {
+                    return null;
+                }
+                return NodeLocator::method_by_name(d.methods, method_name);
+            }
+            _ => { return null; }
+        }
+    }
+
+    static method_by_name(methods: &MethodNode*[], name: SymbolStr) -> MethodNode* {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (m.func.name.equals(name)) { return m; }
+        }
+        return null;
+    }
+
+    static owner_if_contains(stmt: ASTNode*, method: MethodNode*) -> SymbolStr {
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                if (NodeLocator::methods_contains(d.methods, method)) { return d.name; }
+                return SymbolStr::empty();
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (NodeLocator::methods_contains(d.methods, method)) { return d.name; }
+                return SymbolStr::empty();
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (NodeLocator::methods_contains(d.methods, method)) { return d.target_type; }
+                return SymbolStr::empty();
+            }
+            _ => { return SymbolStr::empty(); }
+        }
+    }
+
+    static methods_contains(arr: &MethodNode*[], target: MethodNode*) -> boolean {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            if (arr[i] == target) { return true; }
+        }
+        return false;
+    }
+
+    static enclosing_owner_of(stmt: ASTNode*, line: u32, character: u32) -> SymbolStr {
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                if (NodeLocator::method_body_contains_at(d.methods, line, character)) {
+                    return d.name;
+                }
+                return SymbolStr::empty();
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (NodeLocator::method_body_contains_at(d.methods, line, character)) {
+                    return d.name;
+                }
+                return SymbolStr::empty();
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (NodeLocator::method_body_contains_at(d.methods, line, character)) {
+                    return d.target_type;
+                }
+                return SymbolStr::empty();
+            }
+            NodeKind::TraitDeclaration => {
+                // Trait method bodies (default impls): for the `Self`
+                // hover case.  Trait methods are FunctionDeclNode here.
+                const d: TraitDeclNode* = stmt as TraitDeclNode*;
+                for (mut fi: i64 = 0; fi < d.methods.length; fi++) {
+                    const f: FunctionDeclNode* = d.methods[fi];
+                    if (f != null && f.body != null
+                            && span_contains(f.body.span, line, character)) {
+                        return d.name;
+                    }
+                }
+                return SymbolStr::empty();
+            }
+            _ => { return SymbolStr::empty(); }
+        }
+    }
+
+    static method_body_contains_at(arr: &MethodNode*[], line: u32, character: u32) -> boolean {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const m: MethodNode* = arr[i];
+            if (m == null || m.func == null || m.func.body == null) { continue; }
+            if (span_contains(m.func.body.span, line, character)) { return true; }
+        }
+        return false;
+    }
+
+    static enclosing_function_in(stmt: ASTNode*, line: u32, character: u32) -> FunctionDeclNode* {
+        if (stmt == null) { return null; }
+        if (stmt.kind == NodeKind::FunctionDeclaration) {
+            const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+            if (f.body != null && span_contains(f.body.span, line, character)) {
+                return f;
+            }
+            return null;
+        }
+        if (stmt.kind == NodeKind::StructDeclaration) {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            return NodeLocator::enclosing_function_in_methods(d.methods, line, character);
+        }
+        if (stmt.kind == NodeKind::ClassDeclaration) {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            return NodeLocator::enclosing_function_in_methods(d.methods, line, character);
+        }
+        if (stmt.kind == NodeKind::ImplementationBlock) {
+            const d: ImplBlockNode* = stmt as ImplBlockNode*;
+            return NodeLocator::enclosing_function_in_methods(d.methods, line, character);
+        }
+        if (stmt.kind == NodeKind::TraitDeclaration) {
+            const d: TraitDeclNode* = stmt as TraitDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                const f: FunctionDeclNode* = d.methods[i];
+                if (f != null && f.body != null
+                        && span_contains(f.body.span, line, character)) {
+                    return f;
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    static enclosing_function_in_methods(arr: &MethodNode*[], line: u32, character: u32) -> FunctionDeclNode* {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            const m: MethodNode* = arr[i];
+            if (m == null || m.func == null || m.func.body == null) { continue; }
+            if (span_contains(m.func.body.span, line, character)) {
+                return m.func;
+            }
+        }
+        return null;
+    }
+
+    /// DFS over the AST looking for a `CallExprNode` whose `callee` is
+    /// `target`.  Per-kind dispatch over the structural children; adding
+    /// a new node kind that owns expression children means adding a case
+    /// here, otherwise the search just stops at that branch.
+    static node_contains_callee(node: ASTNode*, target: MemberAccessNode*) -> boolean {
+        if (node == null) { return false; }
+
+        if (node.kind == NodeKind::CallExpression) {
+            const c: CallExprNode* = node as CallExprNode*;
+            if (c.callee == target as ExpressionNode*) { return true; }
+            if (NodeLocator::node_contains_callee(c.callee as ASTNode*, target)) { return true; }
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                if (NodeLocator::node_contains_callee(c.arguments[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::MemberAccess) {
+            const m: MemberAccessNode* = node as MemberAccessNode*;
+            return NodeLocator::node_contains_callee(m.object as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = node as ArrayAccessNode*;
+            if (NodeLocator::node_contains_callee(a.array as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(a.index as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = node as BinaryExprNode*;
+            if (NodeLocator::node_contains_callee(b.left as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(b.right as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = node as UnaryExprNode*;
+            return NodeLocator::node_contains_callee(u.operand as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = node as TernaryExprNode*;
+            if (NodeLocator::node_contains_callee(t.condition as ASTNode*, target))  { return true; }
+            if (NodeLocator::node_contains_callee(t.true_expr as ASTNode*, target))  { return true; }
+            return NodeLocator::node_contains_callee(t.false_expr as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::IfExpression) {
+            const i: IfExprNode* = node as IfExprNode*;
+            if (NodeLocator::node_contains_callee(i.condition as ASTNode*, target)) { return true; }
+            if (NodeLocator::node_contains_callee(i.then_expr as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(i.else_expr as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::CastExpression) {
+            const e: CastExprNode* = node as CastExprNode*;
+            return NodeLocator::node_contains_callee(e.expression as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::DeleteExpression) {
+            const e: DeleteExprNode* = node as DeleteExprNode*;
+            return NodeLocator::node_contains_callee(e.operand as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::TypeofExpression) {
+            const e: TypeofExprNode* = node as TypeofExprNode*;
+            return NodeLocator::node_contains_callee(e.operand as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::ArrayLiteral) {
+            const a: ArrayLiteralNode* = node as ArrayLiteralNode*;
+            for (mut i: i64 = 0; i < a.elements.length; i++) {
+                if (NodeLocator::node_contains_callee(a.elements[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::TupleLiteral) {
+            const t: TupleLiteralNode* = node as TupleLiteralNode*;
+            for (mut i: i64 = 0; i < t.elements.length; i++) {
+                if (NodeLocator::node_contains_callee(t.elements[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::StructLiteral) {
+            const s: StructLiteralNode* = node as StructLiteralNode*;
+            for (mut i: i64 = 0; i < s.field_inits.length; i++) {
+                if (NodeLocator::node_contains_callee(s.field_inits[i].value as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::NewExpression) {
+            const n: NewExprNode* = node as NewExprNode*;
+            for (mut i: i64 = 0; i < n.arguments.length; i++) {
+                if (NodeLocator::node_contains_callee(n.arguments[i] as ASTNode*, target)) { return true; }
+            }
+            if (n.array_size != null) {
+                if (NodeLocator::node_contains_callee(n.array_size as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::MatchExpression) {
+            const m: MatchExprNode* = node as MatchExprNode*;
+            if (NodeLocator::node_contains_callee(m.subject as ASTNode*, target)) { return true; }
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                const arm: MatchArmNode* = m.arms[i];
+                if (arm != null && NodeLocator::node_contains_callee(arm.body as ASTNode*, target)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::StaticMatchExpression) {
+            const sm: StaticMatchExprNode* = node as StaticMatchExprNode*;
+            for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                const arm: StaticMatchArmNode* = sm.arms[i];
+                if (arm != null && NodeLocator::node_contains_callee(arm.body as ASTNode*, target)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Statements that own expressions / nested blocks
+        if (node.kind == NodeKind::BlockStatement) {
+            const b: BlockStmtNode* = node as BlockStmtNode*;
+            for (mut i: i64 = 0; i < b.statements.length; i++) {
+                if (NodeLocator::node_contains_callee(b.statements[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::UnsafeBlockStatement) {
+            const u: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
+            return NodeLocator::node_contains_callee(u.block as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::ReturnStatement) {
+            const r: ReturnStmtNode* = node as ReturnStmtNode*;
+            return NodeLocator::node_contains_callee(r.expression as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::IfStatement) {
+            const s: IfStmtNode* = node as IfStmtNode*;
+            if (NodeLocator::node_contains_callee(s.condition as ASTNode*, target)) { return true; }
+            if (NodeLocator::node_contains_callee(s.then_stmt as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(s.else_stmt as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::WhileStatement) {
+            const s: WhileStmtNode* = node as WhileStmtNode*;
+            if (NodeLocator::node_contains_callee(s.condition as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(s.body as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::DoWhileStatement) {
+            const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
+            if (NodeLocator::node_contains_callee(s.body as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(s.condition as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::ForStatement) {
+            const s: ForStmtNode* = node as ForStmtNode*;
+            if (NodeLocator::node_contains_callee(s.init, target)) { return true; }
+            if (NodeLocator::node_contains_callee(s.condition as ASTNode*, target)) { return true; }
+            if (NodeLocator::node_contains_callee(s.update as ASTNode*, target)) { return true; }
+            return NodeLocator::node_contains_callee(s.body as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::LoopStatement) {
+            const s: LoopStmtNode* = node as LoopStmtNode*;
+            return NodeLocator::node_contains_callee(s.body as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::ExpressionStatement) {
+            const s: ExprStmtNode* = node as ExprStmtNode*;
+            return NodeLocator::node_contains_callee(s.expression as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::DeclarationStatement) {
+            const s: DeclStmtNode* = node as DeclStmtNode*;
+            return NodeLocator::node_contains_callee(s.declaration as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::MatchStatement) {
+            const s: MatchStmtNode* = node as MatchStmtNode*;
+            if (NodeLocator::node_contains_callee(s.subject as ASTNode*, target)) { return true; }
+            for (mut i: i64 = 0; i < s.arms.length; i++) {
+                const arm: MatchArmNode* = s.arms[i];
+                if (arm != null && NodeLocator::node_contains_callee(arm.body as ASTNode*, target)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::StaticMatchStatement) {
+            const sm: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
+            for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                const arm: StaticMatchArmNode* = sm.arms[i];
+                if (arm != null && NodeLocator::node_contains_callee(arm.body as ASTNode*, target)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Declarations whose bodies own expressions
+        if (node.kind == NodeKind::VariableDeclaration) {
+            const v: VarDeclNode* = node as VarDeclNode*;
+            return NodeLocator::node_contains_callee(v.initializer as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::FunctionDeclaration) {
+            const f: FunctionDeclNode* = node as FunctionDeclNode*;
+            return NodeLocator::node_contains_callee(f.body as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = node as MethodNode*;
+            if (m.func == null) { return false; }
+            return NodeLocator::node_contains_callee(m.func.body as ASTNode*, target);
+        }
+        if (node.kind == NodeKind::StructDeclaration) {
+            const d: StructDeclNode* = node as StructDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                if (NodeLocator::node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::ClassDeclaration) {
+            const d: ClassDeclNode* = node as ClassDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                if (NodeLocator::node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::ImplementationBlock) {
+            const d: ImplBlockNode* = node as ImplBlockNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                if (NodeLocator::node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::TraitDeclaration) {
+            const d: TraitDeclNode* = node as TraitDeclNode*;
+            for (mut i: i64 = 0; i < d.methods.length; i++) {
+                if (NodeLocator::node_contains_callee(d.methods[i] as ASTNode*, target)) { return true; }
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    static match_fields_on_type(stmt: ASTNode*, intern: InternTable*,
+                                   type_name: SymbolStr, type_leaf: string,
+                                   field_name: SymbolStr) -> FieldDeclNode* {
+        if (stmt.kind == NodeKind::StructDeclaration) {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            if (!NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            for (mut i: i64 = 0; i < d.fields.length; i++) {
+                const f: FieldDeclNode* = d.fields[i];
+                if (f != null && f.name.equals(field_name)) { return f; }
+            }
+            return null;
+        }
+        if (stmt.kind == NodeKind::ClassDeclaration) {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            if (!NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            for (mut i: i64 = 0; i < d.fields.length; i++) {
+                const f: FieldDeclNode* = d.fields[i];
+                if (f != null && f.name.equals(field_name)) { return f; }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    static decl_name_matches(stmt: ASTNode*, intern: InternTable*,
+                                type_name: SymbolStr, type_leaf: string) -> boolean {
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                return NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                return NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                return NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::TraitDeclaration => {
+                const d: TraitDeclNode* = stmt as TraitDeclNode*;
+                return NodeLocator::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const d: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
+                return NodeLocator::type_name_matches(intern, d.alias_name, type_name, type_leaf);
+            }
+            _ => { return false; }
+        }
+        return false;
+    }
 }

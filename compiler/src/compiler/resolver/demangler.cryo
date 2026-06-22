@@ -438,180 +438,186 @@ type struct ParsedPath {
 
 // Top-level demangler.
 
-/// Returns the pretty form of `input`.  For non-`C$`-prefixed inputs,
-/// returns `"<input> (unmangled)"`.  For malformed inputs, returns
-/// `"<input> (malformed)"`.
-function demangle(input: string) -> string {
-    const len: i64 = libc::strlen(input) as i64;
-    if (len < 2 || input[0] != 'C' || input[1] != '$') {
-        return input + " (unmangled)";
-    }
+/// Symbol demangler: turns `C$`-mangled linker names back into readable
+/// Cryo signatures (used by `cryo demangle` / diagnostics).  Single
+/// `static` entry point over the module-level `Cursor`/`ParsedPath`.
+type struct Demangler {
 
-    mut cur: Cursor = Cursor::new(input);
-    cur.advance(2);
-
-    // Optional kind tag.  The mangler emits `C$<code>$<path>` (one `$`
-    // shared between the `C$` prefix and the kind-tag opener), so after
-    // consuming `C$` we look directly at the two code chars and check for
-    // a closing `$` after them.  Kept as a (char, char) pair rather than
-    // a substring + dynamic `==` comparison to avoid heap allocation on a
-    // hot path; demangling runs once per symbol lookup.
-    mut kind_a: char = 0 as char;
-    mut kind_b: char = 0 as char;
-    {
-        const a: char = cur.peek_at(0);
-        const b: char = cur.peek_at(1);
-        const close: char = cur.peek_at(2);
-        if (close == '$' && Cursor::is_kind_tag(a, b)) {
-            kind_a = a;
-            kind_b = b;
-            cur.advance(2);            // consume code
-            cur.expect_char('$');      // consume trailing `$`
+    /// Returns the pretty form of `input`.  For non-`C$`-prefixed inputs,
+    /// returns `"<input> (unmangled)"`.  For malformed inputs, returns
+    /// `"<input> (malformed)"`.
+    static demangle(input: string) -> string {
+        const len: i64 = libc::strlen(input) as i64;
+        if (len < 2 || input[0] != 'C' || input[1] != '$') {
+            return input + " (unmangled)";
         }
-    }
 
-    // Trait impls have a different head: `<trait-segment>$f<owner-path>`.
-    mut trait_seg: string = "";
-    mut path: ParsedPath = ParsedPath { segments: [], member: "", has_member: false };
-
-    if (kind_a == 't' && kind_b == 'r') {
-        trait_seg = cur.parse_segment();
-        if (cur.ok) { cur.expect2('$', 'f'); }
-        if (cur.ok) { path = cur.parse_path(); }
-    } else {
-        path = cur.parse_path();
-    }
-
-    if (!cur.ok) { return input + " (malformed)"; }
-
-    // Optional signature: `$F <params> $R <ret>`.
-    mut has_sig: boolean = false;
-    mut params_str: string = "";
-    mut return_str: string = "";
-    mut leads_with_receiver: boolean = false;
-
-    if (cur.starts_with2('$', 'F')) {
+        mut cur: Cursor = Cursor::new(input);
         cur.advance(2);
-        has_sig = true;
-        // Detect receiver before dispatching so the path-head separator can
-        // adapt: methods use `.`, statics use `::`.
-        if (cur.starts_with2('$', 's') || cur.starts_with2('$', 'm')) {
-            leads_with_receiver = true;
+
+        // Optional kind tag.  The mangler emits `C$<code>$<path>` (one `$`
+        // shared between the `C$` prefix and the kind-tag opener), so after
+        // consuming `C$` we look directly at the two code chars and check for
+        // a closing `$` after them.  Kept as a (char, char) pair rather than
+        // a substring + dynamic `==` comparison to avoid heap allocation on a
+        // hot path; demangling runs once per symbol lookup.
+        mut kind_a: char = 0 as char;
+        mut kind_b: char = 0 as char;
+        {
+            const a: char = cur.peek_at(0);
+            const b: char = cur.peek_at(1);
+            const close: char = cur.peek_at(2);
+            if (close == '$' && Cursor::is_kind_tag(a, b)) {
+                kind_a = a;
+                kind_b = b;
+                cur.advance(2);            // consume code
+                cur.expect_char('$');      // consume trailing `$`
+            }
         }
-        params_str = cur.parse_param_list();
+
+        // Trait impls have a different head: `<trait-segment>$f<owner-path>`.
+        mut trait_seg: string = "";
+        mut path: ParsedPath = ParsedPath { segments: [], member: "", has_member: false };
+
+        if (kind_a == 't' && kind_b == 'r') {
+            trait_seg = cur.parse_segment();
+            if (cur.ok) { cur.expect2('$', 'f'); }
+            if (cur.ok) { path = cur.parse_path(); }
+        } else {
+            path = cur.parse_path();
+        }
+
         if (!cur.ok) { return input + " (malformed)"; }
-        cur.expect2('$', 'R');
-        if (!cur.ok) { return input + " (malformed)"; }
-        return_str = cur.parse_type();
-        if (!cur.ok) { return input + " (malformed)"; }
+
+        // Optional signature: `$F <params> $R <ret>`.
+        mut has_sig: boolean = false;
+        mut params_str: string = "";
+        mut return_str: string = "";
+        mut leads_with_receiver: boolean = false;
+
+        if (cur.starts_with2('$', 'F')) {
+            cur.advance(2);
+            has_sig = true;
+            // Detect receiver before dispatching so the path-head separator can
+            // adapt: methods use `.`, statics use `::`.
+            if (cur.starts_with2('$', 's') || cur.starts_with2('$', 'm')) {
+                leads_with_receiver = true;
+            }
+            params_str = cur.parse_param_list();
+            if (!cur.ok) { return input + " (malformed)"; }
+            cur.expect2('$', 'R');
+            if (!cur.ok) { return input + " (malformed)"; }
+            return_str = cur.parse_type();
+            if (!cur.ok) { return input + " (malformed)"; }
+        }
+
+        // Optional overload index: `$O<digits>`.
+        mut overload: i64 = -1;
+        if (cur.starts_with2('$', 'O')) {
+            cur.advance(2);
+            overload = cur.read_decimal();
+            if (!cur.ok) { return input + " (malformed)"; }
+        }
+
+        // Optional LLVM uniquification suffix: `.<digits>` (spec section 14).
+        mut llvm_suffix: i64 = -1;
+        if (cur.peek() == '.') {
+            // Only consume if the rest is purely digits.
+            mut k: i64 = cur.pos + 1;
+            mut all_digits: boolean = (k < cur.len);
+            while (k < cur.len) {
+                const c2: char = cur.text[k];
+                if (!(c2 >= '0' && c2 <= '9')) { all_digits = false; break; }
+                k += 1;
+            }
+            if (all_digits) {
+                cur.advance(1);
+                llvm_suffix = cur.read_decimal();
+            }
+        }
+
+        if (!cur.eof()) { return input + " (malformed)"; }
+
+        // Render the demangled symbol.  Branching on kind keeps the formatting
+        // concerns (data symbols vs. function-like) cleanly separate.
+
+        const path_inline: string = path.render_inline();
+
+        if (kind_a == 'v' && kind_b == 't') { return "<vtable for " + path_inline + ">"; }
+        if (kind_a == 't' && kind_b == 'i') { return "<typeinfo for " + path_inline + ">"; }
+        if (kind_a == 'm' && kind_b == 'i') { return "<module init for " + path_inline + ">"; }
+
+        if (kind_a == 'c' && kind_b == 'l') {
+            mut out: string = "<closure";
+            if (overload >= 0) {
+                out += " #";
+                out += overload.to_decimal_str();
+            }
+            out += " inside " + path_inline + ">";
+            if (llvm_suffix >= 0) {
+                out += " [.";
+                out += llvm_suffix.to_decimal_str();
+                out += "]";
+            }
+            return out;
+        }
+
+        // Function-like symbols from here on need a signature.
+        if (!has_sig) {
+            // Bare data symbol: just `C$<path>` with no kind tag.
+            mut bare: string = path_inline;
+            if (overload >= 0) {
+                bare += " [overload ";
+                bare += overload.to_decimal_str();
+                bare += "]";
+            }
+            if (llvm_suffix >= 0) {
+                bare += " [.";
+                bare += llvm_suffix.to_decimal_str();
+                bare += "]";
+            }
+            return bare;
+        }
+
+        // For ct/dt/op the member segment carries either the type leaf (ct/dt)
+        // or the operator code (op).  Render those in source-style form.
+        if (kind_a == 'c' && kind_b == 't') {
+            // `Owner::Owner(args) -> Owner`; drop the `-Owner` tail and add it
+            // back as the constructor name with `::`.
+            mut head: string = path.render_no_member();
+            if (path.has_member) {
+                head += "::";
+                head += path.member;
+            }
+            return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
+        }
+        if (kind_a == 'd' && kind_b == 't') {
+            mut head: string = "~" + path.render_no_member();
+            if (path.has_member) {
+                head += "::";
+                head += path.member;
+            }
+            return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
+        }
+        if (kind_a == 'o' && kind_b == 'p') {
+            mut head: string = path.render_no_member();
+            head += "::operator";
+            if (path.has_member) {
+                head += Cursor::op_code_to_symbol(path.member);
+            }
+            return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
+        }
+        if (kind_a == 't' && kind_b == 'r') {
+            const owner: string = path.render_no_member();
+            mut head: string = "<" + trait_seg + " for " + owner + ">";
+            if (path.has_member) {
+                head += (if (leads_with_receiver) { "." } else { "::" }) + path.member;
+            }
+            return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
+        }
+
+        // Plain function or method (no kind tag).
+        const head2: string = path.render_head(leads_with_receiver);
+        return Cursor::finalize(head2, params_str, return_str, overload, llvm_suffix);
     }
-
-    // Optional overload index: `$O<digits>`.
-    mut overload: i64 = -1;
-    if (cur.starts_with2('$', 'O')) {
-        cur.advance(2);
-        overload = cur.read_decimal();
-        if (!cur.ok) { return input + " (malformed)"; }
-    }
-
-    // Optional LLVM uniquification suffix: `.<digits>` (spec section 14).
-    mut llvm_suffix: i64 = -1;
-    if (cur.peek() == '.') {
-        // Only consume if the rest is purely digits.
-        mut k: i64 = cur.pos + 1;
-        mut all_digits: boolean = (k < cur.len);
-        while (k < cur.len) {
-            const c2: char = cur.text[k];
-            if (!(c2 >= '0' && c2 <= '9')) { all_digits = false; break; }
-            k += 1;
-        }
-        if (all_digits) {
-            cur.advance(1);
-            llvm_suffix = cur.read_decimal();
-        }
-    }
-
-    if (!cur.eof()) { return input + " (malformed)"; }
-
-    // Render the demangled symbol.  Branching on kind keeps the formatting
-    // concerns (data symbols vs. function-like) cleanly separate.
-
-    const path_inline: string = path.render_inline();
-
-    if (kind_a == 'v' && kind_b == 't') { return "<vtable for " + path_inline + ">"; }
-    if (kind_a == 't' && kind_b == 'i') { return "<typeinfo for " + path_inline + ">"; }
-    if (kind_a == 'm' && kind_b == 'i') { return "<module init for " + path_inline + ">"; }
-
-    if (kind_a == 'c' && kind_b == 'l') {
-        mut out: string = "<closure";
-        if (overload >= 0) {
-            out += " #";
-            out += overload.to_decimal_str();
-        }
-        out += " inside " + path_inline + ">";
-        if (llvm_suffix >= 0) {
-            out += " [.";
-            out += llvm_suffix.to_decimal_str();
-            out += "]";
-        }
-        return out;
-    }
-
-    // Function-like symbols from here on need a signature.
-    if (!has_sig) {
-        // Bare data symbol: just `C$<path>` with no kind tag.
-        mut bare: string = path_inline;
-        if (overload >= 0) {
-            bare += " [overload ";
-            bare += overload.to_decimal_str();
-            bare += "]";
-        }
-        if (llvm_suffix >= 0) {
-            bare += " [.";
-            bare += llvm_suffix.to_decimal_str();
-            bare += "]";
-        }
-        return bare;
-    }
-
-    // For ct/dt/op the member segment carries either the type leaf (ct/dt)
-    // or the operator code (op).  Render those in source-style form.
-    if (kind_a == 'c' && kind_b == 't') {
-        // `Owner::Owner(args) -> Owner`; drop the `-Owner` tail and add it
-        // back as the constructor name with `::`.
-        mut head: string = path.render_no_member();
-        if (path.has_member) {
-            head += "::";
-            head += path.member;
-        }
-        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
-    }
-    if (kind_a == 'd' && kind_b == 't') {
-        mut head: string = "~" + path.render_no_member();
-        if (path.has_member) {
-            head += "::";
-            head += path.member;
-        }
-        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
-    }
-    if (kind_a == 'o' && kind_b == 'p') {
-        mut head: string = path.render_no_member();
-        head += "::operator";
-        if (path.has_member) {
-            head += Cursor::op_code_to_symbol(path.member);
-        }
-        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
-    }
-    if (kind_a == 't' && kind_b == 'r') {
-        const owner: string = path.render_no_member();
-        mut head: string = "<" + trait_seg + " for " + owner + ">";
-        if (path.has_member) {
-            head += (if (leads_with_receiver) { "." } else { "::" }) + path.member;
-        }
-        return Cursor::finalize(head, params_str, return_str, overload, llvm_suffix);
-    }
-
-    // Plain function or method (no kind tag).
-    const head2: string = path.render_head(leads_with_receiver);
-    return Cursor::finalize(head2, params_str, return_str, overload, llvm_suffix);
 }

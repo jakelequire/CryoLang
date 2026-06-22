@@ -14,6 +14,7 @@ import ffi::libc;
 
 import Utils::Logger;
 import std::fs::metadata;
+import std::fs::dir;
 import std::fs::path;
 import std::fmt;
 import std::collections::str;
@@ -21,224 +22,205 @@ import std::collections::string;
 import Compiler::Deps::Cache;
 
 
-// Bare clone management
 
-/// Ensure the bare clone for `url` exists and (when `refresh` is true)
-/// has the latest remote refs. Idempotent.  Returns true on success.
-function ensure_bare_clone(url: string, refresh: boolean) -> boolean {
-    const dir: string = Cache::git_dir_for(url);
+/// Stateless namespace for the git subprocess operations the dep
+/// resolver drives.  All entry points are `static`; state lives on disk
+/// under the shared cache, not on any instance.
+type struct Git {
 
-    if (!metadata::exists(Path::from_cstr(dir))) {
-        // First-time clone.  `--bare` skips materialising a working
-        // tree (we make those on demand via `materialize_checkout`).
-        // `--quiet` keeps `cryo fetch` output focused on what's
-        // happening across multiple deps; users wanting verbose git
-        // output can run with `CRYO_DEBUG=1`.
-        Cache::ensure_dir(dir.parent_dir());
-        fmt::println(f"[deps] cloning {url}");
-        const cmd: string = format("git clone --bare --quiet '%s' '%s'", url, dir);
-        const status: i32 = system(cmd);
-        if (status != 0) {
-            fmt::eprintln(f"error: git clone failed for {url}");
+    // Bare clone management
+
+    /// Ensure the bare clone for `url` exists and (when `refresh` is true)
+    /// has the latest remote refs. Idempotent.  Returns true on success.
+    static ensure_bare_clone(url: string, refresh: boolean) -> boolean {
+        const dir: string = Cache::git_dir_for(url);
+
+        if (!metadata::exists(Path::from_cstr(dir))) {
+            // First-time clone.  `--bare` skips materialising a working
+            // tree (we make those on demand via `materialize_checkout`).
+            // `--quiet` keeps `cryo fetch` output focused on what's
+            // happening across multiple deps; users wanting verbose git
+            // output can run with `CRYO_DEBUG=1`.
+            dir::create_dir_all(Path::from_cstr(dir.parent_dir()));
+            fmt::println(f"[deps] cloning {url}");
+            const cmd: string = format("git clone --bare --quiet '%s' '%s'", url, dir);
+            const status: i32 = system(cmd);
+            if (status != 0) {
+                fmt::eprintln(f"error: git clone failed for {url}");
+                return false;
+            }
+            return true;
+        }
+
+        if (refresh) {
+            fmt::println(f"[deps] refreshing {url}");
+            const cmd: string = format(
+                "git --git-dir='%s' fetch --quiet --tags --prune --all", dir);
+            const status: i32 = system(cmd);
+            if (status != 0) {
+                fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
+                // Soft-fail: an offline build with a populated cache is
+                // still useful, and an unreachable remote shouldn't kill
+                // a project that was already pinned.
+            }
+        }
+
+        return true;
+    }
+
+    // Ref resolution
+
+    /// Resolve a ref (tag, branch, or short SHA) inside the bare clone
+    /// for `url` to a full 40-char commit SHA.  Returns "" on failure
+    /// and prints a diagnostic.
+    ///
+    /// Branch refs have to be qualified; `git fetch` from a bare clone
+    /// doesn't track local branches, so we look at the remote-tracking
+    /// `refs/heads/<branch>` ref directly.
+    static resolve_ref_to_sha(url: string, ref_kind: GitRefKind, ref_val: string) -> string {
+        const dir: string = Cache::git_dir_for(url);
+
+        // Build the candidate refspec list.  We try them in order; the
+        // first one that resolves wins.  `git rev-parse` succeeds (exit 0)
+        // and prints the SHA; on failure it prints to stderr and exits
+        // non-zero.
+        mut candidates: string[] = [];
+        match (ref_kind) {
+            GitRefKind::Tag => {
+                candidates.push(format("refs/tags/%s", ref_val));
+                candidates.push(ref_val);  // bare name in case user wrote `tag = "0.1.0"` and the tag is also `0.1.0`
+            }
+            GitRefKind::Branch => {
+                candidates.push(format("refs/heads/%s", ref_val));
+                candidates.push(ref_val);
+            }
+            GitRefKind::Rev => {
+                candidates.push(ref_val);
+            }
+            GitRefKind::Version => {
+                // Caller resolves Version -> tag separately via list_tags;
+                // by the time we land here it should have been rewritten.
+                fmt::eprintf("internal error: resolve_ref_to_sha called with raw Version ref\n");
+                return "";
+            }
+            GitRefKind::None => {
+                fmt::eprintf("internal error: resolve_ref_to_sha called with no ref\n");
+                return "";
+            }
+        }
+
+        for (mut i: int = 0; i < candidates.length; i++) {
+            const cmd: string = format(
+                "git --git-dir='%s' rev-parse --verify --quiet '%s^{commit}' 2>/dev/null",
+                dir, candidates[i]);
+            const sha: string = Git::read_first_line(cmd);
+            if (libc::strlen(sha) > 0) {
+                return sha;
+            }
+        }
+
+        fmt::eprintln(f"error: could not resolve '{ref_val}' inside {url}");
+        return "";
+    }
+
+    /// List every tag in the bare clone for `url`, one per element.
+    /// Used for semver-range resolution against `version = "..."`.
+    /// Returns an empty list on failure (and prints a diagnostic).
+    static list_tags(url: string) -> string[] {
+        const dir: string = Cache::git_dir_for(url);
+        const cmd: string = format(
+            "git --git-dir='%s' tag --list 2>/dev/null", dir);
+        return Git::read_lines(cmd);
+    }
+
+
+    // Working-tree materialisation
+
+    /// Path to the working tree for (`url`, `sha`).  Does not check
+    /// existence; callers use `is_checkout_present` for that.
+    static checkout_path(url: string, sha: string) -> string {
+        return Cache::checkout_dir_for(url, sha);
+    }
+
+    /// True when the working tree at (`url`, `sha`) is fully materialised.
+    /// We probe for `.git` rather than the directory itself because an
+    /// interrupted clone may leave a half-populated dir behind.
+    static is_checkout_present(url: string, sha: string) -> boolean {
+        const dir: string = Cache::checkout_dir_for(url, sha);
+        if (!metadata::exists(Path::from_cstr(dir))) { return false; }
+        return metadata::exists(Path::from_cstr(format("%s/.git", dir)));
+    }
+
+    /// Clone the bare cache into a fresh working tree at `<checkout>/<sha>`,
+    /// then `checkout` the requested SHA.  `--local` uses hardlinks where
+    /// the filesystem permits, so per-SHA storage cost is dominated by the
+    /// working tree itself rather than the .git history.
+    static materialize_checkout(url: string, sha: string) -> boolean {
+        if (Git::is_checkout_present(url, sha)) { return true; }
+
+        const bare:    string = Cache::git_dir_for(url);
+        const wt:      string = Cache::checkout_dir_for(url, sha);
+        const wt_par:  string = wt.parent_dir();
+
+        dir::create_dir_all(Path::from_cstr(wt_par));
+
+        // If a previous run left a partial tree behind (e.g., crash
+        // mid-checkout), clear it so the clone starts from a clean slate.
+        if (metadata::exists(Path::from_cstr(wt))) {
+            dir::remove_dir_all(Path::from_cstr(wt));
+        }
+
+        const clone_cmd: string = format(
+            "git clone --local --quiet '%s' '%s'", bare, wt);
+        if (system(clone_cmd) != 0) {
+            fmt::eprintln(f"error: failed to materialize working tree at {wt}");
+            return false;
+        }
+        const co_cmd: string = format(
+            "git -C '%s' checkout --quiet --detach '%s'", wt, sha);
+        if (system(co_cmd) != 0) {
+            fmt::eprintln(f"error: failed to checkout {sha} in {wt}");
             return false;
         }
         return true;
     }
 
-    if (refresh) {
-        fmt::println(f"[deps] refreshing {url}");
-        const cmd: string = format(
-            "git --git-dir='%s' fetch --quiet --tags --prune --all", dir);
-        const status: i32 = system(cmd);
-        if (status != 0) {
-            fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
-            // Soft-fail: an offline build with a populated cache is
-            // still useful, and an unreachable remote shouldn't kill
-            // a project that was already pinned.
-        }
-    }
 
-    return true;
-}
+    // Subprocess output capture
 
-// Ref resolution
-
-/// Resolve a ref (tag, branch, or short SHA) inside the bare clone
-/// for `url` to a full 40-char commit SHA.  Returns "" on failure
-/// and prints a diagnostic.
-///
-/// Branch refs have to be qualified; `git fetch` from a bare clone
-/// doesn't track local branches, so we look at the remote-tracking
-/// `refs/heads/<branch>` ref directly.
-function resolve_ref_to_sha(url: string, ref_kind: GitRefKind, ref_val: string) -> string {
-    const dir: string = Cache::git_dir_for(url);
-
-    // Build the candidate refspec list.  We try them in order; the
-    // first one that resolves wins.  `git rev-parse` succeeds (exit 0)
-    // and prints the SHA; on failure it prints to stderr and exits
-    // non-zero.
-    mut candidates: string[] = [];
-    match (ref_kind) {
-        GitRefKind::Tag => {
-            candidates.push(format("refs/tags/%s", ref_val));
-            candidates.push(ref_val);  // bare name in case user wrote `tag = "0.1.0"` and the tag is also `0.1.0`
-        }
-        GitRefKind::Branch => {
-            candidates.push(format("refs/heads/%s", ref_val));
-            candidates.push(ref_val);
-        }
-        GitRefKind::Rev => {
-            candidates.push(ref_val);
-        }
-        GitRefKind::Version => {
-            // Caller resolves Version -> tag separately via list_tags;
-            // by the time we land here it should have been rewritten.
-            fmt::eprintf("internal error: resolve_ref_to_sha called with raw Version ref\n");
-            return "";
-        }
-        GitRefKind::None => {
-            fmt::eprintf("internal error: resolve_ref_to_sha called with no ref\n");
-            return "";
-        }
-    }
-
-    for (mut i: int = 0; i < candidates.length; i++) {
-        const cmd: string = format(
-            "git --git-dir='%s' rev-parse --verify --quiet '%s^{commit}' 2>/dev/null",
-            dir, candidates[i]);
-        const sha: string = read_first_line(cmd);
-        if (libc::strlen(sha) > 0) {
-            return sha;
-        }
-    }
-
-    fmt::eprintln(f"error: could not resolve '{ref_val}' inside {url}");
-    return "";
-}
-
-/// List every tag in the bare clone for `url`, one per element.
-/// Used for semver-range resolution against `version = "..."`.
-/// Returns an empty list on failure (and prints a diagnostic).
-function list_tags(url: string) -> string[] {
-    const dir: string = Cache::git_dir_for(url);
-    const cmd: string = format(
-        "git --git-dir='%s' tag --list 2>/dev/null", dir);
-    return read_lines(cmd);
-}
-
-
-// Working-tree materialisation
-
-/// Path to the working tree for (`url`, `sha`).  Does not check
-/// existence; callers use `is_checkout_present` for that.
-function checkout_path(url: string, sha: string) -> string {
-    return Cache::checkout_dir_for(url, sha);
-}
-
-/// True when the working tree at (`url`, `sha`) is fully materialised.
-/// We probe for `.git` rather than the directory itself because an
-/// interrupted clone may leave a half-populated dir behind.
-function is_checkout_present(url: string, sha: string) -> boolean {
-    const dir: string = Cache::checkout_dir_for(url, sha);
-    if (!metadata::exists(Path::from_cstr(dir))) { return false; }
-    return metadata::exists(Path::from_cstr(format("%s/.git", dir)));
-}
-
-/// Clone the bare cache into a fresh working tree at `<checkout>/<sha>`,
-/// then `checkout` the requested SHA.  `--local` uses hardlinks where
-/// the filesystem permits, so per-SHA storage cost is dominated by the
-/// working tree itself rather than the .git history.
-function materialize_checkout(url: string, sha: string) -> boolean {
-    if (is_checkout_present(url, sha)) { return true; }
-
-    const bare:    string = Cache::git_dir_for(url);
-    const wt:      string = Cache::checkout_dir_for(url, sha);
-    const wt_par:  string = wt.parent_dir();
-
-    Cache::ensure_dir(wt_par);
-
-    // If a previous run left a partial tree behind (e.g., crash
-    // mid-checkout), clear it so the clone starts from a clean slate.
-    if (metadata::exists(Path::from_cstr(wt))) {
-        Cache::remove_dir(wt);
-    }
-
-    const clone_cmd: string = format(
-        "git clone --local --quiet '%s' '%s'", bare, wt);
-    if (system(clone_cmd) != 0) {
-        fmt::eprintln(f"error: failed to materialize working tree at {wt}");
-        return false;
-    }
-    const co_cmd: string = format(
-        "git -C '%s' checkout --quiet --detach '%s'", wt, sha);
-    if (system(co_cmd) != 0) {
-        fmt::eprintln(f"error: failed to checkout {sha} in {wt}");
-        return false;
-    }
-    return true;
-}
-
-
-// Subprocess output capture
-
-/// Run `cmd` and return its first line of stdout (with trailing
-/// newline stripped).  Returns "" if the process produced no output
-/// or exited non-zero.  Caller is responsible for adding redirection
-/// (`2>/dev/null`) when stderr noise is unwanted.
-function read_first_line(cmd: string) -> string {
-    const pipe: void* = intrinsics::popen(cmd, "r");
-    if (pipe == null) { return ""; }
-    mut buf: i8* = intrinsics::malloc(4096) as i8*;
-    const got: i8* = libc::fgets(buf, 4096, pipe) as i8*;
-    const status: i32 = intrinsics::pclose(pipe);
-    if (got == null) { return ""; }
-    const line: string = trim_trailing_newline(buf as string);
-    if (status != 0 && libc::strlen(line) == 0) { return ""; }
-    return line;
-}
-
-/// Run `cmd` and return every line of stdout in source order.
-/// Trailing newlines are stripped; empty lines are skipped.
-function read_lines(cmd: string) -> string[] {
-    mut out: string[] = [];
-    const pipe: void* = intrinsics::popen(cmd, "r");
-    if (pipe == null) { return out; }
-
-    mut buf: i8* = intrinsics::malloc(4096) as i8*;
-    while (true) {
+    /// Run `cmd` and return its first line of stdout (with trailing
+    /// newline stripped).  Returns "" if the process produced no output
+    /// or exited non-zero.  Caller is responsible for adding redirection
+    /// (`2>/dev/null`) when stderr noise is unwanted.
+    static read_first_line(cmd: string) -> string {
+        const pipe: void* = intrinsics::popen(cmd, "r");
+        if (pipe == null) { return ""; }
+        mut buf: i8* = intrinsics::malloc(4096) as i8*;
         const got: i8* = libc::fgets(buf, 4096, pipe) as i8*;
-        if (got == null) { break; }
-        const line: string = trim_trailing_newline(buf as string);
-        if (libc::strlen(line) > 0) {
-            out.push(copy_string(line));
+        const status: i32 = intrinsics::pclose(pipe);
+        if (got == null) { return ""; }
+        const line: string = (buf as string).trim();
+        if (status != 0 && libc::strlen(line) == 0) { return ""; }
+        return line;
+    }
+
+    /// Run `cmd` and return every line of stdout in source order.
+    /// Trailing newlines are stripped; empty lines are skipped.
+    static read_lines(cmd: string) -> string[] {
+        mut out: string[] = [];
+        const pipe: void* = intrinsics::popen(cmd, "r");
+        if (pipe == null) { return out; }
+
+        mut buf: i8* = intrinsics::malloc(4096) as i8*;
+        while (true) {
+            const got: i8* = libc::fgets(buf, 4096, pipe) as i8*;
+            if (got == null) { break; }
+            const line: string = (buf as string).trim();
+            if (libc::strlen(line) > 0) {
+                out.push(line);
+            }
         }
+        intrinsics::pclose(pipe);
+        return out;
     }
-    intrinsics::pclose(pipe);
-    return out;
-}
-
-
-// Internal string helpers
-
-/// Strip a trailing '\n' (and '\r' for cross-platform safety) in place.
-/// Returns the same buffer pointer cast back to a string.
-function trim_trailing_newline(s: string) -> string {
-    const slen: i64 = libc::strlen(s) as i64;
-    if (slen == 0) { return s; }
-    mut end: i64 = slen;
-    while (end > 0 && (s[end - 1] == 10 || s[end - 1] == 13)) {
-        end -= 1;
-    }
-    if (end == slen) { return s; }
-    // fgets returns a writable buffer; truncate in place.
-    const ptr: i8* = s as i8*;
-    ptr[end as u64] = 0;
-    return ptr as string;
-}
-
-/// Copy a string into a fresh malloc'd buffer.  Needed when reading
-/// successive lines from popen; fgets reuses its destination buffer,
-/// so without copying the prior line gets clobbered by the next read.
-function copy_string(s: string) -> string {
-    return String::from_str(Str::from_cstr(s)).into_raw();
 }
