@@ -21,120 +21,6 @@ import Compiler::Resolver::{ SymbolStr, InternTable };
 import Utils;
 import Utils::Logger;
 
-
-// Pass Entry Point
-
-/// Runs the CHeaderImport pass.  Walks all top-level statements looking for
-/// ExternBlockNodes that have a namespace alias (CImport blocks).  For each
-/// block, resolves include paths, preprocesses the header, parses function
-/// prototypes, and injects them as FunctionDeclNode children.
-function run(ctx: CompilationContext*) -> PassResult {
-    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
-    const root: ProgramNode* = ctx.artifacts.ast.root;
-
-    if (root == null) {
-        return PassResult::from_snapshot(ctx.diagnostics, snap);
-    }
-
-    mut total_imported: i32 = 0;
-    for (mut i: int = 0; i < root.statements.length; i++) {
-        const node: ASTNode* = root.statements[i];
-        if (node == null) { continue; }
-        if (node.kind != NodeKind::ExternBlock) { continue; }
-
-        const extern_node: ExternBlockNode* = node as ExternBlockNode*;
-        if (!extern_node.is_c_import()) { continue; }
-
-        const source_dir: string = get_directory(ctx.source_file);
-
-        for (mut j: int = 0; j < extern_node.include_paths.length; j++) {
-            const include_path: string = extern_node.include_paths[j];
-            const is_system: boolean =
-                (j < extern_node.include_is_system.length)
-                && extern_node.include_is_system[j];
-
-            if (is_system) {
-                // `#include <stdio.h>`: let the C preprocessor resolve it
-                // against its system search path. There is no local file
-                // to stat first.
-                const count: i32 =
-                    process_c_system_header(include_path, extern_node, ctx);
-                total_imported += count;
-                continue;
-            }
-
-            // `#include "foo.h"`: resolve relative to the importing file.
-            const resolved: string = resolve_include_path(source_dir, include_path);
-            if (resolved == "") {
-                cdebug("[CHeaderImport] WARNING: header not found: '%s' (relative to '%s')\n",
-                       include_path, source_dir);
-                continue;
-            }
-
-            const count: i32 = process_c_header(resolved, extern_node, ctx);
-            total_imported += count;
-        }
-
-        if (ctx.debug_mode) {
-            const alias_str: string = ctx.intern_table.resolve(extern_node.namespace_alias);
-            cdebug("[CHeaderImport] '%s': %d includes, %d functions\n",
-                   alias_str, extern_node.include_paths.length, extern_node.functions.length);
-        }
-    }
-
-    if (ctx.debug_mode && total_imported > 0) {
-        cdebug("[CHeaderImport] Total: %d C functions imported\n", total_imported);
-    }
-
-    return PassResult::from_snapshot(ctx.diagnostics, snap);
-}
-
-
-// Path Resolution
-
-/// Extract directory component from a file path.
-function get_directory(path: string) -> string {
-    const len: u64 = libc::strlen(path);
-    mut last_sep: i64 = -1;
-    for (mut i: u64 = 0; i < len; i++) {
-        if (path[i] == '/' || path[i] == '\\') {
-            last_sep = i as i64;
-        }
-    }
-    if (last_sep < 0) {
-        return ".";
-    }
-    const dir: i8* = intrinsics::malloc((last_sep + 1) as u64) as i8*;
-    intrinsics::memcpy(dir as void*, path as void*, last_sep as u64);
-    dir[last_sep] = 0;
-    return dir as string;
-}
-
-/// Resolve an include path relative to a source directory.
-/// Returns the resolved path if the file exists, empty string otherwise.
-function resolve_include_path(source_dir: string, include_path: string) -> string {
-    const src_len: u64 = libc::strlen(source_dir);
-    const inc_len: u64 = libc::strlen(include_path);
-    const total: u64 = src_len + 1 + inc_len + 1;
-    const buf: i8* = intrinsics::malloc(total) as i8*;
-    intrinsics::memcpy(buf as void*, source_dir as void*, src_len);
-    buf[src_len] = '/';
-    intrinsics::memcpy((buf + src_len + 1) as void*, include_path as void*, inc_len);
-    buf[src_len + 1 + inc_len] = 0;
-
-    const f: void* = libc::fopen(buf as string, "r");
-    if (f != null) {
-        libc::fclose(f);
-        return buf as string;
-    }
-
-    intrinsics::free(buf as void*);
-    return "";
-}
-
-
-// Preprocessor Invocation
-
 /// Shell redirect that discards stdout+stderr while probing a compiler.
 /// `cmd` (Windows host) uses `>NUL`; POSIX `sh` uses `>/dev/null`.  Both
 /// honour `2>&1`.  Host-gated because ConfigGating strips one side at
@@ -146,566 +32,688 @@ function cc_silence() -> string { return ">/dev/null 2>&1"; }
 ![target(windows)]
 function cc_silence() -> string { return ">NUL 2>&1"; }
 
-/// True if the C driver `cc` can be launched, probed via `cc --version`.
-/// A missing binary makes the shell exit non-zero (`sh`: 127; `cmd`:
-/// 9009), and `system(3)` reports that, so exit 0 means it's usable.
-function cc_available(cc: string) -> boolean {
-    return system(format("%s --version %s", cc, cc_silence())) == 0;
-}
-
-/// Pick the C preprocessor binary for `#include` lowering.  `CRYO_CC`
-/// wins outright; otherwise AUTO-DETECT by probing a candidate list and
-/// returning the first that launches.
-///
-/// `clang-20` stays first so a Linux dev/CI host (where that exact name
-/// exists) keeps its historic choice - preserving selfhost byte-identity -
-/// while macOS and native Windows / msys2 (which have no `clang-20` by
-/// that name, only `clang` / `gcc` / `cc`) fall through and Just Work
-/// without anyone setting `CRYO_CC`.  This is what lets `make
-/// selfhost-check` and a native compiler self-build run on a stock
-/// mingw64 box.  The imported header the compiler itself cares about
-/// (`llvm_bindings.h`) is self-contained - no `#include`s - so every
-/// candidate produces identical `-E -P` output and thus identical parsed
-/// externs regardless of which one is chosen.  Falls back to `clang-20`
-/// when nothing is found so the existing "set $CRYO_CC" diagnostic still
-/// fires with an actionable message.
-function pick_c_preprocessor() -> string {
-    const env_raw: i8* = libc::getenv("CRYO_CC") as i8*;
-    if (env_raw != null) {
-        const env_val: string = env_raw as string;
-        if (libc::strlen(env_val) > 0) { return env_val; }
-    }
-    if (cc_available("clang-20")) { return "clang-20"; }
-    if (cc_available("clang"))    { return "clang"; }
-    if (cc_available("gcc"))      { return "gcc"; }
-    if (cc_available("cc"))       { return "cc"; }
-    return "clang-20";
-}
-
-/// Preprocess a local header *file* (quoted include `#include "foo.h"`)
-/// and parse the output. Returns the number of function declarations
-/// extracted.
-function process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
-                          ctx: CompilationContext*) -> i32 {
-    const cc: string = pick_c_preprocessor();
-    // cc -E -P "<resolved_path>"
-    const cmd: string = format("%s -E -P \"%s\"", cc, resolved_path);
-    return run_preproc_pipe(cmd, resolved_path, extern_node, ctx);
-}
-
-/// Preprocess an angle-bracket *system* header (`#include <stdio.h>`).
-/// The header is not a local file, so rather than stat a path we feed a
-/// one-line `#include <...>` to the preprocessor on stdin and let it
-/// resolve the header against its own system search path. The header
-/// name is validated to path-safe characters first so it can be embedded
-/// in the single-quoted shell argument without injection risk.
-function process_c_system_header(header: string, extern_node: ExternBlockNode*,
-                                 ctx: CompilationContext*) -> i32 {
-    if (!is_safe_header_name(header)) {
-        ctx.diagnostics.emit(Diagnostic::error(
-            ErrorCode::E0806_HEADER_PREPROC_FAILED,
-            format("invalid system header name '<%s>': only letters, digits, and '. _ / + -' are allowed",
-                header)));
-        return 0;
-    }
-    const cc: string = pick_c_preprocessor();
-    // printf '#include <hdr>\n' | cc -E -P -x c -
-    // The single quotes keep '<', '>', and '#' literal; is_safe_header_name
-    // has already excluded the only single-quote breakout character.
-    const cmd: string = format("printf '#include <%s>\\n' | %s -E -P -x c -",
-        header, cc);
-    return run_preproc_pipe(cmd, header, extern_node, ctx);
-}
-
-/// True when `name` contains only characters valid in a C header path:
-/// ASCII letters, digits, and '. _ / + -'. Excludes shell metacharacters
-/// (notably the single quote) so the name is safe to embed in the
-/// single-quoted printf argument of the system-header preprocess command.
-function is_safe_header_name(name: string) -> boolean {
-    const len: u64 = libc::strlen(name);
-    if (len == 0) { return false; }
-    for (mut i: u64 = 0; i < len; i++) {
-        const c: i8 = name[i];
-        const ok: boolean = (c as char).is_c_ident_char()
-            || c == '.' || c == '/' || c == '+' || c == '-';
-        if (!ok) { return false; }
-    }
-    return true;
-}
-
-/// popen `cmd`, slurp its stdout, and extract C function prototypes into
-/// `extern_node`. `label` names the header for diagnostics. Returns the
-/// number of functions extracted. Emits a proper diagnostic when the
-/// preprocessor can't launch, exits non-zero, or yields nothing; silent
-/// failures previously surfaced as confusing "no extern decls visible"
-/// errors at the next pass with no clue why. Does not free `cmd`.
-function run_preproc_pipe(cmd: string, label: string,
-                          extern_node: ExternBlockNode*,
-                          ctx: CompilationContext*) -> i32 {
-    if (ctx.debug_mode) {
-        cdebug("[CHeaderImport] Running preprocessor: %s\n", cmd);
-    }
-
-    const pipe: void* = intrinsics::popen(cmd, "r");
-    if (pipe == null) {
-        ctx.diagnostics.emit(Diagnostic::error(
-            ErrorCode::E0806_HEADER_PREPROC_FAILED,
-            format("failed to launch C preprocessor for header '%s' (popen returned null)",
-                label)));
-        return 0;
-    }
-
-    // Read all preprocessor output
-    mut output_buf: i8* = intrinsics::malloc(65536) as i8*;
-    mut output_len: u64 = 0;
-    mut output_cap: u64 = 65536;
-    mut line_buf: i8[4096];
-
-    while (libc::fgets(&line_buf[0], 4096, pipe) != null) {
-        const line_len: u64 = libc::strlen(&line_buf[0] as string);
-        if (output_len + line_len >= output_cap) {
-            output_cap *= 2;
-            const new_buf: i8* = intrinsics::malloc(output_cap) as i8*;
-            intrinsics::memcpy(new_buf as void*, output_buf as void*, output_len);
-            intrinsics::free(output_buf as void*);
-            output_buf = new_buf;
-        }
-        intrinsics::memcpy((output_buf + output_len) as void*, &line_buf[0] as void*, line_len);
-        output_len += line_len;
-    }
-    output_buf[output_len] = 0;
-    const exit_code: i32 = intrinsics::pclose(pipe);
-
-    // pclose returns the wait(2) status; non-zero means the preprocessor
-    // exited with an error (or was killed, or the shell couldn't find it
-    // exit 127).  Surface as a diagnostic instead of silently returning
-    // zero functions, which used to produce "no extern decls visible"
-    // errors at the next pass with no clue why.
-    if (exit_code != 0) {
-        ctx.diagnostics.emit(Diagnostic::error(
-            ErrorCode::E0806_HEADER_PREPROC_FAILED,
-            format("C preprocessor failed for header '%s' (exit status %d); set $CRYO_CC if your clang binary is named differently",
-                label, exit_code)));
-        intrinsics::free(output_buf as void*);
-        return 0;
-    }
-
-    if (output_len == 0) {
-        intrinsics::free(output_buf as void*);
-        return 0;
-    }
-
-    const count: i32 = parse_c_functions(output_buf as string, output_len as i64, extern_node, ctx);
-    intrinsics::free(output_buf as void*);
-    return count;
-}
-
-
-// C Function Declaration Parser
-
+// C function-declaration parser result (module-level: a return type
+// shared by the parser statics below).
 type struct CFuncParseResult {
     success: boolean;
     func:    FunctionDeclNode*;
     end_pos: i64;
 }
 
-/// Parse preprocessed C source to extract function prototypes.
-/// Skips typedefs, struct/union/enum definitions, and function bodies.
-function parse_c_functions(source: string, source_len: i64,
-                           extern_node: ExternBlockNode*,
-                           ctx: CompilationContext*) -> i32 {
-    mut count: i32 = 0;
-    mut pos: i64 = 0;
 
-    while (pos < source_len) {
-        // Skip whitespace
-        while (pos < source_len && is_whitespace(source[pos])) {
-            pos += 1;
-        }
-        if (pos >= source_len) { break; }
+/// The C `#include` import pass.  All entry points are `static`; the pass
+/// holds no instance state — it threads `CompilationContext*` explicitly.
+type struct CHeaderImport {
 
-        // Skip typedef, struct, union, enum blocks
-        if (starts_with_at(source, pos, "typedef ") ||
-            starts_with_at(source, pos, "struct ") ||
-            starts_with_at(source, pos, "union ") ||
-            starts_with_at(source, pos, "enum ")) {
-            pos = skip_to_semicolon_or_brace(source, source_len, pos);
-            continue;
+
+    /// Runs the CHeaderImport pass.  Walks all top-level statements looking for
+    /// ExternBlockNodes that have a namespace alias (CImport blocks).  For each
+    /// block, resolves include paths, preprocesses the header, parses function
+    /// prototypes, and injects them as FunctionDeclNode children.
+    static run(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+
+        if (root == null) {
+            return PassResult::from_snapshot(ctx.diagnostics, snap);
         }
 
-        // Skip __attribute__, _Pragma, etc.
-        if (source[pos] == '_' && pos + 1 < source_len && source[pos + 1] == '_') {
-            pos = skip_to_semicolon_or_brace(source, source_len, pos);
-            continue;
-        }
+        mut total_imported: i32 = 0;
+        for (mut i: int = 0; i < root.statements.length; i++) {
+            const node: ASTNode* = root.statements[i];
+            if (node == null) { continue; }
+            if (node.kind != NodeKind::ExternBlock) { continue; }
 
-        // Skip preprocessor leftovers (# lines)
-        if (source[pos] == '#') {
-            while (pos < source_len && source[pos] != '\n') { pos += 1; }
-            continue;
-        }
+            const extern_node: ExternBlockNode* = node as ExternBlockNode*;
+            if (!extern_node.is_c_import()) { continue; }
 
-        // Try to parse a function declaration
-        const result: CFuncParseResult = try_parse_c_func(source, source_len, pos, ctx);
-        if (result.success) {
-            extern_node.add_function(result.func);
-            count += 1;
-            pos = result.end_pos;
-        } else {
-            pos = skip_to_semicolon_or_brace(source, source_len, pos);
-        }
-    }
+            const source_dir: string = CHeaderImport::get_directory(ctx.source_file);
 
-    return count;
-}
+            for (mut j: int = 0; j < extern_node.include_paths.length; j++) {
+                const include_path: string = extern_node.include_paths[j];
+                const is_system: boolean =
+                    (j < extern_node.include_is_system.length)
+                    && extern_node.include_is_system[j];
 
-/// Try to parse a single C function declaration.
-/// Pattern: [qualifiers] return_type [*...] name ( params ) ;
-function try_parse_c_func(source: string, source_len: i64, start: i64,
-                          ctx: CompilationContext*) -> CFuncParseResult {
-    mut pos: i64 = start;
-    const fail: CFuncParseResult = CFuncParseResult { success: false, func: null, end_pos: start };
-
-    // Skip storage-class specifiers
-    pos = skip_c_qualifiers(source, source_len, pos);
-
-    // Scan forward to find: ... name (
-    // The last identifier before '(' is the function name
-    const ret_start: i64 = pos;
-    mut ret_end: i64 = pos;
-    mut name_start: i64 = -1;
-    mut name_end: i64 = -1;
-    mut paren_pos: i64 = -1;
-    mut depth: i32 = 0;
-
-    while (pos < source_len) {
-        const c: i8 = source[pos];
-        if (c == '(') {
-            if (depth == 0) { paren_pos = pos; break; }
-            depth += 1;
-        }
-        if (c == ')') { depth -= 1; }
-        if (c == ';' || c == '{' || c == '}') { return fail; }
-        if (c == '\n' && pos > start + 500) { return fail; }
-
-        if ((c as char).is_c_ident_start()) {
-            const id_start: i64 = pos;
-            while (pos < source_len && (source[pos] as char).is_c_ident_char()) { pos += 1; }
-            name_start = id_start;
-            name_end = pos;
-            ret_end = id_start;
-            continue;
-        }
-        pos += 1;
-    }
-
-    if (paren_pos < 0 || name_start < 0) { return fail; }
-
-    // Extract function name
-    const func_name: SymbolStr = intern_slice(source, name_start, name_end, ctx);
-
-    // Extract return type string
-    const ret_type_str: string = extract_trimmed(source, ret_start, ret_end);
-
-    // Parse parameter list
-    pos = paren_pos + 1;
-    mut params: VarDeclNode*[] = [];
-    mut is_variadic: boolean = false;
-
-    pos = skip_ws(source, source_len, pos);
-
-    if (pos < source_len && source[pos] == ')') {
-        pos += 1;
-    } else if (starts_with_at(source, pos, "void)") || starts_with_at(source, pos, "void )")) {
-        while (pos < source_len && source[pos] != ')') { pos += 1; }
-        pos += 1;
-    } else {
-        while (pos < source_len && source[pos] != ')') {
-            pos = skip_ws(source, source_len, pos);
-
-            if (starts_with_at(source, pos, "...")) {
-                is_variadic = true;
-                pos += 3;
-                while (pos < source_len && source[pos] != ')') { pos += 1; }
-                break;
-            }
-
-            // Parse one parameter: type [*...] [name]
-            const param_start: i64 = pos;
-            mut param_name_start: i64 = -1;
-            mut param_name_end: i64 = -1;
-            mut param_type_end: i64 = pos;
-
-            while (pos < source_len && source[pos] != ',' && source[pos] != ')') {
-                if ((source[pos] as char).is_c_ident_start()) {
-                    const ps: i64 = pos;
-                    while (pos < source_len && (source[pos] as char).is_c_ident_char()) { pos += 1; }
-                    param_name_start = ps;
-                    param_name_end = pos;
-                    param_type_end = ps;
+                if (is_system) {
+                    // `#include <stdio.h>`: let the C preprocessor resolve it
+                    // against its system search path. There is no local file
+                    // to stat first.
+                    const count: i32 =
+                        CHeaderImport::process_c_system_header(include_path, extern_node, ctx);
+                    total_imported += count;
                     continue;
                 }
+
+                // `#include "foo.h"`: resolve relative to the importing file.
+                const resolved: string = CHeaderImport::resolve_include_path(source_dir, include_path);
+                if (resolved == "") {
+                    cdebug("[CHeaderImport] WARNING: header not found: '%s' (relative to '%s')\n",
+                           include_path, source_dir);
+                    continue;
+                }
+
+                const count: i32 = CHeaderImport::process_c_header(resolved, extern_node, ctx);
+                total_imported += count;
+            }
+
+            if (ctx.debug_mode) {
+                const alias_str: string = ctx.intern_table.resolve(extern_node.namespace_alias);
+                cdebug("[CHeaderImport] '%s': %d includes, %d functions\n",
+                       alias_str, extern_node.include_paths.length, extern_node.functions.length);
+            }
+        }
+
+        if (ctx.debug_mode && total_imported > 0) {
+            cdebug("[CHeaderImport] Total: %d C functions imported\n", total_imported);
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+
+    // Path Resolution
+
+    /// Extract directory component from a file path.
+    static get_directory(path: string) -> string {
+        const len: u64 = libc::strlen(path);
+        mut last_sep: i64 = -1;
+        for (mut i: u64 = 0; i < len; i++) {
+            if (path[i] == '/' || path[i] == '\\') {
+                last_sep = i as i64;
+            }
+        }
+        if (last_sep < 0) {
+            return ".";
+        }
+        const dir: i8* = intrinsics::malloc((last_sep + 1) as u64) as i8*;
+        intrinsics::memcpy(dir as void*, path as void*, last_sep as u64);
+        dir[last_sep] = 0;
+        return dir as string;
+    }
+
+    /// Resolve an include path relative to a source directory.
+    /// Returns the resolved path if the file exists, empty string otherwise.
+    static resolve_include_path(source_dir: string, include_path: string) -> string {
+        const src_len: u64 = libc::strlen(source_dir);
+        const inc_len: u64 = libc::strlen(include_path);
+        const total: u64 = src_len + 1 + inc_len + 1;
+        const buf: i8* = intrinsics::malloc(total) as i8*;
+        intrinsics::memcpy(buf as void*, source_dir as void*, src_len);
+        buf[src_len] = '/';
+        intrinsics::memcpy((buf + src_len + 1) as void*, include_path as void*, inc_len);
+        buf[src_len + 1 + inc_len] = 0;
+
+        const f: void* = libc::fopen(buf as string, "r");
+        if (f != null) {
+            libc::fclose(f);
+            return buf as string;
+        }
+
+        intrinsics::free(buf as void*);
+        return "";
+    }
+
+
+    // Preprocessor Invocation
+
+
+    /// True if the C driver `cc` can be launched, probed via `cc --version`.
+    /// A missing binary makes the shell exit non-zero (`sh`: 127; `cmd`:
+    /// 9009), and `system(3)` reports that, so exit 0 means it's usable.
+    static cc_available(cc: string) -> boolean {
+        return system(format("%s --version %s", cc, cc_silence())) == 0;
+    }
+
+    /// Pick the C preprocessor binary for `#include` lowering.  `CRYO_CC`
+    /// wins outright; otherwise AUTO-DETECT by probing a candidate list and
+    /// returning the first that launches.
+    ///
+    /// `clang-20` stays first so a Linux dev/CI host (where that exact name
+    /// exists) keeps its historic choice - preserving selfhost byte-identity -
+    /// while macOS and native Windows / msys2 (which have no `clang-20` by
+    /// that name, only `clang` / `gcc` / `cc`) fall through and Just Work
+    /// without anyone setting `CRYO_CC`.  This is what lets `make
+    /// selfhost-check` and a native compiler self-build run on a stock
+    /// mingw64 box.  The imported header the compiler itself cares about
+    /// (`llvm_bindings.h`) is self-contained - no `#include`s - so every
+    /// candidate produces identical `-E -P` output and thus identical parsed
+    /// externs regardless of which one is chosen.  Falls back to `clang-20`
+    /// when nothing is found so the existing "set $CRYO_CC" diagnostic still
+    /// fires with an actionable message.
+    static pick_c_preprocessor() -> string {
+        const env_raw: i8* = libc::getenv("CRYO_CC") as i8*;
+        if (env_raw != null) {
+            const env_val: string = env_raw as string;
+            if (libc::strlen(env_val) > 0) { return env_val; }
+        }
+        if (CHeaderImport::cc_available("clang-20")) { return "clang-20"; }
+        if (CHeaderImport::cc_available("clang"))    { return "clang"; }
+        if (CHeaderImport::cc_available("gcc"))      { return "gcc"; }
+        if (CHeaderImport::cc_available("cc"))       { return "cc"; }
+        return "clang-20";
+    }
+
+    /// Preprocess a local header *file* (quoted include `#include "foo.h"`)
+    /// and parse the output. Returns the number of function declarations
+    /// extracted.
+    static process_c_header(resolved_path: string, extern_node: ExternBlockNode*,
+                              ctx: CompilationContext*) -> i32 {
+        const cc: string = CHeaderImport::pick_c_preprocessor();
+        // cc -E -P "<resolved_path>"
+        const cmd: string = format("%s -E -P \"%s\"", cc, resolved_path);
+        return CHeaderImport::run_preproc_pipe(cmd, resolved_path, extern_node, ctx);
+    }
+
+    /// Preprocess an angle-bracket *system* header (`#include <stdio.h>`).
+    /// The header is not a local file, so rather than stat a path we feed a
+    /// one-line `#include <...>` to the preprocessor on stdin and let it
+    /// resolve the header against its own system search path. The header
+    /// name is validated to path-safe characters first so it can be embedded
+    /// in the single-quoted shell argument without injection risk.
+    static process_c_system_header(header: string, extern_node: ExternBlockNode*,
+                                     ctx: CompilationContext*) -> i32 {
+        if (!CHeaderImport::is_safe_header_name(header)) {
+            ctx.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0806_HEADER_PREPROC_FAILED,
+                format("invalid system header name '<%s>': only letters, digits, and '. _ / + -' are allowed",
+                    header)));
+            return 0;
+        }
+        const cc: string = CHeaderImport::pick_c_preprocessor();
+        // printf '#include <hdr>\n' | cc -E -P -x c -
+        // The single quotes keep '<', '>', and '#' literal; is_safe_header_name
+        // has already excluded the only single-quote breakout character.
+        const cmd: string = format("printf '#include <%s>\\n' | %s -E -P -x c -",
+            header, cc);
+        return CHeaderImport::run_preproc_pipe(cmd, header, extern_node, ctx);
+    }
+
+    /// True when `name` contains only characters valid in a C header path:
+    /// ASCII letters, digits, and '. _ / + -'. Excludes shell metacharacters
+    /// (notably the single quote) so the name is safe to embed in the
+    /// single-quoted printf argument of the system-header preprocess command.
+    static is_safe_header_name(name: string) -> boolean {
+        const len: u64 = libc::strlen(name);
+        if (len == 0) { return false; }
+        for (mut i: u64 = 0; i < len; i++) {
+            const c: i8 = name[i];
+            const ok: boolean = (c as char).is_c_ident_char()
+                || c == '.' || c == '/' || c == '+' || c == '-';
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /// popen `cmd`, slurp its stdout, and extract C function prototypes into
+    /// `extern_node`. `label` names the header for diagnostics. Returns the
+    /// number of functions extracted. Emits a proper diagnostic when the
+    /// preprocessor can't launch, exits non-zero, or yields nothing; silent
+    /// failures previously surfaced as confusing "no extern decls visible"
+    /// errors at the next pass with no clue why. Does not free `cmd`.
+    static run_preproc_pipe(cmd: string, label: string,
+                              extern_node: ExternBlockNode*,
+                              ctx: CompilationContext*) -> i32 {
+        if (ctx.debug_mode) {
+            cdebug("[CHeaderImport] Running preprocessor: %s\n", cmd);
+        }
+
+        const pipe: void* = intrinsics::popen(cmd, "r");
+        if (pipe == null) {
+            ctx.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0806_HEADER_PREPROC_FAILED,
+                format("failed to launch C preprocessor for header '%s' (popen returned null)",
+                    label)));
+            return 0;
+        }
+
+        // Read all preprocessor output
+        mut output_buf: i8* = intrinsics::malloc(65536) as i8*;
+        mut output_len: u64 = 0;
+        mut output_cap: u64 = 65536;
+        mut line_buf: i8[4096];
+
+        while (libc::fgets(&line_buf[0], 4096, pipe) != null) {
+            const line_len: u64 = libc::strlen(&line_buf[0] as string);
+            if (output_len + line_len >= output_cap) {
+                output_cap *= 2;
+                const new_buf: i8* = intrinsics::malloc(output_cap) as i8*;
+                intrinsics::memcpy(new_buf as void*, output_buf as void*, output_len);
+                intrinsics::free(output_buf as void*);
+                output_buf = new_buf;
+            }
+            intrinsics::memcpy((output_buf + output_len) as void*, &line_buf[0] as void*, line_len);
+            output_len += line_len;
+        }
+        output_buf[output_len] = 0;
+        const exit_code: i32 = intrinsics::pclose(pipe);
+
+        // pclose returns the wait(2) status; non-zero means the preprocessor
+        // exited with an error (or was killed, or the shell couldn't find it
+        // exit 127).  Surface as a diagnostic instead of silently returning
+        // zero functions, which used to produce "no extern decls visible"
+        // errors at the next pass with no clue why.
+        if (exit_code != 0) {
+            ctx.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0806_HEADER_PREPROC_FAILED,
+                format("C preprocessor failed for header '%s' (exit status %d); set $CRYO_CC if your clang binary is named differently",
+                    label, exit_code)));
+            intrinsics::free(output_buf as void*);
+            return 0;
+        }
+
+        if (output_len == 0) {
+            intrinsics::free(output_buf as void*);
+            return 0;
+        }
+
+        const count: i32 = CHeaderImport::parse_c_functions(output_buf as string, output_len as i64, extern_node, ctx);
+        intrinsics::free(output_buf as void*);
+        return count;
+    }
+
+
+    // C Function Declaration Parser
+
+
+    /// Parse preprocessed C source to extract function prototypes.
+    /// Skips typedefs, struct/union/enum definitions, and function bodies.
+    static parse_c_functions(source: string, source_len: i64,
+                               extern_node: ExternBlockNode*,
+                               ctx: CompilationContext*) -> i32 {
+        mut count: i32 = 0;
+        mut pos: i64 = 0;
+
+        while (pos < source_len) {
+            // Skip whitespace
+            while (pos < source_len && CHeaderImport::is_whitespace(source[pos])) {
                 pos += 1;
             }
+            if (pos >= source_len) { break; }
 
-            // Unnamed pointer parameter (`FILE *`, `void *`): the scan above
-            // treats the type's trailing identifier as a parameter name, but
-            // a `*` after it means the parameter is unnamed and the `*`
-            // belongs to the type. Critically, for `void *` this otherwise
-            // truncates the type to bare `void` (the `*` sits past
-            // param_type_end), which is not a first-class LLVM type and fails
-            // module verification. Detect the trailing `*` and fold the whole
-            // span into the type.
-            mut unnamed_ptr: boolean = false;
-            if (param_name_end >= 0) {
-                mut k: i64 = param_name_end;
-                while (k < pos) {
-                    if (source[k] == '*') { unnamed_ptr = true; break; }
-                    k += 1;
+            // Skip typedef, struct, union, enum blocks
+            if (CHeaderImport::starts_with_at(source, pos, "typedef ") ||
+                CHeaderImport::starts_with_at(source, pos, "struct ") ||
+                CHeaderImport::starts_with_at(source, pos, "union ") ||
+                CHeaderImport::starts_with_at(source, pos, "enum ")) {
+                pos = CHeaderImport::skip_to_semicolon_or_brace(source, source_len, pos);
+                continue;
+            }
+
+            // Skip __attribute__, _Pragma, etc.
+            if (source[pos] == '_' && pos + 1 < source_len && source[pos + 1] == '_') {
+                pos = CHeaderImport::skip_to_semicolon_or_brace(source, source_len, pos);
+                continue;
+            }
+
+            // Skip preprocessor leftovers (# lines)
+            if (source[pos] == '#') {
+                while (pos < source_len && source[pos] != '\n') { pos += 1; }
+                continue;
+            }
+
+            // Try to parse a function declaration
+            const result: CFuncParseResult = CHeaderImport::try_parse_c_func(source, source_len, pos, ctx);
+            if (result.success) {
+                extern_node.add_function(result.func);
+                count += 1;
+                pos = result.end_pos;
+            } else {
+                pos = CHeaderImport::skip_to_semicolon_or_brace(source, source_len, pos);
+            }
+        }
+
+        return count;
+    }
+
+    /// Try to parse a single C function declaration.
+    /// Pattern: [qualifiers] return_type [*...] name ( params ) ;
+    static try_parse_c_func(source: string, source_len: i64, start: i64,
+                              ctx: CompilationContext*) -> CFuncParseResult {
+        mut pos: i64 = start;
+        const fail: CFuncParseResult = CFuncParseResult { success: false, func: null, end_pos: start };
+
+        // Skip storage-class specifiers
+        pos = CHeaderImport::skip_c_qualifiers(source, source_len, pos);
+
+        // Scan forward to find: ... name (
+        // The last identifier before '(' is the function name
+        const ret_start: i64 = pos;
+        mut ret_end: i64 = pos;
+        mut name_start: i64 = -1;
+        mut name_end: i64 = -1;
+        mut paren_pos: i64 = -1;
+        mut depth: i32 = 0;
+
+        while (pos < source_len) {
+            const c: i8 = source[pos];
+            if (c == '(') {
+                if (depth == 0) { paren_pos = pos; break; }
+                depth += 1;
+            }
+            if (c == ')') { depth -= 1; }
+            if (c == ';' || c == '{' || c == '}') { return fail; }
+            if (c == '\n' && pos > start + 500) { return fail; }
+
+            if ((c as char).is_c_ident_start()) {
+                const id_start: i64 = pos;
+                while (pos < source_len && (source[pos] as char).is_c_ident_char()) { pos += 1; }
+                name_start = id_start;
+                name_end = pos;
+                ret_end = id_start;
+                continue;
+            }
+            pos += 1;
+        }
+
+        if (paren_pos < 0 || name_start < 0) { return fail; }
+
+        // Extract function name
+        const func_name: SymbolStr = CHeaderImport::intern_slice(source, name_start, name_end, ctx);
+
+        // Extract return type string
+        const ret_type_str: string = CHeaderImport::extract_trimmed(source, ret_start, ret_end);
+
+        // Parse parameter list
+        pos = paren_pos + 1;
+        mut params: VarDeclNode*[] = [];
+        mut is_variadic: boolean = false;
+
+        pos = CHeaderImport::skip_ws(source, source_len, pos);
+
+        if (pos < source_len && source[pos] == ')') {
+            pos += 1;
+        } else if (CHeaderImport::starts_with_at(source, pos, "void)") || CHeaderImport::starts_with_at(source, pos, "void )")) {
+            while (pos < source_len && source[pos] != ')') { pos += 1; }
+            pos += 1;
+        } else {
+            while (pos < source_len && source[pos] != ')') {
+                pos = CHeaderImport::skip_ws(source, source_len, pos);
+
+                if (CHeaderImport::starts_with_at(source, pos, "...")) {
+                    is_variadic = true;
+                    pos += 3;
+                    while (pos < source_len && source[pos] != ')') { pos += 1; }
+                    break;
                 }
-            }
 
-            // Determine parameter name vs type keyword
-            mut pname: string = "";
-            if (unnamed_ptr) {
-                // No name; the full span (including the `*`) is the type.
-                param_type_end = pos;
-            } else if (param_name_start >= 0) {
-                pname = extract_trimmed(source, param_name_start, param_name_end);
-                if (is_c_type_keyword(pname)) {
-                    param_type_end = param_name_end;
-                    pname = "";
+                // Parse one parameter: type [*...] [name]
+                const param_start: i64 = pos;
+                mut param_name_start: i64 = -1;
+                mut param_name_end: i64 = -1;
+                mut param_type_end: i64 = pos;
+
+                while (pos < source_len && source[pos] != ',' && source[pos] != ')') {
+                    if ((source[pos] as char).is_c_ident_start()) {
+                        const ps: i64 = pos;
+                        while (pos < source_len && (source[pos] as char).is_c_ident_char()) { pos += 1; }
+                        param_name_start = ps;
+                        param_name_end = pos;
+                        param_type_end = ps;
+                        continue;
+                    }
+                    pos += 1;
                 }
+
+                // Unnamed pointer parameter (`FILE *`, `void *`): the scan above
+                // treats the type's trailing identifier as a parameter name, but
+                // a `*` after it means the parameter is unnamed and the `*`
+                // belongs to the type. Critically, for `void *` this otherwise
+                // truncates the type to bare `void` (the `*` sits past
+                // param_type_end), which is not a first-class LLVM type and fails
+                // module verification. Detect the trailing `*` and fold the whole
+                // span into the type.
+                mut unnamed_ptr: boolean = false;
+                if (param_name_end >= 0) {
+                    mut k: i64 = param_name_end;
+                    while (k < pos) {
+                        if (source[k] == '*') { unnamed_ptr = true; break; }
+                        k += 1;
+                    }
+                }
+
+                // Determine parameter name vs type keyword
+                mut pname: string = "";
+                if (unnamed_ptr) {
+                    // No name; the full span (including the `*`) is the type.
+                    param_type_end = pos;
+                } else if (param_name_start >= 0) {
+                    pname = CHeaderImport::extract_trimmed(source, param_name_start, param_name_end);
+                    if (CHeaderImport::is_c_type_keyword(pname)) {
+                        param_type_end = param_name_end;
+                        pname = "";
+                    }
+                }
+
+                if (pname == "") {
+                    const idx: i32 = params.length as i32;
+                    const arg_buf: i8* = intrinsics::malloc(16) as i8*;
+                    intrinsics::sprintf(arg_buf as string, "arg%d", idx);
+                    pname = arg_buf as string;
+                }
+
+                const param_type_str: string = CHeaderImport::extract_trimmed(source, param_start, param_type_end);
+                // A bare `void` parameter type is not a first-class LLVM type and
+                // would fail module verification. This shouldn't survive the
+                // unnamed-pointer handling above for valid C, but system headers
+                // are adversarial; skip the whole declaration rather than emit
+                // invalid IR for one unparseable signature.
+                if (param_type_str.eq("void")) {
+                    return fail;
+                }
+                const param_sym: SymbolStr = ctx.intern_table.intern(pname);
+                const param_type_ann: TypeAnnotation* = CHeaderImport::c_type_to_annotation(param_type_str, ctx);
+                const span: SourceSpan = SourceSpan::none();
+                mut param_node: VarDeclNode* = new VarDeclNode(param_sym, span);
+                param_node.type_annotation = param_type_ann;
+                params.push(param_node);
+
+                if (pos < source_len && source[pos] == ',') { pos += 1; }
             }
+            if (pos < source_len && source[pos] == ')') { pos += 1; }
+        }
 
-            if (pname == "") {
-                const idx: i32 = params.length as i32;
-                const arg_buf: i8* = intrinsics::malloc(16) as i8*;
-                intrinsics::sprintf(arg_buf as string, "arg%d", idx);
-                pname = arg_buf as string;
+        // Must end with ';' (declaration), not '{' (definition)
+        pos = CHeaderImport::skip_ws(source, source_len, pos);
+        if (pos < source_len && source[pos] == '{') { return fail; }
+        if (pos < source_len && source[pos] == ';') { pos += 1; }
+
+        // Build the FunctionDeclNode
+        const ret_ann: TypeAnnotation* = CHeaderImport::c_type_to_annotation(ret_type_str, ctx);
+        const span: SourceSpan = SourceSpan::none();
+        mut func: FunctionDeclNode* = new FunctionDeclNode(func_name, span);
+        func.return_type_annotation = ret_ann;
+        func.parameters = params;
+        func.is_variadic = is_variadic;
+
+        return CFuncParseResult { success: true, func: func, end_pos: pos };
+    }
+
+
+    // C-to-Cryo Type Mapping
+
+    /// Allocate a PrimitiveAnnotation wrapped in a heap TypeAnnotation.
+    static make_prim_annotation(name: string, ctx: CompilationContext*) -> TypeAnnotation* {
+        const sym: SymbolStr = ctx.intern_table.intern(name);
+        const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
+        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        *ann = TypeAnnotation::Primitive(prim);
+        return ann;
+    }
+
+    /// Allocate a PointerAnnotation wrapped in a heap TypeAnnotation.
+    static make_ptr_annotation(inner: TypeAnnotation*) -> TypeAnnotation* {
+        const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, span: SourceSpan::none() };
+        const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+        *ann = TypeAnnotation::Pointer(ptr);
+        return ann;
+    }
+
+    /// Map a C type string to a Cryo TypeAnnotation.
+    /// Handles qualifiers, pointer types, standard C types, fixed-width types,
+    /// and falls back to void* for unknown types.
+    static c_type_to_annotation(c_type: string, ctx: CompilationContext*) -> TypeAnnotation* {
+        mut type_str: string = c_type;
+
+        // Strip qualifiers (may appear multiple times)
+        if (CHeaderImport::starts_with_at(type_str, 0, "const "))    { type_str += 6; }
+        if (CHeaderImport::starts_with_at(type_str, 0, "volatile ")) { type_str += 9; }
+        if (CHeaderImport::starts_with_at(type_str, 0, "static "))   { type_str += 7; }
+        if (CHeaderImport::starts_with_at(type_str, 0, "extern "))   { type_str += 7; }
+        if (CHeaderImport::starts_with_at(type_str, 0, "inline "))   { type_str += 7; }
+        if (CHeaderImport::starts_with_at(type_str, 0, "signed "))   { type_str += 7; }
+
+        // Check for pointer (ends with *)
+        const tlen: u64 = libc::strlen(type_str);
+        if (tlen > 0 && type_str[tlen - 1] == '*') {
+            const inner_buf: i8* = intrinsics::malloc(tlen) as i8*;
+            intrinsics::memcpy(inner_buf as void*, type_str as void*, tlen - 1);
+            inner_buf[tlen - 1] = 0;
+            mut end: i64 = (tlen as i64) - 2;
+            while (end >= 0 && (inner_buf[end] == ' ' || inner_buf[end] == '\t')) {
+                inner_buf[end] = 0;
+                end -= 1;
             }
+            const inner: TypeAnnotation* = CHeaderImport::c_type_to_annotation(inner_buf as string, ctx);
+            intrinsics::free(inner_buf as void*);
+            return CHeaderImport::make_ptr_annotation(inner);
+        }
 
-            const param_type_str: string = extract_trimmed(source, param_start, param_type_end);
-            // A bare `void` parameter type is not a first-class LLVM type and
-            // would fail module verification. This shouldn't survive the
-            // unnamed-pointer handling above for valid C, but system headers
-            // are adversarial; skip the whole declaration rather than emit
-            // invalid IR for one unparseable signature.
-            if (param_type_str.eq("void")) {
-                return fail;
+        // Map standard C scalar types (incl. fixed-width typedefs and the LLVM
+        // `LLVMBool`) to their Cryo primitive name.  An unknown scalar yields ""
+        // so the `enum`/opaque-pointer fallbacks below still apply.
+        const prim_name: string = match (type_str) {
+            "void"                   => { "void" }
+            "int"                    => { "i32" }
+            "unsigned int"           => { "u32" }
+            "unsigned"               => { "u32" }
+            "char"                   => { "i8" }
+            "unsigned char"          => { "u8" }
+            "short"                  => { "i16" }
+            "short int"              => { "i16" }
+            "unsigned short"         => { "u16" }
+            "unsigned short int"     => { "u16" }
+            "long"                   => { "i64" }
+            "long int"               => { "i64" }
+            "long long"              => { "i64" }
+            "long long int"          => { "i64" }
+            "unsigned long"          => { "u64" }
+            "unsigned long int"      => { "u64" }
+            "unsigned long long"     => { "u64" }
+            "unsigned long long int" => { "u64" }
+            "float"                  => { "f32" }
+            "double"                 => { "f64" }
+            "long double"            => { "f64" }
+            "_Bool"                  => { "boolean" }
+            "size_t"                 => { "u64" }
+            "ssize_t"                => { "i64" }
+            "ptrdiff_t"              => { "i64" }
+            "intptr_t"               => { "i64" }
+            "uintptr_t"              => { "u64" }
+            "int8_t"                 => { "i8" }
+            "int16_t"                => { "i16" }
+            "int32_t"                => { "i32" }
+            "int64_t"                => { "i64" }
+            "uint8_t"                => { "u8" }
+            "uint16_t"               => { "u16" }
+            "uint32_t"               => { "u32" }
+            "uint64_t"               => { "u64" }
+            "LLVMBool"               => { "i32" }
+            _                        => { "" }
+        };
+        if (!prim_name.eq("")) { return CHeaderImport::make_prim_annotation(prim_name, ctx); }
+
+        // Enum types -> i32
+        if (CHeaderImport::starts_with_at(type_str, 0, "enum "))     { return CHeaderImport::make_prim_annotation("i32", ctx); }
+
+        // Unknown type -> void* (opaque pointer)
+        return CHeaderImport::make_ptr_annotation(CHeaderImport::make_prim_annotation("void", ctx));
+    }
+
+
+    // String / Character Helpers
+
+    static is_whitespace(c: i8) -> boolean {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    static skip_ws(source: string, source_len: i64, start: i64) -> i64 {
+        mut pos: i64 = start;
+        while (pos < source_len && CHeaderImport::is_whitespace(source[pos])) { pos += 1; }
+        return pos;
+    }
+
+    static starts_with_at(s: string, pos: i64, prefix: string) -> boolean {
+        const plen: u64 = libc::strlen(prefix);
+        const slen: u64 = libc::strlen(s);
+        if (pos as u64 + plen > slen) { return false; }
+        for (mut i: u64 = 0; i < plen; i++) {
+            if (s[pos + i] != prefix[i]) { return false; }
+        }
+        return true;
+    }
+
+    static skip_to_semicolon_or_brace(source: string, source_len: i64, start: i64) -> i64 {
+        mut pos: i64 = start;
+        mut depth: i32 = 0;
+        while (pos < source_len) {
+            const c: i8 = source[pos];
+            if (c == '{') { depth += 1; }
+            if (c == '}') {
+                if (depth > 0) { depth -= 1; }
+                else { pos += 1; return pos; }
             }
-            const param_sym: SymbolStr = ctx.intern_table.intern(pname);
-            const param_type_ann: TypeAnnotation* = c_type_to_annotation(param_type_str, ctx);
-            const span: SourceSpan = SourceSpan::none();
-            mut param_node: VarDeclNode* = new VarDeclNode(param_sym, span);
-            param_node.type_annotation = param_type_ann;
-            params.push(param_node);
-
-            if (pos < source_len && source[pos] == ',') { pos += 1; }
+            if (c == ';' && depth == 0) { pos += 1; return pos; }
+            pos += 1;
         }
-        if (pos < source_len && source[pos] == ')') { pos += 1; }
+        return pos;
     }
 
-    // Must end with ';' (declaration), not '{' (definition)
-    pos = skip_ws(source, source_len, pos);
-    if (pos < source_len && source[pos] == '{') { return fail; }
-    if (pos < source_len && source[pos] == ';') { pos += 1; }
+    static is_c_type_keyword(s: string) -> boolean {
+        return match (s) {
+            "void"   => { true } "int"    => { true } "char"     => { true }
+            "short"  => { true } "long"   => { true } "float"    => { true }
+            "double" => { true } "unsigned" => { true } "signed" => { true }
+            "const"  => { true } "volatile" => { true } "struct" => { true }
+            "union"  => { true } "enum"   => { true } "extern"   => { true }
+            "static" => { true } "inline" => { true }
+            _        => { false }
+        };
+    }
 
-    // Build the FunctionDeclNode
-    const ret_ann: TypeAnnotation* = c_type_to_annotation(ret_type_str, ctx);
-    const span: SourceSpan = SourceSpan::none();
-    mut func: FunctionDeclNode* = new FunctionDeclNode(func_name, span);
-    func.return_type_annotation = ret_ann;
-    func.parameters = params;
-    func.is_variadic = is_variadic;
-
-    return CFuncParseResult { success: true, func: func, end_pos: pos };
-}
-
-
-// C-to-Cryo Type Mapping
-
-/// Allocate a PrimitiveAnnotation wrapped in a heap TypeAnnotation.
-function make_prim_annotation(name: string, ctx: CompilationContext*) -> TypeAnnotation* {
-    const sym: SymbolStr = ctx.intern_table.intern(name);
-    const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
-    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
-    *ann = TypeAnnotation::Primitive(prim);
-    return ann;
-}
-
-/// Allocate a PointerAnnotation wrapped in a heap TypeAnnotation.
-function make_ptr_annotation(inner: TypeAnnotation*) -> TypeAnnotation* {
-    const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, span: SourceSpan::none() };
-    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
-    *ann = TypeAnnotation::Pointer(ptr);
-    return ann;
-}
-
-/// Map a C type string to a Cryo TypeAnnotation.
-/// Handles qualifiers, pointer types, standard C types, fixed-width types,
-/// and falls back to void* for unknown types.
-function c_type_to_annotation(c_type: string, ctx: CompilationContext*) -> TypeAnnotation* {
-    mut type_str: string = c_type;
-
-    // Strip qualifiers (may appear multiple times)
-    if (starts_with_at(type_str, 0, "const "))    { type_str += 6; }
-    if (starts_with_at(type_str, 0, "volatile ")) { type_str += 9; }
-    if (starts_with_at(type_str, 0, "static "))   { type_str += 7; }
-    if (starts_with_at(type_str, 0, "extern "))   { type_str += 7; }
-    if (starts_with_at(type_str, 0, "inline "))   { type_str += 7; }
-    if (starts_with_at(type_str, 0, "signed "))   { type_str += 7; }
-
-    // Check for pointer (ends with *)
-    const tlen: u64 = libc::strlen(type_str);
-    if (tlen > 0 && type_str[tlen - 1] == '*') {
-        const inner_buf: i8* = intrinsics::malloc(tlen) as i8*;
-        intrinsics::memcpy(inner_buf as void*, type_str as void*, tlen - 1);
-        inner_buf[tlen - 1] = 0;
-        mut end: i64 = (tlen as i64) - 2;
-        while (end >= 0 && (inner_buf[end] == ' ' || inner_buf[end] == '\t')) {
-            inner_buf[end] = 0;
-            end -= 1;
+    static skip_c_qualifiers(source: string, source_len: i64, start: i64) -> i64 {
+        mut pos: i64 = start;
+        mut changed: boolean = true;
+        while (changed) {
+            changed = false;
+            pos = CHeaderImport::skip_ws(source, source_len, pos);
+            if (CHeaderImport::starts_with_at(source, pos, "extern "))   { pos += 7; changed = true; }
+            if (CHeaderImport::starts_with_at(source, pos, "static "))   { pos += 7; changed = true; }
+            if (CHeaderImport::starts_with_at(source, pos, "inline "))   { pos += 7; changed = true; }
         }
-        const inner: TypeAnnotation* = c_type_to_annotation(inner_buf as string, ctx);
-        intrinsics::free(inner_buf as void*);
-        return make_ptr_annotation(inner);
+        return pos;
     }
 
-    // Map standard C scalar types (incl. fixed-width typedefs and the LLVM
-    // `LLVMBool`) to their Cryo primitive name.  An unknown scalar yields ""
-    // so the `enum`/opaque-pointer fallbacks below still apply.
-    const prim_name: string = match (type_str) {
-        "void"                   => { "void" }
-        "int"                    => { "i32" }
-        "unsigned int"           => { "u32" }
-        "unsigned"               => { "u32" }
-        "char"                   => { "i8" }
-        "unsigned char"          => { "u8" }
-        "short"                  => { "i16" }
-        "short int"              => { "i16" }
-        "unsigned short"         => { "u16" }
-        "unsigned short int"     => { "u16" }
-        "long"                   => { "i64" }
-        "long int"               => { "i64" }
-        "long long"              => { "i64" }
-        "long long int"          => { "i64" }
-        "unsigned long"          => { "u64" }
-        "unsigned long int"      => { "u64" }
-        "unsigned long long"     => { "u64" }
-        "unsigned long long int" => { "u64" }
-        "float"                  => { "f32" }
-        "double"                 => { "f64" }
-        "long double"            => { "f64" }
-        "_Bool"                  => { "boolean" }
-        "size_t"                 => { "u64" }
-        "ssize_t"                => { "i64" }
-        "ptrdiff_t"              => { "i64" }
-        "intptr_t"               => { "i64" }
-        "uintptr_t"              => { "u64" }
-        "int8_t"                 => { "i8" }
-        "int16_t"                => { "i16" }
-        "int32_t"                => { "i32" }
-        "int64_t"                => { "i64" }
-        "uint8_t"                => { "u8" }
-        "uint16_t"               => { "u16" }
-        "uint32_t"               => { "u32" }
-        "uint64_t"               => { "u64" }
-        "LLVMBool"               => { "i32" }
-        _                        => { "" }
-    };
-    if (!prim_name.eq("")) { return make_prim_annotation(prim_name, ctx); }
-
-    // Enum types -> i32
-    if (starts_with_at(type_str, 0, "enum "))     { return make_prim_annotation("i32", ctx); }
-
-    // Unknown type -> void* (opaque pointer)
-    return make_ptr_annotation(make_prim_annotation("void", ctx));
-}
-
-
-// String / Character Helpers
-
-function is_whitespace(c: i8) -> boolean {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
-function skip_ws(source: string, source_len: i64, start: i64) -> i64 {
-    mut pos: i64 = start;
-    while (pos < source_len && is_whitespace(source[pos])) { pos += 1; }
-    return pos;
-}
-
-function starts_with_at(s: string, pos: i64, prefix: string) -> boolean {
-    const plen: u64 = libc::strlen(prefix);
-    const slen: u64 = libc::strlen(s);
-    if (pos as u64 + plen > slen) { return false; }
-    for (mut i: u64 = 0; i < plen; i++) {
-        if (s[pos + i] != prefix[i]) { return false; }
+    static extract_trimmed(source: string, start: i64, end: i64) -> string {
+        mut s: i64 = start;
+        mut e: i64 = end;
+        while (s < e && CHeaderImport::is_whitespace(source[s])) { s += 1; }
+        while (e > s && CHeaderImport::is_whitespace(source[e - 1])) { e -= 1; }
+        const len: i64 = e - s;
+        if (len <= 0) { return "void"; }
+        const buf: i8* = intrinsics::malloc((len + 1) as u64) as i8*;
+        intrinsics::memcpy(buf as void*, (source + s) as void*, len as u64);
+        buf[len] = 0;
+        return buf as string;
     }
-    return true;
-}
 
-function skip_to_semicolon_or_brace(source: string, source_len: i64, start: i64) -> i64 {
-    mut pos: i64 = start;
-    mut depth: i32 = 0;
-    while (pos < source_len) {
-        const c: i8 = source[pos];
-        if (c == '{') { depth += 1; }
-        if (c == '}') {
-            if (depth > 0) { depth -= 1; }
-            else { pos += 1; return pos; }
-        }
-        if (c == ';' && depth == 0) { pos += 1; return pos; }
-        pos += 1;
+    static intern_slice(source: string, start: i64, end: i64, ctx: CompilationContext*) -> SymbolStr {
+        const len: i64 = end - start;
+        const buf: i8* = intrinsics::malloc((len + 1) as u64) as i8*;
+        intrinsics::memcpy(buf as void*, (source + start) as void*, len as u64);
+        buf[len] = 0;
+        const sym: SymbolStr = ctx.intern_table.intern(buf as string);
+        intrinsics::free(buf as void*);
+        return sym;
     }
-    return pos;
-}
-
-function is_c_type_keyword(s: string) -> boolean {
-    return match (s) {
-        "void"   => { true } "int"    => { true } "char"     => { true }
-        "short"  => { true } "long"   => { true } "float"    => { true }
-        "double" => { true } "unsigned" => { true } "signed" => { true }
-        "const"  => { true } "volatile" => { true } "struct" => { true }
-        "union"  => { true } "enum"   => { true } "extern"   => { true }
-        "static" => { true } "inline" => { true }
-        _        => { false }
-    };
-}
-
-function skip_c_qualifiers(source: string, source_len: i64, start: i64) -> i64 {
-    mut pos: i64 = start;
-    mut changed: boolean = true;
-    while (changed) {
-        changed = false;
-        pos = skip_ws(source, source_len, pos);
-        if (starts_with_at(source, pos, "extern "))   { pos += 7; changed = true; }
-        if (starts_with_at(source, pos, "static "))   { pos += 7; changed = true; }
-        if (starts_with_at(source, pos, "inline "))   { pos += 7; changed = true; }
-    }
-    return pos;
-}
-
-function extract_trimmed(source: string, start: i64, end: i64) -> string {
-    mut s: i64 = start;
-    mut e: i64 = end;
-    while (s < e && is_whitespace(source[s])) { s += 1; }
-    while (e > s && is_whitespace(source[e - 1])) { e -= 1; }
-    const len: i64 = e - s;
-    if (len <= 0) { return "void"; }
-    const buf: i8* = intrinsics::malloc((len + 1) as u64) as i8*;
-    intrinsics::memcpy(buf as void*, (source + s) as void*, len as u64);
-    buf[len] = 0;
-    return buf as string;
-}
-
-function intern_slice(source: string, start: i64, end: i64, ctx: CompilationContext*) -> SymbolStr {
-    const len: i64 = end - start;
-    const buf: i8* = intrinsics::malloc((len + 1) as u64) as i8*;
-    intrinsics::memcpy(buf as void*, (source + start) as void*, len as u64);
-    buf[len] = 0;
-    const sym: SymbolStr = ctx.intern_table.intern(buf as string);
-    intrinsics::free(buf as void*);
-    return sym;
 }
