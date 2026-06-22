@@ -61,8 +61,19 @@ public:
         if (left == null || this.panic_mode) { return left; }
 
         if (this.current().kind.is_assignment_op()) {
+            // EXPR_DEPTH_LIMIT: a chain `a = b = c = ...` recurses once per
+            // `=` with no bracketing token to bound it. Guard before advance()
+            // so no token is consumed on the error path. 256 is far beyond any
+            // realistic hand-written nesting.
+            if (this.expr_depth > 256) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "expression nesting too deep (assignment recursion limit exceeded)");
+                return left;
+            }
             const op: Token = this.advance();
+            this.expr_depth += 1;
             const right: ExpressionNode* = this.parse_assignment();
+            this.expr_depth -= 1;
             if (right == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     "expected expression after assignment operator");
@@ -120,8 +131,18 @@ public:
         // Right-associative `??`: recurse on the RHS so `a ?? b ?? c`
         // nests as `a ?? (b ?? c)`.
         if (this.check(TokenType::QuestionQuestion)) {
+            // EXPR_DEPTH_LIMIT: a chain `a ?? b ?? c ...` recurses once per
+            // `??` with no bracketing token to bound it. Guard before advance()
+            // so no token is consumed on the error path.
+            if (this.expr_depth > 256) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "expression nesting too deep (null-coalesce recursion limit exceeded)");
+                return left;
+            }
             this.advance();
+            this.expr_depth += 1;
             const right: ExpressionNode* = this.parse_pipe();
+            this.expr_depth -= 1;
             if (right == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     "expected expression after '??'");
@@ -213,15 +234,27 @@ public:
         if (expr == null || this.panic_mode) { return expr; }
 
         if (this.check(TokenType::Question)) {
+            // EXPR_DEPTH_LIMIT: a chain `a ? b : c ? d : e ...` recurses once
+            // per `:` (the right-associative else branch) with no bracketing
+            // token to bound it. Guard before advance() so no token is
+            // consumed on the error path.
+            if (this.expr_depth > 256) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "expression nesting too deep (ternary recursion limit exceeded)");
+                return expr;
+            }
             this.advance();
+            this.expr_depth += 1;
             const true_expr: ExpressionNode* = this.parse_expression();
             if (true_expr == null) {
+                this.expr_depth -= 1;
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     "expected expression after '?'");
                 return expr;
             }
             this.consume(TokenType::Colon, "':'");
             const false_expr: ExpressionNode* = this.parse_conditional();
+            this.expr_depth -= 1;
             if (false_expr == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     "expected expression after ':'");
@@ -2155,6 +2188,17 @@ public:
             } else {
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
                     format("expected type in generic arguments, found '%s'", this.current().lexeme));
+                break;
+            }
+
+            // A nested generic arg ending in `>>` (e.g. `Option<Option<T>>`)
+            // makes the inner `consume_right_angle` eat the whole `>>` and
+            // raise `pending_right_angle` - the virtual second `>` already
+            // closes THIS level too.  Stop here so the trailing
+            // `consume_right_angle()` below consumes that virtual `>`; without
+            // this, the comma check would greedily swallow a following
+            // `, next_param` as another type arg.
+            if (this.pending_right_angle) {
                 break;
             }
 
