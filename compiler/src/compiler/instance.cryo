@@ -34,6 +34,7 @@ import std::fmt;
 import std::fs::metadata;
 import std::fs::path;
 import std::env;
+import std::time::clock;
 import std::collections::string;
 
 type struct CompilerConfig {
@@ -231,34 +232,6 @@ type struct CompilationResult {
 // resolution fails so users see exactly where the compiler looked.
 
 
-/// Final path component of `path` ("src/hello.cryo" -> "hello.cryo").
-// Self-contained monotonic clock for `CRYO_TIMINGS` phase profiling.
-//
-// Declared locally rather than importing `ffi::libc` / `std::time`: the
-// compiler imports neither, and pulling `ffi::libc` into the compiler's
-// module graph re-introduces the `strstr`/`realpath` `u8*`-vs-`i8*` shim
-// collision that breaks the self-build (see the f-string discovery note in
-// `compile_project_with_ctx`).  A bare `clock_gettime` extern + a two-word
-// struct sidesteps all of that.  CLOCK_MONOTONIC == 1 on Linux.
-type struct TimingTs {
-    secs:  i64;
-    nanos: i64;
-}
-
-![target(unix)]
-extern "C" {
-    function clock_gettime(clk: i32, tp: TimingTs*) -> i32;
-}
-
-// Windows has no `clock_gettime`; the monotonic counter is
-// `QueryPerformanceCounter` (ticks) scaled by `QueryPerformanceFrequency`
-// (ticks/second).  Both live in kernel32, which mingw-w64 auto-links.
-![target(windows)]
-extern "C" {
-    function QueryPerformanceCounter(count: i64*) -> i32;
-    function QueryPerformanceFrequency(freq: i64*) -> i32;
-}
-
 type struct CompilerInstance {
     config: CompilerConfig;
 
@@ -266,32 +239,6 @@ type struct CompilerInstance {
         return CompilerInstance {
             config: config,
         };
-    }
-
-    /// Monotonic nanoseconds.  Only meaningful as a difference between two
-    /// readings; used solely for the `CRYO_TIMINGS` phase report.
-    ![target(unix)]
-    static timing_now_ns() -> i64 {
-        mut ts: TimingTs = TimingTs { secs: 0i64, nanos: 0i64 };
-        clock_gettime(1, &ts);
-        return ts.secs * 1000000000i64 + ts.nanos;
-    }
-
-    /// Windows monotonic nanoseconds via QPC.  `count / freq` gives whole
-    /// seconds and `count % freq` the sub-second remainder; scaling the
-    /// remainder (always < freq) by 1e9 before the divide keeps full
-    /// nanosecond resolution without overflowing i64 the way `count * 1e9`
-    /// would on a long-running counter.
-    ![target(windows)]
-    static timing_now_ns() -> i64 {
-        mut count: i64 = 0i64;
-        mut freq:  i64 = 0i64;
-        QueryPerformanceCounter(&count);
-        QueryPerformanceFrequency(&freq);
-        if (freq == 0i64) { return 0i64; }
-        const secs: i64 = count / freq;
-        const rem:  i64 = count % freq;
-        return secs * 1000000000i64 + (rem * 1000000000i64) / freq;
     }
 
     /// Build a ProjectConfig view that compiles the `[lib]` half of a
@@ -822,7 +769,7 @@ type struct CompilerInstance {
         // the report only prints (success path) when the env var is set, so
         // the overhead on a normal build is a handful of `clock_gettime`s.
         const tm_on: boolean = CompilerInstance::timing_enabled();
-        const tm_entry:        i64 = CompilerInstance::timing_now_ns();
+        const tm_entry:        i64 = Instant::now().as_nanos();
         mut tm_discovery_end:  i64 = 0i64;
         mut tm_frontend_end:   i64 = 0i64;
         mut tm_mono_end:       i64 = 0i64;
@@ -1119,7 +1066,7 @@ type struct CompilerInstance {
 
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
-        tm_discovery_end = CompilerInstance::timing_now_ns();
+        tm_discovery_end = Instant::now().as_nanos();
 
         cdebug("[Compiler] Discovered %u modules, compilation order:\n", n);
         for (mut i: u32 = 0; i < n; i++) {
@@ -1439,7 +1386,7 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        tm_frontend_end = CompilerInstance::timing_now_ns();
+        tm_frontend_end = Instant::now().as_nanos();
 
         // Phase 6a: Specialization: monomorphize ALL modules before validation.
         // GenericValidation walks the shared TypeArena which contains
@@ -1616,7 +1563,7 @@ type struct CompilerInstance {
             return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
-        tm_mono_end = CompilerInstance::timing_now_ns();
+        tm_mono_end = Instant::now().as_nanos();
 
         // ====================================================================
         // Per-module incremental cache: decide which modules can reuse their
@@ -1775,7 +1722,7 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        tm_sema_end = CompilerInstance::timing_now_ns();
+        tm_sema_end = Instant::now().as_nanos();
 
         // Dump ASTs if requested (even on errors, for debugging)
         if (this.config.show_ast) {
@@ -1971,7 +1918,7 @@ type struct CompilerInstance {
                 pipeline.reset();
             }
 
-            tm_codegen_end = CompilerInstance::timing_now_ns();
+            tm_codegen_end = Instant::now().as_nanos();
 
             // Phase 7b: synthesize the test-runner main when in test mode.
             // Walks the directive registry for `![test]` records, builds
@@ -1996,7 +1943,7 @@ type struct CompilerInstance {
                     fmt::eprintf("error: linking failed\n");
                 }
             }
-            tm_link_end = CompilerInstance::timing_now_ns();
+            tm_link_end = Instant::now().as_nanos();
         }
 
         // Print diagnostic summary on errors, warnings, or debug mode.
