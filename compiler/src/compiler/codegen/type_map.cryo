@@ -62,28 +62,28 @@ type struct TypeMapperCache {
     store(mut &this, id: u64, ty: LType) -> void {
         this.cache.insert(id, ty.raw);
     }
+
+    /// Lazy-init accessor for the cross-module type cache.  Idempotent;
+    /// every call after the first returns the same handle.
+    static get_shared_type_cache() -> TypeMapperCache* {
+        if (g_shared_type_cache == null) {
+            const _box: Box<TypeMapperCache> = Box<TypeMapperCache>::new(TypeMapperCache::new());
+            g_shared_type_cache = _box.leak();
+        }
+        return g_shared_type_cache;
+    }
+
+    /// Drop the shared type cache so the next codegen pass starts with an
+    /// empty (TypeRef.id -> LLVMTypeRef) map.  Required when running
+    /// multiple project compiles in the same process; TypeArena.next_id
+    /// resets to 1 per compile, so cached entries from a prior compile
+    /// would otherwise be returned for unrelated types in the new compile.
+    static reset_shared_type_cache() -> void {
+        g_shared_type_cache = null;
+    }
 }
 
 mut g_shared_type_cache: TypeMapperCache* = null;
-
-/// Lazy-init accessor for the cross-module type cache.  Idempotent;
-/// every call after the first returns the same handle.
-function get_shared_type_cache() -> TypeMapperCache* {
-    if (g_shared_type_cache == null) {
-        const _box: Box<TypeMapperCache> = Box<TypeMapperCache>::new(TypeMapperCache::new());
-        g_shared_type_cache = _box.leak();
-    }
-    return g_shared_type_cache;
-}
-
-/// Drop the shared type cache so the next codegen pass starts with an
-/// empty (TypeRef.id -> LLVMTypeRef) map.  Required when running
-/// multiple project compiles in the same process; TypeArena.next_id
-/// resets to 1 per compile, so cached entries from a prior compile
-/// would otherwise be returned for unrelated types in the new compile.
-function reset_shared_type_cache() -> void {
-    g_shared_type_cache = null;
-}
 
 
 type struct TypeMapper {
@@ -662,12 +662,12 @@ type struct TypeMapper {
     /// every module's TypeMapper participates in one cross-module dedup
     /// pool.
     lookup_cache(&this, id: u64) -> LType {
-        const cache: TypeMapperCache* = get_shared_type_cache();
+        const cache: TypeMapperCache* = TypeMapperCache::get_shared_type_cache();
         return cache.lookup(id);
     }
 
     store_cache(mut &this, id: u64, ty: LType) -> void {
-        const cache: TypeMapperCache* = get_shared_type_cache();
+        const cache: TypeMapperCache* = TypeMapperCache::get_shared_type_cache();
         cache.store(id, ty);
     }
 }

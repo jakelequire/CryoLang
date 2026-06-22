@@ -278,4 +278,100 @@ type struct QualifiedName {
     display_leaf(&this, table: InternTable*) -> string {
         return table.resolve(this.leaf());
     }
+
+    /// Extract the last segment after the final "::" in a qualified-name
+    /// string.  E.g., "Compiler::AST::Declaration::DeclarationNode" ->
+    /// "DeclarationNode".  Returns the input as-is if no "::" is found.
+    /// Operates on the raw-string form (for callers holding a flat name
+    /// rather than a structured QualifiedName).
+    static leaf_of(s: string) -> string {
+        const len: i64 = strlen(s) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                last_sep = i;
+            }
+        }
+        if (last_sep < 0) { return s; }
+        const start: i64 = last_sep + 2;
+        if (start >= len) { return ""; }
+        // Use format("%s") on the tail pointer to create a safe copy
+        const tail: string = ptr_add(s as void*, start) as string;
+        return format("%s", tail);
+    }
+
+    /// Inverse of `leaf_of`: return everything BEFORE the final "::".
+    /// Used when building import suggestions - we want the module path
+    /// that owns the type (`Compiler::Diag::Diagnostic`), not the type's
+    /// own fully-qualified path (`Compiler::Diag::Diagnostic::Diagnostic`).
+    /// Returns the empty string when the input has no "::" (single-segment
+    /// names like a primitive have no parent path).
+    static parent_of(s: string) -> string {
+        const len: i64 = strlen(s) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                last_sep = i;
+            }
+        }
+        if (last_sep <= 0) { return ""; }
+        // Copy the prefix [0, last_sep) into a fresh buffer.  format()
+        // doesn't implement the `%.*s` precision spec; build the string
+        // manually so the caller owns a stable copy.
+        const buf: i8* = malloc((last_sep + 1) as u64) as i8*;
+        for (mut i: i64 = 0; i < last_sep; i++) {
+            buf[i] = s[i] as i8;
+        }
+        buf[last_sep] = 0 as i8;
+        return buf as string;
+    }
+
+    /// Shorten every qualified path in `s` to its leaf, keeping all
+    /// non-identifier punctuation (`<`, `>`, `,`, `&`, `*`, etc.) intact.
+    /// Unlike `leaf_of`, this is safe to apply to display strings that
+    /// contain generic-arg lists:
+    ///
+    ///   "Array<u8, std::alloc::allocator::GlobalAlloc>"
+    ///     -> "Array<u8, GlobalAlloc>"
+    ///
+    /// The walk treats `Foo::Bar::Baz` as one identifier path and emits
+    /// only the last segment; mangled names (which use `.` and `$L$G`,
+    /// not `::`) pass through unchanged because no `::` ever matches.
+    /// Used by `format_display_short` for the leaf user-defined type
+    /// case where the Type's `display_name()` already includes generic
+    /// args from the monomorphizer's `custom_display`.
+    static shorten_paths(s: string) -> string {
+        const len: i64 = strlen(s) as i64;
+        // Worst case the output is the same length as the input (when no
+        // qualified path appears) so a single len+1 buffer suffices.
+        const buf: i8* = malloc((len + 1) as u64) as i8*;
+        mut out_idx: i64 = 0;
+        mut i: i64 = 0;
+        while (i < len) {
+            const c: i8 = s[i];
+            if ((c as char).is_c_ident_start()) {
+                // Scan an identifier path: <ident> ("::" <ident>)*
+                mut leaf_start: i64 = i;
+                while (i < len && (s[i] as char).is_c_ident_char()) { i += 1; }
+                while (i + 2 < len
+                       && s[i] == ':' as i8
+                       && s[i + 1] == ':' as i8
+                       && (s[i + 2] as char).is_c_ident_start()) {
+                    i += 2;
+                    leaf_start = i;
+                    while (i < len && (s[i] as char).is_c_ident_char()) { i += 1; }
+                }
+                for (mut j: i64 = leaf_start; j < i; j++) {
+                    buf[out_idx] = s[j];
+                    out_idx += 1;
+                }
+            } else {
+                buf[out_idx] = c;
+                out_idx += 1;
+                i += 1;
+            }
+        }
+        buf[out_idx] = 0 as i8;
+        return buf as string;
+    }
 }

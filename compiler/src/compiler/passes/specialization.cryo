@@ -32,196 +32,6 @@ import Compiler::Resolver::{ InternTable, SymbolStr };
 import Utils::Logger;
 
 
-// Template registration helpers (free functions)
-
-/// Unified template registration for any generic declaration.
-/// Extracts generic parameter metadata, qualifies the name, looks up the
-/// base type in the arena, and registers a TemplateEntry.
-///
-/// `name` and `generic_params` are the common fields every generic
-/// declaration shares.  `ast_node` is the original declaration cast to
-/// ASTNode*.  `node_kind` identifies which declaration type it is.
-/// `lookup_base` controls whether the base type is looked up in the arena
-/// (true for types: struct/enum/class/trait) or left invalid (false for
-/// functions, which have no arena entry).
-function register_generic_template(name: SymbolStr, generic_params: &GenericParamNode*[],
-                                   ast_node: ASTNode*, node_kind: NodeKind,
-                                   lookup_base: boolean,
-                                   registry: GenericRegistry*, arena: TypeArena*,
-                                   ctx: CompilationContext*) -> void {
-    if (generic_params.length == 0) { return; }
-
-    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(name);
-    // Use the namespace (not file path) as the module name so that
-    // the monomorphizer's ResolutionContext can qualify type lookups
-    // correctly (e.g., "std::core::option" not "./core/option.cryo").
-    const module_sym: SymbolStr = if (ctx.has_namespace()) {
-        ctx.namespace_str
-    } else {
-        ctx.intern(ctx.source_file)
-    };
-    LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering %s template '%s'",
-        node_kind.to_string(), ctx.resolve_str(name));
-
-    // Use the shared utility for arena TypeRef creation (single source of truth)
-    const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
-        generic_params, arena);
-    mut param_names: SymbolStr[] = [];
-    mut param_type_ids: u64[] = [];
-    for (mut i: i64 = 0; i < generic_params.length; i++) {
-        const gp: GenericParamNode* = generic_params[i];
-        param_names.push(gp.name);
-        param_type_ids.push(refs[i].id);
-    }
-
-    mut base_type: TypeRef = TypeRef::invalid();
-    if (node_kind == NodeKind::FunctionDeclaration) {
-        // Generic functions have no arena type, but they need a TypeID so
-        // the GenericRegistry can track instantiations (e.g., identity<int>).
-        // Use a FunctionTemplate placeholder instead of a fake StructType.
-        base_type = arena.create_function_template(qualified_sym);
-    } else if (lookup_base) {
-        base_type = arena.lookup_by_name(qualified_sym);
-    }
-
-    const entry: TemplateEntry = TemplateEntry::new(
-        name, qualified_sym, module_sym,
-        param_names, param_type_ids,
-        ast_node, node_kind,
-        base_type
-    );
-    registry.register_template(entry);
-}
-
-/// Register every generic STATIC method on `methods` as a function-style
-/// template. Static generic methods on non-generic types (e.g.
-/// `Layout::array<T>`) are otherwise invisible to the monomorphizer because
-/// `run_template_registration` only walks top-level declarations. Without
-/// registration the inference path in `try_infer_function_call` can't find
-/// them, and ScopeResolution callees like `Layout::array<int>(n)` link to a
-/// never-emitted bare-template symbol.
-///
-/// Generic NON-static methods are intentionally skipped; those go through
-/// `try_infer_method_call` / `specialize_method`, which dispatches by
-/// receiver type rather than scope-qualified name.
-///
-/// Owner-qualified key (`<owner_qualified>::<method>`) avoids collisions
-/// when two types in the same namespace each declare a static method with
-/// the same bare name.
-function register_static_method_templates(owner_name: SymbolStr,
-                                          methods: &MethodNode*[],
-                                          registry: GenericRegistry*,
-                                          arena: TypeArena*,
-                                          ctx: CompilationContext*) -> void {
-    if (methods.length == 0) { return; }
-
-    const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
-    const owner_qstr: string = ctx.intern_table.resolve(owner_qsym);
-    const module_sym: SymbolStr = if (ctx.has_namespace()) {
-        ctx.namespace_str
-    } else {
-        ctx.intern(ctx.source_file)
-    };
-
-    for (mut i: i64 = 0; i < methods.length; i++) {
-        const m: MethodNode* = methods[i];
-        if (m == null || m.func == null) { continue; }
-        if (!m.is_static) { continue; }
-        if (!m.func.is_generic()) { continue; }
-
-        const method_str: string = ctx.intern_table.resolve(m.func.name);
-        const qualified_str: string = owner_qstr + "::" + method_str;
-        const qualified_sym: SymbolStr = ctx.intern_table.intern(qualified_str);
-
-        const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
-            m.func.generic_params, arena);
-        mut param_names: SymbolStr[] = [];
-        mut param_type_ids: u64[] = [];
-        for (mut j: i64 = 0; j < m.func.generic_params.length; j++) {
-            const gp: GenericParamNode* = m.func.generic_params[j];
-            param_names.push(gp.name);
-            param_type_ids.push(refs[j].id);
-        }
-
-        const base_type: TypeRef = arena.create_function_template(qualified_sym);
-
-        const entry: TemplateEntry = TemplateEntry::new(
-            m.func.name, qualified_sym, module_sym,
-            param_names, param_type_ids,
-            m.func as ASTNode*, NodeKind::FunctionDeclaration,
-            base_type
-        );
-        registry.register_template(entry);
-    }
-}
-
-/// Register a non-generic struct/class AST as an "inherent owner",
-/// keyed by both qualified and bare name.  Two consumers:
-///
-/// * The monomorphizer / sema walk the owner's `methods[]` to specialize
-///   generic INSTANCE methods (e.g. `Response::write_to<W>`).  Generic
-///   STATIC methods take a separate path via
-///   `register_static_method_templates`, which keys them by
-///   `Owner::method` for ScopeResolution callees.
-/// * `OwnershipQuery::has_inherent_drop` walks the owner's `methods[]`
-///   to detect an inline `drop` so the Copy classifier and the
-///   drop-insertion pass treat the type as non-Copy and synthesize
-///   scope-exit drops.
-///
-/// Registration is unconditional for non-generic owners so the index is
-/// a complete `qualified_name -> AST` map for them; receiver-type lookups
-/// no longer have to thread a fallback through DeclarationIndex.  Generic
-/// owners go through `register_generic_template` instead; their methods
-/// are specialized as part of struct/class monomorphization rather than
-/// per-call.
-function register_inherent_owner(
-        owner_name: SymbolStr, owner_ast: ASTNode*,
-        registry: GenericRegistry*, ctx: CompilationContext*) -> void {
-    if (owner_ast == null) { return; }
-    const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
-    registry.register_inherent_owner(owner_qsym, owner_ast);
-    // Also register under the bare name so receiver-type lookups that
-    // miss the qualified form (e.g., when the arena returns the bare
-    // name for primitive impls) still find the owner.
-    if (!owner_qsym.equals(owner_name)) {
-        registry.register_inherent_owner(owner_name, owner_ast);
-    }
-}
-
-/// Register a newly injected specialized declaration into the DeclarationIndex
-/// so that sema can look it up without rescanning the AST.
-/// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
-function register_injected_decl(stmt: ASTNode*, owner_mod: SymbolStr,
-                                ctx: CompilationContext*) -> void {
-    // Injected spec clones, not source decls: pass is_source_decl=false so
-    // they are skipped by the cross-module coherence check (their canonical
-    // targets recur across every module that instantiates the template).
-    // `owner_mod` sets the spec's DeclarationIndex module ownership to its
-    // template's defining module (where Phase 6a-iii places its AST), so
-    // codegen's define-vs-extern decision agrees with where it is emitted.
-    TypeResolutionPasses::register_decl_in_index(stmt, ctx, false, owner_mod);
-}
-
-/// Tag an AST node's source_module field with the template's module name.
-/// struct/class/enum/function/impl decls are all DeclarationNode subclasses and
-/// `source_module` lives on that shared base, so a single base-pointer write
-/// covers every kind. (The kind check keeps the cast sound — only declaration
-/// nodes are written.) The earlier per-leaf concrete casts here worked around a
-/// believed vtable field-offset miscompile; that was misdiagnosed — base-pointer
-/// field writes on the vtable'd AST hierarchy are correct (verified 2026-06-17,
-/// O0+O2). The real crash was a since-fixed mangler ICE on `Array<ptr>` specs.
-function tag_decl_source_module(node: ASTNode*, module: string) -> void {
-    if (node == null) { return; }
-    const k: NodeKind = node.kind;
-    const is_decl: boolean =
-        k == NodeKind::StructDeclaration || k == NodeKind::ClassDeclaration
-        || k == NodeKind::EnumDeclaration || k == NodeKind::FunctionDeclaration
-        || k == NodeKind::ImplementationBlock;
-    if (!is_decl) { return; }
-    const decl: DeclarationNode* = node as DeclarationNode*;
-    decl.source_module = module;
-}
-
 /// Register a specialized type declaration using the arena type's actual
 /// qualified name for method keys.  Uses the SpecializationEntry's
 /// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
@@ -239,11 +49,11 @@ type struct SpecInjector {
         if (node == null) { return; }
         // For function declarations, use the standard path (no naming conflict)
         if (node.kind == NodeKind::FunctionDeclaration) {
-            register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, owner_mod, ctx);
             return;
         }
         if (!spec_type.is_valid()) {
-            register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, owner_mod, ctx);
             return;
         }
 
@@ -252,7 +62,7 @@ type struct SpecInjector {
         const arena: TypeArena* = ctx.type_arena;
         const arena_qname: SymbolStr = arena.get_qualified_name(spec_type);
         if (!arena_qname.is_valid()) {
-            register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, owner_mod, ctx);
             return;
         }
 
@@ -308,65 +118,25 @@ type struct SpecInjector {
             // Enum methods come from implement blocks, not inline.
             // Type registration above already covers the enum itself.
         } else {
-            register_injected_decl(node, owner_mod, ctx);
-        }
-    }
-}
-
-function register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
-                             ctx: CompilationContext*) -> void {
-    // Qualify the target name so impl blocks use the same key as templates.
-    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
-    if (registry.get_template(qualified_sym) != null) {
-        registry.register_impl_block(qualified_sym, node);
-    } else if (!node.is_trait_impl()) {
-        // Non-generic target: there is no TemplateEntry to hang the block
-        // on, so an inherent `implement T { ... }` block would otherwise be
-        // invisible to ownership classification.  Record it under both the
-        // qualified and bare names (mirroring `register_inherent_owner`) so
-        // a separately-declared `drop` makes `T` non-Copy and droppable.
-        registry.register_inherent_impl_block(qualified_sym, node);
-        if (!qualified_sym.equals(node.target_type)) {
-            registry.register_inherent_impl_block(node.target_type, node);
+            SpecInjector::register_injected_decl(node, owner_mod, ctx);
         }
     }
 
-    // Trait impls (`implement trait Foo for Bar`) also go into the
-    // (trait, target) registry so sema/dispatch can find them by trait
-    // name. Inherent impls (`implement Bar { ... }`) skip this branch.
-    if (node.is_trait_impl()) {
-        const trait_name: SymbolStr = extract_root_name(node.trait_annotation);
-        if (trait_name.is_valid()) {
-            // NOTE: coherence (a trait may be implemented at most once per
-            // type) is NOT checked here.  At this stage (DeclarationCollection)
-            // there is no import-resolved target name, so a key would have to
-            // use bare simple names — which conflate same-named types in
-            // different modules and ignore trait/target type args.  The
-            // single coherence check lives in TypeResolution's
-            // `register_decl_in_index`, after `canonical_target` is stamped;
-            // it covers same-file and cross-module duplicates uniformly,
-            // including generic traits.  This branch only populates the
-            // dispatch registry.
-            registry.register_trait_impl(trait_name, node.target_type, node);
-        }
+    /// Register a newly injected specialized declaration into the DeclarationIndex
+    /// so that sema can look it up without rescanning the AST.
+    /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
+    static register_injected_decl(stmt: ASTNode*, owner_mod: SymbolStr,
+                                    ctx: CompilationContext*) -> void {
+        // Injected spec clones, not source decls: pass is_source_decl=false so
+        // they are skipped by the cross-module coherence check (their canonical
+        // targets recur across every module that instantiates the template).
+        // `owner_mod` sets the spec's DeclarationIndex module ownership to its
+        // template's defining module (where Phase 6a-iii places its AST), so
+        // codegen's define-vs-extern decision agrees with where it is emitted.
+        TypeResolutionPasses::register_decl_in_index(stmt, ctx, false, owner_mod);
     }
 }
 
-/// Walk a TypeAnnotation* to its underlying head identifier. Used to pull
-/// `Foo` out of `Foo`, `Foo<T>`, or `&Foo`. Returns an invalid SymbolStr
-/// for shapes the trait-impl registry doesn't index (Primitive, ThisType,
-/// Tuple, Function, Optional, Array). Qualified-path traits are tracked
-/// only by their leaf name here; full-path indexing is B.4 work.
-function extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
-    if (ann == null) { return SymbolStr::empty(); }
-    return match (*ann) {
-        TypeAnnotation::Named(n) => { n.name }
-        TypeAnnotation::Generic(g) => { extract_root_name(g.base) }
-        TypeAnnotation::Reference(r) => { extract_root_name(r.inner) }
-        TypeAnnotation::Pointer(p) => { extract_root_name(p.inner) }
-        _ => { SymbolStr::empty() }
-    };
-}
 
 // SpecializationPasses: static methods for cross-module resolution
 //
@@ -419,65 +189,65 @@ type struct SpecializationPasses {
                 NodeKind::StructDeclaration => {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     if (node.is_generic()) {
-                        register_generic_template(node.name, node.generic_params,
+                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::StructDeclaration, true, registry, arena, ctx);
                     }
                     // Static generic methods on non-generic structs (e.g.
                     // `Layout::array<T>`) need their own template entries;
                     // run_template_registration would otherwise miss them.
                     if (!node.is_generic()) {
-                        register_static_method_templates(node.name, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.name, node.methods,
                             registry, arena, ctx);
                         // Generic INSTANCE methods on non-generic structs
                         // (e.g. `Response::write_to<W>`) dispatch via receiver
                         // type rather than scope-qualified name; record the
                         // owner AST here so try_infer_method_call can find
                         // its `methods[]` from a receiver TypeRef.
-                        register_inherent_owner(node.name, stmt, registry, ctx);
+                        SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
                     }
                 }
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
                     if (node.is_generic()) {
-                        register_generic_template(node.name, node.generic_params,
+                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::EnumDeclaration, true, registry, arena, ctx);
                     }
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) {
-                        register_generic_template(node.name, node.generic_params,
+                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::ClassDeclaration, true, registry, arena, ctx);
                     }
                     if (!node.is_generic()) {
-                        register_static_method_templates(node.name, node.methods,
+                        SpecializationPasses::register_static_method_templates(node.name, node.methods,
                             registry, arena, ctx);
-                        register_inherent_owner(node.name, stmt, registry, ctx);
+                        SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
                     }
                 }
                 NodeKind::FunctionDeclaration => {
                     const node: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (node.is_generic()) {
-                        register_generic_template(node.name, node.generic_params,
+                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::FunctionDeclaration, false, registry, arena, ctx);
                     }
                 }
                 NodeKind::TraitDeclaration => {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
                     if (node.is_generic()) {
-                        register_generic_template(node.name, node.generic_params,
+                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
                             stmt, NodeKind::TraitDeclaration, true, registry, arena, ctx);
                     }
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
                     if (node.is_generic()) {
-                        register_generic_template(node.alias_name, node.generic_params,
+                        SpecializationPasses::register_generic_template(node.alias_name, node.generic_params,
                             stmt, NodeKind::TypeAliasDeclaration, true, registry, arena, ctx);
                     }
                 }
                 NodeKind::ImplementationBlock => {
-                    register_impl_block(stmt as ImplBlockNode*, registry, ctx);
+                    SpecializationPasses::register_impl_block(stmt as ImplBlockNode*, registry, ctx);
                 }
                 _ => {
                     // Not a declaration that can be generic
@@ -692,7 +462,7 @@ type struct SpecializationPasses {
                 && entry.ast_node.kind == NodeKind::FunctionDeclaration
                 && entry.template_module.is_valid()) {
             const tmpl_ns: string = ctx.intern_table.resolve(entry.template_module);
-            tag_decl_source_module(entry.ast_node, tmpl_ns);
+            SpecializationPasses::tag_decl_source_module(entry.ast_node, tmpl_ns);
         }
 
         // Scope-tag the main AST with its template module origin in the
@@ -785,14 +555,14 @@ type struct SpecializationPasses {
                 // method-via-trait lookup for `String<GlobalAlloc>::hash`
                 // bottoms out and emits E0091.
                 if (impl_node.is_trait_impl()) {
-                    const trait_nm: SymbolStr = extract_root_name(impl_node.trait_annotation);
+                    const trait_nm: SymbolStr = SpecializationPasses::extract_root_name(impl_node.trait_annotation);
                     if (trait_nm.is_valid()) {
                         ctx.generic_registry.register_trait_impl(
                             trait_nm, impl_qname, impl_node);
                     }
                 }
             } else {
-                register_injected_decl(entry.impl_nodes[j], owner_module_sym, ctx);
+                SpecInjector::register_injected_decl(entry.impl_nodes[j], owner_module_sym, ctx);
             }
         }
 
@@ -856,101 +626,315 @@ type struct SpecializationPasses {
     /// has a valid resolved_type.  Delegates to free functions to avoid
     /// vtable-offset issues with class-method field access.
     static run_generic_validation(ctx: CompilationContext*) -> PassResult {
-        return run_generic_validation_impl(ctx);
-    }
-}
-
-
-// Generic Validation: free function implementation
-//
-// Uses a free function (not class method) and avoids ALL virtual method
-// calls on Type* pointers.  Dispatching virtual methods on Type subclass
-// pointers in certain compilation units has triggered a vtable-offset
-// SIGSEGV; the workaround is to access only plain fields here.
-//
-// Only non-virtual access is used:
-//   - ty.kind        (plain field, TypeKind enum, no vtable)
-//   - inst.resolved_type.is_valid()  (TypeRef is a plain struct, no vtable)
-//   - inst.generic_base.id           (plain u64 field)
-//   - inst.type_args.length          (array length, no vtable)
-
-
-function run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
-    const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
-
-    const arena: TypeArena* = ctx.type_arena;
-    if (arena == null) {
-        return PassResult::ok();
+        return SpecializationPasses::run_generic_validation_impl(ctx);
     }
 
-    const count: i64 = arena.type_count();
-    LOG_DEBUG(LogComponent::General, "[GenericValidation] Validating %lld types in arena", count);
+    /// Unified template registration for any generic declaration.
+    /// Extracts generic parameter metadata, qualifies the name, looks up the
+    /// base type in the arena, and registers a TemplateEntry.
+    ///
+    /// `name` and `generic_params` are the common fields every generic
+    /// declaration shares.  `ast_node` is the original declaration cast to
+    /// ASTNode*.  `node_kind` identifies which declaration type it is.
+    /// `lookup_base` controls whether the base type is looked up in the arena
+    /// (true for types: struct/enum/class/trait) or left invalid (false for
+    /// functions, which have no arena entry).
+    static register_generic_template(name: SymbolStr, generic_params: &GenericParamNode*[],
+                                       ast_node: ASTNode*, node_kind: NodeKind,
+                                       lookup_base: boolean,
+                                       registry: GenericRegistry*, arena: TypeArena*,
+                                       ctx: CompilationContext*) -> void {
+        if (generic_params.length == 0) { return; }
 
-    mut unresolved_count: i64 = 0;
+        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(name);
+        // Use the namespace (not file path) as the module name so that
+        // the monomorphizer's ResolutionContext can qualify type lookups
+        // correctly (e.g., "std::core::option" not "./core/option.cryo").
+        const module_sym: SymbolStr = if (ctx.has_namespace()) {
+            ctx.namespace_str
+        } else {
+            ctx.intern(ctx.source_file)
+        };
+        LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering %s template '%s'",
+            node_kind.to_string(), ctx.resolve_str(name));
 
-    for (mut i: i64 = 0; i < count; i++) {
-        const ty: Type* = arena.types[i];
-        if (ty == null) { continue; }
+        // Use the shared utility for arena TypeRef creation (single source of truth)
+        const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+            generic_params, arena);
+        mut param_names: SymbolStr[] = [];
+        mut param_type_ids: u64[] = [];
+        for (mut i: i64 = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            param_names.push(gp.name);
+            param_type_ids.push(refs[i].id);
+        }
 
-        // Non-virtual field access only; ty.kind is a plain enum field.
-        if (ty.kind != TypeKind::InstantiatedType) { continue; }
+        mut base_type: TypeRef = TypeRef::invalid();
+        if (node_kind == NodeKind::FunctionDeclaration) {
+            // Generic functions have no arena type, but they need a TypeID so
+            // the GenericRegistry can track instantiations (e.g., identity<int>).
+            // Use a FunctionTemplate placeholder instead of a fake StructType.
+            base_type = arena.create_function_template(qualified_sym);
+        } else if (lookup_base) {
+            base_type = arena.lookup_by_name(qualified_sym);
+        }
 
-        const inst: InstantiatedType* = ty as InstantiatedType*;
+        const entry: TemplateEntry = TemplateEntry::new(
+            name, qualified_sym, module_sym,
+            param_names, param_type_ids,
+            ast_node, node_kind,
+            base_type
+        );
+        registry.register_template(entry);
+    }
 
-        // resolved_type is a TypeRef (plain struct); is_valid() is non-virtual.
-        if (inst.resolved_type.is_valid()) { continue; }
+    /// Register every generic STATIC method on `methods` as a function-style
+    /// template. Static generic methods on non-generic types (e.g.
+    /// `Layout::array<T>`) are otherwise invisible to the monomorphizer because
+    /// `run_template_registration` only walks top-level declarations. Without
+    /// registration the inference path in `try_infer_function_call` can't find
+    /// them, and ScopeResolution callees like `Layout::array<int>(n)` link to a
+    /// never-emitted bare-template symbol.
+    ///
+    /// Generic NON-static methods are intentionally skipped; those go through
+    /// `try_infer_method_call` / `specialize_method`, which dispatches by
+    /// receiver type rather than scope-qualified name.
+    ///
+    /// Owner-qualified key (`<owner_qualified>::<method>`) avoids collisions
+    /// when two types in the same namespace each declare a static method with
+    /// the same bare name.
+    static register_static_method_templates(owner_name: SymbolStr,
+                                              methods: &MethodNode*[],
+                                              registry: GenericRegistry*,
+                                              arena: TypeArena*,
+                                              ctx: CompilationContext*) -> void {
+        if (methods.length == 0) { return; }
 
-        // Instantiations minted only by the additive symbolic generic-body walk
-        // are never monomorphized or codegen'd (they may be concrete types that
-        // live solely inside a never-instantiated template). They are not real
-        // unresolved instantiations — skip, exactly like the generic-arg ones below.
-        if (inst.is_symbolic) { continue; }
+        const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
+        const owner_qstr: string = ctx.intern_table.resolve(owner_qsym);
+        const module_sym: SymbolStr = if (ctx.has_namespace()) {
+            ctx.namespace_str
+        } else {
+            ctx.intern(ctx.source_file)
+        };
 
-        // Skip template-internal references whose type args contain generic
-        // parameters at any depth (e.g., Pair<T>, Option<Result<T, E>>).
-        // These are created when a generic declaration references another
-        // generic with its own params and are never meant to be monomorphized
-        // until the *outer* template is specialized.  The shallow direct-arg
-        // check used to miss nested cases like Option<Result<T,E>> where the
-        // direct arg is an InstantiatedType, not a GenericParam.  Mirrors
-        // the recursive filter in `TypeArena::contains_generic_param`, which is
-        // the single authority every consumer (mono, sema, this validator) shares.
-        mut has_generic_arg: boolean = false;
-        for (mut j: i64 = 0; j < inst.type_args.length; j++) {
-            if (arena.contains_generic_param(inst.type_args[j])) {
-                has_generic_arg = true;
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            if (!m.is_static) { continue; }
+            if (!m.func.is_generic()) { continue; }
+
+            const method_str: string = ctx.intern_table.resolve(m.func.name);
+            const qualified_str: string = owner_qstr + "::" + method_str;
+            const qualified_sym: SymbolStr = ctx.intern_table.intern(qualified_str);
+
+            const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
+                m.func.generic_params, arena);
+            mut param_names: SymbolStr[] = [];
+            mut param_type_ids: u64[] = [];
+            for (mut j: i64 = 0; j < m.func.generic_params.length; j++) {
+                const gp: GenericParamNode* = m.func.generic_params[j];
+                param_names.push(gp.name);
+                param_type_ids.push(refs[j].id);
+            }
+
+            const base_type: TypeRef = arena.create_function_template(qualified_sym);
+
+            const entry: TemplateEntry = TemplateEntry::new(
+                m.func.name, qualified_sym, module_sym,
+                param_names, param_type_ids,
+                m.func as ASTNode*, NodeKind::FunctionDeclaration,
+                base_type
+            );
+            registry.register_template(entry);
+        }
+    }
+
+    /// Register a non-generic struct/class AST as an "inherent owner",
+    /// keyed by both qualified and bare name.  Two consumers:
+    ///
+    /// * The monomorphizer / sema walk the owner's `methods[]` to specialize
+    ///   generic INSTANCE methods (e.g. `Response::write_to<W>`).  Generic
+    ///   STATIC methods take a separate path via
+    ///   `register_static_method_templates`, which keys them by
+    ///   `Owner::method` for ScopeResolution callees.
+    /// * `OwnershipQuery::has_inherent_drop` walks the owner's `methods[]`
+    ///   to detect an inline `drop` so the Copy classifier and the
+    ///   drop-insertion pass treat the type as non-Copy and synthesize
+    ///   scope-exit drops.
+    ///
+    /// Registration is unconditional for non-generic owners so the index is
+    /// a complete `qualified_name -> AST` map for them; receiver-type lookups
+    /// no longer have to thread a fallback through DeclarationIndex.  Generic
+    /// owners go through `register_generic_template` instead; their methods
+    /// are specialized as part of struct/class monomorphization rather than
+    /// per-call.
+    static register_inherent_owner(
+            owner_name: SymbolStr, owner_ast: ASTNode*,
+            registry: GenericRegistry*, ctx: CompilationContext*) -> void {
+        if (owner_ast == null) { return; }
+        const owner_qsym: SymbolStr = ctx.qualify_symbol_sym(owner_name);
+        registry.register_inherent_owner(owner_qsym, owner_ast);
+        // Also register under the bare name so receiver-type lookups that
+        // miss the qualified form (e.g., when the arena returns the bare
+        // name for primitive impls) still find the owner.
+        if (!owner_qsym.equals(owner_name)) {
+            registry.register_inherent_owner(owner_name, owner_ast);
+        }
+    }
+
+    /// Tag an AST node's source_module field with the template's module name.
+    /// struct/class/enum/function/impl decls are all DeclarationNode subclasses and
+    /// `source_module` lives on that shared base, so a single base-pointer write
+    /// covers every kind. (The kind check keeps the cast sound — only declaration
+    /// nodes are written.) The earlier per-leaf concrete casts here worked around a
+    /// believed vtable field-offset miscompile; that was misdiagnosed — base-pointer
+    /// field writes on the vtable'd AST hierarchy are correct (verified 2026-06-17,
+    /// O0+O2). The real crash was a since-fixed mangler ICE on `Array<ptr>` specs.
+    static tag_decl_source_module(node: ASTNode*, module: string) -> void {
+        if (node == null) { return; }
+        const k: NodeKind = node.kind;
+        const is_decl: boolean =
+            k == NodeKind::StructDeclaration || k == NodeKind::ClassDeclaration
+            || k == NodeKind::EnumDeclaration || k == NodeKind::FunctionDeclaration
+            || k == NodeKind::ImplementationBlock;
+        if (!is_decl) { return; }
+        const decl: DeclarationNode* = node as DeclarationNode*;
+        decl.source_module = module;
+    }
+
+    static register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
+                                 ctx: CompilationContext*) -> void {
+        // Qualify the target name so impl blocks use the same key as templates.
+        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.target_type);
+        if (registry.get_template(qualified_sym) != null) {
+            registry.register_impl_block(qualified_sym, node);
+        } else if (!node.is_trait_impl()) {
+            // Non-generic target: there is no TemplateEntry to hang the block
+            // on, so an inherent `implement T { ... }` block would otherwise be
+            // invisible to ownership classification.  Record it under both the
+            // qualified and bare names (mirroring `register_inherent_owner`) so
+            // a separately-declared `drop` makes `T` non-Copy and droppable.
+            registry.register_inherent_impl_block(qualified_sym, node);
+            if (!qualified_sym.equals(node.target_type)) {
+                registry.register_inherent_impl_block(node.target_type, node);
             }
         }
-        if (has_generic_arg) { continue; }
 
-        // This InstantiatedType was never monomorphized.
-        unresolved_count += 1;
-
-        // All fields accessed below are plain data (u64, i64), no vtable dispatch.
-        const base_id: u64 = inst.generic_base.id;
-        const n_args: i64 = inst.type_args.length;
-        const base_qname: SymbolStr = arena.get_qualified_name(inst.generic_base);
-        mut base_name: string = "<no-qname>";
-        if (base_qname.is_valid()) { base_name = ctx.intern_table.resolve(base_qname); }
-        mut args_disp: string = "";
-        for (mut ai: i64 = 0; ai < inst.type_args.length; ai++) {
-            const aqn: SymbolStr = arena.get_qualified_name(inst.type_args[ai]);
-            mut an: string = "?";
-            if (aqn.is_valid()) { an = ctx.intern_table.resolve(aqn); }
-            if (ai > 0) { args_disp = args_disp + ", "; }
-            args_disp = args_disp + an;
+        // Trait impls (`implement trait Foo for Bar`) also go into the
+        // (trait, target) registry so sema/dispatch can find them by trait
+        // name. Inherent impls (`implement Bar { ... }`) skip this branch.
+        if (node.is_trait_impl()) {
+            const trait_name: SymbolStr = SpecializationPasses::extract_root_name(node.trait_annotation);
+            if (trait_name.is_valid()) {
+                // NOTE: coherence (a trait may be implemented at most once per
+                // type) is NOT checked here.  At this stage (DeclarationCollection)
+                // there is no import-resolved target name, so a key would have to
+                // use bare simple names — which conflate same-named types in
+                // different modules and ignore trait/target type args.  The
+                // single coherence check lives in TypeResolution's
+                // `register_decl_in_index`, after `canonical_target` is stamped;
+                // it covers same-file and cross-module duplicates uniformly,
+                // including generic traits.  This branch only populates the
+                // dispatch registry.
+                registry.register_trait_impl(trait_name, node.target_type, node);
+            }
         }
-        ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-            format("unresolved generic instantiation after monomorphization: '%s<%s>' (inst_id=%lu, base_id=%lu, n_args=%lld)",
-                    base_name, args_disp, inst.id, base_id, n_args));
     }
 
-    if (unresolved_count > 0) {
-        LOG_DEBUG(LogComponent::General, "[GenericValidation] FAILED: %lld unresolved types found",
-            unresolved_count);
-    } else {
-        LOG_DEBUG(LogComponent::General, "[GenericValidation] All generic types fully resolved");
+    /// Walk a TypeAnnotation* to its underlying head identifier. Used to pull
+    /// `Foo` out of `Foo`, `Foo<T>`, or `&Foo`. Returns an invalid SymbolStr
+    /// for shapes the trait-impl registry doesn't index (Primitive, ThisType,
+    /// Tuple, Function, Optional, Array). Qualified-path traits are tracked
+    /// only by their leaf name here; full-path indexing is B.4 work.
+    static extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => { n.name }
+            TypeAnnotation::Generic(g) => { SpecializationPasses::extract_root_name(g.base) }
+            TypeAnnotation::Reference(r) => { SpecializationPasses::extract_root_name(r.inner) }
+            TypeAnnotation::Pointer(p) => { SpecializationPasses::extract_root_name(p.inner) }
+            _ => { SymbolStr::empty() }
+        };
     }
 
-    return PassResult::from_snapshot(ctx.diagnostics, snap);
+    static run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        const arena: TypeArena* = ctx.type_arena;
+        if (arena == null) {
+            return PassResult::ok();
+        }
+
+        const count: i64 = arena.type_count();
+        LOG_DEBUG(LogComponent::General, "[GenericValidation] Validating %lld types in arena", count);
+
+        mut unresolved_count: i64 = 0;
+
+        for (mut i: i64 = 0; i < count; i++) {
+            const ty: Type* = arena.types[i];
+            if (ty == null) { continue; }
+
+            // Non-virtual field access only; ty.kind is a plain enum field.
+            if (ty.kind != TypeKind::InstantiatedType) { continue; }
+
+            const inst: InstantiatedType* = ty as InstantiatedType*;
+
+            // resolved_type is a TypeRef (plain struct); is_valid() is non-virtual.
+            if (inst.resolved_type.is_valid()) { continue; }
+
+            // Instantiations minted only by the additive symbolic generic-body walk
+            // are never monomorphized or codegen'd (they may be concrete types that
+            // live solely inside a never-instantiated template). They are not real
+            // unresolved instantiations — skip, exactly like the generic-arg ones below.
+            if (inst.is_symbolic) { continue; }
+
+            // Skip template-internal references whose type args contain generic
+            // parameters at any depth (e.g., Pair<T>, Option<Result<T, E>>).
+            // These are created when a generic declaration references another
+            // generic with its own params and are never meant to be monomorphized
+            // until the *outer* template is specialized.  The shallow direct-arg
+            // check used to miss nested cases like Option<Result<T,E>> where the
+            // direct arg is an InstantiatedType, not a GenericParam.  Mirrors
+            // the recursive filter in `TypeArena::contains_generic_param`, which is
+            // the single authority every consumer (mono, sema, this validator) shares.
+            mut has_generic_arg: boolean = false;
+            for (mut j: i64 = 0; j < inst.type_args.length; j++) {
+                if (arena.contains_generic_param(inst.type_args[j])) {
+                    has_generic_arg = true;
+                }
+            }
+            if (has_generic_arg) { continue; }
+
+            // This InstantiatedType was never monomorphized.
+            unresolved_count += 1;
+
+            // All fields accessed below are plain data (u64, i64), no vtable dispatch.
+            const base_id: u64 = inst.generic_base.id;
+            const n_args: i64 = inst.type_args.length;
+            const base_qname: SymbolStr = arena.get_qualified_name(inst.generic_base);
+            mut base_name: string = "<no-qname>";
+            if (base_qname.is_valid()) { base_name = ctx.intern_table.resolve(base_qname); }
+            mut args_disp: string = "";
+            for (mut ai: i64 = 0; ai < inst.type_args.length; ai++) {
+                const aqn: SymbolStr = arena.get_qualified_name(inst.type_args[ai]);
+                mut an: string = "?";
+                if (aqn.is_valid()) { an = ctx.intern_table.resolve(aqn); }
+                if (ai > 0) { args_disp = args_disp + ", "; }
+                args_disp = args_disp + an;
+            }
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("unresolved generic instantiation after monomorphization: '%s<%s>' (inst_id=%lu, base_id=%lu, n_args=%lld)",
+                        base_name, args_disp, inst.id, base_id, n_args));
+        }
+
+        if (unresolved_count > 0) {
+            LOG_DEBUG(LogComponent::General, "[GenericValidation] FAILED: %lld unresolved types found",
+                unresolved_count);
+        } else {
+            LOG_DEBUG(LogComponent::General, "[GenericValidation] All generic types fully resolved");
+        }
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
 }

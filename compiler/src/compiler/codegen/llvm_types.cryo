@@ -495,7 +495,7 @@ type struct LBuilder {
         // Guard: never store a void-typed value; LLVM's DataLayout::getAlignment
         // enters undefined behavior on unsized types, causing infinite recursion.
         const val_ty: void* = llvm::LLVMTypeOf(val.raw);
-        if (val_ty != null && type_kind_of(val_ty) == LTypeKind::Void) {
+        if (val_ty != null && LType::kind_of(val_ty) == LTypeKind::Void) {
             return LValue::null();
         }
         return LValue { raw: llvm::LLVMBuildStore(this.raw, val.raw, ptr.raw) };
@@ -884,6 +884,13 @@ type struct LType {
     static const_array(element_ty: LType, values: void*, count: u32) -> LValue {
         return LValue { raw: llvm::LLVMConstArray(element_ty.raw, values, count) };
     }
+
+    /// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles
+    /// (where wrapping in an `LType` first would just be ceremony).  Mirrors
+    /// `LType::kind()` and lets callers branch on `LTypeKind::Void` etc.
+    static kind_of(raw: void*) -> LTypeKind {
+        return llvm::LLVMGetTypeKind(raw) as LTypeKind;
+    }
 }
 
 
@@ -955,78 +962,124 @@ type struct LTargetMachine {
         }
         return result == 0;
     }
+
+    /// Initialize the native target for code generation.  Must be called
+    /// once before any target-dependent operations.
+    static init_native_target() -> void {
+        llvm::LLVMInitializeX86TargetInfo();
+        llvm::LLVMInitializeX86Target();
+        llvm::LLVMInitializeX86TargetMC();
+        llvm::LLVMInitializeX86AsmPrinter();
+        llvm::LLVMInitializeX86AsmParser();
+    }
+
+    /// Create a target machine for an explicit LLVM target triple.  Used by
+    /// codegen when the project specifies `target = "..."` in cryoconfig or
+    /// the user passed `--target=TRIPLE`.  Falls back to the host triple when
+    /// `triple` is the empty string.
+    static create_target_machine_for_triple(triple: string) -> LTargetMachine {
+        return LTargetMachine::create_target_machine_with_opt(
+            triple, LCodeGenOptLevel::LevelDefault as i32);
+    }
+
+    /// Like `create_target_machine_for_triple`, but with an explicit backend
+    /// codegen optimization level (0=None .. 3=Aggressive; `LCodeGenOptLevel`
+    /// values line up with these). Codegen passes pass `ctx.opt_level` so an
+    /// O0/debuggable build gets less aggressive instruction selection and
+    /// register allocation than an optimized one. Out-of-range levels clamp
+    /// into [0, 3].
+    static create_target_machine_with_opt(triple: string, opt_level: i32) -> LTargetMachine {
+        mut level: i32 = opt_level;
+        if (level < 0) { level = 0; }
+        if (level > 3) { level = 3; }
+
+        mut effective: string = triple;
+        if (triple == "" || libc::strlen(triple) == 0) {
+            // Go through `get_default_triple`, not the raw LLVM API, so the
+            // Windows msvc→gnu coercion applies here too (otherwise a caller
+            // passing "" on Windows would get the raw `windows-msvc` triple
+            // and emit MSVC-style code the mingw linker can't resolve).
+            effective = get_default_triple();
+        }
+        mut target: void* = null;
+        mut err_msg: i8* = null;
+
+        const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as void*, &err_msg as void*);
+        if (found != 0) {
+            if (err_msg != null) {
+                fmt::println(f"[Codegen] Target lookup failed for triple '{effective}': {err_msg as string}");
+                llvm::LLVMDisposeMessage(err_msg as void*);
+            }
+            return LTargetMachine::null();
+        }
+
+        const tm: void* = llvm::LLVMCreateTargetMachine(
+            target, effective, "generic", "",
+            level,
+            LRelocMode::PIC as i32,
+            LCodeModel::Default as i32);
+
+        return LTargetMachine { raw: tm };
+    }
+
+    static pick_windows_default_triple(raw: string) -> string {
+        // Never return null: the result is cached and re-measured via strlen.
+        if (raw == null) { return "x86_64-pc-windows-gnu"; }
+        if (!raw.contains("windows-msvc")) { return raw; }
+        // Prefer mingw (the only link path the port supports) when present.
+        if (LTargetMachine::exe_on_path("x86_64-w64-mingw32-gcc.exe")) {
+            return "x86_64-pc-windows-gnu";
+        }
+        // Otherwise honour an installed MSVC linker so codegen emits MSVC-ABI
+        // objects (the user links them with their own toolchain).
+        if (LTargetMachine::exe_on_path("lld-link.exe") || LTargetMachine::exe_on_path("link.exe")) {
+            return raw;
+        }
+        return "x86_64-pc-windows-gnu";
+    }
+
+    static exe_on_path(exe: string) -> boolean {
+        const path_raw: i8* = libc::getenv("PATH") as i8*;
+        if (path_raw == null) { return false; }
+        const path: string = path_raw as string;
+        const len: i64 = libc::strlen(path) as i64;
+        mut start: i64 = 0;
+        for (mut i: i64 = 0; i <= len; i++) {
+            if (i == len || path[i] == 59) {            // 59 = ';'
+                const dlen: i64 = i - start;
+                if (dlen > 0) {
+                    const dir: string = path.substr(start, dlen);
+                    mut candidate: string = dir;
+                    if (dir[dlen - 1] != 92) {           // 92 = '\'
+                        candidate += "\\";
+                    }
+                    candidate += exe;
+                    if (metadata::exists(Path::from_cstr(candidate))) { return true; }
+                }
+                start = i + 1;
+            }
+        }
+        return false;
+    }
+
+    /// Resolve the effective triple for codegen: returns `requested` when it
+    /// is non-empty, otherwise the host triple.  Centralizes the precedence
+    /// rule so both IR generation and the linker decision read the same
+    /// answer.
+    static resolve_effective_triple(requested: string) -> string {
+        if (requested == "" || libc::strlen(requested) == 0) {
+            return get_default_triple();
+        }
+        return requested;
+    }
 }
 
 
 // Phi Node Helper
 
-/// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles
-/// (where wrapping in an `LType` first would just be ceremony).  Mirrors
-/// `LType::kind()` and lets callers branch on `LTypeKind::Void` etc.
-function type_kind_of(raw: void*) -> LTypeKind {
-    return llvm::LLVMGetTypeKind(raw) as LTypeKind;
-}
 
 // LLVM Initialization
 
-/// Initialize the native target for code generation.  Must be called
-/// once before any target-dependent operations.
-function init_native_target() -> void {
-    llvm::LLVMInitializeX86TargetInfo();
-    llvm::LLVMInitializeX86Target();
-    llvm::LLVMInitializeX86TargetMC();
-    llvm::LLVMInitializeX86AsmPrinter();
-    llvm::LLVMInitializeX86AsmParser();
-}
-
-/// Create a target machine for an explicit LLVM target triple.  Used by
-/// codegen when the project specifies `target = "..."` in cryoconfig or
-/// the user passed `--target=TRIPLE`.  Falls back to the host triple when
-/// `triple` is the empty string.
-function create_target_machine_for_triple(triple: string) -> LTargetMachine {
-    return create_target_machine_with_opt(
-        triple, LCodeGenOptLevel::LevelDefault as i32);
-}
-
-/// Like `create_target_machine_for_triple`, but with an explicit backend
-/// codegen optimization level (0=None .. 3=Aggressive; `LCodeGenOptLevel`
-/// values line up with these). Codegen passes pass `ctx.opt_level` so an
-/// O0/debuggable build gets less aggressive instruction selection and
-/// register allocation than an optimized one. Out-of-range levels clamp
-/// into [0, 3].
-function create_target_machine_with_opt(triple: string, opt_level: i32) -> LTargetMachine {
-    mut level: i32 = opt_level;
-    if (level < 0) { level = 0; }
-    if (level > 3) { level = 3; }
-
-    mut effective: string = triple;
-    if (triple == "" || libc::strlen(triple) == 0) {
-        // Go through `get_default_triple`, not the raw LLVM API, so the
-        // Windows msvc→gnu coercion applies here too (otherwise a caller
-        // passing "" on Windows would get the raw `windows-msvc` triple
-        // and emit MSVC-style code the mingw linker can't resolve).
-        effective = get_default_triple();
-    }
-    mut target: void* = null;
-    mut err_msg: i8* = null;
-
-    const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as void*, &err_msg as void*);
-    if (found != 0) {
-        if (err_msg != null) {
-            fmt::println(f"[Codegen] Target lookup failed for triple '{effective}': {err_msg as string}");
-            llvm::LLVMDisposeMessage(err_msg as void*);
-        }
-        return LTargetMachine::null();
-    }
-
-    const tm: void* = llvm::LLVMCreateTargetMachine(
-        target, effective, "generic", "",
-        level,
-        LRelocMode::PIC as i32,
-        LCodeModel::Default as i32);
-
-    return LTargetMachine { raw: tm };
-}
 
 /// Get the default target triple string for the host build.
 ///
@@ -1066,62 +1119,13 @@ function get_default_triple() -> string {
         return g_win_default_triple;
     }
     const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
-    g_win_default_triple = pick_windows_default_triple(raw);
+    g_win_default_triple = LTargetMachine::pick_windows_default_triple(raw);
     return g_win_default_triple;
 }
 
 /// Choose the windows ABI from the linker that is actually installed (see
 /// `get_default_triple`).  A non-msvc LLVM default is returned unchanged.
 ![target(windows)]
-function pick_windows_default_triple(raw: string) -> string {
-    // Never return null: the result is cached and re-measured via strlen.
-    if (raw == null) { return "x86_64-pc-windows-gnu"; }
-    if (!raw.contains("windows-msvc")) { return raw; }
-    // Prefer mingw (the only link path the port supports) when present.
-    if (exe_on_path("x86_64-w64-mingw32-gcc.exe")) {
-        return "x86_64-pc-windows-gnu";
-    }
-    // Otherwise honour an installed MSVC linker so codegen emits MSVC-ABI
-    // objects (the user links them with their own toolchain).
-    if (exe_on_path("lld-link.exe") || exe_on_path("link.exe")) {
-        return raw;
-    }
-    return "x86_64-pc-windows-gnu";
-}
 
 /// True when `exe` exists in one of the `;`-separated entries of `%PATH%`.
 ![target(windows)]
-function exe_on_path(exe: string) -> boolean {
-    const path_raw: i8* = libc::getenv("PATH") as i8*;
-    if (path_raw == null) { return false; }
-    const path: string = path_raw as string;
-    const len: i64 = libc::strlen(path) as i64;
-    mut start: i64 = 0;
-    for (mut i: i64 = 0; i <= len; i++) {
-        if (i == len || path[i] == 59) {            // 59 = ';'
-            const dlen: i64 = i - start;
-            if (dlen > 0) {
-                const dir: string = path.substr(start, dlen);
-                mut candidate: string = dir;
-                if (dir[dlen - 1] != 92) {           // 92 = '\'
-                    candidate += "\\";
-                }
-                candidate += exe;
-                if (metadata::exists(Path::from_cstr(candidate))) { return true; }
-            }
-            start = i + 1;
-        }
-    }
-    return false;
-}
-
-/// Resolve the effective triple for codegen: returns `requested` when it
-/// is non-empty, otherwise the host triple.  Centralizes the precedence
-/// rule so both IR generation and the linker decision read the same
-/// answer.
-function resolve_effective_triple(requested: string) -> string {
-    if (requested == "" || libc::strlen(requested) == 0) {
-        return get_default_triple();
-    }
-    return requested;
-}

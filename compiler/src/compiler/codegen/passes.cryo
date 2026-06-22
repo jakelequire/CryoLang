@@ -288,16 +288,6 @@ function paths_equal_loose(a: string, b: string) -> boolean {
     return true;
 }
 
-/// True when the module currently being emitted is the project's
-/// discovery root (the executable entry point / library root).  Used to
-/// scope `-o PATH` overrides: a single-file build is a synthesized
-/// one-entry project whose stdlib imports compile as real modules, so
-/// only the ENTRY module's artifact may honor the override.
-function is_entry_module_active(ctx: CompilationContext*) -> boolean {
-    if (ctx.project_config == null) { return false; }
-    return paths_equal_loose(ctx.source_file,
-        ctx.project_config.discovery_root_path());
-}
 
 /// Emit the combined `.ll` IR dump next to the hoisted exe (selfhost-check's
 /// byte-identity input).  POSIX-only: it relies on shell glob expansion
@@ -356,6 +346,60 @@ type struct LinkerConfig {
     extra_system_libs:   string;
     use_stdlib_archive:  boolean;
     supported:           boolean;
+
+    /// Pick the right toolchain for `triple`.  `triple` is the post-
+    /// `resolve_effective_triple` value (empty falls back to host).  Today:
+    ///
+    ///   - SysV-amd64 host (linux/macos): `cc -lm -lstdc++`, no suffix,
+    ///     archive yes.  `-lstdc++` drags in LLVM-20's C++ runtime, which
+    ///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
+    ///     cryo programs don't reference it but the symbol set is a no-op
+    ///     so keeping it on the host line costs nothing.
+    ///   - x86_64 windows-gnu: `x86_64-w64-mingw32-gcc -lm`, `.exe` suffix,
+    ///     archive no.  mingw-w64 ships its own libc/libm equivalents; no
+    ///     C++ runtime to pull in for cross-compiled cryo programs (the
+    ///     compiler binary itself isn't cross-compilable yet - it links
+    ///     libLLVM, which has no Windows-gnu shim in this checkout).
+    ///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
+    ///     `run_linking` falls back to the object-files-only bailout that
+    ///     prints a manual-link hint.
+    static linker_config_for_triple(triple: string) -> LinkerConfig {
+        // Host build: a null/empty triple, or one that matches the (coerced)
+        // host triple, takes the per-host config below.  The split is
+        // platform-gated because the host config diverges by OS - exe suffix
+        // and which extra libs ship by default.
+        if (triple == null
+                || libc::strlen(triple) == 0
+                || libc::strcmp(triple, get_default_triple()) == 0) {
+            return host_linker_config();
+        }
+        // x86_64 windows-gnu (mingw-w64).  Substring-match the OS field so
+        // every reasonable spelling (`x86_64-pc-windows-gnu`,
+        // `x86_64-w64-windows-gnu`, `x86_64-windows-gnu`) routes here.
+        if (strstr(triple, "windows") != null
+                && strstr(triple, "gnu") != null
+                && strstr(triple, "x86_64") != null) {
+            return LinkerConfig {
+                driver:             pick_link_driver("x86_64-w64-mingw32-gcc"),
+                // `-lws2_32` for std::net (Winsock); mingw does NOT auto-link it
+                // the way it does kernel32/advapi32.  It's always present on
+                // Windows and tiny, so linking it unconditionally (like `-lm`)
+                // costs nothing for non-net programs.
+                exe_suffix:         ".exe",
+                extra_system_libs:  "-lm -lws2_32",
+                use_stdlib_archive: false,
+                supported:          true,
+            };
+        }
+        // Unknown triple - keep the existing object-files-only behaviour.
+        return LinkerConfig {
+            driver:             "",
+            exe_suffix:         "",
+            extra_system_libs:  "",
+            use_stdlib_archive: false,
+            supported:          false,
+        };
+    }
 }
 
 /// The host-build `LinkerConfig`: what to run when the user did NOT pass
@@ -397,59 +441,6 @@ function host_linker_config() -> LinkerConfig {
     };
 }
 
-/// Pick the right toolchain for `triple`.  `triple` is the post-
-/// `resolve_effective_triple` value (empty falls back to host).  Today:
-///
-///   - SysV-amd64 host (linux/macos): `cc -lm -lstdc++`, no suffix,
-///     archive yes.  `-lstdc++` drags in LLVM-20's C++ runtime, which
-///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
-///     cryo programs don't reference it but the symbol set is a no-op
-///     so keeping it on the host line costs nothing.
-///   - x86_64 windows-gnu: `x86_64-w64-mingw32-gcc -lm`, `.exe` suffix,
-///     archive no.  mingw-w64 ships its own libc/libm equivalents; no
-///     C++ runtime to pull in for cross-compiled cryo programs (the
-///     compiler binary itself isn't cross-compilable yet - it links
-///     libLLVM, which has no Windows-gnu shim in this checkout).
-///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
-///     `run_linking` falls back to the object-files-only bailout that
-///     prints a manual-link hint.
-function linker_config_for_triple(triple: string) -> LinkerConfig {
-    // Host build: a null/empty triple, or one that matches the (coerced)
-    // host triple, takes the per-host config below.  The split is
-    // platform-gated because the host config diverges by OS - exe suffix
-    // and which extra libs ship by default.
-    if (triple == null
-            || libc::strlen(triple) == 0
-            || libc::strcmp(triple, get_default_triple()) == 0) {
-        return host_linker_config();
-    }
-    // x86_64 windows-gnu (mingw-w64).  Substring-match the OS field so
-    // every reasonable spelling (`x86_64-pc-windows-gnu`,
-    // `x86_64-w64-windows-gnu`, `x86_64-windows-gnu`) routes here.
-    if (strstr(triple, "windows") != null
-            && strstr(triple, "gnu") != null
-            && strstr(triple, "x86_64") != null) {
-        return LinkerConfig {
-            driver:             pick_link_driver("x86_64-w64-mingw32-gcc"),
-            // `-lws2_32` for std::net (Winsock); mingw does NOT auto-link it
-            // the way it does kernel32/advapi32.  It's always present on
-            // Windows and tiny, so linking it unconditionally (like `-lm`)
-            // costs nothing for non-net programs.
-            exe_suffix:         ".exe",
-            extra_system_libs:  "-lm -lws2_32",
-            use_stdlib_archive: false,
-            supported:          true,
-        };
-    }
-    // Unknown triple - keep the existing object-files-only behaviour.
-    return LinkerConfig {
-        driver:             "",
-        exe_suffix:         "",
-        extra_system_libs:  "",
-        use_stdlib_archive: false,
-        supported:          false,
-    };
-}
 
 /// Per-profile link-target path for the active target, with `.exe`
 /// applied on Windows.  Wraps `ProjectConfig::profile_bin_path` so the
@@ -457,8 +448,8 @@ function linker_config_for_triple(triple: string) -> LinkerConfig {
 /// and the incremental-build manifest in instance.cryo stats it.
 function profile_bin_path_for_target(cfg: ProjectConfig*,
                                      ctx: CompilationContext*) -> string {
-    const tri: string = resolve_effective_triple(ctx.target_triple);
-    const lc:  LinkerConfig = linker_config_for_triple(tri);
+    const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+    const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
     return cfg.profile_bin_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
 }
 
@@ -468,151 +459,13 @@ function profile_bin_path_for_target(cfg: ProjectConfig*,
 /// `<output_dir>/<name>[.exe]` instead of the per-profile cache.
 function bin_artifact_path_for_target(cfg: ProjectConfig*,
                                       ctx: CompilationContext*) -> string {
-    const tri: string = resolve_effective_triple(ctx.target_triple);
-    const lc:  LinkerConfig = linker_config_for_triple(tri);
+    const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+    const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
     return cfg.bin_artifact_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
 }
 
 
 // Cascade-strip helper
-
-/// Returns true if `name` is in the stripped-functions set.
-function is_stripped(cg: CodegenContext*, name: string) -> boolean {
-    if (name == null) { return false; }
-    return cg.diag.is_stripped(name);
-}
-
-/// Walk a function's basic blocks and instructions; if any call instruction
-/// targets a function whose mangled name is in the stripped-functions set,
-/// return true.  Used by the cascade-strip pass to identify callers of
-/// stripped same-module siblings (e.g. `Array<T>::quicksort` calling a
-/// stripped `Array<T>::partition`).
-function function_calls_stripped(cg: CodegenContext*, fn_val: void*) -> boolean {
-    if (fn_val == null) { return false; }
-    mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
-    while (bb != null) {
-        mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
-        while (inst != null) {
-            // LLVMOpcode::Call = 45 in the LLVM-C enum (verify via
-            // `<llvm-c/Core.h>`, same value across LLVM 14-20).  CallBr
-            // (asm goto) is 67 but doesn't appear in cryoc-generated IR.
-            const op: i32 = llvm::LLVMGetInstructionOpcode(inst);
-            if (op == 45) {
-                // Last operand of a call instruction is the called value.
-                const n: i32 = llvm::LLVMGetNumOperands(inst);
-                if (n > 0) {
-                    const callee: void* = llvm::LLVMGetOperand(inst, (n - 1) as u32);
-                    if (callee != null) {
-                        const callee_name: string = llvm::LLVMGetValueName(callee) as string;
-                        if (callee_name != null && is_stripped(cg, callee_name)) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            inst = llvm::LLVMGetNextInstruction(inst);
-        }
-        bb = llvm::LLVMGetNextBasicBlock(bb);
-    }
-    return false;
-}
-
-/// Create the per-module DWARF scaffolding when `ctx.emit_debug_info` is
-/// set: a DIBuilder, a DIFile for the module's source path, a
-/// DICompileUnit, and the module-level `Debug Info Version` / `Dwarf
-/// Version` flags (without which the backend drops all debug metadata).
-/// The handles are stashed on `ctx` for the function prologue to attach
-/// per-function DISubprograms; `LLVMDIBuilderFinalize` must be called
-/// before verification. No-op when debug info is off.
-function setup_debug_info(ctx: CompilationContext*, module_raw: void*) -> void {
-    if (!ctx.emit_debug_info) { return; }
-
-    const dib: void* = llvm::LLVMCreateDIBuilder(module_raw);
-    ctx.di_builder = dib;
-
-    // DIFile: use the module's source path as the file name and "." as the
-    // directory; debuggers join the two.
-    const src: string = ctx.source_file;
-    const file: void* = llvm::LLVMDIBuilderCreateFile(
-        dib, src, libc::strlen(src), ".", 1);
-    ctx.di_file = file;
-
-    // DICompileUnit: Lang = C (1), EmissionKind = Full (1); other flags off.
-    const producer: string = "Cryo compiler";
-    const cu: void* = llvm::LLVMDIBuilderCreateCompileUnit(
-        dib, 1, file,
-        producer, libc::strlen(producer),
-        0,            // isOptimized
-        "", 0,        // Flags
-        0,            // RuntimeVer
-        "", 0,        // SplitName
-        1,            // EmissionKind = Full
-        0,            // DWOId
-        0,            // SplitDebugInlining
-        0,            // DebugInfoForProfiling
-        "", 0,        // SysRoot
-        "", 0);       // SDK
-    ctx.di_cu = cu;
-
-    // Module flags (behavior Warning = 1). "Debug Info Version" must be 3
-    // (DEBUG_METADATA_VERSION) or LLVM silently strips the debug info.
-    const ver_key: string = "Debug Info Version";
-    const dver: void* = llvm::LLVMValueAsMetadata(
-        llvm::LLVMConstInt(llvm::LLVMInt32Type(), 3, 0));
-    llvm::LLVMAddModuleFlag(module_raw, 1, ver_key, libc::strlen(ver_key), dver);
-    const dwarf_key: string = "Dwarf Version";
-    const dwarf: void* = llvm::LLVMValueAsMetadata(
-        llvm::LLVMConstInt(llvm::LLVMInt32Type(), 4, 0));
-    llvm::LLVMAddModuleFlag(module_raw, 1, dwarf_key, libc::strlen(dwarf_key), dwarf);
-}
-
-/// Iterate the module's functions until no more cascade-strips happen.
-/// For each function with a body that calls a stripped sibling, strip it
-/// (which adds it to the stripped set, potentially triggering more
-/// strips on its own callers in the next iteration).
-///
-/// Emits a warning per cascade strip so the user can see the chain of
-/// downstream casualties from the original codegen failure.  We use a
-/// warning rather than an error here because the *primary* failure is
-/// already reported by `report_invalid_function_body`; cascade entries
-/// are downstream noise that exists only to avoid the worse alternative
-/// of a half-built body that fails LLVM verification.
-function cascade_strip_dependents(cg: CodegenContext*) -> void {
-    mut iterations: i32 = 0;
-    while (iterations < 16) {
-        mut newly_stripped: i32 = 0;
-        mut fn_val: void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
-        while (fn_val != null) {
-            const next_fn: void* = llvm::LLVMGetNextFunction(fn_val);
-            // Only consider functions WITH a body.
-            const first_bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
-            if (first_bb != null) {
-                if (function_calls_stripped(cg, fn_val)) {
-                    // Don't double-strip a name that's already in the set.
-                    const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                    if (!is_stripped(cg, fn_name)) {
-                        const fn_name_safe: string = if (fn_name == null) {
-                            "<unnamed>"
-                        } else {
-                            fn_name
-                        };
-                        mut wdiag: Diagnostic = Diagnostic::warning(
-                            ErrorCode::E0633_FUNCTION_BODY_ERROR,
-                            format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
-                                fn_name_safe));
-                        cg.diag.emit(wdiag);
-                        const wrap: LValue = LValue { raw: fn_val };
-                        cg.diag.strip_function_body(wrap);
-                        newly_stripped += 1;
-                    }
-                }
-            }
-            fn_val = next_fn;
-        }
-        if (newly_stripped == 0) { break; }
-        iterations += 1;
-    }
-}
 
 
 // Codegen Pass Implementations
@@ -646,7 +499,7 @@ type struct CodegenPasses {
 
         // Initialize LLVM targets (idempotent).
         cdebug("[Codegen] Step 2: Initializing LLVM targets...\n");
-        init_native_target();
+        LTargetMachine::init_native_target();
         cdebug("[Codegen] Step 3: LLVM targets initialized\n");
 
         // Create per-module codegen context on the heap to avoid stack overflow.
@@ -667,12 +520,12 @@ type struct CodegenPasses {
         // LLVM.  The resolved triple is also fed to the target machine
         // below so the data-layout string matches.
         cdebug("[Codegen] Step 6: Setting target triple...\n");
-        const triple: string = resolve_effective_triple(ctx.target_triple);
+        const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
         cg.llvm_module.set_target_triple(triple);
         cdebug("[Codegen] Step 7: Target triple set: %s\n", triple);
 
         cdebug("[Codegen] Step 8: Creating target machine...\n");
-        mut tm: LTargetMachine = create_target_machine_for_triple(triple);
+        mut tm: LTargetMachine = LTargetMachine::create_target_machine_for_triple(triple);
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
             cg.llvm_module.set_data_layout(layout);
@@ -682,7 +535,7 @@ type struct CodegenPasses {
         // DWARF debug-info scaffolding (no-op unless `-g`/--debug-info).
         // Must run before function-body emission so each prologue can
         // attach a DISubprogram + source location to its function.
-        setup_debug_info(ctx, cg.llvm_module.raw);
+        CodegenPasses::setup_debug_info(ctx, cg.llvm_module.raw);
 
         // Cross-module externs are declared lazily by `resolve_function` /
         // `resolve_function_with_arity` / `resolve_global` on first reference
@@ -738,7 +591,7 @@ type struct CodegenPasses {
         // intentionally cross-module externs are unaffected because the
         // strip set only contains symbols whose body was attempted in
         // this module.
-        cascade_strip_dependents(cg);
+        CodegenPasses::cascade_strip_dependents(cg);
 
         // Finalize debug info: wires every DISubprogram into the compile
         // unit and resolves temporary metadata. Must run before
@@ -900,8 +753,8 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        const opt_triple: string = resolve_effective_triple(ctx.target_triple);
-        mut tm: LTargetMachine = create_target_machine_with_opt(
+        const opt_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
             opt_triple, ctx.opt_level as i32);
         if (!tm.is_valid()) {
             return PassResult::ok();
@@ -978,7 +831,7 @@ type struct CodegenPasses {
         // `-o foo.o`.  Non-entry modules behave as if no override were
         // given (per-origin deps layout).
         mut kind: OutputKind = ctx.output_kind;
-        if (ctx.project_config != null && !is_entry_module_active(ctx)) {
+        if (ctx.project_config != null && !CodegenPasses::is_entry_module_active(ctx)) {
             kind = OutputKind::None;
         }
 
@@ -997,8 +850,8 @@ type struct CodegenPasses {
         // (ELF / COFF / Mach-O) is selected by the target machine, so
         // a stale host machine here would silently undo the cross-
         // compile we set up in IR generation.
-        const obj_triple: string = resolve_effective_triple(ctx.target_triple);
-        mut tm: LTargetMachine = create_target_machine_with_opt(
+        const obj_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
             obj_triple, ctx.opt_level as i32);
         if (!tm.is_valid()) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
@@ -1193,8 +1046,8 @@ type struct CodegenPasses {
         // know how to drive end-to-end (aarch64, riscv, windows-msvc,
         // ...) `supported` is false and we keep the historic
         // object-files-only bailout below.
-        const effective_triple: string = resolve_effective_triple(ctx.target_triple);
-        const link_cfg: LinkerConfig = linker_config_for_triple(effective_triple);
+        const effective_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
 
         if (!link_cfg.supported) {
             const obj_only_dir: string = cfg.profile_dir();
@@ -1441,8 +1294,8 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
-        const effective_triple: string = resolve_effective_triple(ctx.target_triple);
-        const link_cfg: LinkerConfig = linker_config_for_triple(effective_triple);
+        const effective_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
         if (!link_cfg.supported) {
             // Unknown triple - same fallback as the project path.
             fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length} object file(s) for target '{ctx.target_triple}'");
@@ -1585,5 +1438,154 @@ type struct CodegenPasses {
         cdebug("[Codegen] Bundled archive: %s (%lld objects)\n",
             archive_path, ctx.artifacts.object_files.length);
         return PassResult::ok();
+    }
+
+    /// True when the module currently being emitted is the project's
+    /// discovery root (the executable entry point / library root).  Used to
+    /// scope `-o PATH` overrides: a single-file build is a synthesized
+    /// one-entry project whose stdlib imports compile as real modules, so
+    /// only the ENTRY module's artifact may honor the override.
+    static is_entry_module_active(ctx: CompilationContext*) -> boolean {
+        if (ctx.project_config == null) { return false; }
+        return paths_equal_loose(ctx.source_file,
+            ctx.project_config.discovery_root_path());
+    }
+
+    /// Returns true if `name` is in the stripped-functions set.
+    static is_stripped(cg: CodegenContext*, name: string) -> boolean {
+        if (name == null) { return false; }
+        return cg.diag.is_stripped(name);
+    }
+
+    /// Walk a function's basic blocks and instructions; if any call instruction
+    /// targets a function whose mangled name is in the stripped-functions set,
+    /// return true.  Used by the cascade-strip pass to identify callers of
+    /// stripped same-module siblings (e.g. `Array<T>::quicksort` calling a
+    /// stripped `Array<T>::partition`).
+    static function_calls_stripped(cg: CodegenContext*, fn_val: void*) -> boolean {
+        if (fn_val == null) { return false; }
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
+        while (bb != null) {
+            mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
+            while (inst != null) {
+                // LLVMOpcode::Call = 45 in the LLVM-C enum (verify via
+                // `<llvm-c/Core.h>`, same value across LLVM 14-20).  CallBr
+                // (asm goto) is 67 but doesn't appear in cryoc-generated IR.
+                const op: i32 = llvm::LLVMGetInstructionOpcode(inst);
+                if (op == 45) {
+                    // Last operand of a call instruction is the called value.
+                    const n: i32 = llvm::LLVMGetNumOperands(inst);
+                    if (n > 0) {
+                        const callee: void* = llvm::LLVMGetOperand(inst, (n - 1) as u32);
+                        if (callee != null) {
+                            const callee_name: string = llvm::LLVMGetValueName(callee) as string;
+                            if (callee_name != null && CodegenPasses::is_stripped(cg, callee_name)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                inst = llvm::LLVMGetNextInstruction(inst);
+            }
+            bb = llvm::LLVMGetNextBasicBlock(bb);
+        }
+        return false;
+    }
+
+    /// Create the per-module DWARF scaffolding when `ctx.emit_debug_info` is
+    /// set: a DIBuilder, a DIFile for the module's source path, a
+    /// DICompileUnit, and the module-level `Debug Info Version` / `Dwarf
+    /// Version` flags (without which the backend drops all debug metadata).
+    /// The handles are stashed on `ctx` for the function prologue to attach
+    /// per-function DISubprograms; `LLVMDIBuilderFinalize` must be called
+    /// before verification. No-op when debug info is off.
+    static setup_debug_info(ctx: CompilationContext*, module_raw: void*) -> void {
+        if (!ctx.emit_debug_info) { return; }
+
+        const dib: void* = llvm::LLVMCreateDIBuilder(module_raw);
+        ctx.di_builder = dib;
+
+        // DIFile: use the module's source path as the file name and "." as the
+        // directory; debuggers join the two.
+        const src: string = ctx.source_file;
+        const file: void* = llvm::LLVMDIBuilderCreateFile(
+            dib, src, libc::strlen(src), ".", 1);
+        ctx.di_file = file;
+
+        // DICompileUnit: Lang = C (1), EmissionKind = Full (1); other flags off.
+        const producer: string = "Cryo compiler";
+        const cu: void* = llvm::LLVMDIBuilderCreateCompileUnit(
+            dib, 1, file,
+            producer, libc::strlen(producer),
+            0,            // isOptimized
+            "", 0,        // Flags
+            0,            // RuntimeVer
+            "", 0,        // SplitName
+            1,            // EmissionKind = Full
+            0,            // DWOId
+            0,            // SplitDebugInlining
+            0,            // DebugInfoForProfiling
+            "", 0,        // SysRoot
+            "", 0);       // SDK
+        ctx.di_cu = cu;
+
+        // Module flags (behavior Warning = 1). "Debug Info Version" must be 3
+        // (DEBUG_METADATA_VERSION) or LLVM silently strips the debug info.
+        const ver_key: string = "Debug Info Version";
+        const dver: void* = llvm::LLVMValueAsMetadata(
+            llvm::LLVMConstInt(llvm::LLVMInt32Type(), 3, 0));
+        llvm::LLVMAddModuleFlag(module_raw, 1, ver_key, libc::strlen(ver_key), dver);
+        const dwarf_key: string = "Dwarf Version";
+        const dwarf: void* = llvm::LLVMValueAsMetadata(
+            llvm::LLVMConstInt(llvm::LLVMInt32Type(), 4, 0));
+        llvm::LLVMAddModuleFlag(module_raw, 1, dwarf_key, libc::strlen(dwarf_key), dwarf);
+    }
+
+    /// Iterate the module's functions until no more cascade-strips happen.
+    /// For each function with a body that calls a stripped sibling, strip it
+    /// (which adds it to the stripped set, potentially triggering more
+    /// strips on its own callers in the next iteration).
+    ///
+    /// Emits a warning per cascade strip so the user can see the chain of
+    /// downstream casualties from the original codegen failure.  We use a
+    /// warning rather than an error here because the *primary* failure is
+    /// already reported by `report_invalid_function_body`; cascade entries
+    /// are downstream noise that exists only to avoid the worse alternative
+    /// of a half-built body that fails LLVM verification.
+    static cascade_strip_dependents(cg: CodegenContext*) -> void {
+        mut iterations: i32 = 0;
+        while (iterations < 16) {
+            mut newly_stripped: i32 = 0;
+            mut fn_val: void* = llvm::LLVMGetFirstFunction(cg.llvm_module.raw);
+            while (fn_val != null) {
+                const next_fn: void* = llvm::LLVMGetNextFunction(fn_val);
+                // Only consider functions WITH a body.
+                const first_bb: void* = llvm::LLVMGetFirstBasicBlock(fn_val);
+                if (first_bb != null) {
+                    if (CodegenPasses::function_calls_stripped(cg, fn_val)) {
+                        // Don't double-strip a name that's already in the set.
+                        const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
+                        if (!CodegenPasses::is_stripped(cg, fn_name)) {
+                            const fn_name_safe: string = if (fn_name == null) {
+                                "<unnamed>"
+                            } else {
+                                fn_name
+                            };
+                            mut wdiag: Diagnostic = Diagnostic::warning(
+                                ErrorCode::E0633_FUNCTION_BODY_ERROR,
+                                format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
+                                    fn_name_safe));
+                            cg.diag.emit(wdiag);
+                            const wrap: LValue = LValue { raw: fn_val };
+                            cg.diag.strip_function_body(wrap);
+                            newly_stripped += 1;
+                        }
+                    }
+                }
+                fn_val = next_fn;
+            }
+            if (newly_stripped == 0) { break; }
+            iterations += 1;
+        }
     }
 }

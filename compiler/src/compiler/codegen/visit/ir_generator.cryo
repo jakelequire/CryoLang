@@ -588,7 +588,7 @@ public:
 
         const src_llvm_ty: void* = llvm::LLVMTypeOf(src_val.raw);
         const src_is_struct_value: boolean = src_llvm_ty != null
-            && type_kind_of(src_llvm_ty) == LTypeKind::Struct;
+            && LType::kind_of(src_llvm_ty) == LTypeKind::Struct;
 
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
@@ -667,7 +667,7 @@ public:
                 // `const_int` path would truncate. Build the constant from the
                 // literal's digit string instead.
                 mut radix: u8 = 10u8;
-                const digits: string = int_literal_clean(node.value, &radix);
+                const digits: string = CodegenUtil::int_literal_clean(node.value, &radix);
                 this.state.last_value = LType::const_int_of_string(ty, digits, radix);
             } else {
                 const val: u64 = node.value.parse_int<u64>();
@@ -688,14 +688,14 @@ public:
             // etc.  Without this, every character-literal escape in cryoc source
             // is wrong (e.g., `c == '\n'` in skip_whitespace never matches).
             this.state.last_value = LType::const_int(LType::i32(),
-                                               decode_char_lexeme(node.value), false);
+                                               CodegenUtil::decode_char_lexeme(node.value), false);
         } else if (kind == LiteralKind::Boolean) {
             const bval: u64 = if (node.value == "true") { 1 } else { 0 };
             this.state.last_value = LType::const_int(LType::i1(), bval, false);
         } else if (kind == LiteralKind::Null) {
             // Null literal must always be a pointer type.  If resolved_type
             // mapped to void or an invalid type, fall back to i8* (void*).
-            if (!ty.is_valid() || type_kind_of(ty.raw) != LTypeKind::Pointer) {
+            if (!ty.is_valid() || LType::kind_of(ty.raw) != LTypeKind::Pointer) {
                 ty = LType::pointer_to(LType::i8());
             }
             this.state.last_value = LType::const_pointer_null(ty);
@@ -767,9 +767,6 @@ public:
         this.state.last_value = LValue::null();
         this.state.last_is_lvalue = false;
     }
-
-
-
 
 
     /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
@@ -936,8 +933,8 @@ public:
                 const field_llvm_ty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, slot);
                 const val_ty_raw: void* = llvm::LLVMTypeOf(val.raw);
                 if (field_llvm_ty != null && val_ty_raw != null
-                        && type_kind_of(field_llvm_ty) == LTypeKind::Integer
-                        && type_kind_of(val_ty_raw) == LTypeKind::Integer) {
+                        && LType::kind_of(field_llvm_ty) == LTypeKind::Integer
+                        && LType::kind_of(val_ty_raw) == LTypeKind::Integer) {
                     const want_bits: u32 = llvm::LLVMGetIntTypeWidth(field_llvm_ty);
                     const got_bits:  u32 = llvm::LLVMGetIntTypeWidth(val_ty_raw);
                     const field_lty: LType = LType { raw: field_llvm_ty };
@@ -1174,7 +1171,6 @@ public:
     }
 
 
-
     /// Tuple literal: Sema tags `resolved_type` with the arena's
     /// TupleType (deduped by element types), so the layout follows
     /// `map_tuple` (anonymous LLVM struct of element types in order).
@@ -1329,7 +1325,7 @@ public:
         mut v: LValue = this.state.last_value;
         const result_ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
         if (v.is_valid() && result_ty.is_valid()) {
-            v = coerce_to_phi_type(this.cg, v, result_ty, node.resolved_type);
+            v = IRGeneratorVisitor::coerce_to_phi_type(this.cg, v, result_ty, node.resolved_type);
         }
         this.state.last_value = v;
         this.state.last_is_lvalue = false;
@@ -1457,7 +1453,7 @@ public:
             // keeps the order valid.
             mut coerced_val: LValue = LValue::null();
             if (!arm_terminated && arm_end.is_valid() && arm_val.is_valid()) {
-                coerced_val = coerce_to_phi_type(this.cg, arm_val, result_ty,
+                coerced_val = IRGeneratorVisitor::coerce_to_phi_type(this.cg, arm_val, result_ty,
                                                  node.resolved_type);
             }
             if (!arm_terminated && arm_end.is_valid()) {
@@ -1575,7 +1571,6 @@ public:
     override visit(mut &this, node: DeleteExprNode*) -> void {
         this.new_delete.emit_delete(this, node);
     }
-
 
 
     // Unsupported AST node kinds
@@ -1707,120 +1702,66 @@ public:
     /// standalone CaseStmtNode is never reached during codegen; this is a
     /// defensive no-op rather than an error.
     override visit(mut &this, node: CaseStmtNode*) -> void {}
+
+    /// Coerce `val` to match `expected` for use as a phi-node operand.  LLVM
+    /// requires every phi incoming to have the phi's result type exactly, and
+    /// match arms routinely produce differently-sized integers (e.g. an i32
+    /// payload binding in one arm vs an i64 literal in another, both feeding a
+    /// phi typed by the outer `const x: i64 =` declaration).  Mirrors the
+    /// widening/narrowing logic in `coerce_return_value`; returns the original
+    /// value when no cheap conversion applies.  LLVM kind codes: 0=void, 8=int,
+    /// 10=struct, 12=pointer.
+    ///
+    /// `result_ty` is the Cryo type of the whole match/if expression - every
+    /// arm must produce a value compatible with it, so its signedness drives
+    /// the sext-vs-zext choice when an arm value is narrower than the phi type.
+    static coerce_to_phi_type(cg: CodegenContext*, val: LValue,
+                                 expected: LType, result_ty: TypeRef) -> LValue {
+        if (!val.is_valid() || !expected.is_valid()) { return val; }
+
+        // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==`; that
+        // currently lowers to strcmp, which returns "equal" for structurally-
+        // different types and short-circuits the coercion path.  Dispatch on
+        // kind + width instead.
+        const got_ty: void* = llvm::LLVMTypeOf(val.raw);
+        const want_ty: void* = expected.raw;
+        const gk: LTypeKind = LType::kind_of(got_ty);
+        const wk: LTypeKind = LType::kind_of(want_ty);
+
+        // int <-> int: widen or narrow.
+        if (gk == LTypeKind::Integer && wk == LTypeKind::Integer) {
+            const gw: u32 = llvm::LLVMGetIntTypeWidth(got_ty);
+            const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
+            if (gw == ww) { return val; }
+            if (gw < ww) {
+                // Widen with the result type's signedness: a signed match arm
+                // feeding a wider signed phi must sext, or `-1` becomes a huge
+                // positive value.
+                if (cg.int_type_is_signed(result_ty)) {
+                    return cg.builder.build_sext(val, expected, "mexpr.widen");
+                }
+                return cg.builder.build_zext(val, expected, "mexpr.widen");
+            }
+            return cg.builder.build_trunc(val, expected, "mexpr.trunc");
+        }
+
+        // int -> ptr / ptr -> int: match the `coerce_return_value` conventions.
+        if (gk == LTypeKind::Integer && wk == LTypeKind::Pointer) {
+            return LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, val.raw, want_ty, "mexpr.i2p") };
+        }
+        if (gk == LTypeKind::Pointer && wk == LTypeKind::Integer) {
+            return LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, val.raw, want_ty, "mexpr.p2i") };
+        }
+
+        // Same-kind struct/ptr/etc with different SHAPE is not safely
+        // convertible at this level; return as-is and let LLVM verification
+        // surface the mismatch.
+        return val;
+    }
 }
 
 
 // Phi-operand coercion
 
-/// Coerce `val` to match `expected` for use as a phi-node operand.  LLVM
-/// requires every phi incoming to have the phi's result type exactly, and
-/// match arms routinely produce differently-sized integers (e.g. an i32
-/// payload binding in one arm vs an i64 literal in another, both feeding a
-/// phi typed by the outer `const x: i64 =` declaration).  Mirrors the
-/// widening/narrowing logic in `coerce_return_value`; returns the original
-/// value when no cheap conversion applies.  LLVM kind codes: 0=void, 8=int,
-/// 10=struct, 12=pointer.
-///
-/// `result_ty` is the Cryo type of the whole match/if expression - every
-/// arm must produce a value compatible with it, so its signedness drives
-/// the sext-vs-zext choice when an arm value is narrower than the phi type.
-function coerce_to_phi_type(cg: CodegenContext*, val: LValue,
-                             expected: LType, result_ty: TypeRef) -> LValue {
-    if (!val.is_valid() || !expected.is_valid()) { return val; }
-
-    // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==`; that
-    // currently lowers to strcmp, which returns "equal" for structurally-
-    // different types and short-circuits the coercion path.  Dispatch on
-    // kind + width instead.
-    const got_ty: void* = llvm::LLVMTypeOf(val.raw);
-    const want_ty: void* = expected.raw;
-    const gk: LTypeKind = type_kind_of(got_ty);
-    const wk: LTypeKind = type_kind_of(want_ty);
-
-    // int <-> int: widen or narrow.
-    if (gk == LTypeKind::Integer && wk == LTypeKind::Integer) {
-        const gw: u32 = llvm::LLVMGetIntTypeWidth(got_ty);
-        const ww: u32 = llvm::LLVMGetIntTypeWidth(want_ty);
-        if (gw == ww) { return val; }
-        if (gw < ww) {
-            // Widen with the result type's signedness: a signed match arm
-            // feeding a wider signed phi must sext, or `-1` becomes a huge
-            // positive value.
-            if (cg.int_type_is_signed(result_ty)) {
-                return cg.builder.build_sext(val, expected, "mexpr.widen");
-            }
-            return cg.builder.build_zext(val, expected, "mexpr.widen");
-        }
-        return cg.builder.build_trunc(val, expected, "mexpr.trunc");
-    }
-
-    // int -> ptr / ptr -> int: match the `coerce_return_value` conventions.
-    if (gk == LTypeKind::Integer && wk == LTypeKind::Pointer) {
-        return LValue { raw: llvm::LLVMBuildIntToPtr(cg.builder.raw, val.raw, want_ty, "mexpr.i2p") };
-    }
-    if (gk == LTypeKind::Pointer && wk == LTypeKind::Integer) {
-        return LValue { raw: llvm::LLVMBuildPtrToInt(cg.builder.raw, val.raw, want_ty, "mexpr.p2i") };
-    }
-
-    // Same-kind struct/ptr/etc with different SHAPE is not safely
-    // convertible at this level; return as-is and let LLVM verification
-    // surface the mismatch.
-    return val;
-}
-
 
 // Module-graph suffix matching for `Shorthand::member` ScopeResolution
-
-/// Walk the module graph and return every qualified function name that
-/// matches `<full_namespace>::<member>` where `<full_namespace>` ends with
-/// `::scope_str` (or equals `scope_str` exactly).  Used by the
-/// ScopeResolution codegen path so a shorthand `libc::read` resolves
-/// directly to `std::ffi::libc::read`, instead of falling through to the
-/// last-write-wins bare-name overload slot.
-///
-/// Only entries that have a probe-able function signature in the codegen
-/// (arity-matched declaration) are returned.  A length-1 result is the
-/// happy path; length > 1 surfaces an E0154 ambiguity at the call site.
-function collect_namespace_suffix_matches(cg: CodegenContext*, intern: InternTable*,
-                                          scope_str: string, member: SymbolStr,
-                                          arity: u32) -> SymbolStr[] {
-    mut result: SymbolStr[] = [];
-    const scope_len: i64 = libc::strlen(scope_str) as i64;
-    if (scope_len == 0) { return result; }
-
-    const mg: ModuleGraph* = cg.ctx.module_graph;
-    const member_str: string = intern.resolve(member);
-    for (mut i: i64 = 0; i < mg.modules.length; i++) {
-        const ns_sym: SymbolStr = mg.modules[i].namespace_name;
-        if (!ns_sym.is_valid()) { continue; }
-        const ns_str: string = intern.resolve(ns_sym);
-        const ns_len: i64 = libc::strlen(ns_str) as i64;
-
-        // Match condition: namespace equals scope_str OR ends with "::scope_str".
-        mut is_match: boolean = false;
-        if (ns_len == scope_len) {
-            is_match = ns_str.eq(scope_str);
-        } else if (ns_len > scope_len + 1) {
-            const suffix_start: i64 = ns_len - scope_len;
-            if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
-                is_match = libc::strcmp(ns_str + suffix_start, scope_str) == 0;
-            }
-        }
-        if (!is_match) { continue; }
-
-        // Build "<ns>::<member>" and probe the function table.
-        const qualified: string = format("%s::%s", ns_str, member_str);
-        const q_sym: SymbolStr = intern.intern(qualified);
-        const probe: LValue = cg.resolver.resolve_function_with_arity(q_sym, arity);
-        if (!probe.is_valid()) { continue; }
-
-        // Dedup: same qualified name shouldn't appear twice (e.g. when
-        // the module graph lists the same module under two indices).
-        mut dup: boolean = false;
-        for (mut k: i64 = 0; k < result.length; k++) {
-            if (result[k].id == q_sym.id) { dup = true; break; }
-        }
-        if (!dup) { result.push(q_sym); }
-    }
-    return result;
-}
