@@ -259,59 +259,6 @@ extern "C" {
     function QueryPerformanceFrequency(freq: i64*) -> i32;
 }
 
-/// Monotonic nanoseconds.  Only meaningful as a difference between two
-/// readings; used solely for the `CRYO_TIMINGS` phase report.
-![target(unix)]
-function timing_now_ns() -> i64 {
-    mut ts: TimingTs = TimingTs { secs: 0i64, nanos: 0i64 };
-    clock_gettime(1, &ts);
-    return ts.secs * 1000000000i64 + ts.nanos;
-}
-
-/// Windows monotonic nanoseconds via QPC.  `count / freq` gives whole
-/// seconds and `count % freq` the sub-second remainder; scaling the
-/// remainder (always < freq) by 1e9 before the divide keeps full
-/// nanosecond resolution without overflowing i64 the way `count * 1e9`
-/// would on a long-running counter.
-![target(windows)]
-function timing_now_ns() -> i64 {
-    mut count: i64 = 0i64;
-    mut freq:  i64 = 0i64;
-    QueryPerformanceCounter(&count);
-    QueryPerformanceFrequency(&freq);
-    if (freq == 0i64) { return 0i64; }
-    const secs: i64 = count / freq;
-    const rem:  i64 = count % freq;
-    return secs * 1000000000i64 + (rem * 1000000000i64) / freq;
-}
-
-
-/// Build a ProjectConfig view that compiles the `[lib]` half of a
-/// multi-target project as a Library.  Inherits debug/optimize/no_std/
-/// stdlib + linkage settings from the base config; overrides only the
-/// fields that select what to compile and what to name the output.
-function make_lib_view(base: ProjectConfig) -> ProjectConfig {
-    mut view: ProjectConfig = base;
-    view.target_type  = TargetType::Library;
-    // Read through `view` (a full copy of `base`) rather than `base`, which
-    // was just moved into `view` - keeps `make_lib_view` move-clean.
-    view.project_name = view.lib.name;
-    view.source_dir   = view.lib.source_dir;
-    return view;
-}
-
-/// Build a ProjectConfig view that compiles a single `[[bin]]` entry
-/// as an Executable.  As with `make_lib_view`, inherits everything
-/// other than what selects the entry point and names the output.
-function make_bin_view(base: ProjectConfig, bin: BinTarget) -> ProjectConfig {
-    mut view: ProjectConfig = base;
-    view.target_type  = TargetType::Executable;
-    view.project_name = bin.name;
-    view.entry_point  = bin.entry_point;
-    return view;
-}
-
-
 type struct CompilerInstance {
     config: CompilerConfig;
 
@@ -319,6 +266,57 @@ type struct CompilerInstance {
         return CompilerInstance {
             config: config,
         };
+    }
+
+    /// Monotonic nanoseconds.  Only meaningful as a difference between two
+    /// readings; used solely for the `CRYO_TIMINGS` phase report.
+    ![target(unix)]
+    static timing_now_ns() -> i64 {
+        mut ts: TimingTs = TimingTs { secs: 0i64, nanos: 0i64 };
+        clock_gettime(1, &ts);
+        return ts.secs * 1000000000i64 + ts.nanos;
+    }
+
+    /// Windows monotonic nanoseconds via QPC.  `count / freq` gives whole
+    /// seconds and `count % freq` the sub-second remainder; scaling the
+    /// remainder (always < freq) by 1e9 before the divide keeps full
+    /// nanosecond resolution without overflowing i64 the way `count * 1e9`
+    /// would on a long-running counter.
+    ![target(windows)]
+    static timing_now_ns() -> i64 {
+        mut count: i64 = 0i64;
+        mut freq:  i64 = 0i64;
+        QueryPerformanceCounter(&count);
+        QueryPerformanceFrequency(&freq);
+        if (freq == 0i64) { return 0i64; }
+        const secs: i64 = count / freq;
+        const rem:  i64 = count % freq;
+        return secs * 1000000000i64 + (rem * 1000000000i64) / freq;
+    }
+
+    /// Build a ProjectConfig view that compiles the `[lib]` half of a
+    /// multi-target project as a Library.  Inherits debug/optimize/no_std/
+    /// stdlib + linkage settings from the base config; overrides only the
+    /// fields that select what to compile and what to name the output.
+    static make_lib_view(base: ProjectConfig) -> ProjectConfig {
+        mut view: ProjectConfig = base;
+        view.target_type  = TargetType::Library;
+        // Read through `view` (a full copy of `base`) rather than `base`, which
+        // was just moved into `view` - keeps `make_lib_view` move-clean.
+        view.project_name = view.lib.name;
+        view.source_dir   = view.lib.source_dir;
+        return view;
+    }
+
+    /// Build a ProjectConfig view that compiles a single `[[bin]]` entry
+    /// as an Executable.  As with `make_lib_view`, inherits everything
+    /// other than what selects the entry point and names the output.
+    static make_bin_view(base: ProjectConfig, bin: BinTarget) -> ProjectConfig {
+        mut view: ProjectConfig = base;
+        view.target_type  = TargetType::Executable;
+        view.project_name = bin.name;
+        view.entry_point  = bin.entry_point;
+        return view;
     }
 
     // Shared pipeline orchestration
@@ -604,12 +602,12 @@ type struct CompilerInstance {
                 // BinTarget is Copy; pull the selection out before `config`
                 // is moved into make_bin_view so the read isn't after-move.
                 const sel: BinTarget = config.bins[chosen];
-                config = make_bin_view(config, sel);
+                config = CompilerInstance::make_bin_view(config, sel);
             } else if (config.lib.is_present()) {
-                config = make_lib_view(config);
+                config = CompilerInstance::make_lib_view(config);
             } else if (config.bins.length > 0) {
                 const sel: BinTarget = config.bins[0];
-                config = make_bin_view(config, sel);
+                config = CompilerInstance::make_bin_view(config, sel);
             }
         }
         return this.compile_project_with_ctx(ctx, config);
@@ -727,7 +725,7 @@ type struct CompilerInstance {
             cdebug("[Compiler] Multi-target: building lib '%s' from %s\n",
                 base.lib.name, base.lib.source_dir);
             // Clone so `base` survives for the per-bin views below.
-            const lib_view: ProjectConfig = make_lib_view(base.clone());
+            const lib_view: ProjectConfig = CompilerInstance::make_lib_view(base.clone());
             const r: CompilationResult = this.compile_project_with_config(lib_view);
             if (!r.success) { return r; }
         }
@@ -737,7 +735,7 @@ type struct CompilerInstance {
                 base.bins[i].name, base.bins[i].entry_point);
             // Clone `base` per iteration; make_bin_view consumes its first arg.
             const sel: BinTarget = base.bins[i];
-            const bin_view: ProjectConfig = make_bin_view(base.clone(), sel);
+            const bin_view: ProjectConfig = CompilerInstance::make_bin_view(base.clone(), sel);
             const r: CompilationResult = this.compile_project_with_config(bin_view);
             if (!r.success) { return r; }
             if (libc::strlen(r.output_path) > 0) { last_output = r.output_path; }
@@ -824,7 +822,7 @@ type struct CompilerInstance {
         // the report only prints (success path) when the env var is set, so
         // the overhead on a normal build is a handful of `clock_gettime`s.
         const tm_on: boolean = CompilerInstance::timing_enabled();
-        const tm_entry:        i64 = timing_now_ns();
+        const tm_entry:        i64 = CompilerInstance::timing_now_ns();
         mut tm_discovery_end:  i64 = 0i64;
         mut tm_frontend_end:   i64 = 0i64;
         mut tm_mono_end:       i64 = 0i64;
@@ -1121,7 +1119,7 @@ type struct CompilerInstance {
 
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
-        tm_discovery_end = timing_now_ns();
+        tm_discovery_end = CompilerInstance::timing_now_ns();
 
         cdebug("[Compiler] Discovered %u modules, compilation order:\n", n);
         for (mut i: u32 = 0; i < n; i++) {
@@ -1441,7 +1439,7 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        tm_frontend_end = timing_now_ns();
+        tm_frontend_end = CompilerInstance::timing_now_ns();
 
         // Phase 6a: Specialization: monomorphize ALL modules before validation.
         // GenericValidation walks the shared TypeArena which contains
@@ -1618,7 +1616,7 @@ type struct CompilerInstance {
             return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
-        tm_mono_end = timing_now_ns();
+        tm_mono_end = CompilerInstance::timing_now_ns();
 
         // ====================================================================
         // Per-module incremental cache: decide which modules can reuse their
@@ -1777,7 +1775,7 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        tm_sema_end = timing_now_ns();
+        tm_sema_end = CompilerInstance::timing_now_ns();
 
         // Dump ASTs if requested (even on errors, for debugging)
         if (this.config.show_ast) {
@@ -1973,7 +1971,7 @@ type struct CompilerInstance {
                 pipeline.reset();
             }
 
-            tm_codegen_end = timing_now_ns();
+            tm_codegen_end = CompilerInstance::timing_now_ns();
 
             // Phase 7b: synthesize the test-runner main when in test mode.
             // Walks the directive registry for `![test]` records, builds
@@ -1998,7 +1996,7 @@ type struct CompilerInstance {
                     fmt::eprintf("error: linking failed\n");
                 }
             }
-            tm_link_end = timing_now_ns();
+            tm_link_end = CompilerInstance::timing_now_ns();
         }
 
         // Print diagnostic summary on errors, warnings, or debug mode.

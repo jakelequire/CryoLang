@@ -999,7 +999,7 @@ type struct LTargetMachine {
             // Windows msvc→gnu coercion applies here too (otherwise a caller
             // passing "" on Windows would get the raw `windows-msvc` triple
             // and emit MSVC-style code the mingw linker can't resolve).
-            effective = get_default_triple();
+            effective = LTargetMachine::get_default_triple();
         }
         mut target: void* = null;
         mut err_msg: i8* = null;
@@ -1068,9 +1068,47 @@ type struct LTargetMachine {
     /// answer.
     static resolve_effective_triple(requested: string) -> string {
         if (requested == "" || libc::strlen(requested) == 0) {
-            return get_default_triple();
+            return LTargetMachine::get_default_triple();
         }
         return requested;
+    }
+
+    /// Get the default target triple string for the host build.
+    ///
+    /// On Linux/macOS this is whatever `LLVMGetDefaultTargetTriple` reports
+    /// (the triple the linked libLLVM was built for).
+    ///
+    /// On Windows the answer depends on which toolchain is installed.  The
+    /// Windows `LLVM-C.dll` the compiler links against is from the official
+    /// `clang+llvm-*-x86_64-pc-windows-msvc` release (see
+    /// `scripts/fetch-windows-llvm.sh`), so `LLVMGetDefaultTargetTriple`
+    /// reports `x86_64-pc-windows-msvc`.  But code emitted for the MSVC ABI
+    /// cannot be linked by mingw — the most visible mismatch is the stack-probe
+    /// symbol: MSVC emits `__chkstk` while mingw provides `___chkstk_ms`, so a
+    /// mingw `cryo build` of MSVC-ABI code fails with `undefined reference to
+    /// __chkstk`.  So when LLVM reports msvc we pick the ABI from the linker
+    /// that is actually on `PATH`, rather than assuming one:
+    ///   - an mingw `gcc` present → `x86_64-pc-windows-gnu` (the only link path
+    ///     the port supports today; preferred when both are installed);
+    ///   - else an MSVC linker (`lld-link`/`link.exe`) present → keep the
+    ///     `windows-msvc` triple, so codegen emits MSVC-ABI objects for the
+    ///     user's own toolchain to link;
+    ///   - else → `x86_64-pc-windows-gnu` (mingw is the default we ship for).
+    /// The probe runs once per process and is cached.  An explicit `--target=`
+    /// bypasses all of this (see `resolve_effective_triple`).
+    ![target(unix)]
+    static get_default_triple() -> string {
+        return llvm::LLVMGetDefaultTargetTriple() as string;
+    }
+
+    ![target(windows)]
+    static get_default_triple() -> string {
+        if (libc::strlen(g_win_default_triple) > 0) {
+            return g_win_default_triple;
+        }
+        const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
+        g_win_default_triple = LTargetMachine::pick_windows_default_triple(raw);
+        return g_win_default_triple;
     }
 }
 
@@ -1081,51 +1119,6 @@ type struct LTargetMachine {
 // LLVM Initialization
 
 
-/// Get the default target triple string for the host build.
-///
-/// On Linux/macOS this is whatever `LLVMGetDefaultTargetTriple` reports
-/// (the triple the linked libLLVM was built for).
-///
-/// On Windows the answer depends on which toolchain is installed.  The
-/// Windows `LLVM-C.dll` the compiler links against is from the official
-/// `clang+llvm-*-x86_64-pc-windows-msvc` release (see
-/// `scripts/fetch-windows-llvm.sh`), so `LLVMGetDefaultTargetTriple`
-/// reports `x86_64-pc-windows-msvc`.  But code emitted for the MSVC ABI
-/// cannot be linked by mingw — the most visible mismatch is the stack-probe
-/// symbol: MSVC emits `__chkstk` while mingw provides `___chkstk_ms`, so a
-/// mingw `cryo build` of MSVC-ABI code fails with `undefined reference to
-/// __chkstk`.  So when LLVM reports msvc we pick the ABI from the linker
-/// that is actually on `PATH`, rather than assuming one:
-///   - an mingw `gcc` present → `x86_64-pc-windows-gnu` (the only link path
-///     the port supports today; preferred when both are installed);
-///   - else an MSVC linker (`lld-link`/`link.exe`) present → keep the
-///     `windows-msvc` triple, so codegen emits MSVC-ABI objects for the
-///     user's own toolchain to link;
-///   - else → `x86_64-pc-windows-gnu` (mingw is the default we ship for).
-/// The probe runs once per process and is cached.  An explicit `--target=`
-/// bypasses all of this (see `resolve_effective_triple`).
 /// Cached result of the windows default-triple toolchain probe ("" until
 /// computed).  Only the windows `get_default_triple` reads or writes it.
 mut g_win_default_triple: string = "";
-
-![target(unix)]
-function get_default_triple() -> string {
-    return llvm::LLVMGetDefaultTargetTriple() as string;
-}
-
-![target(windows)]
-function get_default_triple() -> string {
-    if (libc::strlen(g_win_default_triple) > 0) {
-        return g_win_default_triple;
-    }
-    const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
-    g_win_default_triple = LTargetMachine::pick_windows_default_triple(raw);
-    return g_win_default_triple;
-}
-
-/// Choose the windows ABI from the linker that is actually installed (see
-/// `get_default_triple`).  A non-msvc LLVM default is returned unchanged.
-![target(windows)]
-
-/// True when `exe` exists in one of the `;`-separated entries of `%PATH%`.
-![target(windows)]
