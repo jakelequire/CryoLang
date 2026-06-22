@@ -230,143 +230,6 @@ type struct CompilationResult {
 // rejected; the caller renders these in a hard-error diagnostic when
 // resolution fails so users see exactly where the compiler looked.
 
-function resolve_stdlib_root(cli_override: string,
-                             cryoconfig_override: string,
-                             project_root: string,
-                             tried_out: string[]*) -> string {
-    // 0. CLI override.
-    if (libc::strlen(cli_override) > 0) {
-        if (metadata::exists(Path::from_cstr(cli_override + "/lib.cryo"))) {
-            return cli_override;
-        }
-        if (tried_out != null) {
-            tried_out.push(format("%s  (--stdlib)", cli_override));
-        }
-    }
-
-    // 1. Explicit env var.
-    const env_raw: i8* = libc::getenv("CRYO_STDLIB") as i8*;
-    if (env_raw != null) {
-        const env_path: string = env_raw as string;
-        if (metadata::exists(Path::from_cstr(env_path + "/lib.cryo"))) {
-            return env_path;
-        }
-        if (tried_out != null) {
-            tried_out.push(format("%s  ($CRYO_STDLIB)", env_path));
-        }
-    }
-
-    // 2. + 3. Install-root env var.  install.sh writes CRYO_HOME into
-    // the user's shell rc; the stdlib lives under it at either
-    // `<CRYO_HOME>/stdlib` (the simple layout install.sh creates today)
-    // or `<CRYO_HOME>/share/cryo/stdlib` (FHS layout, in case packagers
-    // pick that).  Cross-platform; does not depend on /proc/self/exe.
-    const home_raw: i8* = libc::getenv("CRYO_HOME") as i8*;
-    if (home_raw != null) {
-        const home_path: string = home_raw as string;
-        const cand_home_simple: string = home_path + "/stdlib";
-        if (metadata::exists(Path::from_cstr(cand_home_simple + "/lib.cryo"))) {
-            return cand_home_simple;
-        }
-        if (tried_out != null) {
-            tried_out.push(format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
-        }
-        const cand_home_share: string = home_path + "/share/cryo/stdlib";
-        if (metadata::exists(Path::from_cstr(cand_home_share + "/lib.cryo"))) {
-            return cand_home_share;
-        }
-        if (tried_out != null) {
-            tried_out.push(format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
-        }
-    }
-
-    // 4. + 5. Binary-relative via /proc/self/exe.  Single 4 KiB scratch
-    // buffer is leaked once per compile; same pattern as the path
-    // concatenations below, and only happens once per `cryo build`.
-    mut self_exe: string = "";
-    match (env::current_exe()) {
-        Option::Some(s) => { self_exe = s.into_raw(); }
-        Option::None    => {}
-    }
-    const exe_len: i64 = libc::strlen(self_exe) as i64;
-    if (exe_len > 0) {
-        mut exe_buf: i8* = self_exe as i8*;
-        const exe_path: string = self_exe;
-        // dirname: walk back to the final path separator.  `current_exe()`
-        // yields a forward-slash path on Unix (`/proc/self/exe`) but a
-        // BACKSLASH path on Windows (`GetModuleFileNameA` returns
-        // `C:\...\bin\cryo.exe`), so both separators must terminate the
-        // scan - otherwise the Windows path has no `/`, `dir_end` walks to
-        // 0, the whole binary-relative block is skipped, and auto-detection
-        // silently fails.
-        mut dir_end: u64 = (exe_len - 1) as u64;
-        while (dir_end > 0) {
-            if (exe_path[dir_end] == '/' || exe_path[dir_end] == '\\') { break; }
-            dir_end -= 1;
-        }
-        if (dir_end > 0) {
-            exe_buf[dir_end] = 0;
-            const bindir: string = exe_buf as string;
-            const cand_repo: string = bindir + "/../stdlib";
-            if (metadata::exists(Path::from_cstr(cand_repo + "/lib.cryo"))) {
-                return cand_repo;
-            }
-            if (tried_out != null) {
-                tried_out.push(format("%s  (binary-relative)", cand_repo));
-            }
-            const cand_sys: string = bindir + "/../share/cryo/stdlib";
-            if (metadata::exists(Path::from_cstr(cand_sys + "/lib.cryo"))) {
-                return cand_sys;
-            }
-            if (tried_out != null) {
-                tried_out.push(format("%s  (binary-relative share)", cand_sys));
-            }
-        }
-    }
-
-    // 6. cryoconfig `[project] stdlib_root`.  Absolute paths used as-is;
-    // relative paths resolved against project_root so a project nested
-    // anywhere in the filesystem can still reach a sibling stdlib via
-    // `stdlib_root = "../shared-stdlib"`.
-    if (libc::strlen(cryoconfig_override) > 0) {
-        mut cand_cfg: string = cryoconfig_override;
-        if (cryoconfig_override[0] != '/' && libc::strlen(project_root) > 0) {
-            cand_cfg = project_root + "/" + cryoconfig_override;
-        }
-        if (metadata::exists(Path::from_cstr(cand_cfg + "/lib.cryo"))) {
-            return cand_cfg;
-        }
-        if (tried_out != null) {
-            tried_out.push(format("%s  ([project] stdlib_root)", cand_cfg));
-        }
-    }
-
-    // 7. <project_root>/../stdlib
-    const cand_proj: string = project_root + "/../stdlib";
-    if (metadata::exists(Path::from_cstr(cand_proj + "/lib.cryo"))) {
-        return cand_proj;
-    }
-    if (tried_out != null) {
-        tried_out.push(format("%s  (project-relative)", cand_proj));
-    }
-    // 8. ../stdlib (cwd-relative)
-    if (metadata::exists(Path::from_cstr("../stdlib/lib.cryo"))) {
-        return "../stdlib";
-    }
-    if (tried_out != null) {
-        tried_out.push("../stdlib  (cwd-relative)");
-    }
-    return "";
-}
-
-
-/// Path to the lockfile next to a given cryoconfig.
-function lock_path_for(consumer_root: string) -> string {
-    if (libc::strlen(consumer_root) == 0 || consumer_root.eq(".")) {
-        return "cryoconfig.lock";
-    }
-    return format("%s/cryoconfig.lock", consumer_root);
-}
 
 /// Final path component of `path` ("src/hello.cryo" -> "hello.cryo").
 // Self-contained monotonic clock for `CRYO_TIMINGS` phase profiling.
@@ -422,25 +285,6 @@ function timing_now_ns() -> i64 {
     return secs * 1000000000i64 + (rem * 1000000000i64) / freq;
 }
 
-/// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
-/// the per-phase wall-time report printed at the end of a successful build.
-function timing_enabled() -> boolean {
-    const raw: i8* = libc::getenv("CRYO_TIMINGS") as i8*;
-    if (raw == null) { return false; }
-    return libc::strlen(raw as string) > 0;
-}
-
-/// Render a nanosecond span as milliseconds with one decimal place, plus
-/// its share of `total_ns`.  Pure formatting helper for the timing report.
-function timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
-    const ms_x10: i64 = (span_ns + 50000i64) / 100000i64;
-    mut pct: i64 = 0i64;
-    if (total_ns > 0i64) {
-        pct = (span_ns * 100i64 + total_ns / 2i64) / total_ns;
-    }
-    fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
-        label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
-}
 
 /// Build a ProjectConfig view that compiles the `[lib]` half of a
 /// multi-target project as a Library.  Inherits debug/optimize/no_std/
@@ -659,7 +503,7 @@ type struct CompilerInstance {
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
         ctx.debug_mode = this.config.debug;
         mut tried: string[] = [];
-        ctx.stdlib_root = resolve_stdlib_root(this.config.stdlib_path_override, "", "", &tried);
+        ctx.stdlib_root = CompilerInstance::resolve_stdlib_root(this.config.stdlib_path_override, "", "", &tried);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(&ctx, &pipeline, "");
     }
@@ -700,7 +544,7 @@ type struct CompilerInstance {
         // resets every compile, so without clearing the (TypeRef.id ->
         // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
         // would alias a stale entry from a prior keystroke's compile.
-        Compiler::Codegen::TypeMap::reset_shared_type_cache();
+        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
         ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(ctx, &pipeline, "");
@@ -974,12 +818,12 @@ type struct CompilerInstance {
         // compile in this process.  TypeArena.next_id resets to 1 every
         // compile, so without this every fresh TypeRef would alias a
         // stale cache entry from the previous run.
-        Compiler::Codegen::TypeMap::reset_shared_type_cache();
+        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
 
         // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
         // the report only prints (success path) when the env var is set, so
         // the overhead on a normal build is a handful of `clock_gettime`s.
-        const tm_on: boolean = timing_enabled();
+        const tm_on: boolean = CompilerInstance::timing_enabled();
         const tm_entry:        i64 = timing_now_ns();
         mut tm_discovery_end:  i64 = 0i64;
         mut tm_frontend_end:   i64 = 0i64;
@@ -1044,7 +888,7 @@ type struct CompilerInstance {
         mut stdlib_root: string = "";
         if (!config.no_std) {
             mut tried: string[] = [];
-            stdlib_root = resolve_stdlib_root(
+            stdlib_root = CompilerInstance::resolve_stdlib_root(
                 this.config.stdlib_path_override,
                 config.stdlib_root,
                 config.project_root,
@@ -1086,7 +930,7 @@ type struct CompilerInstance {
         // to cryoconfig); we surface a hard error rather than dropping
         // dep roots and reporting confusing "namespace not found"
         // diagnostics later.
-        const lock_path: string = lock_path_for(config.project_root);
+        const lock_path: string = CompilerInstance::lock_path_for(config.project_root);
         const dep_outcome: ResolveOutcome = DepResolver::resolve(
             &config, ResolveMode::Build, lock_path);
         if (dep_outcome.failed) {
@@ -1356,7 +1200,7 @@ type struct CompilerInstance {
                 };
                 manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
             }
-            const manifest: BuildManifest::Manifest = BuildManifest::Manifest::new(
+            const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
             const build_fp: u64 = manifest.compute_fingerprint(&mod_entries);
@@ -1797,13 +1641,13 @@ type struct CompilerInstance {
             mut pm_src_h: u64[] = [];
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                pm_src_h.push(BuildManifest::module_source_hash(
+                pm_src_h.push(Compiler::BuildManifest::Manifest::module_source_hash(
                     ctx.intern_table.resolve(mi.name),
                     ModuleInfo::origin_subdir(mi.origin, mi.origin_name),
                     mi.file_path));
             }
 
-            const pm_tool_fp: u64 = BuildManifest::toolchain_fingerprint(
+            const pm_tool_fp: u64 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
 
             // Spec ownership.  A spec whose owner can't be attributed to a
@@ -1827,32 +1671,32 @@ type struct CompilerInstance {
             }
 
             // Global digest over every module's source hash, in topo order.
-            mut pm_global: u64 = BuildManifest::fnv_seed();
-            pm_global = BuildManifest::fnv_u64(pm_global, pm_tool_fp);
+            mut pm_global: u64 = Compiler::BuildManifest::Manifest::fnv_seed();
+            pm_global = Compiler::BuildManifest::Manifest::fnv_u64(pm_global, pm_tool_fp);
             for (mut i: u32 = 0; i < n; i++) {
-                pm_global = BuildManifest::fnv_u64(pm_global, pm_src_h[order[i] as i64]);
+                pm_global = Compiler::BuildManifest::Manifest::fnv_u64(pm_global, pm_src_h[order[i] as i64]);
             }
 
             const pm_prior: BuildManifest::ModuleKeyTable =
-                BuildManifest::read_module_keys(ctx.project_config.module_keys_path());
+                Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
 
             // Per-module key (indexed by module index, parallel arrays).
             for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.resolve(mi.name);
-                mut k: u64 = BuildManifest::fnv_seed();
-                k = BuildManifest::fnv_u64(k, pm_tool_fp);
+                mut k: u64 = Compiler::BuildManifest::Manifest::fnv_seed();
+                k = Compiler::BuildManifest::Manifest::fnv_u64(k, pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
-                    k = BuildManifest::fnv_str(k, "owner");
-                    k = BuildManifest::fnv_u64(k, pm_global);
+                    k = Compiler::BuildManifest::Manifest::fnv_str(k, "owner");
+                    k = Compiler::BuildManifest::Manifest::fnv_u64(k, pm_global);
                 } else {
-                    k = BuildManifest::fnv_str(k, "leaf");
+                    k = Compiler::BuildManifest::Manifest::fnv_str(k, "leaf");
                     const clos: boolean[] =
                         ctx.module_graph.compute_import_closure(m, n);
                     for (mut i: u32 = 0; i < n; i++) {
                         if (clos[order[i] as i64]) {
-                            k = BuildManifest::fnv_u64(k, pm_src_h[order[i] as i64]);
+                            k = Compiler::BuildManifest::Manifest::fnv_u64(k, pm_src_h[order[i] as i64]);
                         }
                     }
                 }
@@ -1870,7 +1714,7 @@ type struct CompilerInstance {
                     const objp: string = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(mi.origin, mi.origin_name)),
-                        BuildManifest::mangle_module(ctx.intern_table.resolve(mi.name)));
+                        Compiler::BuildManifest::Manifest::mangle_module(ctx.intern_table.resolve(mi.name)));
                     if (metadata::exists(Path::from_cstr(objp))) {
                         pm_cached[m as i64] = true;
                     }
@@ -2052,7 +1896,7 @@ type struct CompilerInstance {
                     const cobj: string = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
-                        BuildManifest::mangle_module(_mn));
+                        Compiler::BuildManifest::Manifest::mangle_module(_mn));
                     ctx.artifacts.register_object_file(cobj);
                     cdebug("[Compiler] Phase 7: reused cached object %s\n", cobj);
                     continue;
@@ -2207,7 +2051,7 @@ type struct CompilerInstance {
         // Gated on `do_incremental`; the fingerprint locals were computed
         // before the frontend ran. Side files only; no effect on the IR.
         if (do_incremental && ctx.project_config != null) {
-            const manifest: BuildManifest::Manifest = BuildManifest::Manifest::new(
+            const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
             manifest.write_fingerprint(build_fp_hex);
@@ -2216,7 +2060,7 @@ type struct CompilerInstance {
             // whenever they were computed: every module not marked cached was
             // just recompiled, so its key now matches its on-disk .o.
             if (pm_key_names.length > 0) {
-                BuildManifest::write_module_keys(
+                Compiler::BuildManifest::ModuleKeyTable::write_module_keys(
                     ctx.project_config.module_keys_path(),
                     &pm_key_names, &pm_key_hex);
             }
@@ -2236,20 +2080,20 @@ type struct CompilerInstance {
             const fe: i64 = tm_mono_end - tm_entry;
             const be: i64 = tm_end - tm_mono_end;
             fmt::println(f"\n=== cryo build timings ({config.project_name}) ===");
-            timing_fmt("discovery (phase 1)", tm_discovery_end - tm_entry, total);
-            timing_fmt("frontend (phase 2-5)", tm_frontend_end - tm_discovery_end, total);
-            timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
-            timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
+            CompilerInstance::timing_fmt("discovery (phase 1)", tm_discovery_end - tm_entry, total);
+            CompilerInstance::timing_fmt("frontend (phase 2-5)", tm_frontend_end - tm_discovery_end, total);
+            CompilerInstance::timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
+            CompilerInstance::timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
             if (tm_codegen_end > 0i64) {
-                timing_fmt("codegen+objects (7)", tm_codegen_end - tm_sema_end, total);
+                CompilerInstance::timing_fmt("codegen+objects (7)", tm_codegen_end - tm_sema_end, total);
             }
             if (tm_link_end > 0i64) {
-                timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
+                CompilerInstance::timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
             }
             fmt::printf("  %-28s\n", "----");
-            timing_fmt("FRONTEND (1-6a, uncacheable)", fe, total);
-            timing_fmt("BACKEND  (6b+7+link, cacheable)", be, total);
-            timing_fmt("TOTAL", total, total);
+            CompilerInstance::timing_fmt("FRONTEND (1-6a, uncacheable)", fe, total);
+            CompilerInstance::timing_fmt("BACKEND  (6b+7+link, cacheable)", be, total);
+            CompilerInstance::timing_fmt("TOTAL", total, total);
         }
 
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
@@ -2294,4 +2138,161 @@ type struct CompilerInstance {
             ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
     }
 
+
+    static resolve_stdlib_root(cli_override: string,
+                                 cryoconfig_override: string,
+                                 project_root: string,
+                                 tried_out: string[]*) -> string {
+        // 0. CLI override.
+        if (libc::strlen(cli_override) > 0) {
+            if (metadata::exists(Path::from_cstr(cli_override + "/lib.cryo"))) {
+                return cli_override;
+            }
+            if (tried_out != null) {
+                tried_out.push(format("%s  (--stdlib)", cli_override));
+            }
+        }
+
+        // 1. Explicit env var.
+        const env_raw: i8* = libc::getenv("CRYO_STDLIB") as i8*;
+        if (env_raw != null) {
+            const env_path: string = env_raw as string;
+            if (metadata::exists(Path::from_cstr(env_path + "/lib.cryo"))) {
+                return env_path;
+            }
+            if (tried_out != null) {
+                tried_out.push(format("%s  ($CRYO_STDLIB)", env_path));
+            }
+        }
+
+        // 2. + 3. Install-root env var.  install.sh writes CRYO_HOME into
+        // the user's shell rc; the stdlib lives under it at either
+        // `<CRYO_HOME>/stdlib` (the simple layout install.sh creates today)
+        // or `<CRYO_HOME>/share/cryo/stdlib` (FHS layout, in case packagers
+        // pick that).  Cross-platform; does not depend on /proc/self/exe.
+        const home_raw: i8* = libc::getenv("CRYO_HOME") as i8*;
+        if (home_raw != null) {
+            const home_path: string = home_raw as string;
+            const cand_home_simple: string = home_path + "/stdlib";
+            if (metadata::exists(Path::from_cstr(cand_home_simple + "/lib.cryo"))) {
+                return cand_home_simple;
+            }
+            if (tried_out != null) {
+                tried_out.push(format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
+            }
+            const cand_home_share: string = home_path + "/share/cryo/stdlib";
+            if (metadata::exists(Path::from_cstr(cand_home_share + "/lib.cryo"))) {
+                return cand_home_share;
+            }
+            if (tried_out != null) {
+                tried_out.push(format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
+            }
+        }
+
+        // 4. + 5. Binary-relative via /proc/self/exe.  Single 4 KiB scratch
+        // buffer is leaked once per compile; same pattern as the path
+        // concatenations below, and only happens once per `cryo build`.
+        mut self_exe: string = "";
+        match (env::current_exe()) {
+            Option::Some(s) => { self_exe = s.into_raw(); }
+            Option::None    => {}
+        }
+        const exe_len: i64 = libc::strlen(self_exe) as i64;
+        if (exe_len > 0) {
+            mut exe_buf: i8* = self_exe as i8*;
+            const exe_path: string = self_exe;
+            // dirname: walk back to the final path separator.  `current_exe()`
+            // yields a forward-slash path on Unix (`/proc/self/exe`) but a
+            // BACKSLASH path on Windows (`GetModuleFileNameA` returns
+            // `C:\...\bin\cryo.exe`), so both separators must terminate the
+            // scan - otherwise the Windows path has no `/`, `dir_end` walks to
+            // 0, the whole binary-relative block is skipped, and auto-detection
+            // silently fails.
+            mut dir_end: u64 = (exe_len - 1) as u64;
+            while (dir_end > 0) {
+                if (exe_path[dir_end] == '/' || exe_path[dir_end] == '\\') { break; }
+                dir_end -= 1;
+            }
+            if (dir_end > 0) {
+                exe_buf[dir_end] = 0;
+                const bindir: string = exe_buf as string;
+                const cand_repo: string = bindir + "/../stdlib";
+                if (metadata::exists(Path::from_cstr(cand_repo + "/lib.cryo"))) {
+                    return cand_repo;
+                }
+                if (tried_out != null) {
+                    tried_out.push(format("%s  (binary-relative)", cand_repo));
+                }
+                const cand_sys: string = bindir + "/../share/cryo/stdlib";
+                if (metadata::exists(Path::from_cstr(cand_sys + "/lib.cryo"))) {
+                    return cand_sys;
+                }
+                if (tried_out != null) {
+                    tried_out.push(format("%s  (binary-relative share)", cand_sys));
+                }
+            }
+        }
+
+        // 6. cryoconfig `[project] stdlib_root`.  Absolute paths used as-is;
+        // relative paths resolved against project_root so a project nested
+        // anywhere in the filesystem can still reach a sibling stdlib via
+        // `stdlib_root = "../shared-stdlib"`.
+        if (libc::strlen(cryoconfig_override) > 0) {
+            mut cand_cfg: string = cryoconfig_override;
+            if (cryoconfig_override[0] != '/' && libc::strlen(project_root) > 0) {
+                cand_cfg = project_root + "/" + cryoconfig_override;
+            }
+            if (metadata::exists(Path::from_cstr(cand_cfg + "/lib.cryo"))) {
+                return cand_cfg;
+            }
+            if (tried_out != null) {
+                tried_out.push(format("%s  ([project] stdlib_root)", cand_cfg));
+            }
+        }
+
+        // 7. <project_root>/../stdlib
+        const cand_proj: string = project_root + "/../stdlib";
+        if (metadata::exists(Path::from_cstr(cand_proj + "/lib.cryo"))) {
+            return cand_proj;
+        }
+        if (tried_out != null) {
+            tried_out.push(format("%s  (project-relative)", cand_proj));
+        }
+        // 8. ../stdlib (cwd-relative)
+        if (metadata::exists(Path::from_cstr("../stdlib/lib.cryo"))) {
+            return "../stdlib";
+        }
+        if (tried_out != null) {
+            tried_out.push("../stdlib  (cwd-relative)");
+        }
+        return "";
+    }
+
+    /// Path to the lockfile next to a given cryoconfig.
+    static lock_path_for(consumer_root: string) -> string {
+        if (libc::strlen(consumer_root) == 0 || consumer_root.eq(".")) {
+            return "cryoconfig.lock";
+        }
+        return format("%s/cryoconfig.lock", consumer_root);
+    }
+
+    /// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
+    /// the per-phase wall-time report printed at the end of a successful build.
+    static timing_enabled() -> boolean {
+        const raw: i8* = libc::getenv("CRYO_TIMINGS") as i8*;
+        if (raw == null) { return false; }
+        return libc::strlen(raw as string) > 0;
+    }
+
+    /// Render a nanosecond span as milliseconds with one decimal place, plus
+    /// its share of `total_ns`.  Pure formatting helper for the timing report.
+    static timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
+        const ms_x10: i64 = (span_ns + 50000i64) / 100000i64;
+        mut pct: i64 = 0i64;
+        if (total_ns > 0i64) {
+            pct = (span_ns * 100i64 + total_ns / 2i64) / total_ns;
+        }
+        fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
+            label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
+    }
 }

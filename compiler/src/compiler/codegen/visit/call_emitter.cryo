@@ -309,7 +309,7 @@ type struct CallEmitter {
                                 }
                             }
                             const ctor_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(ctor_fn.raw) };
-                            if (ctor_ty.is_valid() && type_kind_of(ctor_ty.raw) == LTypeKind::Function) {
+                            if (ctor_ty.is_valid() && LType::kind_of(ctor_ty.raw) == LTypeKind::Function) {
                                 mut ctor_args: Pair<LValue, TypeRef>[] = [];
                                 ctor_args.push(Pair<LValue, TypeRef>::new(obj_alloca, node.resolved_type));
                                 for (mut ci: i64 = 0; ci < node.arguments.length; ci++) {
@@ -554,7 +554,7 @@ type struct CallEmitter {
             // call sites whose scope name was substituted (where sema's
             // pin is for the template form) or otherwise didn't pin.
             if (!callee_val.is_valid()) {
-                const matches: SymbolStr[] = collect_namespace_suffix_matches(
+                const matches: SymbolStr[] = CallEmitter::collect_namespace_suffix_matches(
                     this.cg, intern, scope_str, sr.member_name, sr_arity);
                 if (matches.length == 1) {
                     callee_val = this.cg.resolver.resolve_function_with_arity(matches[0], sr_arity);
@@ -1104,7 +1104,7 @@ type struct CallEmitter {
             }
         }
         const is_void: boolean = !ret_ty.is_valid() || ret_ty.raw == void_ty.raw ||
-                                  type_kind_of(ret_ty.raw) == LTypeKind::Void ||
+                                  LType::kind_of(ret_ty.raw) == LTypeKind::Void ||
                                   ret_kind_is_void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
@@ -1127,7 +1127,7 @@ type struct CallEmitter {
         if (result.is_valid() && node.resolved_type.is_valid()) {
             const got_raw: void* = llvm::LLVMTypeOf(result.raw);
             const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-            const got_kind: LTypeKind = type_kind_of(got_raw);
+            const got_kind: LTypeKind = LType::kind_of(got_raw);
             // Detect a coercion-needed mismatch.  The call result type
             // differs from the source-level expected type for any
             // Direct-with-coercion or DirectPair return; reshape via
@@ -1140,7 +1140,7 @@ type struct CallEmitter {
                     || got_kind == LTypeKind::Float
                     || got_kind == LTypeKind::Double
                     || got_kind == LTypeKind::Vector)
-                && type_kind_of(expected_lty.raw) == LTypeKind::Struct;
+                && LType::kind_of(expected_lty.raw) == LTypeKind::Struct;
             if (needs_coerce) {
                 const cur_bb_c: LBasicBlock = this.cg.builder.get_insert_block();
                 if (cur_bb_c.is_valid()) {
@@ -1420,5 +1420,107 @@ type struct CallEmitter {
         }
 
         this.cg.builder.position_at_end(after_bb);
+    }
+
+    /// Walk the module graph and return every qualified function name that
+    /// matches `<full_namespace>::<member>` where `<full_namespace>` ends with
+    /// `::scope_str` (or equals `scope_str` exactly).  Used by the
+    /// ScopeResolution codegen path so a shorthand `libc::read` resolves
+    /// directly to `std::ffi::libc::read`, instead of falling through to the
+    /// last-write-wins bare-name overload slot.
+    ///
+    /// Only entries that have a probe-able function signature in the codegen
+    /// (arity-matched declaration) are returned.  A length-1 result is the
+    /// happy path; length > 1 surfaces an E0154 ambiguity at the call site.
+    static collect_namespace_suffix_matches(cg: CodegenContext*, intern: InternTable*,
+                                              scope_str: string, member: SymbolStr,
+                                              arity: u32) -> SymbolStr[] {
+        mut result: SymbolStr[] = [];
+        const scope_len: i64 = libc::strlen(scope_str) as i64;
+        if (scope_len == 0) { return result; }
+
+        const mg: ModuleGraph* = cg.ctx.module_graph;
+        const member_str: string = intern.resolve(member);
+        for (mut i: i64 = 0; i < mg.modules.length; i++) {
+            const ns_sym: SymbolStr = mg.modules[i].namespace_name;
+            if (!ns_sym.is_valid()) { continue; }
+            const ns_str: string = intern.resolve(ns_sym);
+            const ns_len: i64 = libc::strlen(ns_str) as i64;
+
+            // Match condition: namespace equals scope_str OR ends with "::scope_str".
+            mut is_match: boolean = false;
+            if (ns_len == scope_len) {
+                is_match = ns_str.eq(scope_str);
+            } else if (ns_len > scope_len + 1) {
+                const suffix_start: i64 = ns_len - scope_len;
+                if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
+                    is_match = libc::strcmp(ns_str + suffix_start, scope_str) == 0;
+                }
+            }
+            if (!is_match) { continue; }
+
+            // Build "<ns>::<member>" and probe the function table.
+            const qualified: string = format("%s::%s", ns_str, member_str);
+            const q_sym: SymbolStr = intern.intern(qualified);
+            const probe: LValue = cg.resolver.resolve_function_with_arity(q_sym, arity);
+            if (!probe.is_valid()) { continue; }
+
+            // Dedup: same qualified name shouldn't appear twice (e.g. when
+            // the module graph lists the same module under two indices).
+            mut dup: boolean = false;
+            for (mut k: i64 = 0; k < result.length; k++) {
+                if (result[k].id == q_sym.id) { dup = true; break; }
+            }
+            if (!dup) { result.push(q_sym); }
+        }
+
+        // Struct-static form: when `scope_str` is `<ns_suffix>::<TypeLeaf>` (a
+        // static method reached via an ABBREVIATED namespace, e.g.
+        // `BuildManifest::Manifest::module_source_hash` where the namespace is
+        // `Compiler::BuildManifest` and `Manifest` is a struct), the loop above
+        // can't match — no module namespace ends with `::BuildManifest::Manifest`
+        // because `Manifest` is a type, not a namespace segment.  Split the
+        // scope at its final `::` into (namespace-prefix, type-leaf), match
+        // modules whose namespace ends with the prefix, and probe
+        // `<full_ns>::<TypeLeaf>::<member>`.  This mirrors how the free-function
+        // form (`<ns>::<member>`) resolves a shorthand namespace, extended one
+        // level for a type-qualified static.  Only attempted when the free-
+        // function form found nothing, so it never changes an existing match.
+        if (result.length == 0) {
+            const ns_prefix: string = QualifiedName::parent_of(scope_str);
+            const type_leaf: string = QualifiedName::leaf_of(scope_str);
+            const prefix_len: i64 = libc::strlen(ns_prefix) as i64;
+            if (prefix_len > 0 && !type_leaf.eq(scope_str)) {
+                for (mut i: i64 = 0; i < mg.modules.length; i++) {
+                    const ns_sym: SymbolStr = mg.modules[i].namespace_name;
+                    if (!ns_sym.is_valid()) { continue; }
+                    const ns_str: string = intern.resolve(ns_sym);
+                    const ns_len: i64 = libc::strlen(ns_str) as i64;
+
+                    mut is_match: boolean = false;
+                    if (ns_len == prefix_len) {
+                        is_match = ns_str.eq(ns_prefix);
+                    } else if (ns_len > prefix_len + 1) {
+                        const suffix_start: i64 = ns_len - prefix_len;
+                        if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
+                            is_match = libc::strcmp(ns_str + suffix_start, ns_prefix) == 0;
+                        }
+                    }
+                    if (!is_match) { continue; }
+
+                    const qualified: string = format("%s::%s::%s", ns_str, type_leaf, member_str);
+                    const q_sym: SymbolStr = intern.intern(qualified);
+                    const probe: LValue = cg.resolver.resolve_function_with_arity(q_sym, arity);
+                    if (!probe.is_valid()) { continue; }
+
+                    mut dup: boolean = false;
+                    for (mut k: i64 = 0; k < result.length; k++) {
+                        if (result[k].id == q_sym.id) { dup = true; break; }
+                    }
+                    if (!dup) { result.push(q_sym); }
+                }
+            }
+        }
+        return result;
     }
 }

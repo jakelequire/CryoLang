@@ -2,7 +2,8 @@
 ///
 /// Pure helpers used by the codegen pass.  No CodegenContext dependency,
 /// no LLVM-builder dependency - just data shaping that doesn't naturally
-/// live inside `CodegenContext`'s class body.
+/// live inside `CodegenContext`'s class body.  Grouped as statics on
+/// `CodegenUtil` so the codegen emitters call them as `CodegenUtil::fn(...)`.
 
 namespace Compiler::Codegen::Util;
 import ffi::libc;
@@ -12,172 +13,6 @@ import Compiler::AST::{ Node, Declaration };
 import Compiler::Types;
 import Compiler::Types::{ TypeRef, Type, Arena };
 import Compiler::Resolver::{ SymbolStr, InternTable };
-
-
-// Literal lexeme parsing
-//
-// Integer-literal parsing (hex/oct/bin/dec prefixes, sign, `_` separators)
-// lives in the stdlib as the generic `string::parse_int<T>`; codegen calls
-// `lexeme.parse_int<u64>()` directly.
-
-/// Strip the sign, base prefix (`0x`/`0b`/`0o`), `_` separators, and any type
-/// suffix from an integer-literal lexeme, returning the bare digit string and
-/// writing the detected radix to `*out_radix`. Used to build i128/u128
-/// constants via `LLVMConstIntOfString`, which takes digits + radix rather
-/// than a 64-bit value (so it doesn't truncate literals above `u64::MAX`).
-function int_literal_clean(s: string, out_radix: u8*) -> string {
-    *out_radix = 10u8;
-    if (s == null) { return "0"; }
-    const len: i64 = libc::strlen(s) as i64;
-    mut i: i64 = 0;
-    // A leading sign belongs to the unary operator, not the literal, but
-    // tolerate it defensively.
-    if (len > 0 && (*(s + 0) as char == '-' || *(s + 0) as char == '+')) { i = 1; }
-
-    mut base: u8 = 10u8;
-    if (i + 1 < len && (*(s + i) as char) == '0') {
-        const p: char = *(s + i + 1) as char;
-        if (p == 'x' || p == 'X')      { base = 16u8; i += 2; }
-        else if (p == 'b' || p == 'B') { base = 2u8;  i += 2; }
-        else if (p == 'o' || p == 'O') { base = 8u8;  i += 2; }
-    }
-
-    mut buf: string = intrinsics::malloc(len + 1) as string;
-    mut w: i64 = 0;
-    while (i < len) {
-        const c: char = *(s + i) as char;
-        if (c == '_') { i += 1; continue; }
-        mut digit: i64 = -1;
-        if (c >= '0' && c <= '9')      { digit = (c - '0') as i64; }
-        else if (c >= 'a' && c <= 'f') { digit = (c - 'a' + 10) as i64; }
-        else if (c >= 'A' && c <= 'F') { digit = (c - 'A' + 10) as i64; }
-        else { break; }   // the start of the type suffix (i128/u128) or junk
-        if (digit >= base as i64) { break; }
-        *(buf + w) = c;
-        w += 1;
-        i += 1;
-    }
-    *(buf + w) = '\0';
-    *out_radix = base;
-    if (w == 0) { return "0"; }
-    return buf;
-}
-
-/// Decode a character-literal lexeme: the raw text *between* the quotes,
-/// as the lexer hands it over, to its code-point value.  `'\n'` arrives
-/// as the two-char string "\n" (backslash + n), not 0x0A, so the C-style
-/// escapes are resolved here.  Shared by `codegen_literal` (char literal
-/// expressions) and `codegen_pattern_value` (char literal patterns).
-function decode_char_lexeme(s: string) -> u64 {
-    if (s == null) { return 0; }
-    const len: i64 = libc::strlen(s) as i64;
-    if (len >= 2 && s[0] == '\\') {
-        const esc: char = s[1];
-        match (esc) {
-            'n'  => { return 10; }
-            't'  => { return 9; }
-            'r'  => { return 13; }
-            '0'  => { return 0; }
-            '\\' => { return 92; }
-            '\'' => { return 39; }
-            '"'  => { return 34; }
-            'a'  => { return 7; }
-            'b'  => { return 8; }
-            'f'  => { return 12; }
-            'v'  => { return 11; }
-            'x'  => {
-                // `\xHH`: two hex digits.  A short `\x` (len < 4) is
-                // malformed; fall through to the bare-escape default.
-                if (len >= 4) {
-                    mut hi: u64 = 0;
-                    const c2: char = s[2];
-                    if (c2 >= '0' && c2 <= '9') { hi = (c2 - '0') as u64; }
-                    else if (c2 >= 'a' && c2 <= 'f') { hi = (c2 - 'a' + 10) as u64; }
-                    else if (c2 >= 'A' && c2 <= 'F') { hi = (c2 - 'A' + 10) as u64; }
-                    mut lo: u64 = 0;
-                    const c3: char = s[3];
-                    if (c3 >= '0' && c3 <= '9') { lo = (c3 - '0') as u64; }
-                    else if (c3 >= 'a' && c3 <= 'f') { lo = (c3 - 'a' + 10) as u64; }
-                    else if (c3 >= 'A' && c3 <= 'F') { lo = (c3 - 'A' + 10) as u64; }
-                    return hi * 16 + lo;
-                }
-            }
-            _ => { }
-        }
-        return esc as u64;
-    }
-    if (len > 0) {
-        return s[0] as u64;
-    }
-    return 0;
-}
-
-/// Parse a tuple-field member name (the SymbolStr behind `t.0`, `t.1`, ...)
-/// as a non-negative decimal index, or -1 when the name isn't a pure
-/// decimal. Sema validates the index against the tuple's element count;
-/// codegen trusts that and just uses this to recover the slot number.
-function parse_tuple_member_index(s: string) -> i64 {
-    if (s == null) { return -1; }
-    const len: i64 = libc::strlen(s) as i64;
-    if (len == 0) { return -1; }
-    mut acc: i64 = 0;
-    for (mut i: i64 = 0; i < len; i++) {
-        const c: char = s[i];
-        if (c < '0' || c > '9') { return -1; }
-        acc = acc * 10 + ((c - '0') as i64);
-    }
-    return acc;
-}
-
-
-// Function/method parameter shape
-
-/// Number of parameters to emit as fixed-arity in an LLVM function type.
-/// For variadic Cryo functions (`args...`), the trailing name-only parameter
-/// stands in for the vararg bucket; sema needs it to be a local in scope,
-/// but LLVM must not see it as a fixed param (there's no callable type for
-/// it, and every call site passes a different arity for that slot).
-function fixed_param_count(func: FunctionDeclNode*) -> u32 {
-    mut count: u32 = func.parameters.length as u32;
-    if (func.is_variadic && count > 0) {
-        const last: VarDeclNode* = func.parameters[count - 1];
-        if (last.type_annotation == null) {
-            count -= 1;
-        }
-    }
-    return count;
-}
-
-/// Same shape as `fixed_param_count` but typed for `IntrinsicDeclNode*`.
-/// IntrinsicDeclNode and FunctionDeclNode both inherit from DeclarationNode
-/// but have different field layouts, so reusing the FunctionDeclNode-typed
-/// helper reads `is_variadic` past the end of an IntrinsicDeclNode's
-/// allocation and segfaults when the read crosses an unmapped page.
-function fixed_param_count_intrinsic(node: IntrinsicDeclNode*) -> u32 {
-    mut count: u32 = node.parameters.length as u32;
-    if (node.is_variadic && count > 0) {
-        const last: VarDeclNode* = node.parameters[count - 1];
-        if (last.type_annotation == null) {
-            count -= 1;
-        }
-    }
-    return count;
-}
-
-/// Return the name of the trailing `args...` parameter when `func` is
-/// variadic and its last parameter is the vararg bucket (no type
-/// annotation, so sema couldn't give it a concrete type).  Returns an
-/// empty SymbolStr when the function has no such parameter.
-function variadic_param_name(func: FunctionDeclNode*) -> SymbolStr {
-    if (!func.is_variadic) { return SymbolStr::empty(); }
-    const n: i64 = func.parameters.length;
-    if (n == 0) { return SymbolStr::empty(); }
-    const last: VarDeclNode* = func.parameters[n - 1];
-    if (last == null || last.type_annotation != null) {
-        return SymbolStr::empty();
-    }
-    return last.name;
-}
 
 
 // VTable slot identity
@@ -192,40 +27,201 @@ type struct VTableSlot {
     param_types: TypeRef[];
 }
 
-/// Structural equality on two param-type lists by arena ID.  The arena
-/// canonicalizes types so equal IDs mean equal types regardless of how
-/// they were spelled at the source level (including through type
-/// aliases, generic instantiations, etc.).
-function param_types_equal(a: TypeRef[], b: TypeRef[]) -> boolean {
-    if (a.length != b.length) { return false; }
-    for (mut i: i64 = 0; i < a.length; i++) {
-        if (a[i].id != b[i].id) { return false; }
-    }
-    return true;
-}
 
-/// Like `param_types_equal` but goes through the arena so two TypeRefs
-/// that represent the same shape but happen to live under different IDs
-/// (e.g., a `ASTVisitor*` registered while ASTVisitor was still a forward
-/// declaration vs after the body resolved) compare equal.  Vtable slot
-/// matching needs this lenience because override methods declared in a
-/// subclass may resolve their parameter types in a slightly different
-/// resolution context than the virtual base they override.
-function param_types_equal_structural(arena: TypeArena*, intern: InternTable*,
-                                       a: &TypeRef[], b: &TypeRef[]) -> boolean {
-    if (a.length != b.length) { return false; }
-    for (mut i: i64 = 0; i < a.length; i++) {
-        if (a[i].id == b[i].id) { continue; }
-        const ta: Type* = arena.lookup(a[i].id);
-        const tb: Type* = arena.lookup(b[i].id);
-        if (ta == null || tb == null) { return false; }
-        if (ta.kind != tb.kind) { return false; }
-        // Compare by formatted display so two distinct PointerType IDs
-        // that point at the same nominal class compare equal; display
-        // names are the canonical source-level identity for these types.
-        const sa: string = arena.format_display(ta);
-        const sb: string = arena.format_display(tb);
-        if (!sa.eq(sb)) { return false; }
+type struct CodegenUtil {
+    // Literal lexeme parsing
+    //
+    // Integer-literal parsing (hex/oct/bin/dec prefixes, sign, `_` separators)
+    // lives in the stdlib as the generic `string::parse_int<T>`; codegen calls
+    // `lexeme.parse_int<u64>()` directly.
+
+    /// Strip the sign, base prefix (`0x`/`0b`/`0o`), `_` separators, and any type
+    /// suffix from an integer-literal lexeme, returning the bare digit string and
+    /// writing the detected radix to `*out_radix`. Used to build i128/u128
+    /// constants via `LLVMConstIntOfString`, which takes digits + radix rather
+    /// than a 64-bit value (so it doesn't truncate literals above `u64::MAX`).
+    static int_literal_clean(s: string, out_radix: u8*) -> string {
+        *out_radix = 10u8;
+        if (s == null) { return "0"; }
+        const len: i64 = libc::strlen(s) as i64;
+        mut i: i64 = 0;
+        // A leading sign belongs to the unary operator, not the literal, but
+        // tolerate it defensively.
+        if (len > 0 && (*(s + 0) as char == '-' || *(s + 0) as char == '+')) { i = 1; }
+
+        mut base: u8 = 10u8;
+        if (i + 1 < len && (*(s + i) as char) == '0') {
+            const p: char = *(s + i + 1) as char;
+            if (p == 'x' || p == 'X')      { base = 16u8; i += 2; }
+            else if (p == 'b' || p == 'B') { base = 2u8;  i += 2; }
+            else if (p == 'o' || p == 'O') { base = 8u8;  i += 2; }
+        }
+
+        mut buf: string = intrinsics::malloc(len + 1) as string;
+        mut w: i64 = 0;
+        while (i < len) {
+            const c: char = *(s + i) as char;
+            if (c == '_') { i += 1; continue; }
+            mut digit: i64 = -1;
+            if (c >= '0' && c <= '9')      { digit = (c - '0') as i64; }
+            else if (c >= 'a' && c <= 'f') { digit = (c - 'a' + 10) as i64; }
+            else if (c >= 'A' && c <= 'F') { digit = (c - 'A' + 10) as i64; }
+            else { break; }   // the start of the type suffix (i128/u128) or junk
+            if (digit >= base as i64) { break; }
+            *(buf + w) = c;
+            w += 1;
+            i += 1;
+        }
+        *(buf + w) = '\0';
+        *out_radix = base;
+        if (w == 0) { return "0"; }
+        return buf;
     }
-    return true;
+
+    /// Decode a character-literal lexeme: the raw text *between* the quotes,
+    /// as the lexer hands it over, to its code-point value.  `'\n'` arrives
+    /// as the two-char string "\n" (backslash + n), not 0x0A, so the C-style
+    /// escapes are resolved here.  Shared by `codegen_literal` (char literal
+    /// expressions) and `codegen_pattern_value` (char literal patterns).
+    static decode_char_lexeme(s: string) -> u64 {
+        if (s == null) { return 0; }
+        const len: i64 = libc::strlen(s) as i64;
+        if (len >= 2 && s[0] == '\\') {
+            const esc: char = s[1];
+            match (esc) {
+                'n'  => { return 10; }
+                't'  => { return 9; }
+                'r'  => { return 13; }
+                '0'  => { return 0; }
+                '\\' => { return 92; }
+                '\'' => { return 39; }
+                '"'  => { return 34; }
+                'a'  => { return 7; }
+                'b'  => { return 8; }
+                'f'  => { return 12; }
+                'v'  => { return 11; }
+                'x'  => {
+                    // `\xHH`: two hex digits.  A short `\x` (len < 4) is
+                    // malformed; fall through to the bare-escape default.
+                    if (len >= 4) {
+                        mut hi: u64 = 0;
+                        const c2: char = s[2];
+                        if (c2 >= '0' && c2 <= '9') { hi = (c2 - '0') as u64; }
+                        else if (c2 >= 'a' && c2 <= 'f') { hi = (c2 - 'a' + 10) as u64; }
+                        else if (c2 >= 'A' && c2 <= 'F') { hi = (c2 - 'A' + 10) as u64; }
+                        mut lo: u64 = 0;
+                        const c3: char = s[3];
+                        if (c3 >= '0' && c3 <= '9') { lo = (c3 - '0') as u64; }
+                        else if (c3 >= 'a' && c3 <= 'f') { lo = (c3 - 'a' + 10) as u64; }
+                        else if (c3 >= 'A' && c3 <= 'F') { lo = (c3 - 'A' + 10) as u64; }
+                        return hi * 16 + lo;
+                    }
+                }
+                _ => { }
+            }
+            return esc as u64;
+        }
+        if (len > 0) {
+            return s[0] as u64;
+        }
+        return 0;
+    }
+
+    /// Parse a tuple-field member name (the SymbolStr behind `t.0`, `t.1`, ...)
+    /// as a non-negative decimal index, or -1 when the name isn't a pure
+    /// decimal. Sema validates the index against the tuple's element count;
+    /// codegen trusts that and just uses this to recover the slot number.
+    static parse_tuple_member_index(s: string) -> i64 {
+        if (s == null) { return -1; }
+        const len: i64 = libc::strlen(s) as i64;
+        if (len == 0) { return -1; }
+        mut acc: i64 = 0;
+        for (mut i: i64 = 0; i < len; i++) {
+            const c: char = s[i];
+            if (c < '0' || c > '9') { return -1; }
+            acc = acc * 10 + ((c - '0') as i64);
+        }
+        return acc;
+    }
+
+
+    // Function/method parameter shape
+
+    /// Number of parameters to emit as fixed-arity in an LLVM function type.
+    /// For variadic Cryo functions (`args...`), the trailing name-only parameter
+    /// stands in for the vararg bucket; sema needs it to be a local in scope,
+    /// but LLVM must not see it as a fixed param (there's no callable type for
+    /// it, and every call site passes a different arity for that slot).
+    static fixed_param_count(func: FunctionDeclNode*) -> u32 {
+        mut count: u32 = func.parameters.length as u32;
+        if (func.is_variadic && count > 0) {
+            const last: VarDeclNode* = func.parameters[count - 1];
+            if (last.type_annotation == null) {
+                count -= 1;
+            }
+        }
+        return count;
+    }
+
+    /// Same shape as `fixed_param_count` but typed for `IntrinsicDeclNode*`.
+    /// IntrinsicDeclNode and FunctionDeclNode both inherit from DeclarationNode
+    /// but have different field layouts, so reusing the FunctionDeclNode-typed
+    /// helper reads `is_variadic` past the end of an IntrinsicDeclNode's
+    /// allocation and segfaults when the read crosses an unmapped page.
+    static fixed_param_count_intrinsic(node: IntrinsicDeclNode*) -> u32 {
+        mut count: u32 = node.parameters.length as u32;
+        if (node.is_variadic && count > 0) {
+            const last: VarDeclNode* = node.parameters[count - 1];
+            if (last.type_annotation == null) {
+                count -= 1;
+            }
+        }
+        return count;
+    }
+
+    /// Return the name of the trailing `args...` parameter when `func` is
+    /// variadic and its last parameter is the vararg bucket (no type
+    /// annotation, so sema couldn't give it a concrete type).  Returns an
+    /// empty SymbolStr when the function has no such parameter.
+    static variadic_param_name(func: FunctionDeclNode*) -> SymbolStr {
+        if (!func.is_variadic) { return SymbolStr::empty(); }
+        const n: i64 = func.parameters.length;
+        if (n == 0) { return SymbolStr::empty(); }
+        const last: VarDeclNode* = func.parameters[n - 1];
+        if (last == null || last.type_annotation != null) {
+            return SymbolStr::empty();
+        }
+        return last.name;
+    }
+
+
+    // VTable slot identity
+
+    /// Structural equality on two param-type lists, going through the arena so
+    /// two TypeRefs that represent the same shape but happen to live under
+    /// different IDs (e.g., a `ASTVisitor*` registered while ASTVisitor was
+    /// still a forward declaration vs after the body resolved) compare equal.
+    /// Vtable slot matching needs this lenience because override methods
+    /// declared in a subclass may resolve their parameter types in a slightly
+    /// different resolution context than the virtual base they override.  IDs
+    /// that already match short-circuit; otherwise the arena canonicalizes the
+    /// types and they're compared by formatted display.
+    static param_types_equal_structural(arena: TypeArena*, intern: InternTable*,
+                                        a: &TypeRef[], b: &TypeRef[]) -> boolean {
+        if (a.length != b.length) { return false; }
+        for (mut i: i64 = 0; i < a.length; i++) {
+            if (a[i].id == b[i].id) { continue; }
+            const ta: Type* = arena.lookup(a[i].id);
+            const tb: Type* = arena.lookup(b[i].id);
+            if (ta == null || tb == null) { return false; }
+            if (ta.kind != tb.kind) { return false; }
+            // Compare by formatted display so two distinct PointerType IDs
+            // that point at the same nominal class compare equal; display
+            // names are the canonical source-level identity for these types.
+            const sa: string = arena.format_display(ta);
+            const sb: string = arena.format_display(tb);
+            if (!sa.eq(sb)) { return false; }
+        }
+        return true;
+    }
 }

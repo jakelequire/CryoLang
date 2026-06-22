@@ -163,7 +163,6 @@ type struct DeclarationEmitter {
     }
 
 
-
     // Declaration emission.  Phase-1 (forward-declare types) and Phase-2
     // (declare functions, methods, externs, globals, vtables) of the codegen
     // pipeline; called by the Codegen pass before body emission begins.
@@ -355,7 +354,7 @@ type struct DeclarationEmitter {
         // (sret on returns, byval on params), so the produced LLVM
         // signature looks like `void f(ptr sret(%T), ptr byval(%P), ...)`.
         // Phase 1/2 attribute attachment happens just below.
-        const param_count: u32 = fixed_param_count(node);
+        const param_count: u32 = CodegenUtil::fixed_param_count(node);
 
         mut fn_type:    LType         = LType::null();
         mut sret_pointee: LType       = LType::null();   // null => no sret
@@ -655,7 +654,7 @@ type struct DeclarationEmitter {
                     // while the structural lookup then matched both to one
                     // method - a duplicate slot / index skew.
                     if (slots[ki].name.equals(m.name) &&
-                        param_types_equal_structural(arena, intern,
+                        CodegenUtil::param_types_equal_structural(arena, intern,
                             slots[ki].param_types, m.param_types)) {
                         already = true;
                         break;
@@ -701,7 +700,7 @@ type struct DeclarationEmitter {
                 // and the whole vtable bails (every `new <DerivedClass>` then
                 // skips the vtable store; runtime virtual dispatch crashes
                 // reading a null vtable pointer).
-                if (!param_types_equal_structural(arena, intern, m.param_types, slot_params)) { continue; }
+                if (!CodegenUtil::param_types_equal_structural(arena, intern, m.param_types, slot_params)) { continue; }
                 if (!m.is_virtual && !m.is_override) { continue; }
                 // Skip pure virtual declarations (virtual without body).
                 // Their LLVM function is a bare `declare` that links as an
@@ -786,7 +785,7 @@ type struct DeclarationEmitter {
         const intern: InternTable* = this.get_intern();
         for (mut i: i32 = 0; i < slots.length as i32; i++) {
             if (slots[i].name.equals(method_name) &&
-                param_types_equal_structural(arena, intern,
+                CodegenUtil::param_types_equal_structural(arena, intern,
                     slots[i].param_types, param_types)) {
                 return i;
             }
@@ -1005,7 +1004,7 @@ type struct DeclarationEmitter {
         // existing param; implicit missing self is handled by prepend_implicit_this.
         // For variadic methods (`args...`), skip the trailing name-only param;
         // LLVM's `...` marker covers it.
-        const fixed_user_count: u32 = fixed_param_count(func);
+        const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func);
         mut user_param_count: u32 = 0;
         for (mut pc: u32 = 0; pc < fixed_user_count; pc++) {
             const pp: VarDeclNode* = func.parameters[pc];
@@ -1232,7 +1231,7 @@ type struct DeclarationEmitter {
         } else {
             TypeRef::invalid()
         };
-        const param_count: u32 = fixed_param_count_intrinsic(node);
+        const param_count: u32 = CodegenUtil::fixed_param_count_intrinsic(node);
         mut params: TypeRef[] = [];
         for (mut i: u32 = 0; i < param_count; i++) {
             const param: VarDeclNode* = node.parameters[i];
@@ -1270,7 +1269,7 @@ type struct DeclarationEmitter {
             if (func == null) { continue; }
 
             const name_str: string = intern.resolve(func.name);
-            const param_count: u32 = fixed_param_count(func);
+            const param_count: u32 = CodegenUtil::fixed_param_count(func);
 
             // Route the extern declaration through the Phase 1 + 2 + 3
             // extern-C seam so the LLVM function type matches the SysV
@@ -1386,13 +1385,13 @@ type struct DeclarationEmitter {
         }
         if (init_expr != null && init_expr.kind == NodeKind::Literal) {
             const lit: LiteralNode* = init_expr as LiteralNode*;
-            const tk: LTypeKind = type_kind_of(ty.raw);
+            const tk: LTypeKind = LType::kind_of(ty.raw);
             if (lit.literal_kind == LiteralKind::Integer && tk == LTypeKind::Integer) {
                 if (llvm::LLVMGetIntTypeWidth(ty.raw) == 128u32) {
                     // 128-bit global: build from the digit string so a value
                     // above u64::MAX isn't truncated by the u64 const_int path.
                     mut radix: u8 = 10u8;
-                    const digits: string = int_literal_clean(lit.value, &radix);
+                    const digits: string = CodegenUtil::int_literal_clean(lit.value, &radix);
                     init = LType::const_int_of_string(ty, digits, radix);
                 } else {
                     const ival: u64 = lit.value.parse_int<u64>();
@@ -1425,10 +1424,10 @@ type struct DeclarationEmitter {
         // Only runs when `init` is still invalid (the path that today emits
         // 0), so no currently-correct const can change.
         if (!init.is_valid() && init_expr != null) {
-            const tkf: LTypeKind = type_kind_of(ty.raw);
+            const tkf: LTypeKind = LType::kind_of(ty.raw);
             if (tkf == LTypeKind::Float || tkf == LTypeKind::Double) {
                 mut folded: f64 = 0.0;
-                if (try_fold_const_real(init_expr, &folded)) {
+                if (DeclarationEmitter::try_fold_const_real(init_expr, &folded)) {
                     init = LType::const_real(ty, folded);
                 }
             }
@@ -1590,7 +1589,7 @@ type struct DeclarationEmitter {
         const is_sret_fn: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         mut llvm_idx: u32 = if (is_sret_fn) { 1 } else { 0 } as u32;
 
-        const fixed_count: u32 = fixed_param_count(node);
+        const fixed_count: u32 = CodegenUtil::fixed_param_count(node);
         for (mut i: u32 = 0; i < fixed_count; i++) {
             const param: VarDeclNode* = node.parameters[i];
             const param_name: string = this.resolve(param.name);
@@ -1675,7 +1674,7 @@ type struct DeclarationEmitter {
         // a v* variant (vsprintf, vfprintf, etc.).  Without this the `args`
         // identifier has no LLVM value and every forwarding call codegens
         // with a null operand.
-        this.expr_ops.emit_va_start_for_variadic(fn_val, variadic_param_name(node));
+        this.expr_ops.emit_va_start_for_variadic(fn_val, CodegenUtil::variadic_param_name(node));
 
         // Program-main prologue: publish argc/argv to the standard library
         // before the user's body runs, so `std::env::args()` returns the
@@ -1685,7 +1684,7 @@ type struct DeclarationEmitter {
         // and forward them through the regular function-resolution path.
         // `intern` is already bound at the top of this function.
         const main_sym: SymbolStr = intern.intern("main");
-        if (node.name.equals(main_sym) && fixed_param_count(node) == 0) {
+        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0) {
             this.emit_set_args_call(fn_val);
         }
 
@@ -1733,7 +1732,7 @@ type struct DeclarationEmitter {
                 is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
             }
             if (is_void) {
-                this.expr_ops.emit_va_end_if_variadic(variadic_param_name(node));
+                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
                 this.builder.build_ret_void();
             }
             // Non-void: intentionally leave unterminated. The caller
@@ -1992,7 +1991,7 @@ type struct DeclarationEmitter {
         // method uses (we already handled it above).  Cap iteration at the
         // fixed-param count so a trailing `args...` bucket doesn't try to pull
         // an LLVM param that doesn't exist.
-        const fixed_count: u32 = fixed_param_count(func);
+        const fixed_count: u32 = CodegenUtil::fixed_param_count(func);
         for (mut i: u32 = 0; i < fixed_count; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -2085,59 +2084,59 @@ type struct DeclarationEmitter {
         if (!val.is_valid() || !expected.is_valid()) { return val; }
         const actual_ty: void* = llvm::LLVMTypeOf(val.raw);
         if (actual_ty == null) { return val; }
-        if (type_kind_of(actual_ty) == LTypeKind::Pointer) {
+        if (LType::kind_of(actual_ty) == LTypeKind::Pointer) {
             return this.builder.build_load(expected, val, "deref");
         }
         return val;
     }
 
-}
 
-/// Fold a float-typed const initializer expression to an `f64` constant:
-/// float/integer literals, unary `-`/`+`, and binary `+ - * /`. Returns
-/// false for anything outside that set (identifiers, calls, etc.), which the
-/// caller leaves on the zeroinitializer fallback. Mirrors sema's
-/// `try_fold_const_i64` but in `f64` (IEEE saturates, so no overflow guards).
-/// This is what makes `const F64_MIN: f64 = -1.79e308;` carry its real value
-/// instead of silently becoming 0.0.
-function try_fold_const_real(expr: ExpressionNode*, out: f64*) -> boolean {
-    if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind == NodeKind::Literal) {
-        const lit: LiteralNode* = expr as LiteralNode*;
-        if (lit.literal_kind == LiteralKind::Float) {
-            mut v: f64 = 0.0;
-            intrinsics::sscanf(lit.value, "%lf", &v);
-            *out = v;
-            return true;
+    /// Fold a float-typed const initializer expression to an `f64` constant:
+    /// float/integer literals, unary `-`/`+`, and binary `+ - * /`. Returns
+    /// false for anything outside that set (identifiers, calls, etc.), which the
+    /// caller leaves on the zeroinitializer fallback. Mirrors sema's
+    /// `try_fold_const_i64` but in `f64` (IEEE saturates, so no overflow guards).
+    /// This is what makes `const F64_MIN: f64 = -1.79e308;` carry its real value
+    /// instead of silently becoming 0.0.
+    static try_fold_const_real(expr: ExpressionNode*, out: f64*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            if (lit.literal_kind == LiteralKind::Float) {
+                mut v: f64 = 0.0;
+                intrinsics::sscanf(lit.value, "%lf", &v);
+                *out = v;
+                return true;
+            }
+            if (lit.literal_kind == LiteralKind::Integer) {
+                const iv: u64 = lit.value.parse_int<u64>();
+                *out = iv as f64;
+                return true;
+            }
+            return false;
         }
-        if (lit.literal_kind == LiteralKind::Integer) {
-            const iv: u64 = lit.value.parse_int<u64>();
-            *out = iv as f64;
-            return true;
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            mut a: f64 = 0.0;
+            if (!DeclarationEmitter::try_fold_const_real(u.operand, &a)) { return false; }
+            if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
+            if (u.op.lexeme == "+") { *out = a; return true; }
+            return false;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            mut x: f64 = 0.0;
+            mut y: f64 = 0.0;
+            if (!DeclarationEmitter::try_fold_const_real(b.left, &x)) { return false; }
+            if (!DeclarationEmitter::try_fold_const_real(b.right, &y)) { return false; }
+            const op: string = b.op.lexeme;
+            if (op == "+") { *out = x + y; return true; }
+            if (op == "-") { *out = x - y; return true; }
+            if (op == "*") { *out = x * y; return true; }
+            if (op == "/") { *out = x / y; return true; }
+            return false;
         }
         return false;
     }
-    if (node.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
-        mut a: f64 = 0.0;
-        if (!try_fold_const_real(u.operand, &a)) { return false; }
-        if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
-        if (u.op.lexeme == "+") { *out = a; return true; }
-        return false;
-    }
-    if (node.kind == NodeKind::BinaryExpression) {
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
-        mut x: f64 = 0.0;
-        mut y: f64 = 0.0;
-        if (!try_fold_const_real(b.left, &x)) { return false; }
-        if (!try_fold_const_real(b.right, &y)) { return false; }
-        const op: string = b.op.lexeme;
-        if (op == "+") { *out = x + y; return true; }
-        if (op == "-") { *out = x - y; return true; }
-        if (op == "*") { *out = x * y; return true; }
-        if (op == "/") { *out = x / y; return true; }
-        return false;
-    }
-    return false;
 }

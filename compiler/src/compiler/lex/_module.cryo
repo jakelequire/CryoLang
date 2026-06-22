@@ -869,6 +869,120 @@ implement enum TokenType {
             _             => { TokenType::Unknown }
         };
     }
+
+    /// True when this token opens a top-level declaration (used by the
+    /// lightweight module scanner to find decl boundaries without a full parse).
+    is_declaration_keyword(&this) -> boolean {
+        return match (this) {
+            TokenType::KwFunction | TokenType::KwType | TokenType::KwConst
+            | TokenType::KwStatic | TokenType::KwExtern | TokenType::KwImplement
+            | TokenType::KwPublic | TokenType::KwPrivate => { true }
+            _ => { false }
+        };
+    }
+
+    /// Binary operator precedence for this token kind (Pratt parser).
+    /// Higher number = tighter binding.  Returns 0 for non-operator tokens.
+    binary_precedence(&this) -> int {
+        return match (this) {
+            // Assignment (handled separately, but listed for completeness)
+            TokenType::Equal               => { 1 }
+            TokenType::PlusEqual           => { 1 }
+            TokenType::MinusEqual          => { 1 }
+            TokenType::StarEqual           => { 1 }
+            TokenType::SlashEqual          => { 1 }
+            TokenType::PercentEqual        => { 1 }
+            TokenType::AmpEqual            => { 1 }
+            TokenType::PipeEqual           => { 1 }
+            TokenType::CaretEqual          => { 1 }
+            TokenType::LessLessEqual       => { 1 }
+            TokenType::GreaterGreaterEqual => { 1 }
+
+            // Range expressions: strictly the lowest non-assignment precedence,
+            // below `||`, so `a + b .. c` is `(a+b)..c` and `a..b + c` is
+            // `a..(b+c)`. Previously `..` shared level 2 with `||`, which (being
+            // left-associative at equal precedence) parsed `a..b || c` as
+            // `(a..b)||c` - a latent surprise. Range operands are non-boolean in
+            // practice, so this only changes the parse of range/`||` mixes that
+            // don't occur in real code; every other operator keeps its relative
+            // order (all bumped +1), so non-range parsing is unchanged.
+            TokenType::DotDot           => { 2 }
+            TokenType::DotDotEq         => { 2 }
+
+            // Logical OR
+            TokenType::PipePipe         => { 3 }
+
+            // Logical AND
+            TokenType::AmpAmp           => { 4 }
+
+            // Bitwise OR
+            TokenType::Pipe             => { 5 }
+
+            // Bitwise XOR
+            TokenType::Caret            => { 6 }
+
+            // Bitwise AND
+            TokenType::Amp              => { 7 }
+
+            // Equality
+            TokenType::EqualEqual       => { 8 }
+            TokenType::ExclaimEqual     => { 8 }
+
+            // Relational
+            TokenType::LAngle           => { 9 }
+            TokenType::RAngle           => { 9 }
+            TokenType::LessEqual        => { 9 }
+            TokenType::GreaterEqual     => { 9 }
+            TokenType::Spaceship        => { 9 }
+
+            // Shift
+            TokenType::LessLess         => { 10 }
+            TokenType::GreaterGreater   => { 10 }
+
+            // Additive
+            TokenType::Plus             => { 11 }
+            TokenType::Minus            => { 11 }
+
+            // Multiplicative
+            TokenType::Star             => { 12 }
+            TokenType::Slash            => { 12 }
+            TokenType::Percent          => { 12 }
+
+            _                           => { 0 }
+        };
+    }
+
+    /// Disambiguates the postfix try operator `expr?` from the ternary `?`.
+    /// `parse_postfix` runs *inside* `parse_conditional`, so a greedy `?` would
+    /// swallow the ternary's `?`.  The rule: a ternary's `?` is always followed
+    /// by an expression (the true-branch); the try `?` is always followed by a
+    /// token that *cannot* begin one.  So treat the `?` as a try operator iff
+    /// this (the next token) is a terminator (`;`, `)`, `]`, `}`, `,`, EOF),
+    /// another postfix `?`/`?.`/`??`, an `as` cast, a pipe, or a binary/assignment
+    /// operator, but NOT an operator that can also start a unary expression
+    /// (`-`, `*`, `&`), since `cond ? -x : y` must stay a ternary.
+    question_terminates(&this) -> boolean {
+        return match (this) {
+            TokenType::Semicolon        => { true }
+            TokenType::RParen           => { true }
+            TokenType::RBrace           => { true }
+            TokenType::RSquare          => { true }
+            TokenType::Comma            => { true }
+            TokenType::EOF              => { true }
+            TokenType::Question         => { true }
+            TokenType::QuestionQuestion => { true }
+            TokenType::QuestionDot      => { true }
+            TokenType::KwAs             => { true }
+            TokenType::PipeGreater      => { true }
+            TokenType::LessPipe         => { true }
+            _ => {
+                // Binary/assignment operators terminate the try operand, but
+                // exclude unary-prefix-capable ones (`-`, `*`, `&`); those
+                // can start a ternary true-branch.
+                this.binary_precedence() > 0 && !this.is_unary_prefix_op()
+            }
+        };
+    }
 }
 type struct SourceLocation {
 public:

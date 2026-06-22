@@ -67,189 +67,14 @@ type struct ModuleEntry {
 
 // FNV-1a folding helpers
 
-/// Fold a single byte into a running FNV-1a state, via the canonical
-/// `core::hash` FNV-1a so the offset basis + prime live in one place.
-function fnv_byte(state: u64, b: u8) -> u64 {
-    mut h: DefaultHasher = DefaultHasher::from_state(state);
-    h.write_u8(b);
-    return h.finish();
-}
-
-/// Fold a NUL-terminated string's bytes into the state, plus a separator so
-/// adjacent concatenations can't collide ("ab"+"c" vs "a"+"bc").
-function fnv_str(state: u64, s: string) -> u64 {
-    mut h: u64 = state;
-    const len: u64 = libc::strlen(s);
-    const b: i8* = s as i8*;
-    for (mut i: u64 = 0; i < len; i++) {
-        h = fnv_byte(h, b[i] as u8);
-    }
-    return fnv_byte(h, 0);
-}
-
-/// Fold a u64 (8 bytes, low byte first) into the state.
-function fnv_u64(state: u64, v: u64) -> u64 {
-    mut h: u64 = state;
-    mut x: u64 = v;
-    for (mut i: u64 = 0; i < 8; i++) {
-        h = fnv_byte(h, (x & 255) as u8);
-        x = x >> 8;
-    }
-    return h;
-}
-
-/// Fold a file's full byte content (NULs included) into the state. A
-/// missing or unreadable file folds a distinct marker so it still perturbs
-/// the fingerprint. The byte count is mixed in last as a length guard.
-function fnv_file(state: u64, path: string) -> u64 {
-    mut h: u64 = state;
-    if (!metadata::exists(Path::from_cstr(path))) {
-        return fnv_str(h, "<missing>");
-    }
-    match (file::read(Path::from_cstr(path))) {
-        Result::Ok(data) => {
-            mut bytes: Array<u8> = data;
-            const n: u64 = bytes.length();
-            const d: u8* = bytes.as_ptr();
-            for (mut i: u64 = 0; i < n; i++) {
-                h = fnv_byte(h, d[i]);
-            }
-            bytes.drop();
-            return fnv_u64(h, n);
-        }
-        Result::Err(_) => {
-            return fnv_str(h, "<unreadable>");
-        }
-    }
-}
-
 
 // Compiler self-fingerprint
-
-/// Path to the running compiler binary, or "" on failure. Delegates to
-/// `std::env::current_exe` (which handles `/proc/self/exe` on Unix and
-/// `GetModuleFileNameA` on Windows) instead of reimplementing readlink.
-function self_exe_path() -> string {
-    match (env::current_exe()) {
-        Option::Some(s) => { return s.into_raw(); }
-        Option::None    => { return ""; }
-    }
-}
-
-/// FNV-1a digest of the running compiler's own bytes. Changes whenever the
-/// compiler changes, invalidating every cached build it produced.
-function compiler_fingerprint() -> u64 {
-    const exe: string = self_exe_path();
-    mut h: u64 = DefaultHasher::offset_basis();
-    if (libc::strlen(exe) == 0) {
-        return fnv_str(h, "<unknown-compiler>");
-    }
-    return fnv_file(h, exe);
-}
 
 
 // Per-module cache key components
 
-/// The FNV-1a seed, exposed so the orchestrator can fold module keys with
-/// the same hash family used everywhere else in this module.
-function fnv_seed() -> u64 {
-    return DefaultHasher::offset_basis();
-}
-
-/// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
-/// the per-module folding `Manifest::compute_fingerprint` does (namespace +
-/// output subtree + full file bytes). Used as the atom of every per-module
-/// cache key; folding `origin_subdir` means relocating a module between
-/// packages (which changes where its `.o` lands) invalidates its key.
-function module_source_hash(namespace_name: string, origin_subdir: string,
-                            source_path: string) -> u64 {
-    mut h: u64 = DefaultHasher::offset_basis();
-    h = fnv_str(h, namespace_name);
-    h = fnv_str(h, origin_subdir);
-    h = fnv_file(h, source_path);
-    return h;
-}
-
-/// FNV-1a digest of the toolchain inputs that affect EVERY object file: the
-/// compiler's own bytes plus the resolved codegen knobs. Deliberately
-/// excludes the source modules, the stdlib archive, and the `[link]` lists —
-/// those are folded per-module (sources) or only affect the final link
-/// (archive / link lists), not an individual `.o`. Every per-module key
-/// folds this, so a changed compiler or a `--dev`/`--release` switch
-/// invalidates the whole per-module cache.
-function toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
-                               debug_info: boolean) -> u64 {
-    mut h: u64 = DefaultHasher::offset_basis();
-    h = fnv_u64(h, compiler_fingerprint());
-    h = fnv_u64(h, opt_level as u64);
-    const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
-    const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
-    const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
-    h = fnv_byte(h, dbg_b);
-    h = fnv_byte(h, ell_b);
-    h = fnv_byte(h, nstd_b);
-    h = fnv_str(h, cfg.target_triple);
-    h = fnv_str(h, cfg.profile);
-    return h;
-}
-
 
 // Hex / string helpers
-
-
-/// Read a file's content with trailing whitespace/newlines stripped, or ""
-/// when the file is absent or unreadable.
-function read_file_trimmed(path: string) -> string {
-    mut raw: string = "";
-    match (file::read_to_string(Path::from_cstr(path))) {
-        Result::Ok(s)  => { raw = s.into_raw(); }
-        Result::Err(_) => { return ""; }
-    }
-    mut len: i64 = libc::strlen(raw) as i64;
-    while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
-                       || raw[len - 1] == 32 || raw[len - 1] == 9)) {
-        len -= 1;
-    }
-    if (len <= 0) { return ""; }
-    const out: i8* = intrinsics::malloc(len as u64 + 1) as i8*;
-    intrinsics::memcpy(out as void*, raw as void*, len as u64);
-    out[len] = 0;
-    return out as string;
-}
-
-/// Mangle a namespace to its object-file stem (`::` -> `_`), matching
-/// `CodegenPasses::legacy_obj_path`.
-function mangle_module(ns: string) -> string {
-    const len: u64 = libc::strlen(ns);
-    const buf: i8* = intrinsics::malloc(len + 1) as i8*;
-    intrinsics::memcpy(buf as void*, ns as void*, len);
-    buf[len] = 0;
-    for (mut i: u64 = 0; i < len; i++) {
-        if (buf[i] == ':') { buf[i] = '_'; }
-    }
-    return buf as string;
-}
-
-/// File size in bytes via `fseek`/`ftell`, without reading the contents.
-/// Returns -1 when the file can't be opened.
-function file_size_bytes(path: string) -> i64 {
-    const h: void* = libc::fopen(path, "rb");
-    if (h == null) { return -1 as i64; }
-    libc::fseek(h, 0 as i64, 2);   // SEEK_END
-    const n: i64 = libc::ftell(h);
-    libc::fclose(h);
-    return n;
-}
-
-/// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
-function modkeys_slice(data: i8*, start: u64, len: u64) -> string {
-    const out: i8* = intrinsics::malloc(len + 1) as i8*;
-    if (len > 0) {
-        intrinsics::memcpy(out as void*, intrinsics::ptr_add(data as void*, start) as void*, len);
-    }
-    out[len] = 0;
-    return out as string;
-}
 
 
 // Per-module key sidecar (*.modkeys): `namespace<TAB>keyhex` per line
@@ -273,66 +98,76 @@ type struct ModuleKeyTable {
         }
         return "";
     }
-}
 
-/// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
-/// unreadable file yields an empty table (every module then rebuilds, which
-/// is the safe default). Lines without a TAB separator are skipped.
-///
-/// Kept a free function (not a `ModuleKeyTable` static): a static method here
-/// resolves through the leaf-name dispatcher, where `read`/`write` collide
-/// with the same-arity `read`/`write` intrinsics and a reference-array static
-/// fails codegen resolution outright (E0636). The distinctly-named free
-/// function sidesteps both.
-function read_module_keys(path: string) -> ModuleKeyTable {
-    mut t: ModuleKeyTable = ModuleKeyTable::empty();
-    if (!metadata::exists(Path::from_cstr(path))) { return t; }
-    mut content: string = "";
-    match (file::read_to_string(Path::from_cstr(path))) {
-        Result::Ok(s)  => { content = s.into_raw(); }
-        Result::Err(_) => { return t; }
-    }
-    const data: i8* = content as i8*;
-    const n: u64 = libc::strlen(content) as u64;
-    mut i: u64 = 0;
-    while (i < n) {
-        const name_start: u64 = i;
-        while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
-        mut name: string = "";
-        mut keyh: string = "";
-        if (i < n && data[i] == 9) {
-            name = modkeys_slice(data, name_start, i - name_start);
-            i = i + 1;                       // skip TAB
-            const key_start: u64 = i;
-            while (i < n && data[i] != 10) { i = i + 1; }
-            keyh = modkeys_slice(data, key_start, i - key_start);
-        } else {
-            // No TAB before end-of-line: skip the rest of this line.
-            while (i < n && data[i] != 10) { i = i + 1; }
+    /// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
+    static modkeys_slice(data: i8*, start: u64, len: u64) -> string {
+        const out: i8* = intrinsics::malloc(len + 1) as i8*;
+        if (len > 0) {
+            intrinsics::memcpy(out as void*, intrinsics::ptr_add(data as void*, start) as void*, len);
         }
-        if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
-        if (libc::strlen(name) > 0 && libc::strlen(keyh) > 0) {
-            t.names.push(name);
-            t.keys.push(keyh);
-        }
+        out[len] = 0;
+        return out as string;
     }
-    return t;
-}
 
-/// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The caller
-/// must have created the incremental dir (e.g. via `Manifest::write_fingerprint`,
-/// which always runs alongside this on the success path).
-function write_module_keys(path: string, names: &string[],
-                           keys: &string[]) -> void {
-    const f: void* = libc::fopen(path, "w");
-    if (f == null) {
-        fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
-        return;
+    /// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
+    /// unreadable file yields an empty table (every module then rebuilds, which
+    /// is the safe default). Lines without a TAB separator are skipped.
+    ///
+    /// Kept a free function (not a `ModuleKeyTable` static): a static method here
+    /// resolves through the leaf-name dispatcher, where `read`/`write` collide
+    /// with the same-arity `read`/`write` intrinsics and a reference-array static
+    /// fails codegen resolution outright (E0636). The distinctly-named free
+    /// function sidesteps both.
+    static read_module_keys(path: string) -> ModuleKeyTable {
+        mut t: ModuleKeyTable = ModuleKeyTable::empty();
+        if (!metadata::exists(Path::from_cstr(path))) { return t; }
+        mut content: string = "";
+        match (file::read_to_string(Path::from_cstr(path))) {
+            Result::Ok(s)  => { content = s.into_raw(); }
+            Result::Err(_) => { return t; }
+        }
+        const data: i8* = content as i8*;
+        const n: u64 = libc::strlen(content) as u64;
+        mut i: u64 = 0;
+        while (i < n) {
+            const name_start: u64 = i;
+            while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
+            mut name: string = "";
+            mut keyh: string = "";
+            if (i < n && data[i] == 9) {
+                name = ModuleKeyTable::modkeys_slice(data, name_start, i - name_start);
+                i = i + 1;                       // skip TAB
+                const key_start: u64 = i;
+                while (i < n && data[i] != 10) { i = i + 1; }
+                keyh = ModuleKeyTable::modkeys_slice(data, key_start, i - key_start);
+            } else {
+                // No TAB before end-of-line: skip the rest of this line.
+                while (i < n && data[i] != 10) { i = i + 1; }
+            }
+            if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
+            if (libc::strlen(name) > 0 && libc::strlen(keyh) > 0) {
+                t.names.push(name);
+                t.keys.push(keyh);
+            }
+        }
+        return t;
     }
-    for (mut i: i64 = 0; i < names.length; i++) {
-        intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
+
+    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The caller
+    /// must have created the incremental dir (e.g. via `Manifest::write_fingerprint`,
+    /// which always runs alongside this on the success path).
+    static write_module_keys(path: string, names: &string[],
+                               keys: &string[]) -> void {
+        const f: void* = libc::fopen(path, "w");
+        if (f == null) {
+            fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
+            return;
+        }
+        for (mut i: i64 = 0; i < names.length; i++) {
+            intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
+        }
+        libc::fclose(f);
     }
-    libc::fclose(f);
 }
 
 
@@ -364,33 +199,33 @@ type struct Manifest {
     /// Combined fingerprint over every build input.
     compute_fingerprint(&this, modules: &ModuleEntry[]) -> u64 {
         mut h: u64 = DefaultHasher::offset_basis();
-        h = fnv_u64(h, compiler_fingerprint());
+        h = Manifest::fnv_u64(h, Manifest::compiler_fingerprint());
         // Resolved knobs.
-        h = fnv_u64(h, this.opt_level as u64);
+        h = Manifest::fnv_u64(h, this.opt_level as u64);
         const dbg_b:  u8 = if (this.debug_info)    { 1 } else { 0 };
         const ell_b:  u8 = if (this.cfg.emit_llvm) { 1 } else { 0 };
         const nstd_b: u8 = if (this.cfg.no_std)    { 1 } else { 0 };
-        h = fnv_byte(h, dbg_b);
-        h = fnv_byte(h, ell_b);
-        h = fnv_byte(h, nstd_b);
-        h = fnv_str(h, this.cfg.target_triple);
-        h = fnv_str(h, this.cfg.profile);
+        h = Manifest::fnv_byte(h, dbg_b);
+        h = Manifest::fnv_byte(h, ell_b);
+        h = Manifest::fnv_byte(h, nstd_b);
+        h = Manifest::fnv_str(h, this.cfg.target_triple);
+        h = Manifest::fnv_str(h, this.cfg.profile);
         // [link] lists affect the final binary but not the .o files.
-        for (mut i: i64 = 0; i < this.cfg.link_system.length; i++) { h = fnv_str(h, this.cfg.link_system[i]); }
-        for (mut i: i64 = 0; i < this.cfg.link_search.length; i++) { h = fnv_str(h, this.cfg.link_search[i]); }
-        for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h = fnv_str(h, this.cfg.link_static[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_system.length; i++) { h = Manifest::fnv_str(h, this.cfg.link_system[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_search.length; i++) { h = Manifest::fnv_str(h, this.cfg.link_search[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h = Manifest::fnv_str(h, this.cfg.link_static[i]); }
         // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
         if (libc::strlen(this.stdlib_archive) > 0) {
-            h = fnv_file(h, this.stdlib_archive);
+            h = Manifest::fnv_file(h, this.stdlib_archive);
         }
         // Every source module, in topo order: namespace + origin (output
         // location) + full content.  Folding origin_subdir means moving a
         // module between packages (which changes where its .o lands)
         // invalidates the cache even when its source bytes are unchanged.
         for (mut i: i64 = 0; i < modules.length; i++) {
-            h = fnv_str(h, modules[i].namespace_name);
-            h = fnv_str(h, modules[i].origin_subdir);
-            h = fnv_file(h, modules[i].source_path);
+            h = Manifest::fnv_str(h, modules[i].namespace_name);
+            h = Manifest::fnv_str(h, modules[i].origin_subdir);
+            h = Manifest::fnv_file(h, modules[i].source_path);
         }
         return h;
     }
@@ -399,7 +234,7 @@ type struct Manifest {
     /// still exists on disk. A missing sidecar or any missing artifact forces
     /// a build.
     is_up_to_date(&this, fp_hex: string, artifacts: &string[]) -> boolean {
-        const saved: string = read_file_trimmed(this.cfg.fingerprint_path());
+        const saved: string = Manifest::read_file_trimmed(this.cfg.fingerprint_path());
         if (libc::strlen(saved) == 0) { return false; }
         if (!saved.eq(fp_hex)) { return false; }
         for (mut i: i64 = 0; i < artifacts.length; i++) {
@@ -434,7 +269,7 @@ type struct Manifest {
             return;
         }
 
-        const cfp: u64 = compiler_fingerprint();
+        const cfp: u64 = Manifest::compiler_fingerprint();
         const compiler_fp: string = cfp.to_hex_padded_str(16);
 
         mut root: JsonObject = JsonObject::new();
@@ -467,8 +302,8 @@ type struct Manifest {
         for (mut i: i64 = 0; i < modules.length; i++) {
             const obj: string = format("%s/%s.o",
                 this.cfg.deps_dir_for(modules[i].origin_subdir),
-                mangle_module(modules[i].namespace_name));
-            const obj_size: i64 = file_size_bytes(obj);
+                Manifest::mangle_module(modules[i].namespace_name));
+            const obj_size: i64 = Manifest::file_size_bytes(obj);
             mut m: JsonObject = JsonObject::new();
             m.put("namespace",   JsonValue::from_cstr(modules[i].namespace_name));
             m.put("source",      JsonValue::from_cstr(modules[i].source_path));
@@ -490,5 +325,169 @@ type struct Manifest {
         libc::fputs("\n", f);
         text.drop();
         libc::fclose(f);
+    }
+
+    /// Fold a single byte into a running FNV-1a state, via the canonical
+    /// `core::hash` FNV-1a so the offset basis + prime live in one place.
+    static fnv_byte(state: u64, b: u8) -> u64 {
+        mut h: DefaultHasher = DefaultHasher::from_state(state);
+        h.write_u8(b);
+        return h.finish();
+    }
+
+    /// Fold a NUL-terminated string's bytes into the state, plus a separator so
+    /// adjacent concatenations can't collide ("ab"+"c" vs "a"+"bc").
+    static fnv_str(state: u64, s: string) -> u64 {
+        mut h: u64 = state;
+        const len: u64 = libc::strlen(s);
+        const b: i8* = s as i8*;
+        for (mut i: u64 = 0; i < len; i++) {
+            h = Manifest::fnv_byte(h, b[i] as u8);
+        }
+        return Manifest::fnv_byte(h, 0);
+    }
+
+    /// Fold a u64 (8 bytes, low byte first) into the state.
+    static fnv_u64(state: u64, v: u64) -> u64 {
+        mut h: u64 = state;
+        mut x: u64 = v;
+        for (mut i: u64 = 0; i < 8; i++) {
+            h = Manifest::fnv_byte(h, (x & 255) as u8);
+            x = x >> 8;
+        }
+        return h;
+    }
+
+    /// Fold a file's full byte content (NULs included) into the state. A
+    /// missing or unreadable file folds a distinct marker so it still perturbs
+    /// the fingerprint. The byte count is mixed in last as a length guard.
+    static fnv_file(state: u64, path: string) -> u64 {
+        mut h: u64 = state;
+        if (!metadata::exists(Path::from_cstr(path))) {
+            return Manifest::fnv_str(h, "<missing>");
+        }
+        match (file::read(Path::from_cstr(path))) {
+            Result::Ok(data) => {
+                mut bytes: Array<u8> = data;
+                const n: u64 = bytes.length();
+                const d: u8* = bytes.as_ptr();
+                for (mut i: u64 = 0; i < n; i++) {
+                    h = Manifest::fnv_byte(h, d[i]);
+                }
+                bytes.drop();
+                return Manifest::fnv_u64(h, n);
+            }
+            Result::Err(_) => {
+                return Manifest::fnv_str(h, "<unreadable>");
+            }
+        }
+    }
+
+    /// Path to the running compiler binary, or "" on failure. Delegates to
+    /// `std::env::current_exe` (which handles `/proc/self/exe` on Unix and
+    /// `GetModuleFileNameA` on Windows) instead of reimplementing readlink.
+    static self_exe_path() -> string {
+        match (env::current_exe()) {
+            Option::Some(s) => { return s.into_raw(); }
+            Option::None    => { return ""; }
+        }
+    }
+
+    /// FNV-1a digest of the running compiler's own bytes. Changes whenever the
+    /// compiler changes, invalidating every cached build it produced.
+    static compiler_fingerprint() -> u64 {
+        const exe: string = Manifest::self_exe_path();
+        mut h: u64 = DefaultHasher::offset_basis();
+        if (libc::strlen(exe) == 0) {
+            return Manifest::fnv_str(h, "<unknown-compiler>");
+        }
+        return Manifest::fnv_file(h, exe);
+    }
+
+    /// The FNV-1a seed, exposed so the orchestrator can fold module keys with
+    /// the same hash family used everywhere else in this module.
+    static fnv_seed() -> u64 {
+        return DefaultHasher::offset_basis();
+    }
+
+    /// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
+    /// the per-module folding `Manifest::compute_fingerprint` does (namespace +
+    /// output subtree + full file bytes). Used as the atom of every per-module
+    /// cache key; folding `origin_subdir` means relocating a module between
+    /// packages (which changes where its `.o` lands) invalidates its key.
+    static module_source_hash(namespace_name: string, origin_subdir: string,
+                                source_path: string) -> u64 {
+        mut h: u64 = DefaultHasher::offset_basis();
+        h = Manifest::fnv_str(h, namespace_name);
+        h = Manifest::fnv_str(h, origin_subdir);
+        h = Manifest::fnv_file(h, source_path);
+        return h;
+    }
+
+    /// FNV-1a digest of the toolchain inputs that affect EVERY object file: the
+    /// compiler's own bytes plus the resolved codegen knobs. Deliberately
+    /// excludes the source modules, the stdlib archive, and the `[link]` lists —
+    /// those are folded per-module (sources) or only affect the final link
+    /// (archive / link lists), not an individual `.o`. Every per-module key
+    /// folds this, so a changed compiler or a `--dev`/`--release` switch
+    /// invalidates the whole per-module cache.
+    static toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
+                                   debug_info: boolean) -> u64 {
+        mut h: u64 = DefaultHasher::offset_basis();
+        h = Manifest::fnv_u64(h, Manifest::compiler_fingerprint());
+        h = Manifest::fnv_u64(h, opt_level as u64);
+        const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
+        const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
+        const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
+        h = Manifest::fnv_byte(h, dbg_b);
+        h = Manifest::fnv_byte(h, ell_b);
+        h = Manifest::fnv_byte(h, nstd_b);
+        h = Manifest::fnv_str(h, cfg.target_triple);
+        h = Manifest::fnv_str(h, cfg.profile);
+        return h;
+    }
+
+    /// Read a file's content with trailing whitespace/newlines stripped, or ""
+    /// when the file is absent or unreadable.
+    static read_file_trimmed(path: string) -> string {
+        mut raw: string = "";
+        match (file::read_to_string(Path::from_cstr(path))) {
+            Result::Ok(s)  => { raw = s.into_raw(); }
+            Result::Err(_) => { return ""; }
+        }
+        mut len: i64 = libc::strlen(raw) as i64;
+        while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
+                           || raw[len - 1] == 32 || raw[len - 1] == 9)) {
+            len -= 1;
+        }
+        if (len <= 0) { return ""; }
+        const out: i8* = intrinsics::malloc(len as u64 + 1) as i8*;
+        intrinsics::memcpy(out as void*, raw as void*, len as u64);
+        out[len] = 0;
+        return out as string;
+    }
+
+    /// Mangle a namespace to its object-file stem (`::` -> `_`), matching
+    /// `CodegenPasses::legacy_obj_path`.
+    static mangle_module(ns: string) -> string {
+        const len: u64 = libc::strlen(ns);
+        const buf: i8* = intrinsics::malloc(len + 1) as i8*;
+        intrinsics::memcpy(buf as void*, ns as void*, len);
+        buf[len] = 0;
+        for (mut i: u64 = 0; i < len; i++) {
+            if (buf[i] == ':') { buf[i] = '_'; }
+        }
+        return buf as string;
+    }
+
+    /// File size in bytes via `fseek`/`ftell`, without reading the contents.
+    /// Returns -1 when the file can't be opened.
+    static file_size_bytes(path: string) -> i64 {
+        const h: void* = libc::fopen(path, "rb");
+        if (h == null) { return -1 as i64; }
+        libc::fseek(h, 0 as i64, 2);   // SEEK_END
+        const n: i64 = libc::ftell(h);
+        libc::fclose(h);
+        return n;
     }
 }
