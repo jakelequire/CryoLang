@@ -324,6 +324,16 @@ type struct CallResolver {
                 param_types = this.lookup_scope_variant_payload_types(call.callee as ScopeResolutionNode*);
             }
         }
+        // For an EXPLICIT generic free call (`passthru<i32>(...)`), the param
+        // types above came from the template fn type and still carry the
+        // template's generic params (e.g. `Option<Option<T>>`).  Substitute the
+        // call's explicit type args into them so the expected-type pushed onto
+        // each argument is CONCRETE.  Otherwise an enum/array constructor arg
+        // would adopt the unbound `T` verbatim, producing a size-0 unresolved
+        // argument value that miscompiles (DirectPair `hi` becomes a null
+        // operand at codegen).
+        param_types = this.substitute_explicit_generic_param_types(call, &param_types);
+
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             mut push_expected: boolean = false;
@@ -691,6 +701,50 @@ type struct CallResolver {
             call.set_resolved_type_args(stash);
         }
         return this.subst_free_call_return(entry, &bindings, tmpl.resolved_return_type);
+    }
+
+    /// When `call` is an EXPLICIT generic free call (`f<i32>(...)` on a bare
+    /// identifier), substitute the explicit type args into `param_types` in
+    /// place so expected-type propagation pushes concrete argument types.
+    /// No-op when the callee isn't an identifier, has no explicit generic args,
+    /// names no function template, or any binding fails to resolve.
+    substitute_explicit_generic_param_types(mut &this, call: CallExprNode*,
+                                            param_types: &TypeRef[]) -> TypeRef[] {
+        mut out: TypeRef[] = sema_copy_type_refs(param_types);
+        if (out.length == 0) { return out; }
+        if (call.generic_args.length == 0) { return out; }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind != NodeKind::Identifier) { return out; }
+        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+        const entry: TemplateEntry* = this.find_fn_template_for_call(
+            ident.name, call.arguments.length);
+        if (entry == null || entry.param_type_ids.length == 0) { return out; }
+
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { bindings.push(TypeRef::invalid()); }
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&rc);
+        mut n: i64 = call.generic_args.length;
+        if (n > bindings.length) { n = bindings.length; }
+        for (mut i: i64 = 0; i < n; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(call.generic_args[i], &rc);
+            if (tr.is_valid()) { bindings[i] = tr; }
+        }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return out; }
+        }
+
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(entry.param_type_ids, bindings);
+        for (mut pi: i64 = 0; pi < out.length; pi++) {
+            if (!out[pi].is_valid()) { continue; }
+            if (!this.types.contains_generic_param(out[pi])) { continue; }
+            const sub: TypeRef = subst.apply(out[pi], this.arena);
+            if (sub.is_valid() && !this.types.contains_generic_param(sub)) {
+                out[pi] = sub;
+            }
+        }
+        return out;
     }
 
     /// Substitute a generic free function's inferred/explicit type args into its
