@@ -83,6 +83,31 @@ DLL="${PREFIX}/bin/LLVM-C.dll"
 MINGW_CLANG="${MINGW_PREFIX}/bin/clang.exe"
 MINGW_AR="${MINGW_PREFIX}/bin/llvm-ar.exe"
 
+# Verify a downloaded artifact against its pinned SHA-256 (the GitHub asset
+# digest, recorded in llvm-version.env). A mismatch aborts BEFORE the bytes
+# are extracted or used, so a corrupted download, a man-in-the-middle, or a
+# silently re-tagged/substituted upstream release never enters the cross
+# toolchain. An empty pin is a hard error, not a skip.
+verify_sha256() {
+    local file="$1" expected="$2" label="$3"
+    if [[ -z "$expected" ]]; then
+        echo "error: no pinned SHA-256 for '${label}' (set it in scripts/llvm-version.env)" >&2
+        exit 1
+    fi
+    command -v sha256sum >/dev/null 2>&1 || {
+        echo "error: missing required tool 'sha256sum'" >&2; exit 1; }
+    local actual
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "error: checksum mismatch for '${label}'" >&2
+        echo "  expected sha256: ${expected}" >&2
+        echo "  actual   sha256: ${actual}" >&2
+        echo "  refusing to use a download that does not match the pinned digest." >&2
+        exit 1
+    fi
+    echo "[fetch-windows-llvm] verified ${label} (sha256 ok)"
+}
+
 # ---------------------------------------------------------------------------
 # Part 1: LLVM-C.dll + synthesized mingw import lib (.toolchains/llvm-win)
 # ---------------------------------------------------------------------------
@@ -99,6 +124,7 @@ else
 
     echo "[fetch-windows-llvm] downloading ${ASSET} (~896 MB)…"
     curl -L --fail --progress-bar -o "${work}/llvm.tar.xz" "$URL"
+    verify_sha256 "${work}/llvm.tar.xz" "${LLVM_WIN_SHA256:-}" "${ASSET}"
 
     echo "[fetch-windows-llvm] extracting LLVM-C.dll…"
     base="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc"
@@ -132,6 +158,7 @@ else
 
     echo "[fetch-windows-llvm] downloading ${MINGW_ASSET} (~180 MB)…"
     curl -L --fail --progress-bar -o "${mwork}/llvm-mingw.zip" "$MINGW_URL"
+    verify_sha256 "${mwork}/llvm-mingw.zip" "${LLVM_MINGW_SHA256:-}" "${MINGW_ASSET}"
 
     echo "[fetch-windows-llvm] extracting llvm-mingw toolchain…"
     unzip -q -o "${mwork}/llvm-mingw.zip" -d "$mwork"
