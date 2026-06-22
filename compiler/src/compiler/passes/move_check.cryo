@@ -262,6 +262,30 @@ type struct MoveChecker {
         }
     }
 
+    /// Fully reinstate the moved-set from an explicit (key, span, real)
+    /// snapshot, element-wise (no owning buffer is aliased). Unlike
+    /// `restore_moves` - a truncate-only length rewind - this restores a
+    /// snapshot even after `unmark_moved` DELETED an entry that lived below
+    /// the old checkpoint. That is required at a branch join: an in-branch
+    /// assignment (`x = ...`) revives `x` by rebuilding the moved-set without
+    /// it, so a length rewind cannot put a pre-branch move back, and a
+    /// one-branch revival would otherwise erase a move on every path
+    /// (an accepted use-after-move -> double free).
+    restore_full(mut &this, keys: &u32[], spans: &SourceSpan[],
+                 real: &boolean[]) -> void {
+        mut nk: u32[]        = [];
+        mut ns: SourceSpan[] = [];
+        mut nr: boolean[]    = [];
+        for (mut i: i64 = 0; i < keys.length; i++) {
+            nk.push(keys[i]);
+            ns.push(spans[i]);
+            nr.push(real[i]);
+        }
+        this.moved_keys  = nk;
+        this.moved_spans = ns;
+        this.moved_real  = nr;
+    }
+
     /// Conservative "does every path through `stmt` leave via return / break /
     /// continue" check, used by merge_branches to decide whether a branch's
     /// moves reach the post-branch join. A diverging branch never falls
@@ -332,7 +356,24 @@ type struct MoveChecker {
     /// branch: it is skipped, contributing nothing to the union, which
     /// leaves a one-sided move correctly *possibly*-moved.
     merge_branches(mut &this, bodies: StatementNode*[]) -> void {
-        const snap: i64 = this.snapshot_moves();
+        // Full pre-branch snapshot (element-wise copy). A length checkpoint
+        // alone is unsound here: an in-branch assignment (`x = ...`) calls
+        // `unmark_moved`, which REBUILDS the moved-set without `x`, deleting
+        // an entry that may sit BELOW the checkpoint. `restore_moves` only
+        // truncates, so it cannot reinstate it - a revival on ONE branch
+        // would erase a pre-branch move on EVERY path (an accepted
+        // use-after-move -> double free). We snapshot the whole set and
+        // restore it in full between branches (see `restore_full`).
+        mut pre_keys:  u32[]        = [];
+        mut pre_spans: SourceSpan[] = [];
+        mut pre_real:  boolean[]    = [];
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            pre_keys.push(this.moved_keys[i]);
+            pre_spans.push(this.moved_spans[i]);
+            pre_real.push(this.moved_real[i]);
+        }
+        const pre_len: i64 = pre_keys.length;
+
         // Branches are separate scopes. A binding DECLARED inside a branch
         // (e.g. `Ok(handle) => { mut f = handle; ... }`) is dead at the join,
         // so its move must NOT propagate - otherwise a sibling arm that
@@ -341,19 +382,51 @@ type struct MoveChecker {
         // the walk) and exclude branch-locals from the union, mirroring how
         // walk_loop_body excludes body-locals from the carried set.
         const prev_capture: boolean = this.capture_decls;
+
+        // Post-join moved-set = union, over every fall-through path, of THAT
+        // path's END moved-set. A binding is Moved after the join iff SOME
+        // fall-through path leaves it moved; if EVERY path revives (reassigns)
+        // it, it is Live again. This is a meet over paths, which is why we
+        // iterate each branch's FULL end-set (not just moves added past a
+        // checkpoint): a pre-branch move a branch did NOT revive is still in
+        // its end-set and must survive, while one that ALL branches revived
+        // appears in no end-set and is correctly dropped.
         mut u_keys:  u32[]        = [];
         mut u_spans: SourceSpan[] = [];
         mut u_real:  boolean[]    = [];
         for (mut i: i64 = 0; i < bodies.length; i++) {
             const body: StatementNode* = bodies[i];
-            if (body == null) { continue; }
+            if (body == null) {
+                // Implicit fall-through path (a missing `else`): it moves and
+                // revives nothing, so its end-set IS the pre-branch set.
+                // Contributing it keeps a one-sided move *possibly* moved and
+                // prevents a sibling branch's revival from leaking past the join.
+                for (mut j: i64 = 0; j < pre_len; j++) {
+                    const k: u32 = pre_keys[j];
+                    const real: boolean = pre_real[j];
+                    mut found: boolean = false;
+                    for (mut u: i64 = 0; u < u_keys.length; u++) {
+                        if (u_keys[u] == k) {
+                            if (real) { u_real[u] = true; }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        u_keys.push(k);
+                        u_spans.push(pre_spans[j]);
+                        u_real.push(real);
+                    }
+                }
+                continue;
+            }
             const branch_cap_start: i64 = this.captured_decl_keys.length;
             this.capture_decls = true;
             this.walk_stmt(body);
             this.capture_decls = prev_capture;
             // Only branches that can fall through contribute moves to the join.
             if (!this.always_diverges(body)) {
-                for (mut j: i64 = snap; j < this.moved_keys.length; j++) {
+                for (mut j: i64 = 0; j < this.moved_keys.length; j++) {
                     const k:    u32     = this.moved_keys[j];
                     // Declared in this branch -> dead at the join, skip.
                     if (this.is_body_local(k, branch_cap_start)) { continue; }
@@ -374,7 +447,9 @@ type struct MoveChecker {
                     }
                 }
             }
-            this.restore_moves(snap);
+            // Restore the FULL pre-branch state for the next branch (a plain
+            // truncate cannot undo an in-branch revival).
+            this.restore_full(pre_keys, pre_spans, pre_real);
             // Outside a loop-discovery walk, the captured branch-locals are
             // only needed for the exclusion above - drop them so the stack
             // doesn't grow. Inside one (prev_capture true), leave them: they
@@ -382,6 +457,9 @@ type struct MoveChecker {
             if (!prev_capture) { this.truncate_captured(branch_cap_start); }
         }
         // Apply the merged moves as the post-join state.
+        this.moved_keys  = [];
+        this.moved_spans = [];
+        this.moved_real  = [];
         for (mut i: i64 = 0; i < u_keys.length; i++) {
             this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
         }
@@ -656,7 +734,18 @@ type struct MoveChecker {
     /// which the union models correctly (a one-sided move stays *possibly*
     /// moved and is conservatively treated as Moved).
     merge_switch_cases(mut &this, cases: &CaseStmtNode*[]) -> void {
-        const snap: i64 = this.snapshot_moves();
+        // Full pre-switch snapshot (see `merge_branches` for why a length
+        // checkpoint is unsound when a case revives a pre-switch move).
+        mut pre_keys:  u32[]        = [];
+        mut pre_spans: SourceSpan[] = [];
+        mut pre_real:  boolean[]    = [];
+        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
+            pre_keys.push(this.moved_keys[i]);
+            pre_spans.push(this.moved_spans[i]);
+            pre_real.push(this.moved_real[i]);
+        }
+        const pre_len: i64 = pre_keys.length;
+
         const prev_capture: boolean = this.capture_decls;
         mut u_keys:  u32[]        = [];
         mut u_spans: SourceSpan[] = [];
@@ -669,7 +758,10 @@ type struct MoveChecker {
             this.walk_stmt(c.body as StatementNode*);
             this.capture_decls = prev_capture;
             if (!this.switch_case_diverges(c.body as StatementNode*)) {
-                for (mut j: i64 = snap; j < this.moved_keys.length; j++) {
+                // Contribute this case's FULL end-set (not just moves past a
+                // checkpoint) so a pre-switch move the case did not revive
+                // survives the join. See merge_branches.
+                for (mut j: i64 = 0; j < this.moved_keys.length; j++) {
                     const k: u32 = this.moved_keys[j];
                     if (this.is_body_local(k, branch_cap_start)) { continue; }
                     const real: boolean = this.moved_real[j];
@@ -688,9 +780,33 @@ type struct MoveChecker {
                     }
                 }
             }
-            this.restore_moves(snap);
+            this.restore_full(pre_keys, pre_spans, pre_real);
             if (!prev_capture) { this.truncate_captured(branch_cap_start); }
         }
+        // A switch need not be exhaustive: the implicit "no case matched"
+        // fall-through moves and revives nothing, so its end-set is the
+        // pre-switch set. Contributing it keeps every pre-switch move alive
+        // across the switch (a case's revival cannot leak past the join).
+        for (mut j: i64 = 0; j < pre_len; j++) {
+            const k: u32 = pre_keys[j];
+            const real: boolean = pre_real[j];
+            mut found: boolean = false;
+            for (mut u: i64 = 0; u < u_keys.length; u++) {
+                if (u_keys[u] == k) {
+                    if (real) { u_real[u] = true; }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                u_keys.push(k);
+                u_spans.push(pre_spans[j]);
+                u_real.push(real);
+            }
+        }
+        this.moved_keys  = [];
+        this.moved_spans = [];
+        this.moved_real  = [];
         for (mut i: i64 = 0; i < u_keys.length; i++) {
             this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
         }

@@ -1,0 +1,45 @@
+// E0452: a non-Copy value moved BEFORE a branch and reassigned (revived)
+// on only ONE path of the branch is still moved on the path that did not
+// reassign it, so a read after the join is a use-after-move.
+//
+// Regression for the audit finding that `unmark_moved` (an assignment
+// reviving a binding) rebuilt the moved-set in place, deleting an entry
+// that lived BELOW the branch's snapshot checkpoint, while `restore_moves`
+// was truncate-only and could not reinstate it. A revival on one branch
+// therefore erased the pre-branch move on EVERY path, so the post-branch
+// `consume(h)` compiled clean and double-freed at runtime
+// (`free(): double free detected`). The join now unions each path's FULL
+// end move-set (a missing `else` contributes the pre-branch set), so a
+// binding is Live after the join only if EVERY fall-through path revived
+// it. Here the implicit else does not, so `h` stays moved.
+//
+// The companion all-paths-revive case
+// (`consume(h); if (c) { h = mk(); } else { h = mk(); } consume(h);`)
+// must still COMPILE - every path reinitializes `h` - and is exercised by
+// the self-host build and stdlib suite.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::BranchReviveOnePath;
+
+type struct Heap {
+    p: void*;
+    static make() -> Heap { return Heap { p: malloc(16) }; }
+}
+
+implement trait Drop for struct Heap {
+    drop(mut &this) -> void { free(this.p); }
+}
+
+function consume(h: Heap) -> void {
+    // by-value owning parameter: drops `h` at function exit.
+}
+
+function main() -> int {
+    mut h: Heap = Heap::make();
+    consume(h);                  // `h` moved here
+    if (1 > 2) {
+        h = Heap::make();        // revived only on the (untaken) then-path
+    }
+    consume(h);                  // else-path: use-after-move at the join
+    return 0;
+}
