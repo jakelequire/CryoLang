@@ -189,6 +189,7 @@ BinaryExpr         ::= UnaryExpr (BinOp UnaryExpr)*
 BinOp              ::= "||" | "&&" | "|" | "^" | "&"
                      | "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>"
                      | "<<" | ">>" | "+" | "-" | "*" | "/" | "%"
+                     | ".." | "..="     (* range constructors: a..b, a..=b *)
 
 UnaryExpr          ::= UnaryOp UnaryExpr
                      | PostfixExpr ("as" Type)*
@@ -219,6 +220,9 @@ Primary            ::= Literal
                      | IfExpr
                      | Match
                      | Lambda
+                     | "delete" Expr           (* parsed; see cryo.md §21 *)
+                     | "await"  Expr           (* parsed; no async semantics yet *)
+                     | "yield"  Expr?          (* parsed; no generator semantics yet *)
                      | "(" Expr ")"
 
 Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Type
@@ -247,7 +251,8 @@ If                 ::= "if" "(" Expr ")" Block
                        ("else" Block)?
 While              ::= "while" "(" Expr ")" Block
 DoWhile            ::= "do" Block "while" "(" Expr ")" ";"
-For                ::= "for" "(" ForInit Expr ";" Expr ")" Block
+For                ::= "for" "(" ForInit Expr ";" Expr ")" Block      (* C-style *)
+                     | "for" "(" Ident "in" Expr ")" Block            (* for-in over an iterable *)
 ForInit            ::= VarDecl | Ident ":" Type ("=" Expr)? ";"
 
 Match              ::= "match" "(" Expr ")" "{" MatchArm* "}"
