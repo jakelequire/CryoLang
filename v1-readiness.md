@@ -70,10 +70,23 @@ Legend: ☐ todo · ◐ in progress · ☑ done · ⊘ won't-fix / deferred
 
 ## Tier 3 — Robustness (compiler crashes / CLI)
 
-- ☐ T3.1 Unguarded recursion → SIGSEGV: `parse_binary_expression` (`expr_parser.cryo:272-338`),
-  `parse_type_annotation` (`expr_parser.cryo:2217`), `rewrite_this_type_annotation` family
-  (`type_resolution.cryo:~1401`).
-- ☐ T3.2 Config-gating misclassifies unknown `--target` triples (`passes/config_gating.cryo:59-66`).
+- ☑ T3.1 Unguarded recursion → SIGSEGV. **Fix:** added a `type_depth` field + a guard wrapper on
+  `parse_type_annotation` (256 cap, `parse_type_annotation_inner` holds the body). This is the
+  single chokepoint for all type recursion (&T / Option<T> / (T) / T?), so it also transitively
+  bounds the downstream `rewrite_this_type_annotation` walkers (mono N3) — nothing deeper can be
+  parsed. **`parse_binary_expression` left unguarded deliberately:** its recursion is
+  `parse_binary_expression(prec+1)` with strictly increasing min-precedence, so it self-bounds at
+  the number of precedence tiers (~12), NOT "proportional to operator count" — the agent's C1 was
+  a false positive. *(pending build validation)*
+- ☑ T3.2 Config-gating misclassifies unknown `--target` triples. **Fix:** `ConfigGating::run` now
+  emits `E0904` and fails when the triple resolves to `HostOS::Other` instead of silently
+  stripping all platform decls (`passes/config_gating.cryo`).
+
+  *Validated:* `make test` green (1268/0); a 3000-deep nested-paren type now emits a graceful
+  `E0104 "type nesting too deep"` and exits 1 instead of SIGSEGV. **Build-system note:** `make test`
+  rebuilds the STAGE2 compiler it tests with, but does NOT refresh `compiler/build/cryo.exe` (the
+  `make cryo` output) — run `make cryo` before manually testing the binary, or you'll exercise a
+  stale build.
 - ☐ T3.3 CLI: unknown flags silently accepted; empty `--output=` drops `-o`; failure summaries to
   stdout not stderr (`CLI/_module.cryo`, `commands.cryo`).
 - ◐ T3.4 Flaky `Stdlib::NetHttp2::loopback_h2c_round_trip` ("h2 server bind failed"). **Fix:**

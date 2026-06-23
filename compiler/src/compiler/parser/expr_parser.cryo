@@ -2215,6 +2215,23 @@ public:
 
     /// Parse a full type annotation.
     parse_type_annotation() -> TypeAnnotation* {
+        // TYPE_DEPTH_LIMIT: every nested type form (&T, Option<T>, (T), T?)
+        // recurses through here, and `&`/`?` nesting has no bracketing token
+        // for advance() to count, so `&&&&...T` / `Option<Option<...>>` /
+        // `(((...T)))` would otherwise blow the native stack and crash the
+        // compiler. Guard before recursing; 256 is far beyond any real type.
+        if (this.type_depth > 256) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "type nesting too deep (recursion limit exceeded)");
+            return null;
+        }
+        this.type_depth += 1;
+        const result: TypeAnnotation* = this.parse_type_annotation_inner();
+        this.type_depth -= 1;
+        return result;
+    }
+
+    parse_type_annotation_inner() -> TypeAnnotation* {
         LOG_DEBUG(LogComponent::Parser, "[ExprParser] parse_type_annotation()");
         // Reference types: &T, &mut T, or the alternate `mut &T` form
         // (mut before ampersand) used by stdlib-next.
