@@ -410,6 +410,13 @@ private:
 
     lex_character(&this) -> Token {
         const start: string = this.current;
+        // `lex_token()` already consumed the opening `'` via advance(), so
+        // `current_location.column` sits one past it - the opening quote's
+        // own column is one back.  Capture it for an accurate token span;
+        // `make_token` would instead derive the column from the
+        // quote-stripped lexeme length and land two columns too far right.
+        const start_line: int = this.current_location.line;
+        const start_col:  int = this.current_location.column - 1;
 
         // Escape sequence
         if (this.peek() == '\\') {
@@ -424,6 +431,20 @@ private:
                     while (i < 2 && !this.at_end() && Lexer::is_hex_digit(this.peek())) {
                         this.advance();
                         i++;
+                    }
+                } else if (escape_char == 'u') {
+                    // Unicode escape \u{HEX}: consume the brace-delimited
+                    // codepoint so its body isn't mistaken for extra
+                    // characters (which would mis-report `'\u{1F600}'` as a
+                    // multi-character literal).
+                    if (!this.at_end() && this.peek() == '{') {
+                        this.advance(); // consume '{'
+                        while (!this.at_end() && Lexer::is_hex_digit(this.peek())) {
+                            this.advance();
+                        }
+                        if (!this.at_end() && this.peek() == '}') {
+                            this.advance(); // consume '}'
+                        }
                     }
                 }
             }
@@ -496,7 +517,7 @@ private:
         const len: u64 = (this.current as i64 - start as i64 - 1) as u64;
         const lexeme: string = start.substr(0, len);
 
-        return this.make_token(TokenType::CharConstant, lexeme);
+        return Token::new(TokenType::CharConstant, lexeme, start_line, start_col);
     }
 
     lex_comment(&this) -> Token {
@@ -948,7 +969,11 @@ private:
                 '"'  => { *(buf + wi) = '"';  wi += 1; }
                 '0'  => { *(buf + wi) = '\0'; wi += 1; }
                 'x'  => {
-                    // Hex escape: \xHH (up to 2 hex digits)
+                    // Hex escape: \xHH (exactly up to 2 hex digits).  A
+                    // `\x` with no following hex digit is malformed; emit
+                    // it literally rather than silently materialising a NUL
+                    // byte (the old behaviour wrote `val == 0`, truncating
+                    // the bogus escape to `\0` and corrupting the string).
                     mut val: i64 = 0;
                     mut digits: int = 0;
                     while (digits < 2 && ri < len && Lexer::is_hex_digit(*(raw + ri))) {
@@ -961,8 +986,50 @@ private:
                         ri += 1;
                         digits += 1;
                     }
-                    *(buf + wi) = val as i8;
-                    wi += 1;
+                    if (digits == 0) {
+                        *(buf + wi) = '\\'; wi += 1;
+                        *(buf + wi) = 'x';  wi += 1;
+                    } else {
+                        *(buf + wi) = val as i8;
+                        wi += 1;
+                    }
+                }
+                'u'  => {
+                    // Unicode escape: \u{HEX} - parse the brace-delimited
+                    // codepoint and emit its UTF-8 encoding.  Malformed
+                    // forms (missing `{`, no digits, codepoint out of the
+                    // Unicode range) are preserved literally so a downstream
+                    // pass reports them rather than this silently dropping
+                    // bytes.
+                    if (ri < len && *(raw + ri) as char == '{') {
+                        ri += 1; // consume '{'
+                        mut cp: i64 = 0;
+                        mut ndig: int = 0;
+                        while (ri < len && Lexer::is_hex_digit(*(raw + ri))) {
+                            const d: char = *(raw + ri) as char;
+                            mut dv: i64 = 0;
+                            if (d >= '0' && d <= '9')      { dv = d as i64 - '0' as i64; }
+                            else if (d >= 'a' && d <= 'f') { dv = d as i64 - 'a' as i64 + 10; }
+                            else if (d >= 'A' && d <= 'F') { dv = d as i64 - 'A' as i64 + 10; }
+                            cp = cp * 16 + dv;
+                            ri += 1;
+                            ndig += 1;
+                        }
+                        const closed: boolean = ri < len && *(raw + ri) as char == '}';
+                        if (closed) { ri += 1; } // consume '}'
+                        if (ndig > 0 && closed && cp <= 0x10FFFF) {
+                            wi = Lexer::encode_utf8(buf, wi, cp);
+                        } else {
+                            // Malformed: preserve the `\u` we consumed; the
+                            // brace/digit bytes were already copied past or
+                            // will be re-scanned as ordinary characters.
+                            *(buf + wi) = '\\'; wi += 1;
+                            *(buf + wi) = 'u';  wi += 1;
+                        }
+                    } else {
+                        *(buf + wi) = '\\'; wi += 1;
+                        *(buf + wi) = 'u';  wi += 1;
+                    }
                 }
                 _ => {
                     // Unknown escape; preserve both characters
@@ -976,6 +1043,29 @@ private:
 
         *(buf + wi) = '\0';
         return buf;
+    }
+
+    /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8 into
+    /// `buf` starting at write index `w`, returning the index past the last
+    /// byte written.  Used by `process_escape_sequences` for `\u{HEX}`.
+    static encode_utf8(buf: string, w: i64, cp: i64) -> i64 {
+        mut wi: i64 = w;
+        if (cp <= 0x7F) {
+            *(buf + wi) = cp as i8; wi += 1;
+        } else if (cp <= 0x7FF) {
+            *(buf + wi) = (0xC0 | (cp >> 6)) as i8; wi += 1;
+            *(buf + wi) = (0x80 | (cp & 0x3F)) as i8; wi += 1;
+        } else if (cp <= 0xFFFF) {
+            *(buf + wi) = (0xE0 | (cp >> 12)) as i8; wi += 1;
+            *(buf + wi) = (0x80 | ((cp >> 6) & 0x3F)) as i8; wi += 1;
+            *(buf + wi) = (0x80 | (cp & 0x3F)) as i8; wi += 1;
+        } else {
+            *(buf + wi) = (0xF0 | (cp >> 18)) as i8; wi += 1;
+            *(buf + wi) = (0x80 | ((cp >> 12) & 0x3F)) as i8; wi += 1;
+            *(buf + wi) = (0x80 | ((cp >> 6) & 0x3F)) as i8; wi += 1;
+            *(buf + wi) = (0x80 | (cp & 0x3F)) as i8; wi += 1;
+        }
+        return wi;
     }
 }
 

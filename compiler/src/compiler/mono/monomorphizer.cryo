@@ -212,8 +212,28 @@ type struct Monomorphizer {
             this.state.enqueue_from_type_ref(unprocessed[i]);
         }
 
+        // Worklist-iteration ceiling.  The cycle detection below only
+        // catches a request re-entering the SAME key while in progress; a
+        // *type-growing* template - one whose field/arg type gains a level
+        // of nesting at each instantiation (`Wrap<T> { f: Wrap<Wrap<T>> }`)
+        // - mints a fresh, ever-larger key every level and so never trips
+        // it, looping until the process exhausts memory.  Bound the loop to
+        // a generous multiple of the program's type count (far above any
+        // legitimate instantiation set) and report E0900 on exceed instead
+        // of hanging / OOMing with no diagnostic.
+        const max_iterations: i64 = 100000 + this.arena.type_count() * 100;
+        mut iterations: i64 = 0;
+
         // Process worklist until empty
         while (this.state.pending_cursor < this.state.pending.length) {
+            iterations += 1;
+            if (iterations > max_iterations) {
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("monomorphization exceeded %lld instantiations - a generic type that grows its type arguments at each level (e.g. `Wrap<T> { f: Wrap<Wrap<T>> }`) instantiates without bound",
+                        max_iterations)));
+                this.state.error_count += 1;
+                break;
+            }
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
 

@@ -1064,7 +1064,7 @@ type struct DropInserter {
     /// registered, which sit on top after the arm body's own scope balanced
     /// out) along with their subject links, and report whether any was
     /// consumed (moved) within the arm.
-    check_and_unregister_arm_bindings(mut &this, count: i64) -> boolean {
+    check_and_unregister_arm_bindings(mut &this, count: i64, link_mark: i64) -> boolean {
         mut consumed: boolean = false;
         for (mut k: i64 = 0; k < count; k++) {
             const idx: i64 = this.types_keys.length - 1;
@@ -1072,10 +1072,18 @@ type struct DropInserter {
             if (this.is_moved_id(this.types_keys[idx])) { consumed = true; }
             this.types_keys.pop();
             this.types_refs.pop();
-            if (this.link_payload.length > 0) {
-                this.link_payload.pop();
-                this.link_subject.pop();
-            }
+        }
+        // Pop exactly the subject links this arm pushed - the entries from
+        // `link_mark` to the current top - decoupled from the types-map
+        // loop above.  The old length-guarded pop inside that loop popped
+        // one link per types entry and so could over-pop into an enclosing
+        // match's links (when the binding count drifted from the pushed-link
+        // count) or under-pop and strand links (when the loop broke early on
+        // a types-map underflow), either way mis-attributing a later move to
+        // the wrong subject.
+        while (this.link_payload.length > link_mark) {
+            this.link_payload.pop();
+            this.link_subject.pop();
         }
         return consumed;
     }
@@ -1155,6 +1163,11 @@ type struct DropInserter {
             // non-Copy proxy: registration is used purely to make
             // `.drop()` / move detection see the binding, never to emit a
             // drop for it.
+            // Mark the link arrays' length before registration so the
+            // matching unregister pops back to exactly this point - the
+            // links this arm pushed are contiguous from here to the top,
+            // independent of the binding count.
+            const link_mark: i64 = this.link_payload.length;
             mut reg_count: i64 = 0;
             if (subj_name.is_valid()) {
                 reg_count = this.register_arm_pattern_bindings(arm, subj_ty, subj_name.id);
@@ -1174,7 +1187,7 @@ type struct DropInserter {
             // this path; suppress its glue.  Checked before restore_moves so
             // the in-arm move is still visible.  Always unregisters.
             if (reg_count > 0) {
-                if (this.check_and_unregister_arm_bindings(reg_count)) {
+                if (this.check_and_unregister_arm_bindings(reg_count, link_mark)) {
                     subject_consumed = true;
                     consumed_arm_idx.push(a);
                 }

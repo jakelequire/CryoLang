@@ -111,6 +111,24 @@ type struct TypeLoweringPasses {
             ctx.emit_diagnostic(diag);
         }
 
+        // Internal-consistency check.  A `needs_layout` type whose member /
+        // element references no longer resolve in the arena was laid out
+        // above with a silent minimal/zero fallback (e.g. an Optional whose
+        // wrapped type vanished becomes a bare 1-byte tag) - a miscompile.
+        // All types are allocated before this pass, so this only fires on a
+        // genuine internal inconsistency; report it as an ICE rather than
+        // letting the bogus layout flow into codegen.
+        for (mut ui: i64 = 0; ui < arena.type_count(); ui++) {
+            const uty: Type* = arena.types[ui];
+            if (uty == null) { continue; }
+            if (!TypeLoweringPasses::needs_layout(uty)) { continue; }
+            if (!TypeLoweringPasses::has_unresolved_layout_child(arena, uty)) { continue; }
+            ctx.emit_diagnostic(Diagnostic::error(
+                ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("type lowering: a member type of type #%lld did not resolve in the type arena (internal inconsistency)",
+                       uty.id as i64)));
+        }
+
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
@@ -610,6 +628,76 @@ type struct TypeLoweringPasses {
 
         alias.set_layout(t_size, t_align);
         return true;
+    }
+
+
+    /// Detect a member/element type reference that fails to resolve in the
+    /// arena during layout.  By the time this pass runs every type is
+    /// allocated, so a valid `TypeRef` always resolves to a non-null
+    /// `Type*` (a not-yet-laid-out dependency resolves to a `Type*` whose
+    /// `size_bytes()` is merely still 0 - that path returns `false` and is
+    /// retried, it is NOT a null lookup).  A null lookup here therefore
+    /// means the member type vanished from the arena - an internal
+    /// inconsistency.  The per-kind `compute_*_layout` routines react to it
+    /// by silently falling back to a minimal/zero layout (an Optional
+    /// becomes a bare 1-byte tag, a fixed array becomes size 0, a struct
+    /// drops the field), which miscompiles downstream.  The driver uses
+    /// this to surface an E0900 instead.  Mirrors the child set each
+    /// `compute_*_layout` reads for sizing.
+    static has_unresolved_layout_child(arena: TypeArena*, ty: Type*) -> boolean {
+        if (ty.kind == TypeKind::Struct) {
+            const st: StructType* = ty as StructType*;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                if (arena.lookup(st.fields[i].field_type.id) == null) { return true; }
+            }
+            return false;
+        }
+        if (ty.kind == TypeKind::Class) {
+            const cl: ClassType* = ty as ClassType*;
+            if (cl.has_base && cl.base_class.is_valid()
+                    && arena.lookup(cl.base_class.id) == null) { return true; }
+            for (mut i: i64 = 0; i < cl.fields.length; i++) {
+                if (arena.lookup(cl.fields[i].field_type.id) == null) { return true; }
+            }
+            return false;
+        }
+        if (ty.kind == TypeKind::Enum) {
+            const en: EnumType* = ty as EnumType*;
+            for (mut i: i64 = 0; i < en.variants.length; i++) {
+                const variant: EnumVariantInfo* = &en.variants[i];
+                for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
+                    if (arena.lookup(variant.payload_types[j].id) == null) { return true; }
+                }
+            }
+            return false;
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const tt: TupleType* = ty as TupleType*;
+            for (mut i: i64 = 0; i < tt.elements.length; i++) {
+                if (arena.lookup(tt.elements[i].id) == null) { return true; }
+            }
+            return false;
+        }
+        if (ty.kind == TypeKind::Optional) {
+            const opt: OptionalType* = ty as OptionalType*;
+            return arena.lookup(opt.wrapped.id) == null;
+        }
+        if (ty.kind == TypeKind::Array) {
+            const arr: ArrayType* = ty as ArrayType*;
+            if (arr.is_fixed()) { return arena.lookup(arr.element.id) == null; }
+            return false;
+        }
+        if (ty.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = ty as TypeAliasType*;
+            if (al.has_target()) { return arena.lookup(al.target.id) == null; }
+            return false;
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = ty as InstantiatedType*;
+            if (it.has_resolved_type()) { return arena.lookup(it.resolved_type.id) == null; }
+            return false;
+        }
+        return false;
     }
 
 

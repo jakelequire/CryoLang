@@ -925,23 +925,38 @@ type struct ExprOps {
         intrinsics::free(buf);
 
         // Phase 2 - propagate `byval(%T)` from the callee's parameter
-        // attributes onto the matching call-site slots.  The existing
-        // struct -> ptr coercion above already arranged for each byval
-        // slot to be a pointer-to-temp; adding the attribute tells the
-        // backend this is a by-value copy (not aliasing).  Skipped for
-        // function-pointer callees: `byval_pointee_of_param` is gated
-        // by `LLVMIsAFunction` and silently returns null in that case
-        // (tracked under the function-pointer ABI gap).
-        if (out_value.is_valid()) {
-            for (mut bi: u32 = 0; bi < n; bi++) {
-                const pointee_b: LType = this.abi.byval_pointee_of_param(callee, bi);
-                if (pointee_b.is_valid()) {
-                    this.abi.apply_byval_call_attribute(out_value, bi, pointee_b);
-                }
-            }
-        }
+        // attributes onto the matching call-site slots.  In this 1:1 path
+        // each source arg fills exactly one LLVM slot, so the LLVM slot
+        // index equals the source ordinal and `n` slots were emitted.
+        this.apply_byval_call_attributes(callee, out_value, n);
 
         return out_value;
+    }
+
+    /// Propagate the callee's `byval(%T)` parameter attributes onto the
+    /// matching call-site argument slots.  Driven off the *LLVM slot
+    /// index*, not the source-argument ordinal: `byval_pointee_of_param`
+    /// queries the callee's LLVM parameter at index `s`, and the call was
+    /// built with one argument per LLVM slot (`buf[s]`), so the same `s`
+    /// names both ends.  This matters when a 9-16 byte DirectPair param
+    /// (two slots) precedes a >16 byte byval param: the byval attribute
+    /// must land on its true slot, not on the source ordinal (which lags
+    /// by the surplus DirectPair slot).  The struct -> ptr coercion in
+    /// the marshalling loops already arranged for each byval slot to be a
+    /// pointer-to-temp; the attribute tells the backend this is a
+    /// by-value copy (not aliasing).  Skipped for function-pointer
+    /// callees: `byval_pointee_of_param` is gated by `LLVMIsAFunction`
+    /// and silently returns null in that case (tracked under the
+    /// function-pointer ABI gap).
+    apply_byval_call_attributes(mut &this, callee: LValue, call_val: LValue,
+                                slot_count: u32) -> void {
+        if (!call_val.is_valid()) { return; }
+        for (mut s: u32 = 0; s < slot_count; s++) {
+            const pointee_b: LType = this.abi.byval_pointee_of_param(callee, s);
+            if (pointee_b.is_valid()) {
+                this.abi.apply_byval_call_attribute(call_val, s, pointee_b);
+            }
+        }
     }
 
 
@@ -1165,6 +1180,17 @@ type struct ExprOps {
         const out: LValue = this.builder.build_call(
             callee_type, callee, buf, expected_count, name);
         intrinsics::free(buf);
+
+        // Phase 2 - byval propagation, driven off the LLVM slot index.
+        // The DirectPair expansion above fills slots 0..expected_count
+        // directly (one source aggregate can own two slots), so a >16
+        // byte byval param sits at its true LLVM slot, which is also the
+        // index `byval_pointee_of_param` queries.  Without this pass a
+        // call mixing a DirectPair arg with a byval arg silently dropped
+        // the byval attribute (ABI break: the backend treated the
+        // pointer as aliasing rather than a by-value copy).
+        this.apply_byval_call_attributes(callee, out, expected_count);
+
         return out;
     }
 
