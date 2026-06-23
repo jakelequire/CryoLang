@@ -394,13 +394,15 @@ type struct NewDeleteEmitter {
         // `delete ptr` is the manual-memory dual of an end-of-scope drop:
         //   1. Run the pointee's drop method, if it has one.
         //   2. Free the allocation.
-        // The drop call is synthesized as `operand.drop()` and routed
+        // The operand is evaluated exactly once (see below): the pointer
+        // is spilled to a temp slot, the drop is synthesized as a
+        // `.drop()` on a synthetic local reading that slot - routed
         // through the normal method-dispatch path so trait `Drop` impls,
         // inherent `drop`, and virtual class destructors all reach the
-        // right symbol.  The operand expression is then evaluated a
-        // second time for the free; safe for identifiers and member
-        // access on locals (the common case) but the caller should avoid
-        // side-effecting operands like `delete some_fn()`.
+        // right symbol - and the same spilled pointer is freed.  This
+        // makes side-effecting operands (`delete arr.pop()`) safe: the
+        // side effects fire once and the destructor and `free` see the
+        // identical pointer.
         const operand_type: TypeRef = node.operand.resolved_type;
         const arena_ptr: TypeArena* = this.cg.get_arena();
         const intern_ptr: InternTable* = this.cg.get_intern();
@@ -425,19 +427,47 @@ type struct NewDeleteEmitter {
                                                         intern_ptr, pointee);
         }
 
+        // Evaluate the operand exactly once.  A side-effecting operand
+        // (`delete arr.pop()`) must not fire its side effects twice, and
+        // the destructor must run on the *same* pointer that is freed - a
+        // second evaluation can yield a different pointer (UAF /
+        // double-free).  Spill the evaluated pointer to a temp slot and
+        // drive both the synthesized `.drop()` and the `free` off it.
+        const ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.operand);
+        if (!ptr.is_valid()) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
         if (should_drop) {
+            // Bind the already-evaluated pointer to a synthetic local so
+            // the drop dispatch (which re-codegens its receiver node) reads
+            // the spilled value instead of re-evaluating `node.operand`.
+            // The slot mirrors a real `T*` local - it holds the pointer
+            // value - so the receiver auto-deref in method dispatch behaves
+            // identically to the old `node.operand.drop()`.
+            const slot_ty: LType = LType::pointer_to(LType::i8());
+            const slot: LValue = this.cg.builder.build_alloca(slot_ty, "delete.recv");
+            this.cg.builder.build_store(ptr, slot);
+            const recv_sym: SymbolStr = intern_ptr.intern("$delete.recv");
+            this.cg.values.set_raw(recv_sym.id, slot.raw);
+
             const drop_sym: SymbolStr = intern_ptr.intern("drop");
+            mut recv: IdentifierNode* = new IdentifierNode(recv_sym, node.span);
+            recv.set_resolved_type(node.operand.resolved_type);
             mut member: MemberAccessNode* = new MemberAccessNode(
-                node.operand, drop_sym, node.span, node.span);
+                recv as ExpressionNode*, drop_sym, node.span, node.span);
             member.set_resolved_type(TypeRef::invalid());
             mut call: CallExprNode* = new CallExprNode(
                 member as ExpressionNode*, node.span);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, node.span);
             stmt.accept(visitor);
+
+            this.cg.values.remove_raw(recv_sym.id);
         }
 
-        const ptr: LValue = this.dispatch.codegen_rvalue(visitor,node.operand);
         const free_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("free"));
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(

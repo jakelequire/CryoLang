@@ -1,0 +1,96 @@
+///! Escape-sequence lexing matrix (v1.0.0 audit, lexer fix):
+///!
+///!  - simple escapes: \n \t \r \\ \' \"
+///!  - \xHH hex byte escapes, including the truncated 1-digit form
+///!  - \u{HEX} Unicode escapes lowered to UTF-8 (1-, 2-, 3-, and 4-byte
+///!    encodings)
+///!
+///! Bytes are inspected directly through the string pointer (not via a
+///! length helper) so the exact lowered byte sequence is pinned. None of
+///! the cases embed a NUL, so a C-string-terminated constant reads back
+///! intact.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LexerEscapes;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// Unsigned byte at offset `i` of a string literal, widened for comparison.
+function byte_at(s: string, i: i64) -> i64 {
+    return *(s + i) as u8 as i64;
+}
+
+![test]
+function simple_escapes() -> Result<(), TestError> {
+    const s: string = "\n\t\r\\\'\"";
+    expect_eq(byte_at(s, 0), 10)?;   // \n
+    expect_eq(byte_at(s, 1), 9)?;    // \t
+    expect_eq(byte_at(s, 2), 13)?;   // \r
+    expect_eq(byte_at(s, 3), 92)?;   // backslash
+    expect_eq(byte_at(s, 4), 39)?;   // '
+    expect_eq(byte_at(s, 5), 34)?;   // "
+    expect_eq(byte_at(s, 6), 0)?;    // NUL terminator
+    return Result::Ok(());
+}
+
+![test]
+function hex_escapes() -> Result<(), TestError> {
+    const s: string = "\x41\x42\x7f\xff";
+    expect_eq(byte_at(s, 0), 65)?;    // A
+    expect_eq(byte_at(s, 1), 66)?;    // B
+    expect_eq(byte_at(s, 2), 127)?;
+    expect_eq(byte_at(s, 3), 255)?;
+    expect_eq(byte_at(s, 4), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function hex_escape_single_digit_then_letter() -> Result<(), TestError> {
+    // `\xA` reads one hex digit and stops at the non-hex `Z`; the byte is
+    // 0x0A and the `Z` is an ordinary following character.
+    const s: string = "\xAZ";
+    expect_eq(byte_at(s, 0), 10)?;   // \xA
+    expect_eq(byte_at(s, 1), 90)?;   // Z
+    expect_eq(byte_at(s, 2), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function unicode_escape_one_byte() -> Result<(), TestError> {
+    const s: string = "\u{41}";       // 'A' -> 0x41
+    expect_eq(byte_at(s, 0), 65)?;
+    expect_eq(byte_at(s, 1), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function unicode_escape_two_bytes() -> Result<(), TestError> {
+    const s: string = "\u{A9}";       // U+00A9 (c) -> C2 A9
+    expect_eq(byte_at(s, 0), 194)?;
+    expect_eq(byte_at(s, 1), 169)?;
+    expect_eq(byte_at(s, 2), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function unicode_escape_three_bytes() -> Result<(), TestError> {
+    const s: string = "\u{20AC}";     // U+20AC euro sign -> E2 82 AC
+    expect_eq(byte_at(s, 0), 226)?;
+    expect_eq(byte_at(s, 1), 130)?;
+    expect_eq(byte_at(s, 2), 172)?;
+    expect_eq(byte_at(s, 3), 0)?;
+    return Result::Ok(());
+}
+
+![test]
+function unicode_escape_four_bytes() -> Result<(), TestError> {
+    const s: string = "\u{1F600}";    // U+1F600 grinning face -> F0 9F 98 80
+    expect_eq(byte_at(s, 0), 240)?;
+    expect_eq(byte_at(s, 1), 159)?;
+    expect_eq(byte_at(s, 2), 152)?;
+    expect_eq(byte_at(s, 3), 128)?;
+    expect_eq(byte_at(s, 4), 0)?;
+    return Result::Ok(());
+}
