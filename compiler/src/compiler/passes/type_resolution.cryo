@@ -2752,6 +2752,20 @@ type struct TypeResolutionPasses {
                     for (mut j: i64 = 0; j < node.fields.length; j++) {
                         const field: FieldDeclNode* = node.fields[j];
                         if (field == null) { continue; }
+                        // An unresolved field type must never be baked into the
+                        // arena: TypeLowering would size the struct from the id-0
+                        // sentinel (wrong layout) or the mangler would ICE, both
+                        // decoupled from any diagnostic. Emit E0203 here so the
+                        // pass fails (via from_snapshot) and Phase 5 aborts before
+                        // codegen ever sees the poisoned StructType.
+                        if (!field.resolved_type.is_valid()) {
+                            const fname: string = ctx.intern_table.resolve(field.name);
+                            const sname: string = ctx.intern_table.resolve(node.name);
+                            ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                                format("cannot resolve type for field `%s` of `%s`", fname, sname),
+                                field.span);
+                            continue;
+                        }
                         const is_pub: boolean = field.visibility == Visibility::Public;
                         const is_prot: boolean = field.visibility == Visibility::Protected;
                         field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
@@ -2815,6 +2829,18 @@ type struct TypeResolutionPasses {
                     for (mut j: i64 = 0; j < node.fields.length; j++) {
                         const field: FieldDeclNode* = node.fields[j];
                         if (field == null) { continue; }
+                        // See the StructDeclaration arm: never bake an unresolved
+                        // field type into the arena. Emit E0203 so the pass fails
+                        // and Phase 5 aborts before the poisoned ClassType reaches
+                        // layout/vtable codegen.
+                        if (!field.resolved_type.is_valid()) {
+                            const fname: string = ctx.intern_table.resolve(field.name);
+                            const sname: string = ctx.intern_table.resolve(node.name);
+                            ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                                format("cannot resolve type for field `%s` of `%s`", fname, sname),
+                                field.span);
+                            continue;
+                        }
                         const is_pub: boolean = field.visibility == Visibility::Public;
                         const is_prot: boolean = field.visibility == Visibility::Protected;
                         field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
@@ -2987,6 +3013,19 @@ type struct TypeResolutionPasses {
                             mut resolved: TypeRef = TypeRef::invalid();
                             if (ann != null && ctx.type_resolver != null) {
                                 resolved = ctx.type_resolver.resolve(ann, &res_ctx);
+                            }
+                            // Never bake an unresolved payload into the enum: the
+                            // variant would be sized from the id-0 sentinel (wrong
+                            // layout / discriminant) or ICE the mangler, decoupled
+                            // from any diagnostic. Emit E0203 so the pass fails and
+                            // Phase 5 aborts before codegen.
+                            if (!resolved.is_valid()) {
+                                const vname: string = ctx.intern_table.resolve(variant.name);
+                                const ename: string = ctx.intern_table.resolve(node.name);
+                                ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                                    format("cannot resolve payload type for variant `%s` of enum `%s`", vname, ename),
+                                    variant.span);
+                                continue;
                             }
                             payload_types.push(resolved);
                         }
