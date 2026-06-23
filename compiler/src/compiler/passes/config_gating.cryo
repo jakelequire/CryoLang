@@ -39,6 +39,7 @@ import Compiler::AST::{ Node, Declaration, Statement, Pattern };
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Codegen::LLVMTypes;
+import Compiler::Diag;
 import Utils::Logger;
 
 
@@ -366,6 +367,21 @@ type struct ConfigGatingPasses {
         }
 
         const os: HostOS = ConfigGatingPasses::active_os(ctx);
+
+        // An unclassifiable triple can't drive platform gating correctly: every
+        // ![windows]/![linux]/![macos]/![unix] decl would be stripped and every
+        // ![not(...)] decl kept, silently producing a wrong build. Fail loudly
+        // instead. Reachable only via an explicit unsupported --target; the LLVM
+        // host-triple fallback always classifies.
+        const os_unknown: boolean = match (os) {
+            HostOS::Other => { true }
+            _             => { false }
+        };
+        if (os_unknown) {
+            ctx.emit_error(ErrorCode::E0904_COMPILER_CONFIGURATION_ERROR,
+                "unsupported target triple: cannot resolve a target platform (expected windows, linux, or macos)");
+            return PassResult::failure(1);
+        }
 
         mut kept: ASTNode*[] = [];
         mut stripped: i64 = 0;
