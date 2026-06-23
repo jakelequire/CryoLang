@@ -219,3 +219,60 @@ function octal_in_u64_const() -> Result<(), TestError> {
     const mode: u64 = 0o644;
     return expect_eq(mode, 420);
 }
+
+// Negative / folded module-level integer const globals.
+//
+// A module-level `const X: iN = -V` parses as a UnaryExpression, not a bare
+// Literal.  The global-variable codegen handled bare integer literals and
+// folded constant *float* initializers, but no integer const-expression, so
+// a negative integer global fell through to `zeroinitializer` - every
+// negative module-level constant (EOF, AT_FDCWD, the EAI_* family,
+// INVALID_HANDLE_VALUE, ...) silently emitted as 0.  Fixed by folding
+// integer const-expression initializers (unary -/+/~ and the
+// sign-independent binary ops +/-/*/<</&/|/^) before the zero fallback in
+// declaration_emitter.cryo.  These globals are referenced, not inlined
+// (codegen does no const-propagation of globals), so the test loads the
+// emitted initializer.
+const NEG_I32_G:   i32 = -5;
+const NEG_I64_G:   i64 = -100;
+const EOF_G:       i32 = -1;            // the EOF / SOCKET_ERROR shape
+const NEG_EXPR_G:  i32 = 0 - 42;
+const FLAG_BITS_G: u32 = (1 << 4) | (1 << 2);   // 20
+const POS_GUARD_G: i32 = 7;
+
+![test]
+function neg_i32_global_keeps_value() -> Result<(), TestError> {
+    const x: i32 = NEG_I32_G;
+    return expect_eq(x, -5);
+}
+
+![test]
+function neg_i64_global_keeps_value() -> Result<(), TestError> {
+    const x: i64 = NEG_I64_G;
+    return expect_eq(x, -100);
+}
+
+![test]
+function neg_one_global_keeps_value() -> Result<(), TestError> {
+    const x: i32 = EOF_G;
+    return expect_eq(x, -1);
+}
+
+![test]
+function neg_const_expr_global_folds() -> Result<(), TestError> {
+    const x: i32 = NEG_EXPR_G;
+    return expect_eq(x, -42);
+}
+
+![test]
+function bitwise_const_expr_global_folds() -> Result<(), TestError> {
+    const x: u32 = FLAG_BITS_G;
+    return expect_eq(x, 20);
+}
+
+![test]
+function positive_global_unaffected() -> Result<(), TestError> {
+    // Guard: the integer-fold path must not disturb a plain positive literal.
+    const x: i32 = POS_GUARD_G;
+    return expect_eq(x, 7);
+}

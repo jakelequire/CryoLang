@@ -30,6 +30,14 @@ const DYNAMIC_BASE: u64 = 62;
 /// value byte lengths (RFC 7541 §4.1).
 const ENTRY_OVERHEAD: u64 = 32;
 
+/// Hard ceiling on the cumulative *uncompressed* size of a decoded header
+/// list (each field counts name + value + ENTRY_OVERHEAD per §4.1). HPACK
+/// lets a handful of index bytes expand into a large field, so without
+/// this a small compressed block could decode into an unbounded list - a
+/// decompression bomb. A block that decodes past this is rejected. Kept in
+/// step with the connection's advertised SETTINGS_MAX_HEADER_LIST_SIZE.
+const MAX_DECODED_HEADER_LIST: u64 = 262144;
+
 /// One header field. Owns its name and value bytes.
 type struct HeaderField {
     name:  String;
@@ -301,6 +309,7 @@ type struct HpackDecoder {
     decode(mut &this, data: Slice<u8>) -> Option<Array<HeaderField>> {
         mut out: Array<HeaderField> = Array<HeaderField>::new();
         mut cur: Cursor = Cursor { pos: 0 };
+        mut list_size: u64 = 0;
 
         while (cur.pos < data.length()) {
             const b: u8 = byte_at(data, cur.pos);
@@ -312,13 +321,23 @@ type struct HpackDecoder {
                 };
                 if (index == 0) { out.drop(); return Option::None; }
                 match (this.entry_at(index)) {
-                    Option::Some(field) => { out.push(field); }
+                    Option::Some(field) => {
+                        if (!HpackDecoder::account_and_push(&out, field, &list_size)) {
+                            out.drop();
+                            return Option::None;
+                        }
+                    }
                     Option::None        => { out.drop(); return Option::None; }
                 }
             } else if ((b & 0x40) != 0) {
                 // §6.2.1 Literal with incremental indexing.
                 match (this.decode_literal(data, &cur, 6, true)) {
-                    Option::Some(field) => { out.push(field); }
+                    Option::Some(field) => {
+                        if (!HpackDecoder::account_and_push(&out, field, &list_size)) {
+                            out.drop();
+                            return Option::None;
+                        }
+                    }
                     Option::None        => { out.drop(); return Option::None; }
                 }
             } else if ((b & 0x20) != 0) {
@@ -332,12 +351,33 @@ type struct HpackDecoder {
                 // §6.2.2 / §6.2.3 Literal without indexing / never indexed.
                 // Both use a 4-bit index prefix and do not touch the table.
                 match (this.decode_literal(data, &cur, 4, false)) {
-                    Option::Some(field) => { out.push(field); }
+                    Option::Some(field) => {
+                        if (!HpackDecoder::account_and_push(&out, field, &list_size)) {
+                            out.drop();
+                            return Option::None;
+                        }
+                    }
                     Option::None        => { out.drop(); return Option::None; }
                 }
             }
         }
         return Option::Some(out);
+    }
+
+    /// Account `field` against the decoded header-list budget, then push it
+    /// onto `out`. Returns false - having dropped the un-pushed `field` -
+    /// when the cumulative uncompressed size would exceed
+    /// MAX_DECODED_HEADER_LIST (the HPACK decompression-bomb guard). On a
+    /// false return the caller drops `out`.
+    static account_and_push(out: mut &Array<HeaderField>, field: HeaderField,
+                            list_size: mut &u64) -> boolean {
+        *list_size = *list_size + field.name.length() + field.value.length()
+                     + ENTRY_OVERHEAD;
+        if (*list_size > MAX_DECODED_HEADER_LIST) {
+            return false;
+        }
+        out.push(field);
+        return true;
     }
 
     /// Decode a literal representation whose index field uses

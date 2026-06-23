@@ -29,10 +29,15 @@ type enum OpCode : u8 {
     Pong         = 0xA;
 }
 
-/// One decoded frame. Owns its payload bytes; call `drop`.
+/// One decoded frame. Owns its payload bytes; call `drop`. `masked`
+/// records whether the wire frame set the mask bit, so the connection
+/// layer - which knows whether it is the client or the server - can
+/// enforce the RFC 6455 §5.1 mask-direction rule (the frame reader itself
+/// is role-agnostic).
 type struct Frame {
     fin:     boolean;
     opcode:  OpCode;
+    masked:  boolean;
     payload: Array<u8>;
 
     drop(mut &this) -> void {
@@ -91,12 +96,23 @@ where W: Write {
     return result;
 }
 
-/// Read one frame off `reader`. Unmasks if the mask bit is set. Rejects
-/// reserved opcodes and oversized payloads (`InvalidData`).
+/// Read one frame off `reader`, enforcing the role-independent RFC 6455
+/// framing rules: a set reserved bit (RSV1-3, §5.2, no extension
+/// negotiated), an over-long or fragmented control frame (§5.4-5.5), a
+/// reserved opcode, and an oversized payload are all rejected with
+/// `InvalidData`. The mask-direction rule (§5.1) is role-dependent, so the
+/// decoded `Frame` carries its `masked` bit and the connection layer
+/// enforces it. (Kept single-argument on purpose - see conn.cryo.)
 function read_frame<R>(reader: mut &R) -> Result<Frame, IoError>
 where R: Read {
     mut header: u8[2];
     reader.read_exact(&header[0], 2)?;
+
+    // RSV1-3 (bits 0x70 of byte 0) MUST be clear: we negotiate no
+    // extension that would define them. (§5.2)
+    if ((header[0] & 0x70) != 0) {
+        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+    }
 
     const fin: boolean = (header[0] & 0x80) != 0;
     const masked: boolean = (header[1] & 0x80) != 0;
@@ -120,6 +136,15 @@ where R: Read {
             while (i < 8) { len = (len << 8) | (ext[i] as u64); i++; }
         }
     }
+
+    // Control frames (Close/Ping/Pong) MUST carry the FIN bit and at most
+    // 125 payload bytes (§5.4-5.5). Rejecting here - before the payload is
+    // buffered - stops a 64 MiB "ping" from being read and echoed back as
+    // a Pong (a DoS amplification).
+    if (is_control(opcode) && (!fin || len > 125)) {
+        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+    }
+
     if (len > MAX_PAYLOAD) {
         return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
     }
@@ -142,7 +167,7 @@ where R: Read {
         while (i < len) { p[i] = p[i] ^ key[i % 4]; i++; }
     }
 
-    return Result::Ok(Frame { fin: fin, opcode: opcode, payload: payload });
+    return Result::Ok(Frame { fin: fin, opcode: opcode, masked: masked, payload: payload });
 }
 
 /// Numeric opcode for the wire.
@@ -154,6 +179,19 @@ function op_to_u8(op: OpCode) -> u8 {
         OpCode::Close        => { return 0x8; }
         OpCode::Ping         => { return 0x9; }
         OpCode::Pong         => { return 0xA; }
+    }
+}
+
+/// Is this one of the control opcodes (Close / Ping / Pong)? Control
+/// frames carry the §5.4-5.5 size/fragmentation restrictions.
+function is_control(op: OpCode) -> boolean {
+    match (op) {
+        OpCode::Continuation => { return false; }
+        OpCode::Text         => { return false; }
+        OpCode::Binary       => { return false; }
+        OpCode::Close        => { return true; }
+        OpCode::Ping         => { return true; }
+        OpCode::Pong         => { return true; }
     }
 }
 

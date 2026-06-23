@@ -1430,6 +1430,23 @@ type struct DeclarationEmitter {
                 if (DeclarationEmitter::try_fold_const_real(init_expr, &folded)) {
                     init = LType::const_real(ty, folded);
                 }
+            } else if (tkf == LTypeKind::Integer) {
+                // Integer const-expression initializer that isn't a bare literal -
+                // unary minus / bitwise-not / arithmetic, e.g. `const EOF: i32 = -1;`
+                // or `const FLAGS: u32 = (1 << 4) | (1 << 2)`.  A negative literal
+                // parses as a UnaryExpression (not a Literal), so without this the
+                // leading `-` is dropped and the global silently lands on the
+                // `const_null` (0) fallback below - a real miscompile for every
+                // negative module-level integer constant (EOF, AT_FDCWD, the EAI_*
+                // family, INVALID_HANDLE_VALUE, ...).  Only widths <= 64 fold here;
+                // the u64 two's-complement result truncates to the global's width
+                // in LLVMConstInt, which is exact for those types.
+                if (llvm::LLVMGetIntTypeWidth(ty.raw) <= 64u32) {
+                    mut ifold: u64 = 0;
+                    if (DeclarationEmitter::try_fold_const_int(init_expr, &ifold)) {
+                        init = LType::const_int(ty, ifold, true);
+                    }
+                }
             }
         }
         if (!init.is_valid()) {
@@ -2135,6 +2152,60 @@ type struct DeclarationEmitter {
             if (op == "-") { *out = x - y; return true; }
             if (op == "*") { *out = x * y; return true; }
             if (op == "/") { *out = x / y; return true; }
+            return false;
+        }
+        return false;
+    }
+
+    /// Constant-fold an INTEGER const initializer to its 64-bit two's-complement
+    /// bit pattern.  Handles integer/bool literals, unary `-`/`+`/`~`, and the
+    /// binary operators that are bit-exact in two's complement regardless of
+    /// signedness (`+ - * << & | ^`).  Sign-dependent operators (`>> / %`) and
+    /// anything else (identifiers, calls) return false, leaving the caller on
+    /// the zeroinitializer fallback - so the folder is correct-or-decline, never
+    /// silently wrong.  Computing in u64 keeps every accepted operation
+    /// well-defined wrapping (codegen emits plain LLVMBuildAdd/Sub/Mul) and
+    /// bit-identical to the signed result, which is what makes
+    /// `const EOF: i32 = -1;` carry 0xFFFFFFFF instead of silently becoming 0.
+    static try_fold_const_int(expr: ExpressionNode*, out: u64*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            if (lit.literal_kind == LiteralKind::Integer) {
+                *out = lit.value.parse_int<u64>();
+                return true;
+            }
+            if (lit.literal_kind == LiteralKind::Boolean) {
+                *out = if (lit.value == "true") { 1 } else { 0 };
+                return true;
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            mut a: u64 = 0;
+            if (!DeclarationEmitter::try_fold_const_int(u.operand, &a)) { return false; }
+            const op: string = u.op.lexeme;
+            if (op == "-") { *out = 0u64 - a; return true; }
+            if (op == "+") { *out = a;        return true; }
+            if (op == "~") { *out = ~a;       return true; }
+            return false;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            mut x: u64 = 0;
+            mut y: u64 = 0;
+            if (!DeclarationEmitter::try_fold_const_int(b.left, &x)) { return false; }
+            if (!DeclarationEmitter::try_fold_const_int(b.right, &y)) { return false; }
+            const op: string = b.op.lexeme;
+            if (op == "+")  { *out = x + y;  return true; }
+            if (op == "-")  { *out = x - y;  return true; }
+            if (op == "*")  { *out = x * y;  return true; }
+            if (op == "&")  { *out = x & y;  return true; }
+            if (op == "|")  { *out = x | y;  return true; }
+            if (op == "^")  { *out = x ^ y;  return true; }
+            if (op == "<<") { *out = x << y; return true; }
             return false;
         }
         return false;
