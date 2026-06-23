@@ -5,9 +5,13 @@
 ///! in the project. Each test runs in its own forked child so a panic
 ///! or `Err` return in one test cannot take down the rest of the suite.
 ///!
-///! Output is cargo-style human-readable. Failing tests print their
-///! stderr inline (no capture-and-replay yet); the trailing summary
-///! reports counts and overall verdict.
+///! Output is cargo-style human-readable; the trailing summary reports
+///! counts and overall verdict. The default multi-threaded run streams a
+///! LIVE feed: each result prints the instant it lands (in completion
+///! order), and if the feed stalls the runner names the tests still in
+///! flight - so a hang shows its culprit instead of a frozen screen. The
+///! single-threaded path (`--jobs=1`) keeps the classic ordered
+///! `test NAME ... ok` framing and honours `--format`.
 ///!
 ///! Argument parsing
 ///!
@@ -77,6 +81,19 @@ const ANSI_YELLOW: string = "\x1B[33m";
 const ANSI_DIM:    string = "\x1B[2m";
 const ANSI_BOLD:   string = "\x1B[1m";
 const ANSI_RESET:  string = "\x1B[0m";
+
+// Live parallel feed tuning. `STALL_REPORT_SECS`: how long the feed may go
+// without a single test completing before it prints the in-flight "still
+// running" list, so a hang is named on screen before its per-test watchdog
+// fires (or, with `--timeout=0`, at all). `STALL_POLL_MS`: how often the main
+// thread wakes to look for new results while the queue is momentarily empty;
+// it does NOT throttle throughput (ready results are drained back-to-back
+// without sleeping). Elapsed idle time is measured by accumulating poll
+// intervals rather than reading a clock, which keeps the runner free of any
+// time-module dependency.
+const STALL_REPORT_SECS: u64 = 10;
+const STALL_POLL_MS:     u64 = 50;
+const STALL_REPORT_MS:   u64 = 10000;   // STALL_REPORT_SECS * 1000
 
 // TestFormat: how per-test results are laid out on stdout
 //
@@ -1357,17 +1374,41 @@ function compact_skipped(state: mut &ReporterState, name: Str) -> void {
 //
 // A worker pool runs tests concurrently while preserving the same
 // process-per-test isolation the sequential path uses. Work is handed out
-// by a lock-free atomic cursor; each worker ships its (index, outcome)
-// back over an mpsc channel. The main thread reassembles results into a
-// per-index buffer, then replays the reporter in original order so the
-// on-screen output stays byte-for-byte deterministic regardless of the
-// order tests actually finished in.
+// by a lock-free atomic cursor; each worker ships events back over an mpsc
+// channel. The main thread streams every result the moment it lands, so the
+// feed is live: you watch tests complete in real time instead of staring at
+// a frozen screen until the whole suite finishes.
+//
+// Each worker emits TWO events per test - a `Started` the instant it picks
+// the test up, and a `Finished` carrying the outcome (and captured output).
+// Tracking which `Started`s have no matching `Finished` lets the main thread
+// name the tests still in flight when the feed stalls, so a hang points at
+// its culprit before (or instead of) the per-test watchdog firing.
+//
+// Output order follows completion, not the descriptor table: with workers
+// racing there is no meaningful single order to preserve, and a live feed is
+// worth more than a deterministic-but-delayed replay. Each event prints as
+// one self-contained line so concurrent workers never interleave a partial
+// one. (`--jobs=1` still takes the sequential path, which keeps the classic
+// ordered `test NAME ... ok` framing and honours `--format`.)
 
-/// One finished test, addressed back to its slot in the descriptor table.
-/// `captured` carries the child's output (moved across the channel; `String`
-/// is structurally `Send`); empty when capture is off.
+/// Which half of a test's lifecycle a `WorkerResult` reports.
+type enum WorkerEventKind {
+    /// A worker has just picked this test up and is about to run it. Carries
+    /// no outcome; its only job is to mark the test in-flight so a stall can
+    /// name it.
+    Started;
+    /// The test finished; `outcome` and `captured` are meaningful.
+    Finished;
+}
+
+/// One lifecycle event for a test, addressed back to its slot in the
+/// descriptor table. `captured` carries the child's output on a `Finished`
+/// event (moved across the channel; `String` is structurally `Send`); it is
+/// empty on `Started` and whenever capture is off.
 type struct WorkerResult {
     idx:      u64;
+    kind:     WorkerEventKind;
     outcome:  TestOutcome;
     captured: String;
 
@@ -1401,87 +1442,77 @@ type struct WorkerCtx {
 }
 
 /// Pool worker body. Pulls test indices off the shared cursor until the
-/// runnable list is exhausted, running each in its own child process and
-/// shipping the outcome back. `ctx` (including its `Sender`) is dropped on
-/// return, releasing this worker's sender so the channel can disconnect
-/// once every worker has finished.
+/// runnable list is exhausted, running each in its own child process. For
+/// each test it ships a `Started` event the instant it picks the test up and
+/// a `Finished` event carrying the outcome once the child exits, so the main
+/// thread can both stream results live and name the tests still in flight
+/// during a stall. `ctx` (including its `Sender`) is dropped on return,
+/// releasing this worker's sender so the channel can disconnect once every
+/// worker has finished.
 function test_worker(ctx: WorkerCtx) -> void {
     loop {
         const k: u64 = (*ctx.counter).fetch_add(1u64, MemoryOrder::Relaxed);
         if (k >= ctx.n_runnable) { break; }
         const idx: u64 = ctx.runnable[k];
+
+        // Announce the test as in-flight before the (potentially hanging)
+        // child runs, so a stall report can point at it.
+        const start_ev: WorkerResult = WorkerResult {
+            idx: idx, kind: WorkerEventKind::Started,
+            outcome: TestOutcome::Pass, captured: String::new()
+        };
+        match (ctx.sender.send(start_ev)) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+
         const d: TestDescriptor = ctx.descriptors[idx];
         mut tr: TestRun = run_one(d, idx, ctx.timeout_secs, ctx.capture);
-        const wr: WorkerResult = WorkerResult {
-            idx: idx, outcome: tr.outcome, captured: tr.take_captured()
+        const fin_ev: WorkerResult = WorkerResult {
+            idx: idx, kind: WorkerEventKind::Finished,
+            outcome: tr.outcome, captured: tr.take_captured()
         };
         tr.drop();
-        match (ctx.sender.send(wr)) {
+        match (ctx.sender.send(fin_ev)) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }
     }
 }
 
-/// Run the `runnable` tests across `jobs` worker threads and return a
-/// `count`-sized buffer of `TestRun`s indexed by descriptor position.
-/// Non-runnable slots are left as a placeholder the caller never reads.
-function execute_parallel(descriptors: TestDescriptor*, count: u64,
-                          runnable: u64*, n_runnable: u64,
-                          timeout_secs: u32, jobs: u32,
-                          capture: boolean) -> Array<TestRun> {
-    mut results: Array<TestRun> = Array::with_capacity(count);
-    mut p: u64 = 0;
-    while (p < count) {
-        results.push(TestRun::bare(TestOutcome::Pass)); // placeholder; maybe overwritten
-        p = p + 1;
-    }
-
-    // Shared work cursor on the stack; workers borrow it by pointer and we
-    // join them all before this frame returns (scoped-thread idiom).
-    mut counter: Atomic<u64> = Atomic<u64>::new(0u64);
-    const cptr: Atomic<u64>* = &counter;
-
-    mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel<WorkerResult>();
-
-    {
-        mut scope: thread::Scope = thread::Scope::new();
-        mut w: u32 = 0;
-        while (w < jobs) {
-            const ctx: WorkerCtx = WorkerCtx {
-                counter:      cptr,
-                runnable:     runnable,
-                n_runnable:   n_runnable,
-                descriptors:  descriptors,
-                timeout_secs: timeout_secs,
-                capture:      capture,
-                sender:       rx.sender(),
-            };
-            scope.spawn<WorkerCtx>(ctx, test_worker);
-            w = w + 1;
-        }
-
-        // Drain exactly `n_runnable` outcomes as the workers produce them.
-        // Bounded by the known count, so this never depends on channel
-        // disconnection to terminate.
-        mut got: u64 = 0;
-        while (got < n_runnable) {
-            match (rx.recv()) {
-                Result::Ok(mut wr) => {
-                    results.set(wr.idx, TestRun {
-                        outcome: wr.outcome, captured: wr.take_captured()
-                    });
-                    wr.drop();
-                    got = got + 1;
+/// Print the live feed's "still running" line: every test that has started
+/// but not yet reported a result. Called when the feed stalls (no completion
+/// for `stalled_secs`), so a hang names its culprit on screen before the
+/// per-test watchdog fires - or at all, when `--timeout=0` disables it. The
+/// list is capped so a wide stall on a large suite stays one readable line.
+function print_in_flight(descriptors: TestDescriptor*, count: u64,
+                         in_flight: &Array<boolean>, n_in_flight: u64,
+                         stalled_secs: u64) -> void {
+    intrinsics::printf("[stalled %llu s] still running (%llu): ",
+        stalled_secs, n_in_flight);
+    const cap: u64 = 12;
+    mut shown: u64 = 0;
+    mut i: u64 = 0;
+    while (i < count) {
+        match (in_flight.get_ref(i)) {
+            Option::Some(b) => {
+                if (*b) {
+                    if (shown >= cap) {
+                        intrinsics::printf(", ... and %llu more", n_in_flight - shown);
+                        break;
+                    }
+                    if (shown > 0u64) { intrinsics::printf(", "); }
+                    const d: TestDescriptor = descriptors[i];
+                    intrinsics::printf("%.*s", d.name.length() as i32, d.name.as_ptr());
+                    shown = shown + 1;
                 }
-                Result::Err(_) => { break; }
             }
+            Option::None => { }
         }
-
-        scope.join_all();
+        i = i + 1;
     }
-
-    return results;
+    intrinsics::printf("\n");
+    libc::fflush(null);
 }
 
 // TestRunner: owns the run's configuration, tally, and reporter state and
@@ -1491,10 +1522,11 @@ function execute_parallel(descriptors: TestDescriptor*, count: u64,
 // passed by reference through a pile of free functions.
 //
 // Target-gated primitives (`run_one`, `num_cpus`, `arm_watchdog`) and the
-// thread-pool core (`test_worker`, `execute_parallel`) stay free functions:
-// the first because `![target(...)]` variants can't be methods, the second
-// because the worker body is handed to `thread::spawn` as a plain function
-// pointer.
+// pool worker body (`test_worker`) stay free functions: the first because
+// `![target(...)]` variants can't be methods, the second because the worker
+// is handed to `thread::spawn` as a plain function pointer. The live drain
+// loop itself is a `TestRunner` method (`run_parallel`), so the tally and
+// reporter travel with the object.
 
 type struct TestRunner {
     opts:        RunOptions;
@@ -1588,6 +1620,71 @@ type struct TestRunner {
         intrinsics::printf("----\n");
     }
 
+    /// One self-contained result line for the live parallel feed. The
+    /// sequential reporters split a test across `begin` (prefix, no newline)
+    /// and `end` (outcome word), which only reads correctly when one test
+    /// runs at a time. Concurrent workers would interleave those halves, so
+    /// the live feed instead prints the whole line atomically on completion:
+    /// a fixed-width status token (color-coded when active), the
+    /// fully-qualified name, then any detail. Format-independent - the
+    /// grouped Pretty/Compact layouts need ordered, buffered results, which
+    /// the live path deliberately does without.
+    report_live_finish(&this, name: Str, outcome: TestOutcome,
+                       was_should_panic: boolean) -> void {
+        const active: boolean = this.opts.color_active;
+        match (outcome) {
+            TestOutcome::Pass => {
+                emit_ansi(active, ANSI_GREEN);
+                intrinsics::printf("ok  ");
+                emit_ansi(active, ANSI_RESET);
+                intrinsics::printf("  %.*s", name.length() as i32, name.as_ptr());
+                if (was_should_panic) {
+                    intrinsics::printf("  (panicked as expected)");
+                }
+                intrinsics::printf("\n");
+            }
+            TestOutcome::Fail(code, signal, signaled) => {
+                emit_ansi(active, ANSI_RED);
+                intrinsics::printf("FAIL");
+                emit_ansi(active, ANSI_RESET);
+                intrinsics::printf("  %.*s", name.length() as i32, name.as_ptr());
+                if (signaled) {
+                    intrinsics::printf("  (panicked, signal %d)\n", signal);
+                } else {
+                    intrinsics::printf("  (exit %d)\n", code);
+                }
+            }
+            TestOutcome::Skipped => {
+                emit_ansi(active, ANSI_YELLOW);
+                intrinsics::printf("skip");
+                emit_ansi(active, ANSI_RESET);
+                intrinsics::printf("  %.*s\n", name.length() as i32, name.as_ptr());
+            }
+            TestOutcome::DidNotPanic => {
+                emit_ansi(active, ANSI_RED);
+                intrinsics::printf("FAIL");
+                emit_ansi(active, ANSI_RESET);
+                intrinsics::printf("  %.*s  (test did not panic as expected)\n",
+                    name.length() as i32, name.as_ptr());
+            }
+            TestOutcome::Timeout(secs) => {
+                emit_ansi(active, ANSI_RED);
+                intrinsics::printf("FAIL");
+                emit_ansi(active, ANSI_RESET);
+                intrinsics::printf("  %.*s  (timed out after %u s)\n",
+                    name.length() as i32, name.as_ptr(), secs);
+            }
+            TestOutcome::RunnerError(code) => {
+                emit_ansi(active, ANSI_RED);
+                intrinsics::printf("FAIL");
+                emit_ansi(active, ANSI_RESET);
+                intrinsics::printf("  %.*s  (runner error: errno=%d)\n",
+                    name.length() as i32, name.as_ptr(), code);
+            }
+        }
+        libc::fflush(null);
+    }
+
     // ---- Drivers ----
 
     /// `--list`: print each matching test name and return without running.
@@ -1654,73 +1751,137 @@ type struct TestRunner {
         }
     }
 
-    /// Parallel driver: run matching tests across `jobs` workers, then
-    /// replay the reporter in original index order so the on-screen output
-    /// stays byte-for-byte identical to the sequential path.
+    /// Parallel driver (live): run matching tests across `jobs` workers and
+    /// stream each result the instant it lands, in completion order. Filtered
+    /// and ignored-skipped tests - which never reach a worker - are accounted
+    /// for in a quick pre-pass; the rest run concurrently while the main
+    /// thread drains events as fast as they arrive, sleeping only when the
+    /// queue is momentarily empty. Tracking which started tests have not yet
+    /// finished lets a stall (no completion for `STALL_REPORT_SECS`) print the
+    /// names still in flight, so a hang is visible long before its watchdog.
     run_parallel(mut &this, jobs: u32, to_run: u64) -> void {
-        // Indices that will actually execute (match filter, not skipped-ignored).
-        mut runnable: Array<u64> = Array::with_capacity(to_run);
+        // Pre-pass on the main thread: report + tally the tests that won't be
+        // executed (filtered / ignored-skipped), and collect the runnable
+        // indices. `in_flight[i]` tracks whether descriptor `i` is currently
+        // running, for the stall report.
+        mut runnable:  Array<u64>     = Array::with_capacity(to_run);
+        mut in_flight: Array<boolean> = Array::with_capacity(this.count);
         mut i: u64 = 0;
         while (i < this.count) {
+            in_flight.push(false);
             const d: TestDescriptor = this.descriptors[i];
-            if (name_matches(d.name, &this.opts) && (!d.ignored || this.opts.include_ignored)) {
+            if (!name_matches(d.name, &this.opts)) {
+                this.counts.filtered = this.counts.filtered + 1;
+            } else if (d.ignored && !this.opts.include_ignored) {
+                if (!this.opts.quiet) {
+                    this.report_live_finish(d.name, TestOutcome::Skipped, false);
+                }
+                this.counts.ignored = this.counts.ignored + 1;
+            } else {
                 runnable.push(i);
             }
             i = i + 1;
         }
 
-        mut results: Array<TestRun> = execute_parallel(
-            this.descriptors, this.count, runnable.as_ptr(), runnable.length(),
-            this.opts.timeout_secs, jobs, this.opts.capture);
-
-        // Replay: drive the reporter sequentially, in index order.
-        i = 0;
-        while (i < this.count) {
-            const d: TestDescriptor = this.descriptors[i];
-
-            if (!name_matches(d.name, &this.opts)) {
-                this.counts.filtered = this.counts.filtered + 1;
-                i = i + 1;
-                continue;
-            }
-
-            if (d.ignored && !this.opts.include_ignored) {
-                if (!this.opts.quiet) {
-                    this.report_skipped(d.name);
-                }
-                this.counts.ignored = this.counts.ignored + 1;
-                i = i + 1;
-                continue;
-            }
-
-            this.report_begin(d.name);
-            mut outcome: TestOutcome = TestOutcome::RunnerError(0);
-            match (results.get_ref(i)) {
-                Option::Some(trp) => { outcome = (*trp).outcome; }
-                Option::None      => { }
-            }
-            const failed: boolean = is_failure(outcome);
-            this.report_end(outcome, d.should_panic);
-            if (this.should_show(failed)) {
-                match (results.get_ref(i)) {
-                    Option::Some(trp) => {
-                        if ((*trp).captured.length() > 0u64) {
-                            this.report_output(d.name, &(*trp).captured);
-                        }
-                    }
-                    Option::None => { }
-                }
-            }
-
-            if (failed) {
-                this.counts.failed = this.counts.failed + 1;
-            } else {
-                this.counts.passed = this.counts.passed + 1;
-            }
-            i = i + 1;
+        const n_runnable: u64 = runnable.length();
+        if (n_runnable == 0u64) {
+            in_flight.drop();
+            runnable.drop();
+            return;
         }
 
-        results.drop();
+        // Shared work cursor on the stack; workers borrow it by pointer and we
+        // join them all before this frame returns (scoped-thread idiom).
+        mut counter: Atomic<u64> = Atomic<u64>::new(0u64);
+        const cptr: Atomic<u64>* = &counter;
+
+        mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel<WorkerResult>();
+
+        {
+            mut scope: thread::Scope = thread::Scope::new();
+            mut w: u32 = 0;
+            while (w < jobs) {
+                const ctx: WorkerCtx = WorkerCtx {
+                    counter:      cptr,
+                    runnable:     runnable.as_ptr(),
+                    n_runnable:   n_runnable,
+                    descriptors:  this.descriptors,
+                    timeout_secs: this.opts.timeout_secs,
+                    capture:      this.opts.capture,
+                    sender:       rx.sender(),
+                };
+                scope.spawn<WorkerCtx>(ctx, test_worker);
+                w = w + 1;
+            }
+
+            // Live drain. Loop until every runnable test has reported a
+            // `Finished`. Ready events are handled back-to-back; only an empty
+            // queue sleeps, and only then do we consider a stall report. Idle
+            // time is tracked by accumulating poll intervals (`idle_ms`),
+            // reset whenever any event lands; `next_report_ms` re-arms one
+            // interval ahead so a persistent hang reprints every
+            // `STALL_REPORT_SECS` with a rising count.
+            mut finished:       u64 = 0;
+            mut n_in_flight:    u64 = 0;
+            mut idle_ms:        u64 = 0;
+            mut next_report_ms: u64 = STALL_REPORT_MS;
+            loop {
+                if (finished >= n_runnable) { break; }
+                match (rx.try_recv()) {
+                    Result::Ok(mut ev) => {
+                        match (ev.kind) {
+                            WorkerEventKind::Started => {
+                                in_flight.set(ev.idx, true);
+                                n_in_flight = n_in_flight + 1;
+                            }
+                            WorkerEventKind::Finished => {
+                                in_flight.set(ev.idx, false);
+                                if (n_in_flight > 0u64) {
+                                    n_in_flight = n_in_flight - 1;
+                                }
+                                const d: TestDescriptor = this.descriptors[ev.idx];
+                                const outcome: TestOutcome = ev.outcome;
+                                const failed: boolean = is_failure(outcome);
+                                this.report_live_finish(d.name, outcome, d.should_panic);
+                                if (this.should_show(failed) && ev.captured.length() > 0u64) {
+                                    this.report_output(d.name, &ev.captured);
+                                }
+                                if (failed) {
+                                    this.counts.failed = this.counts.failed + 1;
+                                } else {
+                                    this.counts.passed = this.counts.passed + 1;
+                                }
+                                finished = finished + 1;
+                            }
+                        }
+                        ev.drop();
+                        // Progress: clear the idle timer and re-arm the report.
+                        idle_ms = 0u64;
+                        next_report_ms = STALL_REPORT_MS;
+                    }
+                    Result::Err(e) => {
+                        match (e) {
+                            // All senders dropped before every result arrived:
+                            // workers are gone, nothing more is coming.
+                            TryRecvError::Disconnected => { break; }
+                            TryRecvError::Empty => {
+                                idle_ms = idle_ms + STALL_POLL_MS;
+                                if (n_in_flight > 0u64 && idle_ms >= next_report_ms) {
+                                    print_in_flight(this.descriptors, this.count,
+                                        &in_flight, n_in_flight, idle_ms / 1000u64);
+                                    next_report_ms = next_report_ms + STALL_REPORT_MS;
+                                }
+                                thread::sleep_ms(STALL_POLL_MS);
+                            }
+                        }
+                    }
+                }
+            }
+
+            scope.join_all();
+        }
+
+        in_flight.drop();
         runnable.drop();
     }
 
@@ -1730,7 +1891,7 @@ type struct TestRunner {
         if (to_run == 1) {
             intrinsics::printf("  CRYO TESTS  /  unit  --  running 1 test\n");
         } else if (parallel) {
-            intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests on %u threads\n",
+            intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests on %u threads (live, completion order)\n",
                 to_run, jobs);
         } else {
             intrinsics::printf("  CRYO TESTS  /  unit  --  running %llu tests\n", to_run);
