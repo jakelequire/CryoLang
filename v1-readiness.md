@@ -87,8 +87,13 @@ Legend: ☐ todo · ◐ in progress · ☑ done · ⊘ won't-fix / deferred
   rebuilds the STAGE2 compiler it tests with, but does NOT refresh `compiler/build/cryo.exe` (the
   `make cryo` output) — run `make cryo` before manually testing the binary, or you'll exercise a
   stale build.
-- ☐ T3.3 CLI: unknown flags silently accepted; empty `--output=` drops `-o`; failure summaries to
-  stdout not stderr (`CLI/_module.cryo`, `commands.cryo`).
+- ◐ T3.3 CLI robustness. **Done:** failure summaries ("Project compilation failed", "Test build
+  failed", "Check failed", "Compilation failed") now go to **stderr** (`fmt::eprintf`) so CI that
+  captures stderr sees them; "succeeded" messages stay on stdout (`CLI/commands.cryo`). *(validated:
+  make test 1268/0)*
+  **Deferred (documented, not done):** unknown-flag rejection (needs a per-command allow-list —
+  risk of breaking valid flags; many flags aren't even in `FlagKind`/help today) and empty
+  `--output=` silently dropping `-o`. Both are minor and lower-value; left for a maintainer pass.
 - ◐ T3.4 Flaky `Stdlib::NetHttp2::loopback_h2c_round_trip` ("h2 server bind failed"). **Fix:**
   replaced the single fixed PID-derived port with a bind-retry loop (walks up to 50 ports) in
   `tests/tests/stdlib/net_http2.cryo`. (Root cause: fixed port busy / in TIME_WAIT.)
@@ -115,7 +120,9 @@ Legend: ☐ todo · ◐ in progress · ☑ done · ⊘ won't-fix / deferred
   live contradiction remains in `[1.0.0]`; "Iterator" now appears only under `[Unreleased]`.)
 - ☑ T5.2 `docs/cryo.md` `macro` claim corrected — `macro` is NOT a reserved word (verified: no
   `macro`/`KwMacro` token in `lex/_module.cryo`); it lexes as an ordinary identifier.
-- ☐ T5.3 `docs/grammar.md` omits `for (x in …)`, range `../..=`, `await`/`yield`/`delete`.
+- ☑ T5.3 `docs/grammar.md` completed: added range `..`/`..=` to `BinOp`, the `for (Ident in Expr)`
+  loop form to `For`, and `delete Expr` / `await Expr` / `yield Expr?` to `Primary` (forms verified
+  against `expr_parser.cryo`).
 - ☑ T5.4 README stdlib table updated: `net` now lists TCP/UDP/DNS/TLS/HTTP2/WebSocket; added
   `encoding`, `time`, `random` rows (descriptions sourced from `stdlib/lib.cryo`).
 - ☐ T5.5 No native-Windows CI job (only mingw cross + wine).
