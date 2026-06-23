@@ -408,11 +408,14 @@ entry_point = "src/tool/main.cryo"
 | `io` | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping. |
 | `fmt` | `Display`, `Debug`, `Formatter<W>`, `FmtWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`. |
 | `json` | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`. |
+| `encoding` | Byte↔text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest. |
 | `fs` | `Path` / `PathBuf`. `OpenOptions` builder, `File` (`Read + Write`). Path manipulation. |
 | `ffi` | The C ABI boundary. `libc` houses every `extern "C"` the stdlib needs. `cstr` for `CStr` / `CString`. |
 | `env` | `args()`, `var()`, `set_var()`, `process_exit()`. |
 | `math` | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`. |
-| `net` | TCP sockets and an HTTP/1.1 layer: `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server (`HttpServer::with_router(addr, &router).run()`), `Client::get`/`post`. |
+| `time` | `Duration` (normalized seconds + nanoseconds), `Instant` (monotonic clock; `now`/`elapsed`), system-clock access for Unix timestamps, and `sleep(Duration)`. |
+| `random` | `SecureRng` over the kernel CSPRNG (`getrandom` / `RtlGenRandom`): `fill`, `next_u64`, unbiased range sampling, and shuffling. |
+| `net` | TCP/UDP sockets, DNS, IPv4/IPv6 addressing, and TLS. HTTP/1.1 (`Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server `HttpServer::with_router(addr, &router).run()`, `Client::get`/`post`), HTTP/2 (h2c + HPACK), and WebSocket. |
 | `process` | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`. |
 | `sync` | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
 | `thread` | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |

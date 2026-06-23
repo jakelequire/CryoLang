@@ -66,3 +66,35 @@ function get_returns_independent_owned_copy() -> Result<(), TestError> {
         }
     }
 }
+
+// Header-injection defense: an embedded CRLF in a value (here smuggling a
+// forged `Evil:` header) must be stripped so `write_to` can't split the
+// serialized message into two headers (response splitting / request
+// smuggling).
+![test]
+function insert_strips_crlf_from_value() -> Result<(), TestError> {
+    mut h: Headers = Headers::new();
+    h.insert(Str::new("X-Test"), Str::new("a\r\nEvil: 1"));
+    match (h.get(Str::new("x-test"))) {
+        Option::Some(mut v) => {
+            const ok: boolean = v.as_str().equals(&Str::new("aEvil: 1"));
+            v.drop();
+            h.drop();
+            return expect(ok, Str::new("CR/LF should be stripped from header value"));
+        }
+        Option::None => {
+            h.drop();
+            return bail(Str::new("inserted header missing"));
+        }
+    }
+}
+
+// CRLF in the name must also be stripped (before lowercasing).
+![test]
+function insert_strips_crlf_from_name() -> Result<(), TestError> {
+    mut h: Headers = Headers::new();
+    h.insert(Str::new("X-\r\nTest"), Str::new("v"));
+    const ok: boolean = h.contains(Str::new("x-test"));
+    h.drop();
+    return expect(ok, Str::new("CR/LF should be stripped from header name"));
+}

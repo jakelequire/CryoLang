@@ -205,10 +205,24 @@ type struct Http2Connection<S> {
         }
         if (fr.ftype == frame::FRAME_WINDOW_UPDATE) {
             const inc: i64 = read_u31(fr.payload.as_slice()) as i64;
+            // RFC 7540 §6.9.1: a 0 increment is a PROTOCOL_ERROR, and a flow-
+            // control window must never exceed 2^31-1 (FLOW_CONTROL_ERROR).
+            // The 0 check also rejects a short/truncated payload, for which
+            // read_u31 returns 0.
+            const WINDOW_MAX: i64 = 2147483647;   // 2^31 - 1
+            if (inc == 0) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
             if (fr.stream_id == 0) {
                 this.conn_send_window = this.conn_send_window + inc;
+                if (this.conn_send_window > WINDOW_MAX) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
             } else {
                 this.stream_send_window = this.stream_send_window + inc;
+                if (this.stream_send_window > WINDOW_MAX) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
             }
             return Result::Ok(true);
         }

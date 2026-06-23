@@ -76,13 +76,26 @@ function body_eq(body: &Array<u8>, expected: Str) -> boolean {
 
 ![test]
 function loopback_h2c_round_trip() -> Result<(), TestError> {
-    // PID-derived port in a band distinct from the other net tests so a
-    // full-suite run never collides.
-    const port: u16 = (44000 + (libc::getpid() % 20000)) as u16;
-
-    mut server: Http2Server = match (Http2Server::bind(SocketAddr::localhost_v4(port))) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { return bail(Str::new("h2 server bind failed")); }
+    // Find a free loopback port: try a PID-derived base in a band distinct
+    // from the other net tests, walking upward on failure. A single fixed
+    // PID-derived port flaked with "h2 server bind failed" when it happened to
+    // be busy or in TIME_WAIT from a prior run; the retry makes the bind
+    // deterministic.
+    const base: u16 = (44000 + (libc::getpid() % 20000)) as u16;
+    mut port: u16 = base;
+    mut server_opt: Option<Http2Server> = Option::None;
+    mut attempt: u16 = 0;
+    while (attempt < 50) {
+        port = base + attempt;
+        match (Http2Server::bind(SocketAddr::localhost_v4(port))) {
+            Result::Ok(s)  => { server_opt = Option::Some(s); break; }
+            Result::Err(_) => { }
+        }
+        attempt = attempt + 1;
+    }
+    mut server: Http2Server = match (server_opt) {
+        Option::Some(s) => { s }
+        Option::None    => { return bail(Str::new("h2 server bind failed")); }
     };
 
     const handle: thread::JoinHandle<i32> =

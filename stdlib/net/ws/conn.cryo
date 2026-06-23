@@ -28,6 +28,16 @@ import net::ws::handshake;
 
 const MAX_HEAD: u64 = 16384;
 
+/// Cap on a single reassembled message. Fragmentation lets a peer stream an
+/// unbounded number of continuation frames into one message; without a ceiling
+/// that is an OOM DoS. 64 MiB matches the single-frame cap in `ws::frame`.
+const MAX_MESSAGE: u64 = 67108864;          // 64 MiB
+
+/// Cap on control frames (Ping/Pong) serviced within a single `recv` before a
+/// data frame arrives. A peer that streams only Pings would otherwise pin the
+/// connection in unbounded auto-Pong work and never yield a message.
+const MAX_CONTROL_PER_RECV: u64 = 256;
+
 /// A complete application message. Owns its payload.
 type enum Message {
     Text(String);
@@ -75,6 +85,7 @@ type struct WebSocket<S> {
     where S: Read + Write {
         mut acc: Array<u8> = Array<u8>::new();
         mut binary: boolean = false;
+        mut control_count: u64 = 0;
         loop {
             mut fr: Frame = match (frame::read_frame(this.inner)) {
                 Result::Ok(f)  => { f }
@@ -99,8 +110,20 @@ type struct WebSocket<S> {
                         Result::Err(_) => { }
                     }
                     fr.drop();
+                    control_count = control_count + 1;
+                    if (control_count > MAX_CONTROL_PER_RECV) {
+                        acc.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
                 }
-                OpCode::Pong => { fr.drop(); }
+                OpCode::Pong => {
+                    fr.drop();
+                    control_count = control_count + 1;
+                    if (control_count > MAX_CONTROL_PER_RECV) {
+                        acc.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
                 OpCode::Close => {
                     fr.drop();
                     acc.drop();
@@ -112,6 +135,10 @@ type struct WebSocket<S> {
                     acc.append(fr.payload.as_slice());
                     const fin: boolean = fr.fin;
                     fr.drop();
+                    if (acc.length() > MAX_MESSAGE) {
+                        acc.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
                     if (fin) { return Result::Ok(build_message(acc, binary)); }
                 }
                 OpCode::Binary => {
@@ -119,12 +146,20 @@ type struct WebSocket<S> {
                     acc.append(fr.payload.as_slice());
                     const fin: boolean = fr.fin;
                     fr.drop();
+                    if (acc.length() > MAX_MESSAGE) {
+                        acc.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
                     if (fin) { return Result::Ok(build_message(acc, binary)); }
                 }
                 OpCode::Continuation => {
                     acc.append(fr.payload.as_slice());
                     const fin: boolean = fr.fin;
                     fr.drop();
+                    if (acc.length() > MAX_MESSAGE) {
+                        acc.drop();
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
                     if (fin) { return Result::Ok(build_message(acc, binary)); }
                 }
             }

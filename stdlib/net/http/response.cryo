@@ -26,6 +26,9 @@ import net::http::request;
 // panic-abort on) gigabytes before a single body byte arrives - a remote
 // DoS.  Mirrors `request::MAX_BODY` (16 MiB) on the server side.
 const MAX_BODY: u64 = 16777216;
+/// Cap on the number of response header lines (slow memory-exhaustion DoS
+/// guard). Mirrors `request::MAX_HEADER_COUNT`.
+const MAX_HEADER_COUNT: u64 = 100;
 
 type struct Response {
     status: StatusCode;
@@ -161,6 +164,7 @@ type struct Response {
             body: Array::new()
         };
 
+        mut header_count: u64 = 0;
         loop {
             mut header_line: String = String::new();
             request::read_line(reader, &header_line, 8192)?;
@@ -168,6 +172,10 @@ type struct Response {
                 break;
             }
             if (!resp.headers.parse_line(header_line.as_str())) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            header_count = header_count + 1;
+            if (header_count > MAX_HEADER_COUNT) {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
         }
