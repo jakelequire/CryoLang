@@ -236,6 +236,26 @@ function parse_trailing_data() -> Result<(), TestError> {
     }
 }
 
+// Trailing data after a HEAP-owning value: the parsed tree (array + string)
+// must be dropped before erroring, not leaked. Exercises the owned.drop() on
+// the trailing-data path that a scalar input like "1 2" (above) would not -
+// a leak here would surface under the valgrind-gated CI run.
+![test]
+function parse_trailing_data_drops_owned_tree() -> Result<(), TestError> {
+    match (parser::parse(s("[\"abc\"] x", 9))) {
+        Result::Ok(v) => { mut owned: JsonValue = v; owned.drop(); return bail(s("expected error", 14)); }
+        Result::Err(e) => {
+            mut err: JsonError = e;
+            const got: boolean = match (err.kind) {
+                JsonErrorKind::TrailingData => { true }
+                _                           => { false }
+            };
+            err.drop();
+            return expect(got, s("expected TrailingData", 21));
+        }
+    }
+}
+
 ![test]
 function parse_invalid_escape() -> Result<(), TestError> {
     match (parser::parse(s("\"a\\xb\"", 6))) {

@@ -27,6 +27,11 @@ import net::http::headers;
 const HTTP_VERSION: Str = Str::new("HTTP/1.1");
 const MAX_HEADER_LINE: u64 = 8192;
 const MAX_BODY: u64 = 16777216;  // 16 MiB; hard cap against runaway Content-Length
+/// Cap on the number of header lines. Each line is already bounded by
+/// MAX_HEADER_LINE, but without a count cap the parse loop grows the Headers
+/// map without bound on a peer that sends endless header lines (slow
+/// memory-exhaustion DoS). 100 mirrors common server defaults.
+const MAX_HEADER_COUNT: u64 = 100;
 
 type struct Request {
     method:  Method;
@@ -147,6 +152,7 @@ type struct Request {
         // Header block: lines until an empty one.  The loop body owns
         // each `header_line` String; auto-drop synthesis emits the
         // per-iteration drop at scope exit.
+        mut header_count: u64 = 0;
         loop {
             mut header_line: String = String::new();
             read_line(reader, &header_line, MAX_HEADER_LINE)?;
@@ -154,6 +160,10 @@ type struct Request {
                 break;
             }
             if (!req.headers.parse_line(header_line.as_str())) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            header_count = header_count + 1;
+            if (header_count > MAX_HEADER_COUNT) {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
         }

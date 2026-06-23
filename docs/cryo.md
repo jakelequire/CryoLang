@@ -2367,7 +2367,7 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
 | Struct field defaults (`field: T = expr`) | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
-| Macros | No macro system exists. The lexer and parser reserve the `macro` syntax for a future hygienic macro system. |
+| Macros | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one. |
 | `![pure]` | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics). |
 | `![const]` | Reserved. Will mark a function as evaluable at compile time. |
 | `![noreturn]` | Reserved. Will declare a function that never returns normally. |
