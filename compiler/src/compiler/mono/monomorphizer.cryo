@@ -330,7 +330,19 @@ type struct Monomorphizer {
     /// `specialize_calls_in_module` queues new instantiations.  Returns true on success.
     drain_pending_worklist(mut &this) -> boolean {
         mut errors: i64 = 0;
+        // Same type-growing-instantiation ceiling as `process_all` (this drain
+        // path was previously uncapped, so an unbounded tower hung hard here).
+        const max_iterations: i64 = 100000 + this.arena.type_count() * 100;
+        mut drain_iters: i64 = 0;
         while (this.state.pending_cursor < this.state.pending.length) {
+            drain_iters += 1;
+            if (drain_iters > max_iterations) {
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("monomorphization exceeded %lld instantiations (type-growing generic that grows its type arguments at each level)",
+                        max_iterations)));
+                this.state.error_count += 1;
+                break;
+            }
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
             const key: string = this.make_key(request);

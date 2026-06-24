@@ -844,6 +844,76 @@ type struct TypeArena {
         return false;
     }
 
+    /// True if `ty` (or a type nested inside it) is an instantiation of the
+    /// generic type named `owner_qname` (its fully-qualified name) whose
+    /// type-arguments are a STRICT structural superterm of the owner's own
+    /// parameters - i.e. a generic param appears WRAPPED (pointer / reference /
+    /// array / nested generic), not bare.
+    ///
+    /// This is the signature shape that towers infinitely under eager
+    /// monomorphization: `Option<T>::as_ref -> Option<T*>` grows the args one
+    /// pointer level per instantiation, minting `Option<T*>`, `Option<T**>`,
+    /// ... forever.  A non-generic method whose return (or a param) matches
+    /// this MUST be instantiated lazily at call sites, never eagerly, exactly
+    /// like a self-returning trait-default combinator.
+    ///
+    /// The owner is identified by NAME (not a `TypeRef`): the owner handle the
+    /// caller has at signature-resolution time is often an invalid `TypeRef`
+    /// for `implement` blocks (the receiver is back-filled later), so an
+    /// identity check would silently never match.
+    ///
+    /// NOT matched (these are finite, so they stay eager):
+    ///   - `Option<T>`   bare param arg  -> same level, no growth
+    ///   - `Option<i32*>` concrete arg   -> no param, materialized once
+    ///   - `&Option<T>` (`&this`)        -> peels to the bare-param owner
+    ///   - `Foo<T>` for a different base than the owner
+    is_self_growing_instantiation(&this, ty: TypeRef, owner_qname: SymbolStr) -> boolean {
+        if (!ty.is_valid() || !owner_qname.is_valid()) { return false; }
+        const t: Type* = this.lookup(ty.id);
+        if (t == null) { return false; }
+        // Peel transparent wrappers so `&Option<T*>` / `Option<T*>[]` match.
+        if (t.kind == TypeKind::Pointer) {
+            return this.is_self_growing_instantiation((t as PointerType*).pointee, owner_qname);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.is_self_growing_instantiation((t as ReferenceType*).referent, owner_qname);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.is_self_growing_instantiation((t as ArrayType*).element, owner_qname);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.is_self_growing_instantiation((t as OptionalType*).wrapped, owner_qname);
+        }
+        if (t.kind != TypeKind::InstantiatedType) { return false; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        // Same generic base as the owner, matched by qualified name.
+        const bn: SymbolStr = this.get_qualified_name(inst.generic_base);
+        const same_base: boolean = bn.is_valid() && bn.equals(owner_qname);
+        if (!same_base) {
+            // Different base: the owner base may be nested deeper
+            // (e.g. `Pair<i32, Option<T*>>` on owner `Option`).
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (this.is_self_growing_instantiation(inst.type_args[i], owner_qname)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Same base as the owner: a STRICT superterm has at least one arg that
+        // contains a generic param but is not the bare param itself.
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            const arg: TypeRef = inst.type_args[i];
+            const at: Type* = this.lookup(arg.id);
+            if (at == null) { continue; }
+            const bare_param: boolean = at.kind == TypeKind::GenericParam
+                                     || at.kind == TypeKind::BoundedParam;
+            if (!bare_param && this.contains_generic_param(arg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Get the qualified name for a user-defined type by TypeRef.
     /// Returns the name the type was registered under in the arena.
     /// Doing the `as StructType*` / `as ClassType*` cast and field read
