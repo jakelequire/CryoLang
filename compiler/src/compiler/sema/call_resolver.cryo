@@ -2371,8 +2371,8 @@ type struct CallResolver {
     /// `false` for the authoritative pass and only run it (`true`) as a LAST RESORT,
     /// AFTER turbofish + concrete args + the expected type have all failed — otherwise
     /// `RwLock<i32> = RwLock::new(0)` would guess+warn (E0307) instead of taking the
-    /// owner arg from the `<i32>` annotation.  The guess emits one diagnostic
-    /// (`emit_static_owner_literal_default`).
+    /// owner arg from the `<i32>` annotation.  The guess is applied silently
+    /// (i32 IS the language-defined default for an unsuffixed literal).
     infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
                                           call: CallExprNode*, allow_literal_default: boolean) -> TypeRef[] {
         if (method == null || method.func == null) { return []; }
@@ -2400,8 +2400,7 @@ type struct CallResolver {
         // defined default for an unsuffixed literal (`0..5` -> `Range<i32>`).  The
         // dangerous `Atomic<u64>::new(0)` case is bound by the expected-type/turbofish
         // sources BEFORE this guess, so applying the standard default here is correct
-        // and NOT warned about (it was previously a spurious E0307 on idiomatic code;
-        // see emit_static_owner_literal_default, now intentionally uncalled).
+        // and NOT warned about (it was previously a spurious E0307 on idiomatic code).
         if (allow_literal_default) {
             for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
                 const p2: VarDeclNode* = method.func.parameters[i];
@@ -2536,8 +2535,8 @@ type struct CallResolver {
 
         // 3. LAST RESORT: the literal-default GUESS (`Atomic::new(0)` with no turbofish
         // and no expected type -> i32).  Runs only after every authoritative source
-        // failed, and emits the E0307 diagnostic.  Demoting it here is what stops a
-        // spurious E0307 on `RwLock<i32> = RwLock::new(0)` (step 2 binds it from `<i32>`).
+        // failed.  Demoting it here is what stops a spurious E0307 on
+        // `RwLock<i32> = RwLock::new(0)` (step 2 binds it from `<i32>`).
         const lb: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, true);
         if (lb.length == want) { return lb; }
         return [];
@@ -2562,22 +2561,6 @@ type struct CallResolver {
             if (this.types.contains_generic_param(binds[i])) { return; }
         }
         call.set_resolved_type_args(binds);
-    }
-
-    /// The single gated diagnostic for the owner-type literal-default fallback.
-    /// `Atomic::new(0)` infers the owner arg from `0`'s default (i32); warn so the
-    /// `Atomic<u64>` miscompile surfaces and the user can annotate explicitly.
-    emit_static_owner_literal_default(mut &this, call: CallExprNode*, tmpl: TemplateEntry*) -> void {
-        const owner: string = this.intern.resolve(tmpl.name);
-        mut d: Diagnostic = Diagnostic::warning(
-            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
-            format("type argument for `%s` inferred from a default literal type", owner));
-        d = d.at(call.span);
-        d = d.with_note(
-            "the owner type argument was guessed from a literal's default type and may be wrong");
-        d = d.help(format(
-            "specify it explicitly, e.g. `%s<T>::...`, or annotate the binding's type", owner));
-        this.ctx.diagnostics.emit(d);
     }
 
     try_resolve_type_or_variant(mut &this, scope: ScopeResolutionNode*, lookup_sym: SymbolStr,

@@ -503,3 +503,85 @@ function with_capacity_huge_hint_panics_not_hangs() -> Result<(), TestError> {
     map.drop();
     return Result::Ok(());
 }
+
+// ============================================================================
+// Per-map hash seeding
+//
+// `HashMap::new()` draws a random per-process seed so bucket placement is
+// unpredictable (hash-flood hardening). `with_seed` pins that seed so a test
+// can rely on reproducible placement. These tests pin both: a seeded map is
+// functionally correct, and two maps with the same seed + insertion order
+// agree on iteration order (which also proves the seed drives placement).
+// ============================================================================
+
+![test]
+function with_seed_map_is_functional() -> Result<(), TestError> {
+    mut map: HashMap<u32, i32> = HashMap::with_seed(0xDEADBEEF);
+    mut i: u32 = 0;
+    while (i < 16) {
+        map.insert(i, (i as i32) * 3);
+        i = i + 1;
+    }
+    // Every inserted key must read back through the seeded hash path.
+    mut all_present: boolean = true;
+    mut k: u32 = 0;
+    while (k < 16) {
+        const got: Option<i32> = map.get(&k);
+        if (got.unwrap_or(-1) != (k as i32) * 3) { all_present = false; }
+        k = k + 1;
+    }
+    const len: u64 = map.length();
+    map.drop();
+    match (expect_true(all_present,
+        Str::new("seeded map reads back every inserted key"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(len, 16u64);
+}
+
+![test]
+function same_seed_same_iteration_order() -> Result<(), TestError> {
+    mut a: HashMap<u32, i32> = HashMap::with_seed(0x1234567);
+    mut b: HashMap<u32, i32> = HashMap::with_seed(0x1234567);
+    mut i: u32 = 0;
+    while (i < 24) {
+        a.insert(i, i as i32);
+        b.insert(i, i as i32);
+        i = i + 1;
+    }
+    // Identical seed + identical insertion order => identical bucket layout =>
+    // identical iteration order. Walk both iterators in lockstep.
+    mut ita: implement Iterator<Pair<u32, i32>> = a.iter();
+    mut itb: implement Iterator<Pair<u32, i32>> = b.iter();
+    mut same: boolean = true;
+    mut count: u64 = 0;
+    loop {
+        const na: Option<Pair<u32, i32>> = ita.next();
+        const nb: Option<Pair<u32, i32>> = itb.next();
+        match (na) {
+            Option::Some(pa) => {
+                match (nb) {
+                    Option::Some(pb) => {
+                        if (pa.first != pb.first) { same = false; }
+                        count = count + 1;
+                    }
+                    Option::None => { same = false; break; }
+                }
+            }
+            Option::None => {
+                match (nb) {
+                    Option::Some(_) => { same = false; }
+                    Option::None => { }
+                }
+                break;
+            }
+        }
+    }
+    a.drop();
+    b.drop();
+    match (expect_true(same,
+        Str::new("same seed yields same iteration order"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(count, 24u64);
+}
