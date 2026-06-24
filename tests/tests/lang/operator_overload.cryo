@@ -1,0 +1,90 @@
+///! Operator traits (`core::ops`): user `Deref` / `Index` impls.
+///!
+///! v1.0 ships the `Deref<Target>` and `Index<Idx, Output>` traits with
+///! their explicit methods (`.deref()` / `.index()`); the `*` / `[]`
+///! operator sugar over user types is a documented post-1.0 follow-up
+///! (see `core::ops`), so these tests call the methods directly. They
+///! pin that a user type can implement the operator traits and that the
+///! returned pointer aliases the receiver's storage in place.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::OperatorOverload;
+
+import std::core::result;
+import std::core::ops;
+import std::test::error;
+import std::test::assert;
+
+// A minimal smart-pointer-like wrapper implementing Deref.
+type struct Boxed { value: i32; }
+
+implement trait Deref<i32> for Boxed {
+    deref(&this) -> i32* {
+        return &this.value;
+    }
+}
+
+// Resolve `.deref()` through the `Deref` bound rather than the bare global
+// method name: bound-directed resolution is unambiguous and also dodges
+// the unrelated struct also named `Deref` in another test module.
+function deref_ptr<T, U>(x: &T) -> U* where T: Deref<U> {
+    return x.deref();
+}
+
+// A fixed 3-slot container implementing Index.
+type struct Triple {
+    a: i32;
+    b: i32;
+    c: i32;
+}
+
+implement trait Index<u64, i32> for Triple {
+    index(&this, idx: u64) -> i32* {
+        if (idx == 0u64) { return &this.a; }
+        if (idx == 1u64) { return &this.b; }
+        return &this.c;
+    }
+}
+
+![test]
+function deref_returns_pointer_to_value() -> Result<(), TestError> {
+    const b: Boxed = Boxed { value: 41 };
+    const p: i32* = deref_ptr(&b);
+    return expect_eq(*p, 41);
+}
+
+// The Deref pointer aliases the receiver in place: writing through it
+// mutates the original `Boxed`.
+![test]
+function deref_pointer_aliases_in_place() -> Result<(), TestError> {
+    mut b: Boxed = Boxed { value: 1 };
+    const p: i32* = deref_ptr(&b);
+    *p = 100;
+    return expect_eq(b.value, 100);
+}
+
+![test]
+function index_reads_each_slot() -> Result<(), TestError> {
+    const t: Triple = Triple { a: 10, b: 20, c: 30 };
+    const p0: i32* = t.index(0u64);
+    const p1: i32* = t.index(1u64);
+    const p2: i32* = t.index(2u64);
+    match (expect_eq(*p0, 10)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(*p1, 20)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(*p2, 30);
+}
+
+// The Index pointer aliases the receiver in place.
+![test]
+function index_pointer_aliases_in_place() -> Result<(), TestError> {
+    mut t: Triple = Triple { a: 1, b: 2, c: 3 };
+    const p: i32* = t.index(1u64);
+    *p = 99;
+    return expect_eq(t.b, 99);
+}
