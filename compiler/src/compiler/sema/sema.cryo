@@ -647,20 +647,18 @@ public:
         const var_node: VarDeclNode* = decl as VarDeclNode*;
         this.member.check_annotation_visibility(var_node.type_annotation);
 
-        if (var_node.type_annotation == null && !var_node.has_resolved_type() && !var_node.is_auto) {
-            const init: ExpressionNode* = var_node.initializer;
-            const init_is_lambda: boolean = init != null && (init as ASTNode*).kind == NodeKind::LambdaExpression;
-            if (!init_is_lambda) {
-                const var_name: string = this.intern.resolve(var_node.name);
-                const msg: string = if (init == null) {
-                    format("variable `%s` needs a type annotation: write `: T` or initialise with a lambda expression", var_name)
-                } else {
-                    format("variable `%s` needs a type annotation; type inference is only available for lambda initializers (`(params) -> Ret { ... }`)", var_name)
-                };
-                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0104_EXPECTED_TYPE, msg);
-                diag = diag.at_with_label(var_node.span, "missing `:` and type annotation");
-                this.ctx.emit_diagnostic(diag);
-            }
+        // A type-less binding with no initializer has nothing to infer from.
+        // With an initializer, the binding's type is inferred from it below
+        // (general local type inference; see the `resolved_type = init_type`
+        // step). A void-valued initializer is rejected there, after we know
+        // the initializer's type.
+        if (var_node.type_annotation == null && !var_node.has_resolved_type()
+                && !var_node.is_auto && !var_node.has_initializer()) {
+            const var_name: string = this.intern.resolve(var_node.name);
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0104_EXPECTED_TYPE,
+                format("variable `%s` needs a type annotation or an initializer to infer from: write `: T` or `= <expr>`", var_name));
+            diag = diag.at_with_label(var_node.span, "no `:` type and no `=` initializer to infer from");
+            this.ctx.emit_diagnostic(diag);
         }
 
         if (!var_node.has_resolved_type() && var_node.type_annotation != null && this.ctx.type_resolver != null) {
@@ -741,11 +739,25 @@ public:
             const imp_ann: ImplTraitAnnotation* = this.impl_trait_annotation_of(var_node.type_annotation);
             const init_t_node: Type* = this.arena.lookup(init_type.id);
             const init_is_void: boolean = init_t_node != null && init_t_node.kind == TypeKind::Void;
+            // General local type inference: a binding with no annotation adopts
+            // the initializer's type. When an annotation is present resolved_type
+            // is already set above (and wins); the lambda / for-loop `is_auto` /
+            // impl-trait cases are subsumed here. The inferred type is the
+            // concrete type the initializer produces — not an erased
+            // `implement Trait` — so methods on it stay callable.
             if (!var_node.has_resolved_type() && init_type.is_valid() && !init_is_void
-                    && var_node.initializer != null
-                    && ((var_node.initializer as ASTNode*).kind == NodeKind::LambdaExpression
-                        || var_node.is_auto || imp_ann != null || var_node.type_annotation != null)) {
+                    && var_node.initializer != null) {
                 var_node.resolved_type = init_type;
+            }
+            // A type-less binding whose initializer yields no value can't be
+            // inferred: surface that rather than silently binding `void`.
+            if (var_node.type_annotation == null && !var_node.has_resolved_type()
+                    && !var_node.is_auto && init_is_void) {
+                const var_name: string = this.intern.resolve(var_node.name);
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0104_EXPECTED_TYPE,
+                    format("cannot infer the type of `%s`: its initializer produces no value (`void`); add a `: T` annotation or use a value-producing initializer", var_name));
+                diag = diag.at_with_label(var_node.span, "binding has no inferable type");
+                this.ctx.emit_diagnostic(diag);
             }
             if (imp_ann != null && init_type.is_valid()) {
                 this.verify_impl_trait_bounds(imp_ann, init_type, var_node);

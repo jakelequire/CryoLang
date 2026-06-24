@@ -17,8 +17,10 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   by the previous release; `make selfhost-check` runs a 3-round (6-stage)
   byte-identical IR check that gates every push to `main`.
 - **Type system:** static, monomorphic generics with `where` bounds, no
-  implicit conversions, no inference on variable bindings. `typeof(expr)`
-  in type position.
+  implicit conversions. Local type inference on `const`/`mut` bindings: a
+  binding adopts its initializer's concrete type, so an explicit `: T` is
+  required only when there is no initializer to infer from (or to widen the
+  declared type). `typeof(expr)` in type position.
 - **Traits:** trait declarations with default methods; impls on primitives,
   structs, classes, and enums; coherence checks (a trait may be implemented
   at most once per type) enforced uniformly within a file and across
@@ -266,17 +268,6 @@ without them and the grammar reserves the relevant syntax. See
 [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
-- Local type inference. A binding needs an explicit type unless its
-  initializer is a lambda (`mut it = arr.iter()` is E0104; write the type or
-  chain on the expression). One consequence for iterators: an opaque
-  `implement Iterator<T>` local initialised from a *producer* that itself
-  returns an opaque iterator cannot take further combinators
-  (`mut it: implement Iterator<i32> = arr.iter(); it.take(1)...`), since the
-  concrete adapter type is erased - chain on the call expression instead. An
-  opaque local initialised from a concrete static constructor *can* be
-  re-adapted (`mut it: implement Iterator<i32> = Range<i32>::new(0,10);
-  it.take(3)`), and a concrete-typed adapter local works
-  (`mut z: ZipIter<.., ..> = a.zip(b)`).
 - Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
 - macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See
