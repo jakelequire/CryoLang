@@ -131,6 +131,41 @@ public:
         }
         return "";
     }
+
+    /// Reject malformed flags before dispatch.  Returns true when the parsed
+    /// flags are acceptable; on the first problem it prints a diagnostic to
+    /// stderr (matching the CLI's plain `Error:` style) and returns false, so
+    /// the caller exits non-zero.  Two checks:
+    ///   1. every flag must be in the known union (`is_known_flag`) — catches
+    ///      typos like `--relese` that were previously silently ignored;
+    ///   2. `--output=`/`--target=` must carry a non-empty value — an empty
+    ///      value used to be silently accepted (dropping `-o`, etc.).
+    /// `-D` defines live in a separate list and are intentionally not checked.
+    validate(&this) -> boolean {
+        for (mut i: int = 0; i < this.flags.length; i++) {
+            const key: string = this.flags[i].first;
+            if (!ArgumentParser::is_known_flag(key)) {
+                fmt::eprintf("Error: unknown flag '--%s'. Run 'cryo help flags' for the list.\n", key);
+                return false;
+            }
+        }
+        for (mut i: int = 0; i < this.args.length; i++) {
+            const key: string = this.args[i].first;
+            if (!ArgumentParser::is_known_flag(key)) {
+                fmt::eprintf("Error: unknown flag '--%s'. Run 'cryo help flags' for the list.\n", key);
+                return false;
+            }
+            const value: string = this.args[i].second.default_value;
+            const is_empty: boolean = strlen(value) == 0;
+            const is_target_or_output: boolean =
+                strcmp(key, "output") == 0 || strcmp(key, "o") == 0 || strcmp(key, "target") == 0;
+            if (is_empty && is_target_or_output) {
+                fmt::eprintf("Error: flag '--%s' requires a non-empty value.\n", key);
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 type struct Command {
@@ -255,6 +290,27 @@ type struct ArgumentParser {
         return strcmp(name, "o") == 0 || strcmp(name, "output") == 0;
     }
 
+    /// True for every flag any command, the test runner, or the build
+    /// scripts accept — the UNION across all commands (names are already
+    /// dash-stripped by `normalize_flag_name`).  `ParsedArgs::validate`
+    /// hard-rejects anything not here, so this list MUST stay in sync with
+    /// the flags commands actually read via `has_flag`/`has_arg` (see
+    /// `CLI/commands.cryo`): a missing entry would reject a VALID flag and
+    /// break real invocations (incl. CI / the selfhost scripts).  It is a
+    /// single union rather than a per-command list, so a valid flag used on
+    /// the wrong command is tolerated; a typo (`--relese`) is not.
+    static is_known_flag(name: string) -> boolean {
+        return match (name) {
+            "help" | "h" | "version" | "v" | "debug" | "quiet" | "q"
+            | "ast" | "emit-llvm" | "stdlib" | "build-dir" | "target"
+            | "output" | "o" | "opt-level" | "debug-info" | "g"
+            | "no-std" | "no-incremental" | "release" | "dev" | "profile"
+            | "release-static" | "ignored" | "list" | "exact" | "nocapture"
+            | "show-output" | "jobs" | "timeout" | "format" | "color" => { true }
+            _ => { false }
+        };
+    }
+
     /// Strips leading '--' or '-' from a flag string.
     static normalize_flag_name(name: string) -> string {
         if (strncmp(name, "--", 2) == 0) {
@@ -344,12 +400,14 @@ public:
                 }
             }
             const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
+            if (!args.validate()) { return 1; }
             return this.dispatch(first_arg, args);
         }
 
         // Not a known command; treat as a file for direct compilation
         if (metadata::exists(Path::from_cstr(first_arg))) {
             const args: ParsedArgs = ArgumentParser::parse(argc, argv, 2);
+            if (!args.validate()) { return 1; }
             return CLI::Commands::Executor::compile_file(first_arg, args);
         }
 
