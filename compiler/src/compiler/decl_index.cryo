@@ -133,6 +133,18 @@ type struct DeclarationIndex {
     // resolve time — the consumer must try each, like the original linear scan.
     mangled_to_overload_pos: HashMap<u32, u32[]>;
 
+    // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
+    // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_add, panic,
+    // atomic_*, ...).  Codegen's inline-intrinsic dispatcher matches a call's
+    // leaf name against `IntrinsicKind::is_name`, which is broader than this
+    // set (it also covers pure-magic forms like `rotl32`/`bswap32` that have
+    // NO declaration).  This set lets codegen tell a genuine intrinsic call
+    // from a user/stdlib function that merely shares an intrinsic's leaf name:
+    // a pinned `resolved_callee` whose leaf is NOT in here is a real function
+    // and must NOT be silently replaced by inline IR.  See
+    // `is_intrinsic_decl_name`.
+    intrinsic_names:     HashMap<u32, boolean>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -161,6 +173,7 @@ type struct DeclarationIndex {
             module_func_first:  HashMap<u32, u32>::new(),
             module_func_pairs:  HashMap<u64, boolean>::new(),
             mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
+            intrinsic_names:    HashMap<u32, boolean>::new(),
         };
     }
 
@@ -247,6 +260,11 @@ type struct DeclarationIndex {
     /// an ambiguous second overload, E0636). The qualified `libc::<name>`
     /// form registered separately stays available regardless.
     register_intrinsic_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef) -> void {
+        // Record the leaf name as a genuine intrinsic declaration so codegen
+        // can distinguish it from a user function that shares the leaf name
+        // (see `is_intrinsic_decl_name` and the inline-dispatch guards in
+        // call_emitter).
+        this.intrinsic_names.insert(name.id, true);
         this.func_type_refs.insert(name.id, func_type_ref);
         const new_pos: u32 = this.overload_func_keys.length as u32;
         this.overload_func_keys.push(name.id);
@@ -255,6 +273,16 @@ type struct DeclarationIndex {
         mut positions: u32[] = [];
         positions.push(new_pos);
         this.overload_index.insert(name.id, positions);
+    }
+
+    /// True iff `name`'s leaf was declared as a compiler `intrinsic function`
+    /// (see `register_intrinsic_function_type`).  Codegen uses this to avoid
+    /// silently lowering a user/stdlib function to inline IR just because its
+    /// leaf name collides with an entry in `IntrinsicKind::is_name`: a call
+    /// with a pinned `resolved_callee` whose leaf is NOT a declared intrinsic
+    /// is a real function and must be emitted as a normal call.
+    is_intrinsic_decl_name(&this, name: SymbolStr) -> boolean {
+        return this.intrinsic_names.contains_key(&name.id);
     }
 
     /// Associate an overload-specific mangled LLVM name with a registered

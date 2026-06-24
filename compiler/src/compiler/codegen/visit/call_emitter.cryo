@@ -195,7 +195,20 @@ type struct CallEmitter {
             // fail with `undefined reference`.  Run the inline dispatcher
             // up front to avoid that path.
             const intr_name_str: string = intern.resolve(id.name);
-            if (IntrinsicKind::is_name(intr_name_str)) {
+            // `IntrinsicKind::is_name` matches by leaf name only, and that set
+            // is broader than the actual intrinsic declarations: it also covers
+            // pure-magic forms (`rotl32`, `bswap32`, casts, ...) that are NOT
+            // declared anywhere. Without the `user_shadow` guard a user/stdlib
+            // function sharing an intrinsic's leaf name (e.g. sha1's `rotl32`)
+            // would be silently replaced by inline IR and its body never run.
+            // A pinned `resolved_callee` whose leaf is NOT a declared
+            // `intrinsic function` is a real function: fall through to the
+            // normal-call path below. Genuine intrinsics either have no
+            // resolved_callee (pure-magic) or are declared intrinsics
+            // (is_intrinsic_decl_name true), so both still inline here.
+            const intr_user_shadow: boolean = node.resolved_callee.is_valid()
+                && !this.cg.get_decl_index().is_intrinsic_decl_name(id.name);
+            if (IntrinsicKind::is_name(intr_name_str) && !intr_user_shadow) {
                 // `intr_args` is scoped to this branch: it is built and moved
                 // into try_emit unconditionally here, so nothing is left
                 // conditionally moved past the if.
@@ -422,7 +435,15 @@ type struct CallEmitter {
             // causing the linker to look for a real `ptr_add` symbol that
             // doesn't exist (intrinsics are lowered inline, never linked).
             const sr_leaf_str: string = intern.resolve(sr.member_name);
-            if (IntrinsicKind::is_name(sr_leaf_str)) {
+            // Same guard as the Identifier branch: a qualified call whose leaf
+            // collides with an intrinsic name (e.g. `mymod::rotl32`) but
+            // resolves to a real, non-intrinsic function must NOT be replaced
+            // by inline IR. Genuine `intrinsics::<name>` calls are either
+            // pure-magic (no resolved_callee) or declared intrinsics
+            // (is_intrinsic_decl_name true), so they still inline.
+            const sr_user_shadow: boolean = node.resolved_callee.is_valid()
+                && !di.is_intrinsic_decl_name(sr.member_name);
+            if (IntrinsicKind::is_name(sr_leaf_str) && !sr_user_shadow) {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));

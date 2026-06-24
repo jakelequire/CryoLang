@@ -858,6 +858,25 @@ public:
         // post-construction (parser fills them, sema reads them), so the inner
         // trait_refs arrays can be shared safely.
         c.where_bounds = node.where_bounds;
+        // NOTE: `qualified_target_name` and `target_type_span` are deliberately
+        // NOT copied. `qualified_target_name` is the DI identity stamped by the
+        // TypeResolution pass when an impl is registered; the monomorphizer
+        // renames a cloned impl's `target_type` to the spec, so copying the
+        // template's qualified name here strands the clone under the wrong DI
+        // key (method lookups then miss -> E0636). It is re-stamped per clone.
+        // Associated-type bindings (`type Item = T;` / positional-header
+        // desugar) and monomorphizer-recovered derived element bindings. These
+        // are how `This::Item` projections and self-returning default methods
+        // resolve concretely. Omitting them left eager-specialized generic-trait
+        // impls with empty bindings -> E0636-class projection failures. The
+        // annotations are owning pointers, so deep-clone them (no aliasing).
+        for (mut i: i64 = 0; i < node.derived_param_names.length; i++) {
+            c.add_derived_param(node.derived_param_names[i], node.derived_param_types[i]);
+        }
+        for (mut i: i64 = 0; i < node.assoc_binding_names.length; i++) {
+            c.add_assoc_binding(node.assoc_binding_names[i],
+                this.clone_type_annotation(node.assoc_binding_annotations[i]));
+        }
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
             c.add_method(this.result as MethodNode*);
