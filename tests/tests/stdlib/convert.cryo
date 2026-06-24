@@ -1,0 +1,76 @@
+///! From / Into conversions (`core::convert`) - user impls, chaining,
+///! and numeric widening.
+///!
+///! `core::convert` is part of the frozen v1.0 surface but was only
+///! exercised indirectly. These pin: trait-static `From::from` dispatch
+///! on a user type, `Into::into` on a user type, a two-hop `From` chain,
+///! and the numeric widening impls the stdlib ships.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Convert;
+
+import std::core::result;
+import std::core::convert;
+import std::test::error;
+import std::test::assert;
+
+type struct Celsius { degrees: i32; }
+type struct Fahrenheit { degrees: i32; }
+type struct Kelvin { degrees: i32; }
+
+// From<Celsius> for Fahrenheit: an always-defined user conversion.
+implement trait From<Celsius> for Fahrenheit {
+    static from(value: Celsius) -> Fahrenheit {
+        return Fahrenheit { degrees: value.degrees * 9 / 5 + 32 };
+    }
+}
+
+// Into<Kelvin> for Celsius: the borrowing/consuming direction.
+implement trait Into<Kelvin> for Celsius {
+    into(&this) -> Kelvin {
+        return Kelvin { degrees: this.degrees + 273 };
+    }
+}
+
+// A second `From` hop so a conversion can chain Fahrenheit -> Kelvin.
+implement trait From<Fahrenheit> for Kelvin {
+    static from(value: Fahrenheit) -> Kelvin {
+        // F -> C -> K, integer math.
+        return Kelvin { degrees: (value.degrees - 32) * 5 / 9 + 273 };
+    }
+}
+
+![test]
+function user_from_converts() -> Result<(), TestError> {
+    const f: Fahrenheit = Fahrenheit::from(Celsius { degrees: 100 });
+    return expect_eq(f.degrees, 212);
+}
+
+![test]
+function user_into_converts() -> Result<(), TestError> {
+    const c: Celsius = Celsius { degrees: 27 };
+    const k: Kelvin = c.into();
+    return expect_eq(k.degrees, 300);
+}
+
+![test]
+function from_chain_two_hops() -> Result<(), TestError> {
+    // Celsius -> Fahrenheit -> Kelvin, each via `From`.
+    const f: Fahrenheit = Fahrenheit::from(Celsius { degrees: 100 });
+    const k: Kelvin = Kelvin::from(f);
+    return expect_eq(k.degrees, 373);
+}
+
+![test]
+function numeric_widening_from_signed() -> Result<(), TestError> {
+    const small: i8 = 42;
+    const wide: i64 = i64::from(small);
+    return expect_eq(wide, 42 as i64);
+}
+
+![test]
+function numeric_widening_from_unsigned() -> Result<(), TestError> {
+    const small: u8 = 200;
+    const wide: u32 = u32::from(small);
+    return expect_eq(wide, 200 as u32);
+}
