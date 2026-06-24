@@ -1,0 +1,76 @@
+// Local type inference: a `const`/`mut` binding with no `: T` annotation
+// adopts the concrete type of its initializer (not just lambda initializers,
+// which were the previous sole exception). The inferred type is the concrete
+// one the initializer produces, so methods on it stay callable — including
+// iterator combinators chained off an inferred producer result.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LocalTypeInference;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::core::ops;
+import std::collections::array;
+import std::test::error;
+import std::test::assert;
+
+type struct LtiPoint {
+    x: i32;
+    y: i32;
+}
+
+implement struct LtiPoint {
+    static origin() -> LtiPoint { return LtiPoint { x: 0, y: 0 }; }
+    sum(&this) -> i32 { return this.x + this.y; }
+}
+
+function add_i32(acc: i32, x: i32) -> i32 { return acc + x; }
+function plus(a: i32, b: i32) -> i32 { return a + b; }
+
+// Integer / float / bool / char literals infer their default types.
+![test]
+function infers_literal_types() -> Result<(), TestError> {
+    mut i = 41;          // i32
+    const f = 1.5;       // f64
+    const b = true;      // boolean
+    mut total = i + 1;   // i32 arithmetic on an inferred binding
+    match (expect_eq(total, 42)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(b, true)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(f > 1.0, true);
+}
+
+// Arithmetic, struct literals, struct methods, and calls all infer.
+![test]
+function infers_exprs_structs_calls() -> Result<(), TestError> {
+    const c = 3 + 4 * 2;             // i32 = 11
+    const p = LtiPoint { x: 2, y: 5 };  // LtiPoint
+    const q = LtiPoint::origin();       // LtiPoint via static ctor
+    const s = plus(10, 20);          // i32 via free call
+    const total = c + p.sum() + q.sum() + s;   // 11 + 7 + 0 + 30 = 48
+    return expect_eq(total, 48);
+}
+
+// Inferred binding from a concrete static constructor, then chain combinators.
+![test]
+function infers_range_then_chains() -> Result<(), TestError> {
+    mut it = Range<i32>::new(0, 10);          // concrete Range<i32>
+    const s = it.take(3).fold(0, add_i32);    // 0 + 1 + 2 = 3
+    return expect_eq(s, 3);
+}
+
+// The previously-documented limitation: an inferred binding from a *producer*
+// (`a.iter()`) is now the concrete adapter type, so it chains further
+// combinators — no explicit type, no "chain on the call expression" workaround.
+![test]
+function infers_iter_producer_then_chains() -> Result<(), TestError> {
+    mut a: Array<i32> = Array<i32>::new();
+    a.push(1); a.push(2); a.push(3); a.push(4);
+    mut it = a.iter();                         // inferred concrete iterator
+    const s = it.take(2).fold(0, add_i32);     // 1 + 2 = 3
+    return expect_eq(s, 3);
+}

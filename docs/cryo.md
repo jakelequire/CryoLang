@@ -5,7 +5,7 @@
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
-1. **Explicitness.** Cryo has no implicit conversions, no type inference on variables, and no hidden control flow. The programmer writes out every cast, every type annotation, and every loop condition. This verbosity is a feature: it keeps the cost of every operation visible in the source and makes the code easier to reason about.
+1. **Explicitness.** Cryo has no implicit conversions and no hidden control flow. The programmer writes out every cast and every loop condition. Type inference is deliberately local — a binding may adopt its initialiser's type, but there is no flow- or program-level inference — so the cost of every operation stays visible in the source and the code is easy to reason about.
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
@@ -181,7 +181,7 @@ There is no implicit conversion between `boolean` and integers; `if (1)` is a ty
 
 ## 2. Type System
 
-Every value in Cryo has a known type at compile time, and the programmer must state that type explicitly. There is no inference on variable declarations. There are no implicit conversions between numeric types; when you need a conversion, you write it with `as`.
+Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only — see [§ 3](#3-variables-and-constants)). There are no implicit conversions between numeric types; when you need a conversion, you write it with `as`.
 
 ### 2.1 Primitive Types
 
@@ -506,12 +506,16 @@ or differ only in representation (`String` vs `String<GlobalAlloc>`).
 
 ## 3. Variables and Constants
 
-Every variable declaration in Cryo has three parts: a mutability qualifier (`const` or `mut`), a name with a type annotation, and an optional initialiser.
+Every variable declaration in Cryo has three parts: a mutability qualifier (`const` or `mut`), a name with an **optional** type annotation, and an optional initialiser. When the annotation is omitted, the binding's type is inferred from its initialiser.
 
 ```cryo
 const name: string = "Cryo";   // immutable binding
 mut counter: int   = 0;        // mutable binding
 counter = counter + 1;         // reassignment requires `mut`
+
+const greeting = "hello";      // inferred: string
+mut total      = 3 + 4;        // inferred: i32
+mut it         = arr.iter();   // inferred: the concrete iterator type
 ```
 
 **Immutable by default.** A `const` binding cannot be reassigned after initialisation. Mutability is opt-in via `mut`, which makes mutation visible at the declaration site.
@@ -527,7 +531,7 @@ const VERSION:    string = "1.0.0";
 mut   g_counter:  u64    = 0;
 ```
 
-> The type annotation is **always required**. `const x = 10;` is a syntax error. There is no inference at the variable level, by design.
+> **Local type inference.** The type annotation may be omitted when an initialiser is present; the binding adopts the initialiser's *concrete* type (`const x = 10;` infers `i32`, `mut p = Point { ... };` infers `Point`). Because the inferred type is the concrete one the initialiser produces — not an erased `implement Trait` — methods on it stay callable, so `mut it = arr.iter(); it.take(3)...` works without naming the iterator type. Inference is purely local: it reads only the initialiser of the same statement, never later uses. A binding with no initialiser therefore still needs an annotation (`mut y: int;`), and an initialiser that yields no value (`void`) cannot be inferred (both are `E0104`). There are still no implicit conversions and no flow- or program-level inference.
 
 ---
 

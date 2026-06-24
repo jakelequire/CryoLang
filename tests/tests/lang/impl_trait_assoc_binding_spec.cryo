@@ -1,0 +1,66 @@
+// Iterator default methods that project `This::Item` in their SIGNATURE must
+// resolve when bound into a user type's `Iterator` impl.
+//
+// `implement trait Iterator<i32> for struct UpTo` binds the associated type
+// `Item := i32` via positional sugar. The trait's default methods are shared
+// across implementors; `fold` and `for_each` mention `This::Item` in their
+// parameter types (`f: (Acc, This::Item) -> Acc`, `f: (This::Item) -> void`).
+// For these to compile against `UpTo`, the `Item := i32` binding the impl
+// carries must survive into the default-method instantiation — the same
+// associated-type-binding propagation the AST cloner must preserve when it
+// copies an impl block (see `visit(ImplBlockNode*)` in AST/cloner.cryo, which
+// copies `assoc_binding_*` / `derived_param_*`).
+//
+// `count` (tested in impl_trait_iter.cryo) only uses `This::Item` internally;
+// these exercise it in the method *signature*, the more demanding projection.
+// Note: the adapter-returning combinators (`take`/`map`/`filter`) do not yet
+// resolve on a concrete user-iterator struct receiver (only on stdlib `Range`
+// and call-expression chains) — see V1-TODO.md.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ImplTraitAssocBindingSpec;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::test::error;
+import std::test::assert;
+
+type struct UpTo {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator<i32> for struct UpTo {
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+function add_i32(acc: i32, x: i32) -> i32 { return acc + x; }
+
+// Module-level sink so a non-capturing `for_each` fn has somewhere to write.
+mut g_sum: i32 = 0;
+function accumulate(x: i32) -> void { g_sum = g_sum + x; }
+
+// `fold`: `f: (Acc, This::Item) -> Acc` projects `This::Item` (= i32) in its
+// signature against the user impl's `Item := i32` binding.
+![test]
+function fold_projects_assoc_item_on_user_impl() -> Result<(), TestError> {
+    mut it: UpTo = UpTo { cur: 0, end: 5 };
+    const s: i32 = it.fold(0, add_i32);   // 0 + 1 + 2 + 3 + 4 = 10
+    return expect_eq(s, 10);
+}
+
+// `for_each`: `f: (This::Item) -> void` — the other `This::Item`-in-signature
+// default method.
+![test]
+function for_each_projects_assoc_item_on_user_impl() -> Result<(), TestError> {
+    g_sum = 0;
+    mut it: UpTo = UpTo { cur: 1, end: 5 };
+    it.for_each(accumulate);              // 1 + 2 + 3 + 4 = 10
+    return expect_eq(g_sum, 10);
+}
