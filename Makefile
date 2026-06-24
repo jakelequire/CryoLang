@@ -101,7 +101,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list examples examples-golden pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list examples examples-golden valgrind-check pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -427,6 +427,20 @@ examples-golden: $(STAGE2_EXE) $(LIBCRYO_A)
 else
 examples-golden: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/check-examples-output.sh
+endif
+
+# ---- runtime memory-safety gate (valgrind) ----------------------------
+# Build AND run the deterministic examples under valgrind, failing on any
+# invalid free/read/write or definite leak.  The static move-checker rejects
+# use-after-move at compile time; this exercises the generated drop/free paths
+# at runtime, so a miscompile that double-freed or leaked an owned value is
+# caught here.  POSIX/Linux-only and requires valgrind on PATH.
+ifeq ($(HOST_OS),windows)
+valgrind-check: $(STAGE2_EXE) $(LIBCRYO_A)
+	@echo "make valgrind-check runs under POSIX/Linux only (valgrind)."
+else
+valgrind-check: $(STAGE2) $(LIBCRYO_A)
+	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
 endif
 
 # ---- release packaging -------------------------------------------------

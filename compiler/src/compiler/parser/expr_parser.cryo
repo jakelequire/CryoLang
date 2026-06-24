@@ -1287,6 +1287,16 @@ public:
 
     /// Parse an array literal: [ expr, expr, ... ]
     parse_array_literal() -> ExpressionNode* {
+        // BRACKET_DEPTH_LIMIT: nested array literals (`[[[...]]]`) recurse
+        // through parse_expression for each element, overflowing the native
+        // stack (SIGSEGV) on pathological depth. `bracket_depth` is maintained
+        // by advance(); 256 is well past any realistic literal. report_error
+        // sets panic_mode, so the caller unwinds without re-reading the `[`.
+        if (this.bracket_depth > 256) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "array-literal nesting too deep (recursion limit exceeded)");
+            return null;
+        }
         const start: Token = this.advance(); // consume '['
         mut arr: ArrayLiteralNode* = new ArrayLiteralNode(this.span_from_token(start));
 
@@ -1954,6 +1964,16 @@ public:
 
     /// Parse function call arguments: callee(arg1, arg2, ...)
     parse_call_args(callee: ExpressionNode*) -> CallExprNode* {
+        // PAREN_DEPTH_LIMIT: nested calls (`f(f(f(...)))`) recurse through
+        // parse_expression for each argument, overflowing the native stack
+        // (SIGSEGV) on pathological depth. `paren_depth` is maintained by
+        // advance(); 256 is well past any realistic call nesting. report_error
+        // sets panic_mode, so parse_postfix breaks instead of re-reading `(`.
+        if (this.paren_depth > 256) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "call nesting too deep (recursion limit exceeded)");
+            return null;
+        }
         this.advance(); // consume '('
         mut call: CallExprNode* = new CallExprNode(callee, callee.span);
 
@@ -1992,6 +2012,17 @@ public:
 
     /// Parse array access: array[index]
     parse_array_access_expr(array: ExpressionNode*) -> ArrayAccessNode* {
+        // BRACKET_DEPTH_LIMIT: nested index expressions (`a[a[a[...]]]`)
+        // recurse through parse_expression for the index, overflowing the
+        // native stack (SIGSEGV) on pathological depth. `bracket_depth` is
+        // maintained by advance(); 256 is well past any realistic indexing.
+        // report_error sets panic_mode, so parse_postfix breaks instead of
+        // re-reading `[`.
+        if (this.bracket_depth > 256) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "index nesting too deep (recursion limit exceeded)");
+            return null;
+        }
         this.advance(); // consume '['
         const index: ExpressionNode* = this.parse_expression();
         const end: Token = this.consume(TokenType::RSquare, "']'");

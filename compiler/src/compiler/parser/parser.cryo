@@ -39,6 +39,20 @@ public:
     /// Unlike parse_block_statement(), semicolons are optional before '}'
     /// (the last expression in the block is the arm's return value).
     override parse_inner_block() -> BlockStmtNode* {
+        // BRACE_DEPTH_LIMIT: nested blocks (`{{{...}}}`, and the block bodies
+        // of nested `if`/`match`/`while`/`for`) recurse through here with no
+        // expression-level bracketing for the unary/expr/type guards to catch,
+        // so a pathological depth overflows the native stack (SIGSEGV).
+        // `brace_depth` is maintained by advance(); 256 is far beyond any
+        // realistic hand-written nesting. Return an empty block (not null) so
+        // the many callers that don't null-check a body never deref null; the
+        // enclosing block loop's no-progress guard force-advances past the
+        // unconsumed `{`, so this also terminates rather than spinning.
+        if (this.brace_depth > 256) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "block nesting too deep (recursion limit exceeded)");
+            return new BlockStmtNode(this.current_span());
+        }
         const bstart: Token = this.advance(); // consume '{'
         mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(bstart));
 
@@ -2519,6 +2533,18 @@ public:
 
     /// Parse a block statement: { statement* }
     parse_block_statement() -> BlockStmtNode* {
+        // BRACE_DEPTH_LIMIT: see parse_inner_block. Nested block statements
+        // (and the bodies of nested if/match/while/for, which route here)
+        // recurse with no expression-bracketing token to bound them, so a
+        // pathological depth crashes the compiler (SIGSEGV). Cap via the
+        // advance()-maintained brace_depth; return an empty block so no caller
+        // dereferences null and the enclosing loop's no-progress guard makes
+        // forward progress past the unconsumed `{`.
+        if (this.brace_depth > 256) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "block nesting too deep (recursion limit exceeded)");
+            return new BlockStmtNode(this.current_span());
+        }
         const start: Token = this.advance(); // consume '{'
         this.enter_scope();
         mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
