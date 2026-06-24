@@ -146,3 +146,43 @@ function unwrap_on_owning_ok_payload_no_double_free() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// `as_ref` borrows both payloads IN PLACE: the returned pointer aliases
+// the receiver's payload, not a copy.  Writing through it changes the
+// original `Result`.  Soundness pin for the borrowing accessor.
+![test]
+function as_ref_ok_aliases_in_place() -> Result<(), TestError> {
+    mut r: Result<i32, i32> = Result::Ok(7);
+    match (r.as_ref()) {
+        Result::Ok(p) => { *p = 70; }
+        Result::Err(_) => { return bail(Str::new("as_ref on Ok gave Err")); }
+    }
+    return expect_eq(r.unwrap(), 70);
+}
+
+![test]
+function as_ref_err_aliases_in_place() -> Result<(), TestError> {
+    mut r: Result<i32, i32> = Result::Err(3);
+    match (r.as_ref()) {
+        Result::Ok(_) => { return bail(Str::new("as_ref on Err gave Ok")); }
+        Result::Err(p) => { *p = 30; }
+    }
+    return expect_eq(r.unwrap_err(), 30);
+}
+
+// `as_ref` does not consume an owning `Ok` payload: the receiver still
+// owns the `String` afterwards (unwrapped + dropped exactly once).
+![test]
+function as_ref_owning_ok_does_not_consume() -> Result<(), TestError> {
+    mut r: Result<String, i32> = Result::Ok(String::from_str(Str::new("payload")));
+    const ok: boolean = r.as_ref().is_ok();
+    mut s: String = r.unwrap();
+    const len: u64 = s.length();
+    s.drop();
+    match (expect(ok, Str::new("as_ref on Ok(String) is Ok"))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const want: u64 = 7;
+    return expect_eq(len, want);
+}

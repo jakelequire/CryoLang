@@ -254,3 +254,62 @@ function eq_option_f64_unequal_payloads() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
+// `as_ref` borrows the payload IN PLACE: the returned pointer must alias
+// the receiver's payload, not a copy.  Writing through it changes the
+// original `Option`.  (If `as_ref` had copied the payload to a temporary,
+// the write would be lost and `opt` would still read 10.)  This is the
+// soundness pin for the borrowing accessor.
+![test]
+function as_ref_some_aliases_in_place() -> Result<(), TestError> {
+    mut opt: Option<i32> = Option::Some(10);
+    match (opt.as_ref()) {
+        Option::Some(p) => { *p = 99; }
+        Option::None => { return bail(Str::new("as_ref on Some returned None")); }
+    }
+    return expect_eq(opt.unwrap(), 99);
+}
+
+// Reading through the borrow yields the stored value, and the receiver
+// stays usable afterwards (`as_ref` is NOT `![sink]`).
+![test]
+function as_ref_some_reads_without_consuming() -> Result<(), TestError> {
+    const opt: Option<i32> = Option::Some(7);
+    match (opt.as_ref()) {
+        Option::Some(p) => {
+            match (expect_eq(*p, 7)) {
+                Result::Ok(_) => { }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Option::None => { return bail(Str::new("as_ref on Some returned None")); }
+    }
+    return expect_eq(opt.unwrap_or(0), 7);
+}
+
+// Calls a method ON the as_ref result (Option<i32*>), which forces
+// Option<i32*> to full materialization. The lazy-instantiation fix must
+// keep Option<i32*>::as_ref deferred so this does NOT re-tower.
+![test]
+function as_ref_none_is_none() -> Result<(), TestError> {
+    const opt: Option<i32> = Option::None;
+    return expect(opt.as_ref().is_none(), Str::new("as_ref on None is None"));
+}
+
+// `as_ref` does not consume an owning payload: the receiver still owns the
+// `String` afterwards, so it is unwrapped and dropped exactly once. A
+// `![sink]`-style consume here would double-free the heap buffer.
+![test]
+function as_ref_owning_payload_does_not_consume() -> Result<(), TestError> {
+    mut opt: Option<String> = Option::Some(String::from_str(Str::new("hi")));
+    const present: boolean = opt.as_ref().is_some();
+    mut s: String = opt.unwrap();
+    const len: u64 = s.length();
+    s.drop();
+    match (expect(present, Str::new("as_ref on Some(String) is Some"))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const want: u64 = 2;
+    return expect_eq(len, want);
+}
+

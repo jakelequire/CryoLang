@@ -708,7 +708,8 @@ type struct TypeResolver {
     /// 1-arg method.
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
-                              owner_type: TypeRef) -> void {
+                              owner_type: TypeRef,
+                              owner_qname: SymbolStr) -> void {
         const this_ref_name: SymbolStr = this.intern_table.intern("&this");
         const this_val_name: SymbolStr = this.intern_table.intern("this");
         // Bind `This` to the impl's owner type for the duration of method-
@@ -737,6 +738,53 @@ type struct TypeResolver {
                 this.resolve_func_signature(method.func, &method_ctx);
             } else {
                 this.resolve_func_signature(method.func, res_ctx);
+            }
+
+            // Anti-tower: flag a non-generic INSTANCE method whose resolved
+            // return type (or a non-receiver param) is a strict structural
+            // superterm of the owner - e.g. `Option<T>::as_ref -> Option<T*>`.
+            // Eagerly materializing such a method recurses forever (each level
+            // grows the type args: `Option<T*>`, `Option<T**>`, ...).  Reuse the
+            // `is_self_returning_default` path, whose operational meaning is
+            // "skip every eager-materialization site, instantiate lazily at the
+            // call site" (MonoCallSpecializer::try_instantiate_self_returning_default
+            // materializes the spec'd copy on demand and discovers its return
+            // type's instantiation there).  Only the self-growing method is
+            // deferred - drop glue and all other methods stay eager, so the
+            // post-mono DropInsertion contract is unaffected.  Restricted to
+            // 0-own-generic instance methods because that is the only shape the
+            // lazy call path materializes.
+            //
+            // Compared by the owner's QUALIFIED NAME, not a `TypeRef`: for an
+            // `implement enum`/`implement` block the owner `TypeRef` handed in
+            // is often invalid at this pass (the receiver is back-filled later),
+            // so a TypeRef-identity check would silently never fire.
+            if (owner_qname.is_valid()
+                    && !method.func.is_generic()
+                    && !method.is_static
+                    && !method.func.is_self_returning_default
+                    && !method.func.is_lazy_self_growing) {
+                mut grows: boolean = method.func.resolved_return_type.is_valid()
+                    && this.arena.is_self_growing_instantiation(
+                           method.func.resolved_return_type, owner_qname);
+                if (!grows) {
+                    for (mut gp: i64 = 0; gp < method.func.parameters.length; gp++) {
+                        const gparam: VarDeclNode* = method.func.parameters[gp];
+                        if (gparam == null || !gparam.resolved_type.is_valid()) { continue; }
+                        // Skip the receiver: `&this`/`this` is the owner itself,
+                        // never a superterm.
+                        if (gparam.name.equals(this_ref_name)
+                                || gparam.name.equals(this_val_name)) { continue; }
+                        if (this.arena.is_self_growing_instantiation(
+                                gparam.resolved_type, owner_qname)) {
+                            grows = true;
+                            break;
+                        }
+                    }
+                }
+                if (grows) {
+                    method.func.set_lazy_self_growing(true);
+                }
             }
 
             // Back-fill `this`/`&this` resolved_type from owner_type when

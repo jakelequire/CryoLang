@@ -183,3 +183,91 @@ jobs:
           cd "$(dirname "$exe")"
           wine64 cryo.exe --version
           wine64 cryo.exe --help
+
+  windows-native:
+    name: windows native (build + test on windows-latest)
+    runs-on: windows-latest
+    # Independent of the Linux `build` job (different host); runs in parallel.
+    # NOTE (unvalidated): this job was authored without a Windows runner to test
+    # against and WILL need iteration in live CI before it is made a required
+    # check. The most likely points to adjust are (a) the toolchain package
+    # names / PATH below, (b) `cc`/`ar` availability for the test-helpers recipe
+    # (Makefile:367-370), and (c) the LLVM-C import-lib synthesis tool names
+    # passed to fetch-windows-llvm.sh. The cross-build `windows-smoke` job above
+    # stays as the always-green Windows gate until this one is proven.
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # GNU make (so the cmd-shell Windows recipes run), mingw-w64 (native gcc +
+      # ar + dlltool), and LLVM (llvm-readobj, used to dump LLVM-C.dll exports).
+      # GNU make on native Windows drives recipes through cmd.exe, which is what
+      # the HOST_OS==windows branch of the Makefile expects (backslash paths,
+      # `rmdir /s /q`); running make from bash would break those recipes.
+      - name: Install GNU make, mingw-w64 (gcc/ar/dlltool) and LLVM
+        run: |
+          choco install --no-progress -y make mingw llvm
+
+      # The test-helpers archive recipe (Makefile:367-370) shells out to `cc`
+      # and `ar`. mingw-w64 ships `gcc`/`ar` but not always `cc`; alias it.
+      - name: Ensure a `cc` shim exists for the test-helper recipe
+        run: |
+          $gcc = (Get-Command gcc).Source
+          $cc  = Join-Path (Split-Path $gcc) 'cc.exe'
+          if (-not (Test-Path $cc)) { Copy-Item $gcc $cc }
+          gcc --version
+          ar --version
+          dlltool --version
+          llvm-readobj --version
+
+      - name: Restore the windows LLVM bits cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .toolchains/llvm-win
+          key: llvm-win-native-${{ hashFiles('scripts/llvm-version.env') }}
+
+      # Synthesize the LLVM-C mingw import lib (lib/libLLVM-C.dll.a) and stage
+      # the runtime DLL (bin/LLVM-C.dll). fetch-windows-llvm.sh is a bash script;
+      # run it under Git Bash (present on the runner). It also downloads the
+      # Part-2 llvm-mingw/wine driver, which a native build does not strictly
+      # need; that overhead is acceptable and keeps us on the single shared
+      # provisioning path. Override the Linux-style tool names with the
+      # choco-installed unprefixed ones (llvm-readobj / dlltool).
+      - name: Fetch / synthesize the windows LLVM-C import lib + DLL
+        shell: bash
+        env:
+          LLVM_READOBJ: llvm-readobj
+          DLLTOOL: dlltool
+        run: ./scripts/fetch-windows-llvm.sh
+
+      # cryo.exe (both the committed pin and the freshly built stage-2) loads
+      # LLVM-C.dll at runtime; put its directory on PATH for every later step.
+      - name: Put LLVM-C.dll on PATH
+        run: |
+          "$(Resolve-Path .toolchains/llvm-win/bin)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify the committed pins match their sidecars (sha256)
+        run: make verify-pin
+
+      - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo.exe)
+        env:
+          CRYO_CC: gcc
+        run: make cryo
+
+      - name: Smoke-test the binary
+        run: |
+          ./compiler/build/cryo.exe --version
+          ./compiler/build/cryo.exe --help
+
+      - name: Run the test suite (tests/ via cryo test)
+        env:
+          CRYO_CC: gcc
+        run: make test
+
+      - name: Run the test suite at -O0 (catch opt-level-dependent miscompiles)
+        env:
+          CRYO_CC: gcc
+        run: make test ARGS="--opt-level=0"

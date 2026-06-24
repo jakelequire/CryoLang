@@ -6,45 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [Unreleased]
-
-### Added
-
-- **Re-adapting an opaque iterator local (static-constructor form).** An opaque
-  `implement Iterator<T>` local whose initialiser is a concrete static
-  constructor can now be re-adapted with a combinator
-  (`mut it: implement Iterator<i32> = Range<i32>::new(0,10); it.take(3)`); this
-  previously failed with `E0636`. A local initialised from a producer that
-  itself returns an opaque iterator (`let it = arr.iter(); it.map(..)`) remains
-  restricted — chain off the source. See
-  [`docs/cryo.md` §2.11](./docs/cryo.md#211-opaque-types-implement-trait).
-
-- **Associated types.** A trait may declare an associated type
-  (`type Item;`) and refer to it by projection (`This::Item` inside the trait,
-  `I::Item` off a generic parameter). Each impl binds it positionally
-  (`implement trait Iterator<i32> for X` — sugar for `Iterator<Item = i32>`,
-  available when the trait has no generic params of its own) or with the
-  explicit body form (`type Item = i32;`). Two diagnostics enforce the binding
-  rules: `E0309` (a declared associated type left unbound by an impl) and
-  `E0310` (an associated type bound positionally on a trait that also has
-  generic params — use the explicit body form `type Out = …;` instead).
-  Declaration-site bounds on an associated type (`type Item: Copy;`) are
-  enforced against each impl's concrete binding (`E0306`). Opaque `implement Iterator<T>`
-  bindings now cross-check `<T>` against the iterator's actual `Item` (`E0200`
-  on a category-level mismatch). See [`docs/cryo.md` §11.5](./docs/cryo.md#115-associated-types).
-
-### Changed
-
-- **`core::iter`:** `Iterator` migrated from the generic-param form
-  `Iterator<Item>` to an associated type — `type trait Iterator { type Item;
-  next(...) -> Option<This::Item>; ... }`. Existing `Iterator<T>` impls,
-  `where I: Iterator<T>` bounds, and `implement Iterator<T>` opaque returns
-  continue to work unchanged via positional sugar; the migration is
-  source-compatible for these forms. The `MapIter`/`FilterIter`/`EnumerateIter`
-  adapters dropped their redundant element parameter (`MapIter<I, A, O>` →
-  `MapIter<I, O>`, etc.), deriving it from the source's `Item`.
-
-
 ## [1.0.0] - 2026-06-11
 
 The first stable release. The compiler is self-hosted, the standard library
@@ -64,6 +25,19 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   modules, keyed on the import-resolved impl head so generic traits
   (`From<i8>` vs `From<i16>`), generic targets, and `where`-bounds are all
   distinguished.
+- **Associated types.** A trait may declare an associated type
+  (`type Item;`) and refer to it by projection (`This::Item` inside the trait,
+  `I::Item` off a generic parameter). Each impl binds it positionally
+  (`implement trait Iterator<i32> for X` — sugar for `Iterator<Item = i32>`,
+  available when the trait has no generic params of its own) or with the
+  explicit body form (`type Item = i32;`). Two diagnostics enforce the binding
+  rules: `E0309` (a declared associated type left unbound by an impl) and
+  `E0310` (an associated type bound positionally on a trait that also has
+  generic params — use the explicit body form `type Out = …;` instead).
+  Declaration-site bounds on an associated type (`type Item: Copy;`) are
+  enforced against each impl's concrete binding (`E0306`). Opaque `implement Iterator<T>`
+  bindings now cross-check `<T>` against the iterator's actual `Item` (`E0200`
+  on a category-level mismatch). See [`docs/cryo.md` §11.5](./docs/cryo.md#115-associated-types).
 - **Classes:** single-inheritance with virtual dispatch, destructors,
   `protected`/`private` visibility, `override` and `virtual` modifiers.
 - **Enums:** algebraic enums with explicit discriminants and discriminant
@@ -161,8 +135,12 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`core`:** `Copy`/`Drop`/`Clone`/`Eq`/`Ord`/`Hash`/`Default`/`From`/`Into`/
   `TryFrom`/`TryInto`/`Display`/`Debug`/`FmtWrite`/`Iterator`/`Error`
   traits; `Option<T>` and `Result<T,E>`.
-- **`core::iter`:** `Iterator<Item>` (one required `next`) with default
-  consumers `count`/`fold`/`for_each`/`any`/`all`/`find` and lazy combinator
+- **`core::iter`:** `Iterator` with an associated `type Item` (one required
+  `next() -> Option<This::Item>`); the legacy generic-param form `Iterator<T>`
+  remains accepted as positional sugar for `Iterator<Item = T>` in impls,
+  `where I: Iterator<T>` bounds, and `implement Iterator<T>` opaque returns.
+  Default consumers `count`/`fold`/`for_each`/`any`/`all`/`find` and lazy
+  combinator
   adapters `.take(n)` / `.map(f)` / `.filter(pred)` / `.chain(other)` /
   `.enumerate()` / `.zip(other)` (returning `TakeIter` / `MapIter` /
   `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` are
@@ -290,11 +268,15 @@ authoritative list.
 
 - Local type inference. A binding needs an explicit type unless its
   initializer is a lambda (`mut it = arr.iter()` is E0104; write the type or
-  chain on the expression). One consequence for iterators: an iterator widened
-  to an opaque `implement Iterator<T>` local cannot take further combinators
+  chain on the expression). One consequence for iterators: an opaque
+  `implement Iterator<T>` local initialised from a *producer* that itself
+  returns an opaque iterator cannot take further combinators
   (`mut it: implement Iterator<i32> = arr.iter(); it.take(1)...`), since the
-  concrete adapter type is erased - chain on the call expression instead. A
-  concrete-typed adapter local works (`mut z: ZipIter<.., ..> = a.zip(b)`).
+  concrete adapter type is erased - chain on the call expression instead. An
+  opaque local initialised from a concrete static constructor *can* be
+  re-adapted (`mut it: implement Iterator<i32> = Range<i32>::new(0,10);
+  it.take(3)`), and a concrete-typed adapter local works
+  (`mut z: ZipIter<.., ..> = a.zip(b)`).
 - Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
 - macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See
