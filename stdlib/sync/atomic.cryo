@@ -79,16 +79,27 @@ implement enum MemoryOrder {
 /// (`Relaxed`) is a no-op fence and is clamped up to `SeqCst` rather
 /// than producing invalid IR.
 function fence(order: MemoryOrder) -> void {
-    atomic_fence(MemoryOrder::to_u32(order));
+    // LLVM's `fence` instruction rejects Relaxed/Monotonic. Relaxed (2) is
+    // the only sub-Acquire ordering in MemoryOrder, and a Relaxed fence is a
+    // semantic no-op, so clamp it up to SeqCst (7) rather than emit invalid
+    // IR. Acquire/Release/AcqRel/SeqCst pass through unchanged.
+    mut ord: u32 = MemoryOrder::to_u32(order);
+    if (ord < 4u32) { ord = 7u32; }
+    atomic_fence(ord);
 }
 
-/// Like `fence`, but only constrains the compiler's reordering, not
-/// the CPU's.  Today this lowers to the same SeqCst LLVM fence as
-/// `fence` (the conservative path); the distinction is preserved for
-/// future refinement.  Use this when communicating with code inside
+/// Like `fence`, but intended only to constrain the compiler's
+/// reordering, not the CPU's.  Today this conservatively lowers to a
+/// real LLVM `fence` at the requested ordering (so it also bars CPU
+/// reordering); the lighter semantics are preserved in the signature
+/// for future refinement.  Use this when communicating with code inside
 /// the same thread (e.g., signal handlers, longjmp paths).
 function compiler_fence(order: MemoryOrder) -> void {
-    atomic_fence(MemoryOrder::to_u32(order));
+    // Same Relaxed-clamp as `fence`: LLVM's `fence` rejects the sub-Acquire
+    // ordering, so a Relaxed request becomes SeqCst rather than invalid IR.
+    mut ord: u32 = MemoryOrder::to_u32(order);
+    if (ord < 4u32) { ord = 7u32; }
+    atomic_fence(ord);
 }
 
 
