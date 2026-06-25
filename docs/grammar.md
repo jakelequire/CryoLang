@@ -15,7 +15,7 @@ Namespace          ::= "namespace" QualName ";"
 TopLevelItem       ::= Import | ModuleDecl | VarDecl | FunctionDecl
                      | ExternDecl | CHeaderImport | IntrinsicDecl
                      | AggregateDecl | EnumDecl | TraitDecl
-                     | TypeAlias | ImplBlock
+                     | TypeAlias | ImplBlock | StaticAssert
 
 Statement          ::= VarDecl | FunctionDecl
                      | AggregateDecl | EnumDecl | TraitDecl
@@ -80,6 +80,12 @@ CIncludeLine       ::= "#include" ( "<" /* path */ ">"
 IntrinsicDecl      ::= "intrinsic" "function" Ident
                        "(" ParamList? ")" ("->" Type)? (Block | ";")
                      | "intrinsic" "const" Ident ":" Type ("=" Expr)? ";"
+
+(*  Compile-time assertion: `cond` is folded after layout; a false or
+    non-constant condition is a compile error (E0237).  `cond` may use
+    integer/boolean literals, `sizeof`/`alignof`, and arithmetic /
+    comparison / logical / bitwise operators.                          *)
+StaticAssert       ::= "static_assert" "(" Expr ("," StringLit)? ")" ";"
 
 ParamList          ::= Param ("," Param)* ("," VariadicParam)?
                      | VariadicParam

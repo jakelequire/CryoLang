@@ -30,9 +30,26 @@ public:
 
 // ProgramNode: Root of a compilation unit
 
+/// A `static_assert(cond)` / `static_assert(cond, "message")` declared at module
+/// scope. Held in a side list on ProgramNode (not the statement stream) so it
+/// needs no NodeKind and no visitor changes: TypeResolution resolves the
+/// `sizeof`/`alignof` types inside `cond`, and TypeLowering folds it once
+/// layouts are known, emitting E0237 if the condition is false or non-constant.
+type struct StaticAssertItem {
+    /// The condition expression, stored opaquely as `void*` (really an
+    /// `ExpressionNode*`). The AST root module can't import
+    /// `Compiler::AST::Expression` without a module cycle (same reason as
+    /// `TypeofAnnotation.operand`); the parser stashes it and the
+    /// TypeResolution / TypeLowering passes cast it back to evaluate.
+    cond:    void*;
+    message: string;
+    span:    SourceSpan;
+}
+
 type class ProgramNode : ASTNode {
 public:
     statements:     ASTNode*[];
+    static_asserts: StaticAssertItem*[];
     namespace_name: string;
     /// Set by the parser when this module contains at least one f-string
     /// (`f"..."`).  The AutoImport pass reads it to inject a synthetic
@@ -42,12 +59,17 @@ public:
 
     ProgramNode(span: SourceSpan) : ASTNode(NodeKind::Program, span) {
         this.statements     = [];
+        this.static_asserts = [];
         this.namespace_name = "";
         this.uses_fstring   = false;
     }
 
     add_statement(stmt: ASTNode*) -> void {
         this.statements.push(stmt);
+    }
+
+    add_static_assert(item: StaticAssertItem*) -> void {
+        this.static_asserts.push(item);
     }
 
     set_namespace_name(name: string) -> void {

@@ -541,8 +541,9 @@ type struct CHeaderImport {
     }
 
     /// Allocate a PointerAnnotation wrapped in a heap TypeAnnotation.
-    static make_ptr_annotation(inner: TypeAnnotation*) -> TypeAnnotation* {
-        const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, span: SourceSpan::none() };
+    /// `is_const` marks `const T*` (pointee is const).
+    static make_ptr_annotation(inner: TypeAnnotation*, is_const: boolean) -> TypeAnnotation* {
+        const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, is_const: is_const, span: SourceSpan::none() };
         const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Pointer(ptr);
         return ann;
@@ -554,8 +555,14 @@ type struct CHeaderImport {
     static c_type_to_annotation(c_type: string, ctx: CompilationContext*) -> TypeAnnotation* {
         mut type_str: string = c_type;
 
-        // Strip qualifiers (may appear multiple times)
-        if (CHeaderImport::starts_with_at(type_str, 0, "const "))    { type_str += 6; }
+        // Strip qualifiers (may appear multiple times). `const` is remembered
+        // (not just dropped): when this level is a pointer, the stripped const
+        // qualifies its pointee, so the emitted `T*` becomes `const T*`. This
+        // is exact for the common single-level `const char*`; deeper multi-level
+        // const placement is approximate in the inline path (the libclang
+        // vendor path is authoritative for those).
+        mut had_const: boolean = false;
+        if (CHeaderImport::starts_with_at(type_str, 0, "const "))    { type_str += 6; had_const = true; }
         if (CHeaderImport::starts_with_at(type_str, 0, "volatile ")) { type_str += 9; }
         if (CHeaderImport::starts_with_at(type_str, 0, "static "))   { type_str += 7; }
         if (CHeaderImport::starts_with_at(type_str, 0, "extern "))   { type_str += 7; }
@@ -575,7 +582,7 @@ type struct CHeaderImport {
             }
             const inner: TypeAnnotation* = CHeaderImport::c_type_to_annotation(inner_buf as string, ctx);
             intrinsics::free(inner_buf as void*);
-            return CHeaderImport::make_ptr_annotation(inner);
+            return CHeaderImport::make_ptr_annotation(inner, had_const);
         }
 
         // Map standard C scalar types (incl. fixed-width typedefs and the LLVM
@@ -626,7 +633,7 @@ type struct CHeaderImport {
         if (CHeaderImport::starts_with_at(type_str, 0, "enum "))     { return CHeaderImport::make_prim_annotation("i32", ctx); }
 
         // Unknown type -> void* (opaque pointer)
-        return CHeaderImport::make_ptr_annotation(CHeaderImport::make_prim_annotation("void", ctx));
+        return CHeaderImport::make_ptr_annotation(CHeaderImport::make_prim_annotation("void", ctx), had_const);
     }
 
 

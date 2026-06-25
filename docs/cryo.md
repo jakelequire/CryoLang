@@ -78,7 +78,7 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | `for`        | `module`     |             | `override`  |                   |                | `with`                  |
 | `loop`       | `import`     |             | `inline`    |                   |                |                         |
 | `do`         | `export`     |             | `unsafe`    |                   |                |                         |
-| `break`      |              |             | `move`      |                   |                |                         |
+| `break`      | `static_assert` |          | `move`      |                   |                |                         |
 | `continue`   |              |             |             |                   |                |                         |
 | `return`     |              |             |             |                   |                |                         |
 
@@ -2220,6 +2220,50 @@ An aliased import block holds **only** `#include` directives, never Cryo declara
 Cryo emits each declaration under its [mangled symbol name](cryo-mangling-spec.md). To call a Cryo function from C, write a thin wrapper inside an `extern "C"` block on the Cryo side that forwards to the real function, and declare the wrapper in your C header using the wrapper's mangled symbol.
 
 A `![no_mangle]` / `![export]` directive that suppresses mangling for a single Cryo function is on the post-1.0 roadmap; until then, the wrapper-plus-mangled-symbol approach is the supported path.
+
+### 18.4 Function-pointer callbacks
+
+Many C APIs take a function pointer (`qsort`, event loops, AST visitors). Declare the parameter with Cryo's function-pointer type `(Args) -> Ret` and pass a **named Cryo function by its bare name** — taking the address is implicit, no `&`:
+
+```cryo
+extern "C" {
+    function qsort(base: void*, nmemb: u64, size: u64,
+                   compar: (const void*, const void*) -> i32) -> void;
+}
+
+function cmp_i32(a: const void*, b: const void*) -> i32 {
+    const pa: i32* = a as i32*;
+    const pb: i32* = b as i32*;
+    return *pa - *pb;
+}
+
+// qsort(&arr[0] as void*, n, 4, cmp_i32);   // sorts in place via the callback
+```
+
+The callback must be a **bare function pointer** — a named function or a non-capturing lambda. A capturing closure is *not* C-compatible: a C function pointer has no environment slot. Thread per-call state through an explicit `void*` client-data parameter instead (the standard C idiom, e.g. libclang's `clang_visitChildren(cursor, visitor, client_data)`):
+
+```cryo
+extern "C" {
+    function with_each(items: void*, n: u64,
+                       visit: (void*, void*) -> i32, client: void*) -> void;
+}
+```
+
+Where a C API documents an *optional* callback, a typed `null` is a valid value: pass `null` and guard the call site with `f == null`.
+
+### 18.5 Compile-time layout assertions (`static_assert`)
+
+When binding a C library, a Cryo struct must match the C struct's layout exactly. `static_assert` checks a constant condition at compile time and fails the build (E0237) if it is false — so a binding can verify its own layout against the numbers the C side guarantees, rather than miscompiling silently.
+
+```cryo
+type struct Color { r: u8; g: u8; b: u8; a: u8; }
+
+static_assert(sizeof(Color) == 4);
+static_assert(alignof(Color) == 1);
+static_assert(sizeof(Color) == 4, "Color must be 4 bytes to match the C ABI");
+```
+
+`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use integer/boolean literals, `sizeof(T)`, `alignof(T)`, and the arithmetic, comparison, logical, and bitwise operators. A condition that is false — or that is not a compile-time constant — is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
 
 ---
 
