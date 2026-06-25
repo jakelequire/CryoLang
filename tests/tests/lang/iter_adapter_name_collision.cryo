@@ -1,0 +1,61 @@
+// Cross-module bare-name disambiguation for Iterator method specialization.
+//
+// This file DELIBERATELY defines a `struct UpTo` implementing `Iterator<i32>`
+// with the SAME leaf name as the `UpTo` in `impl_trait_assoc_binding_spec.cryo`
+// (a different module). The two are compiled together into the test binary, so
+// the monomorphizer's trait-impl registry holds two `UpTo` impls.
+//
+// Method specialization used to key only on the bare leaf name (`UpTo`) and
+// return whichever impl registered first, specializing a method against the
+// WRONG type — codegen then found no method on the actual receiver (`E0636`).
+// This exercises that path for BOTH a self-returning adapter default (`take`,
+// here) and — via the other file — a generic terminal default (`fold<Acc>`):
+// `mono/call_specializer.cryo` now disambiguates by qualified name
+// (`find_self_returning_default` + `find_trait_impl_method_for_target`).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::IterAdapterNameCollision;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::test::error;
+import std::test::assert;
+
+type struct UpTo {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator<i32> for struct UpTo {
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+function dbl(x: i32) -> i32 { return x * 2; }
+
+function drain<I>(mut it: I) -> i32 where I: Iterator<i32> {
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+// Adapters on THIS module's `UpTo` must resolve against THIS `UpTo`, not the
+// same-named one in `impl_trait_assoc_binding_spec.cryo`.
+![test]
+function adapters_on_same_named_struct_resolve_correctly() -> Result<(), TestError> {
+    mut a: UpTo = UpTo { cur: 0, end: 10 };
+    const t: i32 = drain(a.take(3));        // 0+1+2 = 3
+    mut b: UpTo = UpTo { cur: 0, end: 4 };
+    const m: i32 = drain(b.map(dbl));       // 0+2+4+6 = 12
+    return expect_eq(t + m, 15);
+}

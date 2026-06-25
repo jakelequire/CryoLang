@@ -66,21 +66,21 @@ The compiler does not enforce naming, but the standard library and ecosystem use
 
 Keywords are reserved identifiers. They cannot be used as variable, function, or type names.
 
-| Control flow | Declarations | | Modifiers | Operator keywords | Special values | Reserved for future use |
-|---|---|---|---|---|---|---|
-| `if`       | `function`   | `from`        | `const`     | `new`    | `true`  | `yield`    |
-| `else`     | `class`      | `as`          | `mut`       | `delete` | `false` | `async`    |
-| `switch`   | `struct`     | `implement`   | `static`    | `sizeof` | `null`  | `await`    |
-| `case`     | `enum`       | `intrinsic`   | `public`    | `alignof`| `this`  | `auto`     |
-| `default`  | `trait`      | `where`       | `private`   | `typeof` | `This`  | `unsigned` |
-| `match`    | `type`       | `extern`      | `protected` | `in`     |         | `tuple`    |
-| `while`    | `namespace`  |               | `virtual`   | `as`     |         | `optional` |
-| `for`      | `module`     |               | `override`  |          |         | `with`     |
-| `loop`     | `import`     |               | `inline`    |          |         |            |
-| `do`       | `export`     |               | `unsafe`    |          |         |            |
-| `break`    |              |               | `move`      |          |         |            |
-| `continue` |              |               |             |          |         |            |
-| `return`   |              |               |             |          |         |            |
+| Control flow | Declarations |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
+| ------------ | ------------ | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
+| `if`         | `function`   | `from`      | `const`     | `new`             | `true`         | `yield`                 |
+| `else`       | `class`      | `as`        | `mut`       | `delete`          | `false`        | `async`                 |
+| `switch`     | `struct`     | `implement` | `static`    | `sizeof`          | `null`         | `await`                 |
+| `case`       | `enum`       | `intrinsic` | `public`    | `alignof`         | `this`         | `auto`                  |
+| `default`    | `trait`      | `where`     | `private`   | `typeof`          | `This`         | `unsigned`              |
+| `match`      | `type`       | `extern`    | `protected` | `in`              |                | `tuple`                 |
+| `while`      | `namespace`  |             | `virtual`   | `as`              |                | `optional`              |
+| `for`        | `module`     |             | `override`  |                   |                | `with`                  |
+| `loop`       | `import`     |             | `inline`    |                   |                |                         |
+| `do`         | `export`     |             | `unsafe`    |                   |                |                         |
+| `break`      |              |             | `move`      |                   |                |                         |
+| `continue`   |              |             |             |                   |                |                         |
+| `return`     |              |             |             |                   |                |                         |
 
 `move` marks a closure that captures its environment by move (see [§ 16.3](#163-move-checking)).
 
@@ -185,20 +185,20 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 
 ### 2.1 Primitive Types
 
-| Type | Description | Size |
-| --- | --- | --- |
-| `void` | No value; only valid as a return type. | 0 |
-| `boolean` | `true` / `false`. Not interchangeable with integers. | 1 byte |
-| `char` | 8-bit character (byte). | 1 byte |
-| `string` | NUL-terminated raw string (`*u8`). FFI-shaped. | pointer |
-| `int` | Default signed integer; alias for `i32`. | 4 bytes |
-| `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width. | 1 / 2 / 4 / 8 / 16 bytes |
-| `uint` | Default unsigned integer; alias for `u32`. | 4 bytes |
-| `u8` `u16` `u32` `u64` `u128` | Unsigned integers of fixed width. | 1 / 2 / 4 / 8 / 16 bytes |
-| `float` | Default float; alias for `f64`. | 8 bytes |
-| `f32` `f64` | IEEE 754 floats. | 4 / 8 bytes |
-| `double` | Alias for `f64`. | 8 bytes |
-| `usize` `isize` | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit |
+| Type                          | Description                                                                                                                                      | Size                     |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
+| `void`                        | No value; only valid as a return type.                                                                                                           | 0                        |
+| `boolean`                     | `true` / `false`. Not interchangeable with integers.                                                                                             | 1 byte                   |
+| `char`                        | 8-bit character (byte).                                                                                                                          | 1 byte                   |
+| `string`                      | NUL-terminated raw string (`*u8`). FFI-shaped.                                                                                                   | pointer                  |
+| `int`                         | Default signed integer; alias for `i32`.                                                                                                         | 4 bytes                  |
+| `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width.                                                                                                                  | 1 / 2 / 4 / 8 / 16 bytes |
+| `uint`                        | Default unsigned integer; alias for `u32`.                                                                                                       | 4 bytes                  |
+| `u8` `u16` `u32` `u64` `u128` | Unsigned integers of fixed width.                                                                                                                | 1 / 2 / 4 / 8 / 16 bytes |
+| `float`                       | Default float; alias for `f64`.                                                                                                                  | 8 bytes                  |
+| `f32` `f64`                   | IEEE 754 floats.                                                                                                                                 | 4 / 8 bytes              |
+| `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
+| `usize` `isize`               | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
@@ -655,10 +655,10 @@ The complete list of intrinsics is the file [`stdlib/core/intrinsics.cryo`](../s
 
 The compiler also expands two source-location pseudo-constants at the call site:
 
-| Constant | Expands to |
-| --- | --- |
-| `FILE` | The current source file path (`string`). |
-| `LINE` | The current line number (`i32`). |
+| Constant | Expands to                               |
+| -------- | ---------------------------------------- |
+| `FILE`   | The current source file path (`string`). |
+| `LINE`   | The current line number (`i32`).         |
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
 
@@ -668,11 +668,11 @@ These are used by `panic`, `assert`, and the testing framework to report failure
 
 ### 5.1 Arithmetic
 
-| Operator | Description |
-| --- | --- |
+| Operator            | Description                             |
+| ------------------- | --------------------------------------- |
 | `+` `-` `*` `/` `%` | Add, subtract, multiply, divide, modulo |
-| `-` (unary) | Negation |
-| `++` `--` | Pre/postfix increment, decrement |
+| `-` (unary)         | Negation                                |
+| `++` `--`           | Pre/postfix increment, decrement        |
 
 Integer division truncates toward zero. The prefix forms `++x`, `--x` evaluate to the new value; the postfix forms `x++`, `x--` evaluate to the old value (C semantics).
 
@@ -689,59 +689,59 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 
 ### 5.2 Comparison
 
-| Operator | Description |
-| --- | --- |
-| `==` `!=` | Equal / not equal |
-| `<` `>` `<=` `>=` | Ordering comparisons |
-| `<=>` | Three-way comparison (spaceship); negative / zero / positive |
+| Operator          | Description                                                  |
+| ----------------- | ------------------------------------------------------------ |
+| `==` `!=`         | Equal / not equal                                            |
+| `<` `>` `<=` `>=` | Ordering comparisons                                         |
+| `<=>`             | Three-way comparison (spaceship); negative / zero / positive |
 
 Comparison operators return `boolean`. They work on numeric types and pointers; for user-defined types, use the `Eq` and `Ord` traits ([§ 11](#11-traits)).
 
 ### 5.3 Logical
 
-| Operator | Description |
-| --- | --- |
-| `&&` | Logical AND (short-circuiting) |
-| `\|\|` | Logical OR (short-circuiting) |
-| `!` | Logical NOT (unary) |
+| Operator | Description                    |
+| -------- | ------------------------------ |
+| `&&`     | Logical AND (short-circuiting) |
+| `\|\|`   | Logical OR (short-circuiting)  |
+| `!`      | Logical NOT (unary)            |
 
 ### 5.4 Bitwise
 
-| Operator | Description |
-| --- | --- |
-| `&` `\|` `^` | AND / OR / XOR |
-| `~` | Bitwise NOT (unary) |
-| `<<` `>>` | Left / right shift (arithmetic on signed, logical on unsigned) |
+| Operator     | Description                                                    |
+| ------------ | -------------------------------------------------------------- |
+| `&` `\|` `^` | AND / OR / XOR                                                 |
+| `~`          | Bitwise NOT (unary)                                            |
+| `<<` `>>`    | Left / right shift (arithmetic on signed, logical on unsigned) |
 
 ### 5.5 Assignment
 
 Only `mut` bindings can be assigned to.
 
-| Operator | Description |
-| --- | --- |
-| `=` | Simple assignment |
-| `+=` `-=` `*=` `/=` `%=` | Compound arithmetic |
-| `&=` `\|=` `^=` `<<=` `>>=` | Compound bitwise |
+| Operator                    | Description         |
+| --------------------------- | ------------------- |
+| `=`                         | Simple assignment   |
+| `+=` `-=` `*=` `/=` `%=`    | Compound arithmetic |
+| `&=` `\|=` `^=` `<<=` `>>=` | Compound bitwise    |
 
 ### 5.6 Other Operators
 
-| Operator | Description |
-| --- | --- |
-| `->` | Return-type arrow; pointer member access (`p->field`). |
-| `=>` | Pattern-to-body separator inside `match`. |
-| `::` | Scope resolution: static methods, enum variants, module members. |
-| `?` `:` | Ternary conditional. |
-| `?` (postfix) | Error propagation ("try"): on a `Result`/`Option`, yields the `Ok`/`Some` payload, else returns the `Err`/`None` from the enclosing function. |
-| `??` | Null-coalescing: `opt ?? fallback` yields a `Some`'s payload, else `fallback` (evaluated only when `opt` is `None`). |
-| `\|>` `<\|` | Pipeline: thread a value into a call (`x \|> f(a)` ⇒ `f(x, a)`; `f(a) <\| x` ⇒ `f(a, x)`). |
-| `as` | Explicit type cast. |
-| `.` | Member access. |
-| `&` | Address-of (unary). |
-| `*` | Dereference (unary). |
-| `sizeof(T)` | Compile-time size of `T` in bytes. |
-| `alignof(T)` | Compile-time alignment of `T` in bytes. |
-| `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style). |
-| `new` `delete` | Heap allocation / deallocation. |
+| Operator       | Description                                                                                                                                   |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `->`           | Return-type arrow; pointer member access (`p->field`).                                                                                        |
+| `=>`           | Pattern-to-body separator inside `match`.                                                                                                     |
+| `::`           | Scope resolution: static methods, enum variants, module members.                                                                              |
+| `?` `:`        | Ternary conditional.                                                                                                                          |
+| `?` (postfix)  | Error propagation ("try"): on a `Result`/`Option`, yields the `Ok`/`Some` payload, else returns the `Err`/`None` from the enclosing function. |
+| `??`           | Null-coalescing: `opt ?? fallback` yields a `Some`'s payload, else `fallback` (evaluated only when `opt` is `None`).                          |
+| `\|>` `<\|`    | Pipeline: thread a value into a call (`x \|> f(a)` ⇒ `f(x, a)`; `f(a) <\| x` ⇒ `f(a, x)`).                                                    |
+| `as`           | Explicit type cast.                                                                                                                           |
+| `.`            | Member access.                                                                                                                                |
+| `&`            | Address-of (unary).                                                                                                                           |
+| `*`            | Dereference (unary).                                                                                                                          |
+| `sizeof(T)`    | Compile-time size of `T` in bytes.                                                                                                            |
+| `alignof(T)`   | Compile-time alignment of `T` in bytes.                                                                                                       |
+| `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style).                                                                          |
+| `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
 > **Reserved.** `?.`, `..` (in expression position), and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax).
 
@@ -780,26 +780,26 @@ const back = n as typeof(x);   // back : i32
 
 From **lowest** to **highest**:
 
-| Level | Operators | Associativity |
-| --- | --- | --- |
-| 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | Right |
-| 2 | `??` (null-coalescing) | Right |
-| 3 | `\|>` `<\|` (pipeline) | Left |
-| 4 | `? :` (ternary) | Right |
-| 5 | `..` `..=` (range) | Left |
-| 6 | `\|\|` | Left |
-| 7 | `&&` | Left |
-| 8 | `\|` | Left |
-| 9 | `^` | Left |
-| 10 | `&` | Left |
-| 11 | `==` `!=` | Left |
-| 12 | `<` `>` `<=` `>=` `<=>` | Left |
-| 13 | `<<` `>>` | Left |
-| 14 | `+` `-` | Left |
-| 15 | `*` `/` `%` | Left |
-| 16 | `as` | Left |
-| 17 | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right |
-| 18 | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix) | Left |
+| Level | Operators                                                     | Associativity |
+| ----- | ------------------------------------------------------------- | ------------- |
+| 1     | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=`      | Right         |
+| 2     | `??` (null-coalescing)                                        | Right         |
+| 3     | `\|>` `<\|` (pipeline)                                        | Left          |
+| 4     | `? :` (ternary)                                               | Right         |
+| 5     | `..` `..=` (range)                                            | Left          |
+| 6     | `\|\|`                                                        | Left          |
+| 7     | `&&`                                                          | Left          |
+| 8     | `\|`                                                          | Left          |
+| 9     | `^`                                                           | Left          |
+| 10    | `&`                                                           | Left          |
+| 11    | `==` `!=`                                                     | Left          |
+| 12    | `<` `>` `<=` `>=` `<=>`                                       | Left          |
+| 13    | `<<` `>>`                                                     | Left          |
+| 14    | `+` `-`                                                       | Left          |
+| 15    | `*` `/` `%`                                                   | Left          |
+| 16    | `as`                                                          | Left          |
+| 17    | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right         |
+| 18    | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix)      | Left          |
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
@@ -989,15 +989,15 @@ A pattern describes the shape of a value. When a value matches, any variables in
 
 ### 7.1 Pattern Forms
 
-| Pattern | Syntax | Matches |
-| --- | --- | --- |
-| Literal | `42`, `"hello"`, `true`, `'A'` | Exactly that value. |
-| Identifier | `x` | Any value; binds it to `x`. |
-| Wildcard | `_` | Any value; discards it. |
-| Enum (unit) | `Color::Red` | That variant, no payload. |
-| Enum (with payload) | `Shape::Circle(r)` | That variant; binds the payload to `r`. |
-| Range | `'0'..'9'` | Any value in the range (inclusive). |
-| Or | `pat \| pat \| pat` | Any of the listed patterns. |
+| Pattern             | Syntax                         | Matches                                 |
+| ------------------- | ------------------------------ | --------------------------------------- |
+| Literal             | `42`, `"hello"`, `true`, `'A'` | Exactly that value.                     |
+| Identifier          | `x`                            | Any value; binds it to `x`.             |
+| Wildcard            | `_`                            | Any value; discards it.                 |
+| Enum (unit)         | `Color::Red`                   | That variant, no payload.               |
+| Enum (with payload) | `Shape::Circle(r)`             | That variant; binds the payload to `r`. |
+| Range               | `'0'..'9'`                     | Any value in the range (inclusive).     |
+| Or                  | `pat \| pat \| pat`            | Any of the listed patterns.             |
 
 ### 7.2 Enum Destructuring
 
@@ -1352,13 +1352,13 @@ function main() -> i32 {
 
 ### 9.6 Structs vs. Classes
 
-|  | Struct | Class |
-| --- | --- | --- |
-| Allocation | Stack (value type) | Heap via `new` (reference type) |
-| Inheritance | No | Single inheritance |
-| Virtual dispatch | No | `virtual` / `override` |
-| Receivers | `&this` / `mut &this` | `&this` / `mut &this` |
-| Use when | Plain data, generics, hot paths | Polymorphism, object hierarchies |
+|                  | Struct                          | Class                            |
+| ---------------- | ------------------------------- | -------------------------------- |
+| Allocation       | Stack (value type)              | Heap via `new` (reference type)  |
+| Inheritance      | No                              | Single inheritance               |
+| Virtual dispatch | No                              | `virtual` / `override`           |
+| Receivers        | `&this` / `mut &this`           | `&this` / `mut &this`            |
+| Use when         | Plain data, generics, hot paths | Polymorphism, object hierarchies |
 
 **Default to structs.** Reach for a class only when you need inheritance and virtual dispatch.
 
@@ -1537,23 +1537,23 @@ where T: Hash + Eq, V: Clone
 
 ### 11.4 Standard Library Traits
 
-| Trait | Purpose |
-| --- | --- |
-| `Copy` | Marker for types that are bitwise-copyable (no `Drop` impl). |
-| `Drop` | Explicit destructor; types implementing it are non-`Copy`. |
-| `Clone` | Explicit deep duplication via `clone()`. |
-| `Default` | A canonical zero value: `static default() -> This`. |
-| `Eq` | Equality. |
-| `Ord` (`: Eq`) | Total ordering via `compare(...) -> Ordering`. |
-| `Hash` | Type-level hashing into a `Hasher`. |
-| `Iterator` | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
-| `IntoIterator` | Conversion into an iterator. |
-| `From<T>` / `Into<T>` | Infallible conversions. |
-| `TryFrom<T>` / `TryInto<T>` | Fallible conversions returning `Result`. |
-| `Read` / `Write` | Byte-level I/O. |
-| `Display` / `Debug` | Formatting. |
-| `FmtWrite` | Sink trait for the formatter. |
-| `Allocator` | Heap allocation strategy. |
+| Trait                       | Purpose                                                                                                    |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `Copy`                      | Marker for types that are bitwise-copyable (no `Drop` impl).                                               |
+| `Drop`                      | Explicit destructor; types implementing it are non-`Copy`.                                                 |
+| `Clone`                     | Explicit deep duplication via `clone()`.                                                                   |
+| `Default`                   | A canonical zero value: `static default() -> This`.                                                        |
+| `Eq`                        | Equality.                                                                                                  |
+| `Ord` (`: Eq`)              | Total ordering via `compare(...) -> Ordering`.                                                             |
+| `Hash`                      | Type-level hashing into a `Hasher`.                                                                        |
+| `Iterator`                  | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
+| `IntoIterator`              | Conversion into an iterator.                                                                               |
+| `From<T>` / `Into<T>`       | Infallible conversions.                                                                                    |
+| `TryFrom<T>` / `TryInto<T>` | Fallible conversions returning `Result`.                                                                   |
+| `Read` / `Write`            | Byte-level I/O.                                                                                            |
+| `Display` / `Debug`         | Formatting.                                                                                                |
+| `FmtWrite`                  | Sink trait for the formatter.                                                                              |
+| `Allocator`                 | Heap allocation strategy.                                                                                  |
 
 Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FmtWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
 
@@ -1840,11 +1840,11 @@ Wildcard imports are convenient but can cause name collisions; prefer the brace 
 
 ### 14.4 Visibility
 
-| Modifier | Meaning |
-| --- | --- |
+| Modifier            | Meaning                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------- |
 | *(none)* / `public` | Accessible to any module that imports this one. This is the default for top-level items. |
-| `private` | Accessible only within the same module. |
-| `protected` | Class-only; accessible to the class and its subclasses. |
+| `private`           | Accessible only within the same module.                                                  |
+| `protected`         | Class-only; accessible to the class and its subclasses.                                  |
 
 Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `class` / `enum`), `private` is enforced across modules: naming a `private` type from another module — in a type annotation, a struct literal, or a function signature — is rejected with `E0503`. A `private` type remains fully usable within its own module.
 
@@ -2017,19 +2017,19 @@ type struct AlignedData {
 
 ### 17.1 Recognised Attributes
 
-| Directive | Target | Description |
-| --- | --- | --- |
-| `![inline]` | function | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).* |
-| `![noinline]` | function | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.* |
-| `![deprecated]` / `![deprecated("msg")]` | any decl | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.* |
-| `![link("name")]` | extern fn | Override the linker symbol used to resolve an extern function: Cryo callers use the declared name while the symbol resolved at link time is `name`. |
-| `![allow(name)]` / `![warn(name)]` / `![deny(name)]` | any decl | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* |
-| `![derive(Trait, …)]` | struct / class / enum | Auto-derive one or more traits. |
-| `![sink]` | method | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics. |
-| `![implicit]` | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = …` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(…)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
-| `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]` | any decl | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match. |
-| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum | Memory layout control. See [§ 17.3](#173-memory-layout). |
-| `![align(N)]` | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout). |
+| Directive                                                 | Target                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `![inline]`                                               | function                  | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).*                                                                                                                                                                                                                                                                                                               |
+| `![noinline]`                                             | function                  | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.*                                                                                                                                                                                                                                                                                                                                           |
+| `![deprecated]` / `![deprecated("msg")]`                  | any decl                  | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                           |
+| `![link("name")]`                                         | extern fn                 | Override the linker symbol used to resolve an extern function: Cryo callers use the declared name while the symbol resolved at link time is `name`.                                                                                                                                                                                                                                                                         |
+| `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                  | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.*                                                                                                                                                                                                                                                                                                              |
+| `![derive(Trait, …)]`                                     | struct / class / enum     | Auto-derive one or more traits.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `![sink]`                                                 | method                    | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                    |
+| `![implicit]`                                             | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = …` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(…)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
+| `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
+| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
+| `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
 
@@ -2039,12 +2039,12 @@ Other names that appear with `![…]` syntax are accepted by the parser and reco
 
 The test framework introduces a small set of directives recognised by the compiler ([§ 20](#20-testing) covers usage):
 
-| Directive | Description |
-| --- | --- |
+| Directive            | Description                                                        |
+| -------------------- | ------------------------------------------------------------------ |
 | `![config(testing)]` | Marks a file as a test source. May appear next to its `namespace`. |
-| `![test]` | Marks a function as a discoverable test. |
-| `![ignore]` | Skips the test unless `cryo test --ignored` is passed. |
-| `![should_panic]` | Asserts the test panics; passing the test means observing a panic. |
+| `![test]`            | Marks a function as a discoverable test.                           |
+| `![ignore]`          | Skips the test unless `cryo test --ignored` is passed.             |
+| `![should_panic]`    | Asserts the test panics; passing the test means observing a panic. |
 
 ### 17.3 Memory Layout
 
@@ -2231,44 +2231,44 @@ The standard library is written entirely in Cryo and ships with the compiler as 
 
 The prelude is auto-imported into every Cryo source file. Currently:
 
-| Module | What it brings in |
-| --- | --- |
-| `core::panic` | `panic(message: string, file: string, line: u32) -> void` (does not return; aborts the process) |
-| `core::option` | `Option<T>` (`Some` / `None`) and its methods |
-| `core::result` | `Result<T, E>` (`Ok` / `Err`) and its methods |
-| `core::primitives` | Methods on built-in types (`i32::max_value`, `char::is_digit`, …) |
-| `core::intrinsics` | Compiler intrinsics including `printf`, `malloc`, `free`, `memcpy` (the `print`/`println` family lives in `std::fmt`) |
-| `core::varargs` | `VaArgs`, the compiler-assigned type of a function's `args...` bucket |
-| `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>` |
-| `core::slice` | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: T[N]`) |
-| `core::ops` | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`) |
-| `core::iter` | `Iterator`, the trait the for-in sugar drives the scrutinee through |
-| `alloc::box` | `Box<T>` |
-| `alloc::rc` | `Rc<T>` |
+| Module               | What it brings in                                                                                                     |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `core::panic`        | `panic(message: string, file: string, line: u32) -> void` (does not return; aborts the process)                       |
+| `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
+| `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
+| `core::primitives`   | Methods on built-in types (`i32::max_value`, `char::is_digit`, …)                                                     |
+| `core::intrinsics`   | Compiler intrinsics including `printf`, `malloc`, `free`, `memcpy` (the `print`/`println` family lives in `std::fmt`) |
+| `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
+| `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>`                                                               |
+| `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: T[N]`)                   |
+| `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
+| `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
+| `alloc::box`         | `Box<T>`                                                                                                              |
+| `alloc::rc`          | `Rc<T>`                                                                                                               |
 
 The prelude is deliberately small. Anything else is an explicit `import` - notably, the `print` / `println` / `eprint` / `eprintln` family lives in `std::fmt` and is **not** auto-imported. Examples in this document that use `println` assume `import std::fmt;` is in scope.
 
 ### 19.2 Module Map
 
-| Module | Highlights |
-| --- | --- |
-| **`core`** | The language foundations. `Option<T>`, `Result<T, E>`, `Slice<T>`, `NonNull<T>`, `Range<T>`, `RangeInclusive<T>`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `IntoIterator`, `From`/`Into`/`TryFrom`/`TryInto`, `Step`. Memory utilities (`copy`, `zero`, `swap`, `transmute`, `align_up`/`align_down`). Hashing (`Hasher`, `DefaultHasher`, an FNV-1a implementation). |
-| **`alloc`** | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting), `Arc<T>` (atomic reference counting for cross-thread sharing). |
-| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view), `String<A>` (owned UTF-8), `HashMap<K, V, A>` (separate-chaining), `HashSet<T, A>`, `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAlloc` default. |
-| **`io`** | `Read` / `Write` traits with rich defaults (`read_byte`, `read_until`, `read_to_end`, `read_to_string`, `write_all`, `write_str`, `write_line`). `Stdin`, `Stdout`, `Stderr` handles with `is_tty()`/`as_fd()`. `BufWriter<W>` / `LineWriter<W>` / `BufReader<R>`. POSIX flag constants and an `IoError` / `IoErrorKind` mapping `errno`. |
-| **`fmt`** | `Display` and `Debug` traits, `Formatter<W>` borrowing its sink, `FmtWrite`, `print` / `println` / `eprint` / `eprintln`, `format_to_string`, `format_debug_to_string`. Heap-free integer and float writers (`write_u64_decimal`, `write_f64`). |
-| **`json`** | RFC 8259 parser and serialiser. `JsonValue`, `JsonNumber`, `JsonObject` (insertion-ordered). `parse`, `stringify`, `stringify_pretty`. |
-| **`fs`** | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` / `write(path, bytes)` / `read_to_string(path)` / `copy(from, to)`. Whole-path operations: `remove_file`, `rename`, `create_dir` / `create_dir_all`, `remove_dir` / `remove_dir_all`, `read_dir` (a `ReadDir` iterator of `DirEntry`), `canonicalize`. Metadata: `metadata` / `symlink_metadata` (typed `Metadata` via `stat` / `lstat`), `exists`, `is_file`, `is_dir`. `O_*` and `SEEK_*` constants. |
-| **`ffi`** | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures. |
-| **`env`** | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`. |
-| **`math`** | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, …), and the constants `PI`, `TAU`, `E`. |
-| **`time`** | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero. |
-| **`random`** | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic. |
-| **`net`** | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
-| **`process`** | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported. |
-| **`sync`** | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement. |
-| **`thread`** | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn. |
-| **`test`** | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing). |
+| Module            | Highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`core`**        | The language foundations. `Option<T>`, `Result<T, E>`, `Slice<T>`, `NonNull<T>`, `Range<T>`, `RangeInclusive<T>`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `IntoIterator`, `From`/`Into`/`TryFrom`/`TryInto`, `Step`. Memory utilities (`copy`, `zero`, `swap`, `transmute`, `align_up`/`align_down`). Hashing (`Hasher`, `DefaultHasher`, an FNV-1a implementation).                                                                                                                                                                            |
+| **`alloc`**       | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting), `Arc<T>` (atomic reference counting for cross-thread sharing).                                                                                                                                                                                                                                                                                                                                                                      |
+| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view), `String<A>` (owned UTF-8), `HashMap<K, V, A>` (separate-chaining), `HashSet<T, A>`, `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAlloc` default.                                                                                                                                                                                                                                                                                                                                           |
+| **`io`**          | `Read` / `Write` traits with rich defaults (`read_byte`, `read_until`, `read_to_end`, `read_to_string`, `write_all`, `write_str`, `write_line`). `Stdin`, `Stdout`, `Stderr` handles with `is_tty()`/`as_fd()`. `BufWriter<W>` / `LineWriter<W>` / `BufReader<R>`. POSIX flag constants and an `IoError` / `IoErrorKind` mapping `errno`.                                                                                                                                                                                                                                                              |
+| **`fmt`**         | `Display` and `Debug` traits, `Formatter<W>` borrowing its sink, `FmtWrite`, `print` / `println` / `eprint` / `eprintln`, `format_to_string`, `format_debug_to_string`. Heap-free integer and float writers (`write_u64_decimal`, `write_f64`).                                                                                                                                                                                                                                                                                                                                                        |
+| **`json`**        | RFC 8259 parser and serialiser. `JsonValue`, `JsonNumber`, `JsonObject` (insertion-ordered). `parse`, `stringify`, `stringify_pretty`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **`fs`**          | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` / `write(path, bytes)` / `read_to_string(path)` / `copy(from, to)`. Whole-path operations: `remove_file`, `rename`, `create_dir` / `create_dir_all`, `remove_dir` / `remove_dir_all`, `read_dir` (a `ReadDir` iterator of `DirEntry`), `canonicalize`. Metadata: `metadata` / `symlink_metadata` (typed `Metadata` via `stat` / `lstat`), `exists`, `is_file`, `is_dir`. `O_*` and `SEEK_*` constants.                                                                               |
+| **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures.                                                                                                                                                                                                                                                                                                                                       |
+| **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **`math`**        | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, …), and the constants `PI`, `TAU`, `E`.                                                                                                                                                                                                                                                             |
+| **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero.                                                                                                               |
+| **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                      |
+| **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
+| **`process`**     | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported.                                                                                                                                                                                                                                                                                                                          |
+| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement.                                                                                                      |
+| **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                             |
+| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                      |
 
 ### 19.3 Naming Conventions in the Standard Library
 
@@ -2335,10 +2335,10 @@ cryo test -q, --quiet              # suppress per-test ok / ignored lines
 
 The runner ships three output formats; `--format=<mode>` picks per-run:
 
-| Format    | Layout                                                         |
-| --------- | -------------------------------------------------------------- |
-| `plain`   | Cargo-style `test NAME ... ok` lines; CI-friendly. **Default.** |
-| `pretty`  | Tests grouped under their namespace, indented leaves, `[PASS]` / `[FAIL]` / `[skip]` chips. Colored on a TTY. |
+| Format    | Layout                                                                                                                                                  |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `plain`   | Cargo-style `test NAME ... ok` lines; CI-friendly. **Default.**                                                                                         |
+| `pretty`  | Tests grouped under their namespace, indented leaves, `[PASS]` / `[FAIL]` / `[skip]` chips. Colored on a TTY.                                           |
 | `compact` | One line per namespace with a dot-stream of results (`.` pass, `F` fail, `s` skip, `P` did-not-panic, `E` runner error) and a trailing per-group tally. |
 
 Color follows `--color=<auto|always|never>`. `auto` (default) emits ANSI escapes only when stdout is a terminal; the `NO_COLOR` environment variable forces it off per <https://no-color.org/>.
@@ -2365,25 +2365,25 @@ color  = "auto"     # one of: auto  | always | never
 
 The lexer and grammar reserve the following forms because the language plans to use them. The compiler does not yet lower them; using them today either errors at parse time or is silently ignored by later passes. Treat this list as a roadmap, not as features.
 
-| Reserved | Status |
-| --- | --- |
-| Raw strings `r"..."` | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal. |
-| Escapes `\a` `\b` `\f` `\v` | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`. |
-| `async` / `await` | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines. |
-| `yield` | Parser accepts a `yield` expression; no generator semantics exist. |
-| Optional chaining `?.` | Token reserved; not consumed by the parser. |
-| Spread `...` in calls / literals | The token exists for variadic parameter declarations only. |
-| Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point. |
-| Struct field defaults (`field: T = expr`) | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
-| Macros | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one. |
-| `![pure]` | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics). |
-| `![const]` | Reserved. Will mark a function as evaluable at compile time. |
-| `![noreturn]` | Reserved. Will declare a function that never returns normally. |
-| `![export]` / `![no_mangle]` | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [§ 18.3](#183-calling-cryo-from-c). |
-| `![section("name")]` | Reserved. Will place the symbol in a specific object-file section. |
-| `![weak]` | Reserved. Will declare weak linkage. |
-| `![constructor]` / `![destructor]` | Reserved. Will register functions that run before `main` / after `main` returns. |
-| `![repr(<int_type>)]` on enums | Reserved. Use `type enum Foo : u8 { … }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling. |
+| Reserved                                      | Status                                                                                                                                                                                            |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Raw strings `r"..."`                          | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal.                                     |
+| Escapes `\a` `\b` `\f` `\v`                   | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`.    |
+| `async` / `await`                             | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines.                                                |
+| `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist.                                                                                                                                |
+| Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                       |
+| Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                        |
+| Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point.                                                                                                             |
+| Struct field defaults (`field: T = expr`)     | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
+| Macros                                        | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one.                                  |
+| `![pure]`                                     | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics).                                   |
+| `![const]`                                    | Reserved. Will mark a function as evaluable at compile time.                                                                                                                                      |
+| `![noreturn]`                                 | Reserved. Will declare a function that never returns normally.                                                                                                                                    |
+| `![export]` / `![no_mangle]`                  | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [§ 18.3](#183-calling-cryo-from-c).                |
+| `![section("name")]`                          | Reserved. Will place the symbol in a specific object-file section.                                                                                                                                |
+| `![weak]`                                     | Reserved. Will declare weak linkage.                                                                                                                                                              |
+| `![constructor]` / `![destructor]`            | Reserved. Will register functions that run before `main` / after `main` returns.                                                                                                                  |
+| `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { … }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                      |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 
@@ -2487,10 +2487,10 @@ no_std    = false                   # build without linking the standard library
 default optimization level and debug-info setting and names the per-profile
 cache subtree. Two are built in:
 
-| Profile | Optimization | Debug info |
-| --- | --- | --- |
-| `release` (default) | `O2` | off |
-| `debug` | `O0` | DWARF (`-g`) |
+| Profile             | Optimization | Debug info   |
+| ------------------- | ------------ | ------------ |
+| `release` (default) | `O2`         | off          |
+| `debug`             | `O0`         | DWARF (`-g`) |
 
 Set the default in cryoconfig, or pick one per build with `--release` / `--dev`
 (`--dev` = the `debug` profile) / `--profile=NAME`:
@@ -2546,11 +2546,11 @@ search = ["/usr/lib/llvm-20/lib"]   # extra -L dirs to resolve `system` libs
 static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by path
 ```
 
-| Key | Role | Linker form |
-| --- | --- | --- |
-| `system` | A library the linker finds on its default search path. | `-l<name>` |
-| `search` | Extra directories to search — only needed for `system` libs that live off the default path. | `-L<dir>` |
-| `static` | A local archive in your project; linked by its path. | the path, verbatim |
+| Key      | Role                                                                                        | Linker form        |
+| -------- | ------------------------------------------------------------------------------------------- | ------------------ |
+| `system` | A library the linker finds on its default search path.                                      | `-l<name>`         |
+| `search` | Extra directories to search — only needed for `system` libs that live off the default path. | `-L<dir>`          |
+| `static` | A local archive in your project; linked by its path.                                        | the path, verbatim |
 
 > Migrating from pre-1.0: `link_libs` → `[link] system`, `link_paths` → `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone — set `emit_llvm = true`. `[compiler] include_paths` → `[project] source_paths`. `[project] target` → `[project] target_triple`.
 
@@ -2598,18 +2598,18 @@ color  = "auto"                     # auto | always | never
 
 ### 24.1 Commands
 
-| Command | Purpose |
-| --- | --- |
+| Command                  | Purpose                                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------------ |
 | `cryo build [file\|dir]` | Build a single `.cryo` file, or the project whose cryoconfig lives in `dir` (default `.`). |
-| `cryo run` | Build the project and run the resulting executable. |
-| `cryo test [pattern]` | Build and run the project's `![test]` functions. |
-| `cryo check <file>` | Front-end + semantic analysis only; no codegen. |
-| `cryo init [dir]` | Scaffold a new project (`cryoconfig` + `main.cryo`). |
-| `cryo raw <file>` | Compile without the stdlib or prelude. |
-| `cryo demangle <sym>` | Decode a mangled symbol to its source form. |
-| `cryo fetch` | Fetch dependencies and write `cryoconfig.lock`. |
-| `cryo update` | Re-resolve every dependency, ignoring the lockfile. |
-| `cryo version` | Print the compiler version. |
+| `cryo run`               | Build the project and run the resulting executable.                                        |
+| `cryo test [pattern]`    | Build and run the project's `![test]` functions.                                           |
+| `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                            |
+| `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                       |
+| `cryo raw <file>`        | Compile without the stdlib or prelude.                                                     |
+| `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                |
+| `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                            |
+| `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                        |
+| `cryo version`           | Print the compiler version.                                                                |
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
 
@@ -2617,21 +2617,21 @@ Running `cryo <file.cryo>` with no command compiles that file directly.
 
 Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` or `cryo help <flag>` for detail.
 
-| Flag | Effect |
-| --- | --- |
-| `--debug` | Verbose compiler logging. |
-| `--ast` | Dump the AST after parsing. |
-| `--emit-llvm` | Emit LLVM IR (`.ll`) beside the object output. |
-| `--build-dir=PATH` | Override `[project] output_dir`. |
-| `--stdlib=PATH` | Standard-library root for this run (highest priority; see §24.3). |
-| `--target=TRIPLE` | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other triples emit object files only. |
-| `--opt-level=N` | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`. |
-| `-g`, `--debug-info` | Emit DWARF debug info. |
-| `--release` | Build with the `release` profile (O2, no debug info). |
-| `--dev` | Build with the `debug` profile (O0 + DWARF). |
-| `--profile=NAME` | Build with a named profile (cache under `build/target/NAME/`). |
-| `--no-incremental` | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write. |
-| `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable). |
+| Flag                  | Effect                                                                                                                                  |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `--debug`             | Verbose compiler logging.                                                                                                               |
+| `--ast`               | Dump the AST after parsing.                                                                                                             |
+| `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output.                                                                                          |
+| `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
+| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see §24.3).                                                                       |
+| `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other triples emit object files only. |
+| `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
+| `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
+| `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |
+| `--dev`               | Build with the `debug` profile (O0 + DWARF).                                                                                            |
+| `--profile=NAME`      | Build with a named profile (cache under `build/target/NAME/`).                                                                          |
+| `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
+| `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 

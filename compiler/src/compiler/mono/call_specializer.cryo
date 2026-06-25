@@ -602,9 +602,22 @@ type struct MonoCallSpecializer {
         // An already-concrete (non-generic, or already-minted spec) resolved method
         // needs no work; mono pins the spec back into resolved_method at the end, so
         // a re-walk over the same call (fixpoint) lands here and short-circuits.
+        //
+        // EXCEPTION: a self-returning / lazy-self-growing adapter default
+        // (`take`/`filter`/`map`/...) is pinned by sema by NAME (it has 0 own
+        // generics) but is still an un-instantiated template. On a CONCRETE
+        // user-iterator receiver (`it: UpTo; it.take(n)`) sema resolves and pins
+        // the unspecialized default; short-circuiting here would leave it never
+        // instantiated and codegen would find no emitted `take` (E0636). Let these
+        // fall through to `try_instantiate_self_returning_default` below. (Once
+        // instantiated, the spec carries `is_self_returning_default = false`, so the
+        // fixpoint re-walk short-circuits correctly.)
         if (call.resolved_method != null) {
             const rm: MethodNode* = call.resolved_method as MethodNode*;
-            if (rm == null || rm.func == null || rm.func.generic_params.length == 0) {
+            if (rm == null || rm.func == null) { return; }
+            if (rm.func.generic_params.length == 0
+                    && !rm.func.is_self_returning_default
+                    && !rm.func.is_lazy_self_growing) {
                 return;
             }
         }
@@ -686,9 +699,10 @@ type struct MonoCallSpecializer {
                 // Synthesized/hand-written generic trait method on a non-generic
                 // user type (e.g. a `Display::fmt<W>` keyed by the bare target).
                 const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+                const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
                 mut cand_impl: ImplBlockNode* = null;
                 const cand: MethodNode* = this.find_trait_impl_method_for_target(
-                    bare, ma.member, ma.resolved_trait, &cand_impl);
+                    bare, ma.member, ma.resolved_trait, recv_q, &cand_impl);
                 if (cand != null && cand.func != null
                         && (cand.func.is_synth_default || cand.func.is_generic())) {
                     orig_method = cand;
@@ -697,8 +711,9 @@ type struct MonoCallSpecializer {
             }
         } else {
             const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+            const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
             orig_method = this.find_trait_impl_method_for_target(
-                bare, ma.member, ma.resolved_trait, &impl_node);
+                bare, ma.member, ma.resolved_trait, recv_q, &impl_node);
             // Inherent (non-trait) generic method on a primitive receiver
             // (`"42".parse_int<u64>()` on `implement string`).  Not in the
             // trait-impl registry; consult the inherent-impl registry, keyed by
@@ -1204,10 +1219,43 @@ type struct MonoCallSpecializer {
     find_trait_impl_method_for_target(&this, bare_target_name: SymbolStr,
                                       method_name: SymbolStr,
                                       preferred_trait: SymbolStr,
+                                      qualified_target: SymbolStr,
                                       out_impl: ImplBlockNode**) -> MethodNode* {
         if (!bare_target_name.is_valid()) { return null; }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
+        // Pass 1: QUALIFIED-name match. Two modules can each define a same-leaf
+        // `struct UpTo` implementing the same trait; matching only the bare leaf
+        // returns whichever impl registered first and specializes a generic trait
+        // method (`map<B>` / `fold<Acc>`) against the WRONG type -> codegen E0636.
+        // Prefer the impl whose qualified target matches this receiver.
+        if (qualified_target.is_valid()) {
+            mut q_first_m: MethodNode* = null;
+            mut q_first_impl: ImplBlockNode* = null;
+            for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
+                const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
+                if (impl_node == null) { continue; }
+                if (!impl_node.qualified_target_name.equals(qualified_target)
+                        && !impl_node.target_type.equals(qualified_target)) { continue; }
+                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                    const m: MethodNode* = impl_node.methods[k];
+                    if (m == null || m.func == null) { continue; }
+                    if (!m.func.name.equals(method_name)) { continue; }
+                    if (m.func.generic_params.length == 0) { continue; }
+                    if (preferred_trait.is_valid() && impl_node.is_trait_impl()) {
+                        const tl: SymbolStr = this.trait_leaf_of_ann(impl_node.trait_annotation);
+                        if (tl.is_valid() && tl.equals(preferred_trait)) {
+                            *out_impl = impl_node;
+                            return m;
+                        }
+                    }
+                    if (q_first_m == null) { q_first_m = m; q_first_impl = impl_node; }
+                }
+            }
+            if (q_first_m != null) { *out_impl = q_first_impl; return q_first_m; }
+        }
+        // Pass 2: bare-name fallback (original behavior — single-impl programs,
+        // and impls whose qualified target is unavailable).
         mut first_m: MethodNode* = null;
         mut first_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
@@ -1257,18 +1305,46 @@ type struct MonoCallSpecializer {
         if (this.generic_registry == null) { return null; }
         const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
         if (!bare.is_valid()) { return null; }
+        // Pass 1: precise QUALIFIED-name match. Two modules can each define a
+        // `struct UpTo` implementing the same trait; keying only on the bare leaf
+        // would return whichever impl is registered first and specialize the
+        // adapter against the WRONG type (codegen then can't find the method on
+        // the actual receiver -> E0636). Prefer the impl whose qualified target
+        // matches this receiver's qualified name.
+        const recv_qname: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (recv_qname.is_valid()) {
+            for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
+                const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
+                if (impl_node == null) { continue; }
+                if (!impl_node.qualified_target_name.equals(recv_qname)
+                        && !impl_node.target_type.equals(recv_qname)) { continue; }
+                const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
+                if (m != null) { *out_impl = impl_node; return m; }
+            }
+        }
+        // Pass 2: bare-name fallback for impls without a qualified target (or a
+        // primitive receiver whose qualified name is unavailable).
         for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
             if (impl_node == null) { continue; }
             if (!impl_node.target_type.equals(bare)) { continue; }
-            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-                const m: MethodNode* = impl_node.methods[k];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(method_name)) { continue; }
-                if (!m.func.is_self_returning_default) { continue; }
-                *out_impl = impl_node;
-                return m;
-            }
+            const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
+            if (m != null) { *out_impl = impl_node; return m; }
+        }
+        return null;
+    }
+
+    /// First method named `method_name` in `impl_node` that is an
+    /// un-instantiated self-returning / lazy-self-growing adapter default.
+    find_self_ret_method_in_impl(&this, impl_node: ImplBlockNode*,
+                                 method_name: SymbolStr) -> MethodNode* {
+        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+            const m: MethodNode* = impl_node.methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (!m.func.name.equals(method_name)) { continue; }
+            if (!m.func.is_self_returning_default
+                    && !m.func.is_lazy_self_growing) { continue; }
+            return m;
         }
         return null;
     }
