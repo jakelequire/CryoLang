@@ -1,0 +1,78 @@
+///! `String::as_cstr()` - borrow an owned String as a NUL-terminated C string
+///! (`u8*` / `const char*`) for `extern "C"` APIs. A String built by `push`
+///! carries no trailing NUL, so this is the accessor that makes it safe to hand
+///! to C. Verified against libc `strlen` / `strcmp`. Covers IMPROVEMENT.md §2.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::StringAsCstr;
+
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::test::error;
+import std::test::assert;
+
+extern "C" {
+    function strlen(s: u8*) -> u64;
+    function strcmp(a: u8*, b: u8*) -> i32;
+}
+
+// A heap String assembled by `push` has no natural trailing NUL; `as_cstr()`
+// must add one so libc sees the right length and contents.
+![test]
+function as_cstr_pushed_string_round_trips() -> Result<(), TestError> {
+    mut s: String = String::new();
+    s.push(Str::new("Cryo"));
+    s.push(Str::new("Lang"));            // logical content is "CryoLang"
+
+    const cs: u8* = s.as_cstr();
+    const clen: u64 = strlen(cs);        // C-side length stops at the NUL
+    const cmp: i32 = strcmp(cs, "CryoLang");
+
+    s.drop();
+
+    const want_len: u64 = 8;
+    match (expect_eq(clen, want_len)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(cmp, 0);
+}
+
+// `as_cstr()` writes the terminator at index `length` WITHOUT changing the
+// logical length, so the String is still fully usable afterward.
+![test]
+function as_cstr_preserves_logical_length() -> Result<(), TestError> {
+    mut s: String = String::from_str(Str::new("abc"));
+    const before: u64 = s.length();
+
+    const _cs: u8* = s.as_cstr();
+    const after: u64 = s.length();
+
+    // The terminator must not have leaked into the logical view, and a
+    // subsequent mutation must keep working over the same buffer.
+    s.push(Str::new("d"));
+    const grown: u8* = s.as_cstr();
+    const grown_len: u64 = strlen(grown);
+
+    s.drop();
+
+    match (expect_eq(before, after)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const want_grown: u64 = 4;            // "abcd"
+    return expect_eq(grown_len, want_grown);
+}
+
+// Empty String -> a valid empty C string (just the NUL).
+![test]
+function as_cstr_empty_string() -> Result<(), TestError> {
+    mut s: String = String::new();
+    const cs: u8* = s.as_cstr();
+    const clen: u64 = strlen(cs);
+    s.drop();
+
+    const want: u64 = 0;
+    return expect_eq(clen, want);
+}

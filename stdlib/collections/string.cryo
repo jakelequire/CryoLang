@@ -125,6 +125,31 @@ type struct String<A = GlobalAlloc> {
         return this.buffer.ptr();
     }
 
+    /// Borrow this String as a NUL-terminated C string (`u8*` /
+    /// `const char*`) for handing to an `extern "C"` API.
+    ///
+    /// A String built by `push`/`from_str` carries no trailing NUL, so
+    /// `as_ptr()` alone is not a valid C string. `as_cstr()` writes the
+    /// terminator at index `length` - reserving one spare byte if the
+    /// buffer is full - WITHOUT changing the logical length, mirroring
+    /// the `from_str_c` invariant. The work is idempotent and zero-alloc
+    /// once the spare byte exists.
+    ///
+    /// The returned pointer borrows this String's buffer: it is valid
+    /// until the next mutating call (`push`, `clear`, drop) and must not
+    /// be freed by the caller. Like C, an interior NUL ends the string
+    /// early; the bytes are not otherwise validated.
+    as_cstr(mut &this) -> u8* {
+        match (this.buffer.reserve(this.length, 1, INITIAL_CAPACITY)) {
+            Ok(_) => {}
+            Err(_) => {
+                intrinsics::panic("String::as_cstr: allocation failed", FILE, LINE);
+            }
+        }
+        this.buffer.ptr()[this.length] = 0 as u8;
+        return this.buffer.ptr();
+    }
+
     /// Consume the String and return its NUL-terminated buffer as a raw
     /// `string` (C-string view), leaking the allocation so the caller
     /// owns the bytes with no borrow lifetime. A NUL terminator is
