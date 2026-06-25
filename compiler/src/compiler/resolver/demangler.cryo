@@ -102,8 +102,78 @@ implement Cursor {
         return this.take(n);
     }
 
+    /// Recover a monomorphized owner leaf that the mangler emitted
+    /// double-length-prefixed.  In path position (`encode_path` over a
+    /// specialized qualified name), the leaf is an *already-mangled* segment
+    /// such as `5Array$Li_N$L...$G$G`, and `encode_path` length-prefixes the
+    /// WHOLE blob.  Because that blob begins with its own length digit, a
+    /// greedy decimal read fuses the two counts - outer `53` followed by the
+    /// inner `5Array...` is read as `535`.  We split the leading digit run so
+    /// the inner blob parses as a complete segment of exactly the outer length,
+    /// then render it normally (e.g. `Array<int, std::alloc::allocator::
+    /// GlobalAlloc>`).  Returns "" with the cursor unmoved when this isn't that
+    /// case (the common path) - the exact-consume validation guarantees a plain
+    /// segment never matches.
+    ///
+    /// NOTE: the underlying encoding is non-canonical per the mangling spec
+    /// (which says generic args attach directly to their segment, with no
+    /// extra length wrapper).  The mangler is self-consistent, so linked
+    /// output is correct and we decode here rather than repinning every
+    /// generic-method symbol.
+    try_parse_generic_blob(mut &this) -> string {
+        const start: i64 = this.pos;
+        mut di: i64 = start;
+        while (di < this.len) {
+            const c: char = this.text[di];
+            if (!(c >= '0' && c <= '9')) { break; }
+            di += 1;
+        }
+        const ndigits: i64 = di - start;
+        // Need at least two digits to split into outer + inner length prefixes.
+        // A single-digit length can't be a fused double prefix, and an ordinary
+        // identifier never starts with a digit, so a plain segment's length is
+        // followed immediately by a letter and produces no valid split below.
+        if (ndigits < 2) { return ""; }
+        // Try every split of the digit run into <outer-length><inner-blob>.  The
+        // exact-consume + `<...>` validation makes the true split unique: a wider
+        // outer leaves the blob's trailing bytes unconsumed (sub.pos < len) and a
+        // narrower one truncates it, so only the real outer length validates.  We
+        // deliberately do NOT gate on buffer overrun - a long method signature
+        // after the owner can make the fused (too-large) length still fit, yet the
+        // segment is just as wrapped.  Longest outer first (purely an ordering).
+        for (mut k: i64 = ndigits - 1; k >= 1; k--) {
+            mut outer: i64 = 0;
+            for (mut j: i64 = start; j < start + k; j++) {
+                outer = outer * 10 + ((this.text[j] as i64) - ('0' as i64));
+            }
+            const inner_start: i64 = start + k;
+            if (outer <= 0 || inner_start + outer > this.len) { continue; }
+            const inner: string = this.text.substr(inner_start as u64, outer as u64);
+            mut sub: Cursor = Cursor::new(inner);
+            const rendered: string = sub.parse_segment();
+            if (!sub.ok || sub.pos != sub.len) { continue; }
+            // Require the inner to actually be a generic instance (rendered
+            // with `<...>`), so a coincidental plain-ident split can't match.
+            mut has_angle: boolean = false;
+            const rlen: i64 = libc::strlen(rendered) as i64;
+            for (mut z: i64 = 0; z < rlen; z++) {
+                if (rendered[z] == '<') { has_angle = true; break; }
+            }
+            if (!has_angle) { continue; }
+            this.pos = inner_start + outer;
+            return rendered;
+        }
+        return "";
+    }
+
     /// Segment: `<ident>` optionally followed by `$L <type-list> $G`.
     parse_segment(mut &this) -> string {
+        // A monomorphized owner leaf reaches us double-length-prefixed; peel
+        // that off first (no-op for ordinary segments).
+        const before: i64 = this.pos;
+        const blob: string = this.try_parse_generic_blob();
+        if (this.pos != before) { return blob; }
+
         const name: string = this.parse_ident();
         if (!this.ok) { return ""; }
         if (!this.starts_with2('$', 'L')) { return name; }

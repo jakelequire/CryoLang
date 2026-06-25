@@ -1075,17 +1075,21 @@ type struct Point {
 
 ### 8.2 Fields and Visibility
 
-Fields are private to their module by default. Visibility blocks group fields that share an access level:
+Struct fields are **public by default** — readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from within the declaring type's own methods (enforced as `E0353`), so it is hidden even from free functions in the same module. Visibility blocks group fields that share an access level:
 
 ```cryo
 type struct Rect {
+private:
+    cached_area: int;   // only Rect's own methods may touch this
 public:
     width:  int;
     height: int;
 }
 ```
 
-Visibility may also be declared per-field with a leading `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes.
+Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes (where it extends access to subclasses). Class members carry **no default** — every field and method must appear inside an explicit visibility block.
+
+> Field visibility (a `private` *field* → type-scoped, `E0353`) is a different axis from a top-level type being `private` (module-scoped, `E0503` — see [§14.4](#144-visibility)). A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
 
 Fields may declare **default values** with `= <expr>`.
 
