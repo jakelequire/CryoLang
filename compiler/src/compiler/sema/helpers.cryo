@@ -174,6 +174,12 @@ public function int_literal_text_is_zero(s: string) -> boolean {
     while (i < len) {
         const c: char = s[i];
         if (c == '_') { i = i + 1; continue; }
+        // A type suffix (`i64`/`u64`/...) begins with a non-hex-digit; stop there
+        // so a suffixed zero (`0i64`) is still recognised as zero rather than
+        // failing on the suffix's first letter.
+        const is_hex_digit: boolean = (c >= '0' && c <= '9')
+            || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!is_hex_digit) { break; }
         if (c != '0') { return false; }
         saw_digit = true;
         i = i + 1;
@@ -205,7 +211,10 @@ public function parse_int_literal_u64(s: string, out: u64*) -> boolean {
         if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
         else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
         else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
-        else { return false; }
+        // Stop at the type suffix (`i64`/`u64`/...) and fold the magnitude parsed
+        // so far, rather than failing the fold on a perfectly valid suffixed
+        // literal (`100i64`). Same suffix-stop as `int_literal_exceeds`.
+        else { break; }
         if (d >= radix) { return false; }
         saw = true;
         if (acc > (SEMA_U64_MAX - d) / radix) { return false; }
@@ -241,8 +250,14 @@ public function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
         if (c >= '0' && c <= '9') { d = (c - '0') as u64; }
         else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
         else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
-        else { return false; }
-        if (d >= radix) { return false; }
+        // First non-digit is the type suffix (`i64`/`u64`/...): STOP and compare
+        // the magnitude parsed so far. Returning `false` (does-not-exceed) here
+        // wrongly classified a large suffixed literal (`9000000000i64`) as
+        // in-range, so `sema_default_int_type` picked `i32` and codegen
+        // truncated the value via `const_int(i32, …)`. Mirrors the suffix-stop
+        // in `string_parse_radix_u64` / `int_literal_clean`.
+        else { break; }
+        if (d >= radix) { break; }
         saw_digit = true;
         // Overflow-checked acc = acc*radix + d.  Past u64 it can only be larger
         // than any in-range bound, so report "exceeds".
