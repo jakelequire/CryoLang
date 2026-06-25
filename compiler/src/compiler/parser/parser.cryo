@@ -18,9 +18,14 @@ import Utils::Logger;
 
 type class Parser : ExprParser {
 public:
+    /// Module-scope `static_assert(...)` items collected during the top-level
+    /// parse and attached to the ProgramNode before it is returned. Kept off
+    /// the statement stream so they need no NodeKind / visitor handling.
+    static_assert_items: StaticAssertItem*[];
 
     Parser(tokens: Token[], source_file: string, ctx: CompilationContext*)
         : ExprParser(tokens, source_file, ctx) {
+        this.static_assert_items = [];
     }
 
     /// Parse a standalone expression from `toks` on a fresh sub-`Parser`,
@@ -230,7 +235,38 @@ public:
             break;
         }
 
+        // Attach module-scope `static_assert(...)` items collected during the
+        // parse to the ProgramNode side list.
+        for (mut sa: i64 = 0; sa < this.static_assert_items.length; sa++) {
+            program.add_static_assert(this.static_assert_items[sa]);
+        }
+
         return program;
+    }
+
+    /// Parse a module-scope `static_assert(cond)` or
+    /// `static_assert(cond, "message")`. The leading `static_assert` identifier
+    /// is current. Stashes a StaticAssertItem; emits nothing to the AST.
+    parse_static_assert() -> void {
+        const start: Token = this.advance(); // consume the `static_assert` keyword
+        this.consume(TokenType::LParen, "'('");
+        const cond: ExpressionNode* = this.parse_expression();
+        mut msg: string = "";
+        if (this.check(TokenType::Comma)) {
+            this.advance(); // consume ','
+            if (this.check(TokenType::StringLiteral)) {
+                msg = this.current().lexeme;
+                this.advance();
+            }
+        }
+        this.consume(TokenType::RParen, "')'");
+        this.consume(TokenType::Semicolon, "';'");
+        const item: StaticAssertItem* = new StaticAssertItem {
+            cond:    cond as void*,
+            message: msg,
+            span:    this.span_from(start),
+        };
+        this.static_assert_items.push(item);
     }
 
 
@@ -323,6 +359,15 @@ public:
         // Directive: ![name] or ![name(args)]
         if (tok.kind == TokenType::BangBracket) {
             return this.parse_directive();
+        }
+
+        // `static_assert(cond)` / `static_assert(cond, "message")` at module
+        // scope. `static_assert` is a reserved keyword. The item is stashed on
+        // the parser and attached to the ProgramNode; nothing is added to the
+        // statement stream, so this returns null.
+        if (tok.kind == TokenType::KwStaticAssert) {
+            this.parse_static_assert();
+            return null;
         }
 
         // Regular declaration (function, type, const, mut, etc.).

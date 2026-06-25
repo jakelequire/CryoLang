@@ -24,6 +24,8 @@ import Compiler::Diag::{ Diagnostic, Snapshot };
 import Compiler::CompilationContext;
 import Compiler::Types;
 import Compiler::Types::{ TypeRef, Arena };
+import Compiler::AST;
+import Compiler::AST::{ Node, Expression };
 import Utils::Logger;
 import std::math;
 
@@ -129,7 +131,149 @@ type struct TypeLoweringPasses {
                        uty.id as i64)));
         }
 
+        // Evaluate module-scope `static_assert(...)` now that every type has a
+        // final layout. The `sizeof`/`alignof` operand types were resolved in
+        // TypeResolution; fold the condition to a constant and fail the build
+        // (E0237) if it is false or not a compile-time constant.
+        const sa_root: ProgramNode* = ctx.artifacts.ast.root;
+        if (sa_root != null) {
+            for (mut si: i64 = 0; si < sa_root.static_asserts.length; si++) {
+                const sa: StaticAssertItem* = sa_root.static_asserts[si];
+                if (sa == null) { continue; }
+                mut result: i64 = 0;
+                const ok: boolean = TypeLoweringPasses::fold_static_assert(
+                    sa.cond as ExpressionNode*, arena, &result);
+                if (!ok) {
+                    mut d1: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0237_STATIC_ASSERT_FAILED,
+                        "static_assert condition is not a compile-time constant (allowed: integer/boolean literals, sizeof/alignof, and arithmetic/comparison/logical operators)");
+                    d1 = d1.at_with_label(sa.span, "in this static_assert");
+                    ctx.emit_diagnostic(d1);
+                } else if (result == 0) {
+                    mut msg: string = "static assertion failed";
+                    if (sa.message != "") {
+                        msg = format("static assertion failed: %s", sa.message);
+                    }
+                    mut d2: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0237_STATIC_ASSERT_FAILED, msg);
+                    d2 = d2.at_with_label(sa.span, "this condition is false");
+                    ctx.emit_diagnostic(d2);
+                }
+            }
+        }
+
         return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Fold a `static_assert` condition to an i64 (0 = false, non-zero = true)
+    /// using fully-resolved type layouts. Returns false if the expression is
+    /// not a compile-time constant of the supported shape. Supported: integer /
+    /// boolean literals, `sizeof(T)` / `alignof(T)`, unary `-`/`+`/`~`/`!`, and
+    /// binary arithmetic / comparison / logical / bitwise operators.
+    static fold_static_assert(expr: ExpressionNode*, arena: TypeArena*, out: i64*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            if (lit.literal_kind == LiteralKind::Integer) {
+                return TypeLoweringPasses::sa_parse_int(lit.value, out);
+            }
+            if (lit.literal_kind == LiteralKind::Boolean) {
+                *out = if (lit.value == "true") { 1 } else { 0 };
+                return true;
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::SizeofExpression) {
+            const s: SizeofExprNode* = expr as SizeofExprNode*;
+            if (!s.resolved_type.is_valid()) { return false; }
+            const t: Type* = arena.lookup(s.resolved_type.id);
+            if (t == null) { return false; }
+            *out = t.size_bytes() as i64;
+            return true;
+        }
+        if (node.kind == NodeKind::AlignofExpression) {
+            const a: AlignofExprNode* = expr as AlignofExprNode*;
+            if (!a.resolved_type.is_valid()) { return false; }
+            const t: Type* = arena.lookup(a.resolved_type.id);
+            if (t == null) { return false; }
+            *out = t.alignment() as i64;
+            return true;
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            mut a: i64 = 0;
+            if (!TypeLoweringPasses::fold_static_assert(u.operand, arena, &a)) { return false; }
+            const op: string = u.op.lexeme;
+            if (op == "-") { *out = 0 - a; return true; }
+            if (op == "+") { *out = a; return true; }
+            if (op == "~") { *out = ~a; return true; }
+            if (op == "!") { *out = if (a == 0) { 1 } else { 0 }; return true; }
+            return false;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            mut x: i64 = 0;
+            mut y: i64 = 0;
+            if (!TypeLoweringPasses::fold_static_assert(b.left, arena, &x))  { return false; }
+            if (!TypeLoweringPasses::fold_static_assert(b.right, arena, &y)) { return false; }
+            const op: string = b.op.lexeme;
+            if (op == "+")  { *out = x + y; return true; }
+            if (op == "-")  { *out = x - y; return true; }
+            if (op == "*")  { *out = x * y; return true; }
+            if (op == "/")  { if (y == 0) { return false; } *out = x / y; return true; }
+            if (op == "%")  { if (y == 0) { return false; } *out = x % y; return true; }
+            if (op == "==") { *out = if (x == y) { 1 } else { 0 }; return true; }
+            if (op == "!=") { *out = if (x != y) { 1 } else { 0 }; return true; }
+            if (op == "<")  { *out = if (x < y)  { 1 } else { 0 }; return true; }
+            if (op == "<=") { *out = if (x <= y) { 1 } else { 0 }; return true; }
+            if (op == ">")  { *out = if (x > y)  { 1 } else { 0 }; return true; }
+            if (op == ">=") { *out = if (x >= y) { 1 } else { 0 }; return true; }
+            if (op == "&&") { *out = if (x != 0 && y != 0) { 1 } else { 0 }; return true; }
+            if (op == "||") { *out = if (x != 0 || y != 0) { 1 } else { 0 }; return true; }
+            if (op == "&")  { *out = x & y; return true; }
+            if (op == "|")  { *out = x | y; return true; }
+            if (op == "^")  { *out = x ^ y; return true; }
+            return false;
+        }
+        return false;
+    }
+
+    /// Parse an integer literal lexeme (decimal, or `0x`/`0o`/`0b` prefixed,
+    /// with `_` separators and an optional trailing type suffix) to i64.
+    /// Mirrors `parse_int_literal_u64`; inlined to keep this pass free of a
+    /// Sema dependency. Strings are NUL-terminated, so length is a NUL scan.
+    static sa_parse_int(s: string, out: i64*) -> boolean {
+        if (s == null) { return false; }
+        mut len: i64 = 0;
+        while (s[len] != 0) { len = len + 1; }
+        if (len == 0) { return false; }
+        mut i: i64 = 0;
+        mut radix: u64 = 10;
+        if (len >= 2 && s[0] == '0') {
+            const c1: char = s[1];
+            if (c1 == 'x' || c1 == 'X')      { radix = 16; i = 2; }
+            else if (c1 == 'b' || c1 == 'B') { radix = 2;  i = 2; }
+            else if (c1 == 'o' || c1 == 'O') { radix = 8;  i = 2; }
+        }
+        mut acc: u64 = 0;
+        mut saw: boolean = false;
+        while (i < len) {
+            const c: char = s[i];
+            if (c == '_') { i = i + 1; continue; }
+            mut d: u64 = 0;
+            if (c >= '0' && c <= '9')      { d = (c - '0') as u64; }
+            else if (c >= 'a' && c <= 'f') { d = (c - 'a' + 10) as u64; }
+            else if (c >= 'A' && c <= 'F') { d = (c - 'A' + 10) as u64; }
+            else { break; }   // type suffix (`i64`/`u8`/...)
+            if (d >= radix) { return false; }
+            saw = true;
+            acc = acc * radix + d;
+            i = i + 1;
+        }
+        if (!saw) { return false; }
+        *out = acc as i64;
+        return true;
     }
 
 

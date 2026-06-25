@@ -145,6 +145,14 @@ type struct DeclarationIndex {
     // `is_intrinsic_decl_name`.
     intrinsic_names:     HashMap<u32, boolean>;
 
+    // Bare C symbol -> owning module/file (intern id) for symbols claimed by an
+    // `extern "C"` block specifically. Lets the resolver warn (W0011) when a
+    // SECOND extern block tries to claim an already-extern-owned bare slot
+    // (e.g. two vendor libs both export `printf`), while staying silent on the
+    // intentional intrinsic-wins / function-wins cases (those never record an
+    // entry here). See type_resolution.cryo extern-block handling.
+    extern_bare_owner:   HashMap<u32, u32>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -174,6 +182,7 @@ type struct DeclarationIndex {
             module_func_pairs:  HashMap<u64, boolean>::new(),
             mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
             intrinsic_names:    HashMap<u32, boolean>::new(),
+            extern_bare_owner:  HashMap<u32, u32>::new(),
         };
     }
 
@@ -283,6 +292,23 @@ type struct DeclarationIndex {
     /// is a real function and must be emitted as a normal call.
     is_intrinsic_decl_name(&this, name: SymbolStr) -> boolean {
         return this.intrinsic_names.contains_key(&name.id);
+    }
+
+    /// Record that an `extern "C"` block claimed the bare C symbol `name`,
+    /// owned by `module` (an interned file/module id). Called only when the
+    /// bare slot is actually claimed by an extern block.
+    note_extern_bare_owner(mut &this, name: SymbolStr, module: SymbolStr) -> void {
+        this.extern_bare_owner.insert(name.id, module.id);
+    }
+
+    /// The module/file id that first claimed bare C symbol `name` via an
+    /// `extern "C"` block, or 0 if no extern block owns it (i.e. the bare slot
+    /// is unclaimed or owned by an intrinsic / regular function).
+    extern_bare_owner_of(&this, name: SymbolStr) -> u32 {
+        return match (this.extern_bare_owner.get(&name.id)) {
+            Option::Some(m) => { m }
+            Option::None    => { 0 }
+        };
     }
 
     /// Associate an overload-specific mangled LLVM name with a registered

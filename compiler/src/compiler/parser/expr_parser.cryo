@@ -344,6 +344,13 @@ public:
 
         while (this.check(TokenType::KwAs)) {
             this.advance();
+            // `as const T*` casts to a pointer-to-const; the const binds to the
+            // first pointer suffix (threaded via parse_type_suffixes_q).
+            mut pending_const: boolean = false;
+            if (this.check(TokenType::KwConst)) {
+                this.advance();
+                pending_const = true;
+            }
             // Parse base type first, then selectively apply suffixes.
             // This resolves the ambiguity: `x as u64 * 8` should be
             // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
@@ -360,10 +367,10 @@ public:
             // Heuristic: * is a pointer suffix if followed by a non-expression
             // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
             if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                target = this.parse_type_suffixes(target);
+                target = this.parse_type_suffixes_q(target, pending_const);
             } else if (!this.check(TokenType::Star)) {
                 // Non-star suffixes ([], ?) are unambiguous
-                target = this.parse_type_suffixes(target);
+                target = this.parse_type_suffixes_q(target, pending_const);
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
@@ -2301,6 +2308,18 @@ public:
             return this.parse_impl_trait_type();
         }
 
+        // `const T*` FFI pointer-to-const. The `const` qualifies the pointee,
+        // so it binds to the first pointer suffix (`parse_type_suffixes`
+        // consumes the pending flag for the nearest `*`). A `const` with no
+        // following `*` has no representation on a value type and is dropped,
+        // matching C (top-level const on a by-value param is meaningless).
+        if (this.check(TokenType::KwConst)) {
+            this.advance(); // consume `const`
+            const cbase: TypeAnnotation* = this.parse_base_type();
+            if (cbase == null) { return null; }
+            return this.parse_type_suffixes_q(cbase, true);
+        }
+
         // Base type + optional suffixes
         const base: TypeAnnotation* = this.parse_base_type();
         if (base == null) { return null; }
@@ -2477,16 +2496,26 @@ public:
 
     /// Parse type suffixes: *, [], [N], ?
     parse_type_suffixes(base: TypeAnnotation*) -> TypeAnnotation* {
+        return this.parse_type_suffixes_q(base, false);
+    }
+
+    /// As `parse_type_suffixes`, but `pending_const` marks the pointee of the
+    /// nearest `*` suffix as const (`const T*`). The flag is consumed by the
+    /// first pointer only; subsequent levels default to non-const.
+    parse_type_suffixes_q(base: TypeAnnotation*, pending_const: boolean) -> TypeAnnotation* {
         mut result: TypeAnnotation* = base;
+        mut ptr_const: boolean = pending_const;
 
         while (true) {
             // Pointer suffix: T*
             if (this.check(TokenType::Star)) {
                 this.advance();
                 const ptr_ann: PointerAnnotation* = new PointerAnnotation {
-                    inner: result,
-                    span:  this.current_span(),
+                    inner:    result,
+                    is_const: ptr_const,
+                    span:     this.current_span(),
                 };
+                ptr_const = false; // const binds to the innermost pointer only
                 result = new TypeAnnotation::Pointer(ptr_ann);
             }
             // Array suffix: T[] or T[N]

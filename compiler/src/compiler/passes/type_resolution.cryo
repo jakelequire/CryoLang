@@ -2203,6 +2203,38 @@ type struct TypeResolutionPasses {
                                 ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
                                 // Extern C functions use bare name as LLVM symbol.
                                 ctx.decl_index.register_mangled_name(fn_node.name, fn_node.name);
+                                // Remember that an extern block owns this bare
+                                // slot, so a later extern collision can be told
+                                // apart from the intentional intrinsic-wins case.
+                                ctx.decl_index.note_extern_bare_owner(fn_node.name, ext_mod_sym);
+                            } else {
+                                // The bare slot is already taken. Warn ONLY when
+                                // a *previous extern block* owns it (two libs
+                                // exporting the same bare C symbol): the bare
+                                // name resolves to the first claimant and the
+                                // second is reachable only via its qualified
+                                // form. Stay silent when an intrinsic / regular
+                                // function owns the slot - that shadowing is
+                                // intentional (see the comment above).
+                                const prev_owner_id: u32 =
+                                    ctx.decl_index.extern_bare_owner_of(fn_node.name);
+                                if (prev_owner_id != 0) {
+                                    const sym_str: string =
+                                        ctx.intern_table.resolve(fn_node.name);
+                                    const prev_str: string =
+                                        ctx.intern_table.resolve(SymbolStr::from_id(prev_owner_id));
+                                    const here_str: string =
+                                        ctx.intern_table.resolve(ext_mod_sym);
+                                    mut wdiag: Diagnostic = Diagnostic::warning(
+                                        ErrorCode::W0011_DUPLICATE_EXTERN_SYMBOL,
+                                        format("extern C symbol `%s` is declared in more than one extern block; the unqualified name resolves to the first declaration",
+                                            sym_str));
+                                    wdiag = wdiag.at_with_label(fn_node.span,
+                                        "duplicate extern declaration here");
+                                    wdiag = wdiag.help(format("first declared in `%s`; this one is in `%s`. Reach this one through its qualified `Namespace::%s` form, or remove the duplicate.",
+                                        prev_str, here_str, sym_str));
+                                    ctx.emit_diagnostic(wdiag);
+                                }
                             }
                             // Also register under the enclosing namespace's
                             // qualified form so `libc::read` resolves the
@@ -2706,7 +2738,54 @@ type struct TypeResolutionPasses {
             cdebug("[TypeResolution] Phase 4: Registered %lld types in ModuleTypeRegistry + DeclarationIndex\n", reg_count);
         }
 
+        // Resolve the `sizeof`/`alignof` operand types inside module-scope
+        // `static_assert(...)` conditions. These live in a side list (not the
+        // statement stream), so the normal expression resolver never visits
+        // them; resolve them here while the module's resolution context is set
+        // up. TypeLowering later folds the condition once layouts are known.
+        for (mut si: i64 = 0; si < root.static_asserts.length; si++) {
+            const sa: StaticAssertItem* = root.static_asserts[si];
+            if (sa == null) { continue; }
+            TypeResolutionPasses::resolve_static_assert_types(
+                sa.cond as ExpressionNode*, resolver, &runner.res_ctx);
+        }
+
         return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Recursively resolve the `sizeof`/`alignof` operand type annotations in a
+    /// `static_assert` condition so TypeLowering can read their sizes. Only the
+    /// node kinds a constant condition can contain are walked; everything else
+    /// is left untouched (the folder rejects anything non-constant).
+    static resolve_static_assert_types(expr: ExpressionNode*, resolver: TypeResolver*,
+                                       res_ctx: ResolutionContext*) -> void {
+        if (expr == null) { return; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::SizeofExpression) {
+            const s: SizeofExprNode* = expr as SizeofExprNode*;
+            if (s.type_ann != null) {
+                s.set_resolved_type(resolver.resolve(s.type_ann, res_ctx));
+            }
+            return;
+        }
+        if (node.kind == NodeKind::AlignofExpression) {
+            const a: AlignofExprNode* = expr as AlignofExprNode*;
+            if (a.type_ann != null) {
+                a.set_resolved_type(resolver.resolve(a.type_ann, res_ctx));
+            }
+            return;
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            TypeResolutionPasses::resolve_static_assert_types(u.operand, resolver, res_ctx);
+            return;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            TypeResolutionPasses::resolve_static_assert_types(b.left, resolver, res_ctx);
+            TypeResolutionPasses::resolve_static_assert_types(b.right, resolver, res_ctx);
+            return;
+        }
     }
 
 

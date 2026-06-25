@@ -1,0 +1,87 @@
+///! Regression: a Cryo function passed as a C callback through an `extern "C"`
+///! function-pointer parameter round-trips correctly. Covers the bare-function
+///! contract (named function passed by name, address-of implicit), the `void*`
+///! client-data pattern (the `clang_visitChildren` shape), and typed-null
+///! optional callbacks. Verifies IMPROVEMENT.md §3 (FFI function pointers).
+///!
+///! Function-pointer types are spelled `(Args) -> Ret`. `const void*` params
+///! exercise the FFI const qualifier (IMPROVEMENT.md §1).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::FnPointerCallback;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+extern "C" {
+    function qsort(base: void*, nmemb: u64, size: u64,
+                   compar: (const void*, const void*) -> i32) -> void;
+}
+
+// Ascending i32 comparator, handed to libc `qsort` as a callback.
+function cmp_i32_asc(a: const void*, b: const void*) -> i32 {
+    const pa: i32* = a as i32*;
+    const pb: i32* = b as i32*;
+    return *pa - *pb;
+}
+
+![test]
+function qsort_with_cryo_callback() -> Result<(), TestError> {
+    mut arr: i32[5];
+    arr[0] = 5; arr[1] = 2; arr[2] = 8; arr[3] = 1; arr[4] = 3;
+    // Pass the comparator by bare name - taking its address is implicit.
+    qsort(&arr[0] as void*, 5, 4, cmp_i32_asc);
+    match (expect_eq(arr[0], 1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(arr[2], 3)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(arr[4], 8)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+// --- portable pure-Cryo coverage (no external library) ---
+
+function add1(n: i32) -> i32 { return n + 1; }
+
+// A receiver that stores no environment: the callback is a bare function
+// pointer, exactly as a C API requires.
+function fold_twice(seed: i32, f: (i32) -> i32) -> i32 {
+    return f(f(seed));
+}
+
+![test]
+function fn_pointer_local_then_call() -> Result<(), TestError> {
+    const fp: (i32) -> i32 = add1;     // named function -> typed fn-pointer local
+    return expect_eq(fold_twice(40, fp), 42);
+}
+
+// `void*` client-data pattern: per-call state travels through an explicit
+// pointer argument, never a closure environment - the `clang_visitChildren`
+// (visitor + client_data) shape.
+function visit_with_client(data: void*, cb: (void*, void*) -> i32, client: void*) -> i32 {
+    return cb(data, client);
+}
+
+function sum_two(d: void*, c: void*) -> i32 {
+    const pd: i32* = d as i32*;
+    const pc: i32* = c as i32*;
+    return *pd + *pc;
+}
+
+![test]
+function void_client_data_callback() -> Result<(), TestError> {
+    mut a: i32 = 30;
+    mut b: i32 = 12;
+    return expect_eq(visit_with_client(&a as void*, sum_two, &b as void*), 42);
+}
+
+// Optional callbacks: a typed null is a valid value, guarded with `== null`.
+function maybe_apply(f: (i32) -> i32, x: i32) -> i32 {
+    if (f == null) { return -1; }
+    return f(x);
+}
+
+![test]
+function typed_null_callback() -> Result<(), TestError> {
+    match (expect_eq(maybe_apply(null, 5), -1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(maybe_apply(add1, 41), 42);
+}

@@ -325,15 +325,23 @@ type struct TypeChecker {
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
             const from_ptr: PointerType* = from_type as PointerType*;
             const to_ptr: PointerType* = to_type as PointerType*;
+            // const-correctness: dropping const (`const T*` -> `T*`) is unsafe
+            // and is never implicit; it requires an explicit cast. Adding const
+            // (`T*` -> `const T*`) is always safe. This gate runs before the
+            // void*/identity rules so `const T*` -> `T*` cannot slip through the
+            // same-pointee fast path below.
+            const drops_const: boolean = from_ptr.const_pointee && !to_ptr.const_pointee;
             // void* -> T* and T* -> void* are implicit (C-style universal pointer)
             const from_inner: Type* = this.arena.lookup(from_ptr.pointee.id);
             const to_inner: Type* = this.arena.lookup(to_ptr.pointee.id);
             if ((from_inner != null && from_inner.kind == TypeKind::Void) ||
                 (to_inner != null && to_inner.kind == TypeKind::Void)) {
+                if (drops_const) { return TypeCompatibility::ExplicitCast; }
                 return TypeCompatibility::ImplicitConvert;
             }
             // Same pointee type after deref
             if (from_ptr.pointee.equals(to_ptr.pointee)) {
+                if (drops_const) { return TypeCompatibility::ExplicitCast; }
                 return TypeCompatibility::Identical;
             }
             // Class hierarchy upcast: Derived* -> Base* is implicit.
@@ -351,7 +359,7 @@ type struct TypeChecker {
             // follows from i8* -> string).
             const pointee_compat: TypeCompatibility = this.check_compatibility(
                 from_ptr.pointee, to_ptr.pointee);
-            if (pointee_compat.is_assignable()) {
+            if (pointee_compat.is_assignable() && !drops_const) {
                 return TypeCompatibility::ImplicitConvert;
             }
             return TypeCompatibility::ExplicitCast;
@@ -580,6 +588,22 @@ type struct TypeChecker {
     /// (i32 <-> u32) and any widening preserve the representation and are
     /// deliberately NOT flagged, so the FFI-heavy `i32` -> `u64` argument
     /// pattern stays legal.  Char/enum are left to their existing rules.
+    /// True when `from` is `const T*` and `to` is a non-const pointer with the
+    /// same pointee: passing/assigning would silently drop const. `check_compat`
+    /// already returns `ExplicitCast` for this (so assignment and return are
+    /// rejected and an explicit `as` cast is still allowed), but call arguments
+    /// only reject `Incompatible`, so the call resolver consults this predicate
+    /// directly — mirroring `is_lossy_numeric_narrowing`.
+    is_const_drop(&this, from: TypeRef, to: TypeRef) -> boolean {
+        const f: Type* = this.arena.lookup(from.id);
+        const t: Type* = this.arena.lookup(to.id);
+        if (f == null || t == null) { return false; }
+        if (f.kind != TypeKind::Pointer || t.kind != TypeKind::Pointer) { return false; }
+        const fp: PointerType* = f as PointerType*;
+        const tp: PointerType* = t as PointerType*;
+        return fp.const_pointee && !tp.const_pointee && fp.pointee.equals(tp.pointee);
+    }
+
     is_lossy_numeric_narrowing(&this, from: TypeRef, to: TypeRef) -> boolean {
         const f: Type* = this.arena.lookup(from.id);
         const t: Type* = this.arena.lookup(to.id);
