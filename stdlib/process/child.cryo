@@ -44,7 +44,12 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
     mut status: i32 = 0;
     loop {
         const rc: i32 = libc::waitpid(pid, &status, 0);
-        if (rc >= 0) { return Result::Ok(decode_wstatus(status)); }
+        if (rc >= 0) {
+            // A stop/continue notification isn't a termination; keep blocking
+            // until the child actually exits or is killed.
+            if (wstatus_is_alive(status)) { continue; }
+            return Result::Ok(decode_wstatus(status));
+        }
         const err: IoError = IoError::from_errno(libc::errno());
         match (err.kind) {
             IoErrorKind::Interrupted => { }
@@ -61,12 +66,27 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
     return Result::Ok(ExitStatus { code: code as i32, signal: 0, signaled: false });
 }
 
+/// True when a waitpid `wstatus` reports a state change that is NOT a real
+/// termination: a stopped child (`WIFSTOPPED`, low byte `0x7F`) or a continued
+/// one (`WIFCONTINUED`, `0xFFFF`). `Child` exposes only exited/signaled, so such
+/// a status must be treated as "still alive" rather than decoded - otherwise a
+/// stopped child reads as a clean exit-0 (`decode_wstatus`'s stop branch).
+/// Reachable only if a future change passes `WUNTRACED`/`WCONTINUED`; guarded
+/// here so the contract holds regardless.
+![target(unix)]
+function wstatus_is_alive(wstatus: i32) -> boolean {
+    return (wstatus & 0xFF) == 0x7F || wstatus == 0xFFFF;
+}
+
 ![target(unix)]
 private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     mut status: i32 = 0;
     loop {
         const rc: i32 = libc::waitpid(pid, &status, libc::WNOHANG);
-        if (rc > 0) { return Result::Ok(Option::Some(decode_wstatus(status))); }
+        if (rc > 0) {
+            if (wstatus_is_alive(status)) { return Result::Ok(Option::None); }
+            return Result::Ok(Option::Some(decode_wstatus(status)));
+        }
         if (rc == 0) { return Result::Ok(Option::None); }
         const err: IoError = IoError::from_errno(libc::errno());
         match (err.kind) {

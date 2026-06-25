@@ -151,8 +151,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   no heterogeneous tuple literal, so `Pair` is the element type). Combinators
   chain freely (`r.take(n).map(f).filter(p)`, `r.chain(b).map(f)`,
   `a.zip(b).count()`, longer mixed chains) and feed `.count()` / `.fold(..)` /
-  `for (x in ..)`; bind an adapter to a concrete-typed local
-  (`mut z: ZipIter<.., ..> = a.zip(b)`) or chain on the expression directly.
+  `for (x in ..)`. The adapters resolve on any concrete `Iterator` receiver,
+  including a user struct that `implement`s `Iterator`
+  (`mut c: Counter = ...; c.take(3).map(f)`), not just stdlib iterators; bind an
+  adapter to a concrete-typed local (`mut z: ZipIter<.., ..> = a.zip(b)`) or
+  chain on the expression directly when you need a named local.
   `collections::array::from_iter(it)` collects into an `Array<T>` (a free
   function, fixed by the expected `Array<T>` at the call site).
 - **`io`:** `Read`/`Write` traits with default `read_all`/`read_byte`/
