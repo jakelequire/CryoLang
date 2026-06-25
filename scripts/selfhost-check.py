@@ -314,6 +314,16 @@ def print_summary(times, total):
 WIN_TRIPLE      = "x86_64-pc-windows-gnu"
 WIN_LLVM_LIB    = ROOT / ".toolchains" / "llvm-win" / "lib" / "libLLVM-C.dll.a"
 WIN_LLVM_DLL    = ROOT / ".toolchains" / "llvm-win" / "bin" / "LLVM-C.dll"
+# libclang import lib + DLL: the C-import engine (Compiler::Bindgen) links
+# libclang, so a cryo.exe cross-build links/loads it alongside LLVM-C.
+WIN_CLANG_LIB   = ROOT / ".toolchains" / "llvm-win" / "lib" / "libclang.dll.a"
+WIN_CLANG_DLL   = ROOT / ".toolchains" / "llvm-win" / "bin" / "libclang.dll"
+# clang resource dir (contains include/stddef.h, stdint.h, …). Passed to the
+# wine cryo.exe as CRYO_CLANG_RESOURCE_DIR so libclang resolves the builtin
+# headers llvm_bindings.h #includes — the default <dll>/../lib/clang/<v> walk
+# fails once libclang.dll is staged next to a per-stage cryo.exe. "20" is the
+# clang major (LLVM_WIN_VERSION 20.x in scripts/llvm-version.env).
+WIN_CLANG_RESDIR = ROOT / ".toolchains" / "llvm-win" / "lib" / "clang" / "20"
 # llvm-mingw's clang.exe + llvm-ar.exe (fetched by fetch-windows-llvm.sh) let
 # cryo.exe compile AND LINK the compiler itself under wine: clang.exe is both
 # the C preprocessor for the one `extern "C" { #include "llvm_bindings.h" }`
@@ -339,6 +349,8 @@ def _win_prereqs_missing():
         missing.append(LLVM_LINK)
     if not WIN_LLVM_LIB.exists():
         missing.append("windows libLLVM-C (run scripts/fetch-windows-llvm.sh)")
+    if not WIN_CLANG_LIB.exists():
+        missing.append("windows libclang (run scripts/fetch-windows-llvm.sh)")
     return missing
 
 
@@ -472,16 +484,19 @@ def make_windows_stages(runner: list, env: dict) -> list:
 
 
 def _drop_llvm_dll_beside(exe: Path):
-    """cryo.exe loads LLVM-C.dll from its own dir; copy it next to a freshly
-    built stage compiler so the next stage can run it."""
-    src = ROOT / "bin" / "LLVM-C.dll"
-    if not src.exists():
-        src = WIN_LLVM_DLL
-    if exe.exists() and src.exists():
-        try:
-            shutil.copy2(src, exe.parent / "LLVM-C.dll")
-        except OSError:
-            pass
+    """cryo.exe loads LLVM-C.dll AND libclang.dll from its own dir; copy them
+    next to a freshly built stage compiler so the next stage can run it."""
+    if not exe.exists():
+        return
+    for name, fallback in (("LLVM-C.dll", WIN_LLVM_DLL), ("libclang.dll", WIN_CLANG_DLL)):
+        src = ROOT / "bin" / name
+        if not src.exists():
+            src = fallback
+        if src.exists():
+            try:
+                shutil.copy2(src, exe.parent / name)
+            except OSError:
+                pass
 
 
 def _compare_ir_trees(root_a: Path, root_b: Path):
@@ -524,7 +539,8 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
         missing = []
         if not shutil.which("wine"):
             missing.append("wine")
-        if not (WIN_CLANG.exists() and WIN_AR.exists() and WIN_LLVM_DLL.exists()):
+        if not (WIN_CLANG.exists() and WIN_AR.exists()
+                and WIN_LLVM_DLL.exists() and WIN_CLANG_DLL.exists()):
             missing.append("windows toolchain (.toolchains/llvm-mingw + llvm-win — scripts/fetch-windows-llvm.sh)")
         if missing:
             print(f"  {C.YELLOW}↷ skipped{C.RESET} (can't self-host under wine):")
@@ -537,7 +553,8 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
         env = {"WINEDEBUG": "-all",
                "CRYO_STDLIB": "Z:" + str(ROOT / "stdlib").replace("\\", "/"),
                "CRYO_CC": zwin(WIN_CLANG),
-               "CRYO_AR": zwin(WIN_AR)}
+               "CRYO_AR": zwin(WIN_AR),
+               "CRYO_CLANG_RESOURCE_DIR": zwin(WIN_CLANG_RESDIR)}
 
     wlog = LOG_DIR / "windows-selfhost"
     ensure_dir(wlog)

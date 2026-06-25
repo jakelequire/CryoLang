@@ -1,0 +1,93 @@
+/// CXType -> Cryo type-annotation mapper
+///
+/// Replaces the hand-rolled string-matching `c_type_to_annotation`: instead
+/// of pattern-matching C type *spellings*, it inspects the libclang
+/// CANONICAL type (typedefs/elaborated forms already resolved), so e.g.
+/// `LLVMModuleRef` (typedef void*) -> `void*` and `size_t` -> `u64` fall out
+/// of the real type, not a name table.
+///
+/// Phase 1 keeps exact parity with the old engine's *output*: scalars map to
+/// the matching Cryo primitive, `T*` to a (const-aware, §1) pointer, `enum`
+/// to `i32`, and everything else (records, function pointers, unexposed) to
+/// the opaque `void*` fallback.  Emitting real record/fn-pointer types is
+/// Phase 2.
+
+namespace Compiler::Bindgen::TypeMap;
+
+import ffi::libc;
+import Compiler::Bindgen::Clang;
+import Compiler::Bindgen::Clang::{ CXType };
+import Compiler::CompilationContext;
+import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::Diag::{ SourceSpan };
+import Compiler::AST;
+import Compiler::AST::{ Node, Declaration };
+
+/// Heap-allocate a PrimitiveAnnotation wrapped in a TypeAnnotation.
+function make_prim(name: string, ctx: CompilationContext*) -> TypeAnnotation* {
+    const sym: SymbolStr = ctx.intern_table.intern(name);
+    const prim: PrimitiveAnnotation* = new PrimitiveAnnotation { name: sym, span: SourceSpan::none() };
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Primitive(prim);
+    return ann;
+}
+
+/// Heap-allocate a PointerAnnotation wrapped in a TypeAnnotation.  `is_const`
+/// marks `const T*` (the pointee is const — §1 frontend-only flag).
+function make_ptr(inner: TypeAnnotation*, is_const: boolean) -> TypeAnnotation* {
+    const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, is_const: is_const, span: SourceSpan::none() };
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Pointer(ptr);
+    return ann;
+}
+
+/// CXTypeKind -> Cryo primitive name, mirroring the old scalar table.
+/// Returns "" for kinds that are not plain scalars (caller handles those).
+function scalar_name(k: i32) -> string {
+    if (k == Clang::TK_Void)       { return "void"; }
+    if (k == Clang::TK_Bool)       { return "boolean"; }
+    if (k == Clang::TK_Char_U)     { return "u8"; }
+    if (k == Clang::TK_UChar)      { return "u8"; }
+    if (k == Clang::TK_Char_S)     { return "i8"; }
+    if (k == Clang::TK_SChar)      { return "i8"; }
+    if (k == Clang::TK_UShort)     { return "u16"; }
+    if (k == Clang::TK_Short)      { return "i16"; }
+    if (k == Clang::TK_UInt)       { return "u32"; }
+    if (k == Clang::TK_Int)        { return "i32"; }
+    if (k == Clang::TK_ULong)      { return "u64"; }
+    if (k == Clang::TK_Long)       { return "i64"; }
+    if (k == Clang::TK_ULongLong)  { return "u64"; }
+    if (k == Clang::TK_LongLong)   { return "i64"; }
+    if (k == Clang::TK_Float)      { return "f32"; }
+    if (k == Clang::TK_Double)     { return "f64"; }
+    if (k == Clang::TK_LongDouble) { return "f64"; }
+    if (k == Clang::TK_Enum)       { return "i32"; }
+    return "";
+}
+
+/// Map a libclang type to a Cryo TypeAnnotation (Phase-1 rules).
+function map_type(t: CXType, ctx: CompilationContext*) -> TypeAnnotation* {
+    const c: CXType = Clang::clang_getCanonicalType(t);
+    const k: i32 = c.kind;
+
+    if (k == Clang::TK_Pointer) {
+        const pointee: CXType = Clang::clang_getPointeeType(c);
+        const pc: CXType = Clang::clang_getCanonicalType(pointee);
+        // Phase-1 parity: a function-pointer pointee collapses to `void*`.
+        if (pc.kind == Clang::TK_FunctionProto || pc.kind == Clang::TK_FunctionNoProto) {
+            return make_ptr(make_prim("void", ctx), false);
+        }
+        const is_const: boolean = Clang::clang_isConstQualifiedType(pointee) != 0u32;
+        const inner: TypeAnnotation* = map_type(pointee, ctx);
+        return make_ptr(inner, is_const);
+    }
+
+    const name: string = scalar_name(k);
+    if (!name.eq("")) {
+        return make_prim(name, ctx);
+    }
+
+    // Records, unexposed types, etc. -> opaque `void*`, exactly as the old
+    // engine's "unknown -> void*" rule.  (Real record types are Phase 2.)
+    return make_ptr(make_prim("void", ctx), false);
+}

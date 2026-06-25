@@ -1,0 +1,140 @@
+/// libclang FFI surface
+///
+/// The stable libclang C API that drives C-header binding generation.  All
+/// handles (CXIndex, CXTranslationUnit) are opaque `void*`; the three small
+/// libclang aggregates (`CXString`, `CXCursor`, `CXType`) are passed and
+/// returned BY VALUE — Cryo's SysV x86-64 codegen handles this correctly
+/// (proven by the Phase-0 ABI spike: 16B DirectPair, 32B Indirect/SRet/ByVal,
+/// including the >16B callee-side ByVal prologue `clang_visitChildren` needs).
+///
+/// These are hand-written `extern "C"` declarations rather than an
+/// `extern module clang := "C" { #include <clang-c/Index.h> }` block: the
+/// engine that parses `#include`s is built ON TOP of these, so they cannot
+/// themselves come through that path (and a curated surface keeps the
+/// bootstrap free of a clang-c header dependency).
+
+namespace Compiler::Bindgen::Clang;
+
+import ffi::libc;
+import Compiler::CompilationContext;
+import Compiler::Resolver::{ SymbolStr, InternTable };
+
+// ---- By-value aggregates (stable libclang ABI layouts) ----
+
+/// `{ const void *data; unsigned private_flags; }` — 16 bytes (DirectPair).
+type struct CXString {
+    data:          void*;
+    private_flags: u32;
+}
+
+/// `{ enum kind; int xdata; const void *data[3]; }` — 32 bytes (Indirect).
+type struct CXCursor {
+    kind:  i32;
+    xdata: i32;
+    data:  void*[3];
+}
+
+/// `{ enum kind; void *data[2]; }` — 24 bytes (Indirect).
+type struct CXType {
+    kind: i32;
+    data: void*[2];
+}
+
+/// `{ const char *Filename; const char *Contents; unsigned long Length; }`.
+/// Lets a system header (`#include <stdio.h>`) be parsed from an in-memory
+/// buffer with a virtual filename — no temp file on disk.
+type struct CXUnsavedFile {
+    filename: u8*;
+    contents: u8*;
+    length:   u64;
+}
+
+// ---- CXCursorKind / CXChildVisitResult constants ----
+const CURSOR_FUNCTION_DECL: i32 = 8;
+const VISIT_CONTINUE: i32 = 1;
+
+// ---- CXTypeKind constants (stable libclang ABI) ----
+const TK_Void: i32       = 2;
+const TK_Bool: i32       = 3;
+const TK_Char_U: i32     = 4;
+const TK_UChar: i32      = 5;
+const TK_UShort: i32     = 8;
+const TK_UInt: i32       = 9;
+const TK_ULong: i32      = 10;
+const TK_ULongLong: i32  = 11;
+const TK_Char_S: i32     = 13;
+const TK_SChar: i32      = 14;
+const TK_Short: i32      = 16;
+const TK_Int: i32        = 17;
+const TK_Long: i32       = 18;
+const TK_LongLong: i32   = 19;
+const TK_Float: i32      = 21;
+const TK_Double: i32     = 22;
+const TK_LongDouble: i32 = 23;
+const TK_Pointer: i32    = 101;
+const TK_Enum: i32       = 106;
+const TK_FunctionNoProto: i32 = 110;
+const TK_FunctionProto: i32   = 111;
+
+extern "C" {
+    // Index / translation-unit lifecycle.
+    function clang_createIndex(exclude_pch: i32, display_diags: i32) -> void*;
+    function clang_parseTranslationUnit(idx: void*, source_filename: u8*,
+        command_line_args: u8**, num_args: i32,
+        unsaved_files: CXUnsavedFile*, num_unsaved: u32, options: u32) -> void*;
+    function clang_disposeTranslationUnit(tu: void*) -> void;
+    function clang_disposeIndex(idx: void*) -> void;
+
+    // Cursor walk.
+    function clang_getTranslationUnitCursor(tu: void*) -> CXCursor;
+    function clang_visitChildren(parent: CXCursor,
+        visitor: (CXCursor, CXCursor, void*) -> i32, client: void*) -> u32;
+    function clang_getCursorKind(c: CXCursor) -> i32;
+    function clang_getCursorSpelling(c: CXCursor) -> CXString;
+
+    // Function-decl introspection.
+    function clang_getCursorResultType(c: CXCursor) -> CXType;
+    function clang_getCursorType(c: CXCursor) -> CXType;
+    function clang_Cursor_getNumArguments(c: CXCursor) -> i32;
+    function clang_Cursor_getArgument(c: CXCursor, i: u32) -> CXCursor;
+    function clang_isFunctionTypeVariadic(t: CXType) -> u32;
+
+    // Type introspection (drives the CXType -> Cryo annotation mapper).
+    function clang_getCanonicalType(t: CXType) -> CXType;
+    function clang_getPointeeType(t: CXType) -> CXType;
+    function clang_isConstQualifiedType(t: CXType) -> u32;
+
+    // CXString access.
+    function clang_getCString(s: CXString) -> u8*;
+    function clang_disposeString(s: CXString) -> void;
+}
+
+/// Intern a cursor's spelling (e.g. a function name) into `ctx`.  The C
+/// string is owned by the CXString, so it is copied (interned) before the
+/// string is disposed.
+function intern_spelling(cursor: CXCursor, ctx: CompilationContext*) -> SymbolStr {
+    const s: CXString = clang_getCursorSpelling(cursor);
+    const cstr: u8* = clang_getCString(s);
+    const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
+    clang_disposeString(s);
+    return sym;
+}
+
+/// Intern a parameter cursor's name.  Unnamed parameters (empty spelling)
+/// get a synthesized `argN`, exactly as the hand-rolled scanner did, so a
+/// `void *` with no name still yields a first-class declaration.
+function intern_arg_name(arg: CXCursor, index: i32, ctx: CompilationContext*) -> SymbolStr {
+    const s: CXString = clang_getCursorSpelling(arg);
+    const cstr: u8* = clang_getCString(s);
+    if (cstr == null || libc::strlen(cstr as string) == 0) {
+        clang_disposeString(s);
+        const buf: i8* = intrinsics::malloc(16) as i8*;
+        intrinsics::sprintf(buf as string, "arg%d", index);
+        const sym: SymbolStr = ctx.intern_table.intern(buf as string);
+        intrinsics::free(buf as void*);
+        return sym;
+    }
+    const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
+    clang_disposeString(s);
+    return sym;
+}
