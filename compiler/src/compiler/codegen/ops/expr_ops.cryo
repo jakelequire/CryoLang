@@ -1758,6 +1758,47 @@ type struct ExprOps {
         this.builder.position_at_end(ok_bb);
     }
 
+    /// Emit a runtime guard that aborts if `count * elem_size` - the byte
+    /// count feeding an array `malloc` (`new T[n]`) - would overflow u64.
+    /// A wrapped product mallocs a too-small block, after which the caller
+    /// writes `count` elements past the allocation: the same heap-overflow
+    /// class already guarded in `Layout::array` / `Pool::grow`.
+    ///
+    /// `elem_size` is a compile-time constant, so the bound `U64_MAX /
+    /// elem_size` is folded here and compared against `count` with a single
+    /// unsigned compare - no runtime division (which would itself need a
+    /// zero-guard). The count is treated as unsigned, so a negative literal
+    /// (`new int[-1]`) reads as a huge value and traps too. 1-byte elements
+    /// can never overflow, so the guard is elided. Leaves the builder at the
+    /// ok block; mirrors `emit_int_div_guard`'s trap shape.
+    emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64) -> void {
+        if (elem_size <= (1 as u64)) { return; }
+        const u64_max: u64 = (0 as u64) - (1 as u64);
+        const max_count: u64 = u64_max / elem_size;
+        const max_val: LValue = LType::const_int(LType::i64(), max_count, false);
+        const overflow: LValue = this.builder.build_icmp(
+            LIntPredicate::UGT, count_i64, max_val, "new.arr.ovf");
+
+        const cur_bb: LBasicBlock = this.builder.get_insert_block();
+        if (!cur_bb.is_valid()) { return; }
+        const fn: LValue = cur_bb.get_parent();
+        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "new.arr.trap");
+        const ok_bb: LBasicBlock = LBasicBlock::append(fn, "new.arr.ok");
+
+        this.builder.build_cond_br(overflow, trap_bb, ok_bb);
+
+        // Trap arm: call @abort(); unreachable - a clean SIGABRT instead of
+        // a silently-truncated allocation.
+        this.builder.position_at_end(trap_bb);
+        const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
+        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+        mut a_args: Pair<LValue, TypeRef>[] = [];
+        this.codegen_call(abort_fn, abort_ty, a_args, "");
+        this.builder.build_unreachable();
+
+        this.builder.position_at_end(ok_bb);
+    }
+
     /// Generate IR for a unary expression.
     codegen_unary(mut &this, operand: LValue, op_kind: TokenType, operand_type: TypeRef) -> LValue {
         mut out_value: LValue = LValue::null();

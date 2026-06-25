@@ -517,6 +517,15 @@ type struct HashMap<K, V, A = GlobalAlloc> {
 // Stays `public` (unlike KeysIter/ValuesIter): `HashSetIter` in the
 // `collections::hashset` module holds one as a field, a cross-module
 // reference that a `private` marking would (correctly) reject.
+//
+// A `public` struct with public fields is externally constructible via a
+// struct literal, bypassing the `K: Copy, V: Copy` gate on `HashMap::iter`.
+// The `Iterator` impl is therefore Copy-gated directly: without it, a caller
+// could hand-build a `HashMapIter` over a map of owning values and `next()`
+// would bit-copy them out, aliasing map-owned storage (double-free). With the
+// gate, `next()` simply doesn't exist for non-`Copy` `K`/`V`. The legitimate
+// producers (`HashMap::iter`, `HashSetIter` over `HashMapIter<T, ()>` where
+// `()` is trivially `Copy`) are unaffected.
 
 type struct HashMapIter<K, V> {
     buckets: Entry<K, V>**;
@@ -525,7 +534,8 @@ type struct HashMapIter<K, V> {
     current: Entry<K, V>*;
 }
 
-implement<K, V> trait Iterator<Pair<K, V>> for struct HashMapIter<K, V> {
+implement<K, V> trait Iterator<Pair<K, V>> for struct HashMapIter<K, V>
+where K: Copy, V: Copy {
     next(mut &this) -> Option<Pair<K, V>> {
         loop {
             if (this.current != null) {
