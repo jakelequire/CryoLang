@@ -27,7 +27,8 @@ TARBALL="${CACHE_DIR}/llvm-${LLVM_MAJOR}-toolchain.tar.zst"
 
 toolchain_ok() {
     "clang-${LLVM_MAJOR}" --version >/dev/null 2>&1 \
-        && "llvm-config-${LLVM_MAJOR}" --libs core >/dev/null 2>&1
+        && "llvm-config-${LLVM_MAJOR}" --libs core >/dev/null 2>&1 \
+        && [ -e "/usr/lib/llvm-${LLVM_MAJOR}/lib/libclang-${LLVM_MAJOR}.so.1" ]
 }
 
 install_from_apt() {
@@ -35,8 +36,11 @@ install_from_apt() {
     wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
     chmod +x /tmp/llvm.sh
     sudo /tmp/llvm.sh "${LLVM_MAJOR}"
+    # libclang1-N provides the libclang-N.so the C-import engine (Compiler::Bindgen)
+    # links against — /usr/lib/llvm-N/lib/libclang-N.so.1 (a symlink into the
+    # multiarch dir, captured by write_cache_tarball below).
     sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "clang-${LLVM_MAJOR}" \
-        "libpolly-${LLVM_MAJOR}-dev"
+        "libpolly-${LLVM_MAJOR}-dev" "libclang1-${LLVM_MAJOR}"
 }
 
 write_cache_tarball() {
@@ -45,9 +49,13 @@ write_cache_tarball() {
     # Everything the build needs: the self-contained /usr/lib/llvm-X tree,
     # the runtime libLLVM.so in the multiarch dir, and the /usr/bin/<tool>-X
     # entry points into the tree.
+    # The /usr/lib/llvm-N tree includes the libclang-N.so.1 symlink, but that
+    # symlink points into the multiarch dir — capture the real libclang shared
+    # object there too (alongside libLLVM) or a cache restore leaves it dangling.
     sudo tar --zstd -cf "$TARBALL" \
         "/usr/lib/llvm-${LLVM_MAJOR}" \
         /usr/lib/x86_64-linux-gnu/libLLVM*"${LLVM_MAJOR}"* \
+        /usr/lib/x86_64-linux-gnu/libclang*"${LLVM_MAJOR}"* \
         /usr/bin/*-"${LLVM_MAJOR}"
     sudo chmod 644 "$TARBALL"
 }

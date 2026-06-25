@@ -122,3 +122,14 @@ ArrF2 abi_make_arr_f2(float a, float b) {
 float abi_sum_arr_f2(ArrF2 s) {
     return s.v[0] + s.v[1];
 }
+
+
+// ----- libclang C-import engine (Compiler::Bindgen) regression probe -------
+// Uniquely named so the dedicated #include-import test
+// (tests/tests/lang/c_import_libclang.cryo) can declare it in a local header,
+// import it through the libclang engine, and CALL it — exercising the full
+// parse -> emit FunctionDecl -> resolve -> link -> run path. (Self-host proves
+// IR byte-identity over llvm_bindings.h but never runs an imported function.)
+int bindgen_probe_add3(int a, int b, int c) {
+    return a + b + c;
+}

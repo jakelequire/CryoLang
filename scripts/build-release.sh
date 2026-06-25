@@ -120,7 +120,9 @@ build_windows() {
     rm -rf "$stage"; mkdir -p "${stage}/bin"
 
     local dll="${ROOT}/.toolchains/llvm-win/bin/LLVM-C.dll"
+    local clang_dll="${ROOT}/.toolchains/llvm-win/bin/libclang.dll"
     [ -f "$dll" ] || { echo "error: ${dll} missing - run scripts/fetch-windows-llvm.sh first" >&2; exit 1; }
+    [ -f "$clang_dll" ] || { echo "error: ${clang_dll} missing - run scripts/fetch-windows-llvm.sh first" >&2; exit 1; }
 
     echo "[build-release] cross-building cryo.exe"
     make -C "$ROOT" cryo-exe >/dev/null
@@ -129,6 +131,8 @@ build_windows() {
     [ -x "$exe" ] || [ -f "$exe" ] || { echo "error: cryo.exe not produced at $exe" >&2; exit 1; }
     cp "$exe" "${stage}/bin/cryo.exe"
     cp "$dll" "${stage}/bin/LLVM-C.dll"
+    # libclang.dll: runtime dep of the C-import engine (Compiler::Bindgen).
+    cp "$clang_dll" "${stage}/bin/libclang.dll"
 
     # Windows uses per-build stdlib .o (use_stdlib_archive:false for the
     # windows-gnu triple), so ship stdlib SOURCE only - no libcryo.a needed.

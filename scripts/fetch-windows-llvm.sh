@@ -80,6 +80,13 @@ done
 
 LIB="${PREFIX}/lib/libLLVM-C.dll.a"
 DLL="${PREFIX}/bin/LLVM-C.dll"
+# libclang drives the C-import engine (Compiler::Bindgen). Same provisioning
+# pattern as LLVM-C: take the official msvc libclang.dll, synthesize a mingw
+# import lib from its `clang_*` exports. The C ABI is identical across
+# msvc/mingw on x64, and a cross-built cryo.exe needs the Win64 by-value-struct
+# ABI for CXString/CXCursor/CXType (codegen's AbiKind::Win64 path).
+CLANG_LIB="${PREFIX}/lib/libclang.dll.a"
+CLANG_DLL="${PREFIX}/bin/libclang.dll"
 MINGW_CLANG="${MINGW_PREFIX}/bin/clang.exe"
 MINGW_AR="${MINGW_PREFIX}/bin/llvm-ar.exe"
 
@@ -111,7 +118,8 @@ verify_sha256() {
 # ---------------------------------------------------------------------------
 # Part 1: LLVM-C.dll + synthesized mingw import lib (.toolchains/llvm-win)
 # ---------------------------------------------------------------------------
-if [[ -f "$LIB" && -f "$DLL" && "$force" -eq 0 ]]; then
+if [[ -f "$LIB" && -f "$DLL" && -f "$CLANG_LIB" && -f "$CLANG_DLL" \
+      && -d "${PREFIX}/lib/clang" && "$force" -eq 0 ]]; then
     echo "[fetch-windows-llvm] llvm-win already present under $PREFIX (pass --force to rebuild)"
 else
     for tool in curl tar "$READOBJ" "$DLLTOOL"; do
@@ -126,21 +134,47 @@ else
     curl -L --fail --progress-bar -o "${work}/llvm.tar.xz" "$URL"
     verify_sha256 "${work}/llvm.tar.xz" "${LLVM_WIN_SHA256:-}" "${ASSET}"
 
-    echo "[fetch-windows-llvm] extracting LLVM-C.dll…"
+    echo "[fetch-windows-llvm] extracting LLVM-C.dll + libclang.dll…"
     base="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc"
     tar xJf "${work}/llvm.tar.xz" -C "$work" --strip-components=2 --wildcards \
-        "${base}/bin/LLVM-C.dll"
-    cp "${work}/LLVM-C.dll" "$DLL"
+        "${base}/bin/LLVM-C.dll" "${base}/bin/libclang.dll"
+    cp "${work}/LLVM-C.dll"  "$DLL"
+    cp "${work}/libclang.dll" "$CLANG_DLL"
 
-    echo "[fetch-windows-llvm] synthesizing mingw import lib…"
-    "$READOBJ" --coff-exports "$DLL" \
-        | grep -oE 'Name: LLVM[A-Za-z0-9_]+' | sed 's/Name: //' | sort -u > "${work}/exports.txt"
-    { echo "LIBRARY LLVM-C.dll"; echo "EXPORTS"; cat "${work}/exports.txt"; } > "${work}/LLVM-C.def"
-    "$DLLTOOL" --input-def "${work}/LLVM-C.def" --dllname LLVM-C.dll --output-lib "$LIB"
+    # libclang's builtin resource headers (stddef.h / stdint.h / …).  The
+    # Windows libclang must find these to parse any header that #includes them
+    # — e.g. the compiler's own llvm_bindings.h.  Staged at lib/clang/<v>/include
+    # so they sit at libclang.dll's default `<dll>/../lib/clang/<v>` resource
+    # path; selfhost-check also exports CRYO_CLANG_RESOURCE_DIR to lib/clang/<v>
+    # for the wine self-host, where libclang.dll is copied out of this tree and
+    # the default walk no longer reaches here.
+    echo "[fetch-windows-llvm] extracting clang resource headers…"
+    rm -rf "${PREFIX}/lib/clang"
+    tar xJf "${work}/llvm.tar.xz" -C "${PREFIX}/lib" --strip-components=2 --wildcards \
+        "${base}/lib/clang"
+
+    # synth_import_lib <dll> <export-name-prefix> <import-lib-out>
+    # Dumps the DLL's COFF export table, keeps the exports whose name starts
+    # with the given prefix, and synthesizes a mingw import lib from them.
+    synth_import_lib() {
+        local dll="$1" prefix="$2" out="$3"
+        local dllbase def
+        dllbase="$(basename "$dll")"
+        def="${work}/$(basename "$out").def"
+        "$READOBJ" --coff-exports "$dll" \
+            | grep -oE "Name: ${prefix}[A-Za-z0-9_]+" | sed 's/Name: //' | sort -u > "${def}.exports"
+        { echo "LIBRARY ${dllbase}"; echo "EXPORTS"; cat "${def}.exports"; } > "$def"
+        "$DLLTOOL" --input-def "$def" --dllname "$dllbase" --output-lib "$out"
+        echo "  $(basename "$out")  ($(grep -c . "${def}.exports") ${prefix}* exports)"
+    }
+
+    echo "[fetch-windows-llvm] synthesizing mingw import libs…"
+    synth_import_lib "$DLL"       "LLVM"  "$LIB"
+    synth_import_lib "$CLANG_DLL" "clang_" "$CLANG_LIB"
 
     echo "[fetch-windows-llvm] llvm-win done:"
-    echo "  import lib: $LIB  ($(grep -c . "${work}/exports.txt") exports)"
-    echo "  runtime:    $DLL"
+    echo "  runtime DLLs: $DLL"
+    echo "                $CLANG_DLL"
 fi
 
 # ---------------------------------------------------------------------------
@@ -180,8 +214,10 @@ cat <<EOF
 [link.windows] in compiler/cryoconfig is already wired for this:
 
   [link.windows]
-  system = ["LLVM-C"]
+  system = ["LLVM-C", "clang"]
   search = ["../.toolchains/llvm-win/lib"]
+
+Ship BOTH DLLs next to cryo.exe at runtime: LLVM-C.dll and libclang.dll.
 
 Cross-build + self-host under wine:
 

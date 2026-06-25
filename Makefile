@@ -58,6 +58,10 @@ MINGW_GCC    := x86_64-w64-mingw32-gcc
 MINGW_STRIP  := x86_64-w64-mingw32-strip
 WIN_LLVM_LIB := $(ROOT)/.toolchains/llvm-win/lib/libLLVM-C.dll.a
 WIN_LLVM_DLL := $(ROOT)/.toolchains/llvm-win/bin/LLVM-C.dll
+# libclang import lib + DLL: the C-import engine (Compiler::Bindgen) links
+# libclang, so a cryo.exe cross-build needs both alongside LLVM-C.
+WIN_CLANG_LIB := $(ROOT)/.toolchains/llvm-win/lib/libclang.dll.a
+WIN_CLANG_DLL := $(ROOT)/.toolchains/llvm-win/bin/libclang.dll
 
 # C-side helpers for the ABI tests.  Compiled with the host cc to a
 # static archive that `tests/cryoconfig` links via -L./helpers
@@ -211,6 +215,7 @@ $(LIBCRYO_A):
 cryo-exe: cryo
 	@command -v $(MINGW_GCC) >/dev/null 2>&1 || { echo "ERROR: $(MINGW_GCC) not found (install gcc-mingw-w64-x86-64)."; exit 1; }
 	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
+	@test -f "$(WIN_CLANG_LIB)" || { echo "ERROR: windows libclang import lib missing at"; echo "       $(WIN_CLANG_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
 	@echo "==> Cross-building cryo.exe ($(WIN_TRIPLE)) via the self-hosted compiler"
 	@cd compiler && "$(STAGE2)" build --target=$(WIN_TRIPLE) --no-incremental
 	@echo "==> cryo.exe: $(STAGE2_EXE)"
@@ -237,14 +242,14 @@ pin-linux-impl: cryo
 	@python3 scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)"
 
 pin-windows-impl:
-	@if command -v $(MINGW_GCC) >/dev/null 2>&1 && [ -f "$(WIN_LLVM_LIB)" ]; then \
+	@if command -v $(MINGW_GCC) >/dev/null 2>&1 && [ -f "$(WIN_LLVM_LIB)" ] && [ -f "$(WIN_CLANG_LIB)" ]; then \
 		$(MAKE) --no-print-directory _pin-windows-do; \
 	else \
 		echo "==> [skip] bin/cryo.exe pin: Windows cross-toolchain absent."; \
 		command -v $(MINGW_GCC) >/dev/null 2>&1 \
 			|| echo "       missing: $(MINGW_GCC) (install gcc-mingw-w64-x86-64)"; \
-		[ -f "$(WIN_LLVM_LIB)" ] \
-			|| { echo "       missing: $(WIN_LLVM_LIB)"; \
+		{ [ -f "$(WIN_LLVM_LIB)" ] && [ -f "$(WIN_CLANG_LIB)" ]; } \
+			|| { echo "       missing: windows libLLVM-C / libclang import libs"; \
 			     echo "         run: scripts/fetch-windows-llvm.sh"; }; \
 	fi
 
@@ -252,6 +257,8 @@ _pin-windows-do: cryo-exe
 	@python3 scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP)
 	@cp -f "$(WIN_LLVM_DLL)" "$(ROOT)/bin/LLVM-C.dll" 2>/dev/null \
 		&& echo "==> Runtime LLVM-C.dll copied to bin/ (gitignored)" || true
+	@cp -f "$(WIN_CLANG_DLL)" "$(ROOT)/bin/libclang.dll" 2>/dev/null \
+		&& echo "==> Runtime libclang.dll copied to bin/ (gitignored)" || true
 endif
 
 # ---- Cryo-language LSP server -----------------------------------------

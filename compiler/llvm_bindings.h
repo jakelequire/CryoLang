@@ -13,6 +13,16 @@
 #ifndef CRYO_LLVM_BINDINGS_H
 #define CRYO_LLVM_BINDINGS_H
 
+/* size_t / uint64_t used below come from these. Required now that the C-import
+ * engine (libclang) semantically PARSES this header rather than only
+ * preprocessing it: without the declarations clang would default the unknown
+ * type names to implicit-int (i32), silently truncating the 64-bit DIBuilder
+ * size/length arguments. (Preprocess-only scanning never resolved types, so
+ * the spellings `size_t`/`uint64_t` mapped to u64 by name — this keeps both
+ * engines in agreement; verified parity-neutral for the old scanner.) */
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
