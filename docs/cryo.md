@@ -635,7 +635,7 @@ extern "C" {
 }
 ```
 
-See [§ 18](#18-foreign-function-interface) for full FFI semantics, including `extern "C" { ... }` blocks and the `c := extern "C" { #include <header.h> }` form.
+See [§ 18](#18-foreign-function-interface) for full FFI semantics, including `extern "C" { ... }` blocks and the `extern module c := "C" { #include <header.h> }` form.
 
 ### 4.5 Intrinsic Functions
 
@@ -2197,7 +2197,7 @@ It is the programmer's responsibility to ensure the Cryo signature matches the C
 For larger C libraries, transcribing every signature by hand is error-prone. Cryo can import a C header directly. The compiler invokes `clang` to preprocess the header and generates Cryo declarations for every function and symbol it finds.
 
 ```cryo
-c := extern "C" {
+extern module c := "C" {
     #include <stdio.h>       // angle: system include search path
     #include <stdlib.h>
     #include "./my_header.h" // quoted: relative to this source file
@@ -2211,7 +2211,7 @@ function main() -> int {
 }
 ```
 
-Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) — exactly as in C. The identifier before `:=` (`c` here) introduces a namespace into which the imported declarations are placed; access them with `::` to prevent collisions between C and Cryo names.
+Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) — exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access them with `::` to prevent collisions between C and Cryo names.
 
 An aliased import block holds **only** `#include` directives, never Cryo declarations; conversely, a plain `extern "C"` block (§18.1) holds **only** hand-written Cryo signatures, never `#include`. Don't also hand-declare a symbol that an imported header already defines (e.g. `puts` from `<stdio.h>`) — reach it through the alias (`c::puts`) instead.
 

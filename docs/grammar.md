@@ -72,7 +72,7 @@ ExternFn           ::= "function" Ident
 (*  C-header import - a named-namespace form of `extern "C"` that
     asks the compiler to invoke clang on the listed headers and pull
     the resulting declarations into the named namespace.            *)
-CHeaderImport      ::= Ident ":=" "extern" StringLit
+CHeaderImport      ::= "extern" "module" Ident ":=" StringLit
                        "{" CIncludeLine+ "}"
 CIncludeLine       ::= "#include" ( "<" /* path */ ">"
                                   | StringLit )

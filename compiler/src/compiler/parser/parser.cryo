@@ -322,24 +322,15 @@ public:
             return imp;
         }
 
-        // CImport: name := extern "C" { #include "..." }
-        if (tok.kind == TokenType::Identifier &&
-            this.peek_at(1).kind == TokenType::Colon &&
-            this.peek_at(2).kind == TokenType::Equal &&
-            this.peek_at(3).kind == TokenType::KwExtern) {
-            const alias_tok: Token = this.advance(); // consume identifier
-            const alias: SymbolStr = this.intern_lexeme(alias_tok);
-            this.advance(); // consume ':'
-            this.advance(); // consume '='
-            const ext: ExternBlockNode* = this.parse_extern_block_cimport(alias);
-            if (ext != null && doc != "") {
-                ext.set_documentation(doc);
-            }
-            return ext;
-        }
-
-        // Extern block
+        // Extern block, or the C-header import form `extern module name := "C"`.
         if (tok.kind == TokenType::KwExtern) {
+            if (this.peek_at(1).kind == TokenType::KwModule) {
+                const cext: ExternBlockNode* = this.parse_extern_module_cimport();
+                if (cext != null && doc != "") {
+                    cext.set_documentation(doc);
+                }
+                return cext;
+            }
             const ext: ExternBlockNode* = this.parse_extern_block();
             if (ext != null && doc != "") {
                 ext.set_documentation(doc);
@@ -2042,10 +2033,24 @@ public:
         return node;
     }
 
-    /// Parse a CImport extern block: name := extern "C" { #include "..." }
-    /// The 'name :=' part has already been consumed; 'extern' is current.
-    parse_extern_block_cimport(alias: SymbolStr) -> ExternBlockNode* {
+    /// Parse the CImport form: `extern module name := "C" { #include "..." }`
+    /// 'extern' is current. The keyword-led spelling groups with other `extern`
+    /// declarations and reuses the existing `module` keyword.
+    parse_extern_module_cimport() -> ExternBlockNode* {
         const start: Token = this.advance(); // consume 'extern'
+        this.advance();                      // consume 'module'
+        const alias_tok: Token = this.current();
+        const alias: SymbolStr = this.intern_lexeme(alias_tok);
+        this.advance();                      // consume the alias identifier
+        this.consume(TokenType::Colon, "':'");
+        this.consume(TokenType::Equal, "'='");
+        return this.finish_cimport_block(alias, start);
+    }
+
+    /// Shared tail for both CImport spellings: with `start` at the leading
+    /// `extern` token and the cursor positioned at the linkage string, parse
+    /// `"C" { #include ... }` into a namespace-aliased ExternBlockNode.
+    finish_cimport_block(alias: SymbolStr, start: Token) -> ExternBlockNode* {
         mut linkage: string = "C";
 
         // Linkage type: "C"
