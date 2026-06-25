@@ -60,6 +60,17 @@ Validation: `make test` green (1298 unit + 106 compile-fail), `make selfhost-che
 
 Validation: `make test` green (1299 unit + 111 compile-fail), `make selfhost-check` byte-identical FIXED POINT on Linux (IR md5 `5bc5aa98…`), `valgrind` clean on the mpsc repros. Not repinned/committed (maintainer's call).
 
+## ✅ Done this cycle (2026-06-24, cont.) — std::fmt print family: coverage + 2 bug fixes
+
+Extensive testing of `printf`/`println`/`print`/f-strings (self-tested in `/tmp` + 25 new suite tests in `tests/stdlib/fmt_print_family.cryo`). Found and fixed two real bugs:
+
+- **`println("literal")` segfault** (the implicit `string -> String` path). Root cause: `sema/call_resolver.cryo:check_scope_call_arg_types` looked up the overload by the *written* abbreviated namespace (`fmt::println`), but functions register under the full name (`std::fmt::println`). The miss skipped arg checking AND the `![implicit]` `from_cstr` conversion, so the raw `string` (char*) was passed `byval` as a `String` struct → garbage pointer → segfault. Fix: mirror `resolve_module_qualified_function`'s module-namespace **suffix match** to recover the full overload, then apply a **conversion-only** arg pass (new `apply_implicit_conversions_only`). Deliberately conversion-only: these abbreviated calls were never arg-checked, and the codebase relies on that leniency for same-width sign reinterprets like `intrinsics::panic(.., LINE)` (i32 -> u32) — enforcing the full narrowing/sign errors there is a separate change (see the missed-ambiguity item). `eprintln`/`eprint` literals are fixed by the same path.
+- **i64/u64 suffix literal truncation.** `sema/helpers.cryo:int_literal_exceeds` bailed `return false` (does-not-exceed) on hitting the type-suffix char, so a large suffixed literal (`9000000000i64`) was mis-classified as in-range, `sema_default_int_type` picked `i32`, and codegen truncated via `const_int(i32, …)` → `9000000000i64` printed as `410065408`. Fix: stop at the suffix (`break`) and compare the parsed magnitude. Applied the same suffix-stop to the siblings `parse_int_literal_u64` (so `try_fold_const_i64` folds suffixed literals) and `int_literal_text_is_zero` (so `0i64` is recognised as zero).
+
+Coverage added (25 tests): printf specifiers (`%u`/`%x`/`%X`/`%o`/`%f`/`%.2f`/`%c`/width/precision/`%lld`/`%llu`) via byte-count assertions; `println`/`print` implicit-string + f-string + explicit-String + empty + percent + long (buffer growth) + UTF-8; eprintf byte count + eprint/eprintln smoke; f-strings across all primitives, Debug holes, Option/Result/Array Debug, expression holes (field/method/arithmetic), `{{`/`}}` escapes, empty/no-hole, and the i64-suffix regression. Also a behavior note: `\u{…}` doesn't work inside an f-string (the `{` opens an interpolation hole) — use a plain string literal.
+
+Validation: `make test` (Windows) OVERALL PASS — **1324 unit + 111 compile-fail** (+25 fmt tests); `make selfhost-check` byte-identical FIXED POINT on Linux (IR md5 `65bc12e7…`). Not repinned/committed (maintainer's call).
+
 ---
 
 ## ⬜ Release checklist (before tagging)
