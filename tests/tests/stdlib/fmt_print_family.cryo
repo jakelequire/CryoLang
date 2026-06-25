@@ -1,0 +1,257 @@
+///! Coverage for the `std::fmt` print family: `printf`/`eprintf` (C-variadic),
+///! `print`/`println` (Display-based, take an owned `String`), the implicit
+///! `string -> String` conversion at a `println("literal")` call site, and
+///! f-string interpolation across many value shapes.
+///!
+///! Two assertion styles (the print family returns void, so stdout content
+///! can't be compared in-process):
+///!   * `printf` returns its byte count -> assert the count (a formatted-length
+///!     proxy that also catches value corruption, since a wrong value usually
+///!     has a different digit count).
+///!   * f-strings build a `String` -> assert its exact contents.
+///!   * `print`/`println` -> smoke tests (a crash fails the test); these are the
+///!     regression guard for the implicit-`from_cstr` segfault.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FmtPrintFamily;
+
+import std::core::result;
+import std::core::option;
+import std::collections::string;
+import std::collections::str;
+import std::collections::array;
+import std::fmt;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// printf: byte-count contract across specifiers.
+// ---------------------------------------------------------------------------
+
+![test]
+function printf_unsigned() -> Result<(), TestError> {
+    // "u=4000000000\n" = 13
+    return expect_eq(fmt::printf("u=%u\n", 4000000000u32), 13);
+}
+
+![test]
+function printf_hex_lower_upper() -> Result<(), TestError> {
+    match (expect_eq(fmt::printf("%x\n", 255u32), 3)) {     // "ff\n"
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(fmt::printf("%X\n", 255u32), 3);        // "FF\n"
+}
+
+![test]
+function printf_octal() -> Result<(), TestError> {
+    return expect_eq(fmt::printf("%o\n", 64u32), 4);         // "100\n"
+}
+
+![test]
+function printf_float_default_and_precision() -> Result<(), TestError> {
+    match (expect_eq(fmt::printf("%f\n", 3.14159), 9)) {     // "3.141590\n"
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(fmt::printf("%.2f\n", 3.14159), 5);     // "3.14\n"
+}
+
+![test]
+function printf_char() -> Result<(), TestError> {
+    return expect_eq(fmt::printf("%c\n", 65), 2);            // "A\n"
+}
+
+![test]
+function printf_width_and_padding() -> Result<(), TestError> {
+    match (expect_eq(fmt::printf("[%5d]\n", 42), 8)) {       // "[   42]\n"
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(fmt::printf("[%-5d]\n", 42), 8)) {      // "[42   ]\n"
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(fmt::printf("[%05d]\n", 42), 8);        // "[00042]\n"
+}
+
+![test]
+function printf_string_precision() -> Result<(), TestError> {
+    return expect_eq(fmt::printf("[%.3s]\n", "abcdef"), 6);  // "[abc]\n"
+}
+
+![test]
+function printf_empty_string_arg() -> Result<(), TestError> {
+    return expect_eq(fmt::printf("[%s]\n", ""), 3);          // "[]\n"
+}
+
+// Regression: an `i64`/`u64` SUFFIX literal larger than i32 used to be typed
+// i32 (the suffix-blind magnitude scan) and codegen truncated it, so
+// `%lld` printed `410065408` (9 digits) instead of `9000000000` (10). The
+// byte count distinguishes them: "lld=9000000000\n" = 15, "lld=410065408\n" = 14.
+![test]
+function printf_i64_suffix_literal_not_truncated() -> Result<(), TestError> {
+    return expect_eq(fmt::printf("lld=%lld\n", 9000000000i64), 15);
+}
+
+![test]
+function printf_u64_suffix_literal_not_truncated() -> Result<(), TestError> {
+    return expect_eq(fmt::printf("llu=%llu\n", 9000000000u64), 15);
+}
+
+// ---------------------------------------------------------------------------
+// print / println: implicit `string -> String` conversion (regression for a
+// segfault) + f-string + explicit String. Smoke tests — a crash fails them.
+// ---------------------------------------------------------------------------
+
+// Regression: `println("literal")` relies on the `![implicit]`
+// `String::from_cstr`. The implicit conversion was skipped on an abbreviated-
+// namespace stdlib call (`fmt::println`), passing the raw `string` where a
+// `String` is expected -> segfault. These must run to completion.
+![test]
+function println_implicit_string_literal() -> Result<(), TestError> {
+    fmt::println("println implicit literal");
+    fmt::print("print implicit literal (no newline)");
+    fmt::printf("\n");
+    return Result::Ok(());
+}
+
+![test]
+function println_implicit_string_variable() -> Result<(), TestError> {
+    const s: string = "from a string variable";
+    fmt::println(s);
+    return Result::Ok(());
+}
+
+![test]
+function println_empty_and_percent() -> Result<(), TestError> {
+    fmt::println("");                       // just a newline
+    fmt::println("100% literal percent");   // '%' is data here, not a directive
+    return Result::Ok(());
+}
+
+![test]
+function println_fstring_and_explicit_string() -> Result<(), TestError> {
+    const n: i32 = 7;
+    fmt::println(f"fstring n={n}");
+    mut owned: String = String::from_cstr("explicit String");
+    fmt::println(owned);                    // consumes + drops owned
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// f-strings: exact-content assertions across value shapes + edge cases.
+// ---------------------------------------------------------------------------
+
+function expect_fstring(s: String, want: string) -> Result<(), TestError> {
+    mut owned: String = s;
+    const ok: boolean = owned.as_str().equals(&Str::new(want));
+    owned.drop();
+    return expect(ok, Str::new(want));
+}
+
+![test]
+function fstring_primitive_types() -> Result<(), TestError> {
+    match (expect_fstring(f"{42}", "42")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"{-7}", "-7")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"{255u8}", "255")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"{true}", "true")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"{'A'}", "A")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_fstring(f"{3.5}", "3.500000");
+}
+
+// Regression: a large `i64` suffix literal in an f-string hole must format its
+// full value, not a 32-bit-truncated one.
+![test]
+function fstring_i64_suffix_literal() -> Result<(), TestError> {
+    return expect_fstring(f"{9000000000i64}", "9000000000");
+}
+
+![test]
+function fstring_edge_cases() -> Result<(), TestError> {
+    match (expect_fstring(f"", "")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"just text", "just text")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"{1}{2}{3}", "123")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"{{literal braces}}", "{literal braces}")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_fstring(f"a={1} b={2}", "a=1 b=2");
+}
+
+![test]
+function fstring_string_interpolation() -> Result<(), TestError> {
+    const w: string = "world";
+    match (expect_fstring(f"hello {w}", "hello world")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    mut owned: String = String::from_cstr("owned");
+    const r: Result<(), TestError> = expect_fstring(f"[{owned}]", "[owned]");
+    owned.drop();
+    return r;
+}
+
+![test]
+function fstring_debug_holes() -> Result<(), TestError> {
+    // Debug of an int matches Display; Option uses Debug.
+    match (expect_fstring(f"{42:?}", "42")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    mut some: Option<i32> = Option::Some(5);
+    match (expect_fstring(f"{some:?}", "Some(5)")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    mut none: Option<i32> = Option::None;
+    return expect_fstring(f"{none:?}", "None");
+}
+
+![test]
+function fstring_result_and_array_debug() -> Result<(), TestError> {
+    mut ok: Result<i32, i32> = Result::Ok(5);
+    match (expect_fstring(f"{ok:?}", "Ok(5)")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    mut err: Result<i32, i32> = Result::Err(3);
+    match (expect_fstring(f"{err:?}", "Err(3)")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    mut xs: Array<i32> = Array<i32>::new();
+    xs.push(1); xs.push(2); xs.push(3);
+    const r: Result<(), TestError> = expect_fstring(f"{xs:?}", "[1, 2, 3]");
+    xs.drop();
+    return r;
+}
+
+// f-string holes accept arbitrary expressions, not just bare names.
+type struct Pt { x: i32; y: i32; }
+implement Pt { sum(&this) -> i32 { return this.x + this.y; } }
+
+![test]
+function fstring_expression_holes() -> Result<(), TestError> {
+    mut p: Pt = Pt { x: 4, y: 6 };
+    match (expect_fstring(f"x={p.x} y={p.y}", "x=4 y=6")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_fstring(f"sum={p.sum()}", "sum=10")) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return expect_fstring(f"{p.x * p.y}", "24");
+}
+
+// ---------------------------------------------------------------------------
+// stderr family (eprintf byte count + eprint/eprintln smoke, incl. implicit).
+// ---------------------------------------------------------------------------
+
+![test]
+function eprintf_returns_byte_count() -> Result<(), TestError> {
+    return expect_eq(fmt::eprintf("e=%d\n", 42), 5);   // "e=42\n"
+}
+
+![test]
+function eprint_family_implicit_literal() -> Result<(), TestError> {
+    // Same abbreviated-namespace implicit `from_cstr` path as println — smoke.
+    fmt::eprintln("eprintln implicit literal");
+    fmt::eprint("eprint implicit literal\n");
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// print/println of a long owned String (buffer growth) — smoke + length check.
+// ---------------------------------------------------------------------------
+
+![test]
+function println_long_string() -> Result<(), TestError> {
+    mut big: String = String::from_cstr("");
+    for (mut i: i32 = 0; i < 50; i++) { big.push_cstr("ab"); }
+    const len_ok: boolean = big.length() == 100u64;
+    fmt::println(big);                       // consumes + drops big
+    return expect(len_ok, Str::new("100-char String should print and have length 100"));
+}
+
+// UTF-8 bytes survive String construction + println (multi-byte content).
+![test]
+function utf8_string_length_and_print() -> Result<(), TestError> {
+    mut s: String = String::from_cstr("caf\u{e9}");   // 'é' is 2 UTF-8 bytes
+    const len_ok: boolean = s.length() == 5u64;        // c,a,f,0xC3,0xA9
+    fmt::println(s);
+    return expect(len_ok, Str::new("\"café\" should be 5 UTF-8 bytes"));
+}

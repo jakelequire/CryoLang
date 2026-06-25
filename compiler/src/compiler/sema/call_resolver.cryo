@@ -1106,6 +1106,30 @@ type struct CallResolver {
         return true;
     }
 
+    /// Like `check_args_against_params` but inserts `![implicit]` converters ONLY
+    /// — never emits a mismatch/narrowing/sign diagnostic.  Used for the
+    /// abbreviated-namespace scope-call path (`fmt::println("x")`), whose calls
+    /// were historically not arg-checked at all: applying the needed conversion
+    /// (e.g. `string -> String`) fixes a real miscompile, but newly *enforcing*
+    /// the type errors there would break code that relies on the prior leniency.
+    apply_implicit_conversions_only(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                                    param_types: Slice<TypeRef>) -> void {
+        const n: i64 = param_types.length as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i >= call.arguments.length) { break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const arg_ty:   TypeRef = arg.resolved_type;
+            const param_ty: TypeRef = param_types.get(i as u64).unwrap();
+            if (!this.types.arg_type_is_concrete(arg_ty))   { continue; }
+            if (!this.types.arg_type_is_concrete(param_ty)) { continue; }
+            if (this.checker.check_compatibility(arg_ty, param_ty) != TypeCompatibility::Incompatible) { continue; }
+            if (this.types.indirection_compatible(arg_ty, param_ty)) { continue; }
+            if (this.types.enum_int_compatible(arg_ty, param_ty)) { continue; }
+            this.try_apply_implicit_conversion(visitor, call, i, arg, arg_ty, param_ty);
+        }
+    }
+
     /// Per-argument type checking for a 1:1 arg/param list.  Flags only hard
     /// category mismatches / lossy narrowing / same-width sign reinterpret;
     /// synthesizes implicit conversions where registered.
@@ -2872,6 +2896,58 @@ type struct CallResolver {
                 }
             }
             return;
+        }
+        // The scope may be an ABBREVIATED namespace (`fmt` for `std::fmt`): the
+        // callee resolves via `resolve_module_qualified_function`'s module-suffix
+        // match, but the lookup above keyed only on the written form, so the
+        // overload (and thus its param types) was missed — which silently skipped
+        // the `![implicit]` arg conversions. `fmt::println("literal")` then passed
+        // the raw `string` where a `String` is expected (no `from_cstr`) and
+        // segfaulted. Recover the full `<ns>::<member>` overload by mirroring that
+        // suffix match (resolve_qualified maps only bare symbol leaves, not
+        // namespace segments) and apply CONVERSIONS ONLY: these calls were never
+        // arg-checked before, and the codebase relies on that leniency for
+        // same-width sign reinterprets like `intrinsics::panic(.., LINE)` (i32 ->
+        // u32). Enforcing the full narrowing/sign errors here is a separate change.
+        if (overloads.length == 0 && this.ctx.module_graph != null) {
+            const modules: &ModuleInfo[] = &this.ctx.module_graph.modules;
+            const scope_len: i64 = strlen(scope_str) as i64;
+            mut found_combined: SymbolStr = SymbolStr::empty();
+            mut match_count: i64 = 0;
+            for (mut i: i64 = 0; i < modules.length; i++) {
+                const ns_str: string = this.intern.resolve(modules[i].namespace_name);
+                const ns_len: i64 = strlen(ns_str) as i64;
+                mut is_match: boolean = false;
+                if (ns_len == scope_len) {
+                    is_match = ns_str.eq(scope_str);
+                } else if (ns_len > scope_len + 1) {
+                    const suffix_start: i64 = ns_len - scope_len;
+                    if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
+                        is_match = strcmp(ns_str + suffix_start, scope_str) == 0;
+                    }
+                }
+                if (!is_match) { continue; }
+                const cand: SymbolStr = this.intern.intern(format("%s::%s", ns_str, member_str));
+                if (this.ctx.decl_index.lookup_func_type_overloads(cand).length == 1) {
+                    found_combined = cand;
+                    match_count = match_count + 1;
+                }
+            }
+            if (match_count == 1 && found_combined.is_valid()) {
+                const exp: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(found_combined);
+                if (exp.length == 1) {
+                    const ot: Type* = this.arena.lookup(exp[0].id);
+                    if (ot != null && ot.kind == TypeKind::Function) {
+                        const ft: FunctionType* = ot as FunctionType*;
+                        if (!ft.is_variadic
+                                && ft.param_types.length == call.arguments.length) {
+                            this.apply_implicit_conversions_only(
+                                visitor, call, ft.param_types.as_slice());
+                        }
+                    }
+                    return;
+                }
+            }
         }
         this.check_static_scope_method_args(visitor, lookup_sym, scope, call);
     }
