@@ -1,0 +1,87 @@
+// Adapter-returning Iterator defaults (`take`/`filter`/`map`/`enumerate`, and
+// chains of them) resolve on a CONCRETE user-iterator struct receiver.
+//
+// These defaults return a wrapper iterator parameterized by `This`
+// (`take -> TakeIter<This>`, `map -> MapIter<This, B>`, ...), so they are
+// flagged `is_self_returning_default` and instantiated lazily at the call site
+// by the monomorphizer (`mono/call_specializer.cryo`). Previously, when the
+// receiver was a concrete user struct (not `Range` / an opaque iterator local),
+// sema pinned the unspecialized default into `call.resolved_method`; because
+// that default has 0 own generic params, mono's `specialize_method_call`
+// early-returned ("already concrete") before reaching
+// `try_instantiate_self_returning_default`, and codegen found no emitted method
+// (`E0636`). The early-return now makes an exception for self-returning /
+// lazy-self-growing defaults so they are instantiated.
+//
+// Terminal defaults (`fold`/`for_each`/`count`) already worked — they are not
+// self-returning, so they are materialized eagerly with the impl
+// (see `impl_trait_assoc_binding_spec.cryo`).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::IterAdaptersOnUserStruct;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::test::error;
+import std::test::assert;
+
+type struct Counter {
+    cur: i32;
+    end: i32;
+}
+
+implement trait Iterator<i32> for struct Counter {
+    next(mut &this) -> Option<i32> {
+        if (this.cur >= this.end) { return Option::None; }
+        const v: i32 = this.cur;
+        this.cur = this.cur + 1;
+        return Option::Some(v);
+    }
+}
+
+function dbl(x: i32) -> i32 { return x * 2; }
+function is_even(x: i32) -> boolean { return (x % 2) == 0; }
+
+// Generic terminal sink: drains any Iterator<i32> to its sum. Exercises the
+// adapter result types through a `where I: Iterator<i32>` bound.
+function drain<I>(mut it: I) -> i32 where I: Iterator<i32> {
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + v; }
+            Option::None => { break; }
+        }
+    }
+    return sum;
+}
+
+// `take` on a concrete user iterator: first 3 of 0.. = 0+1+2 = 3.
+![test]
+function take_on_user_struct() -> Result<(), TestError> {
+    mut it: Counter = Counter { cur: 0, end: 10 };
+    return expect_eq(drain(it.take(3)), 3);
+}
+
+// `filter` on a concrete user iterator: evens of 0..6 = 0+2+4 = 6.
+![test]
+function filter_on_user_struct() -> Result<(), TestError> {
+    mut it: Counter = Counter { cur: 0, end: 6 };
+    return expect_eq(drain(it.filter(is_even)), 6);
+}
+
+// `map` (own-generic adapter default) on a concrete user iterator:
+// double 0..4 = 0+2+4+6 = 12.
+![test]
+function map_on_user_struct() -> Result<(), TestError> {
+    mut it: Counter = Counter { cur: 0, end: 4 };
+    return expect_eq(drain(it.map(dbl)), 12);
+}
+
+// Chained adapters off a concrete user iterator: take 3 of 0.. -> 0,1,2 then
+// double -> 0,2,4 = 6.
+![test]
+function chained_adapters_on_user_struct() -> Result<(), TestError> {
+    mut it: Counter = Counter { cur: 0, end: 10 };
+    return expect_eq(drain(it.take(3).map(dbl)), 6);
+}
