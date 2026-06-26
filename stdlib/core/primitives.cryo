@@ -780,6 +780,68 @@ implement string {
         return this.length() == 0;
     }
 
+    // ---- C literal-token classifiers ----
+    //
+    // Classify the spelling of a single C literal token (as produced by a C
+    // lexer / libclang `clang_tokenize`).  Used by C-header binding generation
+    // to decide how an object-like `#define <literal>` lowers; kept here so the
+    // C-lexing rules live next to `char::is_c_ident_char`.
+
+    /// True when this token spelling is a C string or character literal
+    /// (`"..."`, `'c'`, or an encoding-prefixed form: `L"…"`, `u'…'`, `U"…"`,
+    /// `u8"…"`, `R"(…)"`).  Detected by the presence of a `"` or `'` quote: a
+    /// well-formed C numeric literal never contains one, so this correctly
+    /// accepts the prefixed forms too — a prefix-scan that bailed on the first
+    /// digit would misread the `8` in `u8"…"` as a numeric literal.
+    is_text_literal(&this) -> boolean {
+        const len: u64 = strlen(this);
+        for (mut i: u64 = 0; i < len; i++) {
+            const c: i8 = this[i];
+            if (c == '"' || c == '\'') { return true; }
+        }
+        return false;
+    }
+
+    /// True when this numeric-literal token spelling is a C floating-point
+    /// constant.  A decimal float carries a `.` or a decimal exponent (`e`/`E`);
+    /// a hexadecimal float (`0x…`) carries a `.` or a binary exponent (`p`/`P`).
+    /// The hex case is handled distinctly because in hex the letters `e`/`E` are
+    /// digits, not an exponent — and `p`/`P` is the *definitive* float marker, so
+    /// a dot-less hex float such as `0x1p4` is correctly recognized (a `.`/`e`
+    /// only scan would miss it and mis-bind it as an integer).
+    /// Assumes a numeric literal — rule out string/char literals with
+    /// `is_text_literal` first.
+    is_float_literal(&this) -> boolean {
+        const len: u64 = strlen(this);
+        if (len == 0) { return false; }
+        const is_hex: boolean = len >= 2u64 && this[0] == '0' && (this[1] == 'x' || this[1] == 'X');
+        for (mut i: u64 = 0; i < len; i++) {
+            const c: i8 = this[i];
+            if (c == '.') { return true; }
+            if (is_hex) {
+                if (c == 'p' || c == 'P') { return true; }
+            } else {
+                if (c == 'e' || c == 'E') { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// True when this integer-literal token spelling carries an unsigned type
+    /// suffix (`u`/`U`).  Only the trailing suffix run is inspected, stepping
+    /// over any `l`/`L` length suffix, so `5u`, `0xFFul`, `10LU`, and `7llu` all
+    /// report unsigned while `5`, `5l`, and `7ll` do not.
+    is_unsigned_literal(&this) -> boolean {
+        mut i: i64 = (strlen(this) as i64) - 1;
+        while (i >= 0) {
+            const c: i8 = this[i as u64];
+            if (c == 'u' || c == 'U') { return true; }
+            if (c == 'l' || c == 'L') { i -= 1; continue; }
+            break;
+        }
+        return false;
+    }
+
     /// `substring(start, len)`: extract `len` bytes starting at `start`,
     /// returning a freshly allocated NUL-terminated string.  Matches the
     /// legacy compiler's call convention (start, length), not (start, end).
