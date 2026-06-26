@@ -1,0 +1,55 @@
+///! std::test::fixture — `F::setup()` dispatched through a generic bound.
+///!
+///! Risk-register smoke test (TESTING-INFRA-DESIGN §8): a static trait method
+///! resolved through a generic bound `where F: Fixture` is a recently
+///! stabilized path. This pins it: a generic `acquire<F>()` that calls
+///! `F::setup()` must instantiate and run the concrete fixture's setup. If
+///! this regresses, the Fixture trait's forward-compatibility with a future
+///! `![test(fixture = T)]` directive breaks here first.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::TestFixtureStaticDispatch;
+
+import std::core::result;
+import std::core::drop;
+import std::core::cmp;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+import std::test::fixture;
+
+mut g_setup: i32 = 0;
+function reset() -> void { g_setup = 0; }
+
+type struct Probe { id: i32; }
+implement trait Fixture for struct Probe {
+    static setup() -> Result<Probe, TestError> {
+        g_setup = g_setup + 1;
+        return Result::Ok(Probe { id: 42 });
+    }
+}
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { }
+}
+// Eq so `Result<Probe, TestError>` instantiates cleanly.
+implement trait Eq for struct Probe {
+    equals(&this, other: &Probe) -> boolean { return this.id == other.id; }
+}
+
+// Generic acquisition through the Fixture bound (no closures involved).
+function acquire<F>() -> Result<F, TestError>
+where F: Fixture {
+    return F::setup();
+}
+
+![test]
+function static_setup_through_generic_bound() -> Result<(), TestError> {
+    reset();
+    mut p: Probe = match (acquire<Probe>()) {
+        Result::Ok(v)  => { v }
+        Result::Err(e) => { return Result::Err(e); }
+    };
+    expect_eq(p.id, 42)?;     // the concrete setup() actually ran
+    expect_eq(g_setup, 1)?;
+    return Result::Ok(());
+}

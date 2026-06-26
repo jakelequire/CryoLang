@@ -431,6 +431,19 @@ type struct LambdaSynth {
         return st.get_method(this.intern.intern("__call__")) != null;
     }
 
+    /// True if any of `call`'s arguments is a capturing closure (an anonymous
+    /// closure-struct value, i.e. has a `__call__` method). Non-capturing
+    /// lambdas lower to plain function pointers and are NOT closure structs.
+    call_has_closure_struct_arg(mut &this, call: CallExprNode*) -> boolean {
+        if (call == null) { return false; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            if (this.is_closure_struct_type(arg.resolved_type)) { return true; }
+        }
+        return false;
+    }
+
     /// If `call.callee` is a closure-struct local, rewrite `f(args)` to
     /// `f.__call__(args)` in place.
     maybe_rewrite_closure_call(mut &this, call: CallExprNode*) -> void {
@@ -452,6 +465,29 @@ type struct LambdaSynth {
     /// as the concrete closure-struct, inject it, and pin `call.resolved_callee`.
     try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
         if (call == null || ident == null) { return; }
+
+        // Guard: a capturing closure (closure-struct value) passed to a
+        // *generic* free function's fn-typed parameter is not yet supported.
+        // The closure-arg specialization below cannot compose with
+        // monomorphization of the generic receiver, and letting it fall
+        // through silently miscompiles — the generic body calls the parameter
+        // as a plain fn-pointer while the argument is a closure-struct value,
+        // which segfaults at the indirect call.  Reject cleanly here, BEFORE
+        // the `generic_args`/`resolved_callee` early returns below, so an
+        // explicit `f<T>(closure)` call is caught as well as an inferred one.
+        if (this.call_has_closure_struct_arg(call)) {
+            mut gen_fn: FunctionDeclNode* = this.find_top_level_function(ident.name);
+            if (gen_fn == null) {
+                const q: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+                if (!q.equals(ident.name)) { gen_fn = this.find_top_level_function(q); }
+            }
+            if (gen_fn != null && gen_fn.is_generic()) {
+                this.reject_closure_struct_args_in_non_free_call(
+                    call, "passing a capturing closure to a generic free function's parameter");
+                return;
+            }
+        }
+
         if (call.resolved_callee.is_valid()) { return; }
         if (call.generic_args.length > 0) { return; }
 
@@ -503,6 +539,8 @@ type struct LambdaSynth {
             }
         }
         if (orig_func == null) { return; }
+        // Generic receivers are handled by the capturing-closure guard at the
+        // top of this function (they are rejected before reaching here).
         if (orig_func.is_generic()) { return; }
         if (orig_func.body == null) { return; }
 
@@ -587,7 +625,7 @@ type struct LambdaSynth {
                 format("%s is not yet supported", context_msg));
             diag = diag.at_with_label(arg.span, "this is a capturing closure (anonymous struct value)");
             diag = diag.with_note(
-                "v1.0 routes capturing closures through free-function `(Args) -> Ret` parameters only; method-call and scope-resolution-call closure parameters are deferred");
+                "v1.0 routes capturing closures through NON-GENERIC free-function `(Args) -> Ret` parameters only; generic free-function, method-call, and scope-resolution-call closure parameters are deferred");
             diag = diag.with_note(
                 "workaround: pull the call out into a free function, or pre-extract the closure into a fn-pointer if the capture set is empty");
             this.ctx.emit_diagnostic(diag);

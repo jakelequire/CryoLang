@@ -1,0 +1,87 @@
+///! Parametrized (data-driven) tests: run one test body over a table of
+///! cases and identify which row failed.
+///!
+///! v1.0 uses the *inline-loop* pattern: the test owns a `while` loop over a
+///! const array of cases and calls the ordinary `expect_*` assertions on each
+///! row directly. The helpers here turn a per-row failure into a message that
+///! names the offending case, so a failure in row 7 reads `case [7]: ...`
+///! instead of an anonymous assertion failure.
+///!
+///! ```cryo
+///! type struct Case { input: i32; want: i32; }
+///!
+///! ![test]
+///! function doubling_table() -> Result<(), TestError> {
+///!     const cases: Case[] = [
+///!         Case { input: 1, want: 2 },
+///!         Case { input: 2, want: 4 },
+///!         Case { input: 3, want: 6 },
+///!     ];
+///!     mut i: i64 = 0;
+///!     while (i < cases.length) {
+///!         const c: &Case = &cases[i];
+///!         match (expect_eq(c.input * 2, c.want)) {
+///!             Result::Ok(_)  => { }
+///!             Result::Err(e) => { return Result::Err(prefix_case(i as u64, e)); }
+///!         }
+///!         i = i + 1;
+///!     }
+///!     return Result::Ok(());
+///! }
+///! ```
+///!
+///! All cases share one process and one pass/fail line: the index prefix
+///! recovers *which* row failed, but a row that aborts (panic) still takes
+///! the whole group down, and the group shares one timeout. That is the
+///! right trade for pure-value tables; cases that can crash independently
+///! want their own `![test]` functions (or, post-1.0, a `![test_each(DATA)]`
+///! directive that emits one descriptor per case).
+///!
+///! A directive-driven form is intentionally NOT in v1.0 — see
+///! `docs/TESTING-INFRA-DESIGN.md` (Tier 2) for the deferred design.
+
+namespace std::test::table;
+
+import core::result;
+import collections::str;
+import collections::string;
+import test::error;
+
+/// Wrap `e`'s message with a `case [<index>]: ` prefix, preserving the
+/// error's variant (`Failed` vs `Other`). Consumes `e` and returns the new
+/// error; call it on the failing-row path:
+/// `return Result::Err(prefix_case(i as u64, e));`
+function prefix_case(index: u64, e: TestError) -> TestError {
+    mut buf: String = String::new();
+    buf.push(Str::new("case ["));
+    const idx: string = format("%llu", index);
+    buf.push(Str::from_raw(idx, strlen(idx)));
+    buf.push(Str::new("]: "));
+    buf.push(e.message_str());
+    // Reconstruct with the same variant, then drop the consumed error. The
+    // variant probe borrows `e`; the `e.drop()` after the match moves it, so
+    // the borrow and the move never overlap.
+    mut out: TestError = match (&e) {
+        TestError::Failed(_) => { TestError::Failed(buf) }
+        TestError::Other(_)  => { TestError::Other(buf) }
+    };
+    e.drop();
+    return out;
+}
+
+/// Like `prefix_case` but uses a caller-supplied case label instead of a
+/// numeric index: `case [empty input]: ...`. Useful when the table rows
+/// carry their own names.
+function prefix_named_case(name: Str, e: TestError) -> TestError {
+    mut buf: String = String::new();
+    buf.push(Str::new("case ["));
+    buf.push(name);
+    buf.push(Str::new("]: "));
+    buf.push(e.message_str());
+    mut out: TestError = match (&e) {
+        TestError::Failed(_) => { TestError::Failed(buf) }
+        TestError::Other(_)  => { TestError::Other(buf) }
+    };
+    e.drop();
+    return out;
+}
