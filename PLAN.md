@@ -3,7 +3,7 @@
 ## Context
 
 Cryo today can interop with C two ways: hand-written `extern "C"` blocks, and an aliased
-`c := extern "C" { #include <stdio.h> }` import that shells out to `clang -E -P` and feeds the
+`extern module c := "C" { #include <stdio.h> }` import that shells out to `clang -E -P` and feeds the
 preprocessed text to a **hand-written function-prototype parser**. That parser only recognizes
 function signatures — it **silently skips every struct, union, enum, and typedef**
 (`c_header_import.cryo:334-339`). That is fatal for real libraries: raylib's API is built on
@@ -35,7 +35,7 @@ walker.
 All file paths are real and verified by five parallel investigations + one design probe.
 
 ### FFI & C-header path
-- **Aliased import end-to-end:** parser recognizes `name := extern` at
+- **Aliased import end-to-end:** parser recognizes `extern module name := "C"` at
   `parser.cryo:289-303`; `parse_extern_block_cimport` (`parser.cryo:2002-2077`) records
   `#include` paths into `ExternBlockNode` (`AST/declaration.cryo:964-1015`). The
   **`CHeaderImport` pass** (`passes/c_header_import.cryo`) runs after ASTValidation, before
@@ -118,7 +118,7 @@ extern "C" {
 }
 ```
 
-- **Why unaliased `extern "C"` (not `RayLib := extern`):** `parse_extern_block_cimport` only parses
+- **Why unaliased `extern "C"` (not `extern module RayLib := "C"`):** `parse_extern_block_cimport` only parses
   `#include` directives — it cannot accept hand-written signatures, and the alias creates a
   *separate* namespace from the module, so structs and functions would land in two namespaces. The
   **unaliased** path (`parser.cryo:1981-1992`) parses bodyless `function f(...) -> T;` lines AND
@@ -133,24 +133,32 @@ extern "C" {
 
 ### Registry record schema (global + project-local)
 A **global** registry plus **project-local pins** that win.
-- Global: `$CRYO_HOME/vendor/registry.toml` (fallback `~/.cache/cryo/vendor/registry.toml`, reusing
-  the `deps/cache.cryo` root chain). Project pin: a `[vendor]` section in `cryoconfig`.
+- Global: `$CRYO_HOME/vendor/registry.json` (fallback `~/.cache/cryo/vendor/registry.json`, reusing
+  the `deps/cache.cryo` root chain). The registry is **JSON** so it reuses the existing
+  `stdlib/json` parser + serializer (`stdlib/json/parser.cryo`, `stdlib/json/serializer.cryo`) —
+  no new TOML reader/writer is needed (see IMPROVEMENT.md §7). Project pin: a `[vendor]` section in
+  `cryoconfig` (the project config keeps its existing TOML-ish format, parsed by `project_config.cryo`).
 - Resolution order: **project pin → global → error.**
 - Record (designed so a future C++-shim `binding_source` slots in without a rewrite):
-  ```toml
-  [raylib]
-  name          = "RayLib"            # the import namespace
-  source_path   = "/abs/path/to/raylib"
-  binding_source = "headers"          # "headers" now; "cxx-shim" later (§5)
-  headers       = ["raylib.h"]        # entry headers to parse
-  include_dirs  = ["/abs/path/to/raylib/src"]
-  defines       = ["PLATFORM_DESKTOP"]
-  # link metadata -> threads into ProjectConfig link arrays
-  link.system   = ["raylib"]
-  link.search   = ["/abs/path/to/raylib/lib"]
-  link.windows.system = ["raylib", "opengl32", "gdi32", "winmm"]
-  # cache index: triple -> generated file + provenance key
-  cache.x86_64-linux-gnu = { file = "...", key = "<sha>" }
+  ```json
+  {
+    "raylib": {
+      "name": "RayLib",                       // the import namespace
+      "source_path": "/abs/path/to/raylib",
+      "binding_source": "headers",            // "headers" now; "cxx-shim" later (§5)
+      "headers": ["raylib.h"],                // entry headers to parse
+      "include_dirs": ["/abs/path/to/raylib/src"],
+      "defines": ["PLATFORM_DESKTOP"],
+      "link": {                               // link metadata -> ProjectConfig link arrays
+        "system": ["raylib"],
+        "search": ["/abs/path/to/raylib/lib"],
+        "windows": { "system": ["raylib", "opengl32", "gdi32", "winmm"] }
+      },
+      "cache": {                              // triple -> generated file + provenance key
+        "x86_64-linux-gnu": { "file": "...", "key": "<sha>" }
+      }
+    }
+  }
   ```
 
 ### Caching key (correctness-critical)
@@ -186,7 +194,7 @@ cryo vendor ./raylib
 [VendorGenerator]  --FFI-->  libclang  (parse TU, walk cursors)
    │   emits namespaced .cryo source
    ▼
-~/.cache/cryo/vendor/raylib/<triple>/RayLib.cryo   +   registry.toml entry (+ link meta)
+~/.cache/cryo/vendor/raylib/<triple>/RayLib.cryo   +   registry.json entry (+ link meta)
                                    ▲
 import vendor::RayLib              │ resolve_import_path() vendor:: rule
    │                               │
@@ -209,7 +217,7 @@ Drive every primitive off libclang's **canonical type + size queries**, never th
 | `_Bool` | `boolean` | |
 | `T*` | `T*` (Cryo pointer) | |
 | `const T*` | `T*` | const dropped (Cryo has no FFI const); document. See IMPROVEMENT.md |
-| `char*` / `const char*` | `u8*` | **string-literal→`u8*` coercion is an open item (§5)** |
+| `char*` / `const char*` | `u8*` | string literals already pass as `u8*` (Cryo `string` lowers to `i8*`, not a fat pointer — verified); see §5 |
 | `T[N]` in struct | fixed-size field / `T*` in params | params decay to pointer; struct arrays need layout-faithful field |
 | `struct`/`union` (definition) | `type struct` with layout-faithful fields | verify each field offset via `clang_Type_getOffsetOf`; emit explicit padding if mismatch |
 | opaque / forward-declared struct | `type struct Foo {}` opaque handle, used as `Foo*` | raylib uses some |
@@ -232,8 +240,8 @@ reported (count + names) at `cryo vendor` time, never dropped silently.
 
 **Stage 1 — Registry + resolver + link, NO generation (de-risk plumbing).**
 - Add `cryo vendor <path>` (+ `list`/`remove`/`rebuild`) to `CLI/commands.cryo` (6-step recipe).
-- Implement the global `registry.toml` reader/writer + `cryoconfig [vendor]` project pin
-  (project→global order).
+- Implement the global `registry.json` reader/writer (reuse `stdlib/json`) + `cryoconfig [vendor]`
+  project pin (project→global order).
 - Add the `vendor::` branch in `resolve_import_path` (`module_loader.cryo:281-321`).
 - Merge vendor `link.*` into `ProjectConfig.link_*`.
 - **Acceptance:** hand-place a stub `RayLib.cryo` (a few `type struct`s + an `extern "C"` block) and
@@ -273,11 +281,15 @@ reported (count + names) at `cryo vendor` time, never dropped silently.
   strings all supported today (§1). No compiler prerequisite. *Lowest-risk path:* validate end-to-end
   with one by-value-struct-returning call (e.g. `clang_getCursorSpelling` → `CXString`) very early in
   Stage 2 to confirm the ABI on the real toolchain before building the full walker.
-- **C-string ergonomics (OPEN):** the demo writes `RayLib::InitWindow(800, 450, "Cryo")`, but a Cryo
-  string literal is a fat pointer, not `u8*`. Decide between (a) implicit string-literal→`u8*`
-  coercion at extern-C call boundaries, or (b) requiring `"Cryo".as_cstr()`/`c"Cryo"`. This affects
-  whether the headline demo works verbatim. **Recommend deciding before Stage 2 acceptance.** See
-  IMPROVEMENT.md.
+- **C-string ergonomics (MOSTLY RESOLVED):** the demo writes `RayLib::InitWindow(800, 450, "Cryo")`.
+  A Cryo `string` is **not** a fat pointer — it lowers to a null-terminated `i8*`
+  (`codegen/type_map.cryo:224`), so a string *literal* already passes directly to a C `u8*` parameter
+  and runs (verified end-to-end against `extern "C"` `strlen`/`puts`). The headline demo's string
+  argument works verbatim today. Two residuals remain: (a) `const char*` params — once the FFI
+  `const` qualifier lands (IMPROVEMENT.md §1) the literal must still coerce to `const u8*`; and
+  (b) **non-literal** runtime values — a heap `String` is a struct, not an `i8*`, so passing one to a
+  C API needs a `.as_cstr()` accessor (the `c"..."` literal is then optional sugar, not a blocker).
+  See IMPROVEMENT.md §2.
 - **libclang discovery/version:** locate via `$CRYO_LIBCLANG`, then `llvm-config --libdir`, then OS
   defaults; record the libclang version in the cache key; define a supported version window. The
   Clang dependency itself is already accepted (the `#include` path shells out to clang).
