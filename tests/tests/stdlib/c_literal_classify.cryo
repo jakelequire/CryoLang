@@ -1,0 +1,72 @@
+///! C literal-token classifiers on `string`: is_text_literal / is_float_literal
+///! / is_unsigned_literal.  These back C-header binding generation's decision on
+///! how an object-like `#define <literal>` lowers, so the edge cases that a
+///! naive scan trips on (the `8` in a `u8"…"` prefix, a dot-less hex float like
+///! `0x1p4`, an `e` that is a hex *digit* not an exponent) are pinned here.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::CLiteralClassify;
+
+import std::core::result;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// `is_text_literal` keys off the presence of a quote, so encoding prefixes
+// (`L`, `u`, `U`, `u8`) never fool it — in particular the `8` in `u8"…"` must
+// not be read as the start of a numeric literal.
+![test]
+function text_literal_detection() -> Result<(), TestError> {
+    expect_true("\"cryo\"".is_text_literal(), Str::new("plain string literal"))?;
+    expect_true("'c'".is_text_literal(), Str::new("char literal"))?;
+    expect_true("L\"wide\"".is_text_literal(), Str::new("L-prefixed wide string"))?;
+    expect_true("u8\"utf8\"".is_text_literal(), Str::new("u8-prefixed string: the 8 must not fool it"))?;
+    expect_true("U'x'".is_text_literal(), Str::new("U-prefixed char"))?;
+    expect_true("'\\''".is_text_literal(), Str::new("escaped-quote char literal"))?;
+
+    expect_true(!"256".is_text_literal(), Str::new("decimal int is not text"))?;
+    expect_true(!"0xFF".is_text_literal(), Str::new("hex int is not text"))?;
+    expect_true(!"3.5".is_text_literal(), Str::new("float is not text"))?;
+    expect_true(!"".is_text_literal(), Str::new("empty is not text"))?;
+    return Result::Ok(());
+}
+
+// `is_float_literal` distinguishes the hex case: in hex `e`/`E` are digits (not
+// an exponent) and `p`/`P` is the float marker — so `0x1p4` is a float while
+// `0xFF` and `0xe` are integers.
+![test]
+function float_literal_detection() -> Result<(), TestError> {
+    expect_true("3.5".is_float_literal(), Str::new("decimal with point"))?;
+    expect_true(".5".is_float_literal(), Str::new("leading-point float"))?;
+    expect_true("5.".is_float_literal(), Str::new("trailing-point float"))?;
+    expect_true("1e5".is_float_literal(), Str::new("decimal exponent"))?;
+    expect_true("1E-5".is_float_literal(), Str::new("signed decimal exponent"))?;
+    expect_true("0x1.8p3".is_float_literal(), Str::new("hex float with point and binary exponent"))?;
+    expect_true("0x1p4".is_float_literal(), Str::new("dot-less hex float: p is the marker"))?;
+    expect_true("0X1P4".is_float_literal(), Str::new("uppercase hex float"))?;
+
+    expect_true(!"256".is_float_literal(), Str::new("decimal int is not float"))?;
+    expect_true(!"0xFF".is_float_literal(), Str::new("hex int is not float"))?;
+    expect_true(!"0xe".is_float_literal(), Str::new("hex int: e is a digit, not an exponent"))?;
+    expect_true(!"0".is_float_literal(), Str::new("zero is not float"))?;
+    expect_true(!"".is_float_literal(), Str::new("empty is not float"))?;
+    return Result::Ok(());
+}
+
+// `is_unsigned_literal` inspects only the trailing suffix run, stepping over an
+// `l`/`L` length suffix to find a `u`/`U`.
+![test]
+function unsigned_suffix_detection() -> Result<(), TestError> {
+    expect_true("5u".is_unsigned_literal(), Str::new("lowercase u suffix"))?;
+    expect_true("5U".is_unsigned_literal(), Str::new("uppercase U suffix"))?;
+    expect_true("0xFFul".is_unsigned_literal(), Str::new("u before l"))?;
+    expect_true("10LU".is_unsigned_literal(), Str::new("U after L"))?;
+    expect_true("7llu".is_unsigned_literal(), Str::new("u after ll"))?;
+
+    expect_true(!"5".is_unsigned_literal(), Str::new("bare decimal is signed"))?;
+    expect_true(!"5l".is_unsigned_literal(), Str::new("l suffix alone is signed"))?;
+    expect_true(!"7ll".is_unsigned_literal(), Str::new("ll suffix alone is signed"))?;
+    expect_true(!"0xFF".is_unsigned_literal(), Str::new("hex without u suffix is signed"))?;
+    expect_true(!"".is_unsigned_literal(), Str::new("empty is signed"))?;
+    return Result::Ok(());
+}
