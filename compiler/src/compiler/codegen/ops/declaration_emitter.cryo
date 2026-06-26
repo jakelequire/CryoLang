@@ -1354,8 +1354,16 @@ type struct DeclarationEmitter {
         // (`C$<namespace>.<name>`) so two modules with the same private
         // `const NAME = ...` don't collide at link time.  Cross-module readers
         // pull the same namespace out of `DeclarationIndex::get_global_namespace`.
+        // A C-imported global const mangles under its alias namespace instead,
+        // so two extern-module imports in one file each defining the same const
+        // name (e.g. `a::FOO` and `b::FOO`) emit distinct symbols.
+        const def_ns: SymbolStr = if (!node.binding_namespace.is_empty()) {
+            node.binding_namespace
+        } else {
+            this.ctx.namespace_str
+        };
         const mangled: string = MangledName::for_global(
-            this.get_intern(), this.ctx.namespace_str, node.name).resolve(this.get_intern());
+            this.get_intern(), def_ns, node.name).resolve(this.get_intern());
 
         const ty: LType = this.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
@@ -1459,7 +1467,18 @@ type struct DeclarationEmitter {
             global.set_global_constant(true);
         }
 
-        this.globals.register(node.name, global);
+        // A C-imported const is referenced only as `cit::NAME` (a
+        // ScopeResolution), which `resolve_global` probes under the qualified
+        // key.  `resolve_global` checks this cache before its cross-module
+        // (owned-by-current-module) short-circuit, so register under the
+        // qualified key — the bare key would never be hit and would risk a
+        // last-write-wins collision between two imports' same-named consts.
+        const cache_key: SymbolStr = if (!node.binding_namespace.is_empty()) {
+            this.ctx.qualify_binding_sym(node.name, node.binding_namespace)
+        } else {
+            node.name
+        };
+        this.globals.register(cache_key, global);
     }
 
     /// Generate the body of a function.  Called from the IRGeneratorVisitor.

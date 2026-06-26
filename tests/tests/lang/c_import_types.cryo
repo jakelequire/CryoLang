@@ -1,0 +1,53 @@
+///! Regression test for Phase-2 of the libclang C-import engine
+///! (Compiler::Bindgen): emitting struct / enum / typedef declarations from an
+///! `extern module x := "C" { #include ... }` block as real Cryo types, reached
+///! through the import's alias namespace (`cit::Vec2`).  Phase 1 imported only
+///! function prototypes and dropped every type; this proves the types now
+///! round-trip through name/type resolution and codegen and are usable.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::CImportTypes;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+extern module cit := "C" {
+    #include "../../helpers/bindgen_types.h"
+}
+
+// `struct Vec2 { int x; int y; }` -> a Cryo `type struct cit::Vec2` with i32
+// fields, constructible and field-addressable.
+![test]
+function c_import_struct_construct_and_read() -> Result<(), TestError> {
+    const v: cit::Vec2 = cit::Vec2 { x: 3 as i32, y: 4 as i32 };
+    return expect_eq(v.x + v.y, 7 as i32);
+}
+
+// `typedef int Celsius;` -> a Cryo type alias usable in type position.
+![test]
+function c_import_typedef_alias() -> Result<(), TestError> {
+    const c: cit::Celsius = 21 as i32;
+    return expect_eq(c, 21 as i32);
+}
+
+// `enum Mode { MODE_OFF = 0, MODE_ON = 7 }` -> a Cryo enum whose explicit
+// discriminant values round-trip.
+![test]
+function c_import_enum_value() -> Result<(), TestError> {
+    return expect_eq(cit::Mode::MODE_ON as i32, 7 as i32);
+}
+
+// `enum { FLAG_A = 1, FLAG_B = 2, ... }` (anonymous) -> one alias-namespaced
+// global `const` per constant, reachable only as `cit::FLAG_A` (never bare).
+![test]
+function c_import_anon_enum_const() -> Result<(), TestError> {
+    return expect_eq((cit::FLAG_A + cit::FLAG_B) as i32, 3 as i32);
+}
+
+// A negative anonymous-enum constant round-trips: emitted as its u64
+// two's-complement bit pattern, truncated to the const's `int` width.
+![test]
+function c_import_anon_enum_negative() -> Result<(), TestError> {
+    return expect_eq(cit::FLAG_NEG as i32, -3 as i32);
+}

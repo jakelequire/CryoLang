@@ -24,6 +24,7 @@ import Compiler::Artifacts;
 import Compiler::CompilationContext;
 import Compiler::AST;
 import Compiler::AST::{ Node, Declaration };
+import Compiler::AST::Expression;
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Utils;
 import Utils::Logger;
@@ -112,6 +113,48 @@ function visit_enum_const(cursor: CXCursor, parent: CXCursor, client: void*) -> 
     return Clang::VISIT_CONTINUE;
 }
 
+/// Client data for the constant walk of an ANONYMOUS enum cursor, whose
+/// constants are plain integer constants (not enum variants) and so become
+/// global `const`s qualified under the alias namespace.
+type struct AnonEnumState {
+    st:       ImportState*;
+    /// The anonymous enum's underlying integer type; each constant's global
+    /// is typed against it.
+    int_type: CXType;
+}
+
+/// Nested visitor: emit one alias-namespaced global `const NAME = value` per
+/// EnumConstantDecl child of an anonymous enum cursor.
+function visit_anon_enum_const(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+    if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_ENUM_CONSTANT_DECL) {
+        return Clang::VISIT_CONTINUE;
+    }
+    const s: AnonEnumState* = client as AnonEnumState*;
+    const st: ImportState* = s.st;
+    const cname: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    if (st.ctx.intern_table.resolve(cname).eq("")) { return Clang::VISIT_CONTINUE; }
+    if (name_seen(st, cname)) { return Clang::VISIT_CONTINUE; }
+
+    // Reinterpret the signed discriminant as its u64 bit pattern: a negative
+    // value (e.g. -1) emits as the unsigned two's-complement decimal, and
+    // LLVMConstInt truncates it to the const's declared width at codegen,
+    // reproducing C's value exactly (-1 in an `int` enum -> 0xFFFFFFFF).
+    const v: i64 = Clang::clang_getEnumConstantDeclValue(cursor);
+    const v_str: string = format("%llu", v as u64);
+    mut lit: LiteralNode* = new LiteralNode(v_str, LiteralKind::Integer, SourceSpan::none());
+
+    mut vnode: VarDeclNode* = new VarDeclNode(cname, SourceSpan::none());
+    vnode.is_global = true;
+    vnode.is_mutable = false;
+    vnode.binding_namespace = st.alias;
+    vnode.type_annotation = TypeMap::map_type_aliased(s.int_type, st.alias, st.ctx);
+    vnode.set_initializer(lit as ExpressionNode*);
+
+    st.seen_names.push(cname);
+    emit_top_level(st, vnode as ASTNode*);
+    return Clang::VISIT_CONTINUE;
+}
+
 /// Emit one FunctionDeclNode for a C function prototype (Phase-1 behavior).
 function emit_function(cursor: CXCursor, st: ImportState*) -> void {
     const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
@@ -143,8 +186,10 @@ function emit_function(cursor: CXCursor, st: ImportState*) -> void {
 /// forward-decl-then-definition double visit and truly-opaque records.
 function emit_record(cursor: CXCursor, st: ImportState*, is_union: boolean) -> void {
     const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
-    if (st.ctx.intern_table.resolve(name_sym).eq("")) {
-        // Anonymous record: not nameable as a top-level type. Reported, not
+    if (Clang::is_anonymous(cursor)) {
+        // Anonymous record: not nameable as a top-level type (libclang gives it
+        // a synthetic `struct (unnamed at …)` spelling, so test anonymity via
+        // clang_Cursor_isAnonymous, NOT an empty-spelling check). Reported, not
         // silently relied upon — references fall back to void* in TypeMap.
         cdebug("[Bindgen] skipped anonymous record (use a typedef to name it)\n");
         return;
@@ -192,13 +237,17 @@ function emit_record(cursor: CXCursor, st: ImportState*, is_union: boolean) -> v
 }
 
 /// Emit a `type enum E : <int> { NAME = value; ... }` for a NAMED C enum.
-/// Anonymous enums (whose constants are plain global ints, e.g. the
-/// `LLVMIntEQ` blocks) are reported and skipped — emitting their constants as
-/// free `const`s is a deliberate follow-up.
+/// An ANONYMOUS enum has no nameable type; its constants are plain integer
+/// constants in the enclosing scope (e.g. the `LLVMIntEQ = 32` blocks), so
+/// each becomes a global `const NAME = value` qualified under the alias.
 function emit_enum(cursor: CXCursor, st: ImportState*) -> void {
     const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
-    if (st.ctx.intern_table.resolve(name_sym).eq("")) {
-        cdebug("[Bindgen] skipped anonymous enum (constants not yet imported)\n");
+    if (Clang::is_anonymous(cursor)) {
+        mut aes: AnonEnumState = AnonEnumState {
+            st:       st,
+            int_type: Clang::clang_getEnumDeclIntegerType(cursor),
+        };
+        Clang::clang_visitChildren(cursor, visit_anon_enum_const, (&aes) as void*);
         return;
     }
     if (name_seen(st, name_sym)) { return; }

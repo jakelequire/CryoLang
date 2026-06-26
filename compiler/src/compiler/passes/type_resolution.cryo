@@ -2744,15 +2744,29 @@ type struct TypeResolutionPasses {
                     }
                     if (var_node.resolved_type.is_valid()) {
                         const gmod_sym: SymbolStr = ctx.intern(ctx.source_file);
-                        ctx.decl_index.register_global_with_module(
-                            var_node.name, var_node.resolved_type, gmod_sym, ctx.namespace_str);
-                        // Also register under the module-qualified name so a
-                        // same-bare-name global in another module can't shadow
-                        // this one in the (bare-keyed, last-write-wins) type
-                        // registry. See sema::TypeUtils::lookup_global_var.
-                        const gq_sym: SymbolStr = ctx.qualify_symbol_sym(var_node.name);
-                        if (!gq_sym.equals(var_node.name)) {
-                            ctx.decl_index.register_global(gq_sym, var_node.resolved_type);
+                        if (!var_node.binding_namespace.is_empty()) {
+                            // C-imported global const (e.g. an anonymous-enum
+                            // constant): reachable ONLY as `cit::NAME`, qualified
+                            // under the alias namespace, never bare (a bare key
+                            // would pollute/shadow same-leaf globals in other
+                            // modules — same rule as the struct/enum decls).
+                            // sema::resolve_scope_resolution probes this qualified
+                            // key; codegen mangles the symbol under the alias too.
+                            const bq_sym: SymbolStr =
+                                ctx.qualify_binding_sym(var_node.name, var_node.binding_namespace);
+                            ctx.decl_index.register_global_with_module(
+                                bq_sym, var_node.resolved_type, gmod_sym, var_node.binding_namespace);
+                        } else {
+                            ctx.decl_index.register_global_with_module(
+                                var_node.name, var_node.resolved_type, gmod_sym, ctx.namespace_str);
+                            // Also register under the module-qualified name so a
+                            // same-bare-name global in another module can't shadow
+                            // this one in the (bare-keyed, last-write-wins) type
+                            // registry. See sema::TypeUtils::lookup_global_var.
+                            const gq_sym: SymbolStr = ctx.qualify_symbol_sym(var_node.name);
+                            if (!gq_sym.equals(var_node.name)) {
+                                ctx.decl_index.register_global(gq_sym, var_node.resolved_type);
+                            }
                         }
                     }
                 }
