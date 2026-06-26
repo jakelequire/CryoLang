@@ -1,0 +1,74 @@
+///! std::test::table — inline-loop parametrized (data-driven) tests.
+///!
+///! The recommended v1.0 form: the test owns a `while` loop over a const
+///! array of cases, calls the ordinary `expect_*` assertions on each row, and
+///! wraps a per-row failure with `prefix_case(index, e)` so the message names
+///! the offending case. These tests confirm (a) an all-passing table returns
+///! Ok, and (b) a failing row produces a `case [<index>]: ...` message that
+///! names the right row.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::TestParametrized;
+
+import std::core::result;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+import std::test::table;
+
+type struct Case { input: i32; want: i32; }
+function double(n: i32) -> i32 { return n * 2; }
+
+// Run the table; `bad_row` (or -1 for none) selects which row to corrupt.
+function run_table(bad_row: i64) -> Result<(), TestError> {
+    const cases: Case[] = [
+        Case { input: 1, want: 2 },
+        Case { input: 2, want: 4 },
+        Case { input: 3, want: 6 },
+    ];
+    mut i: i64 = 0;
+    while (i < cases.length) {
+        const c: &Case = &cases[i];
+        mut want: i32 = c.want;
+        if (i == bad_row) { want = want + 1; }   // corrupt the expected value
+        match (expect_eq(double(c.input), want)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(prefix_case(i as u64, e)); }
+        }
+        i = i + 1;
+    }
+    return Result::Ok(());
+}
+
+// An all-passing table returns Ok.
+![test]
+function all_cases_pass() -> Result<(), TestError> {
+    return run_table(-1);
+}
+
+// A failing row's message is prefixed with the correct case index.
+![test]
+function failing_case_names_its_index() -> Result<(), TestError> {
+    match (run_table(2)) {
+        Result::Ok(_) => { return bail(Str::new("row 2 should have failed")); }
+        Result::Err(mut e) => {
+            const m: Str = e.message_str();
+            const prefix: Str = Str::new("case [2]:");
+            const ok: boolean = m.starts_with(&prefix);
+            e.drop();
+            return expect_true(ok, Str::new("failure message should start with `case [2]:`"));
+        }
+    }
+}
+
+// prefix_named_case uses a textual label instead of an index.
+![test]
+function named_case_prefix() -> Result<(), TestError> {
+    const inner: TestError = TestError::failed(Str::new("boom"));
+    mut wrapped: TestError = prefix_named_case(Str::new("empty input"), inner);
+    const m: Str = wrapped.message_str();
+    const prefix: Str = Str::new("case [empty input]:");
+    const ok: boolean = m.starts_with(&prefix);
+    wrapped.drop();
+    return expect_true(ok, Str::new("message should start with `case [empty input]:`"));
+}

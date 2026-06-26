@@ -1,0 +1,81 @@
+///! Fixture: a per-test resource with deterministic setup and teardown.
+///!
+///! A *fixture* is a value a test needs to set up before it runs and tear
+///! down afterwards — a temp directory, a seeded RNG, a probe allocator, a
+///! socket. The `Fixture` trait standardizes the *setup* half:
+///!
+///! ```cryo
+///! type trait Fixture {
+///!     static setup() -> Result<This, TestError>;
+///! }
+///! ```
+///!
+///! The *teardown* half is the value's own `Drop` impl. Because Cryo runs
+///! drop glue on every scope exit — including the early-return paths that
+///! `?` and `return Err(...)` take — a fixture bound as a local in a test
+///! function is torn down on success AND on assertion failure, with no
+///! per-test cleanup code. (The one path Drop cannot cover is a hard
+///! process abort, e.g. a panic; there the OS reclaims everything.)
+///!
+///! Recommended pattern (plain RAII — no closures, full `expect_*` support):
+///!
+///! ```cryo
+///! type struct TmpDir { path: String; }
+///! // Define `setup()` ONCE, in the Fixture impl. (A second inherent
+///! // `setup()` that called `TmpDir::setup()` would recurse into itself.)
+///! implement trait Fixture for struct TmpDir {
+///!     static setup() -> Result<TmpDir, TestError> {
+///!         // mkdtemp etc.; bail_other(...) on failure
+///!         return Result::Ok(TmpDir { path: make_temp_dir() });
+///!     }
+///! }
+///! implement trait Drop for struct TmpDir {
+///!     drop(mut &this) -> void {
+///!         remove_dir_all(this.path.as_str());
+///!         this.path.drop();
+///!     }
+///! }
+///!
+///! ![test]
+///! function writes_then_reads() -> Result<(), TestError> {
+///!     mut dir: TmpDir = match (TmpDir::setup()) {
+///!         Result::Ok(v)  => { v }
+///!         Result::Err(e) => { return Result::Err(e); }
+///!     };
+///!     // `dir` is torn down on EVERY path below, including the failing one.
+///!     match (write_file(dir.path.as_str(), Str::new("hi"))) {
+///!         Result::Ok(_)  => { }
+///!         Result::Err(_) => { return bail_other(Str::new("write failed")); }
+///!     }
+///!     return expect_eq(read_file(dir.path.as_str()), Str::new("hi"));
+///! }
+///! ```
+///!
+///! Why a trait at all, if the pattern is plain RAII? Two reasons:
+///!   * It names the convention — every fixture exposes `setup()`, so a
+///!     reader knows where construction lives and that teardown is the
+///!     `Drop` impl.
+///!   * It is the dispatch point a future `![test(fixture = T)]` directive
+///!     would call (`T::setup()`), so code written against it today stays
+///!     forward-compatible.
+///!
+///! Closure-combinator forms (`with_fixture(|f| ...)`) are intentionally NOT
+///! provided in v1.0: a closure body passed to a generic helper cannot yet
+///! call the generic `expect_*` assertions (the monomorphizer does not
+///! discover generic calls nested inside such a body), which would make the
+///! combinator unusable for real assertions. Plain RAII has none of that
+///! limitation and gives the identical teardown guarantee.
+
+namespace std::test::fixture;
+
+import core::result;
+import test::error;
+
+/// A per-test resource. `setup()` builds it; the value's `Drop` impl is the
+/// teardown. Bind the result as a local in the test function and let scope
+/// exit run the teardown on every path.
+type trait Fixture {
+    /// Construct the fixture, or return a `TestError` (use `bail_other` for
+    /// environment/setup failures) if the resource could not be acquired.
+    static setup() -> Result<This, TestError>;
+}

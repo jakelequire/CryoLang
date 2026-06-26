@@ -1,0 +1,79 @@
+///! std::test::fixture — Fixture trait + plain-RAII teardown.
+///!
+///! A fixture bound as a local in a function is torn down by its `Drop` impl
+///! on EVERY exit path: the success path and the early-return failure path
+///! alike. These tests observe setup/teardown via module-global counters
+///! (each `![test]` runs in its own forked process, so the counters start at
+///! zero per test; `reset()` is belt-and-suspenders).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::TestFixture;
+
+import std::core::result;
+import std::core::drop;
+import std::core::cmp;
+import std::collections::str;
+import std::collections::string;
+import std::test::error;
+import std::test::assert;
+import std::test::fixture;
+
+mut g_setup: i32 = 0;
+mut g_drop:  i32 = 0;
+function reset() -> void { g_setup = 0; g_drop = 0; }
+
+type struct TmpThing { id: i32; }
+// setup() defined once, via the Fixture trait impl.
+implement trait Fixture for struct TmpThing {
+    static setup() -> Result<TmpThing, TestError> {
+        g_setup = g_setup + 1;
+        return Result::Ok(TmpThing { id: 7 });
+    }
+}
+implement trait Drop for struct TmpThing {
+    drop(mut &this) -> void { g_drop = g_drop + 1; }
+}
+// Eq so `Result<TmpThing, TestError>` instantiates cleanly.
+implement trait Eq for struct TmpThing {
+    equals(&this, other: &TmpThing) -> boolean { return this.id == other.id; }
+}
+
+// Acquire the fixture, then either succeed or fail in the "body". The fixture
+// must be torn down on BOTH paths.
+function use_fixture(fail: boolean) -> Result<(), TestError> {
+    mut t: TmpThing = match (TmpThing::setup()) {
+        Result::Ok(v)  => { v }
+        Result::Err(e) => { return Result::Err(e); }
+    };
+    if (fail) {
+        return bail(Str::new("deliberate failure"));   // `t` drops here
+    }
+    expect_eq(t.id, 7)?;                                // body saw the fixture
+    return Result::Ok(());                              // `t` drops here
+}
+
+// Setup runs and teardown runs on the success path.
+![test]
+function fixture_setup_and_teardown_on_success() -> Result<(), TestError> {
+    reset();
+    match (use_fixture(false)) {
+        Result::Ok(_)      => { }
+        Result::Err(mut e) => { e.drop(); return bail(Str::new("body should have succeeded")); }
+    }
+    expect_eq(g_setup, 1)?;   // setup() ran exactly once
+    expect_eq(g_drop, 1)?;    // teardown ran on the Ok path
+    return Result::Ok(());
+}
+
+// Teardown still runs when the body returns Err before the normal end.
+![test]
+function fixture_teardown_on_failure() -> Result<(), TestError> {
+    reset();
+    match (use_fixture(true)) {
+        Result::Ok(_)      => { return bail(Str::new("body should have failed")); }
+        Result::Err(mut e) => { e.drop(); }
+    }
+    expect_eq(g_setup, 1)?;
+    expect_eq(g_drop, 1)?;    // teardown ran on the early-return Err path
+    return Result::Ok(());
+}

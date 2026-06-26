@@ -8,8 +8,11 @@ import Compiler::Resolver::Demangler;
 import Utils;
 import Utils::Logger;
 import std::collections::string;
+import std::collections::str;
 import std::fs::file;
 import std::fs::path;
+import std::json::parser;
+import std::json::value;
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
 // unit runner's framing in stdlib/test/runner.cryo so the two suites read
@@ -29,6 +32,26 @@ const NEG_ANSI_RESET: string = "\x1B[0m";
 type struct NegSuiteResult {
     ran:      i32;
     failures: i32;
+}
+
+/// Parsed `test.json` for a multi-module test project (see
+/// `run_projects_suite`). `outcome`: 0 = collect (run the project's own
+/// `![test]`s, expect exit 0), 1 = compile_fail (build must fail with
+/// `diagnostic`), 2 = run (build+run, exit must equal `exit_code` and, if
+/// non-empty, stdout must contain `stdout_sub`).
+type struct ProjSpec {
+    outcome:    i32;
+    ignore:     boolean;
+    exit_code:  i64;
+    diagnostic: string;
+    stdout_sub: string;
+}
+
+/// Result of dispatching one project: did it meet its declared outcome, and
+/// a human-readable reason when it didn't.
+type struct ProjOutcome {
+    passed: boolean;
+    detail: string;
 }
 
 // Host-shell-aware binary launch
@@ -1200,17 +1223,33 @@ type struct Executor {
         // Skipped under --list (which only enumerates the runtime tests).
         mut neg_ran: i32 = 0;
         mut neg_failures: i32 = 0;
+        mut proj_ran: i32 = 0;
+        mut proj_failures: i32 = 0;
         if (!args.has_flag("list")) {
             const proj_root: string = Executor::dir_of(config_path);
-            const neg_dir: string = format("%s/tests/negative", proj_root);
             mut pattern: string = "";
             if (args.positional_count() > 0) { pattern = args.input_file(); }
+            const neg_dir: string = format("%s/tests/negative", proj_root);
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir,
                                              pattern, fmt_choice, col_choice);
             neg_ran      = neg_res.ran;
             neg_failures = neg_res.failures;
             if (neg_failures > 0 && exit_code == 0) {
+                exit_code = 1;
+            }
+
+            // Multi-module test projects: each is a real Cryo package under
+            // tests/projects/ carrying a test.json. Driven via this compiler
+            // as a subprocess (collect / compile_fail / run). Absent dir is a
+            // clean no-op.
+            const proj_dir: string = format("%s/tests/projects", proj_root);
+            const proj_res: NegSuiteResult =
+                Executor::run_projects_suite(self_exe, stdlib_abs, proj_dir,
+                                             pattern, fmt_choice, col_choice);
+            proj_ran      = proj_res.ran;
+            proj_failures = proj_res.failures;
+            if (proj_failures > 0 && exit_code == 0) {
                 exit_code = 1;
             }
         }
@@ -1220,7 +1259,8 @@ type struct Executor {
         // unit runner and `run_negative_suite` already printed. Skipped
         // under --list (no real run happened).
         if (!args.has_flag("list")) {
-            const overall_pass: boolean = unit_ok && (neg_failures == 0);
+            const overall_pass: boolean =
+                unit_ok && (neg_failures == 0) && (proj_failures == 0);
             const overall_active: boolean = Executor::neg_color_active(col_choice);
             fmt::printf("\n%s\n", TEST_RULE_HEAVY);
             if (overall_active && overall_pass) {
@@ -1231,16 +1271,16 @@ type struct Executor {
                 fmt::printf("  OVERALL  %s", if (overall_pass) { "PASS" } else { "FAIL" });
             }
             const unit_label: string = if (unit_ok) { "ok" } else { "failed" };
+            fmt::printf("  (unit: %s", unit_label);
             if (neg_ran > 0) {
-                fmt::printf("  (unit: %s; compile-fail: %d passed",
-                    unit_label, neg_ran - neg_failures);
-                if (neg_failures > 0) {
-                    fmt::printf(", %d failed", neg_failures);
-                }
-                fmt::printf(")\n");
-            } else {
-                fmt::printf("  (unit: %s)\n", unit_label);
+                fmt::printf("; compile-fail: %d passed", neg_ran - neg_failures);
+                if (neg_failures > 0) { fmt::printf(", %d failed", neg_failures); }
             }
+            if (proj_ran > 0) {
+                fmt::printf("; projects: %d passed", proj_ran - proj_failures);
+                if (proj_failures > 0) { fmt::printf(", %d failed", proj_failures); }
+            }
+            fmt::printf(")\n");
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
         return exit_code;
@@ -1516,6 +1556,309 @@ type struct Executor {
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
         return NegSuiteResult { ran: ran, failures: failures };
+    }
+
+    /// Copy a borrowed `Str` into an owned NUL-terminated C string. The copy
+    /// outlives the `JsonValue` it was read from (which we drop right after
+    /// parsing), so the dispatch logic can keep using it.
+    static dup_cstr(s: Str) -> string {
+        mut owned: String = String::from_str(s);
+        return owned.into_raw();
+    }
+
+    /// Parse a project's `test.json` into a `ProjSpec`. Returns `None` if the
+    /// file is malformed (the caller reports that as a failing project).
+    static parse_test_json(content: string) -> Option<ProjSpec> {
+        mut root: JsonValue = match (parser::parse(Str::from_cstr(content))) {
+            Result::Ok(v)      => { v }
+            Result::Err(mut e) => { e.drop(); return Option::None; }
+        };
+        mut spec: ProjSpec = ProjSpec {
+            outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: ""
+        };
+
+        const cf_str:  Str = Str::new("compile_fail");
+        const run_str: Str = Str::new("run");
+        match (root.get(Str::new("outcome"))) {
+            Option::Some(vp) => {
+                match (vp.as_str()) {
+                    Option::Some(os) => {
+                        if (os.equals(&cf_str))       { spec.outcome = 1; }
+                        else if (os.equals(&run_str)) { spec.outcome = 2; }
+                    }
+                    Option::None => { }
+                }
+            }
+            Option::None => { }
+        }
+        match (root.get(Str::new("ignore"))) {
+            Option::Some(vp) => {
+                match (vp.as_bool()) {
+                    Option::Some(b) => { spec.ignore = b; }
+                    Option::None    => { }
+                }
+            }
+            Option::None => { }
+        }
+        match (root.get(Str::new("expect"))) {
+            Option::Some(ep) => {
+                match (ep.get(Str::new("exit_code"))) {
+                    Option::Some(xp) => {
+                        match (xp.as_i64()) {
+                            Option::Some(n) => { spec.exit_code = n; }
+                            Option::None    => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+                match (ep.get(Str::new("diagnostic"))) {
+                    Option::Some(dp) => {
+                        match (dp.as_str()) {
+                            Option::Some(ds) => { spec.diagnostic = Executor::dup_cstr(ds); }
+                            Option::None     => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+                match (ep.get(Str::new("stdout_contains"))) {
+                    Option::Some(sp) => {
+                        match (sp.as_str()) {
+                            Option::Some(ss) => { spec.stdout_sub = Executor::dup_cstr(ss); }
+                            Option::None     => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+            Option::None => { }
+        }
+        root.drop();
+        return Option::Some(spec);
+    }
+
+    /// True if `<projects_dir>/<name>/test.json` exists and `name` is a real
+    /// subdirectory entry (not `.`/`..`) passing the optional `pattern`.
+    static proj_marker_path(projects_dir: string, name: string) -> string {
+        return format("%s/%s/test.json", projects_dir, name);
+    }
+
+    /// Run every multi-module test project under `projects_dir`. Each project
+    /// is a real Cryo package (its own `cryoconfig` + `src/`) carrying a
+    /// `test.json` that selects how it is checked (collect / compile_fail /
+    /// run). This is the `cryo test` META-RUNNER: it `chdir`s into each
+    /// project and drives this very compiler (`self_exe`) as a subprocess,
+    /// mirroring how `run_negative_suite` drives `cryo check`. Absent or empty
+    /// `projects_dir` is a clean no-op (returns {0,0}).
+    static run_projects_suite(self_exe: string, stdlib_abs: string,
+                              projects_dir: string, pattern: string,
+                              fmt_choice: string, col_choice: string)
+            -> NegSuiteResult {
+        // Pre-pass: count projects (subdirs with a readable test.json that
+        // pass the filter) so an empty/absent dir prints no section at all.
+        const pre_dp: void* = opendir(projects_dir);
+        if (pre_dp == null) {
+            return NegSuiteResult { ran: 0, failures: 0 };
+        }
+        mut to_run: i32 = 0;
+        mut pre_entry: void* = readdir(pre_dp);
+        while (pre_entry != null) {
+            const pn: string = dirent_name(pre_entry);
+            if (strcmp(pn, ".") != 0 && strcmp(pn, "..") != 0
+                && (strlen(pattern) == 0 || strstr(pn, pattern) != null)) {
+                const tj: string = Executor::proj_marker_path(projects_dir, pn);
+                if (access(tj, 0) == 0) { to_run += 1; }
+            }
+            pre_entry = readdir(pre_dp);
+        }
+        closedir(pre_dp);
+        if (to_run == 0) {
+            return NegSuiteResult { ran: 0, failures: 0 };
+        }
+
+        const dp: void* = opendir(projects_dir);
+        if (dp == null) {
+            return NegSuiteResult { ran: 0, failures: 0 };
+        }
+
+        const is_pretty:  boolean = strcmp(fmt_choice, "pretty")  == 0;
+        const is_compact: boolean = strcmp(fmt_choice, "compact") == 0;
+        const color_on:   boolean = Executor::neg_color_active(col_choice);
+
+        fmt::printf("\n%s\n", TEST_RULE_HEAVY);
+        fmt::printf("  CRYO TESTS  /  projects\n");
+        fmt::printf("%s\n\n", TEST_RULE_HEAVY);
+        if (is_pretty) {
+            fmt::printf("projects\n");
+        } else if (is_compact) {
+            fmt::printf("projects                                          ");
+        }
+
+        const tmp: string = neg_tmp_path();
+        mut failures: i32 = 0;
+        mut ran: i32 = 0;
+        mut entry: void* = readdir(dp);
+        while (entry != null) {
+            const name: string = dirent_name(entry);
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                entry = readdir(dp); continue;
+            }
+            if (strlen(pattern) > 0 && strstr(name, pattern) == null) {
+                entry = readdir(dp); continue;
+            }
+            const tj: string = Executor::proj_marker_path(projects_dir, name);
+            if (access(tj, 0) != 0) { entry = readdir(dp); continue; }
+
+            if (is_pretty) {
+                fmt::printf("  %s ... ", name);
+            } else if (!is_compact) {
+                fmt::printf("test (project) %s ... ", name);
+            }
+            fflush(null);
+
+            const content: string = Executor::read_file_or_empty(tj);
+            mut spec: ProjSpec = ProjSpec {
+                outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: ""
+            };
+            mut parsed_ok: boolean = false;
+            match (Executor::parse_test_json(content)) {
+                Option::Some(s) => { spec = s; parsed_ok = true; }
+                Option::None    => { parsed_ok = false; }
+            }
+            if (!parsed_ok) {
+                Executor::proj_report(is_pretty, is_compact, color_on, false,
+                    "malformed test.json");
+                failures += 1; ran += 1; entry = readdir(dp); continue;
+            }
+            if (spec.ignore) {
+                if (is_compact) { fmt::printf("i"); }
+                else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
+                else { fmt::printf("ignored\n"); }
+                entry = readdir(dp); continue;
+            }
+
+            const proj_dir: string = format("%s/%s", projects_dir, name);
+            const res: ProjOutcome =
+                Executor::dispatch_project(self_exe, stdlib_abs, proj_dir, &spec, tmp);
+            Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
+            if (!res.passed) {
+                failures += 1;
+                // Surface the captured subprocess output on failure so the
+                // reason is visible (kept quiet on success).
+                if (!is_compact) {
+                    const out: string = Executor::read_file_or_empty(tmp);
+                    if (strlen(out) > 0) { fmt::printf("%s\n", out); }
+                }
+            }
+            ran += 1;
+            entry = readdir(dp);
+        }
+        closedir(dp);
+        unlink(tmp);
+
+        if (is_compact && ran > 0) {
+            fmt::printf("   %d ok", ran - failures);
+            if (failures > 0) { fmt::printf(", %d fail", failures); }
+            fmt::printf("\n");
+        }
+        if (ran > 0) {
+            const verdict: string = if (failures == 0) { "PASS" } else { "FAIL" };
+            fmt::printf("\n%s\n", TEST_RULE_HEAVY);
+            fmt::printf("  projects summary\n");
+            fmt::printf("%s\n", TEST_RULE_THIN);
+            fmt::printf("    %-9s%6d\n", "passed", ran - failures);
+            fmt::printf("    %-9s%6d\n", "failed", failures);
+            fmt::printf("%s\n", TEST_RULE_THIN);
+            if (color_on && failures == 0) {
+                fmt::printf("    result   %s%s%s\n", NEG_ANSI_GREEN, verdict, NEG_ANSI_RESET);
+            } else if (color_on) {
+                fmt::printf("    result   %s%s%s\n", NEG_ANSI_RED, verdict, NEG_ANSI_RESET);
+            } else {
+                fmt::printf("    result   %s\n", verdict);
+            }
+            fmt::printf("%s\n", TEST_RULE_HEAVY);
+        }
+        return NegSuiteResult { ran: ran, failures: failures };
+    }
+
+    /// Print one project's PASS/FAIL line in the active format. `detail` is
+    /// shown after a FAIL (e.g. "expected E0200").
+    static proj_report(is_pretty: boolean, is_compact: boolean,
+                       color_on: boolean, passed: boolean, detail: string) -> void {
+        if (passed) {
+            if (is_compact)      { fmt::printf("."); }
+            else if (is_pretty)  { Executor::neg_chip_pass(color_on); fmt::printf("\n"); }
+            else                 { fmt::printf("ok\n"); }
+        } else {
+            if (is_compact)      { fmt::printf("F"); }
+            else if (is_pretty)  {
+                Executor::neg_chip_fail(color_on);
+                if (strlen(detail) > 0) { fmt::printf("  (%s)\n", detail); } else { fmt::printf("\n"); }
+            } else {
+                if (strlen(detail) > 0) { fmt::printf("FAILED (%s)\n", detail); } else { fmt::printf("FAILED\n"); }
+            }
+        }
+    }
+
+    /// Drive one project to its declared outcome by running this compiler in
+    /// the project directory (`chdir` in, run, `chdir` back). All paths handed
+    /// to the subprocess (`self_exe`, `stdlib_abs`, `tmp`) are absolute so the
+    /// changed cwd doesn't break them.
+    static dispatch_project(self_exe: string, stdlib_abs: string,
+                            proj_dir: string, spec: &ProjSpec, tmp: string)
+            -> ProjOutcome {
+        mut cwd_buf: i8[4096];
+        const got: i8* = getcwd(&cwd_buf[0], 4096);
+        const saved_cwd: string = if (got != null) { format("%s", &cwd_buf[0] as string) } else { "." };
+        if (chdir(proj_dir) != 0) {
+            return ProjOutcome { passed: false, detail: format("cannot chdir to %s", proj_dir) };
+        }
+
+        mut std_flag: string = "";
+        if (strlen(stdlib_abs) > 0) { std_flag = format(" --stdlib=%s", stdlib_abs); }
+
+        mut passed: boolean = false;
+        mut detail: string = "";
+
+        if (spec.outcome == 1) {
+            // compile_fail: `cryo build` must fail and emit error[<diagnostic>].
+            const cmd: string = format("%s build%s > %s 2>&1", self_exe, std_flag, tmp);
+            fflush(null);
+            const st: i32 = system(cmd);
+            const failed: boolean = exit_code_of(st) != 0;
+            const out: string = Executor::read_file_or_empty(tmp);
+            if (strlen(spec.diagnostic) > 0) {
+                const want: string = format("error[%s]", spec.diagnostic);
+                passed = failed && (strstr(out, want) != null);
+                if (!passed) { detail = format("expected build to fail with %s", spec.diagnostic); }
+            } else {
+                passed = failed;
+                if (!passed) { detail = "expected build to fail"; }
+            }
+        } else if (spec.outcome == 2) {
+            // run: build+run; assert exit code (and optional stdout substring).
+            const cmd: string = format("%s run%s > %s 2>&1", self_exe, std_flag, tmp);
+            fflush(null);
+            const st: i32 = system(cmd);
+            const ec: int = exit_code_of(st);
+            passed = (ec as i64) == spec.exit_code;
+            if (!passed) {
+                detail = format("exit %d, expected %lld", ec, spec.exit_code);
+            } else if (strlen(spec.stdout_sub) > 0) {
+                const out: string = Executor::read_file_or_empty(tmp);
+                passed = strstr(out, spec.stdout_sub) != null;
+                if (!passed) { detail = format("stdout missing \"%s\"", spec.stdout_sub); }
+            }
+        } else {
+            // collect: run the project's own `cryo test`; exit 0 = all passed.
+            const cmd: string = format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp);
+            fflush(null);
+            const st: i32 = system(cmd);
+            passed = exit_code_of(st) == 0;
+            if (!passed) { detail = "project tests failed"; }
+        }
+
+        chdir(saved_cwd);
+        return ProjOutcome { passed: passed, detail: detail };
     }
 
     /// `cryo check <file>`: frontend + semantic analysis, no codegen.
