@@ -112,6 +112,28 @@ type struct CTypeMapper {
         return ann;
     }
 
+    /// A layout-faithful opaque storage blob for a type that has no first-class
+    /// Cryo representation (an anonymous record member, a union, a bitfield run):
+    /// `E[N]` where `E` is the largest unsigned integer whose width divides the
+    /// alignment (so the array's natural alignment matches C's) and `N` spans the
+    /// byte size.  C records have `size % align == 0`, so the division is exact.
+    /// A field of this type round-trips by value but offers no member access.
+    aligned_blob(&this, size: i64, align: i64) -> TypeAnnotation* {
+        mut elem_bytes: i64 = align;
+        if (elem_bytes != 1 && elem_bytes != 2 && elem_bytes != 4 && elem_bytes != 8) {
+            // Non-power-of-two or >8 (e.g. 16-byte `long double`): the widest
+            // primitive is u64; rely on the enclosing struct's min_alignment for
+            // overall alignment, and Phase 3's static_assert to catch a mismatch.
+            elem_bytes = if (size % 8 == 0) { 8 } else { 1 };
+        }
+        const count: i64 = size / elem_bytes;
+        mut elem_name: string = "u8";
+        if (elem_bytes == 2)      { elem_name = "u16"; }
+        else if (elem_bytes == 4) { elem_name = "u32"; }
+        else if (elem_bytes == 8) { elem_name = "u64"; }
+        return this.array(this.prim(elem_name), count);
+    }
+
     /// The bare tag name of a record/enum CXType (e.g. `Point` for
     /// `struct Point`), interned into `ctx`.  Empty SymbolStr for anonymous types.
     tag_name(&this, t: CXType) -> SymbolStr {
@@ -167,18 +189,35 @@ type struct CTypeMapper {
             return this.array(elem, Clang::clang_getArraySize(c));
         }
 
-        if (k == Clang::TK_Record || k == Clang::TK_Enum) {
-            // Reference to an emitted aggregate: name it, qualified under the
-            // alias.  An anonymous/unnameable record falls back to `void*`.
+        if (k == Clang::TK_Record) {
+            // Anonymous record (a nameless `struct {...}` used as a field type):
+            // a layout-faithful opaque blob, not `void*`, so the enclosing
+            // struct's size/alignment stay correct.  Detected via the type's
+            // declaration anonymity — libclang gives an anonymous tag a SYNTHETIC
+            // spelling (`struct (unnamed at …)`), so `tag_name` is non-empty and
+            // an emptiness test would miss it.  An incomplete record (size
+            // unknown) keeps the opaque-pointer fallback.
+            if (c.is_anonymous_record()) {
+                const sz: i64 = Clang::clang_Type_getSizeOf(c);
+                const al: i64 = Clang::clang_Type_getAlignOf(c);
+                if (sz > 0) { return this.aligned_blob(sz, al); }
+                return this.ptr(this.prim("void"), false);
+            }
+            // Reference to an emitted record: name it, qualified under the alias.
+            const tag: SymbolStr = this.tag_name(c);
+            if (!tag.is_empty() && !this.alias.is_empty()) {
+                return this.named(this.qualify_under_alias(tag));
+            }
+            return this.ptr(this.prim("void"), false);
+        }
+
+        if (k == Clang::TK_Enum) {
             const tag: SymbolStr = this.tag_name(c);
             if (!tag.is_empty() && !this.alias.is_empty()) {
                 return this.named(this.qualify_under_alias(tag));
             }
             // Enums with no emittable name still round-trip as their integer width.
-            if (k == Clang::TK_Enum) {
-                return this.prim("i32");
-            }
-            return this.ptr(this.prim("void"), false);
+            return this.prim("i32");
         }
 
         const name: string = scalar_name(k);

@@ -11,11 +11,26 @@ enum Mode { MODE_OFF = 0, MODE_ON = 7 };   /* named enum w/ explicit discriminan
 enum { FLAG_A = 1, FLAG_B = 2, FLAG_NEG = -3 };
 
 /* object-like #define constants -> alias-namespaced `const`s (cit::CIT_MAX, ...).
- * Covers decimal, hex, negative, and float.  The function-like and string macros
- * below must be reported-and-skipped, never bound. */
+ * Covers decimal, hex, negative, float, string, and char.  The function-like
+ * macro must be reported-and-skipped, never bound. */
 #define CIT_MAX  256
 #define CIT_MASK 0xFF
 #define CIT_NEG  -3
 #define CIT_HALF 3.5
-#define CIT_SQUARE(x) ((x) * (x))   /* function-like: unbindable, skipped */
-#define CIT_NAME "cryo"             /* string: not yet bound, skipped */
+#define CIT_NAME "cry\to"            /* string -> `string` const (escape decoded) */
+#define CIT_NL   '\n'               /* char   -> `char` const (code point 10)    */
+#define CIT_LET  'A'                /* char   -> `char` const (code point 65)    */
+#define CIT_SQUARE(x) ((x) * (x))   /* function-like: unbindable, reported-skipped */
+
+/* Bitfields share a storage unit: a per-field map would inflate the layout, so
+ * the run collapses to one opaque storage blob.  sizeof must stay 8 (two `unsigned`
+ * bitfields packed into the first 4-byte unit, then `c`). */
+struct Bits { unsigned a : 3; unsigned b : 5; int c; };
+
+/* A C11 anonymous union MEMBER (no field name): contributes 4 bytes of storage
+ * with no FieldDecl, so a naive field walk would undersize it.  sizeof == 8. */
+struct Tagged { int tag; union { int i; float f; }; };
+
+/* A named field of anonymous struct type: mapped to a layout-faithful blob, not
+ * void*.  sizeof == 12 (kind + an 8-byte {x,y}). */
+struct Named { int kind; struct { int x; int y; } pt; };

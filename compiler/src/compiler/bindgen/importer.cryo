@@ -19,9 +19,11 @@
 /// callback signature) that cast their `client: void*` back to the live
 /// `Importer` and delegate to an instance method.  The same object is reused
 /// as the client data for the nested field/constant walks (the transient
-/// `cur_struct` / `cur_enum` / `cur_enum_int` targets), so no separate
+/// `field_cursors` / `cur_enum` / `cur_enum_int` targets), so no separate
 /// per-walk state structs are needed — libclang walks synchronously and the
-/// nested visitors never overlap.
+/// nested visitors never overlap.  A record's members are collected into
+/// `field_cursors` first (rather than emitted one-by-one) so a run of bitfields
+/// can be spanned by a single storage blob with look-ahead.
 
 namespace Compiler::Bindgen::Importer;
 
@@ -30,6 +32,8 @@ import Compiler::Bindgen::Clang;
 import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken };
 import Compiler::Bindgen::TypeMap;
 import Compiler::Bindgen::TypeMap::{ CTypeMapper };
+import Compiler::Lex::Lexer;
+import Compiler::Codegen::Util;
 import Compiler::Passes::PassID;
 import Compiler::Diag;
 import Compiler::Diag::{ Snapshot, Sink, SourceSpan, Diagnostic };
@@ -41,6 +45,43 @@ import Compiler::AST::Expression;
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Utils;
 import Utils::Logger;
+
+/// A structured account of what a single translation unit's import could NOT
+/// translate faithfully — the honesty channel PLAN.md §3 requires.  Two buckets:
+/// `skipped` (a construct that produced NO binding — a function-like macro, a
+/// non-literal macro body) and `approximated` (a binding that round-trips by
+/// value but loses member access — a union, a bitfield run, an anonymous
+/// record member or field, lowered to an opaque storage blob).  Surfaced via
+/// `cdebug` today (so it only appears under `--debug`); the eventual `cryo
+/// vendor` generator will consume the same lists for its translation report.
+type struct ImportReport {
+    skipped:      string[];
+    approximated: string[];
+
+    static new() -> ImportReport {
+        return ImportReport { skipped: [], approximated: [] };
+    }
+
+    /// Note a construct that yielded no binding at all.
+    skip(mut &this, line: string) -> void { this.skipped.push(line); }
+
+    /// Note a binding emitted at reduced fidelity (layout-only, no field access).
+    approx(mut &this, line: string) -> void { this.approximated.push(line); }
+
+    /// Emit a per-translation-unit summary (no-op when nothing was lost, and
+    /// silent unless `--debug` is set, since it rides `cdebug`).
+    summary(&this, label: string) -> void {
+        if (this.skipped.length == 0 && this.approximated.length == 0) { return; }
+        cdebug("[Bindgen] '%s' translation report: %lld skipped, %lld approximated\n",
+               label, this.skipped.length as i64, this.approximated.length as i64);
+        for (mut i: i64 = 0; i < this.skipped.length; i++) {
+            cdebug("  [skip]   %s\n", this.skipped[i]);
+        }
+        for (mut i: i64 = 0; i < this.approximated.length; i++) {
+            cdebug("  [approx] %s\n", this.approximated[i]);
+        }
+    }
+}
 
 /// The C-header import engine: one object per translation unit, plus the static
 /// pass entry and path-resolution helpers.
@@ -69,9 +110,15 @@ type struct Importer {
     /// Transient targets for the nested walks (set just before the synchronous
     /// `clang_visitChildren`, read by the nested visitors).  `cur_enum_int`
     /// points at a stack-local CXType live for the duration of the walk.
-    cur_struct:     StructDeclNode*;
     cur_enum:       EnumDeclNode*;
     cur_enum_int:   CXType*;
+    /// Transient: a record's child member cursors (plain fields AND anonymous
+    /// struct/union members), collected by `visit_collect_member` and then
+    /// processed with look-ahead so a run of bitfields can be spanned by one
+    /// storage blob.  Reset at the start of each record.
+    field_cursors:  CXCursor[];
+    /// Honesty channel: every construct this import skipped or approximated.
+    report:         ImportReport;
 
     /// Build a per-TU importer.  Alias and `functions_only` are derived from the
     /// extern block; the type mapper is wired with the same (ctx, alias).
@@ -88,9 +135,10 @@ type struct Importer {
             struct_names:   [],
             struct_nodes:   [],
             types:          CTypeMapper::new(ctx, alias),
-            cur_struct:     null,
             cur_enum:       null,
             cur_enum_int:   null,
+            field_cursors:  [],
+            report:         ImportReport::new(),
         };
     }
 
@@ -109,7 +157,7 @@ type struct Importer {
     static visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         const imp: Importer* = client as Importer*;
 
-        if (Clang::is_in_system_header(cursor)) {
+        if (cursor.is_in_system_header()) {
             return Clang::VISIT_CONTINUE;
         }
 
@@ -137,13 +185,22 @@ type struct Importer {
         return Clang::VISIT_CONTINUE;
     }
 
-    /// Nested visitor: one FieldDeclNode per FieldDecl child of a record cursor.
-    static visit_field(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_FIELD_DECL) {
-            return Clang::VISIT_CONTINUE;
-        }
+    /// Nested visitor: collect a record's layout-contributing children into
+    /// `field_cursors` — every FieldDecl, plus each anonymous struct/union MEMBER
+    /// (a nameless `union { ... };`, which carries storage but has no FieldDecl).
+    /// A nameless record DEFINITION used by a following named field is NOT a
+    /// member (its `is_anonymous_record_decl` is false) and is skipped here; the
+    /// named field that references it is collected as a normal FieldDecl.  The
+    /// collected list is processed by `populate_record_fields` with look-ahead.
+    static visit_collect_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+        const k: i32 = Clang::clang_getCursorKind(cursor);
         const imp: Importer* = client as Importer*;
-        imp.add_field_from(cursor);
+        if (k == Clang::CURSOR_FIELD_DECL) {
+            imp.field_cursors.push(cursor);
+        } else if ((k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL)
+                   && cursor.is_anonymous_record_decl()) {
+            imp.field_cursors.push(cursor);
+        }
         return Clang::VISIT_CONTINUE;
     }
 
@@ -208,7 +265,7 @@ type struct Importer {
 
     /// Emit one FunctionDeclNode for a C function prototype.
     emit_function(mut &this, cursor: CXCursor) -> void {
-        const name_sym: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
         func.return_type_annotation = this.types.map(Clang::clang_getCursorResultType(cursor));
 
@@ -217,7 +274,7 @@ type struct Importer {
         for (mut i: i32 = 0; i < nargs; i++) {
             const arg: CXCursor = Clang::clang_Cursor_getArgument(cursor, i as u32);
             const ptype: TypeAnnotation* = this.types.map(Clang::clang_getCursorType(arg));
-            const pname: SymbolStr = Clang::intern_arg_name(arg, i, this.ctx);
+            const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
             mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
             pnode.type_annotation = ptype;
             params.push(pnode);
@@ -234,8 +291,8 @@ type struct Importer {
     /// union — Cryo has no native union).  Find-or-populate handles libclang's
     /// forward-decl-then-definition double visit and truly-opaque records.
     emit_record(mut &this, cursor: CXCursor, is_union: boolean) -> void {
-        const name_sym: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
-        if (Clang::is_anonymous(cursor)) {
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
+        if (cursor.is_anonymous()) {
             // Anonymous record: not nameable as a top-level type (libclang gives
             // it a synthetic `struct (unnamed at …)` spelling, so test anonymity
             // via clang_Cursor_isAnonymous, NOT an empty-spelling check).
@@ -263,6 +320,8 @@ type struct Importer {
             unode.add_field(storage);
             this.seen_names.push(name_sym);
             this.emit_top_level(unode as ASTNode*);
+            this.report.approx(format("union '%s' -> %lld-byte opaque storage (round-trips by value; no field access)",
+                                      this.ctx.intern_table.resolve(name_sym), size));
             return;
         }
 
@@ -279,18 +338,117 @@ type struct Importer {
         // Populate fields from this cursor only if not already populated (an
         // earlier forward-decl cursor left it empty; the definition fills it).
         if (node.fields.length == 0) {
-            this.cur_struct = node;
-            Clang::clang_visitChildren(cursor, Importer::visit_field, this as void*);
+            this.field_cursors = [];
+            Clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
+            this.populate_record_fields(node, cursor);
         }
     }
 
-    /// Nested-walk body: append one FieldDeclNode (from a FieldDecl cursor) to
-    /// the record currently being populated (`cur_struct`).
-    add_field_from(mut &this, cursor: CXCursor) -> void {
-        const fname: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
-        mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
-        fnode.type_annotation = this.types.map(Clang::clang_getCursorType(cursor));
-        this.cur_struct.add_field(fnode);
+    /// Build a struct's fields from its collected member cursors, faithfully
+    /// handling the three constructs a one-to-one field map gets wrong:
+    ///   - a **bitfield run** (`unsigned a:3; unsigned b:5;`) — adjacent
+    ///     bitfields share a storage unit, so a per-field map would inflate the
+    ///     layout; the whole run collapses to one opaque `u8[span]` blob spanning
+    ///     from its first bit to the next non-bitfield field (or the struct end);
+    ///   - an **anonymous record member** (`union { ... };`) — no FieldDecl, so a
+    ///     plain field walk drops it and undersizes the struct; emitted as an
+    ///     aligned blob in declaration order;
+    ///   - a **named field of anonymous type** (`struct {...} pt;`) — mapped to an
+    ///     aligned blob by `CTypeMapper::map` rather than `void*`.
+    /// Any approximation raises the struct's `min_alignment` to libclang's
+    /// authoritative figure, so an opaque blob (alignment 1) can't lower the
+    /// record's overall alignment below the C ABI.  Each lossy member is reported.
+    populate_record_fields(mut &this, node: StructDeclNode*, record_cursor: CXCursor) -> void {
+        const rec_type: CXType = Clang::clang_getCursorType(record_cursor);
+        const struct_size: i64 = Clang::clang_Type_getSizeOf(rec_type);
+        const sname: string = this.ctx.intern_table.resolve(node.name);
+        mut approximated: boolean = false;
+        mut anon_n: i32 = 0;
+        mut bits_n: i32 = 0;
+
+        mut i: i64 = 0;
+        while (i < this.field_cursors.length) {
+            const cur: CXCursor = this.field_cursors[i];
+            const k: i32 = Clang::clang_getCursorKind(cur);
+
+            // Anonymous struct/union member: an aligned opaque blob in place.
+            if (k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL) {
+                const ct: CXType = Clang::clang_getCursorType(cur);
+                const sz: i64 = Clang::clang_Type_getSizeOf(ct);
+                const al: i64 = Clang::clang_Type_getAlignOf(ct);
+                const fname: SymbolStr =
+                    this.ctx.intern_table.intern(format("_anon%d", anon_n));
+                mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
+                fnode.type_annotation = this.types.aligned_blob(sz, al);
+                node.add_field(fnode);
+                this.report.approx(format("anonymous member in struct '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
+                                          sname, anon_n, sz));
+                anon_n = anon_n + 1;
+                approximated = true;
+                i = i + 1;
+                continue;
+            }
+
+            // Bitfield run: collapse consecutive bitfields into one storage blob.
+            if (cur.is_bitfield()) {
+                const start_bits: i64 = Clang::clang_Cursor_getOffsetOfField(cur);
+                mut start_byte: i64 = if (start_bits >= 0) { start_bits / 8 } else { 0 };
+
+                mut j: i64 = i + 1;
+                while (j < this.field_cursors.length
+                       && Clang::clang_getCursorKind(this.field_cursors[j]) == Clang::CURSOR_FIELD_DECL
+                       && this.field_cursors[j].is_bitfield()) {
+                    j = j + 1;
+                }
+
+                // The run ends where the next plain field begins; if the next
+                // member is not a plain field (an anonymous member) or the run is
+                // the struct's tail, span to the struct end.  `tail` stops the
+                // loop so a trailing blob never overlaps a later member.
+                mut end_byte: i64 = struct_size;
+                mut tail: boolean = true;
+                if (j < this.field_cursors.length
+                    && Clang::clang_getCursorKind(this.field_cursors[j]) == Clang::CURSOR_FIELD_DECL) {
+                    const nb: i64 = Clang::clang_Cursor_getOffsetOfField(this.field_cursors[j]);
+                    if (nb >= 0) { end_byte = nb / 8; tail = false; }
+                }
+                mut span: i64 = end_byte - start_byte;
+                if (span <= 0) { span = struct_size - start_byte; tail = true; }
+
+                const fname: SymbolStr =
+                    this.ctx.intern_table.intern(format("_bitfield%d", bits_n));
+                mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
+                fnode.type_annotation = this.types.array(this.types.prim("u8"), span);
+                node.add_field(fnode);
+                this.report.approx(format("bitfield run in struct '%s' -> field '_bitfield%d': %lld-byte opaque storage (no field access)",
+                                          sname, bits_n, span));
+                bits_n = bits_n + 1;
+                approximated = true;
+
+                if (tail) { i = this.field_cursors.length; } else { i = j; }
+                continue;
+            }
+
+            // Plain field.  A named field of anonymous record type is mapped to
+            // an aligned blob by `map` (not `void*`); flag it as approximated so
+            // the struct alignment is corrected and the loss is reported.
+            const ftype: CXType = Clang::clang_getCursorType(cur);
+            const fname: SymbolStr = cur.intern_spelling(this.ctx);
+            mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
+            fnode.type_annotation = this.types.map(ftype);
+            node.add_field(fnode);
+            if (ftype.is_anonymous_record()) {
+                this.report.approx(format("field '%s' of anonymous type in struct '%s' -> opaque blob (no field access)",
+                                          this.ctx.intern_table.resolve(fname), sname));
+                approximated = true;
+            }
+            i = i + 1;
+        }
+
+        if (approximated && struct_size > 0) {
+            const al: i64 = Clang::clang_Type_getAlignOf(rec_type);
+            if (al > 0) { node.min_alignment = al as u64; }
+        }
     }
 
     /// Emit a `type enum E : <int> { NAME = value; ... }` for a NAMED C enum.
@@ -298,8 +456,8 @@ type struct Importer {
     /// constants in the enclosing scope, so each becomes a global `const`
     /// qualified under the alias.
     emit_enum(mut &this, cursor: CXCursor) -> void {
-        const name_sym: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
-        if (Clang::is_anonymous(cursor)) {
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
+        if (cursor.is_anonymous()) {
             // The anonymous enum's underlying integer type; each constant's
             // global is typed against it.  Kept on the stack for the synchronous
             // walk and pointed at via `cur_enum_int`.
@@ -326,7 +484,7 @@ type struct Importer {
     /// Nested-walk body: append one EnumVariantNode (from an EnumConstantDecl
     /// cursor) to the named enum currently being populated (`cur_enum`).
     add_enum_const_from(mut &this, cursor: CXCursor) -> void {
-        const cname: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
+        const cname: SymbolStr = cursor.intern_spelling(this.ctx);
         mut vnode: EnumVariantNode* = new EnumVariantNode(cname, SourceSpan::none());
         vnode.set_explicit_value(Clang::clang_getEnumConstantDeclValue(cursor));
         this.cur_enum.add_variant(vnode);
@@ -335,7 +493,7 @@ type struct Importer {
     /// Nested-walk body: emit one alias-namespaced global `const NAME = value`
     /// for an anonymous enum's constant (typed against `cur_enum_int`).
     add_anon_const_from(mut &this, cursor: CXCursor) -> void {
-        const cname: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
+        const cname: SymbolStr = cursor.intern_spelling(this.ctx);
         if (this.ctx.intern_table.resolve(cname).eq("")) { return; }
         if (this.name_seen(cname)) { return; }
 
@@ -353,7 +511,7 @@ type struct Importer {
     /// `typedef struct Foo Foo;` shape (the struct already supplies `alias::Foo`,
     /// and emitting an alias of the same qualified name would collide / E0207).
     emit_typedef(mut &this, cursor: CXCursor) -> void {
-        const name_sym: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
 
@@ -386,14 +544,14 @@ type struct Importer {
         // Compiler/target PREDEFINED macros (`__STDC__`, `__GCC_HAVE_*`, …) live
         // in a `<built-in>` pseudo-file and are NOT flagged as system headers, so
         // the system-header filter misses them; restrict import to the header.
-        if (!Clang::is_from_main_file(cursor)) { return; }
-        const name_sym: SymbolStr = Clang::intern_spelling(cursor, this.ctx);
+        if (!cursor.is_from_main_file()) { return; }
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
         if (this.name_seen(name_sym)) { return; }
 
         if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0u32) {
-            cdebug("[Bindgen] skipped function-like macro '%s' (unbindable)\n", name_str);
+            this.report.skip(format("function-like macro '%s' (unbindable)", name_str));
             return;
         }
 
@@ -404,12 +562,12 @@ type struct Importer {
         mut ntok: u32 = 0u32;
         Clang::clang_tokenize(this.tu, range, &toks, &ntok);
         if (toks == null) {
-            cdebug("[Bindgen] skipped macro '%s' (no tokens)\n", name_str);
+            this.report.skip(format("macro '%s' (no tokens)", name_str));
             return;
         }
         if (ntok < 2u32) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            cdebug("[Bindgen] skipped valueless macro '%s' (guard, not a constant)\n", name_str);
+            this.report.skip(format("valueless macro '%s' (header guard, not a constant)", name_str));
             return;
         }
 
@@ -420,7 +578,7 @@ type struct Importer {
         mut bindable: boolean = true;
         if (nrepl == 2u32) {
             const k0: i32 = Clang::clang_getTokenKind(*(toks + 1));
-            const s0: string = Clang::token_spelling(this.tu, *(toks + 1), this.ctx);
+            const s0: string = (*(toks + 1)).spelling(this.tu, this.ctx);
             if (k0 == Clang::TOKEN_PUNCTUATION && (s0.eq("-") || s0.eq("+"))) {
                 neg = s0.eq("-");
                 lit_idx = 2u32;
@@ -432,21 +590,20 @@ type struct Importer {
         }
         if (!bindable) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            cdebug("[Bindgen] skipped compound macro '%s' (non-trivial replacement)\n", name_str);
+            this.report.skip(format("compound macro '%s' (non-trivial replacement)", name_str));
             return;
         }
 
         const litk: i32 = Clang::clang_getTokenKind(*(toks + lit_idx));
-        const spell: string = Clang::token_spelling(this.tu, *(toks + lit_idx), this.ctx);
+        const spell: string = (*(toks + lit_idx)).spelling(this.tu, this.ctx);
         if (litk != Clang::TOKEN_LITERAL) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            cdebug("[Bindgen] skipped macro '%s' (replacement not a literal: '%s')\n",
-                   name_str, spell);
+            this.report.skip(format("macro '%s' (replacement not a literal: '%s')", name_str, spell));
             return;
         }
         if (spell.is_text_literal()) {
+            this.emit_text_macro(name_sym, name_str, spell, neg);
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            cdebug("[Bindgen] skipped string/char macro '%s' (not yet supported)\n", name_str);
             return;
         }
 
@@ -482,6 +639,52 @@ type struct Importer {
             new LiteralNode(format("%llu", value_u64), LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
         Clang::clang_disposeTokens(this.tu, toks, ntok);
+    }
+
+    /// Lower a string- or char-literal `#define` to an alias-namespaced const.
+    /// `spell` is the literal token (quotes and any encoding prefix included).
+    ///   - A STRING (`"..."`) becomes a `string` const.  C escapes are decoded
+    ///     exactly as the Cryo lexer decodes a source string literal, so the
+    ///     stored value is the final byte sequence codegen interns verbatim.
+    ///   - A CHAR (`'.'`) becomes a `char` const carrying its integer code point.
+    ///     (The global-var emitter has no Char-literal path, but `char` is
+    ///     integer-represented, so an Integer literal lowers correctly.)
+    /// A signed or otherwise unparseable text literal is reported, not bound.
+    emit_text_macro(mut &this, name_sym: SymbolStr, name_str: string,
+                    spell: string, neg: boolean) -> void {
+        if (neg) {
+            this.report.skip(format("macro '%s' (malformed signed text literal)", name_str));
+            return;
+        }
+        // Find the opening quote — it may follow an encoding prefix (`u8`/`L`/
+        // `u`/`U`).  A `"` opens a string; a `'` opens a character.
+        const slen: i64 = libc::strlen(spell) as i64;
+        mut open: i64 = -1;
+        mut q: i8 = 0i8;
+        for (mut p: i64 = 0; p < slen; p++) {
+            const ch: i8 = spell[p];
+            if (ch == '"' || ch == '\'') { open = p; q = ch; break; }
+        }
+        // The closing quote is the last byte equal to the opening quote.
+        mut close: i64 = slen - 1;
+        while (close > open && spell[close] != q) { close = close - 1; }
+        if (open < 0 || close <= open) {
+            this.report.skip(format("macro '%s' (unparseable text literal '%s')", name_str, spell));
+            return;
+        }
+
+        const inner: string = spell.substr(open + 1, close - open - 1);
+        if (q == '"') {
+            const decoded: string = Lexer::process_escape_sequences(inner);
+            mut slit: LiteralNode* =
+                new LiteralNode(decoded, LiteralKind::String, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim("string"), slit as ExpressionNode*);
+        } else {
+            const cp: u64 = CodegenUtil::decode_char_lexeme(inner);
+            mut clit: LiteralNode* =
+                new LiteralNode(format("%llu", cp), LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim("char"), clit as ExpressionNode*);
+        }
     }
 
     /// Pass entry: walk top-level statements for CImport ExternBlockNodes, and
@@ -614,6 +817,7 @@ type struct Importer {
         mut imp: Importer = Importer::new(extern_node, ctx, tu);
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
+        imp.report.summary(label);
 
         Clang::clang_disposeTranslationUnit(tu);
         Clang::clang_disposeIndex(index);

@@ -32,12 +32,94 @@ type struct CXCursor {
     kind:  i32;
     xdata: i32;
     data:  void*[3];
+
+    /// True when this is a C11 anonymous struct/union MEMBER declaration — the
+    /// nameless `union { ... };` that contributes its storage directly to the
+    /// enclosing record.  Narrower than a plain anonymity test: it excludes a
+    /// nameless record DEFINITION that a following named field references, so it
+    /// distinguishes an anonymous member (emitted as a blob in place) from a
+    /// nameless type carried by a named field.
+    is_anonymous_record_decl(this) -> boolean {
+        return clang_Cursor_isAnonymousRecordDecl(this) != 0u32;
+    }
+
+    /// True when this cursor is a bitfield field declaration (`unsigned x : 3`).
+    is_bitfield(this) -> boolean {
+        return clang_Cursor_isBitField(this) != 0u32;
+    }
+
+    /// True for an anonymous tag declaration (`struct {...}` / `enum {...}` with
+    /// no name).  Use this rather than testing the cursor spelling for emptiness:
+    /// libclang reports a synthetic spelling (`enum (unnamed at …)`) for these.
+    is_anonymous(this) -> boolean {
+        return clang_Cursor_isAnonymous(this) != 0u32;
+    }
+
+    /// True when this cursor was declared in a system header (`<stddef.h>` & co.).
+    /// THE Phase-2 filter: libclang exposes every transitively-included header's
+    /// top-level decls, so type emission must drop the system-header ones (their
+    /// `size_t`/`int32_t` typedefs map inline via the canonical type anyway) and
+    /// keep only the user/project headers the import names.
+    is_in_system_header(this) -> boolean {
+        const loc: CXSourceLocation = clang_getCursorLocation(this);
+        return clang_Location_isInSystemHeader(loc) != 0;
+    }
+
+    /// True when this cursor is in the translation unit's MAIN file (the imported
+    /// header itself).  Used to keep object-like `#define` import to the user's
+    /// own header — the compiler/target PREDEFINED macros (`__STDC__`,
+    /// `__GCC_HAVE_DWARF2_CFI_ASM`, …) live in a `<built-in>` pseudo-file, are NOT
+    /// flagged as system headers, and would otherwise leak into the alias.
+    is_from_main_file(this) -> boolean {
+        const loc: CXSourceLocation = clang_getCursorLocation(this);
+        return clang_Location_isFromMainFile(loc) != 0;
+    }
+
+    /// Intern this cursor's spelling (e.g. a function/field name) into `ctx`.
+    /// The C string is owned by the CXString, so it is copied (interned) before
+    /// the string is disposed.
+    intern_spelling(this, ctx: CompilationContext*) -> SymbolStr {
+        const s: CXString = clang_getCursorSpelling(this);
+        const cstr: u8* = clang_getCString(s);
+        const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
+        clang_disposeString(s);
+        return sym;
+    }
+
+    /// Intern this parameter cursor's name.  An unnamed parameter (empty
+    /// spelling) gets a synthesized `argN`, exactly as the hand-rolled scanner
+    /// did, so a `void *` with no name still yields a first-class declaration.
+    intern_arg_name(this, index: i32, ctx: CompilationContext*) -> SymbolStr {
+        const s: CXString = clang_getCursorSpelling(this);
+        const cstr: u8* = clang_getCString(s);
+        if (cstr == null || libc::strlen(cstr as string) == 0) {
+            clang_disposeString(s);
+            const buf: i8* = intrinsics::malloc(16) as i8*;
+            intrinsics::sprintf(buf as string, "arg%d", index);
+            const sym: SymbolStr = ctx.intern_table.intern(buf as string);
+            intrinsics::free(buf as void*);
+            return sym;
+        }
+        const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
+        clang_disposeString(s);
+        return sym;
+    }
 }
 
 /// `{ enum kind; void *data[2]; }` — 24 bytes (Indirect).
 type struct CXType {
     kind: i32;
     data: void*[2];
+
+    /// True when the canonical type is an anonymous record — a struct/union with
+    /// no tag name, so it cannot be referenced by a named Cryo type.  Such a type
+    /// maps to a layout-faithful opaque storage blob rather than `void*`.
+    is_anonymous_record(this) -> boolean {
+        const c: CXType = clang_getCanonicalType(this);
+        if (c.kind != TK_Record) { return false; }
+        const decl: CXCursor = clang_getTypeDeclaration(c);
+        return decl.is_anonymous();
+    }
 }
 
 /// `{ const char *Filename; const char *Contents; unsigned long Length; }`.
@@ -77,6 +159,17 @@ type struct CXSourceRange {
 type struct CXToken {
     int_data: u32[4];
     ptr_data: void*;
+
+    /// Copy this token's spelling into an owned string (backed by the intern
+    /// table, so it outlives the CXString disposed here).  `tu` is the owning
+    /// translation unit.  Used to read an object-like macro's replacement token.
+    spelling(this, tu: void*, ctx: CompilationContext*) -> string {
+        const s: CXString = clang_getTokenSpelling(tu, this);
+        const cstr: u8* = clang_getCString(s);
+        const out: string = ctx.intern_table.resolve(ctx.intern_table.intern(cstr as string));
+        clang_disposeString(s);
+        return out;
+    }
 }
 
 // ---- CXCursorKind / CXChildVisitResult constants ----
@@ -173,6 +266,29 @@ extern "C" {
     function clang_getEnumDeclIntegerType(c: CXCursor) -> CXType;
     function clang_Type_getSizeOf(t: CXType) -> i64;
     function clang_Type_getAlignOf(t: CXType) -> i64;
+    /// Bit offset of a named field within `t` (a record type).  Used to span a
+    /// run of bitfields with one opaque storage blob (Phase 3 reuses it to
+    /// assert per-field offsets).  Returns a negative CXTypeLayoutError on a
+    /// dependent/invalid field.
+    function clang_Type_getOffsetOf(t: CXType, field: u8*) -> i64;
+    /// Bit offset of a field FROM ITS CURSOR (no name lookup) — the per-cursor
+    /// form of `clang_Type_getOffsetOf`, used while walking a record's children
+    /// to locate where a bitfield run begins and ends.
+    function clang_Cursor_getOffsetOfField(c: CXCursor) -> i64;
+    /// True when the field cursor is a bitfield (`unsigned x : 3`).  Such fields
+    /// share a storage unit and have no addressable Cryo equivalent, so a run of
+    /// them is replaced by an opaque storage blob.
+    function clang_Cursor_isBitField(c: CXCursor) -> u32;
+    /// The declared bit width of a bitfield field (`: 3` -> 3), or -1 for a
+    /// non-bitfield.  Reported in the translation summary.
+    function clang_getFieldDeclBitWidth(c: CXCursor) -> i32;
+    /// True ONLY for a C11 anonymous struct/union MEMBER — the nameless
+    /// `union { ... };` that injects its fields into the enclosing record.  This
+    /// is narrower than `clang_Cursor_isAnonymous` (which is also true for a
+    /// nameless record DEFINITION that a following named field references), so it
+    /// distinguishes an anonymous member (contributes layout directly, emitted as
+    /// a blob) from a nameless type used by a named field (the field carries it).
+    function clang_Cursor_isAnonymousRecordDecl(c: CXCursor) -> u32;
     function clang_getArrayElementType(t: CXType) -> CXType;
     function clang_getArraySize(t: CXType) -> i64;
     function clang_getNumArgTypes(t: CXType) -> i32;
@@ -199,70 +315,3 @@ extern "C" {
     function clang_disposeString(s: CXString) -> void;
 }
 
-/// True when `cursor` was declared in a system header (`<stddef.h>` & co.).
-/// THE Phase-2 filter: libclang exposes every transitively-included header's
-/// top-level decls, so type emission must drop the system-header ones (their
-/// `size_t`/`int32_t` typedefs map inline via the canonical type anyway) and
-/// keep only the user/project headers the import names.
-function is_in_system_header(cursor: CXCursor) -> boolean {
-    const loc: CXSourceLocation = clang_getCursorLocation(cursor);
-    return clang_Location_isInSystemHeader(loc) != 0;
-}
-
-/// True when `cursor` is located in the translation unit's MAIN file (the
-/// imported header itself).  Used to keep object-like `#define` import to the
-/// user's own header — the compiler/target PREDEFINED macros (`__STDC__`,
-/// `__GCC_HAVE_DWARF2_CFI_ASM`, …) live in a `<built-in>` pseudo-file, are NOT
-/// flagged as system headers, and would otherwise leak into the alias.
-function is_from_main_file(cursor: CXCursor) -> boolean {
-    const loc: CXSourceLocation = clang_getCursorLocation(cursor);
-    return clang_Location_isFromMainFile(loc) != 0;
-}
-
-/// True for an anonymous tag declaration (`struct {...}` / `enum {...}` with
-/// no name).  Use this rather than testing the cursor spelling for emptiness:
-/// libclang reports a synthetic spelling (`enum (unnamed at …)`) for these.
-function is_anonymous(cursor: CXCursor) -> boolean {
-    return clang_Cursor_isAnonymous(cursor) != 0u32;
-}
-
-/// Copy a token's spelling into an owned string (backed by the intern table,
-/// so it outlives the CXString that is disposed here).  Used to read an
-/// object-like macro's replacement token.
-function token_spelling(tu: void*, token: CXToken, ctx: CompilationContext*) -> string {
-    const s: CXString = clang_getTokenSpelling(tu, token);
-    const cstr: u8* = clang_getCString(s);
-    const out: string = ctx.intern_table.resolve(ctx.intern_table.intern(cstr as string));
-    clang_disposeString(s);
-    return out;
-}
-
-/// Intern a cursor's spelling (e.g. a function name) into `ctx`.  The C
-/// string is owned by the CXString, so it is copied (interned) before the
-/// string is disposed.
-function intern_spelling(cursor: CXCursor, ctx: CompilationContext*) -> SymbolStr {
-    const s: CXString = clang_getCursorSpelling(cursor);
-    const cstr: u8* = clang_getCString(s);
-    const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
-    clang_disposeString(s);
-    return sym;
-}
-
-/// Intern a parameter cursor's name.  Unnamed parameters (empty spelling)
-/// get a synthesized `argN`, exactly as the hand-rolled scanner did, so a
-/// `void *` with no name still yields a first-class declaration.
-function intern_arg_name(arg: CXCursor, index: i32, ctx: CompilationContext*) -> SymbolStr {
-    const s: CXString = clang_getCursorSpelling(arg);
-    const cstr: u8* = clang_getCString(s);
-    if (cstr == null || libc::strlen(cstr as string) == 0) {
-        clang_disposeString(s);
-        const buf: i8* = intrinsics::malloc(16) as i8*;
-        intrinsics::sprintf(buf as string, "arg%d", index);
-        const sym: SymbolStr = ctx.intern_table.intern(buf as string);
-        intrinsics::free(buf as void*);
-        return sym;
-    }
-    const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
-    clang_disposeString(s);
-    return sym;
-}
