@@ -2217,6 +2217,8 @@ Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on t
 
 Type mapping: a C `struct`/`union` becomes a `![repr(c)]` `type struct` (a union is a layout-faithful opaque storage blob — no field access); a named `enum` becomes a `type enum` with its explicit discriminant values; an **anonymous** `enum` (which has no nameable type — its constants are plain integers in C) contributes one alias-namespaced `const` per constant (`enum { LO = 1, HI = 2 }` → `c::LO`, `c::HI`); a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types and constants are namespaced under the alias only (`c::Point`, `c::LO`), never the global namespace.
 
+Object-like `#define` constants whose body is a single numeric literal are imported too, each as an alias-namespaced `const` with an inferred type (`#define MAX_LEN 256` → `c::MAX_LEN: i32`; hex, negative, and floating-point literals are supported, with integer width inferred from the value and `u`/`l` suffixes). Macros that can't be bound — **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), string/char literals, and compound expressions (`#define AREA (W * H)`) — are skipped and reported rather than silently dropped. Only macros defined in the named header itself are considered (the compiler's predefined macros are excluded).
+
 To import only a header's function prototypes — suppressing all struct/enum/typedef emission — apply the **`![functions_only]`** directive to the extern-module block. It is valid only on a C-import extern module:
 
 ```cryo

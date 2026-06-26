@@ -15,7 +15,7 @@ namespace Compiler::Bindgen::Importer;
 
 import ffi::libc;
 import Compiler::Bindgen::Clang;
-import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile };
+import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken };
 import Compiler::Bindgen::TypeMap;
 import Compiler::Passes::PassID;
 import Compiler::Diag;
@@ -34,6 +34,9 @@ import Utils::Logger;
 type struct ImportState {
     extern_node: ExternBlockNode*;
     ctx:         CompilationContext*;
+    /// The libclang translation unit, needed by `emit_macro` to tokenize a
+    /// macro definition's extent (`clang_tokenize`).
+    tu:          void*;
     count:       i32;
     /// The extern module's alias namespace (e.g. `probe`/`llvm`); emitted
     /// types are qualified under it via StructDeclNode.binding_namespace.
@@ -113,6 +116,21 @@ function visit_enum_const(cursor: CXCursor, parent: CXCursor, client: void*) -> 
     return Clang::VISIT_CONTINUE;
 }
 
+/// Push an alias-namespaced immutable global `const name = <init>` — the shape
+/// both anonymous-enum constants and object-like `#define` macros lower to.
+/// `binding_namespace` keeps it reachable only as `alias::name` (never bare).
+function emit_alias_const(st: ImportState*, name_sym: SymbolStr,
+                         type_annotation: TypeAnnotation*, init: ExpressionNode*) -> void {
+    mut vnode: VarDeclNode* = new VarDeclNode(name_sym, SourceSpan::none());
+    vnode.is_global = true;
+    vnode.is_mutable = false;
+    vnode.binding_namespace = st.alias;
+    vnode.type_annotation = type_annotation;
+    vnode.set_initializer(init);
+    st.seen_names.push(name_sym);
+    emit_top_level(st, vnode as ASTNode*);
+}
+
 /// Client data for the constant walk of an ANONYMOUS enum cursor, whose
 /// constants are plain integer constants (not enum variants) and so become
 /// global `const`s qualified under the alias namespace.
@@ -142,16 +160,8 @@ function visit_anon_enum_const(cursor: CXCursor, parent: CXCursor, client: void*
     const v: i64 = Clang::clang_getEnumConstantDeclValue(cursor);
     const v_str: string = format("%llu", v as u64);
     mut lit: LiteralNode* = new LiteralNode(v_str, LiteralKind::Integer, SourceSpan::none());
-
-    mut vnode: VarDeclNode* = new VarDeclNode(cname, SourceSpan::none());
-    vnode.is_global = true;
-    vnode.is_mutable = false;
-    vnode.binding_namespace = st.alias;
-    vnode.type_annotation = TypeMap::map_type_aliased(s.int_type, st.alias, st.ctx);
-    vnode.set_initializer(lit as ExpressionNode*);
-
-    st.seen_names.push(cname);
-    emit_top_level(st, vnode as ASTNode*);
+    emit_alias_const(st, cname,
+        TypeMap::map_type_aliased(s.int_type, st.alias, st.ctx), lit as ExpressionNode*);
     return Clang::VISIT_CONTINUE;
 }
 
@@ -291,6 +301,156 @@ function emit_typedef(cursor: CXCursor, st: ImportState*) -> void {
     emit_top_level(st, anode as ASTNode*);
 }
 
+/// True if a literal-token spelling is a string (`"..."`) or char (`'...'`)
+/// literal: a quote appears before any digit/sign.  (Optional `L`/`u`/`U`/`8`
+/// encoding prefixes precede the quote and are not digits, so they pass.)
+function macro_lit_is_text(s: string) -> boolean {
+    const len: u64 = libc::strlen(s);
+    for (mut i: u64 = 0; i < len; i++) {
+        const c: i8 = s[i];
+        if (c == '"' || c == '\'') { return true; }
+        if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') { return false; }
+    }
+    return false;
+}
+
+/// True if a numeric-literal spelling is a floating-point literal: it carries a
+/// `.` or a decimal exponent (`e`/`E`).  A hex literal (`0x…`) is excluded — its
+/// `e`/`f` are hex digits, not exponent/suffix (hex floats `0x1p4` are rare and
+/// treated as int, an accepted edge).
+function macro_lit_is_float(s: string) -> boolean {
+    const len: u64 = libc::strlen(s);
+    if (len == 0) { return false; }
+    const is_hex: boolean = len >= 2u64 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    for (mut i: u64 = 0; i < len; i++) {
+        const c: i8 = s[i];
+        if (c == '.') { return true; }
+        if (!is_hex && (c == 'e' || c == 'E')) { return true; }
+    }
+    return false;
+}
+
+/// True if an integer-literal spelling carries an unsigned (`u`/`U`) type
+/// suffix.  Only the trailing `u`/`U`/`l`/`L` suffix run is inspected.
+function macro_int_is_unsigned(s: string) -> boolean {
+    mut i: i64 = (libc::strlen(s) as i64) - 1;
+    while (i >= 0) {
+        const c: i8 = s[i as u64];
+        if (c == 'u' || c == 'U') { return true; }
+        if (c == 'l' || c == 'L') { i -= 1; continue; }
+        break;
+    }
+    return false;
+}
+
+/// Emit an object-like `#define NAME <literal>` as an alias-namespaced global
+/// `const`.  Per PLAN.md §3, only simple numeric (int/float) literals are
+/// bound; every unbindable form — function-like macro, builtin, valueless
+/// guard, compound/non-literal body, string/char literal — is REPORTED, never
+/// silently dropped.  String/char binding awaits escape-faithful lowering.
+function emit_macro(cursor: CXCursor, st: ImportState*) -> void {
+    if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0u32) { return; }
+    // Compiler/target PREDEFINED macros (`__STDC__`, `__GCC_HAVE_*`, …) live in
+    // a `<built-in>` pseudo-file and are NOT flagged as system headers, so the
+    // system-header filter misses them; restrict import to the header itself.
+    if (!Clang::is_from_main_file(cursor)) { return; }
+    const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    const name_str: string = st.ctx.intern_table.resolve(name_sym);
+    if (name_str.eq("")) { return; }
+    if (name_seen(st, name_sym)) { return; }
+
+    if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0u32) {
+        cdebug("[Bindgen] skipped function-like macro '%s' (unbindable)\n", name_str);
+        return;
+    }
+
+    // Tokenize the definition's extent: token[0] is the macro name, the rest
+    // are its replacement list.
+    const range: CXSourceRange = Clang::clang_getCursorExtent(cursor);
+    mut toks: CXToken* = null;
+    mut ntok: u32 = 0u32;
+    Clang::clang_tokenize(st.tu, range, &toks, &ntok);
+    if (toks == null) {
+        cdebug("[Bindgen] skipped macro '%s' (no tokens)\n", name_str);
+        return;
+    }
+    if (ntok < 2u32) {
+        Clang::clang_disposeTokens(st.tu, toks, ntok);
+        cdebug("[Bindgen] skipped valueless macro '%s' (guard, not a constant)\n", name_str);
+        return;
+    }
+
+    // Accept either `<literal>` or `<+|-> <numeric-literal>`.
+    const nrepl: u32 = ntok - 1u32;
+    mut neg: boolean = false;
+    mut lit_idx: u32 = 1u32;
+    mut bindable: boolean = true;
+    if (nrepl == 2u32) {
+        const k0: i32 = Clang::clang_getTokenKind(*(toks + 1));
+        const s0: string = Clang::token_spelling(st.tu, *(toks + 1), st.ctx);
+        if (k0 == Clang::TOKEN_PUNCTUATION && (s0.eq("-") || s0.eq("+"))) {
+            neg = s0.eq("-");
+            lit_idx = 2u32;
+        } else {
+            bindable = false;
+        }
+    } else if (nrepl != 1u32) {
+        bindable = false;
+    }
+    if (!bindable) {
+        Clang::clang_disposeTokens(st.tu, toks, ntok);
+        cdebug("[Bindgen] skipped compound macro '%s' (non-trivial replacement)\n", name_str);
+        return;
+    }
+
+    const litk: i32 = Clang::clang_getTokenKind(*(toks + lit_idx));
+    const spell: string = Clang::token_spelling(st.tu, *(toks + lit_idx), st.ctx);
+    if (litk != Clang::TOKEN_LITERAL) {
+        Clang::clang_disposeTokens(st.tu, toks, ntok);
+        cdebug("[Bindgen] skipped macro '%s' (replacement not a literal: '%s')\n",
+               name_str, spell);
+        return;
+    }
+    if (macro_lit_is_text(spell)) {
+        Clang::clang_disposeTokens(st.tu, toks, ntok);
+        cdebug("[Bindgen] skipped string/char macro '%s' (not yet supported)\n", name_str);
+        return;
+    }
+
+    if (macro_lit_is_float(spell)) {
+        // codegen's float path parses the literal text via sscanf("%lf"), which
+        // reads a leading sign, so prepend '-' for a negative macro.
+        const ftext: string = if (neg) { "-" + spell } else { spell };
+        mut flit: LiteralNode* = new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
+        emit_alias_const(st, name_sym, TypeMap::make_prim("f64", st.ctx), flit as ExpressionNode*);
+        Clang::clang_disposeTokens(st.tu, toks, ntok);
+        return;
+    }
+
+    // Integer literal: strtoull(base 0) follows C lexing (0x hex, 0 octal,
+    // decimal) and stops at the type suffix.  Pick the narrowest type that
+    // holds the value, mirroring C integer-literal typing; emit the value as a
+    // u64 decimal (negative -> two's-complement, truncated to width at codegen).
+    const has_u: boolean = macro_int_is_unsigned(spell);
+    const mag: u64 = libc::strtoull(spell as u8*, null, 0);
+    mut type_name: string = "i32";
+    mut value_u64: u64 = mag;
+    if (neg) {
+        const sval: i64 = 0i64 - (mag as i64);
+        value_u64 = sval as u64;
+        type_name = if (sval >= (0i64 - 2147483648i64)) { "i32" } else { "i64" };
+    } else if (has_u) {
+        type_name = if (mag <= 4294967295u64) { "u32" } else { "u64" };
+    } else {
+        type_name = if (mag <= 2147483647u64) { "i32" }
+                    else { if (mag <= 9223372036854775807u64) { "i64" } else { "u64" } };
+    }
+    mut ilit: LiteralNode* =
+        new LiteralNode(format("%llu", value_u64), LiteralKind::Integer, SourceSpan::none());
+    emit_alias_const(st, name_sym, TypeMap::make_prim(type_name, st.ctx), ilit as ExpressionNode*);
+    Clang::clang_disposeTokens(st.tu, toks, ntok);
+}
+
 /// libclang cursor visitor.  Emits a FunctionDeclNode per top-level
 /// FunctionDecl, and (unless `functions_only`) typedef/struct/union/enum
 /// declarations.  System-header decls are filtered out (`is_in_system_header`)
@@ -322,6 +482,8 @@ function visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         emit_record(cursor, st, true);
     } else if (k == Clang::CURSOR_ENUM_DECL) {
         emit_enum(cursor, st);
+    } else if (k == Clang::CURSOR_MACRO_DEFINITION) {
+        emit_macro(cursor, st);
     }
     return Clang::VISIT_CONTINUE;
 }
@@ -445,7 +607,8 @@ type struct Importer {
         }
 
         const tu: void* = Clang::clang_parseTranslationUnit(
-            index, source_filename, &args[0], nargs, unsaved, num_unsaved, 0u32);
+            index, source_filename, &args[0], nargs, unsaved, num_unsaved,
+            Clang::TU_DETAILED_PREPROCESSING_RECORD);
         if ((tu as void*) == null) {
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0806_HEADER_PREPROC_FAILED,
@@ -457,6 +620,7 @@ type struct Importer {
         mut st: ImportState = ImportState {
             extern_node:    extern_node,
             ctx:            ctx,
+            tu:             tu,
             count:          0,
             alias:          extern_node.namespace_alias,
             functions_only: extern_node.has_directive("functions_only"),
