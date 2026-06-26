@@ -61,6 +61,24 @@ type struct CXSourceLocation {
     int_data: u32;
 }
 
+/// `{ const void *ptr_data[2]; unsigned begin_int_data; unsigned end_int_data; }`
+/// — 24 bytes.  A half-open source range; `clang_getCursorExtent` returns one,
+/// and `clang_tokenize` consumes it to recover an object-like `#define`'s
+/// replacement tokens.
+type struct CXSourceRange {
+    ptr_data:       void*[2];
+    begin_int_data: u32;
+    end_int_data:   u32;
+}
+
+/// `{ unsigned int_data[4]; void *ptr_data; }` — 24 bytes.  One lexed token
+/// from `clang_tokenize`; passed BY VALUE to the token accessors (same 24-byte
+/// ABI shape as CXType, handled by the Phase-0 spike).
+type struct CXToken {
+    int_data: u32[4];
+    ptr_data: void*;
+}
+
 // ---- CXCursorKind / CXChildVisitResult constants ----
 const CURSOR_STRUCT_DECL: i32        = 2;
 const CURSOR_UNION_DECL: i32         = 3;
@@ -69,7 +87,21 @@ const CURSOR_FIELD_DECL: i32         = 6;
 const CURSOR_ENUM_CONSTANT_DECL: i32 = 7;
 const CURSOR_FUNCTION_DECL: i32      = 8;
 const CURSOR_TYPEDEF_DECL: i32       = 20;
+const CURSOR_MACRO_DEFINITION: i32   = 501;
 const VISIT_CONTINUE: i32 = 1;
+
+// ---- CXTokenKind constants ----
+const TOKEN_PUNCTUATION: i32 = 0;
+const TOKEN_KEYWORD: i32     = 1;
+const TOKEN_IDENTIFIER: i32  = 2;
+const TOKEN_LITERAL: i32     = 3;
+const TOKEN_COMMENT: i32     = 4;
+
+// ---- CXTranslationUnit_Flags ----
+/// Keep a detailed preprocessing record so `#define` / `#include` /
+/// macro-expansion cursors appear in the TU walk (needed to import
+/// object-like macro constants).
+const TU_DETAILED_PREPROCESSING_RECORD: u32 = 0x01u32;
 
 // ---- CXTypeKind constants (stable libclang ABI) ----
 const TK_Void: i32       = 2;
@@ -152,6 +184,16 @@ extern "C" {
     function clang_Location_isInSystemHeader(loc: CXSourceLocation) -> i32;
     function clang_Location_isFromMainFile(loc: CXSourceLocation) -> i32;
 
+    // Preprocessor / macro introspection (object-like #define import).
+    function clang_Cursor_isMacroFunctionLike(c: CXCursor) -> u32;
+    function clang_Cursor_isMacroBuiltin(c: CXCursor) -> u32;
+    function clang_getCursorExtent(c: CXCursor) -> CXSourceRange;
+    function clang_tokenize(tu: void*, range: CXSourceRange,
+        tokens: CXToken**, num_tokens: u32*) -> void;
+    function clang_getTokenKind(t: CXToken) -> i32;
+    function clang_getTokenSpelling(tu: void*, t: CXToken) -> CXString;
+    function clang_disposeTokens(tu: void*, tokens: CXToken*, num_tokens: u32) -> void;
+
     // CXString access.
     function clang_getCString(s: CXString) -> u8*;
     function clang_disposeString(s: CXString) -> void;
@@ -167,11 +209,32 @@ function is_in_system_header(cursor: CXCursor) -> boolean {
     return clang_Location_isInSystemHeader(loc) != 0;
 }
 
+/// True when `cursor` is located in the translation unit's MAIN file (the
+/// imported header itself).  Used to keep object-like `#define` import to the
+/// user's own header — the compiler/target PREDEFINED macros (`__STDC__`,
+/// `__GCC_HAVE_DWARF2_CFI_ASM`, …) live in a `<built-in>` pseudo-file, are NOT
+/// flagged as system headers, and would otherwise leak into the alias.
+function is_from_main_file(cursor: CXCursor) -> boolean {
+    const loc: CXSourceLocation = clang_getCursorLocation(cursor);
+    return clang_Location_isFromMainFile(loc) != 0;
+}
+
 /// True for an anonymous tag declaration (`struct {...}` / `enum {...}` with
 /// no name).  Use this rather than testing the cursor spelling for emptiness:
 /// libclang reports a synthetic spelling (`enum (unnamed at …)`) for these.
 function is_anonymous(cursor: CXCursor) -> boolean {
     return clang_Cursor_isAnonymous(cursor) != 0u32;
+}
+
+/// Copy a token's spelling into an owned string (backed by the intern table,
+/// so it outlives the CXString that is disposed here).  Used to read an
+/// object-like macro's replacement token.
+function token_spelling(tu: void*, token: CXToken, ctx: CompilationContext*) -> string {
+    const s: CXString = clang_getTokenSpelling(tu, token);
+    const cstr: u8* = clang_getCString(s);
+    const out: string = ctx.intern_table.resolve(ctx.intern_table.intern(cstr as string));
+    clang_disposeString(s);
+    return out;
 }
 
 /// Intern a cursor's spelling (e.g. a function name) into `ctx`.  The C
