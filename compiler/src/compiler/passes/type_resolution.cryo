@@ -1023,7 +1023,7 @@ type struct TypeResolutionPasses {
         match (stmt.kind) {
             NodeKind::StructDeclaration => {
                 const node: StructDeclNode* = stmt as StructDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                 mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
                 if (!ty.is_valid()) {
                     ty = arena.lookup_by_name(node.name);
@@ -1031,7 +1031,10 @@ type struct TypeResolutionPasses {
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
-                if (!qualified_sym.equals(node.name)) {
+                // Bare-name mapping only for file-namespaced types; a
+                // C-imported struct (binding_namespace set) stays
+                // qualified-only (`cit::Vec2`).
+                if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
@@ -1053,7 +1056,7 @@ type struct TypeResolutionPasses {
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                 mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
                 if (!ty.is_valid()) {
                     ty = arena.lookup_by_name(node.name);
@@ -1061,7 +1064,7 @@ type struct TypeResolutionPasses {
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
-                if (!qualified_sym.equals(node.name)) {
+                if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                 }
             }
@@ -1359,10 +1362,13 @@ type struct TypeResolutionPasses {
             }
             NodeKind::TypeAliasDeclaration => {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.alias_name);
+                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.alias_name, node.binding_namespace);
                 const ty: TypeRef = arena.lookup_by_name(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                }
+                if (!qualified_sym.equals(node.alias_name) && node.binding_namespace.is_empty()) {
+                    ctx.decl_index.register_name_mapping(node.alias_name, qualified_sym);
                 }
             }
             _ => {}
@@ -2433,7 +2439,7 @@ type struct TypeResolutionPasses {
                         node.resolved_target = target;
                         // Update the TypeAliasType in the arena with the resolved target
                         const alias_ref: TypeRef = runner.arena.lookup_by_name(
-                            ctx.qualify_symbol_sym(node.alias_name));
+                            ctx.qualify_binding_sym(node.alias_name, node.binding_namespace));
                         if (alias_ref.is_valid()) {
                             const alias_ty: Type* = runner.arena.lookup(alias_ref.id);
                             if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
@@ -2441,8 +2447,9 @@ type struct TypeResolutionPasses {
                                 alias_obj.set_target(target);
                             }
                         }
-                        // Register in module type registry
-                        if (module_registry != null) {
+                        // Register in module type registry (file-namespaced
+                        // aliases only; C-imported typedefs stay qualified-only).
+                        if (module_registry != null && node.binding_namespace.is_empty()) {
                             module_registry.register_type_alias(node.alias_name, target);
                         }
                         alias_count++;
@@ -2684,9 +2691,11 @@ type struct TypeResolutionPasses {
             match (stmt.kind) {
                 NodeKind::StructDeclaration => {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (ty.is_valid() && module_registry != null) {
+                    // C-imported types stay out of the bare-keyed ModuleTypeRegistry
+                    // (they're qualified-only, `cit::Vec2`).
+                    if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
                         const vis: TypeVisibility = node.is_public ?
                             TypeVisibility::Public : TypeVisibility::Private;
                         module_registry.register_type(module_name, node.name, ty, vis);
@@ -2706,9 +2715,9 @@ type struct TypeResolutionPasses {
                 }
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (ty.is_valid() && module_registry != null) {
+                    if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
                         const vis: TypeVisibility = node.is_public ?
                             TypeVisibility::Public : TypeVisibility::Private;
                         module_registry.register_type(module_name, node.name, ty, vis);
@@ -2841,7 +2850,7 @@ type struct TypeResolutionPasses {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     if (node.is_generic()) { continue; }
 
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (!type_ref.is_valid()) { continue; }
 
@@ -3055,7 +3064,7 @@ type struct TypeResolutionPasses {
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
 
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     mut type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (!type_ref.is_valid()) {
                         type_ref = arena.lookup_by_name(qualified_sym);

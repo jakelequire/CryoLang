@@ -1,22 +1,22 @@
 /// CXType -> Cryo type-annotation mapper
 ///
-/// Replaces the hand-rolled string-matching `c_type_to_annotation`: instead
-/// of pattern-matching C type *spellings*, it inspects the libclang
-/// CANONICAL type (typedefs/elaborated forms already resolved), so e.g.
-/// `LLVMModuleRef` (typedef void*) -> `void*` and `size_t` -> `u64` fall out
-/// of the real type, not a name table.
+/// Maps a libclang CANONICAL type (typedefs/elaborated forms resolved) to a
+/// Cryo TypeAnnotation.  Driving off the canonical type means `size_t` -> `u64`
+/// and `LLVMModuleRef` (typedef void*) -> `void*` fall out of the real type,
+/// not a name table.
 ///
-/// Phase 1 keeps exact parity with the old engine's *output*: scalars map to
-/// the matching Cryo primitive, `T*` to a (const-aware, §1) pointer, `enum`
-/// to `i32`, and everything else (records, function pointers, unexposed) to
-/// the opaque `void*` fallback.  Emitting real record/fn-pointer types is
-/// Phase 2.
+/// Phase 2 emits real aggregate types: a record/enum reference maps to the
+/// NAMED Cryo type the importer emits, qualified under the import's alias
+/// namespace (`probe::Point`); a function-pointer pointee maps to a Cryo
+/// `(Args) -> Ret` type; fixed C arrays map to Cryo fixed-array fields.  A
+/// `null` alias (or an anonymous/unnameable record) falls back to the Phase-1
+/// opaque `void*`, preserving the old behavior for references we can't name.
 
 namespace Compiler::Bindgen::TypeMap;
 
 import ffi::libc;
 import Compiler::Bindgen::Clang;
-import Compiler::Bindgen::Clang::{ CXType };
+import Compiler::Bindgen::Clang::{ CXType, CXCursor, CXString };
 import Compiler::CompilationContext;
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Compiler::Diag::{ SourceSpan };
@@ -33,7 +33,7 @@ function make_prim(name: string, ctx: CompilationContext*) -> TypeAnnotation* {
 }
 
 /// Heap-allocate a PointerAnnotation wrapped in a TypeAnnotation.  `is_const`
-/// marks `const T*` (the pointee is const — §1 frontend-only flag).
+/// marks `const T*` (the pointee is const — frontend-only flag).
 function make_ptr(inner: TypeAnnotation*, is_const: boolean) -> TypeAnnotation* {
     const ptr: PointerAnnotation* = new PointerAnnotation { inner: inner, is_const: is_const, span: SourceSpan::none() };
     const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
@@ -41,8 +41,37 @@ function make_ptr(inner: TypeAnnotation*, is_const: boolean) -> TypeAnnotation* 
     return ann;
 }
 
-/// CXTypeKind -> Cryo primitive name, mirroring the old scalar table.
-/// Returns "" for kinds that are not plain scalars (caller handles those).
+/// Heap-allocate a NamedAnnotation (a reference to an emitted record/enum).
+/// `qualified` is the alias-qualified name (e.g. `probe::Point`).
+function make_named(qualified: SymbolStr) -> TypeAnnotation* {
+    const named: NamedAnnotation* = new NamedAnnotation {
+        name: qualified, span: SourceSpan::none(), pre_resolved: TypeRef::invalid()
+    };
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Named(named);
+    return ann;
+}
+
+/// Heap-allocate a fixed-size ArrayAnnotation (`T[N]`).
+function make_array(element: TypeAnnotation*, size: i64) -> TypeAnnotation* {
+    const arr: ArrayAnnotation* = new ArrayAnnotation { element: element, size: size, span: SourceSpan::none() };
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Array(arr);
+    return ann;
+}
+
+/// Heap-allocate a FunctionAnnotation (`(params) -> ret`) — a Cryo function
+/// pointer type.
+function make_function(params: TypeAnnotation*[], ret: TypeAnnotation*) -> TypeAnnotation* {
+    const f: FunctionAnnotation* = new FunctionAnnotation {
+        parameters: params, return_type: ret, span: SourceSpan::none()
+    };
+    const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
+    *ann = TypeAnnotation::Function(f);
+    return ann;
+}
+
+/// CXTypeKind -> Cryo primitive name.  Returns "" for non-scalar kinds.
 function scalar_name(k: i32) -> string {
     if (k == Clang::TK_Void)       { return "void"; }
     if (k == Clang::TK_Bool)       { return "boolean"; }
@@ -61,25 +90,78 @@ function scalar_name(k: i32) -> string {
     if (k == Clang::TK_Float)      { return "f32"; }
     if (k == Clang::TK_Double)     { return "f64"; }
     if (k == Clang::TK_LongDouble) { return "f64"; }
-    if (k == Clang::TK_Enum)       { return "i32"; }
     return "";
 }
 
-/// Map a libclang type to a Cryo TypeAnnotation (Phase-1 rules).
-function map_type(t: CXType, ctx: CompilationContext*) -> TypeAnnotation* {
+/// The bare tag name of a record/enum CXType (e.g. `Point` for `struct Point`),
+/// interned into `ctx`.  Returns an empty SymbolStr for anonymous types.
+function tag_name(t: CXType, ctx: CompilationContext*) -> SymbolStr {
+    const decl: CXCursor = Clang::clang_getTypeDeclaration(t);
+    const s: CXString = Clang::clang_getCursorSpelling(decl);
+    const cstr: u8* = Clang::clang_getCString(s);
+    if (cstr == null || libc::strlen(cstr as string) == 0) {
+        Clang::clang_disposeString(s);
+        return SymbolStr::empty();
+    }
+    const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
+    Clang::clang_disposeString(s);
+    return sym;
+}
+
+/// Qualify a record/enum tag name under the import's alias namespace.
+/// `alias` empty => no qualification (bare name).
+function qualify_under_alias(tag: SymbolStr, alias: SymbolStr, ctx: CompilationContext*) -> SymbolStr {
+    if (alias.is_empty()) {
+        return tag;
+    }
+    const ns: string = ctx.intern_table.resolve(alias);
+    const bare: string = ctx.intern_table.resolve(tag);
+    return ctx.intern_table.intern(ns + "::" + bare);
+}
+
+/// Map a libclang type to a Cryo TypeAnnotation.  `alias` is the import's
+/// extern-module alias namespace (empty for the Phase-1 / functions-only path,
+/// in which records collapse to `void*` exactly as before).
+function map_type_aliased(t: CXType, alias: SymbolStr, ctx: CompilationContext*) -> TypeAnnotation* {
     const c: CXType = Clang::clang_getCanonicalType(t);
     const k: i32 = c.kind;
 
     if (k == Clang::TK_Pointer) {
         const pointee: CXType = Clang::clang_getPointeeType(c);
         const pc: CXType = Clang::clang_getCanonicalType(pointee);
-        // Phase-1 parity: a function-pointer pointee collapses to `void*`.
+        // Function-pointer pointee -> a Cryo `(Args) -> Ret` type (already a
+        // pointer-shaped value in Cryo, so no extra Pointer wrapper).
         if (pc.kind == Clang::TK_FunctionProto || pc.kind == Clang::TK_FunctionNoProto) {
-            return make_ptr(make_prim("void", ctx), false);
+            mut params: TypeAnnotation*[] = [];
+            const nargs: i32 = Clang::clang_getNumArgTypes(pc);
+            for (mut i: i32 = 0; i < nargs; i++) {
+                params.push(map_type_aliased(Clang::clang_getArgType(pc, i as u32), alias, ctx));
+            }
+            const ret: TypeAnnotation* = map_type_aliased(Clang::clang_getResultType(pc), alias, ctx);
+            return make_function(params, ret);
         }
         const is_const: boolean = Clang::clang_isConstQualifiedType(pointee) != 0u32;
-        const inner: TypeAnnotation* = map_type(pointee, ctx);
+        const inner: TypeAnnotation* = map_type_aliased(pointee, alias, ctx);
         return make_ptr(inner, is_const);
+    }
+
+    if (k == Clang::TK_ConstantArray) {
+        const elem: TypeAnnotation* = map_type_aliased(Clang::clang_getArrayElementType(c), alias, ctx);
+        return make_array(elem, Clang::clang_getArraySize(c));
+    }
+
+    if (k == Clang::TK_Record || k == Clang::TK_Enum) {
+        // Reference to an emitted aggregate: name it, qualified under the
+        // alias.  An anonymous/unnameable record falls back to `void*`.
+        const tag: SymbolStr = tag_name(c, ctx);
+        if (!tag.is_empty() && !alias.is_empty()) {
+            return make_named(qualify_under_alias(tag, alias, ctx));
+        }
+        // Enums with no emittable name still round-trip as their integer width.
+        if (k == Clang::TK_Enum) {
+            return make_prim("i32", ctx);
+        }
+        return make_ptr(make_prim("void", ctx), false);
     }
 
     const name: string = scalar_name(k);
@@ -87,7 +169,13 @@ function map_type(t: CXType, ctx: CompilationContext*) -> TypeAnnotation* {
         return make_prim(name, ctx);
     }
 
-    // Records, unexposed types, etc. -> opaque `void*`, exactly as the old
-    // engine's "unknown -> void*" rule.  (Real record types are Phase 2.)
+    // Unexposed / incomplete-array / unknown -> opaque `void*` (Phase-1 rule).
     return make_ptr(make_prim("void", ctx), false);
+}
+
+/// Phase-1-compatible entry: no alias, so records/enums collapse to the opaque
+/// fallback.  Retained for the functions-only path and any caller that doesn't
+/// thread an alias.
+function map_type(t: CXType, ctx: CompilationContext*) -> TypeAnnotation* {
+    return map_type_aliased(t, SymbolStr::empty(), ctx);
 }

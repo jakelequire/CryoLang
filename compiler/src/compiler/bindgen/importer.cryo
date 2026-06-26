@@ -34,29 +34,97 @@ type struct ImportState {
     extern_node: ExternBlockNode*;
     ctx:         CompilationContext*;
     count:       i32;
+    /// The extern module's alias namespace (e.g. `probe`/`llvm`); emitted
+    /// types are qualified under it via StructDeclNode.binding_namespace.
+    alias:       SymbolStr;
+    /// `![functions_only]`: emit prototypes only, no struct/enum/typedef
+    /// (the compiler's own `llvm` bootstrap import sets this — see HANDOFF §1).
+    functions_only: boolean;
+    /// Names already emitted as a top-level type decl (alias-namespaced),
+    /// for dedup across struct/enum/typedef (they share the alias namespace).
+    seen_names:   SymbolStr[];
+    /// Parallel map (name -> emitted StructDeclNode) so a struct's defining
+    /// cursor can populate the empty node left by an earlier forward-decl
+    /// cursor (libclang visits `struct Foo;` then `struct Foo {...}`).
+    struct_names: SymbolStr[];
+    struct_nodes: StructDeclNode*[];
 }
 
-/// libclang cursor visitor.  Emits one FunctionDeclNode per top-level
-/// FunctionDecl; ignores everything else (structs/typedefs/enums are Phase 2).
-/// A free function so it can be passed to `clang_visitChildren` by bare name.
-function visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-    const st: ImportState* = client as ImportState*;
+/// True if `name` was already emitted as a top-level type in this import.
+function name_seen(st: ImportState*, name: SymbolStr) -> boolean {
+    for (mut i: i64 = 0; i < st.seen_names.length; i++) {
+        if (st.seen_names[i].equals(name)) { return true; }
+    }
+    return false;
+}
 
-    if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_FUNCTION_DECL) {
+/// The StructDeclNode previously emitted for `name`, or null.
+function find_struct(st: ImportState*, name: SymbolStr) -> StructDeclNode* {
+    for (mut i: i64 = 0; i < st.struct_names.length; i++) {
+        if (st.struct_names[i].equals(name)) { return st.struct_nodes[i]; }
+    }
+    return null;
+}
+
+/// Append a synthesized top-level declaration to the program so it flows
+/// through TypeDeclaration -> TypeResolution -> codegen like any source decl.
+function emit_top_level(st: ImportState*, node: ASTNode*) -> void {
+    st.ctx.artifacts.ast.root.statements.push(node);
+}
+
+/// Client data for the nested field walk of a struct/union cursor.
+type struct FieldCollectState {
+    struct_node: StructDeclNode*;
+    alias:       SymbolStr;
+    ctx:         CompilationContext*;
+}
+
+/// Nested visitor: one FieldDeclNode per FieldDecl child of a record cursor.
+function visit_field(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+    if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_FIELD_DECL) {
         return Clang::VISIT_CONTINUE;
     }
+    const st: FieldCollectState* = client as FieldCollectState*;
+    const fname: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
+    fnode.type_annotation =
+        TypeMap::map_type_aliased(Clang::clang_getCursorType(cursor), st.alias, st.ctx);
+    st.struct_node.add_field(fnode);
+    return Clang::VISIT_CONTINUE;
+}
 
+/// Client data for the nested constant walk of an enum cursor.
+type struct EnumCollectState {
+    enum_node: EnumDeclNode*;
+    ctx:       CompilationContext*;
+}
+
+/// Nested visitor: one EnumVariantNode per EnumConstantDecl child.
+function visit_enum_const(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+    if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_ENUM_CONSTANT_DECL) {
+        return Clang::VISIT_CONTINUE;
+    }
+    const st: EnumCollectState* = client as EnumCollectState*;
+    const cname: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    mut vnode: EnumVariantNode* = new EnumVariantNode(cname, SourceSpan::none());
+    vnode.set_explicit_value(Clang::clang_getEnumConstantDeclValue(cursor));
+    st.enum_node.add_variant(vnode);
+    return Clang::VISIT_CONTINUE;
+}
+
+/// Emit one FunctionDeclNode for a C function prototype (Phase-1 behavior).
+function emit_function(cursor: CXCursor, st: ImportState*) -> void {
     const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
     mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
     func.return_type_annotation =
-        TypeMap::map_type(Clang::clang_getCursorResultType(cursor), st.ctx);
+        TypeMap::map_type_aliased(Clang::clang_getCursorResultType(cursor), st.alias, st.ctx);
 
     mut params: VarDeclNode*[] = [];
     const nargs: i32 = Clang::clang_Cursor_getNumArguments(cursor);
     for (mut i: i32 = 0; i < nargs; i++) {
         const arg: CXCursor = Clang::clang_Cursor_getArgument(cursor, i as u32);
         const ptype: TypeAnnotation* =
-            TypeMap::map_type(Clang::clang_getCursorType(arg), st.ctx);
+            TypeMap::map_type_aliased(Clang::clang_getCursorType(arg), st.alias, st.ctx);
         const pname: SymbolStr = Clang::intern_arg_name(arg, i, st.ctx);
         mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
         pnode.type_annotation = ptype;
@@ -68,6 +136,144 @@ function visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
 
     st.extern_node.add_function(func);
     st.count = st.count + 1;
+}
+
+/// Emit a `type struct` for a struct (or a layout-faithful opaque blob for a
+/// union — Cryo has no native union).  Find-or-populate handles libclang's
+/// forward-decl-then-definition double visit and truly-opaque records.
+function emit_record(cursor: CXCursor, st: ImportState*, is_union: boolean) -> void {
+    const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    if (st.ctx.intern_table.resolve(name_sym).eq("")) {
+        // Anonymous record: not nameable as a top-level type. Reported, not
+        // silently relied upon — references fall back to void* in TypeMap.
+        cdebug("[Bindgen] skipped anonymous record (use a typedef to name it)\n");
+        return;
+    }
+
+    if (is_union) {
+        // No native union: emit a `![repr(c)]` struct holding one storage
+        // field sized/aligned to the union, so it round-trips by value over
+        // FFI (no field access — flagged limitation).
+        if (name_seen(st, name_sym)) { return; }
+        const ct: CXType = Clang::clang_getCursorType(cursor);
+        const size: i64 = Clang::clang_Type_getSizeOf(ct);
+        const align: i64 = Clang::clang_Type_getAlignOf(ct);
+        if (size <= 0) { return; }
+        mut unode: StructDeclNode* = new StructDeclNode(name_sym, SourceSpan::none());
+        unode.binding_namespace = st.alias;
+        unode.repr_c = true;
+        if (align > 0) { unode.min_alignment = align as u64; }
+        mut storage: FieldDeclNode* =
+            new FieldDeclNode(st.ctx.intern_table.intern("_storage"), SourceSpan::none());
+        storage.type_annotation = TypeMap::make_array(TypeMap::make_prim("u8", st.ctx), size);
+        unode.add_field(storage);
+        st.seen_names.push(name_sym);
+        emit_top_level(st, unode as ASTNode*);
+        return;
+    }
+
+    mut node: StructDeclNode* = find_struct(st, name_sym);
+    if (node == null) {
+        node = new StructDeclNode(name_sym, SourceSpan::none());
+        node.binding_namespace = st.alias;
+        node.repr_c = true;
+        st.seen_names.push(name_sym);
+        st.struct_names.push(name_sym);
+        st.struct_nodes.push(node);
+        emit_top_level(st, node as ASTNode*);
+    }
+    // Populate fields from this cursor only if not already populated (an
+    // earlier forward-decl cursor left it empty; the definition fills it).
+    if (node.fields.length == 0) {
+        mut fcs: FieldCollectState =
+            FieldCollectState { struct_node: node, alias: st.alias, ctx: st.ctx };
+        Clang::clang_visitChildren(cursor, visit_field, (&fcs) as void*);
+    }
+}
+
+/// Emit a `type enum E : <int> { NAME = value; ... }` for a NAMED C enum.
+/// Anonymous enums (whose constants are plain global ints, e.g. the
+/// `LLVMIntEQ` blocks) are reported and skipped — emitting their constants as
+/// free `const`s is a deliberate follow-up.
+function emit_enum(cursor: CXCursor, st: ImportState*) -> void {
+    const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    if (st.ctx.intern_table.resolve(name_sym).eq("")) {
+        cdebug("[Bindgen] skipped anonymous enum (constants not yet imported)\n");
+        return;
+    }
+    if (name_seen(st, name_sym)) { return; }
+
+    mut enode: EnumDeclNode* = new EnumDeclNode(name_sym, SourceSpan::none());
+    enode.binding_namespace = st.alias;
+    enode.repr_c = true;
+    enode.discriminant_annotation =
+        TypeMap::map_type_aliased(Clang::clang_getEnumDeclIntegerType(cursor), st.alias, st.ctx);
+
+    mut ecs: EnumCollectState = EnumCollectState { enum_node: enode, ctx: st.ctx };
+    Clang::clang_visitChildren(cursor, visit_enum_const, (&ecs) as void*);
+
+    st.seen_names.push(name_sym);
+    emit_top_level(st, enode as ASTNode*);
+}
+
+/// Emit a `type alias` for a C typedef.  Skips the redundant
+/// `typedef struct Foo Foo;` shape (the struct already supplies `alias::Foo`,
+/// and emitting an alias of the same qualified name would collide / E0207).
+function emit_typedef(cursor: CXCursor, st: ImportState*) -> void {
+    const name_sym: SymbolStr = Clang::intern_spelling(cursor, st.ctx);
+    const name_str: string = st.ctx.intern_table.resolve(name_sym);
+    if (name_str.eq("")) { return; }
+
+    const underlying: CXType = Clang::clang_getTypedefDeclUnderlyingType(cursor);
+    const canon: CXType = Clang::clang_getCanonicalType(underlying);
+    if (canon.kind == Clang::TK_Record || canon.kind == Clang::TK_Enum) {
+        const tag: SymbolStr = TypeMap::tag_name(canon, st.ctx);
+        if (!tag.is_empty() && st.ctx.intern_table.resolve(tag).eq(name_str)) {
+            return; // typedef name == tag name; the record decl covers it.
+        }
+    }
+    if (name_seen(st, name_sym)) { return; }
+
+    mut anode: TypeAliasDeclNode* = new TypeAliasDeclNode(name_sym, SourceSpan::none());
+    anode.binding_namespace = st.alias;
+    anode.target_annotation = TypeMap::map_type_aliased(underlying, st.alias, st.ctx);
+
+    st.seen_names.push(name_sym);
+    emit_top_level(st, anode as ASTNode*);
+}
+
+/// libclang cursor visitor.  Emits a FunctionDeclNode per top-level
+/// FunctionDecl, and (unless `functions_only`) typedef/struct/union/enum
+/// declarations.  System-header decls are filtered out (`is_in_system_header`)
+/// so a header's own `#include <stddef.h>` does not drag glibc's ~100 internal
+/// typedefs into the alias namespace.  A free function so it can be passed to
+/// `clang_visitChildren` by bare name.
+function visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+    const st: ImportState* = client as ImportState*;
+
+    if (Clang::is_in_system_header(cursor)) {
+        return Clang::VISIT_CONTINUE;
+    }
+
+    const k: i32 = Clang::clang_getCursorKind(cursor);
+    if (k == Clang::CURSOR_FUNCTION_DECL) {
+        emit_function(cursor, st);
+        return Clang::VISIT_CONTINUE;
+    }
+
+    if (st.functions_only) {
+        return Clang::VISIT_CONTINUE;
+    }
+
+    if (k == Clang::CURSOR_TYPEDEF_DECL) {
+        emit_typedef(cursor, st);
+    } else if (k == Clang::CURSOR_STRUCT_DECL) {
+        emit_record(cursor, st, false);
+    } else if (k == Clang::CURSOR_UNION_DECL) {
+        emit_record(cursor, st, true);
+    } else if (k == Clang::CURSOR_ENUM_DECL) {
+        emit_enum(cursor, st);
+    }
     return Clang::VISIT_CONTINUE;
 }
 
@@ -199,7 +405,16 @@ type struct Importer {
             return 0;
         }
 
-        mut st: ImportState = ImportState { extern_node: extern_node, ctx: ctx, count: 0 };
+        mut st: ImportState = ImportState {
+            extern_node:    extern_node,
+            ctx:            ctx,
+            count:          0,
+            alias:          extern_node.namespace_alias,
+            functions_only: extern_node.has_directive("functions_only"),
+            seen_names:     [],
+            struct_names:   [],
+            struct_nodes:   [],
+        };
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, visit_decl, (&st) as void*);
 

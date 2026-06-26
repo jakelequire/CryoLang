@@ -2194,7 +2194,7 @@ It is the programmer's responsibility to ensure the Cryo signature matches the C
 
 ### 18.2 C Header Import
 
-For larger C libraries, transcribing every signature by hand is error-prone. Cryo can import a C header directly. The compiler invokes `clang` to preprocess the header and generates Cryo declarations for every function and symbol it finds.
+For larger C libraries, transcribing every signature by hand is error-prone. Cryo can import a C header directly. The compiler drives **libclang** (Clang's stable C API), which parses the header and generates Cryo declarations for the functions **and the structs, unions, enums, and typedefs** it finds.
 
 ```cryo
 extern module c := "C" {
@@ -2207,11 +2207,24 @@ function main() -> int {
     c::printf("Value: %d\n", 42);
     const buf: void* = c::malloc(256);
     c::free(buf);
+    // Imported C types are reached through the alias too:
+    const p: c::Point = c::Point { x: 1 as i32, y: 2 as i32 };
     return 0;
 }
 ```
 
-Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) — exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access them with `::` to prevent collisions between C and Cryo names.
+Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) — exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access both functions and types with `::` (`c::printf`, `c::Point`) to prevent collisions between C and Cryo names. Only declarations from the named header(s) are imported — types pulled in transitively from system headers (`size_t`, `int32_t`, …) are resolved to their Cryo primitive directly rather than re-emitted.
+
+Type mapping: a C `struct`/`union` becomes a `![repr(c)]` `type struct` (a union is a layout-faithful opaque storage blob — no field access); a named `enum` becomes a `type enum` with its explicit discriminant values; a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types are namespaced under the alias only (`c::Point`), never the global namespace.
+
+To import only a header's function prototypes — suppressing all struct/enum/typedef emission — apply the **`![functions_only]`** directive to the extern-module block. It is valid only on a C-import extern module:
+
+```cryo
+![functions_only]
+extern module c := "C" {
+    #include "./api.h"   // import c::do_thing(...) etc.; skip the header's types
+}
+```
 
 An aliased import block holds **only** `#include` directives, never Cryo declarations; conversely, a plain `extern "C"` block (§18.1) holds **only** hand-written Cryo signatures, never `#include`. Don't also hand-declare a symbol that an imported header already defines (e.g. `puts` from `<stdio.h>`) — reach it through the alias (`c::puts`) instead.
 

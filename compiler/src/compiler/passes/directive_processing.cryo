@@ -218,6 +218,11 @@ type struct DirectiveProcessingPasses {
             // type args at a call site by unifying the callee's return type
             // against the call's expected type (return-type-driven inference).
             | "implicit"
+            // `![functions_only]`: on a C-header import extern module
+            // (`extern module x := "C" { #include ... }`), emit only the
+            // header's function prototypes — suppress struct/enum/typedef
+            // emission.  Used by the compiler's own `llvm` bootstrap import.
+            | "functions_only"
             // Bare-atom forms of the cfg/config gate.  These are sugar for
             // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
             | "windows" | "linux" | "macos" | "unix"
@@ -586,6 +591,18 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
+            // `![functions_only]`: zero args, extern-block target only.  Marks
+            // a C-import extern module as prototype-only (no struct/enum/typedef
+            // emission).  An error anywhere but an extern block.
+            "functions_only" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Extern) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "extern module", target);
+                }
+            }
+
             "derive" => {
                 if (argc == 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
@@ -624,7 +641,7 @@ type struct DirectiveProcessingPasses {
                     "inline", "noinline", "entry", "test", "ignore",
                     "should_panic", "config", "deprecated", "align",
                     "repr", "link", "target", "allow", "warn", "deny",
-                    "derive", "sink",
+                    "derive", "sink", "implicit", "functions_only",
                     "windows", "linux", "macos", "unix", "not"
                 ];
                 const best: string = find_best_candidate(name, cands);
@@ -1318,7 +1335,7 @@ type struct DirectiveProcessingPasses {
                             && !node.repr_transparent && node.min_alignment == 0) {
                         continue;
                     }
-                    const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qsym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref.id);
@@ -1347,7 +1364,7 @@ type struct DirectiveProcessingPasses {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
                     if (node.is_generic()) { continue; }
                     if (!node.repr_c && node.min_alignment == 0) { continue; }
-                    const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qsym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref.id);
