@@ -768,11 +768,11 @@ type struct PassRegistry {
             match (stmt.kind) {
                 NodeKind::StructDeclaration => {
                     const n: StructDeclNode* = stmt as StructDeclNode*;
-                    tsym = ctx.qualify_symbol_sym(n.name); tspan = n.span; is_type = true;
+                    tsym = ctx.qualify_binding_sym(n.name, n.binding_namespace); tspan = n.span; is_type = true;
                 }
                 NodeKind::EnumDeclaration => {
                     const n: EnumDeclNode* = stmt as EnumDeclNode*;
-                    tsym = ctx.qualify_symbol_sym(n.name); tspan = n.span; is_type = true;
+                    tsym = ctx.qualify_binding_sym(n.name, n.binding_namespace); tspan = n.span; is_type = true;
                 }
                 NodeKind::ClassDeclaration => {
                     const n: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -784,7 +784,7 @@ type struct PassRegistry {
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const n: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                    tsym = ctx.qualify_symbol_sym(n.alias_name); tspan = n.span; is_type = true;
+                    tsym = ctx.qualify_binding_sym(n.alias_name, n.binding_namespace); tspan = n.span; is_type = true;
                 }
                 _ => {}
             }
@@ -816,9 +816,14 @@ type struct PassRegistry {
                     const _intern: InternTable* = ctx.get_intern_table();
                     const _dbg: string = _intern.resolve(node.name);
                     cdebug("[TypeDecl]   -> Struct '%s'\n", _dbg);
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                    arena.create_struct(qualified_sym, module_sym);
-                    if (!qualified_sym.equals(node.name)) {
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const struct_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
+                    arena.create_struct(qualified_sym, struct_module_sym);
+                    // A C-imported type (binding_namespace set) is reachable
+                    // ONLY via its alias (`cit::Vec2`); registering its bare
+                    // name globally would pollute the namespace and shadow
+                    // same-named types in other modules.
+                    if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
                     type_count++;
@@ -828,9 +833,10 @@ type struct PassRegistry {
                     const _intern2: InternTable* = ctx.get_intern_table();
                     const _dbg2: string = _intern2.resolve(node.name);
                     cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
-                    arena.create_enum(qualified_sym, module_sym);
-                    if (!qualified_sym.equals(node.name)) {
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const enum_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
+                    arena.create_enum(qualified_sym, enum_module_sym);
+                    if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
                     type_count++;
@@ -855,7 +861,7 @@ type struct PassRegistry {
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                    const qualified_alias: SymbolStr = ctx.qualify_symbol_sym(node.alias_name);
+                    const qualified_alias: SymbolStr = ctx.qualify_binding_sym(node.alias_name, node.binding_namespace);
                     // Use qualified name (consistent with struct/enum/class/trait);
                     // target resolved in TypeResolution pass
                     const alias_ref: TypeRef = arena.create_type_alias(qualified_alias, TypeRef::invalid());
@@ -872,7 +878,13 @@ type struct PassRegistry {
                     // aliases by qualified name during TypeResolution Phase 3
                     // (before Phase 4 populates the index for other types).
                     ctx.decl_index.register_type(qualified_alias, alias_ref);
-                    ctx.decl_index.register_type(node.alias_name, alias_ref);
+                    // Bare-name registration only for file-namespaced aliases;
+                    // a C-imported typedef (binding_namespace set) stays
+                    // qualified-only (`cit::Celsius`) to avoid polluting the
+                    // global bare-name space.
+                    if (node.binding_namespace.is_empty()) {
+                        ctx.decl_index.register_type(node.alias_name, alias_ref);
+                    }
                     type_count++;
                 }
                 _ => {

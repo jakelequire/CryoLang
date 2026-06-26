@@ -49,8 +49,26 @@ type struct CXUnsavedFile {
     length:   u64;
 }
 
+/// `{ const void *ptr_data[2]; unsigned int_data; }` — 24 bytes.  Drives the
+/// system-header filter (`is_in_system_header`): libclang walks the WHOLE
+/// translation unit, including every transitively-`#include`d system header
+/// (`<stddef.h>`/`<stdint.h>` & friends), so without this filter type
+/// emission would pull ~100 glibc typedefs (`size_t`, `__off_t`, …) into the
+/// alias namespace.  (Phase 1 functions-only never hit this: system headers
+/// declare no functions.)
+type struct CXSourceLocation {
+    ptr_data: void*[2];
+    int_data: u32;
+}
+
 // ---- CXCursorKind / CXChildVisitResult constants ----
-const CURSOR_FUNCTION_DECL: i32 = 8;
+const CURSOR_STRUCT_DECL: i32        = 2;
+const CURSOR_UNION_DECL: i32         = 3;
+const CURSOR_ENUM_DECL: i32          = 5;
+const CURSOR_FIELD_DECL: i32         = 6;
+const CURSOR_ENUM_CONSTANT_DECL: i32 = 7;
+const CURSOR_FUNCTION_DECL: i32      = 8;
+const CURSOR_TYPEDEF_DECL: i32       = 20;
 const VISIT_CONTINUE: i32 = 1;
 
 // ---- CXTypeKind constants (stable libclang ABI) ----
@@ -72,9 +90,12 @@ const TK_Float: i32      = 21;
 const TK_Double: i32     = 22;
 const TK_LongDouble: i32 = 23;
 const TK_Pointer: i32    = 101;
+const TK_Record: i32     = 105;
 const TK_Enum: i32       = 106;
 const TK_FunctionNoProto: i32 = 110;
 const TK_FunctionProto: i32   = 111;
+const TK_ConstantArray: i32   = 112;
+const TK_IncompleteArray: i32 = 114;
 
 extern "C" {
     // Index / translation-unit lifecycle.
@@ -103,10 +124,42 @@ extern "C" {
     function clang_getCanonicalType(t: CXType) -> CXType;
     function clang_getPointeeType(t: CXType) -> CXType;
     function clang_isConstQualifiedType(t: CXType) -> u32;
+    function clang_getTypeSpelling(t: CXType) -> CXString;
+    /// Cursor declaring a record/enum type — used to recover the bare tag
+    /// name of a `struct Foo`/`enum E` reference so it can be qualified under
+    /// the import's alias namespace.
+    function clang_getTypeDeclaration(t: CXType) -> CXCursor;
+
+    // Phase 2: record / enum / typedef / array / function-pointer introspection.
+    function clang_getTypedefDeclUnderlyingType(c: CXCursor) -> CXType;
+    function clang_getEnumConstantDeclValue(c: CXCursor) -> i64;
+    function clang_getEnumDeclIntegerType(c: CXCursor) -> CXType;
+    function clang_Type_getSizeOf(t: CXType) -> i64;
+    function clang_Type_getAlignOf(t: CXType) -> i64;
+    function clang_getArrayElementType(t: CXType) -> CXType;
+    function clang_getArraySize(t: CXType) -> i64;
+    function clang_getNumArgTypes(t: CXType) -> i32;
+    function clang_getArgType(t: CXType, i: u32) -> CXType;
+    function clang_getResultType(t: CXType) -> CXType;
+
+    // Source-location queries (system-header filter).
+    function clang_getCursorLocation(c: CXCursor) -> CXSourceLocation;
+    function clang_Location_isInSystemHeader(loc: CXSourceLocation) -> i32;
+    function clang_Location_isFromMainFile(loc: CXSourceLocation) -> i32;
 
     // CXString access.
     function clang_getCString(s: CXString) -> u8*;
     function clang_disposeString(s: CXString) -> void;
+}
+
+/// True when `cursor` was declared in a system header (`<stddef.h>` & co.).
+/// THE Phase-2 filter: libclang exposes every transitively-included header's
+/// top-level decls, so type emission must drop the system-header ones (their
+/// `size_t`/`int32_t` typedefs map inline via the canonical type anyway) and
+/// keep only the user/project headers the import names.
+function is_in_system_header(cursor: CXCursor) -> boolean {
+    const loc: CXSourceLocation = clang_getCursorLocation(cursor);
+    return clang_Location_isInSystemHeader(loc) != 0;
 }
 
 /// Intern a cursor's spelling (e.g. a function name) into `ctx`.  The C
