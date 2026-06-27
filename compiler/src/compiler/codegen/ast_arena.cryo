@@ -1,0 +1,86 @@
+/// AST Arena
+///
+/// A process-global bump arena for the compiler's own AST nodes.  Every
+/// `new T(...)` whose `T` derives from `Compiler::AST::Node::ASTNode` is
+/// lowered by `NewDeleteEmitter::emit_new` to call `cryo_ast_arena_alloc`
+/// instead of `malloc`; the node's vtable seed and constructor run exactly
+/// as before, only the storage comes from the arena.  The whole region is
+/// reclaimed in O(blocks) at each target boundary via `cryo_ast_arena_reset`
+/// (called next to `reset_shared_type_cache` in `instance.cryo`).
+///
+/// Why this fixes the OOM: each `cryo build` compiles a `[lib]` then a
+/// `[[bin]]` target, each with its own heap-leaked `CompilationContext`.
+/// AST nodes are never individually freed, so the lib's parse trees +
+/// monomorphized clones (~1.2 GB) survived into the bin build, summing the
+/// peak to ~2.4 GB.  Resetting the arena between targets caps the peak at
+/// the larger single target instead of the sum.
+///
+/// Soundness:
+///   - Cryo compilation is single-threaded, so a module-level global needs
+///     no synchronization — same argument as `g_shared_type_cache`
+///     (codegen/type_map.cryo).
+///   - The arena holds ONLY target-scoped AST nodes (everything that is
+///     leaked-until-exit today).  Nothing that must outlive a target may be
+///     arena-allocated.  `delete` of an arena node is lowered to a no-op
+///     (see `emit_delete`); `free()` on arena memory would corrupt the heap.
+///   - Determinism: allocation order is deterministic and the compiler is
+///     pointer-value-independent (self-host is byte-identical run to run),
+///     so routing allocation through the arena cannot change emitted IR.
+///   - No bootstrap loop: the arena's own backing (`Arena`/`Chunk`/`Layout`
+///     — plain structs, not `ASTNode`) comes from `intrinsics::malloc`, so
+///     this module's allocations never route back into the arena.
+
+namespace Compiler::Codegen::AstArena;
+
+import std::alloc::arena;       // Arena
+import std::alloc::layout;      // Layout
+import std::alloc::allocator;   // Allocator trait (brings `allocate` into scope)
+import std::core::ptr;          // NonNull
+import std::core::result;
+
+/// Process-wide AST arena.  Heap-boxed + leaked so module-global init is a
+/// single null check; reset (not drop) reclaims it between targets.
+mut g_ast_arena: Arena* = null;
+
+/// Lazy-init accessor.  Idempotent; every call after the first returns the
+/// same handle.  8 MiB chunks keep the chunk list short for the ~1 GB of AST
+/// a self-host build produces (tunable).
+function get_ast_arena() -> Arena* {
+    if (g_ast_arena == null) {
+        const _box: Box<Arena> = Box<Arena>::new(
+            Arena::with_chunk_size(8u64 * 1024u64 * 1024u64));
+        g_ast_arena = _box.leak();
+    }
+    return g_ast_arena;
+}
+
+/// Allocate `size` bytes aligned to `align` from the AST arena.  Called by
+/// EMITTED code at every `new <ASTNode-derived>` site (resolved by qualified
+/// name through the normal cross-module function resolver, exactly like the
+/// constructor call a few lines below the malloc site in
+/// new_delete_emitter.cryo).  Returns uninitialised storage; the caller seeds
+/// the vtable and runs the constructor.  Returns null on OOM, matching
+/// `malloc` so the existing downstream null-checks behave identically.
+public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {
+    mut a: Arena* = get_ast_arena();
+    mut sz: u64 = size;
+    if (sz == 0u64) { sz = 1u64; }       // malloc(0) is UB on some platforms
+    mut al: u64 = align;
+    if (al == 0u64) { al = 16u64; }      // malloc-parity alignment floor
+    const block: Layout = Layout::new(sz, al);
+    return match (a.allocate(block)) {
+        Result::Ok(nn)  => { nn.as_ptr() as void* }
+        Result::Err(_e) => { null }
+    };
+}
+
+/// Reclaim the entire AST arena.  Called by the driver at each target
+/// boundary (after the previous target's compile — including linking — has
+/// fully returned, so all of its AST nodes are dead).  No-op before the
+/// first allocation.  `reset` keeps the chunks for reuse rather than freeing
+/// them, amortizing the malloc/free round-trip across targets.
+public function cryo_ast_arena_reset() -> void {
+    if (g_ast_arena != null) {
+        g_ast_arena.reset();
+    }
+}
