@@ -58,6 +58,31 @@ type struct NewDeleteEmitter {
         this.enum_variant = enum_variant;
     }
 
+    // Arena routing
+    //
+    // `new T(...)` whose `T` derives from `Compiler::AST::Node::ASTNode` is
+    // routed to the AST arena (Compiler::Codegen::AstArena) instead of
+    // `malloc`, so the compiler's own parse trees + monomorphized clones can
+    // be reclaimed in bulk at each target boundary.  The class-base chain is
+    // tiny (e.g. `BinaryExprNode -> ExpressionNode -> ASTNode`) and this runs
+    // once per `new` site at compile time, so the walk is negligible.  The
+    // `ASTNode` qualified name is unique to the compiler's own source, so
+    // routing only ever fires when the compiler compiles itself — user
+    // programs that `new` their own classes are unaffected.
+    derives_from_astnode(mut &this, t: Type*) -> boolean {
+        if (t == null) { return false; }
+        const intern: InternTable* = this.cg.get_intern();
+        const astnode_sym: SymbolStr = intern.intern("Compiler::AST::Node::ASTNode");
+        mut cur: Type* = t;
+        loop {
+            if (cur == null || cur.kind != TypeKind::Class) { return false; }
+            const ct: ClassType* = cur as ClassType*;
+            if (ct.qualified_name.equals(astnode_sym)) { return true; }
+            if (!ct.has_base) { return false; }
+            cur = this.cg.lookup_type_by_id(ct.base_class.id);
+        }
+    }
+
 
     // new T(args) / new T { fields }
 
@@ -123,25 +148,6 @@ type struct NewDeleteEmitter {
             return;
         }
 
-        const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
-        if (!malloc_fn.is_valid()) {
-            this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                "codegen: 'new' expression: 'malloc' not declared",
-                node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
-        }
-        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-        if (!malloc_ty.is_valid()) {
-            this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                "codegen: 'new' expression: failed to retrieve malloc function type",
-                node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
-        }
-
         const mapped: LType = this.cg.type_mapper.map_type(type_ref);
         // Virtual dispatch through `t.size_bytes()` resolves to the base
         // `Type::size_bytes` (which returns 0) when codegen hasn't wired
@@ -164,17 +170,72 @@ type struct NewDeleteEmitter {
         if (size == 0) { size = 1; }  // safe fallback; malloc(0) is UB on some platforms
 
         const size_val: LValue = LType::const_int(LType::i64(), size, false);
-        // Avoid the single-element array literal form (`[size_val]`); it
-        // miscompiles to `alloca [1 x T]` and then loads as `Array<T>`
-        // (3-field struct), reading 16 bytes of stack garbage into the
-        // length/capacity fields.  Downstream code that reads `args.length`
-        // (e.g., `codegen_call`) then feeds the garbage into
-        // `LLVMBuildCall2` as NumArgs -> `bad_alloc`.  `push` on an empty
-        // array initializes the struct correctly.
-        mut malloc_args: Pair<LValue, TypeRef>[] = [];
-        malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
         mut raw_ptr: LValue = LValue::null();
-        raw_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
+
+        if (this.derives_from_astnode(t)) {
+            // AST node: allocate from the process-global AST arena instead of
+            // malloc, so the compiler's own parse trees + monomorphized clones
+            // are reclaimed in bulk at each target boundary.  Everything below
+            // (bitcast, vtable seed, struct init, ctor call) is byte-identical
+            // to the malloc path — only the storage source differs.  The alloc
+            // function is resolved by qualified name through the normal cross-
+            // module resolver (same as the ctor call below), so no `![link]` is
+            // needed.
+            mut align: u64 = 16;
+            if (t.kind == TypeKind::Class) {
+                const ct_a: ClassType* = t as ClassType*;
+                if (ct_a.computed_align > 0) { align = ct_a.computed_align; }
+            }
+            const alloc_sym: SymbolStr =
+                intern.intern("Compiler::Codegen::AstArena::cryo_ast_arena_alloc");
+            const alloc_fn: LValue = this.cg.resolver.resolve_function(alloc_sym);
+            if (!alloc_fn.is_valid()) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    "codegen: 'new' expression: AST arena allocator not declared",
+                    node.span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const alloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(alloc_fn.raw) };
+            const align_val: LValue = LType::const_int(LType::i64(), align, false);
+            // `push` onto an empty array (not the single-element literal form,
+            // which miscompiles to a stack `Array<T>` of garbage) — see the
+            // malloc path note below.
+            mut arena_args: Pair<LValue, TypeRef>[] = [];
+            arena_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+            arena_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+            raw_ptr = this.cg.expr_ops.codegen_call(alloc_fn, alloc_ty, arena_args, "newtmp");
+        } else {
+            const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
+            if (!malloc_fn.is_valid()) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    "codegen: 'new' expression: 'malloc' not declared",
+                    node.span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            if (!malloc_ty.is_valid()) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                    "codegen: 'new' expression: failed to retrieve malloc function type",
+                    node.span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            // Avoid the single-element array literal form (`[size_val]`); it
+            // miscompiles to `alloca [1 x T]` and then loads as `Array<T>`
+            // (3-field struct), reading 16 bytes of stack garbage into the
+            // length/capacity fields.  Downstream code that reads `args.length`
+            // (e.g., `codegen_call`) then feeds the garbage into
+            // `LLVMBuildCall2` as NumArgs -> `bad_alloc`.  `push` on an empty
+            // array initializes the struct correctly.
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+            raw_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
+        }
 
         // Bitcast to the target struct pointer type.
         mut obj_ptr: LValue = raw_ptr;
@@ -357,20 +418,43 @@ type struct NewDeleteEmitter {
         const total: LValue = this.cg.builder.build_mul(
             count_val, elem_size_val, "new.arr.bytes");
 
-        const malloc_fn: LValue = this.cg.resolver.resolve_function(
-            this.cg.intern_str("malloc"));
-        if (!malloc_fn.is_valid()) {
-            this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                "codegen: 'new T[n]': 'malloc' not declared", node.span);
-            this.state.last_value = LValue::null();
-            this.state.last_is_lvalue = false;
-            return;
+        mut raw_ptr: LValue = LValue::null();
+        if (this.derives_from_astnode(elem_t)) {
+            // Defensive parity with emit_new: an AST-node element block routes
+            // to the arena.  AST collections are dynamic `T[]` (grown via
+            // realloc), not `new T[n]`, so this is expected to never fire.
+            const alloc_sym: SymbolStr =
+                this.cg.intern_str("Compiler::Codegen::AstArena::cryo_ast_arena_alloc");
+            const alloc_fn: LValue = this.cg.resolver.resolve_function(alloc_sym);
+            if (!alloc_fn.is_valid()) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    "codegen: 'new T[n]': AST arena allocator not declared", node.span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const alloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(alloc_fn.raw) };
+            const align_val: LValue = LType::const_int(LType::i64(), 16, false);
+            mut arena_args: Pair<LValue, TypeRef>[] = [];
+            arena_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
+            arena_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+            raw_ptr = this.cg.expr_ops.codegen_call(alloc_fn, alloc_ty, arena_args, "new.arr");
+        } else {
+            const malloc_fn: LValue = this.cg.resolver.resolve_function(
+                this.cg.intern_str("malloc"));
+            if (!malloc_fn.is_valid()) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    "codegen: 'new T[n]': 'malloc' not declared", node.span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
+            raw_ptr = this.cg.expr_ops.codegen_call(
+                malloc_fn, malloc_ty, malloc_args, "new.arr");
         }
-        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-        mut malloc_args: Pair<LValue, TypeRef>[] = [];
-        malloc_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
-        const raw_ptr: LValue = this.cg.expr_ops.codegen_call(
-            malloc_fn, malloc_ty, malloc_args, "new.arr");
 
         mut elem_ptr: LValue = raw_ptr;
         if (elem_llvm.is_valid()) {
@@ -419,6 +503,22 @@ type struct NewDeleteEmitter {
             if (ot != null && ot.kind == TypeKind::Pointer) {
                 const pt: PointerType* = ot as PointerType*;
                 pointee = pt.pointee;
+            }
+        }
+
+        // Arena node: storage came from the AST arena (bulk-reclaimed at the
+        // target boundary), so neither free() nor a synthesized drop() is valid
+        // here -- free() on arena memory would corrupt the heap.  Evaluate the
+        // operand once for its side effects, then no-op, exactly preserving
+        // today's behavior (AST nodes are never individually freed).  There are
+        // no `delete` sites on AST nodes in-tree today; this guard is defensive.
+        if (pointee.is_valid() && arena_ptr != null) {
+            const pointee_t: Type* = arena_ptr.lookup(pointee.id);
+            if (this.derives_from_astnode(pointee_t)) {
+                const _p: LValue = this.dispatch.codegen_rvalue(visitor, node.operand);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
             }
         }
 
