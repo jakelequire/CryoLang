@@ -4,22 +4,35 @@
 ///! Allocation is O(1); individual deallocation is unsupported; memory
 ///! is released all at once via `reset` (reuse the chunks) or `drop`
 ///! (free them). When the active chunk runs out, the Arena allocates a
-///! new one from `GlobalAlloc` and links it in.
+///! new one from the platform allocator and links it in.
 ///!
 ///! The usage pattern is "allocate a pile of stuff with related
 ///! lifetimes; throw them away together." Compiler passes, per-request
 ///! web handlers, and parse trees fit this shape; long-lived caches
 ///! don't.
+///!
+///! IMPORTANT — import-cycle discipline: this module deliberately does
+///! NOT import `alloc::allocator`.  The `Allocator` and `Drop` trait
+///! impls for `Arena` live in `alloc::arena_alloc` instead.  The reason
+///! is the per-target global arena (`g_alloc_arena` below): `GlobalAlloc`
+///! in `alloc::allocator` consults it on every allocation, so
+///! `allocator` must be able to `import alloc::arena`.  Were `arena` to
+///! import `allocator` back, the module topological sort (which rejects
+///! true import cycles) would fail.  Keeping `arena` allocator-free makes
+///! `allocator -> arena` a one-way edge.
 
 namespace std::alloc::arena;
 
 import core::intrinsics;
-import core::mem;
-import core::ptr;
-import core::result;
-import core::drop;
 import alloc::layout;
-import alloc::allocator;
+
+// Re-export the sibling module that carries `Arena`'s `Allocator`/`Drop`
+// trait impls, so `import alloc::arena` alone is enough to use `Arena` as an
+// allocator (e.g. `Array<T, Arena>`).  A `public module` declaration pulls
+// the module into the importer's graph for discovery WITHOUT adding a
+// dependency edge (see ModuleLoader::discover_module), so this does not
+// recreate the `allocator`<->`arena` cycle the split exists to avoid.
+public module alloc::arena_alloc;
 
 /// Default chunk size: 64 KiB. Large enough that typical small
 /// allocations rarely cross a chunk; small enough that spare capacity
@@ -37,11 +50,11 @@ type struct Chunk {
 
 type struct Arena {
     head: Chunk*;
-    // Allocation frontier: the chunk `allocate` bumps into on the fast
+    // Allocation frontier: the chunk `bump` advances into on the fast
     // path. Distinct from `head` (the list anchor used by reset/capacity/
-    // drop) so that, after a `reset`, allocation can march back through the
-    // already-allocated chunks and reuse them instead of prepending fresh
-    // ones every cycle. `null` until the first chunk is allocated.
+    // release) so that, after a `reset`, allocation can march back through
+    // the already-allocated chunks and reuse them instead of prepending
+    // fresh ones every cycle. `null` until the first chunk is allocated.
     current: Chunk*;
     chunk_size: u64;
 
@@ -68,7 +81,7 @@ type struct Arena {
     ///
     /// Previously allocated pointers are invalidated; callers must
     /// ensure no references survive this call. To actually release the
-    /// chunks back to `GlobalAlloc`, drop the arena.
+    /// chunks back to the platform allocator, drop the arena.
     reset(mut &this) -> void {
         mut chunk: Chunk* = this.head;
         loop {
@@ -76,7 +89,7 @@ type struct Arena {
             chunk.offset = 0;
             chunk = chunk.next;
         }
-        // Rewind the allocation frontier so the next `allocate` reuses the
+        // Rewind the allocation frontier so the next `bump` reuses the
         // chunks we just emptied rather than prepending new ones.
         this.current = this.head;
     }
@@ -104,38 +117,26 @@ type struct Arena {
         }
         return total;
     }
-}
 
-// Allocator impl
+    // Raw allocation surface
+    //
+    // These inherent methods are the bump allocator proper, expressed in
+    // raw `void*` terms so this module needs no dependency on
+    // `alloc::allocator`.  The `Allocator` trait impl in
+    // `alloc::arena_alloc` is a thin Layout/Result wrapper over them.
 
-implement trait Drop for struct Arena {
-    drop(mut &this) -> void {
-        // Mirrors the inherent `Arena::drop`: walk the chunk list and
-        // release each backing chunk plus its header.
-        mut chunk: Chunk* = this.head;
-        loop {
-            if (chunk == null) { break; }
-            const next: Chunk* = chunk.next;
-            intrinsics::free(chunk.data as void*);
-            intrinsics::free(chunk as void*);
-            chunk = next;
-        }
-        this.head = null;
-        this.current = null;
-    }
-}
-
-implement trait Allocator for struct Arena {
-    allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {
-        if (block.size() == 0) {
-            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, block));
-        }
+    /// Hand out `size` bytes aligned to `align` from the arena.  Returns
+    /// `null` on out-of-memory or a zero-sized request.  Marches through
+    /// the chunk list (reusing chunks emptied by `reset`) before growing.
+    bump(mut &this, size: u64, align: u64) -> void* {
+        if (size == 0) { return null; }
+        const block: Layout = Layout::new(size, align);
 
         // Fast path: bump into the current frontier chunk.
         if (this.current != null) {
             const fit: u8* = try_bump(this.current, block);
             if (fit != null) {
-                return Result::Ok(NonNull::new(fit));
+                return fit as void*;
             }
         }
 
@@ -152,7 +153,7 @@ implement trait Allocator for struct Arena {
                 const fit: u8* = try_bump(scan, block);
                 if (fit != null) {
                     this.current = scan;
-                    return Result::Ok(NonNull::new(fit));
+                    return fit as void*;
                 }
             }
             scan = scan.next;
@@ -167,23 +168,91 @@ implement trait Allocator for struct Arena {
         }
         const chunk: Chunk* = alloc_chunk(new_capacity);
         if (chunk == null) {
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, block));
+            return null;
         }
         chunk.next = this.head;
         this.head = chunk;
         this.current = chunk;
 
         const fit: u8* = try_bump(chunk, block);
-        if (fit == null) {
-            // Freshly allocated chunk; alignment math must succeed.
-            return Result::Err(AllocError::new(AllocErrorKind::Exhausted, block));
-        }
-        return Result::Ok(NonNull::new(fit));
+        // Freshly allocated chunk; alignment math must succeed.  A null here
+        // would be a logic error, but propagate it rather than trap.
+        return fit as void*;
     }
 
-    /// Arenas don't free individuals. This is a no-op; memory comes
-    /// back at `reset` or `drop`.
-    deallocate(mut &this, ptr: NonNull<u8>, block: Layout) -> void {
+    /// True when `ptr` lies inside any chunk this arena owns.  Used by
+    /// `GlobalAlloc`'s free/realloc routing to recognise arena-backed
+    /// pointers so they are never handed to libc `free`.  Range-scan of
+    /// the chunk list (mirrors `capacity`); a pointer one-past-the-end of
+    /// a chunk is intentionally excluded.
+    owns(&this, ptr: void*) -> boolean {
+        const addr: u64 = ptr as u64;
+        mut chunk: Chunk* = this.head;
+        loop {
+            if (chunk == null) { break; }
+            const base: u64 = chunk.data as u64;
+            if (addr >= base && addr < base + chunk.capacity) {
+                return true;
+            }
+            chunk = chunk.next;
+        }
+        return false;
+    }
+
+    /// Grow (or shrink) a block previously handed out by `bump`.  If
+    /// `ptr` is the most-recent allocation in the frontier chunk and that
+    /// chunk has room for the delta, the block is extended in place and
+    /// the same pointer returned — this kills realloc-stranding for
+    /// monotonic single-growers (e.g. a `TypeArena.types` vector that
+    /// only ever grows).  Otherwise a fresh block is allocated and the
+    /// old contents copied; the old block is stranded until `reset`.
+    /// Returns `null` on out-of-memory.
+    grow(mut &this, ptr: void*, old_size: u64, new_size: u64, align: u64) -> void* {
+        if (this.current != null) {
+            const cur: Chunk* = this.current;
+            const base: u64 = cur.data as u64;
+            const pstart: u64 = ptr as u64;
+            const pend: u64 = pstart + old_size;     // end of the old block
+            const hwm: u64 = base + cur.offset;       // chunk high-water mark
+            // `ptr` is the last live allocation in this chunk iff its end
+            // coincides with the chunk's high-water mark.
+            if (pstart >= base && pend == hwm) {
+                if (new_size >= old_size) {
+                    const delta: u64 = new_size - old_size;
+                    if (cur.offset + delta <= cur.capacity) {
+                        cur.offset = cur.offset + delta;
+                        return ptr;
+                    }
+                } else {
+                    cur.offset = cur.offset - (old_size - new_size);
+                    return ptr;
+                }
+            }
+        }
+
+        // Fallback: fresh allocation + copy. Old block is stranded until reset.
+        const np: void* = this.bump(new_size, align);
+        if (np == null) { return null; }
+        mut copy: u64 = old_size;
+        if (new_size < copy) { copy = new_size; }
+        intrinsics::memcpy(np, ptr, copy);
+        return np;
+    }
+
+    /// Release every chunk back to the platform allocator.  Invoked by the
+    /// `Drop` impl in `alloc::arena_alloc`; exposed as an inherent method
+    /// so the drop logic lives next to the allocation logic.
+    release(mut &this) -> void {
+        mut chunk: Chunk* = this.head;
+        loop {
+            if (chunk == null) { break; }
+            const next: Chunk* = chunk.next;
+            intrinsics::free(chunk.data as void*);
+            intrinsics::free(chunk as void*);
+            chunk = next;
+        }
+        this.head = null;
+        this.current = null;
     }
 }
 
@@ -220,4 +289,56 @@ function try_bump(chunk: Chunk*, block: Layout) -> u8* {
     }
     chunk.offset = chunk.offset + total;
     return aligned_addr as u8*;
+}
+
+// Per-target global arena (the OOM fix)
+//
+// The compiler builds `[lib]` then `[[bin]]` in one process, each with a
+// heap-leaked `CompilationContext`.  Routing the compiler's `GlobalAlloc`
+// through a single per-target arena, reset in bulk between targets, caps
+// peak RSS near one target instead of the sum.  These globals are the
+// hand-off point: the compiler driver publishes its arena and toggles the
+// active flag around the heavy pipeline; `GlobalAlloc` (alloc::allocator)
+// consults them.  In every other program both stay null/false, so the
+// arena is physically incapable of activating — zero user impact.
+
+mut g_alloc_arena: Arena* = null;
+mut g_alloc_arena_active: boolean = false;
+
+/// Publish `a` as THE per-target global arena.
+function set_alloc_arena(a: Arena*) -> void { g_alloc_arena = a; }
+
+/// Detach the global arena (subsequent allocations go back to libc).
+function clear_alloc_arena() -> void { g_alloc_arena = null; }
+
+/// Gate whether *new* allocations route to the arena.  Free/realloc
+/// routing does NOT consult this flag (see `alloc_arena_holds`).
+function set_alloc_arena_active(active: boolean) -> void { g_alloc_arena_active = active; }
+
+function get_alloc_arena() -> Arena* { return g_alloc_arena; }
+function is_alloc_arena_active() -> boolean { return g_alloc_arena_active; }
+
+/// True when a fresh allocation should be served from the global arena.
+function alloc_arena_routing() -> boolean {
+    return g_alloc_arena != null && g_alloc_arena_active;
+}
+
+/// Serve a fresh allocation from the global arena.  Caller must have
+/// checked `alloc_arena_routing()`.
+function alloc_arena_take(size: u64, align: u64) -> void* {
+    return g_alloc_arena.bump(size, align);
+}
+
+/// True when `ptr` lives in the global arena.  Consulted by free/realloc
+/// **regardless of the active flag**, so an arena buffer is never handed
+/// to libc `free` even after the arena is deactivated — the central
+/// correctness rule that prevents heap corruption.
+function alloc_arena_holds(ptr: void*) -> boolean {
+    if (g_alloc_arena == null) { return false; }
+    return g_alloc_arena.owns(ptr);
+}
+
+/// Grow an arena-owned block.  Caller must have checked `alloc_arena_holds`.
+function alloc_arena_grow(ptr: void*, old_size: u64, new_size: u64, align: u64) -> void* {
+    return g_alloc_arena.grow(ptr, old_size, new_size, align);
 }
