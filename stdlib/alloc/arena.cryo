@@ -25,6 +25,15 @@ namespace std::alloc::arena;
 
 import core::intrinsics;
 import alloc::layout;
+// OS virtual-memory primitives for chunk backing.  The big `data` buffer of
+// each chunk comes straight from the OS (mmap / VirtualAlloc) so that
+// `release()` can hand it straight back (munmap / VirtualFree) — guaranteed
+// reclamation, independent of glibc's main-heap retention heuristics (small
+// `intrinsics::free`d blocks below the mmap threshold are kept by libc and
+// never return RSS to the OS).  Neither module imports `alloc`, so this does
+// NOT recreate the `allocator`->`arena` one-way edge into a cycle.
+import ffi::libc;
+import ffi::syscall;
 
 // Re-export the sibling module that carries `Arena`'s `Allocator`/`Drop`
 // trait impls, so `import alloc::arena` alone is enough to use `Arena` as an
@@ -34,13 +43,14 @@ import alloc::layout;
 // recreate the `allocator`<->`arena` cycle the split exists to avoid.
 public module alloc::arena_alloc;
 
-/// Default chunk size: 64 MiB. TEMPORARY VALIDATION VALUE — above glibc's
-/// 32 MiB dynamic mmap-threshold ceiling, so every chunk is mmap-backed and
-/// `free()` munmaps it back to the OS at `release()` (the old 64 KiB sat on
-/// glibc's main heap, which holds freed pages → arena release never dropped
-/// RSS between targets). Will be replaced by an explicit mmap/munmap chunk
-/// backing at a sane (1 MiB) size once the inter-target RSS drop is confirmed.
-const DEFAULT_CHUNK_SIZE: u64 = 67108864;
+/// Default chunk size: 1 MiB.  Each chunk's data buffer is mapped directly
+/// from the OS (see `Chunk::os_alloc`), so `release()` returns it to the OS
+/// immediately — RSS drops at the call, with none of glibc's main-heap page
+/// retention (which is why small `malloc`/`free` chunks never gave memory
+/// back).  1 MiB keeps the VMA/syscall count low and the per-arena tail waste
+/// small, and the mapping is demand-paged: untouched pages cost no RSS, so
+/// small arenas stay cheap despite the larger nominal chunk.
+const DEFAULT_CHUNK_SIZE: u64 = 1048576;
 
 // Chunk: one contiguous region in the Arena's chunk list
 
@@ -49,6 +59,85 @@ type struct Chunk {
     capacity: u64;
     offset: u64;
     next: Chunk*;
+
+    /// Allocate a chunk: the small header (~40 B) on the C heap — too small to
+    /// be worth a page-granular mapping, and freed alongside its data — and the
+    /// big `data` buffer mapped straight from the OS so `Chunk::dealloc` can
+    /// return it to the OS.  Returns null on OOM.
+    static alloc(capacity: u64) -> Chunk* {
+        const header: void* = intrinsics::malloc(sizeof(Chunk));
+        if (header == null) { return null; }
+        const data: void* = Chunk::os_alloc(capacity);
+        if (data == null) {
+            intrinsics::free(header);
+            return null;
+        }
+        const chunk: Chunk* = header as Chunk*;
+        chunk.data = data as u8*;
+        chunk.capacity = capacity;
+        chunk.offset = 0;
+        chunk.next = null;
+        return chunk;
+    }
+
+    /// Free a chunk produced by `alloc`: its OS-mapped `data` buffer back to
+    /// the OS, then the C-heap header.  Consumes `chunk`; do not touch it after.
+    static dealloc(chunk: Chunk*) -> void {
+        Chunk::os_free(chunk.data as void*, chunk.capacity);
+        intrinsics::free(chunk as void*);
+    }
+
+    /// Map `size` bytes of zero-filled, demand-paged anonymous memory from the
+    /// OS.  Returns null on failure.  Mapping the big buffers directly (rather
+    /// than via `malloc`) is what lets `dealloc` reclaim RSS deterministically,
+    /// independent of glibc's main-heap retention heuristics.
+    ![target(unix)]
+    static os_alloc(size: u64) -> void* {
+        const prot: i32 = libc::PROT_READ | libc::PROT_WRITE;
+        const flags: i32 = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        const p: u8* = libc::mmap(null, size, prot, flags, -1, 0);
+        // mmap signals failure with MAP_FAILED == (void*)-1, not null.
+        const addr: u64 = p as u64;
+        if (addr == 0xFFFFFFFFFFFFFFFFu64) { return null; }
+        return p as void*;
+    }
+
+    ![target(windows)]
+    static os_alloc(size: u64) -> void* {
+        const ty: u32 = syscall::MEM_COMMIT | syscall::MEM_RESERVE;
+        const p: u8* = syscall::VirtualAlloc(null, size, ty, syscall::PAGE_READWRITE);
+        return p as void*;   // VirtualAlloc returns null on failure
+    }
+
+    /// Return a buffer obtained from `os_alloc` to the OS.  `size` is the
+    /// chunk's stored `capacity`, so the unmap always has its length.
+    ![target(unix)]
+    static os_free(ptr: void*, size: u64) -> void {
+        libc::munmap(ptr as u8*, size);
+    }
+
+    ![target(windows)]
+    static os_free(ptr: void*, size: u64) -> void {
+        // MEM_RELEASE requires dwSize == 0 and frees the entire reservation.
+        syscall::VirtualFree(ptr as u8*, 0u64, syscall::MEM_RELEASE);
+    }
+
+    /// Bump this chunk's high-water mark forward enough to fit `block` at the
+    /// right alignment.  Returns the aligned pointer on success, null when the
+    /// chunk can't fit the request.
+    try_bump(mut &this, block: Layout) -> u8* {
+        const base_addr: u64 = this.data as u64;
+        const current_addr: u64 = base_addr + this.offset;
+        const mask: u64 = block.alignment() - 1;
+        const aligned_addr: u64 = (current_addr + mask) & ~mask;
+        const padding: u64 = aligned_addr - current_addr;
+        const total: u64 = padding + block.size();
+        if (this.offset + total > this.capacity) {
+            return null;
+        }
+        this.offset = this.offset + total;
+        return aligned_addr as u8*;
+    }
 }
 
 type struct Arena {
@@ -137,7 +226,7 @@ type struct Arena {
 
         // Fast path: bump into the current frontier chunk.
         if (this.current != null) {
-            const fit: u8* = try_bump(this.current, block);
+            const fit: u8* = this.current.try_bump(block);
             if (fit != null) {
                 return fit as void*;
             }
@@ -153,7 +242,7 @@ type struct Arena {
         loop {
             if (scan == null) { break; }
             if (scan != this.current) {
-                const fit: u8* = try_bump(scan, block);
+                const fit: u8* = scan.try_bump(block);
                 if (fit != null) {
                     this.current = scan;
                     return fit as void*;
@@ -169,7 +258,7 @@ type struct Arena {
         if (block.padded_size() > new_capacity) {
             new_capacity = block.padded_size();
         }
-        const chunk: Chunk* = alloc_chunk(new_capacity);
+        const chunk: Chunk* = Chunk::alloc(new_capacity);
         if (chunk == null) {
             return null;
         }
@@ -177,7 +266,7 @@ type struct Arena {
         this.head = chunk;
         this.current = chunk;
 
-        const fit: u8* = try_bump(chunk, block);
+        const fit: u8* = chunk.try_bump(block);
         // Freshly allocated chunk; alignment math must succeed.  A null here
         // would be a logic error, but propagate it rather than trap.
         return fit as void*;
@@ -250,48 +339,12 @@ type struct Arena {
         loop {
             if (chunk == null) { break; }
             const next: Chunk* = chunk.next;
-            intrinsics::free(chunk.data as void*);
-            intrinsics::free(chunk as void*);
+            Chunk::dealloc(chunk);
             chunk = next;
         }
         this.head = null;
         this.current = null;
     }
-}
-
-// Chunk helpers
-
-function alloc_chunk(capacity: u64) -> Chunk* {
-    const header: void* = intrinsics::malloc(sizeof(Chunk));
-    if (header == null) { return null; }
-    const data: void* = intrinsics::malloc(capacity);
-    if (data == null) {
-        intrinsics::free(header);
-        return null;
-    }
-    const chunk: Chunk* = header as Chunk*;
-    chunk.data = data as u8*;
-    chunk.capacity = capacity;
-    chunk.offset = 0;
-    chunk.next = null;
-    return chunk;
-}
-
-/// Try to bump `chunk.offset` forward enough to fit `block` at the
-/// right alignment. Returns the aligned pointer on success, null when
-/// the chunk can't fit the request.
-function try_bump(chunk: Chunk*, block: Layout) -> u8* {
-    const base_addr: u64 = chunk.data as u64;
-    const current_addr: u64 = base_addr + chunk.offset;
-    const mask: u64 = block.alignment() - 1;
-    const aligned_addr: u64 = (current_addr + mask) & ~mask;
-    const padding: u64 = aligned_addr - current_addr;
-    const total: u64 = padding + block.size();
-    if (chunk.offset + total > chunk.capacity) {
-        return null;
-    }
-    chunk.offset = chunk.offset + total;
-    return aligned_addr as u8*;
 }
 
 // Per-target global arena (the OOM fix)
@@ -302,46 +355,49 @@ function try_bump(chunk: Chunk*, block: Layout) -> u8* {
 // peak RSS near one target instead of the sum.  These globals are the
 // hand-off point: the compiler driver publishes its arena and toggles the
 // active flag around the heavy pipeline; `GlobalAlloc` (alloc::allocator)
-// consults them.  In every other program both stay null/false, so the
-// arena is physically incapable of activating — zero user impact.
+// consults them via `GlobalArena`.  In every other program both stay
+// null/false, so the arena is physically incapable of activating — zero
+// user impact.
 
 mut g_alloc_arena: Arena* = null;
 mut g_alloc_arena_active: boolean = false;
 
-/// Publish `a` as THE per-target global arena.
-function set_alloc_arena(a: Arena*) -> void { g_alloc_arena = a; }
+/// The process-wide per-target arena routing slot.  Zero-sized: all state
+/// lives in the two module globals above (mirrors how `GlobalAlloc` is a ZST
+/// handle over the platform allocator).  `GlobalAlloc::allocate/deallocate/
+/// reallocate` route every heap allocation through these statics; the compiler
+/// driver `publish`es its arena and brackets `set_active` around the heavy
+/// pipeline.  Null/inactive everywhere else → the consult branches are dead.
+type struct GlobalArena {
+    /// Publish `a` as THE per-target global arena.
+    static publish(a: Arena*) -> void { g_alloc_arena = a; }
 
-/// Detach the global arena (subsequent allocations go back to libc).
-function clear_alloc_arena() -> void { g_alloc_arena = null; }
+    /// Gate whether *new* allocations route to the arena.  Free/realloc
+    /// routing does NOT consult this flag (see `holds`), so a buffer is never
+    /// handed to libc `free` even after the arena is deactivated.
+    static set_active(active: boolean) -> void { g_alloc_arena_active = active; }
 
-/// Gate whether *new* allocations route to the arena.  Free/realloc
-/// routing does NOT consult this flag (see `alloc_arena_holds`).
-function set_alloc_arena_active(active: boolean) -> void { g_alloc_arena_active = active; }
+    /// True when a fresh allocation should be served from the global arena.
+    static routing() -> boolean {
+        return g_alloc_arena != null && g_alloc_arena_active;
+    }
 
-function get_alloc_arena() -> Arena* { return g_alloc_arena; }
-function is_alloc_arena_active() -> boolean { return g_alloc_arena_active; }
+    /// Serve a fresh allocation from the global arena.  Caller must have
+    /// checked `routing()`.
+    static take(size: u64, align: u64) -> void* {
+        return g_alloc_arena.bump(size, align);
+    }
 
-/// True when a fresh allocation should be served from the global arena.
-function alloc_arena_routing() -> boolean {
-    return g_alloc_arena != null && g_alloc_arena_active;
-}
+    /// True when `ptr` lives in the global arena.  Consulted by free/realloc
+    /// **regardless of the active flag** — the central correctness rule that
+    /// keeps an arena buffer from ever reaching libc `free` (heap corruption).
+    static holds(ptr: void*) -> boolean {
+        if (g_alloc_arena == null) { return false; }
+        return g_alloc_arena.owns(ptr);
+    }
 
-/// Serve a fresh allocation from the global arena.  Caller must have
-/// checked `alloc_arena_routing()`.
-function alloc_arena_take(size: u64, align: u64) -> void* {
-    return g_alloc_arena.bump(size, align);
-}
-
-/// True when `ptr` lives in the global arena.  Consulted by free/realloc
-/// **regardless of the active flag**, so an arena buffer is never handed
-/// to libc `free` even after the arena is deactivated — the central
-/// correctness rule that prevents heap corruption.
-function alloc_arena_holds(ptr: void*) -> boolean {
-    if (g_alloc_arena == null) { return false; }
-    return g_alloc_arena.owns(ptr);
-}
-
-/// Grow an arena-owned block.  Caller must have checked `alloc_arena_holds`.
-function alloc_arena_grow(ptr: void*, old_size: u64, new_size: u64, align: u64) -> void* {
-    return g_alloc_arena.grow(ptr, old_size, new_size, align);
+    /// Grow an arena-owned block.  Caller must have checked `holds`.
+    static grow(ptr: void*, old_size: u64, new_size: u64, align: u64) -> void* {
+        return g_alloc_arena.grow(ptr, old_size, new_size, align);
+    }
 }
