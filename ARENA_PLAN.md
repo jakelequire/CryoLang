@@ -113,6 +113,50 @@ earlier-activation are both proven dead). Keep gating every step on the determin
      frees them (the leaked context owns them). The arena's `GlobalAlloc` hook *cannot* see these; only
      rewriting the call sites to route through the arena would capture them.
 
+## Path B feasibility spike (2026-06-27 PM) — Path B refuted; real lever found
+
+Jake chose Path B; the spike (two read-only investigations) was the agreed first step. **Result: Path B
+is SAFE but low-yield, and its premise was overstated.** Both investigations converged independently:
+
+### Drop-safety map (all 19 owned components)
+- A bulk drop (`Box::from_raw` + compiler drop-glue per component) is **free of double-free/UAF**: every
+  cross-component reference is a raw non-owning `T*`/`void*` (drop-glue never recurses through raw
+  pointers), and `GlobalAlloc::deallocate`'s `owns()` no-op frees mixed arena/libc structs correctly by
+  pointer ownership. **Zero real `Drop` impls** exist in the compiler — reclamation is 100% generated glue.
+- **But the win is small.** The ~1 GB container bulk (type_arena, generic_registry, resolver,
+  type_resolver, monomorphizer, module_type_registry, directive_registry, injected_ast arrays) is
+  **arena-born and ALREADY reclaimed** by `cryo_ast_arena_release()` — dropping those = no-op. Drop-glue
+  reclaims only libc-born struct headers + the `ProjectConfig` clone + a few buffers.
+- Drop-glue **cannot reach raw bytes held by non-owning `string`/`void*` handles** — which is precisely
+  what stacks. Named raw-byte leaks glue misses: `module_graph.module_ast_buf`/`module_scope_buf`
+  (raw `void*` malloc), `diag_renderer.cached_contents`/`cached_files`, and InternTable byte copies.
+
+### Direct-malloc census (≈92 sites) — where the 818 MB actually is
+- **Almost all codegen `malloc` sites are TRANSIENT** (scratch `void**` arrays freed right after the one
+  LLVM C-API call) — red herrings, do not stack.
+- The retained 818 MB is **per-string raw byte copies**, concentrated in ~4 sites:
+  - **`resolver/intern_table.cryo:55`** — bytes of every interned string incl. **every mangled mono
+    name**. THE dominant axis. Has `release_strings()` but it uses `intrinsics::free` → libc HOLDS the
+    pages (the `malloc_trim` dead-end) so RSS never drops.
+  - **`lex/lexer.cryo:951`** + **`parser/parser_base.cryo:511`** — per-string-literal byte copies into
+    AST nodes, **NEVER freed**.
+  - **`passes/type_resolution.cryo:1419/1425`** — per-`This`-rewrite TypeAnnotation, never freed
+    (`:1425` → `new`/arena; `:1419` is a staging buffer → stack local or free-after-memcpy).
+
+### The real lever (recommended over both Path A-blind and Path B)
+Floor math is consistent: one-target floor ~1385 MB + lib's retained ~776 MB string copies ≈ the measured
+2161 MB. **Route the ~4 per-string byte-copy sites onto the existing per-target arena** (`global_heap_alloc`
+/`new` instead of `intrinsics::malloc`). Then `cryo_ast_arena_release()` **munmaps** them between targets —
+RSS returns to the OS (unlike `intrinsics::free`, which libc retains). This is the same governing principle
+(route through `GlobalAlloc`, no parallel allocator) applied to the sites that hold the stacking memory; it
+is 4 measured sites, not the 92-site whack-a-mole Path A feared, and it can reach ~the one-target floor.
+- Lifetime check: interned strings live exactly one target; the arena has exactly one scope per target and
+  is released only at the target boundary (after the target returns, survivors already `dup`'d) → safe.
+  The census agent's "interned strings outlive the arena scope" caution does not apply to the per-target
+  model.
+- Order: intern is the big one — reroute + measure FIRST; then lexer/parser/type_resolution. Gate every
+  step on determinism (same compiler builds compiler twice → 0 IR diffs).
+
 ## Strategic fork (2026-06-27) — decision needed before more arena work
 
 Stages 0–4 are correct, safe, byte-identical, shippable — net **~174 MiB (~7%)** off peak. Getting to
