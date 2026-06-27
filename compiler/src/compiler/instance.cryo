@@ -781,6 +781,15 @@ type struct CompilerInstance {
         // context ever becomes shared across targets, those node-pointer arrays
         // would dangle after this reset and must be cleared here too.
         Compiler::Codegen::AstArena::cryo_ast_arena_reset();
+        // Defensive: guarantee this target STARTS with arena routing OFF, so
+        // its survivor construction (below, pre-activation) always lands in
+        // libc — even on the impossible-by-construction path where a prior
+        // target leaked the active flag.  The bracket re-enables it at Phase 2.
+        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        // Same defensive reset for the LLVM context: dispose any leftover from
+        // a prior target so this target starts on the global-context fallback
+        // until its own context is published at Phase 2.
+        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
 
         // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
         // the report only prints (success path) when the env var is set, so
@@ -1182,6 +1191,29 @@ type struct CompilerInstance {
                 return utd_result;
             }
         }
+
+        // ── Per-target arena: ACTIVATE ──────────────────────────────────
+        // From here through linking, every `T[]`/`HashMap`/`Box`/`String`
+        // allocation (the frontend/mono/sema/codegen container heap, ~1 GB)
+        // bumps the per-target arena instead of libc, to be bulk-reclaimed at
+        // the next target's reset rather than leaking with this target's
+        // heap-leaked CompilationContext.  Placed AFTER the up-to-date
+        // short-circuit and every pre-pass error return (those stay inactive)
+        // and AFTER the cross-reset survivors are built (the ProjectConfig
+        // clone at ~844, ctx.stdlib_root at ~879).  Deactivated before result
+        // construction below (success) and in `project_failure_release` (every
+        // pass-failure path), so the active flag never leaks past a target.
+        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(true);
+
+        // ── Per-target LLVM context: CREATE ─────────────────────────────
+        // Publish a fresh LLVMContextRef for this target's codegen.  All leaf
+        // LLVM type/module/builder factories route through it (LContext::
+        // current()), so disposing it at the target boundary reclaims the
+        // ~385 MiB of type tables + named structs that otherwise stack in the
+        // never-disposed global context across the lib+bin builds.  Created
+        // here (before any LLVM type is built — frontend/mono/sema/codegen all
+        // follow) and disposed on every exit path alongside the arena flip.
+        Compiler::Codegen::LLVMTypes::set_codegen_context_new();
 
         // Allocate local buffers for per-module ASTs and scopes.
         // Using local variables avoids deep nested struct field assignment
@@ -1998,6 +2030,22 @@ type struct CompilerInstance {
             }
         }
 
+        // ── Per-target arena: DEACTIVATE (success path) ─────────────────
+        // Frontend → codegen → linking are done.  Turn routing off so the
+        // cross-reset survivors built below (the returned `exe_path`, the
+        // manifest side-files) land in libc and outlive the next target's
+        // reset.  Free/realloc still recognise arena pointers via `owns()`,
+        // so this flip never strands a live arena block to libc `free`.
+        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+
+        // ── Per-target LLVM context: DISPOSE (success path) ─────────────
+        // Codegen + linking are done (linking reads on-disk objects, not LLVM
+        // modules; the per-module LLVMModuleRefs were each disposed in the
+        // Phase 7 loop).  Free this target's whole LLVM context now so its
+        // type tables don't survive into the next target.  Nothing below
+        // touches LLVM (exe_path + manifest are pure string/file work).
+        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+
         if (ctx.diagnostics.has_errors()) {
             return CompilationResult::failed(
                 ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
@@ -2083,6 +2131,15 @@ type struct CompilerInstance {
     project_failure_release(&this, ctx: CompilationContext*,
                             ast_buf: void*, scope_buf: void*)
             -> CompilationResult {
+        // Per-target arena: DEACTIVATE (failure path).  This is the single
+        // chokepoint for all 12 pass-failure returns in
+        // compile_project_with_ctx, so the active flag never leaks past a
+        // failed target into the next target's survivor construction.
+        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        // Dispose this target's LLVM context too (frees any modules/types
+        // built before the failure).  Single chokepoint for all 12
+        // pass-failure returns, so the context never leaks past a failed target.
+        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
         intrinsics::free(ast_buf);
         intrinsics::free(scope_buf);
         return this.project_failure(ctx);

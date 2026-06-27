@@ -158,7 +158,8 @@ type struct LModule {
     raw: void*;
 
     static create(name: string) -> LModule {
-        return LModule { raw: llvm::LLVMModuleCreateWithName(name) };
+        return LModule { raw: llvm::LLVMModuleCreateWithNameInContext(
+            name, LContext::current().raw) };
     }
 
     static null() -> LModule {
@@ -252,6 +253,15 @@ type struct LModule {
 
 // LContext: Wrapper around LLVMContextRef
 
+/// The current target's codegen LLVM context, or null to use the process
+/// global context.  Published/disposed per target by the driver
+/// (`instance.cryo`) so the ~385 MiB of LLVM type tables a single target
+/// produces are reclaimed at the target boundary instead of stacking across
+/// the lib+bin builds in the never-disposed global context.  Single-threaded
+/// compiler → a module-level global needs no synchronisation (same argument
+/// as `g_ast_arena` / `g_shared_type_cache`).
+mut g_codegen_context: void* = null;
+
 type struct LContext {
     raw: void*;
 
@@ -260,6 +270,20 @@ type struct LContext {
     }
 
     static global() -> LContext {
+        return LContext { raw: llvm::LLVMGetGlobalContext() };
+    }
+
+    /// The context codegen should build into.  When a per-target context is
+    /// published (`g_codegen_context`, set by the driver around each target's
+    /// pipeline) every leaf type/module/builder factory routes through it, so
+    /// disposing that one context at the target boundary reclaims all of the
+    /// target's LLVM type tables + named structs (~385 MiB) — the LLVM-side
+    /// analogue of the per-target arena.  Null => the real global context, so
+    /// non-project paths (compile_raw / frontend-only) behave exactly as before.
+    static current() -> LContext {
+        if (g_codegen_context != null) {
+            return LContext { raw: g_codegen_context };
+        }
         return LContext { raw: llvm::LLVMGetGlobalContext() };
     }
 
@@ -279,6 +303,31 @@ type struct LContext {
     }
 }
 
+// Per-target codegen context lifecycle (Stage 4: cap LLVM-side memory).
+// Called by the driver (instance.cryo) around each target's pipeline,
+// mirroring the per-target arena's set-active / reset.
+
+/// Publish a fresh per-target codegen context.  Disposes any prior one first
+/// (defensive: the success/failure paths normally dispose at target end).
+public function set_codegen_context_new() -> void {
+    if (g_codegen_context != null) {
+        llvm::LLVMContextDispose(g_codegen_context);
+    }
+    g_codegen_context = llvm::LLVMContextCreate();
+}
+
+/// Dispose the per-target codegen context and fall back to the global one.
+/// Frees every LLVM type/named-struct/module created for this target in one
+/// shot — the LLVM analogue of the arena reset.  No-op when unset.  Safe to
+/// call after the per-module `LLVMDisposeModule`s: those detach their modules
+/// from the context first, and `LLVMContextDispose` reclaims anything left.
+public function dispose_codegen_context() -> void {
+    if (g_codegen_context != null) {
+        llvm::LLVMContextDispose(g_codegen_context);
+        g_codegen_context = null;
+    }
+}
+
 
 // LBuilder: Wrapper around LLVMBuilderRef
 
@@ -286,7 +335,7 @@ type struct LBuilder {
     raw: void*;
 
     static create() -> LBuilder {
-        return LBuilder { raw: llvm::LLVMCreateBuilder() };
+        return LBuilder { raw: llvm::LLVMCreateBuilderInContext(LContext::current().raw) };
     }
 
     static null() -> LBuilder {
@@ -755,44 +804,51 @@ type struct LType {
 
     // ----- Primitive type constructors -----
 
+    // All primitive types are interned per-LLVMContext.  Routing them through
+    // `LContext::current()` (rather than the implicit-global `LLVM<T>Type()`)
+    // is what keeps every codegen type in the per-target context, so a single
+    // `LLVMContextDispose` at the target boundary reclaims them.  Mixing a
+    // global-context primitive into a per-target-context module would trip an
+    // LLVM context-mismatch assertion, so these must stay consistent with the
+    // module/builder/struct factories.
     static void_type() -> LType {
-        return LType { raw: llvm::LLVMVoidType() };
+        return LType { raw: llvm::LLVMVoidTypeInContext(LContext::current().raw) };
     }
 
     static i1() -> LType {
-        return LType { raw: llvm::LLVMInt1Type() };
+        return LType { raw: llvm::LLVMInt1TypeInContext(LContext::current().raw) };
     }
 
     static i8() -> LType {
-        return LType { raw: llvm::LLVMInt8Type() };
+        return LType { raw: llvm::LLVMInt8TypeInContext(LContext::current().raw) };
     }
 
     static i16() -> LType {
-        return LType { raw: llvm::LLVMInt16Type() };
+        return LType { raw: llvm::LLVMInt16TypeInContext(LContext::current().raw) };
     }
 
     static i32() -> LType {
-        return LType { raw: llvm::LLVMInt32Type() };
+        return LType { raw: llvm::LLVMInt32TypeInContext(LContext::current().raw) };
     }
 
     static i64() -> LType {
-        return LType { raw: llvm::LLVMInt64Type() };
+        return LType { raw: llvm::LLVMInt64TypeInContext(LContext::current().raw) };
     }
 
     static i128() -> LType {
-        return LType { raw: llvm::LLVMInt128Type() };
+        return LType { raw: llvm::LLVMInt128TypeInContext(LContext::current().raw) };
     }
 
     static int_type(bits: u32) -> LType {
-        return LType { raw: llvm::LLVMIntType(bits) };
+        return LType { raw: llvm::LLVMIntTypeInContext(LContext::current().raw, bits) };
     }
 
     static f32() -> LType {
-        return LType { raw: llvm::LLVMFloatType() };
+        return LType { raw: llvm::LLVMFloatTypeInContext(LContext::current().raw) };
     }
 
     static f64() -> LType {
-        return LType { raw: llvm::LLVMDoubleType() };
+        return LType { raw: llvm::LLVMDoubleTypeInContext(LContext::current().raw) };
     }
 
     // ----- Compound type constructors -----
@@ -830,7 +886,7 @@ type struct LType {
 
     static literal_struct(elements: void*, count: u32, packed: boolean) -> LType {
         return LType { raw: llvm::LLVMStructTypeInContext(
-            llvm::LLVMGetGlobalContext(), elements, count, packed as i32) };
+            LContext::current().raw, elements, count, packed as i32) };
     }
 
     // ----- Struct body -----
