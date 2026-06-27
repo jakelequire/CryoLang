@@ -202,3 +202,36 @@ implement trait Allocator for struct GlobalAlloc {
         return Result::Ok(NonNull::new(raw as u8*));
     }
 }
+
+// `new` / `delete` codegen lowering allocates through THIS pair rather than a
+// parallel routing path: both delegate to the canonical `GlobalAlloc`, so a
+// `new T()` shares the exact arena routing as every `T[]`/`Box`/`String`
+// (the active per-target arena while the compiler builds itself, libc
+// otherwise).  They add no allocation logic of their own — they only bridge
+// codegen's raw `call`/`void*` world to the typed `Allocator` API.
+
+/// Allocate `size` bytes aligned to `align` via `GlobalAlloc`.  Null/zero
+/// guarded; returns null on OOM so the emitter's existing null-check on the
+/// old `malloc` result is unchanged.
+public function global_heap_alloc(size: u64, align: u64) -> void* {
+    mut sz: u64 = size;
+    if (sz == 0u64) { sz = 1u64; }
+    mut al: u64 = align;
+    if (al == 0u64) { al = 16u64; }
+    mut ga: GlobalAlloc = GlobalAlloc::new();
+    const r: Result<NonNull<u8>, AllocError> = ga.allocate(Layout::new(sz, al));
+    if (r.is_ok()) { return r.unwrap().as_ptr() as void*; }
+    return null;
+}
+
+/// Free a block from `global_heap_alloc` via `GlobalAlloc::deallocate`, which
+/// already no-ops arena-owned pointers (bulk-reclaimed at the target
+/// boundary) and frees libc-owned ones.  `align` must match the `new` site;
+/// `deallocate` ignores the layout size, so a 1-byte placeholder is fine.
+public function global_heap_free(ptr: void*, align: u64) -> void {
+    if (ptr == null) { return; }
+    mut al: u64 = align;
+    if (al == 0u64) { al = 16u64; }
+    mut ga: GlobalAlloc = GlobalAlloc::new();
+    ga.deallocate(NonNull::new(ptr as u8*), Layout::new(1u64, al));
+}

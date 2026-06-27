@@ -1925,21 +1925,6 @@ type struct ExprOps {
     /// type, and stores the loaded variant struct value at offset 0.
     /// Returns the typed pointer.
     heap_box_enum_variant(mut &this, et: EnumType*, enum_ref: TypeRef, variant_val: LValue, span: SourceSpan) -> LValue {
-        const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("malloc"));
-        if (!malloc_fn.is_valid()) {
-            this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                "codegen: new T::V: malloc not declared",
-                span);
-            return LValue::null();
-        }
-        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-        if (!malloc_ty.is_valid()) {
-            this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                "codegen: new T::V: failed to retrieve malloc function type",
-                span);
-            return LValue::null();
-        }
-
         const size: u64 = et.computed_size;
         if (size == 0) {
             this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
@@ -1949,10 +1934,40 @@ type struct ExprOps {
         }
 
         const size_val: LValue = LType::const_int(LType::i64(), size, false);
-        mut malloc_args: Pair<LValue, TypeRef>[] = [];
-        malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
         mut raw_ptr: LValue = LValue::null();
-        raw_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "newenum");
+        // Box the enum through the canonical `GlobalAlloc` (via
+        // `global_heap_alloc`), exactly like `new T()` / `new T{...}` in
+        // new_delete_emitter, so a boxed `new T::V` shares the per-target
+        // arena routing.  Fall back to a direct `malloc` when the stdlib is
+        // not linked (e.g. `--no-std`).
+        const raw_sym: SymbolStr = this.intern_str("std::alloc::allocator::global_heap_alloc");
+        const raw_fn: LValue = this.resolver.resolve_function(raw_sym);
+        if (raw_fn.is_valid()) {
+            const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
+            const align_val: LValue = LType::const_int(LType::i64(), 16, false);
+            mut raw_args: Pair<LValue, TypeRef>[] = [];
+            raw_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+            raw_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+            raw_ptr = this.codegen_call(raw_fn, raw_ty, raw_args, "newenum");
+        } else {
+            const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("malloc"));
+            if (!malloc_fn.is_valid()) {
+                this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    "codegen: new T::V: malloc not declared",
+                    span);
+                return LValue::null();
+            }
+            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+            if (!malloc_ty.is_valid()) {
+                this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                    "codegen: new T::V: failed to retrieve malloc function type",
+                    span);
+                return LValue::null();
+            }
+            mut malloc_args: Pair<LValue, TypeRef>[] = [];
+            malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+            raw_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "newenum");
+        }
 
         const enum_llvm: LType = this.type_mapper.map_type(enum_ref);
         if (!enum_llvm.is_valid()) {
