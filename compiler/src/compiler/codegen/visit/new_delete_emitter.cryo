@@ -207,34 +207,59 @@ type struct NewDeleteEmitter {
             arena_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
             raw_ptr = this.cg.expr_ops.codegen_call(alloc_fn, alloc_ty, arena_args, "newtmp");
         } else {
-            const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
-            if (!malloc_fn.is_valid()) {
-                this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    "codegen: 'new' expression: 'malloc' not declared",
-                    node.span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+            // Non-AST `new`: allocate through the canonical `GlobalAlloc`
+            // (via `global_heap_alloc`), so this shares the exact arena
+            // routing as every `T[]`/`Box`/`String` — while the per-target
+            // arena is active (the compiler building itself) the object is
+            // bulk-reclaimed at the target boundary instead of leaking with
+            // the heap-leaked context; in every other program it is just
+            // libc.  Resolved by qualified name like the AST arena allocator
+            // above; if the stdlib is not linked (e.g. `--no-std`), fall back
+            // to a direct `malloc`.
+            mut align: u64 = 16;
+            if (t.kind == TypeKind::Class) {
+                const ct_al: ClassType* = t as ClassType*;
+                if (ct_al.computed_align > 0) { align = ct_al.computed_align; }
             }
-            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            if (!malloc_ty.is_valid()) {
-                this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                    "codegen: 'new' expression: failed to retrieve malloc function type",
-                    node.span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+            const raw_sym: SymbolStr = this.cg.intern_str("std::alloc::allocator::global_heap_alloc");
+            const raw_fn: LValue = this.cg.resolver.resolve_function(raw_sym);
+            if (raw_fn.is_valid()) {
+                const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
+                const align_val: LValue = LType::const_int(LType::i64(), align, false);
+                mut raw_args: Pair<LValue, TypeRef>[] = [];
+                raw_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+                raw_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+                raw_ptr = this.cg.expr_ops.codegen_call(raw_fn, raw_ty, raw_args, "newtmp");
+            } else {
+                const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
+                if (!malloc_fn.is_valid()) {
+                    this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                        "codegen: 'new' expression: 'malloc' not declared",
+                        node.span);
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+                if (!malloc_ty.is_valid()) {
+                    this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                        "codegen: 'new' expression: failed to retrieve malloc function type",
+                        node.span);
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                // Avoid the single-element array literal form (`[size_val]`); it
+                // miscompiles to `alloca [1 x T]` and then loads as `Array<T>`
+                // (3-field struct), reading 16 bytes of stack garbage into the
+                // length/capacity fields.  Downstream code that reads `args.length`
+                // (e.g., `codegen_call`) then feeds the garbage into
+                // `LLVMBuildCall2` as NumArgs -> `bad_alloc`.  `push` on an empty
+                // array initializes the struct correctly.
+                mut malloc_args: Pair<LValue, TypeRef>[] = [];
+                malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+                raw_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
             }
-            // Avoid the single-element array literal form (`[size_val]`); it
-            // miscompiles to `alloca [1 x T]` and then loads as `Array<T>`
-            // (3-field struct), reading 16 bytes of stack garbage into the
-            // length/capacity fields.  Downstream code that reads `args.length`
-            // (e.g., `codegen_call`) then feeds the garbage into
-            // `LLVMBuildCall2` as NumArgs -> `bad_alloc`.  `push` on an empty
-            // array initializes the struct correctly.
-            mut malloc_args: Pair<LValue, TypeRef>[] = [];
-            malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
-            raw_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "newtmp");
         }
 
         // Bitcast to the target struct pointer type.
@@ -440,20 +465,35 @@ type struct NewDeleteEmitter {
             arena_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
             raw_ptr = this.cg.expr_ops.codegen_call(alloc_fn, alloc_ty, arena_args, "new.arr");
         } else {
-            const malloc_fn: LValue = this.cg.resolver.resolve_function(
-                this.cg.intern_str("malloc"));
-            if (!malloc_fn.is_valid()) {
-                this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    "codegen: 'new T[n]': 'malloc' not declared", node.span);
-                this.state.last_value = LValue::null();
-                this.state.last_is_lvalue = false;
-                return;
+            // Same `GlobalAlloc` routing as scalar `new` (see emit_new):
+            // arena-allocates while the compiler builds itself, libc
+            // everywhere else, with a direct `malloc` fallback when the
+            // stdlib is not linked.
+            const raw_sym: SymbolStr = this.cg.intern_str("std::alloc::allocator::global_heap_alloc");
+            const raw_fn: LValue = this.cg.resolver.resolve_function(raw_sym);
+            if (raw_fn.is_valid()) {
+                const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
+                const align_val: LValue = LType::const_int(LType::i64(), 16, false);
+                mut raw_args: Pair<LValue, TypeRef>[] = [];
+                raw_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
+                raw_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+                raw_ptr = this.cg.expr_ops.codegen_call(raw_fn, raw_ty, raw_args, "new.arr");
+            } else {
+                const malloc_fn: LValue = this.cg.resolver.resolve_function(
+                    this.cg.intern_str("malloc"));
+                if (!malloc_fn.is_valid()) {
+                    this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                        "codegen: 'new T[n]': 'malloc' not declared", node.span);
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+                mut malloc_args: Pair<LValue, TypeRef>[] = [];
+                malloc_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
+                raw_ptr = this.cg.expr_ops.codegen_call(
+                    malloc_fn, malloc_ty, malloc_args, "new.arr");
             }
-            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            mut malloc_args: Pair<LValue, TypeRef>[] = [];
-            malloc_args.push(Pair<LValue, TypeRef>::new(total, TypeRef::invalid()));
-            raw_ptr = this.cg.expr_ops.codegen_call(
-                malloc_fn, malloc_ty, malloc_args, "new.arr");
         }
 
         mut elem_ptr: LValue = raw_ptr;
@@ -573,7 +613,29 @@ type struct NewDeleteEmitter {
             this.cg.values.remove_raw(recv_sym.id);
         }
 
-        const free_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("free"));
+        // Free through the canonical `GlobalAlloc` (via `global_heap_free`):
+        // a `delete` of an object that was arena-allocated (the compiler
+        // building itself) must NOT reach libc `free` — `GlobalAlloc::
+        // deallocate` no-ops arena-owned pointers (bulk-reclaimed at the
+        // target boundary) and frees libc-owned ones.  Falls back to a direct
+        // `free` when the stdlib is not linked (e.g. `--no-std`).  The shim
+        // takes the pointee alignment so the dealloc pairs with the `new`
+        // site on platforms where free is alignment-sensitive (Windows
+        // `_aligned_free`); the computation mirrors `emit_new`.
+        mut del_align: u64 = 16;
+        if (pointee.is_valid() && arena_ptr != null) {
+            const del_pt: Type* = arena_ptr.lookup(pointee.id);
+            if (del_pt != null && del_pt.kind == TypeKind::Class) {
+                const del_cpt: ClassType* = del_pt as ClassType*;
+                if (del_cpt.computed_align > 0) { del_align = del_cpt.computed_align; }
+            }
+        }
+        mut free_fn: LValue = this.cg.resolver.resolve_function(
+            this.cg.intern_str("std::alloc::allocator::global_heap_free"));
+        mut free_via_shim: boolean = free_fn.is_valid();
+        if (!free_via_shim) {
+            free_fn = this.cg.resolver.resolve_function(this.cg.intern_str("free"));
+        }
         if (free_fn.is_valid() && ptr.is_valid()) {
             const void_ptr: LValue = this.cg.builder.build_pointer_cast(
                 ptr, LType::pointer_to(LType::i8()), "delcast");
@@ -581,6 +643,10 @@ type struct NewDeleteEmitter {
             if (free_ty.is_valid()) {
                 mut free_args: Pair<LValue, TypeRef>[] = [];
                 free_args.push(Pair<LValue, TypeRef>::new(void_ptr, TypeRef::invalid()));
+                if (free_via_shim) {
+                    const align_val: LValue = LType::const_int(LType::i64(), del_align, false);
+                    free_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+                }
                 mut result: LValue = LValue::null();
                 result = this.cg.expr_ops.codegen_call(free_fn, free_ty, free_args, "");
             } else {

@@ -241,6 +241,17 @@ type struct CompilerInstance {
         };
     }
 
+    /// Duplicate a survivor `string` into a fresh libc allocation that is
+    /// independent of any CompilationContext-owned (interned / arena)
+    /// storage.  Used to copy a build's result strings out before the
+    /// per-target context is torn down (`release_per_target`), so the
+    /// returned `CompilationResult` can never alias freed memory.
+    /// `""` and ordinary strings both dup cleanly; the small copy is
+    /// intentionally leaked (it outlives the build).
+    static dup_survivor(s: string) -> string {
+        return libc::strdup(s as u8*) as string;
+    }
+
     /// Build a ProjectConfig view that compiles the `[lib]` half of a
     /// multi-target project as a Library.  Inherits debug/optimize/no_std/
     /// stdlib + linkage settings from the base config; overrides only the
@@ -750,7 +761,22 @@ type struct CompilerInstance {
         const _box_ctx: Box<CompilationContext> = Box<CompilationContext>::new(
             CompilationContext::new(mode, root_path));
         mut ctx: CompilationContext* = _box_ctx.leak();
-        return this.compile_project_with_ctx(ctx, config);
+        mut result: CompilationResult = this.compile_project_with_ctx(ctx, config);
+        // Per-target teardown.  Copy the survivor strings out of any
+        // context-owned (interned) storage FIRST, then reclaim this target's
+        // heap so a multi-target (`[lib]` + `[[bin]]`) build does not stack
+        // both contexts into peak RSS.  Ordering matters: the dup must run
+        // while the interned bytes are still valid, before the teardown frees
+        // them.  The LSP entry (`compile_project_with_ctx`) bypasses this
+        // method and keeps its context alive.
+        result.output_path = CompilerInstance::dup_survivor(result.output_path);
+        result.stdlib_root = CompilerInstance::dup_survivor(result.stdlib_root);
+        ctx.release_per_target();
+        // Release this target's arena chunks back to the OS (the bulk of the
+        // per-target heap) so the next target builds from a low baseline
+        // instead of climbing on top of the prior target's retained arena.
+        Compiler::Codegen::AstArena::cryo_ast_arena_release();
+        return result;
     }
 
     /// Drive the multi-module orchestration against a caller-provided

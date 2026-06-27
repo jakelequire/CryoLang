@@ -16,6 +16,77 @@
 
 **Baseline peak RSS (measured, WSL):** ~2.48 GB. **Stage 2:** ~2.30 GB. **Stage 4:** ~2.30 GB. **Target:** ~1.1–1.3 GB.
 
+## Path B root-cause + arena-routing fix (2026-06-27, Linux codespace)
+
+The handoff's "Path B = drop the context" was the WRONG mechanism. Measured root cause and a
+partial fix below. All RSS numbers are on the Linux codespace (`getrusage`/`/proc` polling; this box
+reproduces baseline ~2.42 GB and OOM-kills near 2.4 GB, so `--no-incremental` builds must be retried).
+
+### What the per-target heap actually is (from `malloc_stats` + a GlobalAlloc byte counter)
+At one target's peak (~1.38 GB total): **~532 MB** arena (AST nodes + active GlobalAlloc containers,
+mmap-backed) + **~29 MB** GlobalAlloc-routed-to-libc + **~824 MB direct `intrinsics::malloc`** that
+bypasses BOTH the arena and GlobalAlloc. The 824 MB is what stacks lib→bin and dominates the ~2.2 GB
+peak. It is NOT in droppable component arrays and NOT GlobalAlloc traffic.
+
+### Dead ends (measured, do not retry)
+- **Drop the leaked context (the handoff's Path B / B1):** freeing all 9 components via `Box::from_raw`
+  reclaims only **~9 MB** — the components are arena-backed; the memory was never in their arrays.
+- **Earlier arena activation (B2 / "Path A" lever):** **+80 MB WORSE.** The bump arena never frees
+  individual allocations, so routing the transient-heavy parse phase into it makes it HOARD until the
+  reset, inflating the within-target peak. (Combined with arena *release* it still didn't capture the
+  824 MB — that heap is direct malloc, not GlobalAlloc, so activation can't reach it.)
+- **`malloc_trim(0)` at the boundary:** ~0 — the heap isn't free in libc's lists, it's held.
+
+### The fix (mechanism: funnel ALL heap allocation through the one canonical chokepoint, `GlobalAlloc`)
+There is exactly one arena-routing implementation — `GlobalAlloc::allocate/deallocate` (Stage 0). The
+fix makes the two allocation sites that bypassed it (`new`/`delete` codegen, and hand-rolled
+`malloc(sizeof)`) go through it too. NO parallel routing logic. (An earlier draft added a
+`cryo_alloc_raw`/`cryo_free_raw` shim that duplicated GlobalAlloc's routing — deleted in favour of
+this.)
+- **`stdlib/alloc/allocator.cryo`**: `global_heap_alloc(size,align)->void*` / `global_heap_free(ptr,
+  align)` — thin `void*`-ABI bridges that DELEGATE to `GlobalAlloc::allocate`/`deallocate` (no logic of
+  their own); they exist only because codegen emits raw `call`s and can't ergonomically consume the
+  `Result<NonNull,AllocError>` API. In user programs GlobalAlloc's arena globals are null → plain libc.
+- **`codegen/visit/new_delete_emitter.cryo`** (scalar `new`, `new T[n]`, `delete`) + **`codegen/ops/
+  expr_ops.cryo` `heap_box_enum_variant`** (`new T::V`): all lowered to `global_heap_alloc`/
+  `global_heap_free`, each with a `malloc`/`free` fallback for `--no-std`. `delete` routing is REQUIRED
+  for correctness — a direct `free` on a now-arena-allocated object corrupts the heap; `GlobalAlloc::
+  deallocate` no-ops arena-owned pointers. (The enum path is a SEPARATE emitter — easy to miss; if its
+  `%newenum` allocations stay on `malloc` the whole TypeAnnotation outer-enum reclaim is lost.)
+- **`AST/_module.cryo` `TypeAnnotation::clone` + `AST/substituter.cryo`**: the hand-rolled
+  `malloc(sizeof(...Annotation))` clone sites (the single biggest direct-malloc chunk — cloned per type
+  annotation per monomorphized specialization) rewritten to idiomatic `new` (expression-match), so they
+  inherit the proper routing with zero bespoke alloc calls.
+- **`codegen/ast_arena.cryo` `cryo_ast_arena_release()`** + call at the target boundary in
+  `instance.cryo`: the boundary `reset()` KEEPS chunks resident; `release()` frees them to the OS so the
+  next target builds from a low baseline. Plus a survivor-strdup guard (copies `output_path`/
+  `stdlib_root` out before teardown) and `InternTable::release_strings` (intern bytes, ~8 MB).
+
+### Measured effect + verification
+- Peak (self-built / stage2, Linux codespace): **arena-only 2249 MB → proper fix ~2161 MB**.
+  Decomposition at the boundary (`malloc_stats`): the clones DO land in the arena now (mmap 532→557 MB),
+  so the routing works; the peak is dominated by the **un-routed main-heap that stacks across targets**
+  (lib-end main-heap 818 MB → bin-end 1652 MB — lib's 818 MB of non-arena libc heap is never freed and
+  stacks under bin). That 818 MB is the remaining direct-malloc to chase.
+  - NOTE: an earlier `cryo_alloc_raw`-shim build measured ~1970 MB at this point; the ~190 MB delta vs
+    the proper build was NOT reproduced cleanly (no A/B after the shim was deleted; the box is contended
+    and OOMs). The decomposition shows the proper routing is equivalent (clones in arena); treat the
+    shim's 1970 as an under-measurement until re-confirmed on a non-OOM box.
+- **Determinism PASS:** the same compiler building the compiler twice → **0 of 219 IR files differ**
+  (no pointer-value dependence introduced — the core selfhost-safety property; re-confirmed after the
+  `new`/enum refactor).
+- Builds green; produces working self-hosting binaries.
+- **NOT yet run on this box (OOMs):** full `make selfhost-check` byte-identity fixed point, `make test`.
+  Run these on the Windows+WSL box before any re-pin.
+
+### Remaining work to reach target (~1.4 GB, i.e. one target)
+The fix is incremental and converging but only ~280 MB so far; ~570 MB of direct-malloc still stacks.
+Repeat: re-run the `malloc_stats` decomposition on the current binary (main-heap should now be ~640 MB),
+find the next hot direct-malloc site(s), route through `cryo_alloc_raw`, measure. The remaining heap is
+more spread out than TypeAnnotations, so expect diminishing per-site returns. This is the
+whack-a-mole the handoff feared, but it IS the only mechanism that reaches the memory (drop-context and
+earlier-activation are both proven dead). Keep gating every step on the determinism/byte-identity check.
+
 ## Stage 4 measurement (2026-06-27) — LLVM was a red herring; the wall is direct libc
 
 - **Peak RSS 2,304,688 KB (~2.30 GB) — unchanged from Stage 2** (2,303,216). The per-target LLVM
