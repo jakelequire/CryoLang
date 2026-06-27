@@ -1,0 +1,69 @@
+///! Arena trait impls: `Allocator` and `Drop` for `Arena`.
+///!
+///! These live in a module separate from `alloc::arena` on purpose.
+///! `alloc::arena` must stay free of any dependency on `alloc::allocator`
+///! so that `allocator` can `import alloc::arena` (to consult the
+///! per-target global arena from `GlobalAlloc`) without forming an import
+///! cycle — the module topological sort rejects true cycles.  The trait
+///! impls, which DO need `allocator` (for the `Allocator` trait and
+///! `AllocError`) and `drop`, are therefore parked here.  Trait impls are
+///! registered globally at compile time, so `Arena` is usable as an
+///! `Allocator` (e.g. `Array<T, Arena>`) anywhere without importing this
+///! module explicitly; it only needs to be in the build (registered via
+///! `alloc/_module.cryo`).
+///!
+///! Both impls are thin wrappers over `Arena`'s inherent raw operations
+///! (`bump`/`grow`/`release`), which carry the actual logic.
+
+namespace std::alloc::arena_alloc;
+
+import core::ptr;
+import core::result;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import alloc::arena;
+
+implement trait Allocator for struct Arena {
+    allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (block.size() == 0) {
+            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, block));
+        }
+        const raw: void* = this.bump(block.size(), block.alignment());
+        if (raw == null) {
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, block));
+        }
+        return Result::Ok(NonNull::new(raw as u8*));
+    }
+
+    /// Arenas don't free individuals. This is a no-op; memory comes
+    /// back at `reset` or `drop`.
+    deallocate(mut &this, ptr: NonNull<u8>, block: Layout) -> void {
+    }
+
+    /// Grow in place at the frontier when possible (see `Arena::grow`),
+    /// else allocate-new + copy.
+    reallocate(mut &this,
+               ptr: NonNull<u8>,
+               old_layout: Layout,
+               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        if (new_layout.size() == 0) {
+            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
+        }
+        const raw: void* = this.grow(
+            ptr.as_ptr() as void*,
+            old_layout.size(),
+            new_layout.size(),
+            new_layout.alignment());
+        if (raw == null) {
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
+        }
+        return Result::Ok(NonNull::new(raw as u8*));
+    }
+}
+
+implement trait Drop for struct Arena {
+    drop(mut &this) -> void {
+        this.release();
+    }
+}

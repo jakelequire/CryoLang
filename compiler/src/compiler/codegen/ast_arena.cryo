@@ -32,11 +32,7 @@
 
 namespace Compiler::Codegen::AstArena;
 
-import std::alloc::arena;       // Arena
-import std::alloc::layout;      // Layout
-import std::alloc::allocator;   // Allocator trait (brings `allocate` into scope)
-import std::core::ptr;          // NonNull
-import std::core::result;
+import std::alloc::arena;       // Arena (+ inherent `bump`)
 
 /// Process-wide AST arena.  Heap-boxed + leaked so module-global init is a
 /// single null check; reset (not drop) reclaims it between targets.
@@ -67,11 +63,11 @@ public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {
     if (sz == 0u64) { sz = 1u64; }       // malloc(0) is UB on some platforms
     mut al: u64 = align;
     if (al == 0u64) { al = 16u64; }      // malloc-parity alignment floor
-    const block: Layout = Layout::new(sz, al);
-    return match (a.allocate(block)) {
-        Result::Ok(nn)  => { nn.as_ptr() as void* }
-        Result::Err(_e) => { null }
-    };
+    // Call the inherent raw bump directly (not the `Allocator` trait) so this
+    // hot path doesn't depend on cross-module trait-impl resolution and needs
+    // no `allocator`/`layout`/`result` imports.  Returns null on OOM, matching
+    // `malloc` so existing downstream null-checks behave identically.
+    return a.bump(sz, al);
 }
 
 /// Reclaim the entire AST arena.  Called by the driver at each target

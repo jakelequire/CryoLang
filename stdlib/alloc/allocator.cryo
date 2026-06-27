@@ -14,6 +14,13 @@ import core::intrinsics;
 import core::ptr;
 import core::result;
 import alloc::layout;
+// One-way edge: `arena` is allocator-free (its `Allocator`/`Drop` impls
+// live in `arena_alloc`), so importing it here forms no cycle.  Brings the
+// per-target global-arena routing hooks into scope; `GlobalAlloc` consults
+// them so the compiler's whole `T[]`/`HashMap`/`Box`/`String` heap can be
+// arena-backed and bulk-reclaimed between targets.  Null/inactive in every
+// other program → the branches below are never taken.
+import alloc::arena;
 
 type enum AllocErrorKind {
     /// The underlying allocator returned null; the system is out of
@@ -113,6 +120,15 @@ implement trait Allocator for struct GlobalAlloc {
         if (layout.size() == 0) {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, layout));
         }
+        // Per-target arena routing.  Active only inside the compiler driver's
+        // bracket (global null/inactive everywhere else → branch not taken).
+        if (alloc_arena_routing()) {
+            const ap: void* = alloc_arena_take(layout.size(), layout.alignment());
+            if (ap != null) {
+                return Result::Ok(NonNull::new(ap as u8*));
+            }
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
+        }
         const raw: void* = intrinsics::aligned_alloc(
             layout.alignment(),
             layout.padded_size()
@@ -124,6 +140,12 @@ implement trait Allocator for struct GlobalAlloc {
     }
 
     deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
+        // Arena-owned blocks are bulk-reclaimed at `reset`; never libc-free
+        // them.  Consulted regardless of the active flag (the central
+        // correctness rule: an arena pointer must not reach `free`).
+        if (alloc_arena_holds(ptr.as_ptr() as void*)) {
+            return;
+        }
         // Pair with `allocate`'s `aligned_alloc`: over-aligned blocks (Windows
         // `_aligned_malloc`) need `_aligned_free`, selected by the layout's
         // alignment.  On POSIX this collapses to plain `free`.
@@ -138,6 +160,20 @@ implement trait Allocator for struct GlobalAlloc {
                new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
         if (new_layout.size() == 0) {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
+        }
+        // Arena-owned blocks grow inside the arena (frontier grow-in-place or
+        // alloc-new + copy); never hand them to libc `realloc`.  Consulted
+        // regardless of the active flag, same correctness rule as `deallocate`.
+        if (alloc_arena_holds(ptr.as_ptr() as void*)) {
+            const np: void* = alloc_arena_grow(
+                ptr.as_ptr() as void*,
+                old_layout.size(),
+                new_layout.size(),
+                new_layout.alignment());
+            if (np != null) {
+                return Result::Ok(NonNull::new(np as u8*));
+            }
+            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }
         // `realloc` only guarantees alignment up to `max_align_t`
         // (MAX_REALLOC_ALIGN = 16).  Any over-aligned type - a
