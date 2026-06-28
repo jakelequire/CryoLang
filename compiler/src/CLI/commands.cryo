@@ -2389,7 +2389,7 @@ type struct Executor {
                 return 1;
             }
             const prov_key: string = VendorGenerator::provenance_key(
-                abs, &entry.headers, &entry.include_dirs, norm_triple);
+                abs, &entry.headers, &entry.include_dirs, norm_triple, prev_file);
             const hit: boolean = !force
                 && strlen(prev_key) > 0 && strcmp(prev_key, prov_key) == 0
                 && strlen(prev_file) > 0 && metadata::exists(Path::from_cstr(prev_file));
@@ -2403,8 +2403,9 @@ type struct Executor {
             } else {
                 fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
                     name, entry.headers.length as i64);
+                mut inputs: string[] = [];
                 const src_text: string = VendorGenerator::generate(
-                    name, abs, &entry.headers, &entry.include_dirs, &entry.defines);
+                    name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs);
                 if (strlen(src_text) == 0) {
                     fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
                     return 1;
@@ -2416,7 +2417,17 @@ type struct Executor {
                 }
                 fputs(src_text, gf);
                 fclose(gf);
-                entry.set_cache(norm_triple, dest, prov_key);
+                // Record the include graph next to the bindings so a later cache
+                // check folds every transitively-included header, not just the
+                // entry header (see VendorGenerator::provenance_key).
+                VendorGenerator::write_depfile(dest, &inputs);
+                // Store the key computed FROM the just-written depfile (not the
+                // pre-generation `prov_key`, which folded the previous graph), so
+                // the next unchanged check folds the same `dest.deps` and hits
+                // without a spurious one-time regeneration.
+                const store_key: string = VendorGenerator::provenance_key(
+                    abs, &entry.headers, &entry.include_dirs, norm_triple, dest);
+                entry.set_cache(norm_triple, dest, store_key);
                 produced = true;
             }
         }
