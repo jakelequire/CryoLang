@@ -33,6 +33,7 @@ import Compiler::CompileMode;
 import Compiler::AST;
 import Compiler::AST::{ Node, Declaration };
 import Compiler::AST::Expression;
+import Compiler::AST::Statement;
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Compiler::Diag::{ SourceSpan };
 import Utils::Logger;
@@ -47,7 +48,7 @@ import std::collections::str;
 /// different type mapping, …).  It participates in the Stage-3 cache key, so an
 /// increment invalidates every previously cached binding after a compiler
 /// upgrade — old caches no longer match and regenerate on next `cryo vendor`.
-const GENERATOR_VERSION: i64 = 2;
+const GENERATOR_VERSION: i64 = 3;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -111,6 +112,8 @@ type struct BindingSerializer {
             return ctx.intern_table.resolve((node as TypeAliasDeclNode*).alias_name);
         } else if (k == NodeKind::VariableDeclaration) {
             return ctx.intern_table.resolve((node as VarDeclNode*).name);
+        } else if (k == NodeKind::FunctionDeclaration) {
+            return ctx.intern_table.resolve((node as FunctionDeclNode*).name);
         }
         return "";
     }
@@ -125,6 +128,10 @@ type struct BindingSerializer {
             this.render_alias(node as TypeAliasDeclNode*);
         } else if (k == NodeKind::VariableDeclaration) {
             this.render_const(node as VarDeclNode*);
+        } else if (k == NodeKind::FunctionDeclaration) {
+            // A bodied top-level function in `root.statements` is a function-alias
+            // forwarding wrapper (the extern prototypes live in `extern_node`).
+            this.render_wrapper_function(node as FunctionDeclNode*);
         }
     }
 
@@ -241,6 +248,43 @@ type struct BindingSerializer {
         }
         this.out.push_cstr(format(") -> %s;\n",
             this.render_type(node.return_type_annotation)));
+    }
+
+    /// Render a function-alias forwarding wrapper (a bodied top-level function):
+    /// `function NAME(p0: T0, …) -> Ret { return TARGET(p0, …); }`.  The body is
+    /// a single statement the importer built — a `return TARGET(args)` (or, for a
+    /// `void` target, a bare `TARGET(args)`).  Top-level functions are public by
+    /// default, so no modifier is emitted; the file's `namespace` qualifies it.
+    render_wrapper_function(mut &this, node: FunctionDeclNode*) -> void {
+        // Signature (param names keyword-escaped, matching the call args below).
+        mut s: string = format("function %s(", this.ctx.intern_table.resolve(node.name));
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            const p: VarDeclNode* = node.parameters[i];
+            const pn: string = BindingSerializer::ident(this.ctx.intern_table.resolve(p.name));
+            s = s + format("%s: %s", pn, this.render_type(p.type_annotation));
+        }
+        s = s + format(") -> %s {\n", this.render_type(node.return_type_annotation));
+
+        // Body: extract the forwarded call (return-of-call, or a void call).
+        const st: StatementNode* = node.body.statements[0];
+        mut is_ret: boolean = st.kind == NodeKind::ReturnStatement;
+        const call: CallExprNode* = if (is_ret) {
+            (st as ReturnStmtNode*).expression as CallExprNode*
+        } else {
+            (st as ExprStmtNode*).expression as CallExprNode*
+        };
+        const target: string =
+            this.ctx.intern_table.resolve((call.callee as IdentifierNode*).name);
+
+        s = s + (if (is_ret) { "    return " } else { "    " });
+        s = s + format("%s(", target);
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            s = s + BindingSerializer::ident(this.ctx.intern_table.resolve(node.parameters[i].name));
+        }
+        s = s + ");\n}\n\n";
+        this.out.push_cstr(s);
     }
 
     /// Render a TypeAnnotation tree to Cryo type syntax.

@@ -42,6 +42,7 @@ import Compiler::CompilationContext;
 import Compiler::AST;
 import Compiler::AST::{ Node, Declaration };
 import Compiler::AST::Expression;
+import Compiler::AST::Statement;
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Utils;
 import Utils::Logger;
@@ -198,6 +199,12 @@ type struct Importer {
     /// Bound type names (struct / enum / typedef bare tags) for type-alias
     /// `#define`s (`#define Foo Bar` where Bar is a bound type).
     type_names:     SymbolStr[];
+    /// True on the `cryo vendor` path (a generated `namespace <Name>;` file),
+    /// false on the inline `extern module := "C"` path.  Function-alias
+    /// forwarding wrappers are a bodied top-level function with no
+    /// `binding_namespace`, so they are emitted ONLY on the vendor path (where
+    /// the file's `namespace` qualifies them); the inline path reports them.
+    is_vendor:      boolean;
 
     /// Build a per-TU importer.  Alias and `functions_only` are derived from the
     /// extern block; the type mapper is wired with the same (ctx, alias).
@@ -227,6 +234,7 @@ type struct Importer {
             mac_texts:      [],
             mac_floats:     [],
             type_names:     [],
+            is_vendor:      false,
         };
     }
 
@@ -899,7 +907,85 @@ type struct Importer {
             return true;
         }
 
+        // Bound function: a thin forwarding wrapper (vendor path only — see
+        // `is_vendor`).  A variadic target can't be forwarded (no way to pass a
+        // C `...` through), so it's left for the caller to report.
+        if (this.is_vendor) {
+            const target_fn: FunctionDeclNode* = this.find_function(tsym);
+            if (target_fn != null && !target_fn.is_variadic) {
+                this.emit_forwarding_wrapper(name_sym, target_fn);
+                return true;
+            }
+        }
+
         return false;
+    }
+
+    /// The bound extern function named `sym`, or null.
+    find_function(&this, sym: SymbolStr) -> FunctionDeclNode* {
+        for (mut i: i64 = 0; i < this.extern_node.functions.length; i++) {
+            if (this.extern_node.functions[i].name.equals(sym)) {
+                return this.extern_node.functions[i];
+            }
+        }
+        return null;
+    }
+
+    /// W2 (function alias): emit a bodied top-level wrapper that forwards to a
+    /// bound C function, e.g. `#define GetMouseRay GetScreenToWorldRay` ->
+    /// `function GetMouseRay(arg0: Vector2, arg1: Camera) -> Ray {
+    ///      return GetScreenToWorldRay(arg0, arg1); }`.
+    /// Params mirror the target's types (unnamed C params get a synthesized
+    /// `argN`); the call forwards them positionally.  A `void` target uses an
+    /// expression statement instead of a return.  Top-level decls are public by
+    /// default, so the wrapper is visible as `<Ns>::<alias>` with no modifier.
+    emit_forwarding_wrapper(mut &this, alias_name: SymbolStr, target_fn: FunctionDeclNode*) -> void {
+        mut wrapper: FunctionDeclNode* = new FunctionDeclNode(alias_name, SourceSpan::none());
+        wrapper.is_public = true;
+        wrapper.return_type_annotation = target_fn.return_type_annotation;
+
+        mut params: VarDeclNode*[] = [];
+        mut call_args: ExpressionNode*[] = [];
+        for (mut i: i64 = 0; i < target_fn.parameters.length; i++) {
+            const tp: VarDeclNode* = target_fn.parameters[i];
+            mut pname: SymbolStr = tp.name;
+            if (this.ctx.intern_table.resolve(pname).eq("")) {
+                pname = this.ctx.intern_table.intern(format("arg%lld", i));
+            }
+            mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
+            pnode.type_annotation = tp.type_annotation;
+            params.push(pnode);
+            call_args.push((new IdentifierNode(pname, SourceSpan::none())) as ExpressionNode*);
+        }
+        wrapper.parameters = params;
+
+        mut callee: IdentifierNode* = new IdentifierNode(target_fn.name, SourceSpan::none());
+        mut call: CallExprNode* = new CallExprNode(callee as ExpressionNode*, SourceSpan::none());
+        call.arguments = call_args;
+
+        mut block: BlockStmtNode* = new BlockStmtNode(SourceSpan::none());
+        if (this.is_void_annotation(target_fn.return_type_annotation)) {
+            block.add_statement(
+                (new ExprStmtNode(call as ExpressionNode*, SourceSpan::none())) as StatementNode*);
+        } else {
+            block.add_statement(
+                (new ReturnStmtNode(call as ExpressionNode*, SourceSpan::none())) as StatementNode*);
+        }
+        wrapper.body = block;
+
+        this.seen_names.push(alias_name);
+        this.emit_top_level(wrapper as ASTNode*);
+    }
+
+    /// True if `ann` denotes `void` (null, or the `void` primitive).
+    is_void_annotation(&this, ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return true; }
+        match (*ann) {
+            TypeAnnotation::Primitive(p) => {
+                return this.ctx.intern_table.resolve(p.name).eq("void");
+            }
+            _ => { return false; }
+        }
     }
 
     /// W3: bind a C compound-literal macro `#define NAME [CLITERAL](Type){ a, b, … }`
@@ -1240,6 +1326,9 @@ type struct Importer {
         }
 
         mut imp: Importer = Importer::new(extern_node, ctx, tu);
+        // The vendor generator passes a non-null out_report; the inline
+        // `#include` path passes null.  Function-alias wrappers ride this flag.
+        imp.is_vendor = out_report != null;
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
         // W1 two-pass macro emission (deferred from the decl walk): bind the
