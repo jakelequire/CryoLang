@@ -1,0 +1,439 @@
+///! Vendor Library Registry
+///!
+///! A per-machine registry of vendored C libraries.  `cryo vendor <path>`
+///! records a library here once; thereafter `import vendor::Name` resolves to
+///! the library's generated `.cryo` bindings and its native link metadata is
+///! merged into the project's link command automatically.
+///!
+///! Storage: a single JSON document at `<cache_root>/vendor/registry.json`
+///! (the same `$CRYO_HOME` -> XDG -> $HOME cache-root chain the dependency
+///! cache uses).  Reuses `std::json` for both read and write so there is no
+///! second config format.  Shape:
+///!
+///!   { "schema_version": 1,
+///!     "libraries": [
+///!       { "key": "raylib", "name": "RayLib", "source_path": "...",
+///!         "binding_source": "headers",
+///!         "headers": [...], "include_dirs": [...], "defines": [...],
+///!         "link": { "system": [...], "search": [...], "static": [...],
+///!                   "system_windows": [...], ... , "system_unix": [...], ... },
+///!         "cache": [ { "triple": "host", "file": ".../RayLib.cryo", "key": "" } ] } ] }
+///!
+///! The `cache` array is keyed on the target triple so multiple triples
+///! coexist (cross-compilation regenerates lazily on a cache miss).  An empty
+///! triple (host build) is normalized to the literal "host" on both the write
+///! and resolve sides so it survives as a directory-name component.
+
+namespace Compiler::Vendor::Registry;
+
+import ffi::libc;
+import Compiler::Deps::Cache;
+import Compiler::ProjectConfig;
+import Utils::Logger;
+import std::fs::dir;
+import std::fs::file;
+import std::fs::metadata;
+import std::fs::path;
+import std::fmt;
+import std::collections::string;
+import std::collections::str;
+import std::core::option;
+import std::json::{ value, parser, serializer };
+
+const VENDOR_SCHEMA_VERSION: i64 = 1;
+
+/// Native link metadata for a vendored library.  Mirrors the three
+/// intent-named roles of `ProjectConfig`'s `[link]` section (system -> `-l`,
+/// search -> `-L`, static -> verbatim archive path) plus the per-OS overlays,
+/// so merging into a project's link command is a field-for-field append.
+type struct VendorLink {
+    system:          string[];
+    search:          string[];
+    static_libs:     string[];
+    system_windows:  string[];
+    search_windows:  string[];
+    static_windows:  string[];
+    system_unix:     string[];
+    search_unix:     string[];
+    static_unix:     string[];
+
+    static empty() -> VendorLink {
+        return VendorLink {
+            system: [], search: [], static_libs: [],
+            system_windows: [], search_windows: [], static_windows: [],
+            system_unix: [], search_unix: [], static_unix: [],
+        };
+    }
+}
+
+/// One (triple -> generated bindings file) cache slot, with the provenance
+/// `key` the cache is validated against (filled by Stage 3; "" for now).
+type struct VendorCacheItem {
+    triple: string;
+    file:   string;
+    key:    string;
+}
+
+/// One registered library.
+type struct VendorEntry {
+    key:            string;   // registry key (the source dir basename, lowercased)
+    name:           string;   // import namespace, e.g. "RayLib"
+    source_path:    string;   // absolute path to the vendored C project
+    binding_source: string;   // "headers" (libclang) | "manual" (pre-written) | "cxx-shim"
+    headers:        string[];
+    include_dirs:   string[];
+    defines:        string[];
+    link:           VendorLink;
+    cache:          VendorCacheItem[];
+
+    /// The generated bindings path for `triple`, or "" if not yet cached.
+    cache_file_for(&this, triple: string) -> string {
+        for (mut i: i64 = 0; i < this.cache.length; i++) {
+            if (strcmp(this.cache[i].triple, triple) == 0) {
+                return this.cache[i].file;
+            }
+        }
+        return "";
+    }
+
+    /// Record (or replace) the bindings file for `triple`.
+    set_cache(mut &this, triple: string, file_path: string, prov_key: string) -> void {
+        for (mut i: i64 = 0; i < this.cache.length; i++) {
+            if (strcmp(this.cache[i].triple, triple) == 0) {
+                this.cache[i].file = file_path;
+                this.cache[i].key  = prov_key;
+                return;
+            }
+        }
+        this.cache.push(VendorCacheItem { triple: triple, file: file_path, key: prov_key });
+    }
+}
+
+/// The whole registry: a flat list of entries (each carries its own key), so
+/// no JSON object-key enumeration is needed on read.
+type struct VendorRegistry {
+    entries: VendorEntry[];
+
+    static empty() -> VendorRegistry {
+        return VendorRegistry { entries: [] };
+    }
+
+    // Paths
+
+    /// `<cache_root>/vendor`: the vendor subtree of the shared cache.
+    static vendor_root() -> string {
+        const root: string = format("%s/vendor", Cache::cache_root());
+        dir::create_dir_all(Path::from_cstr(root));
+        return root;
+    }
+
+    /// `<vendor_root>/registry.json`.
+    static registry_path() -> string {
+        return format("%s/registry.json", VendorRegistry::vendor_root());
+    }
+
+    /// `<vendor_root>/<key>/<triple>`: per-(library, triple) cache dir.
+    static cache_dir_for(key: string, triple: string) -> string {
+        const d: string = format("%s/%s/%s", VendorRegistry::vendor_root(), key,
+                                  VendorRegistry::normalize_triple(triple));
+        dir::create_dir_all(Path::from_cstr(d));
+        return d;
+    }
+
+    /// A host build carries an empty target triple; map it to "host" so it
+    /// survives as a path component and matches on the resolve side.
+    static normalize_triple(triple: string) -> string {
+        if (strlen(triple) == 0) { return "host"; }
+        return triple;
+    }
+
+    // Lookup
+
+    /// Index of the entry matching `lib` by import namespace (exact) or by
+    /// registry key (case-insensitive), or -1.  The import side uses the
+    /// namespace (`vendor::RayLib`); the CLI uses the key (`raylib`).
+    find_index(&this, lib: string) -> i64 {
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            if (strcmp(this.entries[i].name, lib) == 0) { return i; }
+        }
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            if (VendorRegistry::ieq(this.entries[i].key, lib)) { return i; }
+        }
+        return -1;
+    }
+
+    // Mutation
+
+    /// Insert `entry`, replacing any existing entry with the same key.
+    upsert(mut &this, entry: VendorEntry) -> void {
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            if (strcmp(this.entries[i].key, entry.key) == 0) {
+                this.entries[i] = entry;
+                return;
+            }
+        }
+        this.entries.push(entry);
+    }
+
+    /// Remove the entry matching `lib` (by name or key).  Returns true if one
+    /// was removed.
+    remove(mut &this, lib: string) -> boolean {
+        const idx: i64 = this.find_index(lib);
+        if (idx < 0) { return false; }
+        // `remove` moves the element out and shifts the tail down; binding it
+        // lets the owned entry drop at scope exit (no double free).
+        const _gone: VendorEntry = this.entries.remove(idx as u64);
+        return true;
+    }
+
+    // Persistence
+
+    /// Load the global registry, or an empty one if the file is missing or
+    /// malformed (a malformed registry must not wedge every build; `cryo
+    /// vendor` rewrites it cleanly).
+    static load_global() -> VendorRegistry {
+        const path: string = VendorRegistry::registry_path();
+        if (!metadata::exists(Path::from_cstr(path))) {
+            return VendorRegistry::empty();
+        }
+        mut content: string = "";
+        match (file::read_to_string(Path::from_cstr(path))) {
+            Result::Ok(s)  => { content = s.into_raw(); }
+            Result::Err(_) => { return VendorRegistry::empty(); }
+        }
+        mut root: JsonValue = match (parser::parse(Str::from_cstr(content))) {
+            Result::Ok(v)      => { v }
+            Result::Err(mut e) => { e.drop(); return VendorRegistry::empty(); }
+        };
+
+        mut reg: VendorRegistry = VendorRegistry::empty();
+        match (root.get(Str::new("libraries"))) {
+            Option::Some(libs) => {
+                const n: u64 = libs.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (libs.at(i)) {
+                        Option::Some(ep) => {
+                            reg.entries.push(VendorRegistry::read_entry(ep));
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        root.drop();
+        return reg;
+    }
+
+    /// Serialize and write the registry to its global path.  Returns false on
+    /// an I/O failure (reported by the caller).
+    save_global(&this) -> boolean {
+        const path: string = VendorRegistry::registry_path();
+        mut root: JsonObject = JsonObject::new();
+        root.put("schema_version", JsonValue::int_value(VENDOR_SCHEMA_VERSION));
+
+        mut libs: Array<JsonValue> = Array<JsonValue>::new();
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            libs.push(VendorRegistry::entry_to_json(&this.entries[i]));
+        }
+        root.put("libraries", JsonValue::Array(libs));
+
+        mut doc: JsonValue = JsonValue::Object(root);
+        mut text: String = serializer::stringify_pretty(&doc);
+        doc.drop();
+
+        const f: void* = libc::fopen(path, "w");
+        if (f == null) {
+            text.drop();
+            return false;
+        }
+        libc::fwrite(text.as_ptr(), 1, text.length(), f);
+        libc::fputs("\n", f);
+        libc::fclose(f);
+        text.drop();
+        return true;
+    }
+
+    // Link merge
+
+    /// Append `entry`'s link metadata into a project config's link arrays.
+    /// Field-for-field; `run_linking` then emits the `-l`/`-L`/archive flags
+    /// (and the per-OS overlays) exactly as for a hand-written `[link]`.
+    static merge_entry_link(cfg: ProjectConfig*, entry: &VendorEntry) -> void {
+        for (mut i: i64 = 0; i < entry.link.system.length; i++) {
+            cfg.link_system.push(entry.link.system[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.search.length; i++) {
+            cfg.link_search.push(entry.link.search[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.static_libs.length; i++) {
+            cfg.link_static.push(entry.link.static_libs[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.system_windows.length; i++) {
+            cfg.link_system_windows.push(entry.link.system_windows[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.search_windows.length; i++) {
+            cfg.link_search_windows.push(entry.link.search_windows[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.static_windows.length; i++) {
+            cfg.link_static_windows.push(entry.link.static_windows[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.system_unix.length; i++) {
+            cfg.link_system_unix.push(entry.link.system_unix[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.search_unix.length; i++) {
+            cfg.link_search_unix.push(entry.link.search_unix[i]);
+        }
+        for (mut i: i64 = 0; i < entry.link.static_unix.length; i++) {
+            cfg.link_static_unix.push(entry.link.static_unix[i]);
+        }
+    }
+
+    // JSON helpers
+
+    /// Copy a borrowed `Str` into an owned NUL-terminated C string that
+    /// outlives the `JsonValue` it was read from.
+    static dup_cstr(s: Str) -> string {
+        mut owned: String = String::from_str(s);
+        return owned.into_raw();
+    }
+
+    /// ASCII case-insensitive string equality.
+    static ieq(a: string, b: string) -> boolean {
+        const la: u64 = strlen(a);
+        if (la != strlen(b)) { return false; }
+        for (mut i: u64 = 0; i < la; i++) {
+            mut ca: i32 = a[i] as i32;
+            mut cb: i32 = b[i] as i32;
+            if (ca >= 65 && ca <= 90) { ca += 32; }
+            if (cb >= 65 && cb <= 90) { cb += 32; }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    /// Read a string field off a JSON object, or `def` when absent/non-string.
+    static jstr(parent: JsonValue*, key: string, def: string) -> string {
+        match (parent.get(Str::from_cstr(key))) {
+            Option::Some(vp) => {
+                match (vp.as_str()) {
+                    Option::Some(vs) => { return VendorRegistry::dup_cstr(vs); }
+                    Option::None     => { return def; }
+                }
+            }
+            Option::None => { return def; }
+        }
+    }
+
+    /// Read a `string[]` field off a JSON object (empty when absent).
+    static jstrs(parent: JsonValue*, key: string) -> string[] {
+        mut out: string[] = [];
+        match (parent.get(Str::from_cstr(key))) {
+            Option::Some(arrp) => {
+                const n: u64 = arrp.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (arrp.at(i)) {
+                        Option::Some(ep) => {
+                            match (ep.as_str()) {
+                                Option::Some(es) => { out.push(VendorRegistry::dup_cstr(es)); }
+                                Option::None     => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        return out;
+    }
+
+    /// Parse one library entry object.
+    static read_entry(ep: JsonValue*) -> VendorEntry {
+        mut entry: VendorEntry = VendorEntry {
+            key:            VendorRegistry::jstr(ep, "key", ""),
+            name:           VendorRegistry::jstr(ep, "name", ""),
+            source_path:    VendorRegistry::jstr(ep, "source_path", ""),
+            binding_source: VendorRegistry::jstr(ep, "binding_source", "headers"),
+            headers:        VendorRegistry::jstrs(ep, "headers"),
+            include_dirs:   VendorRegistry::jstrs(ep, "include_dirs"),
+            defines:        VendorRegistry::jstrs(ep, "defines"),
+            link:           VendorLink::empty(),
+            cache:          [],
+        };
+        match (ep.get(Str::new("link"))) {
+            Option::Some(lp) => { entry.link = VendorRegistry::read_link(lp); }
+            Option::None     => { }
+        }
+        match (ep.get(Str::new("cache"))) {
+            Option::Some(cp) => {
+                const n: u64 = cp.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (cp.at(i)) {
+                        Option::Some(itp) => {
+                            entry.cache.push(VendorCacheItem {
+                                triple: VendorRegistry::jstr(itp, "triple", ""),
+                                file:   VendorRegistry::jstr(itp, "file", ""),
+                                key:    VendorRegistry::jstr(itp, "key", ""),
+                            });
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        return entry;
+    }
+
+    /// Parse the `link` sub-object.
+    static read_link(lp: JsonValue*) -> VendorLink {
+        return VendorLink {
+            system:          VendorRegistry::jstrs(lp, "system"),
+            search:          VendorRegistry::jstrs(lp, "search"),
+            static_libs:     VendorRegistry::jstrs(lp, "static"),
+            system_windows:  VendorRegistry::jstrs(lp, "system_windows"),
+            search_windows:  VendorRegistry::jstrs(lp, "search_windows"),
+            static_windows:  VendorRegistry::jstrs(lp, "static_windows"),
+            system_unix:     VendorRegistry::jstrs(lp, "system_unix"),
+            search_unix:     VendorRegistry::jstrs(lp, "search_unix"),
+            static_unix:     VendorRegistry::jstrs(lp, "static_unix"),
+        };
+    }
+
+    /// Serialize one entry to a JSON value.
+    static entry_to_json(entry: &VendorEntry) -> JsonValue {
+        mut obj: JsonObject = JsonObject::new();
+        obj.put("key",            JsonValue::from_cstr(entry.key));
+        obj.put("name",           JsonValue::from_cstr(entry.name));
+        obj.put("source_path",    JsonValue::from_cstr(entry.source_path));
+        obj.put("binding_source", JsonValue::from_cstr(entry.binding_source));
+        obj.put("headers",        JsonValue::string_array(&entry.headers));
+        obj.put("include_dirs",   JsonValue::string_array(&entry.include_dirs));
+        obj.put("defines",        JsonValue::string_array(&entry.defines));
+
+        mut link: JsonObject = JsonObject::new();
+        link.put("system",         JsonValue::string_array(&entry.link.system));
+        link.put("search",         JsonValue::string_array(&entry.link.search));
+        link.put("static",         JsonValue::string_array(&entry.link.static_libs));
+        link.put("system_windows", JsonValue::string_array(&entry.link.system_windows));
+        link.put("search_windows", JsonValue::string_array(&entry.link.search_windows));
+        link.put("static_windows", JsonValue::string_array(&entry.link.static_windows));
+        link.put("system_unix",    JsonValue::string_array(&entry.link.system_unix));
+        link.put("search_unix",    JsonValue::string_array(&entry.link.search_unix));
+        link.put("static_unix",    JsonValue::string_array(&entry.link.static_unix));
+        obj.put("link", JsonValue::Object(link));
+
+        mut cache: Array<JsonValue> = Array<JsonValue>::new();
+        for (mut i: i64 = 0; i < entry.cache.length; i++) {
+            mut c: JsonObject = JsonObject::new();
+            c.put("triple", JsonValue::from_cstr(entry.cache[i].triple));
+            c.put("file",   JsonValue::from_cstr(entry.cache[i].file));
+            c.put("key",    JsonValue::from_cstr(entry.cache[i].key));
+            cache.push(JsonValue::Object(c));
+        }
+        obj.put("cache", JsonValue::Array(cache));
+
+        return JsonValue::Object(obj);
+    }
+}

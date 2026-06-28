@@ -15,6 +15,7 @@ import Compiler::ModuleGraph;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Compiler::ProjectConfig;
+import Compiler::Vendor::Registry;
 import Utils::Logger;
 import std::fs::file;
 import std::fs::metadata;
@@ -58,6 +59,17 @@ type struct ModuleLoader {
     lsp_override_path:    string;
     lsp_override_content: string;
 
+    /// Vendor library resolution.  `import vendor::Name` consults this
+    /// registry (loaded once via `set_vendor_context`) and resolves to the
+    /// generated bindings cached for `vendor_triple`.  `used_vendor_keys`
+    /// records which vendor libs an import-walk actually touched, so their
+    /// native link metadata can be merged into the project link command
+    /// afterwards (`merge_vendor_links`).  Empty/disabled in builds that
+    /// never call `set_vendor_context` (single-file, raw, LSP for now).
+    vendor_registry:  VendorRegistry;
+    vendor_triple:    string;
+    used_vendor_keys: string[];
+
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
                extra_roots: string[]) -> ModuleLoader {
@@ -72,7 +84,19 @@ type struct ModuleLoader {
             ns_map:        HashMap<string, string>::new(),
             lsp_override_path:    "",
             lsp_override_content: "",
+            vendor_registry:  VendorRegistry::empty(),
+            vendor_triple:    "",
+            used_vendor_keys: [],
         };
+    }
+
+    /// Enable `vendor::` import resolution.  Loads the global vendor registry
+    /// into this loader and records the effective target triple used to pick a
+    /// library's cached bindings.  Called once, before `discover_project`, on
+    /// the project-build path.
+    set_vendor_context(mut &this, triple: string) -> void {
+        this.vendor_triple    = triple;
+        this.vendor_registry  = VendorRegistry::load_global();
     }
 
     /// Wire the LSP editor-buffer override.  Called once, before
@@ -294,6 +318,26 @@ type struct ModuleLoader {
     /// Resolve an import path (e.g., "BattleTest" or "Compiler::AST")
     /// to a filesystem path.  Returns "" if not found.
     resolve_import_path(&this, import_path: string) -> string {
+        // Vendor libraries: `import vendor::Name` resolves through the vendor
+        // registry to the bindings generated for the active target triple,
+        // never the project tree or stdlib.  Handled before any filesystem
+        // search so a `vendor::` path can never accidentally match a local
+        // module.  Returns "" (the normal not-found path) when the library
+        // isn't registered or has no bindings cached for this triple, so the
+        // standard E0500 "cannot find module" diagnostic still fires.
+        if (ModuleLoader::is_vendor_path(import_path)) {
+            const lib: string = import_path + 8;   // strip "vendor::"
+            const idx: i64 = this.vendor_registry.find_index(lib);
+            if (idx < 0) { return ""; }
+            const triple: string =
+                VendorRegistry::normalize_triple(this.vendor_triple);
+            const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
+            if (strlen(f) > 0 && metadata::exists(Path::from_cstr(f))) {
+                return f;
+            }
+            return "";
+        }
+
         // Fast path: check pre-scanned namespace map first.
         // This handles all case-insensitive resolution automatically since
         // the map was built by walking the actual filesystem.
@@ -333,6 +377,39 @@ type struct ModuleLoader {
         }
 
         return "";
+    }
+
+    /// True when `import_path` names a vendored library (`vendor::Name`).
+    static is_vendor_path(import_path: string) -> boolean {
+        return strlen(import_path) > 8
+            && (strstr(import_path, "vendor::") as void*) == (import_path as void*);
+    }
+
+    /// Record that an import-walk resolved a `vendor::Name` import, so the
+    /// library's native link metadata is merged later (`merge_vendor_links`).
+    /// Dedups by registry key.  No-op for non-vendor paths or unregistered
+    /// libraries.  Called from the discovery loop (which holds `mut &this`).
+    note_vendor_import(mut &this, import_path: string) -> void {
+        if (!ModuleLoader::is_vendor_path(import_path)) { return; }
+        const lib: string = import_path + 8;
+        const idx: i64 = this.vendor_registry.find_index(lib);
+        if (idx < 0) { return; }
+        const key: string = this.vendor_registry.entries[idx].key;
+        for (mut i: i64 = 0; i < this.used_vendor_keys.length; i++) {
+            if (strcmp(this.used_vendor_keys[i], key) == 0) { return; }
+        }
+        this.used_vendor_keys.push(key);
+    }
+
+    /// Merge every used vendor library's link metadata into `cfg`'s link
+    /// arrays, so `run_linking` emits the right `-l`/`-L`/archive flags.
+    /// Called after discovery, before linking.
+    merge_vendor_links(&this, cfg: ProjectConfig*) -> void {
+        for (mut i: i64 = 0; i < this.used_vendor_keys.length; i++) {
+            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i]);
+            if (idx < 0) { continue; }
+            VendorRegistry::merge_entry_link(cfg, &this.vendor_registry.entries[idx]);
+        }
     }
 
 
@@ -498,6 +575,10 @@ type struct ModuleLoader {
                     continue;
                 }
             }
+
+            // Vendor import: record the library so its native link metadata
+            // is merged into the link command after discovery.
+            this.note_vendor_import(import_path);
 
             // Recursively discover the dependency (must happen before
             // add_dependency so the target module's namespace is known)
