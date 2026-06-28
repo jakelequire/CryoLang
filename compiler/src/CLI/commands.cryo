@@ -2268,15 +2268,19 @@ type struct Executor {
             fmt::eprintf("Error: cryo vendor add needs a path to a C project.\n");
             return 1;
         }
-        return Executor::vendor_register(path, &args);
+        return Executor::vendor_register(path, &args, false);
     }
 
     /// Register (or re-register) the C library rooted at `path`.  Reads a
-    /// `cryo-vendor.json` manifest there for the binding/link metadata, copies
-    /// the manifest's `bindings_file` into the triple-keyed cache (Stage-1
-    /// path; Stage 2 replaces this with libclang generation), and writes the
-    /// global registry entry.
-    static vendor_register(path: string, args: &ParsedArgs) -> int {
+    /// `cryo-vendor.json` manifest there for the binding/link metadata,
+    /// generates (or copies) the bindings into the triple-keyed cache, and
+    /// writes the global registry entry.
+    ///
+    /// `force` bypasses the Stage-3 cache-hit check so `cryo vendor rebuild`
+    /// always regenerates; a bare `cryo vendor <path>` passes `false`, so an
+    /// unchanged (headers + triple + libclang + generator) provenance is a
+    /// cache hit and libclang is not re-run.
+    static vendor_register(path: string, args: &ParsedArgs, force: boolean) -> int {
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
         mut abuf: i8* = malloc(4096) as i8*;
@@ -2339,8 +2343,33 @@ type struct Executor {
         const dest: string = format("%s/%s.cryo", cache_dir, name);
         mut produced: boolean = false;
 
+        // Load the on-disk registry up front: it carries any cache entries for
+        // OTHER triples (so they coexist after this re-register) and the prior
+        // provenance key for THIS triple (for the Stage-3 cache-hit check).
+        // `string` fields are non-owning pointers into leaked buffers, so the
+        // carried-over items stay valid after the old entry is replaced.
+        mut reg: VendorRegistry = VendorRegistry::load_global();
+        mut prev_key:  string = "";
+        mut prev_file: string = "";
+        const prev_idx: i64 = reg.find_index(key);
+        if (prev_idx >= 0) {
+            for (mut c: i64 = 0; c < reg.entries[prev_idx].cache.length; c++) {
+                const ct: string = reg.entries[prev_idx].cache[c].triple;
+                entry.cache.push(VendorCacheItem {
+                    triple: ct,
+                    file:   reg.entries[prev_idx].cache[c].file,
+                    key:    reg.entries[prev_idx].cache[c].key,
+                });
+                if (strcmp(ct, norm_triple) == 0) {
+                    prev_key  = reg.entries[prev_idx].cache[c].key;
+                    prev_file = reg.entries[prev_idx].cache[c].file;
+                }
+            }
+        }
+
         if (strlen(bindings_file) > 0) {
             // Escape hatch: copy pre-written bindings verbatim into the cache.
+            // (No provenance key: a hand-supplied file is always re-copied.)
             const src: string = format("%s/%s", abs, bindings_file);
             if (!metadata::exists(Path::from_cstr(src))) {
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
@@ -2353,31 +2382,45 @@ type struct Executor {
             entry.set_cache(norm_triple, dest, "");
             produced = true;
         } else if (strcmp(entry.binding_source, "headers") == 0) {
-            // Generate bindings from the manifest's C headers via libclang.
+            // Generate bindings from the manifest's C headers via libclang,
+            // unless an unchanged provenance key makes this a cache hit.
             if (entry.headers.length == 0) {
                 fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
                 return 1;
             }
-            fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
-                name, entry.headers.length as i64);
-            const src_text: string = VendorGenerator::generate(
-                name, abs, &entry.headers, &entry.include_dirs, &entry.defines);
-            if (strlen(src_text) == 0) {
-                fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
-                return 1;
+            const prov_key: string = VendorGenerator::provenance_key(
+                abs, &entry.headers, &entry.include_dirs, norm_triple);
+            const hit: boolean = !force
+                && strlen(prev_key) > 0 && strcmp(prev_key, prov_key) == 0
+                && strlen(prev_file) > 0 && metadata::exists(Path::from_cstr(prev_file));
+            if (hit) {
+                fmt::printf("Bindings for '%s' are up to date for triple '%s' (cache hit).\n",
+                    name, norm_triple);
+                // Keep the file we just confirmed exists (its path, not the
+                // recomputed `dest`, in case the manifest's name changed).
+                entry.set_cache(norm_triple, prev_file, prov_key);
+                produced = true;
+            } else {
+                fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
+                    name, entry.headers.length as i64);
+                const src_text: string = VendorGenerator::generate(
+                    name, abs, &entry.headers, &entry.include_dirs, &entry.defines);
+                if (strlen(src_text) == 0) {
+                    fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
+                    return 1;
+                }
+                const gf: void* = fopen(dest, "w");
+                if (gf == null) {
+                    fmt::eprintf("Error: cannot write generated bindings to %s\n", dest);
+                    return 1;
+                }
+                fputs(src_text, gf);
+                fclose(gf);
+                entry.set_cache(norm_triple, dest, prov_key);
+                produced = true;
             }
-            const gf: void* = fopen(dest, "w");
-            if (gf == null) {
-                fmt::eprintf("Error: cannot write generated bindings to %s\n", dest);
-                return 1;
-            }
-            fputs(src_text, gf);
-            fclose(gf);
-            entry.set_cache(norm_triple, dest, "");
-            produced = true;
         }
 
-        mut reg: VendorRegistry = VendorRegistry::load_global();
         reg.upsert(entry);
         if (!reg.save_global()) {
             fmt::eprintf("Error: failed to write the vendor registry at %s\n",
@@ -2459,8 +2502,9 @@ type struct Executor {
                 failures += 1;
                 continue;
             }
-            // Re-run registration, which re-reads the manifest and regenerates.
-            if (Executor::vendor_register(src, &args) != 0) { failures += 1; }
+            // Re-run registration with force=true so `rebuild` always
+            // regenerates, bypassing the provenance cache-hit check.
+            if (Executor::vendor_register(src, &args, true) != 0) { failures += 1; }
         }
         if (failures > 0) { return 1; }
         return 0;
