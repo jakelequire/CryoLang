@@ -5,14 +5,18 @@ import std::env;
 import Compiler::{ Instance, CompilationContext, ProjectConfig };
 import Compiler::Deps::DepResolver;
 import Compiler::Resolver::Demangler;
+import Compiler::Vendor::Registry;
 import Utils;
 import Utils::Logger;
 import std::collections::string;
 import std::collections::str;
 import std::fs::file;
 import std::fs::path;
+import std::fs::metadata;
+import std::fs::dir;
 import std::json::parser;
 import std::json::value;
+import std::json::serializer;
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
 // unit runner's framing in stdlib/test/runner.cryo so the two suites read
@@ -137,6 +141,7 @@ type enum CommandKind {
     Demangle;
     Fetch;
     Update;
+    Vendor;
     Unknown;
 }
 
@@ -154,6 +159,7 @@ implement enum CommandKind {
             CommandKind::Demangle => { "demangle" }
             CommandKind::Fetch    => { "fetch"    }
             CommandKind::Update   => { "update"   }
+            CommandKind::Vendor   => { "vendor"   }
             _ => { "" }
         };
     }
@@ -171,6 +177,7 @@ implement enum CommandKind {
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
             CommandKind::Update   => { "Re-resolve every dependency, ignoring the lockfile" }
+            CommandKind::Vendor   => { "Register a C library for `import vendor::Name`" }
             _ => { "" }
         };
     }
@@ -188,6 +195,7 @@ implement enum CommandKind {
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::Fetch    => { "cryo fetch"                        }
             CommandKind::Update   => { "cryo update"                       }
+            CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|rebuild [name]" }
             _ => { "" }
         };
     }
@@ -304,6 +312,20 @@ implement enum CommandKind {
                 fmt::printf("Like `fetch`, but ignores the existing lockfile and re-resolves\n");
                 fmt::printf("every dependency from scratch - use it to bump pinned git SHAs\n");
                 fmt::printf("to the latest tag or branch tip.\n");
+            }
+            CommandKind::Vendor => {
+                fmt::printf("Registers a C library so its API is usable via `import vendor::Name`,\n");
+                fmt::printf("with bindings and native link flags resolved automatically.\n\n");
+                fmt::printf("  cryo vendor <path>        Register the C project at <path>.  Reads a\n");
+                fmt::printf("                            `cryo-vendor.json` manifest there (name, headers,\n");
+                fmt::printf("                            include_dirs, defines, link, bindings_file).\n");
+                fmt::printf("  cryo vendor list          List registered vendor libraries.\n");
+                fmt::printf("  cryo vendor remove <name> Unregister a library (by name or key).\n");
+                fmt::printf("  cryo vendor rebuild [name] Regenerate bindings (not yet implemented).\n\n");
+                fmt::printf("The registry is global (per machine), stored under the cryo cache at\n");
+                fmt::printf("`<cache>/vendor/registry.json`; bindings are cached per target triple.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --target=TRIPLE   Cache bindings for the given triple (default: host)\n");
             }
             _ => {}
         }
@@ -482,6 +504,9 @@ type struct Executor {
 
         const update: CommandKind = CommandKind::Update;
         runner.add_command(Command::new(update.name(), update.description(), update.usage()));
+
+        const vendor: CommandKind = CommandKind::Vendor;
+        runner.add_command(Command::new(vendor.name(), vendor.description(), vendor.usage()));
     }
 
     /// Apply the build-profile and incremental flags shared by
@@ -533,6 +558,7 @@ type struct Executor {
             "demangle" => { CommandKind::Demangle }
             "fetch"    => { CommandKind::Fetch }
             "update"   => { CommandKind::Update }
+            "vendor"   => { CommandKind::Vendor }
             _          => { CommandKind::Unknown }
         };
     }
@@ -557,6 +583,7 @@ type struct Executor {
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
             CommandKind::Fetch    => { return Executor::cmd_fetch(args); }
             CommandKind::Update   => { return Executor::cmd_update(args); }
+            CommandKind::Vendor   => { return Executor::cmd_vendor(args); }
             CommandKind::Unknown => {
                 fmt::eprintf("Error: Unknown command. Run 'cryo help' for usage.\n");
                 return 1;
@@ -2215,5 +2242,215 @@ type struct Executor {
             if (outcome.lock.packages.length == 1) { "y" } else { "ies" },
             lock_path);
         return 0;
+    }
+
+    /// `cryo vendor <path>|list|remove <name>|rebuild [name]`: manage the
+    /// per-machine registry of vendored C libraries.
+    static cmd_vendor(args: ParsedArgs) -> int {
+        if (args.has_flag("debug")) { Logger::enable_debug(); }
+
+        const sub: string = args.input_file();
+        if (strlen(sub) == 0) {
+            fmt::eprintf("Error: cryo vendor needs a subcommand or path.\n");
+            fmt::eprintf("Usage: cryo vendor <path>|list|remove <name>|rebuild [name]\n");
+            return 1;
+        }
+        if (strcmp(sub, "list") == 0)   { return Executor::vendor_list(); }
+        if (strcmp(sub, "remove") == 0) { return Executor::vendor_remove(args.positional_at(1)); }
+        if (strcmp(sub, "rebuild") == 0) {
+            fmt::eprintf("cryo vendor rebuild: bindings regeneration is not yet implemented (Stage 3).\n");
+            return 1;
+        }
+
+        // Bare `<path>` or explicit `add <path>`.
+        const path: string = if (strcmp(sub, "add") == 0) { args.positional_at(1) } else { sub };
+        if (strlen(path) == 0) {
+            fmt::eprintf("Error: cryo vendor add needs a path to a C project.\n");
+            return 1;
+        }
+        return Executor::vendor_register(path, args);
+    }
+
+    /// Register (or re-register) the C library rooted at `path`.  Reads a
+    /// `cryo-vendor.json` manifest there for the binding/link metadata, copies
+    /// the manifest's `bindings_file` into the triple-keyed cache (Stage-1
+    /// path; Stage 2 replaces this with libclang generation), and writes the
+    /// global registry entry.
+    static vendor_register(path: string, args: ParsedArgs) -> int {
+        // Resolve to an absolute path (the registry stores absolute roots so
+        // `import vendor::Name` works from any project directory).
+        mut abuf: i8* = malloc(4096) as i8*;
+        const resolved: i8* = intrinsics::realpath(path, abuf);
+        if (resolved == null) {
+            fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
+            return 1;
+        }
+        const abs: string = abuf as string;
+
+        const manifest_path: string = format("%s/cryo-vendor.json", abs);
+        if (!metadata::exists(Path::from_cstr(manifest_path))) {
+            fmt::eprintf("Error: no cryo-vendor.json manifest found at %s\n", manifest_path);
+            fmt::eprintf("       a vendored library needs a manifest declaring its name,\n");
+            fmt::eprintf("       headers, link libraries, and (Stage 1) a bindings_file.\n");
+            return 1;
+        }
+        mut content: string = "";
+        match (file::read_to_string(Path::from_cstr(manifest_path))) {
+            Result::Ok(s)  => { content = s.into_raw(); }
+            Result::Err(_) => {
+                fmt::eprintf("Error: cannot read %s\n", manifest_path);
+                return 1;
+            }
+        }
+        mut root: JsonValue = match (parser::parse(Str::from_cstr(content))) {
+            Result::Ok(v)      => { v }
+            Result::Err(mut e) => {
+                e.drop();
+                fmt::eprintf("Error: %s is not valid JSON.\n", manifest_path);
+                return 1;
+            }
+        };
+
+        const key: string = Executor::to_lower(Executor::path_basename(abs));
+        const name: string = VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
+
+        mut entry: VendorEntry = VendorEntry {
+            key:            key,
+            name:           name,
+            source_path:    abs,
+            binding_source: VendorRegistry::jstr(&root, "binding_source", "manual"),
+            headers:        VendorRegistry::jstrs(&root, "headers"),
+            include_dirs:   VendorRegistry::jstrs(&root, "include_dirs"),
+            defines:        VendorRegistry::jstrs(&root, "defines"),
+            link:           VendorLink::empty(),
+            cache:          [],
+        };
+        match (root.get(Str::new("link"))) {
+            Option::Some(lp) => { entry.link = VendorRegistry::read_link(lp); }
+            Option::None     => { }
+        }
+
+        // Stage-1 binding source: copy a pre-written `.cryo` named by the
+        // manifest's `bindings_file` into the triple-keyed cache.  Stage 2
+        // replaces this branch with libclang generation when none is given.
+        const triple: string = if (args.has_arg("target")) { args.get_value("target") } else { "" };
+        const norm_triple: string = VendorRegistry::normalize_triple(triple);
+        const bindings_file: string = VendorRegistry::jstr(&root, "bindings_file", "");
+        root.drop();
+
+        mut produced: boolean = false;
+        if (strlen(bindings_file) > 0) {
+            const src: string = format("%s/%s", abs, bindings_file);
+            if (!metadata::exists(Path::from_cstr(src))) {
+                fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
+                return 1;
+            }
+            const cache_dir: string = VendorRegistry::cache_dir_for(key, triple);
+            const dest: string = format("%s/%s.cryo", cache_dir, name);
+            if (!Executor::copy_text_file(src, dest)) {
+                fmt::eprintf("Error: failed to copy bindings into the cache (%s -> %s).\n", src, dest);
+                return 1;
+            }
+            entry.set_cache(norm_triple, dest, "");
+            produced = true;
+        }
+
+        mut reg: VendorRegistry = VendorRegistry::load_global();
+        reg.upsert(entry);
+        if (!reg.save_global()) {
+            fmt::eprintf("Error: failed to write the vendor registry at %s\n",
+                VendorRegistry::registry_path());
+            return 1;
+        }
+
+        fmt::printf("Registered vendor library '%s' -> import vendor::%s\n", key, name);
+        fmt::printf("  source: %s\n", abs);
+        if (produced) {
+            fmt::printf("  bindings cached for triple '%s'\n", norm_triple);
+        } else {
+            fmt::printf("  note: no bindings_file in the manifest; no bindings were produced.\n");
+            fmt::printf("        libclang generation lands in Stage 2 — for now add a\n");
+            fmt::printf("        \"bindings_file\" entry pointing at a hand-written .cryo.\n");
+        }
+        return 0;
+    }
+
+    /// `cryo vendor list`: print the registered libraries.
+    static vendor_list() -> int {
+        const reg: VendorRegistry = VendorRegistry::load_global();
+        if (reg.entries.length == 0) {
+            fmt::printf("No vendor libraries registered.\n");
+            fmt::printf("Register one with: cryo vendor <path-to-c-project>\n");
+            return 0;
+        }
+        fmt::printf("Registered vendor libraries (%lld):\n", reg.entries.length as i64);
+        for (mut i: i64 = 0; i < reg.entries.length; i++) {
+            fmt::printf("  %s  ->  import vendor::%s\n",
+                reg.entries[i].key, reg.entries[i].name);
+            fmt::printf("      source: %s\n", reg.entries[i].source_path);
+            for (mut c: i64 = 0; c < reg.entries[i].cache.length; c++) {
+                fmt::printf("      [%s] %s\n",
+                    reg.entries[i].cache[c].triple, reg.entries[i].cache[c].file);
+            }
+        }
+        return 0;
+    }
+
+    /// `cryo vendor remove <name>`: unregister a library by name or key.
+    static vendor_remove(name: string) -> int {
+        if (strlen(name) == 0) {
+            fmt::eprintf("Error: cryo vendor remove needs a library name.\n");
+            return 1;
+        }
+        mut reg: VendorRegistry = VendorRegistry::load_global();
+        if (!reg.remove(name)) {
+            fmt::eprintf("No vendor library named '%s' is registered.\n", name);
+            return 1;
+        }
+        if (!reg.save_global()) {
+            fmt::eprintf("Error: failed to write the vendor registry.\n");
+            return 1;
+        }
+        fmt::printf("Removed vendor library '%s'.\n", name);
+        return 0;
+    }
+
+    /// The final path component of `p` (handles both `/` and `\` separators).
+    /// Returns a pointer into `p`.
+    static path_basename(p: string) -> string {
+        const n: i64 = strlen(p) as i64;
+        mut start: i64 = 0;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (p[i] == '/' || p[i] == '\\') { start = i + 1; }
+        }
+        return p + start;
+    }
+
+    /// ASCII-lowercase a string into a fresh heap buffer.
+    static to_lower(s: string) -> string {
+        const n: u64 = strlen(s);
+        const buf: i8* = malloc(n + 1) as i8*;
+        for (mut i: u64 = 0; i < n; i++) {
+            mut c: i8 = s[i];
+            if (c >= 65 && c <= 90) { c = (c + 32) as i8; }
+            buf[i] = c;
+        }
+        buf[n] = 0;
+        return buf as string;
+    }
+
+    /// Copy a text file `src` -> `dest` (truncating dest).  Used to seed the
+    /// vendor cache with hand-written Stage-1 bindings.
+    static copy_text_file(src: string, dest: string) -> boolean {
+        mut text: string = "";
+        match (file::read_to_string(Path::from_cstr(src))) {
+            Result::Ok(s)  => { text = s.into_raw(); }
+            Result::Err(_) => { return false; }
+        }
+        const f: void* = fopen(dest, "w");
+        if (f == null) { return false; }
+        fputs(text, f);
+        fclose(f);
+        return true;
     }
 }
