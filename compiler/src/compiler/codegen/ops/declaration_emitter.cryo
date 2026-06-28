@@ -1458,6 +1458,18 @@ type struct DeclarationEmitter {
                 }
             }
         }
+        // Struct-literal const initializer, e.g. the bindgen importer lowers a
+        // C compound-literal macro `#define RAYWHITE (Color){245,245,245,255}`
+        // to `const RAYWHITE: Color = Color { r: 245, ... }`.  Build a constant
+        // aggregate from the field initializers (each must fold to a scalar
+        // constant); decline to the zeroinitializer fallback below otherwise.
+        // Only runs when `init` is still invalid, so no currently-correct const
+        // can change.
+        if (!init.is_valid() && init_expr != null
+            && init_expr.kind == NodeKind::StructLiteral
+            && LType::kind_of(ty.raw) == LTypeKind::Struct) {
+            init = DeclarationEmitter::try_const_struct(init_expr as StructLiteralNode*, ty);
+        }
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
@@ -2232,5 +2244,46 @@ type struct DeclarationEmitter {
             return false;
         }
         return false;
+    }
+
+    /// Build a constant struct aggregate for a module-level struct-literal const
+    /// initializer (`const RAYWHITE: Color = Color { r: 245, ... }`, the shape
+    /// the bindgen importer lowers a C compound-literal macro to).  The importer
+    /// emits the field initializers in struct DECLARATION order, so a positional
+    /// zip against the LLVM struct's element types is exact.  Every field init
+    /// must fold to a scalar constant (`try_fold_const_int`/`try_fold_const_real`);
+    /// any non-constant field, or a field-count mismatch (an unexpected shape),
+    /// returns an invalid value so the caller declines to the zeroinitializer
+    /// fallback — correct-or-decline, never a silently wrong layout.
+    static try_const_struct(sl: StructLiteralNode*, ty: LType) -> LValue {
+        const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
+        if (n == 0u32 || (sl.field_inits.length as u32) != n) { return LValue::null(); }
+        const buf: void* = intrinsics::malloc((n as u64) * 8);
+        const slots: void** = buf as void**;
+        mut ok: boolean = true;
+        for (mut i: u32 = 0u32; i < n; i++) {
+            const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, i);
+            const fty: LType = LType { raw: fty_raw };
+            const fk: LTypeKind = LType::kind_of(fty_raw);
+            const fexpr: ExpressionNode* = sl.field_inits[i as i64].value;
+            mut slot: LValue = LValue::null();
+            if (fk == LTypeKind::Integer) {
+                mut iv: u64 = 0;
+                if (DeclarationEmitter::try_fold_const_int(fexpr, &iv)) {
+                    slot = LType::const_int(fty, iv, true);
+                }
+            } else if (fk == LTypeKind::Float || fk == LTypeKind::Double) {
+                mut fv: f64 = 0.0;
+                if (DeclarationEmitter::try_fold_const_real(fexpr, &fv)) {
+                    slot = LType::const_real(fty, fv);
+                }
+            }
+            if (!slot.is_valid()) { ok = false; break; }
+            slots[i as i64] = slot.raw;
+        }
+        if (!ok) { intrinsics::free(buf); return LValue::null(); }
+        const v: LValue = LType::const_named_struct(ty, buf, n);
+        intrinsics::free(buf);
+        return v;
     }
 }
