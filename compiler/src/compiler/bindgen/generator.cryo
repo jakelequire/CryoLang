@@ -25,6 +25,7 @@ import ffi::libc;
 import Compiler::Bindgen::Importer;
 import Compiler::Bindgen::Importer::{ ImportReport };
 import Compiler::Bindgen::Clang;
+import Compiler::Lex::{ TokenType };
 import Compiler::Bindgen::Clang::{ CXString };
 import Compiler::BuildManifest;
 import Compiler::CompilationContext;
@@ -133,11 +134,11 @@ type struct BindingSerializer {
             this.out.push_cstr(format("![align(%llu)]\n", node.min_alignment));
         }
         this.out.push_cstr(format("type struct %s {\n",
-            this.ctx.intern_table.resolve(node.name)));
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name))));
         for (mut i: i64 = 0; i < node.fields.length; i++) {
             const f: FieldDeclNode* = node.fields[i];
             this.out.push_cstr(format("    %s: %s;\n",
-                this.ctx.intern_table.resolve(f.name),
+                BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
                 this.render_type(f.type_annotation)));
         }
         this.out.push_cstr("}\n\n");
@@ -150,10 +151,10 @@ type struct BindingSerializer {
             disc = this.render_type(node.discriminant_annotation);
         }
         this.out.push_cstr(format("type enum %s : %s {\n",
-            this.ctx.intern_table.resolve(node.name), disc));
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), disc));
         for (mut i: i64 = 0; i < node.variants.length; i++) {
             const v: EnumVariantNode* = node.variants[i];
-            const vn: string = this.ctx.intern_table.resolve(v.name);
+            const vn: string = BindingSerializer::ident(this.ctx.intern_table.resolve(v.name));
             if (v.has_value) {
                 this.out.push_cstr(format("    %s = %lld;\n", vn, v.explicit_value));
             } else {
@@ -165,7 +166,7 @@ type struct BindingSerializer {
 
     render_alias(mut &this, node: TypeAliasDeclNode*) -> void {
         this.out.push_cstr(format("type %s = %s;\n\n",
-            this.ctx.intern_table.resolve(node.alias_name),
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.alias_name)),
             this.render_type(node.target_annotation)));
     }
 
@@ -187,7 +188,7 @@ type struct BindingSerializer {
             val = format("%s as %s", lit.value, ty);
         }
         this.out.push_cstr(format("const %s: %s = %s;\n",
-            this.ctx.intern_table.resolve(node.name), ty, val));
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, val));
     }
 
     render_function(mut &this, node: FunctionDeclNode*) -> void {
@@ -198,6 +199,7 @@ type struct BindingSerializer {
             const p: VarDeclNode* = node.parameters[i];
             mut pn: string = this.ctx.intern_table.resolve(p.name);
             if (libc::strlen(pn) == 0) { pn = format("arg%lld", i); }
+            else                       { pn = BindingSerializer::ident(pn); }
             this.out.push_cstr(format("%s: %s", pn, this.render_type(p.type_annotation)));
         }
         if (node.is_variadic) {
@@ -221,9 +223,11 @@ type struct BindingSerializer {
             }
             TypeAnnotation::Named(n) => {
                 // The importer qualified this as `<ns>::Tag`; strip back to the
-                // bare tag since it lives under this file's namespace.
-                return BindingSerializer::last_segment(
-                    this.ctx.intern_table.resolve(n.name));
+                // bare tag since it lives under this file's namespace.  Apply the
+                // same keyword-escape as the decl site so a reference to a
+                // keyword-named type stays consistent.
+                return BindingSerializer::ident(BindingSerializer::last_segment(
+                    this.ctx.intern_table.resolve(n.name)));
             }
             TypeAnnotation::Array(a) => {
                 return format("%s[%lld]", this.render_type(a.element), a.size);
@@ -241,6 +245,19 @@ type struct BindingSerializer {
     }
 
     // ---- helpers ----
+
+    /// Make a C identifier safe to emit as a Cryo identifier: a C name that is
+    /// a Cryo keyword (`type`, `in`, `new`, `string`, …) is suffixed with `_`
+    /// so the binding parses (raylib's `AutomationEvent.type`, for instance).
+    /// Layout/ABI is positional, so renaming a field/param/variant is harmless;
+    /// the consumer simply uses the suffixed name.  Reuses the lexer's own
+    /// keyword table (single source of truth) so it can never drift.
+    static ident(name: string) -> string {
+        if (TokenType::from_keyword(name) != TokenType::Unknown) {
+            return name + "_";
+        }
+        return name;
+    }
 
     /// The segment after the final `::` (e.g. `RayLib::Color` -> `Color`).
     static last_segment(s: string) -> string {
