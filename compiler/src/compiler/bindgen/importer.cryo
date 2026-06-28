@@ -750,8 +750,9 @@ type struct Importer {
     /// path and emit its function prototypes.  Returns the count.
     static import_local_header(resolved_path: string, extern_node: ExternBlockNode*,
                                ctx: CompilationContext*) -> i32 {
+        mut no_extra: u8*[] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0u32,
-                                         resolved_path, extern_node, ctx);
+                                         &no_extra, resolved_path, extern_node, ctx);
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
@@ -773,8 +774,9 @@ type struct Importer {
             contents: content as u8*,
             length:   libc::strlen(content)
         };
+        mut no_extra: u8*[] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1u32,
-                                         header, extern_node, ctx);
+                                         &no_extra, header, extern_node, ctx);
     }
 
     /// Build a libclang TU (forcing C with `-x c`, matching the old
@@ -782,7 +784,7 @@ type struct Importer {
     /// `unsaved`/`num_unsaved` carry an in-memory buffer for system headers
     /// (null/0 for a real file).  Returns the number of functions emitted.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
-                           label: string, extern_node: ExternBlockNode*,
+                           extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
                            ctx: CompilationContext*) -> i32 {
         const index: void* = Clang::clang_createIndex(0, 0);
         // Force C (matches the old `-x c` preprocess).  `CRYO_CLANG_RESOURCE_DIR`,
@@ -791,20 +793,22 @@ type struct Importer {
         // bundled libclang.dll is staged next to cryo.exe and so cannot locate
         // its resource dir by the default `<dll>/../lib/clang/<v>` walk.  Unset
         // on a normal host install (the system libclang resolves its own), so
-        // this is a no-op there.
-        mut args: u8*[4];
-        args[0] = "-x" as u8*;
-        args[1] = "c" as u8*;
-        mut nargs: i32 = 2;
+        // this is a no-op there.  `extra_args` carries the vendor generator's
+        // `-I<dir>` / `-D<def>` flags (empty for the inline `#include` path).
+        mut args: u8*[] = [];
+        args.push("-x" as u8*);
+        args.push("c" as u8*);
         const res_dir: i8* = libc::getenv("CRYO_CLANG_RESOURCE_DIR") as i8*;
         if (res_dir != null && libc::strlen(res_dir as string) > 0) {
-            args[2] = "-resource-dir" as u8*;
-            args[3] = res_dir as u8*;
-            nargs = 4;
+            args.push("-resource-dir" as u8*);
+            args.push(res_dir as u8*);
+        }
+        for (mut ei: i64 = 0; ei < extra_args.length; ei++) {
+            args.push(extra_args[ei]);
         }
 
         const tu: void* = Clang::clang_parseTranslationUnit(
-            index, source_filename, &args[0], nargs, unsaved, num_unsaved,
+            index, source_filename, &args[0], args.length as i32, unsaved, num_unsaved,
             Clang::TU_DETAILED_PREPROCESSING_RECORD);
         if ((tu as void*) == null) {
             ctx.diagnostics.emit(Diagnostic::error(

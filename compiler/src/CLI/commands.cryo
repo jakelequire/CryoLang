@@ -6,6 +6,7 @@ import Compiler::{ Instance, CompilationContext, ProjectConfig };
 import Compiler::Deps::DepResolver;
 import Compiler::Resolver::Demangler;
 import Compiler::Vendor::Registry;
+import Compiler::Bindgen::Generator;
 import Utils;
 import Utils::Logger;
 import std::collections::string;
@@ -2258,8 +2259,7 @@ type struct Executor {
         if (strcmp(sub, "list") == 0)   { return Executor::vendor_list(); }
         if (strcmp(sub, "remove") == 0) { return Executor::vendor_remove(args.positional_at(1)); }
         if (strcmp(sub, "rebuild") == 0) {
-            fmt::eprintf("cryo vendor rebuild: bindings regeneration is not yet implemented (Stage 3).\n");
-            return 1;
+            return Executor::vendor_rebuild(args.positional_at(1), args);
         }
 
         // Bare `<path>` or explicit `add <path>`.
@@ -2268,7 +2268,7 @@ type struct Executor {
             fmt::eprintf("Error: cryo vendor add needs a path to a C project.\n");
             return 1;
         }
-        return Executor::vendor_register(path, args);
+        return Executor::vendor_register(path, &args);
     }
 
     /// Register (or re-register) the C library rooted at `path`.  Reads a
@@ -2276,7 +2276,7 @@ type struct Executor {
     /// the manifest's `bindings_file` into the triple-keyed cache (Stage-1
     /// path; Stage 2 replaces this with libclang generation), and writes the
     /// global registry entry.
-    static vendor_register(path: string, args: ParsedArgs) -> int {
+    static vendor_register(path: string, args: &ParsedArgs) -> int {
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
         mut abuf: i8* = malloc(4096) as i8*;
@@ -2330,27 +2330,49 @@ type struct Executor {
             Option::None     => { }
         }
 
-        // Stage-1 binding source: copy a pre-written `.cryo` named by the
-        // manifest's `bindings_file` into the triple-keyed cache.  Stage 2
-        // replaces this branch with libclang generation when none is given.
         const triple: string = if (args.has_arg("target")) { args.get_value("target") } else { "" };
         const norm_triple: string = VendorRegistry::normalize_triple(triple);
         const bindings_file: string = VendorRegistry::jstr(&root, "bindings_file", "");
         root.drop();
 
+        const cache_dir: string = VendorRegistry::cache_dir_for(key, triple);
+        const dest: string = format("%s/%s.cryo", cache_dir, name);
         mut produced: boolean = false;
+
         if (strlen(bindings_file) > 0) {
+            // Escape hatch: copy pre-written bindings verbatim into the cache.
             const src: string = format("%s/%s", abs, bindings_file);
             if (!metadata::exists(Path::from_cstr(src))) {
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
                 return 1;
             }
-            const cache_dir: string = VendorRegistry::cache_dir_for(key, triple);
-            const dest: string = format("%s/%s.cryo", cache_dir, name);
             if (!Executor::copy_text_file(src, dest)) {
                 fmt::eprintf("Error: failed to copy bindings into the cache (%s -> %s).\n", src, dest);
                 return 1;
             }
+            entry.set_cache(norm_triple, dest, "");
+            produced = true;
+        } else if (strcmp(entry.binding_source, "headers") == 0) {
+            // Generate bindings from the manifest's C headers via libclang.
+            if (entry.headers.length == 0) {
+                fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
+                return 1;
+            }
+            fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
+                name, entry.headers.length as i64);
+            const src_text: string = VendorGenerator::generate(
+                name, abs, &entry.headers, &entry.include_dirs, &entry.defines);
+            if (strlen(src_text) == 0) {
+                fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
+                return 1;
+            }
+            const gf: void* = fopen(dest, "w");
+            if (gf == null) {
+                fmt::eprintf("Error: cannot write generated bindings to %s\n", dest);
+                return 1;
+            }
+            fputs(src_text, gf);
+            fclose(gf);
             entry.set_cache(norm_triple, dest, "");
             produced = true;
         }
@@ -2366,11 +2388,11 @@ type struct Executor {
         fmt::printf("Registered vendor library '%s' -> import vendor::%s\n", key, name);
         fmt::printf("  source: %s\n", abs);
         if (produced) {
-            fmt::printf("  bindings cached for triple '%s'\n", norm_triple);
+            fmt::printf("  bindings: %s\n", dest);
+            fmt::printf("  cached for triple '%s'\n", norm_triple);
         } else {
-            fmt::printf("  note: no bindings_file in the manifest; no bindings were produced.\n");
-            fmt::printf("        libclang generation lands in Stage 2 — for now add a\n");
-            fmt::printf("        \"bindings_file\" entry pointing at a hand-written .cryo.\n");
+            fmt::printf("  note: no bindings produced (set binding_source=\"headers\" with\n");
+            fmt::printf("        \"headers\", or provide a \"bindings_file\" in the manifest).\n");
         }
         return 0;
     }
@@ -2412,6 +2434,35 @@ type struct Executor {
             return 1;
         }
         fmt::printf("Removed vendor library '%s'.\n", name);
+        return 0;
+    }
+
+    /// `cryo vendor rebuild [name]`: regenerate bindings from a library's
+    /// recorded source path.  With no name, rebuilds every registered library.
+    static vendor_rebuild(name: string, args: ParsedArgs) -> int {
+        const reg: VendorRegistry = VendorRegistry::load_global();
+        if (reg.entries.length == 0) {
+            fmt::printf("No vendor libraries registered.\n");
+            return 0;
+        }
+        mut failures: i32 = 0;
+        for (mut i: i64 = 0; i < reg.entries.length; i++) {
+            if (strlen(name) > 0
+                    && strcmp(reg.entries[i].key, name) != 0
+                    && !VendorRegistry::ieq(reg.entries[i].name, name)) {
+                continue;
+            }
+            const src: string = reg.entries[i].source_path;
+            if (!metadata::exists(Path::from_cstr(src))) {
+                fmt::eprintf("Error: source path for '%s' is gone: %s\n",
+                    reg.entries[i].key, src);
+                failures += 1;
+                continue;
+            }
+            // Re-run registration, which re-reads the manifest and regenerates.
+            if (Executor::vendor_register(src, &args) != 0) { failures += 1; }
+        }
+        if (failures > 0) { return 1; }
         return 0;
     }
 
