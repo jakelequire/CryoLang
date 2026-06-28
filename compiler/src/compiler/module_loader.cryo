@@ -70,6 +70,11 @@ type struct ModuleLoader {
     vendor_registry:  VendorRegistry;
     vendor_triple:    string;
     used_vendor_keys: string[];
+    /// `[vendor.<Name>]` project pins from cryoconfig.  When a pin names the
+    /// library being resolved, its triple overrides `vendor_triple` for that
+    /// one library (project pin -> global), so a project can lock a lib to a
+    /// specific triple's bindings.  Empty when the project pins nothing.
+    vendor_pins:      VendorPin[];
 
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
@@ -88,16 +93,38 @@ type struct ModuleLoader {
             vendor_registry:  VendorRegistry::empty(),
             vendor_triple:    "",
             used_vendor_keys: [],
+            vendor_pins:      [],
         };
     }
 
     /// Enable `vendor::` import resolution.  Loads the global vendor registry
     /// into this loader and records the effective target triple used to pick a
-    /// library's cached bindings.  Called once, before `discover_project`, on
-    /// the project-build path.
-    set_vendor_context(mut &this, triple: string) -> void {
+    /// library's cached bindings, plus any cryoconfig `[vendor.<Name>]` pins
+    /// that override that triple per library.  Called once, before
+    /// `discover_project`, on the project-build path — after the AutoVendor
+    /// hook has generated any pinned bindings, so the load sees them.
+    set_vendor_context(mut &this, triple: string, pins: &VendorPin[]) -> void {
         this.vendor_triple    = triple;
         this.vendor_registry  = VendorRegistry::load_global();
+        this.vendor_pins      = [];
+        for (mut i: i64 = 0; i < pins.length; i++) {
+            this.vendor_pins.push(pins[i]);
+        }
+    }
+
+    /// The target triple `import vendor::<lib>` resolves against: a matching
+    /// `[vendor.<lib>]` pin's triple when present and non-empty (project pin
+    /// shadows the build triple for that library), otherwise the build's
+    /// `vendor_triple`.  `lib` is the namespace after `vendor::` (e.g. the
+    /// "RayLib" in `vendor::RayLib`), matched against the pin name verbatim.
+    triple_for_lib(&this, lib: string) -> string {
+        for (mut i: i64 = 0; i < this.vendor_pins.length; i++) {
+            if (strcmp(this.vendor_pins[i].name, lib) == 0
+                    && strlen(this.vendor_pins[i].triple) > 0) {
+                return this.vendor_pins[i].triple;
+            }
+        }
+        return this.vendor_triple;
     }
 
     /// Wire the LSP editor-buffer override.  Called once, before
@@ -330,8 +357,9 @@ type struct ModuleLoader {
             const lib: string = import_path + 8;   // strip "vendor::"
             const idx: i64 = this.vendor_registry.find_index(lib);
             if (idx < 0) { return ""; }
+            // A `[vendor.<lib>]` pin overrides the build triple for this lib.
             const triple: string =
-                VendorRegistry::normalize_triple(this.vendor_triple);
+                VendorRegistry::normalize_triple(this.triple_for_lib(lib));
             const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
             if (strlen(f) > 0 && metadata::exists(Path::from_cstr(f))) {
                 return f;

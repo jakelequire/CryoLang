@@ -175,6 +175,33 @@ type struct Dependency {
     }
 }
 
+/// One `[vendor.<Name>]` project pin.  Locks `import vendor::<Name>` for this
+/// project to a specific target `triple`'s generated bindings, overriding the
+/// build's default target triple for that one library.  The library's source
+/// (headers / include dirs / link metadata) still comes from the global vendor
+/// registry — the pin only selects which triple's bindings to resolve against
+/// (and auto-generate on a cache miss; see the AutoVendor pre-build hook and
+/// the loader's `vendor::` resolution branch).
+///
+/// Resolution precedence is project pin -> global registry -> not-found: a pin
+/// fully shadows the build triple for its library, but a library that is not
+/// registered globally has no source to generate from, so its pin is reported
+/// and ignored (the normal E0500 "cannot find module" path then fires).
+///
+/// `name` is the import namespace taken verbatim from the section header
+/// (`[vendor.RayLib]` -> "RayLib"); an empty `triple` means "use the build's
+/// own `target_triple`", which makes the pin a no-op.  Both fields are
+/// non-owning `string`s, so `VendorPin` is Copy and safe to pass/return by
+/// value (mirrors `BinTarget` / `Dependency`).
+type struct VendorPin {
+    name:   string;
+    triple: string;
+
+    static empty(name: string) -> VendorPin {
+        return VendorPin { name: name, triple: "" };
+    }
+}
+
 /// Parsed representation of a `cryoconfig` file.
 type struct ProjectConfig {
     project_name: string;
@@ -258,6 +285,13 @@ type struct ProjectConfig {
     /// cache and pinned by `cryoconfig.lock`.  See `Dependency`.
     dependencies: Dependency[];
 
+    /// `[vendor.<Name>]` project pins.  Each locks `import vendor::<Name>` to a
+    /// target triple's bindings for this project, shadowing the build triple
+    /// for that library and (via the AutoVendor pre-build hook) generating the
+    /// bindings on a cache miss.  Empty when the project pins no vendor libs.
+    /// See `VendorPin`.
+    vendor_pins: VendorPin[];
+
     /// `[test] format = "..."` - preferred output format for the
     /// project's test runner. One of "plain" / "pretty" / "compact",
     /// or "" when unset (runner falls back to its built-in default).
@@ -310,6 +344,7 @@ type struct ProjectConfig {
             lib:          LibTarget::empty(),
             bins:         [],
             dependencies: [],
+            vendor_pins:  [],
             test_format:  "",
             test_color:   "",
             error_count:  0,
@@ -335,6 +370,7 @@ type struct ProjectConfig {
         mut source_paths_c:  string[]      = [];
         mut bins_c:          BinTarget[]   = [];
         mut deps_c:          Dependency[]  = [];
+        mut vendor_pins_c:   VendorPin[]   = [];
         for (mut i: i64 = 0; i < this.link_system.length; i++)   { link_system_c.push(this.link_system[i]); }
         for (mut i: i64 = 0; i < this.link_search.length; i++)   { link_search_c.push(this.link_search[i]); }
         for (mut i: i64 = 0; i < this.link_static.length; i++)   { link_static_c.push(this.link_static[i]); }
@@ -347,6 +383,7 @@ type struct ProjectConfig {
         for (mut i: i64 = 0; i < this.source_paths.length; i++)  { source_paths_c.push(this.source_paths[i]); }
         for (mut i: i64 = 0; i < this.bins.length; i++)          { bins_c.push(this.bins[i]); }
         for (mut i: i64 = 0; i < this.dependencies.length; i++)  { deps_c.push(this.dependencies[i]); }
+        for (mut i: i64 = 0; i < this.vendor_pins.length; i++)   { vendor_pins_c.push(this.vendor_pins[i]); }
         return ProjectConfig {
             project_name:  this.project_name,
             output_dir:    this.output_dir,
@@ -375,6 +412,7 @@ type struct ProjectConfig {
             lib:           this.lib,
             bins:          bins_c,
             dependencies:  deps_c,
+            vendor_pins:   vendor_pins_c,
             test_format:   this.test_format,
             test_color:    this.test_color,
             error_count:   this.error_count,
@@ -447,6 +485,10 @@ type struct ProjectConfig {
         // current_bin_idx is -1 when not inside a [[bin]] block.
         mut current_section: string = "";
         mut current_bin_idx:  i64    = -1;
+        // Index into config.vendor_pins for the current `[vendor.<Name>]`
+        // section, or -1 when not inside one.  Set when the section header is
+        // seen (mirrors current_bin_idx for `[[bin]]`).
+        mut current_vendor_idx: i64  = -1;
         mut pos: i64 = 0;
         const len: i64 = libc::strlen(content) as i64;
 
@@ -474,6 +516,7 @@ type struct ProjectConfig {
                 if (is_array) {
                     // [[bin]] -> current_section = "bin", push fresh BinTarget.
                     current_section = trimmed.substr(2, t_len - 4);
+                    current_vendor_idx = -1;
                     if (current_section.eq("bin")) {
                         config.bins.push(BinTarget::empty());
                         current_bin_idx = config.bins.length as i64 - 1;
@@ -486,6 +529,15 @@ type struct ProjectConfig {
                         current_section = trimmed.substr(1, close - 1);
                     }
                     current_bin_idx = -1;
+                    current_vendor_idx = -1;
+                    // `[vendor.<Name>]` -> push a fresh pin and track its index,
+                    // so the dotted-section keys below land on the right pin.
+                    if (current_section.starts_with("vendor.")) {
+                        const vname: string = current_section.substr(
+                            7, libc::strlen(current_section) as i64 - 7);
+                        config.vendor_pins.push(VendorPin::empty(vname));
+                        current_vendor_idx = config.vendor_pins.length as i64 - 1;
+                    }
                 }
                 continue;
             }
@@ -499,6 +551,17 @@ type struct ProjectConfig {
             const val_slice: string = trimmed.substr(eq_pos + 1, libc::strlen(trimmed) as i64 - eq_pos - 1);
             const raw_val: string = val_slice.trim();
             const val: string   = raw_val.strip_quotes();
+
+            // `[vendor.<Name>]` pins use a dynamic section name, so they can't
+            // be a `match` arm; dispatch them here before the fixed-section
+            // match.  Only `triple` is recognized today.
+            if (current_vendor_idx >= 0) {
+                match (key) {
+                    "triple" => { config.vendor_pins[current_vendor_idx].triple = val; }
+                    _ => { ProjectConfig::report_unknown_key(current_section, key); }
+                }
+                continue;
+            }
 
             // Apply to config based on section + key
             match (current_section) {

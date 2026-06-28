@@ -26,6 +26,7 @@ import Compiler::Resolver::{
 };
 import Compiler::AST::{ Node, Dumper };
 import Compiler::Deps::DepResolver;
+import Compiler::Vendor::AutoVendor;
 import Compiler::Diag::Diagnostic;
 import Compiler::Lex::Lexer;
 import Utils;
@@ -943,9 +944,15 @@ type struct CompilerInstance {
             config.project_root, root_path, stdlib_root, config.no_std,
             effective_roots);
 
-        // Vendor libraries: enable `import vendor::Name` resolution against the
-        // global registry, keyed on this build's effective target triple.
-        loader.set_vendor_context(config.target_triple);
+        // Vendor libraries: honor any cryoconfig `[vendor.<Name>]` pins first,
+        // generating bindings for each pinned triple on a cache miss (this is
+        // the only libclang work on the build path; the loader stays read-only
+        // over the generated `.cryo`).  Then enable `import vendor::Name`
+        // resolution against the global registry — loaded AFTER the hook so it
+        // sees freshly auto-vendored bindings — keyed on this build's effective
+        // target triple, with the pins overriding it per library.
+        AutoVendor::ensure_pins(&config.vendor_pins, config.target_triple);
+        loader.set_vendor_context(config.target_triple, &config.vendor_pins);
 
         // LSP mode: feed the loader the editor buffer for the active
         // file so import-discovery sees the imports the user is typing
