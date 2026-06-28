@@ -35,27 +35,62 @@ type struct Cache {
 
     /// Resolve the cache root directory.  Creates intermediate dirs on
     /// first use.  Returns the absolute (or env-relative) path; never empty.
+    ///
+    /// Resolution (first match wins):
+    ///   1. `$CRYO_HOME/cache`                     explicit override (CI / portable)
+    ///   2. per-OS default (see `default_cache_root`):
+    ///        Windows  `%LOCALAPPDATA%\cryo`  ->  `%USERPROFILE%\.cache\cryo`
+    ///        Unix     `$XDG_CACHE_HOME/cryo` ->  `$HOME/.cache/cryo`
+    ///   3. a temp dir (warned) only when no user directory resolves at all.
     static cache_root() -> string {
+        // An EMPTY env var counts as unset (Windows shells often export "").
         const cryo_home: i8* = libc::getenv("CRYO_HOME") as i8*;
-        if (cryo_home != null) {
+        if (cryo_home != null && libc::strlen(cryo_home as string) > 0) {
             const root: string = format("%s/cache", cryo_home as string);
             dir::create_dir_all(Path::from_cstr(root));
             return root;
         }
+        const root: string = Cache::default_cache_root();
+        dir::create_dir_all(Path::from_cstr(root));
+        return root;
+    }
+
+    /// Windows per-user cache root: `%LOCALAPPDATA%\cryo` (the non-roaming,
+    /// machine-local app-data convention), then `%USERPROFILE%\.cache\cryo`,
+    /// then a `%TEMP%` last resort.  Forward slashes join the suffix to match
+    /// the `/`-joined paths layered on top (Windows accepts mixed separators).
+    ![target(windows)]
+    static default_cache_root() -> string {
+        const lad: i8* = libc::getenv("LOCALAPPDATA") as i8*;
+        if (lad != null && libc::strlen(lad as string) > 0) {
+            return format("%s/cryo", lad as string);
+        }
+        const up: i8* = libc::getenv("USERPROFILE") as i8*;
+        if (up != null && libc::strlen(up as string) > 0) {
+            return format("%s/.cache/cryo", up as string);
+        }
+        const tmp: i8* = libc::getenv("TEMP") as i8*;
+        if (tmp != null && libc::strlen(tmp as string) > 0) {
+            fmt::eprintf("warning: LOCALAPPDATA and USERPROFILE unset; using %%TEMP%% for the cryo cache\n");
+            return format("%s/cryo-cache", tmp as string);
+        }
+        fmt::eprintf("warning: no user directory resolved; using C:/tmp/cryo-cache\n");
+        return "C:/tmp/cryo-cache";
+    }
+
+    /// Unix per-user cache root: `$XDG_CACHE_HOME/cryo` (XDG Base Directory),
+    /// then `$HOME/.cache/cryo`, then `/tmp/cryo-cache`.
+    ![target(unix)]
+    static default_cache_root() -> string {
         const xdg: i8* = libc::getenv("XDG_CACHE_HOME") as i8*;
-        if (xdg != null) {
-            const root: string = format("%s/cryo", xdg as string);
-            dir::create_dir_all(Path::from_cstr(root));
-            return root;
+        if (xdg != null && libc::strlen(xdg as string) > 0) {
+            return format("%s/cryo", xdg as string);
         }
         const home: i8* = libc::getenv("HOME") as i8*;
-        if (home != null) {
-            const root: string = format("%s/.cache/cryo", home as string);
-            dir::create_dir_all(Path::from_cstr(root));
-            return root;
+        if (home != null && libc::strlen(home as string) > 0) {
+            return format("%s/.cache/cryo", home as string);
         }
-        fmt::eprintf("warning: $HOME unset; using /tmp/cryo-cache as the dependency cache\n");
-        dir::create_dir_all(Path::from_cstr("/tmp/cryo-cache"));
+        fmt::eprintf("warning: $HOME and $XDG_CACHE_HOME unset; using /tmp/cryo-cache\n");
         return "/tmp/cryo-cache";
     }
 
