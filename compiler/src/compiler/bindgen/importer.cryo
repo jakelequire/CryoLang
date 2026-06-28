@@ -56,32 +56,49 @@ import std::fmt;
 /// `cdebug` today (so it only appears under `--debug`); the eventual `cryo
 /// vendor` generator will consume the same lists for its translation report.
 type struct ImportReport {
+    /// LOST: a construct we *could* bind but don't yet — real API surface the
+    /// import failed to translate.  This is the headline number.
     skipped:      string[];
     approximated: string[];
+    /// IGNORED: a `#define`/decl that is never bindable API in the first place —
+    /// a header guard, a marker macro (`RLAPI`, `extern`), a function-like macro.
+    /// Tracked so it doesn't inflate the "not bound" headline; surfaced as a
+    /// single count line, with detail only under `--debug`.
+    ignored:      string[];
 
     static new() -> ImportReport {
-        return ImportReport { skipped: [], approximated: [] };
+        return ImportReport { skipped: [], approximated: [], ignored: [] };
     }
 
-    /// Note a construct that yielded no binding at all.
+    /// Note a construct that yielded no binding at all but COULD be bound (lost
+    /// API) — the headline "not bound" bucket.
     skip(mut &this, line: string) -> void { this.skipped.push(line); }
 
     /// Note a binding emitted at reduced fidelity (layout-only, no field access).
     approx(mut &this, line: string) -> void { this.approximated.push(line); }
+
+    /// Note a construct that is inherently not bindable API (header guard, marker
+    /// macro, function-like macro) — expected noise, kept out of the headline.
+    ignore(mut &this, line: string) -> void { this.ignored.push(line); }
 
     /// Emit a per-translation-unit summary (no-op when nothing was lost, and
     /// silent unless `--debug` is set, since it rides `cdebug`).  Used by the
     /// inline `#include` path, where the report is diagnostic noise during a
     /// normal compile; the `cryo vendor` path uses `summary_stdout` instead.
     summary(&this, label: string) -> void {
-        if (this.skipped.length == 0 && this.approximated.length == 0) { return; }
-        cdebug("[Bindgen] '%s' translation report: %lld skipped, %lld approximated\n",
-               label, this.skipped.length as i64, this.approximated.length as i64);
+        if (this.skipped.length == 0 && this.approximated.length == 0
+            && this.ignored.length == 0) { return; }
+        cdebug("[Bindgen] '%s' translation report: %lld not bound, %lld approximated, %lld ignored\n",
+               label, this.skipped.length as i64, this.approximated.length as i64,
+               this.ignored.length as i64);
         for (mut i: i64 = 0; i < this.skipped.length; i++) {
             cdebug("  [skip]   %s\n", this.skipped[i]);
         }
         for (mut i: i64 = 0; i < this.approximated.length; i++) {
             cdebug("  [approx] %s\n", this.approximated[i]);
+        }
+        for (mut i: i64 = 0; i < this.ignored.length; i++) {
+            cdebug("  [ignore] %s\n", this.ignored[i]);
         }
     }
 
@@ -95,6 +112,9 @@ type struct ImportReport {
         for (mut i: i64 = 0; i < this.approximated.length; i++) {
             dst.approximated.push(this.approximated[i]);
         }
+        for (mut i: i64 = 0; i < this.ignored.length; i++) {
+            dst.ignored.push(this.ignored[i]);
+        }
     }
 
     /// Print the user-facing translation report to stdout at `cryo vendor`
@@ -102,15 +122,21 @@ type struct ImportReport {
     /// approximated construct is listed, never silently dropped).  No-op when
     /// everything bound faithfully.
     summary_stdout(&this, label: string) -> void {
-        if (this.skipped.length == 0 && this.approximated.length == 0) { return; }
-        fmt::printf("Translation report for '%s': %lld not bound, %lld approximated.\n",
-               label, this.skipped.length as i64, this.approximated.length as i64);
+        if (this.skipped.length == 0 && this.approximated.length == 0
+            && this.ignored.length == 0) { return; }
+        fmt::printf("Translation report for '%s': %lld not bound, %lld approximated (+%lld ignored: header guards / markers / function-like macros).\n",
+               label, this.skipped.length as i64, this.approximated.length as i64,
+               this.ignored.length as i64);
+        // LOST API (the headline): list prominently.
         for (mut i: i64 = 0; i < this.skipped.length; i++) {
             fmt::printf("  [skip]   %s\n", this.skipped[i]);
         }
+        // Reduced-fidelity bindings.
         for (mut i: i64 = 0; i < this.approximated.length; i++) {
             fmt::printf("  [approx] %s\n", this.approximated[i]);
         }
+        // Inherently-unbindable noise is summarized by the count above only; its
+        // detail rides the `--debug` `summary()` path, not this user-facing one.
     }
 }
 
@@ -150,6 +176,28 @@ type struct Importer {
     field_cursors:  CXCursor[];
     /// Honesty channel: every construct this import skipped or approximated.
     report:         ImportReport;
+    /// W1: macro-definition cursors deferred from the decl walk so they emit
+    /// AFTER every type/enum/function is known (cursor order is not guaranteed
+    /// with a detailed-preprocessing-record TU).  Processed in two sub-passes:
+    /// simple literal macros first (which populate `mac_*`), then
+    /// alias/compound/arithmetic macros that resolve against the full tables.
+    macro_cursors:  CXCursor[];
+    /// Enum-constant table (named-enum VARIANTS + anonymous-enum consts):
+    /// name -> (i64 value, owning enum bare tag, or empty tag for an anon-enum
+    /// const).  Lets an identifier-alias `#define` resolve to a bound constant.
+    ec_names:       SymbolStr[];
+    ec_values:      i64[];
+    ec_enum_tags:   SymbolStr[];
+    /// Object-like `#define` constant table built by the simple-macro pass:
+    /// name -> (Cryo type name, literal text, is-float).  Lets a later alias or
+    /// arithmetic macro copy / numerically reference an earlier macro const.
+    mac_names:      SymbolStr[];
+    mac_types:      string[];
+    mac_texts:      string[];
+    mac_floats:     boolean[];
+    /// Bound type names (struct / enum / typedef bare tags) for type-alias
+    /// `#define`s (`#define Foo Bar` where Bar is a bound type).
+    type_names:     SymbolStr[];
 
     /// Build a per-TU importer.  Alias and `functions_only` are derived from the
     /// extern block; the type mapper is wired with the same (ctx, alias).
@@ -170,6 +218,15 @@ type struct Importer {
             cur_enum_int:   null,
             field_cursors:  [],
             report:         ImportReport::new(),
+            macro_cursors:  [],
+            ec_names:       [],
+            ec_values:      [],
+            ec_enum_tags:   [],
+            mac_names:      [],
+            mac_types:      [],
+            mac_texts:      [],
+            mac_floats:     [],
+            type_names:     [],
         };
     }
 
@@ -211,7 +268,11 @@ type struct Importer {
         } else if (k == Clang::CURSOR_ENUM_DECL) {
             imp.emit_enum(cursor);
         } else if (k == Clang::CURSOR_MACRO_DEFINITION) {
-            imp.emit_macro(cursor);
+            // W1: defer — a macro can alias an enum constant, struct, or another
+            // macro that this walk hasn't reached yet (cursor order is not
+            // guaranteed with a detailed-preprocessing-record TU), so it is
+            // emitted only after every decl is bound.
+            imp.macro_cursors.push(cursor);
         }
         return Clang::VISIT_CONTINUE;
     }
@@ -350,6 +411,7 @@ type struct Importer {
             storage.type_annotation = this.types.array(this.types.prim("u8"), size);
             unode.add_field(storage);
             this.seen_names.push(name_sym);
+            this.type_names.push(name_sym);
             this.emit_top_level(unode as ASTNode*);
             this.report.approx(format("union '%s' -> %lld-byte opaque storage (round-trips by value; no field access)",
                                       this.ctx.intern_table.resolve(name_sym), size));
@@ -362,6 +424,7 @@ type struct Importer {
             node.binding_namespace = this.alias;
             node.repr_c = true;
             this.seen_names.push(name_sym);
+            this.type_names.push(name_sym);
             this.struct_names.push(name_sym);
             this.struct_nodes.push(node);
             this.emit_top_level(node as ASTNode*);
@@ -509,6 +572,7 @@ type struct Importer {
         Clang::clang_visitChildren(cursor, Importer::visit_enum_const, this as void*);
 
         this.seen_names.push(name_sym);
+        this.type_names.push(name_sym);
         this.emit_top_level(enode as ASTNode*);
     }
 
@@ -516,9 +580,15 @@ type struct Importer {
     /// cursor) to the named enum currently being populated (`cur_enum`).
     add_enum_const_from(mut &this, cursor: CXCursor) -> void {
         const cname: SymbolStr = cursor.intern_spelling(this.ctx);
+        const value: i64 = Clang::clang_getEnumConstantDeclValue(cursor);
         mut vnode: EnumVariantNode* = new EnumVariantNode(cname, SourceSpan::none());
-        vnode.set_explicit_value(Clang::clang_getEnumConstantDeclValue(cursor));
+        vnode.set_explicit_value(value);
         this.cur_enum.add_variant(vnode);
+        // W2: record so an identifier-alias `#define` can resolve to this
+        // constant.  The owning enum's tag types the emitted alias const.
+        this.ec_names.push(cname);
+        this.ec_values.push(value);
+        this.ec_enum_tags.push(this.cur_enum.name);
     }
 
     /// Nested-walk body: emit one alias-namespaced global `const NAME = value`
@@ -536,6 +606,10 @@ type struct Importer {
         const v_str: string = format("%llu", v as u64);
         mut lit: LiteralNode* = new LiteralNode(v_str, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(cname, this.types.map(*this.cur_enum_int), lit as ExpressionNode*);
+        // W2: record (empty owning tag => an alias resolves it as a plain int).
+        this.ec_names.push(cname);
+        this.ec_values.push(v);
+        this.ec_enum_tags.push(SymbolStr::empty());
     }
 
     /// Emit a `type alias` for a C typedef.  Skips the redundant
@@ -561,6 +635,7 @@ type struct Importer {
         anode.target_annotation = this.types.map(underlying);
 
         this.seen_names.push(name_sym);
+        this.type_names.push(name_sym);
         this.emit_top_level(anode as ASTNode*);
     }
 
@@ -581,10 +656,14 @@ type struct Importer {
         if (name_str.eq("")) { return; }
         if (this.name_seen(name_sym)) { return; }
 
-        if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0u32) {
-            this.report.skip(format("function-like macro '%s' (unbindable)", name_str));
-            return;
-        }
+        // SIMPLE-MACRO PASS (W1): bind only an object-like macro whose body is a
+        // single numeric/text literal (optionally signed).  Anything else —
+        // function-like, valueless, a compound/identifier/arithmetic body — is
+        // LEFT for `emit_macro_complex`, which runs after this pass has recorded
+        // every simple const, so an alias/arithmetic macro can resolve forward
+        // references regardless of cursor order.  No report entries here; the
+        // complex pass is the single point that classifies the unbound.
+        if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0u32) { return; }
 
         // Tokenize the definition's extent: token[0] is the macro name, the rest
         // are its replacement list.
@@ -592,13 +671,9 @@ type struct Importer {
         mut toks: CXToken* = null;
         mut ntok: u32 = 0u32;
         Clang::clang_tokenize(this.tu, range, &toks, &ntok);
-        if (toks == null) {
-            this.report.skip(format("macro '%s' (no tokens)", name_str));
-            return;
-        }
+        if (toks == null) { return; }
         if (ntok < 2u32) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            this.report.skip(format("valueless macro '%s' (header guard, not a constant)", name_str));
             return;
         }
 
@@ -621,7 +696,6 @@ type struct Importer {
         }
         if (!bindable) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            this.report.skip(format("compound macro '%s' (non-trivial replacement)", name_str));
             return;
         }
 
@@ -629,7 +703,6 @@ type struct Importer {
         const spell: string = (*(toks + lit_idx)).spelling(this.tu, this.ctx);
         if (litk != Clang::TOKEN_LITERAL) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
-            this.report.skip(format("macro '%s' (replacement not a literal: '%s')", name_str, spell));
             return;
         }
         if (spell.is_text_literal()) {
@@ -643,19 +716,11 @@ type struct Importer {
             // `#define PI 3.14...f`): codegen's sscanf("%lf") tolerates it, but a
             // Cryo float literal carries no suffix, so a serialized binding would
             // fail to re-parse without this.
-            mut clean: string = spell;
-            const sl: i64 = libc::strlen(spell) as i64;
-            if (sl > 0) {
-                const last: i8 = spell[sl - 1];
-                if (last == 'f' || last == 'F' || last == 'l' || last == 'L') {
-                    clean = spell.substr(0, sl - 1);
-                }
-            }
-            // codegen's float path parses the literal text via sscanf("%lf"),
-            // which reads a leading sign, so prepend '-' for a negative macro.
-            const ftext: string = if (neg) { "-" + clean } else { clean };
+            const ftext: string = if (neg) { "-" + Importer::strip_float_suffix(spell) }
+                                  else      { Importer::strip_float_suffix(spell) };
             mut flit: LiteralNode* = new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
+            this.record_macro_const(name_sym, "f64", ftext, true);
             Clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
@@ -678,10 +743,319 @@ type struct Importer {
             type_name = if (mag <= 2147483647u64) { "i32" }
                         else { if (mag <= 9223372036854775807u64) { "i64" } else { "u64" } };
         }
+        const itext: string = format("%llu", value_u64);
         mut ilit: LiteralNode* =
-            new LiteralNode(format("%llu", value_u64), LiteralKind::Integer, SourceSpan::none());
+            new LiteralNode(itext, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
+        this.record_macro_const(name_sym, type_name, itext, false);
         Clang::clang_disposeTokens(this.tu, toks, ntok);
+    }
+
+    /// Record an object-like macro const (name -> type/text/is-float) so a later
+    /// identifier-alias or constant-arithmetic macro in `emit_macro_complex` can
+    /// copy it or reference its value numerically.
+    record_macro_const(mut &this, name: SymbolStr, type_name: string,
+                       text: string, is_float: boolean) -> void {
+        this.mac_names.push(name);
+        this.mac_types.push(type_name);
+        this.mac_texts.push(text);
+        this.mac_floats.push(is_float);
+    }
+
+    /// COMPLEX-MACRO PASS (W1): runs after `emit_macro` has bound every simple
+    /// const and the decl walk has bound every type/enum/function.  Classifies
+    /// and (where possible) binds the macros the simple pass left:
+    ///   - W2 identifier alias (`#define MOUSE_LEFT_BUTTON MOUSE_BUTTON_LEFT`)
+    ///     -> a const aliasing the resolved enum constant / macro const, or a
+    ///        `type` alias of a resolved type;
+    ///   - W3 compound-literal struct const (`#define RAYWHITE CLITERAL(Color){…}`)
+    ///     -> `const RAYWHITE: Color = Color { … }`;
+    ///   - W4 constant arithmetic (`#define DEG2RAD (PI/180.0f)`) -> the value
+    ///     folded to a single float literal const.
+    /// Everything genuinely unbindable is reported: inherently-not-API noise
+    /// (function-like, header guards, markers) via `ignore`, and a construct we
+    /// *could* bind but don't yet via `skip` (the headline "not bound" bucket).
+    emit_macro_complex(mut &this, cursor: CXCursor) -> void {
+        if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0u32) { return; }
+        if (!cursor.is_from_main_file()) { return; }
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
+        const name_str: string = this.ctx.intern_table.resolve(name_sym);
+        if (name_str.eq("")) { return; }
+        if (this.name_seen(name_sym)) { return; } // already bound by the simple pass
+
+        if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0u32) {
+            this.report.ignore(format("function-like macro '%s'", name_str));
+            return;
+        }
+
+        const range: CXSourceRange = Clang::clang_getCursorExtent(cursor);
+        mut toks: CXToken* = null;
+        mut ntok: u32 = 0u32;
+        Clang::clang_tokenize(this.tu, range, &toks, &ntok);
+        if (toks == null) {
+            this.report.ignore(format("macro '%s' (no tokens)", name_str));
+            return;
+        }
+        if (ntok < 2u32) {
+            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            this.report.ignore(format("valueless macro '%s' (header guard / marker)", name_str));
+            return;
+        }
+
+        // W3: compound-literal struct const, e.g. `CLITERAL(Color){ 245,… }`.
+        if (this.try_emit_compound_struct(name_sym, name_str, toks, ntok)) {
+            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            return;
+        }
+
+        // W2: single-identifier alias.  (A single LITERAL token was already
+        // bound by the simple pass, so a 2-token body here is non-literal.)
+        if (ntok == 2u32) {
+            const k1: i32 = Clang::clang_getTokenKind(*(toks + 1));
+            const s1: string = (*(toks + 1)).spelling(this.tu, this.ctx);
+            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            if (k1 == Clang::TOKEN_IDENTIFIER) {
+                if (this.try_emit_identifier_alias(name_sym, name_str, s1)) { return; }
+                if (this.is_bound_function(s1)) {
+                    this.report.skip(format("alias '%s' -> function '%s' (forwarding wrapper unsupported)",
+                                            name_str, s1));
+                    return;
+                }
+            }
+            // A keyword/punctuation token, or an identifier that resolves to
+            // nothing bound, is a marker (`RLAPI`, `extern`), not lost API.
+            this.report.ignore(format("marker macro '%s' -> '%s'", name_str, s1));
+            return;
+        }
+
+        // W4: constant arithmetic over literals / macro consts.
+        if (this.try_emit_arith_macro(name_sym, name_str, toks, ntok)) {
+            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            return;
+        }
+
+        Clang::clang_disposeTokens(this.tu, toks, ntok);
+        this.report.skip(format("compound macro '%s' (non-trivial replacement)", name_str));
+    }
+
+    /// True if a top-level C function `name` was bound in this import (so a
+    /// macro aliasing it is recognized as a — currently unsupported — function
+    /// alias rather than misclassified as a marker).
+    is_bound_function(&this, name: string) -> boolean {
+        const sym: SymbolStr = this.ctx.intern_table.intern(name);
+        for (mut i: i64 = 0; i < this.extern_node.functions.length; i++) {
+            if (this.extern_node.functions[i].name.equals(sym)) { return true; }
+        }
+        return false;
+    }
+
+    /// W2: bind `#define ALIAS TARGET` where TARGET is a bound symbol.
+    ///   - enum constant -> `const ALIAS: <EnumType> = <value>;`
+    ///   - macro const    -> a copy with the target's type and literal value;
+    ///   - type           -> `type ALIAS = TARGET;`.
+    /// Returns false (caller decides marker-vs-lost) when TARGET resolves to no
+    /// bound symbol, or to a function (handled separately).
+    try_emit_identifier_alias(mut &this, name_sym: SymbolStr, name_str: string,
+                              target: string) -> boolean {
+        const tsym: SymbolStr = this.ctx.intern_table.intern(target);
+
+        // Enum constant (named-enum variant or anonymous-enum const).
+        for (mut i: i64 = 0; i < this.ec_names.length; i++) {
+            if (!this.ec_names[i].equals(tsym)) { continue; }
+            const value: i64 = this.ec_values[i];
+            const tag: SymbolStr = this.ec_enum_tags[i];
+            const ty: TypeAnnotation* = if (tag.is_empty()) {
+                this.types.prim("i32")
+            } else {
+                this.types.named(this.types.qualify_under_alias(tag))
+            };
+            mut lit: LiteralNode* =
+                new LiteralNode(format("%llu", value as u64), LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(name_sym, ty, lit as ExpressionNode*);
+            return true;
+        }
+
+        // Object-like macro const: copy its type and literal value.
+        for (mut i: i64 = 0; i < this.mac_names.length; i++) {
+            if (!this.mac_names[i].equals(tsym)) { continue; }
+            const kind: LiteralKind =
+                if (this.mac_floats[i]) { LiteralKind::Float } else { LiteralKind::Integer };
+            mut lit: LiteralNode* =
+                new LiteralNode(this.mac_texts[i], kind, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim(this.mac_types[i]), lit as ExpressionNode*);
+            this.record_macro_const(name_sym, this.mac_types[i], this.mac_texts[i], this.mac_floats[i]);
+            return true;
+        }
+
+        // Bound type: a `type` alias.
+        for (mut i: i64 = 0; i < this.type_names.length; i++) {
+            if (!this.type_names[i].equals(tsym)) { continue; }
+            mut anode: TypeAliasDeclNode* = new TypeAliasDeclNode(name_sym, SourceSpan::none());
+            anode.binding_namespace = this.alias;
+            anode.target_annotation = this.types.named(this.types.qualify_under_alias(tsym));
+            this.seen_names.push(name_sym);
+            this.type_names.push(name_sym);
+            this.emit_top_level(anode as ASTNode*);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// W3: bind a C compound-literal macro `#define NAME [CLITERAL](Type){ a, b, … }`
+    /// as `const NAME: Type = Type { f0: a, f1: b, … }`.  The struct's fields
+    /// supply the names (positional C initializer); each value must be a numeric
+    /// literal.  Returns false (leaving the macro for another handler) when the
+    /// tokens are not this shape, the type isn't a bound struct, or the value
+    /// count doesn't match the field count.
+    try_emit_compound_struct(mut &this, name_sym: SymbolStr, name_str: string,
+                             toks: CXToken*, ntok: u32) -> boolean {
+        // Locate the brace group `{ … }`.
+        mut bo: i64 = -1;
+        mut bc: i64 = -1;
+        for (mut i: i64 = 1; i < ntok as i64; i++) {
+            const sp: string = (*(toks + i)).spelling(this.tu, this.ctx);
+            if (Clang::clang_getTokenKind(*(toks + i)) == Clang::TOKEN_PUNCTUATION) {
+                if (sp.eq("{") && bo < 0) { bo = i; }
+                if (sp.eq("}"))           { bc = i; }
+            }
+        }
+        if (bo < 0 || bc <= bo) { return false; }
+
+        // The struct type is the last bound-struct identifier before the brace
+        // (handles both `(Type){…}` and `CLITERAL(Type){…}`).
+        mut struct_node: StructDeclNode* = null;
+        for (mut i: i64 = 1; i < bo; i++) {
+            if (Clang::clang_getTokenKind(*(toks + i)) != Clang::TOKEN_IDENTIFIER) { continue; }
+            const sp: string = (*(toks + i)).spelling(this.tu, this.ctx);
+            const cand: StructDeclNode* = this.find_struct(this.ctx.intern_table.intern(sp));
+            if (cand != null) { struct_node = cand; }
+        }
+        if (struct_node == null) { return false; }
+
+        // Collect the literal values inside the braces (commas are punctuation
+        // and are skipped); each must be a numeric literal.
+        mut vals: string[] = [];
+        for (mut i: i64 = bo + 1; i < bc; i++) {
+            if (Clang::clang_getTokenKind(*(toks + i)) != Clang::TOKEN_LITERAL) { continue; }
+            vals.push((*(toks + i)).spelling(this.tu, this.ctx));
+        }
+        if (vals.length != struct_node.fields.length || vals.length == 0) { return false; }
+
+        // Build the struct literal in field-declaration order (the codegen
+        // const-aggregate path zips positionally, so order must match).
+        const qualified: SymbolStr = this.types.qualify_under_alias(struct_node.name);
+        mut slit: StructLiteralNode* = new StructLiteralNode(qualified, SourceSpan::none());
+        for (mut i: i64 = 0; i < struct_node.fields.length; i++) {
+            const raw: string = vals[i];
+            mut lk: LiteralKind = LiteralKind::Integer;
+            mut text: string = raw;
+            if (raw.is_text_literal()) { return false; } // not a numeric color value
+            if (raw.is_float_literal()) { lk = LiteralKind::Float; text = Importer::strip_float_suffix(raw); }
+            mut vlit: LiteralNode* = new LiteralNode(text, lk, SourceSpan::none());
+            slit.add_field_init(FieldInit {
+                field_name: struct_node.fields[i].name,
+                value:      vlit as ExpressionNode*,
+                span:       SourceSpan::none()
+            });
+        }
+        this.emit_alias_const(name_sym, this.types.named(qualified), slit as ExpressionNode*);
+        return true;
+    }
+
+    /// W4: bind a constant-arithmetic macro `#define NAME (A op B)` where A and B
+    /// are numeric literals or already-bound macro consts and `op` is `+ - * /`.
+    /// The value is folded at import time to a single f64 literal const — which
+    /// sidesteps both the unsupported global const-references-const init and any
+    /// serializer change.  Returns false for any other shape.
+    try_emit_arith_macro(mut &this, name_sym: SymbolStr, name_str: string,
+                         toks: CXToken*, ntok: u32) -> boolean {
+        // Gather replacement tokens (index 1..ntok-1), stripping balanced outer
+        // parens, into a small list of (kind, spelling).
+        mut lo: i64 = 1;
+        mut hi: i64 = (ntok as i64) - 1;
+        while (lo < hi
+               && Clang::clang_getTokenKind(*(toks + lo)) == Clang::TOKEN_PUNCTUATION
+               && (*(toks + lo)).spelling(this.tu, this.ctx).eq("(")
+               && Clang::clang_getTokenKind(*(toks + hi)) == Clang::TOKEN_PUNCTUATION
+               && (*(toks + hi)).spelling(this.tu, this.ctx).eq(")")) {
+            lo = lo + 1;
+            hi = hi - 1;
+        }
+        // Expect exactly three tokens: operand, operator, operand.
+        if (hi - lo != 2) { return false; }
+        mut a: f64 = 0.0;
+        mut b: f64 = 0.0;
+        if (!this.arith_operand(*(toks + lo), &a)) { return false; }
+        if (!this.arith_operand(*(toks + lo + 2), &b)) { return false; }
+        const opk: i32 = Clang::clang_getTokenKind(*(toks + lo + 1));
+        if (opk != Clang::TOKEN_PUNCTUATION) { return false; }
+        const op: string = (*(toks + lo + 1)).spelling(this.tu, this.ctx);
+        mut r: f64 = 0.0;
+        if      (op.eq("+")) { r = a + b; }
+        else if (op.eq("-")) { r = a - b; }
+        else if (op.eq("*")) { r = a * b; }
+        else if (op.eq("/")) { if (b == 0.0) { return false; } r = a / b; }
+        else { return false; }
+
+        // Format with full double precision, ensuring a Cryo float literal (a
+        // decimal point or exponent) so it doesn't re-lex as an integer.
+        mut text: string = format("%.17g", r);
+        if (!Importer::has_float_marker(text)) { text = text + ".0"; }
+        mut flit: LiteralNode* = new LiteralNode(text, LiteralKind::Float, SourceSpan::none());
+        this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
+        this.record_macro_const(name_sym, "f64", text, true);
+        return true;
+    }
+
+    /// Resolve a single arithmetic operand token to an f64: a numeric literal
+    /// (any C float/int suffix stripped) or a bound macro const referenced by
+    /// name.  Returns false for anything else.
+    arith_operand(&this, tok: CXToken, out: f64*) -> boolean {
+        const k: i32 = Clang::clang_getTokenKind(tok);
+        const sp: string = tok.spelling(this.tu, this.ctx);
+        if (k == Clang::TOKEN_LITERAL) {
+            if (sp.is_text_literal()) { return false; }
+            mut v: f64 = 0.0;
+            intrinsics::sscanf(Importer::strip_float_suffix(sp), "%lf", &v);
+            *out = v;
+            return true;
+        }
+        if (k == Clang::TOKEN_IDENTIFIER) {
+            const tsym: SymbolStr = this.ctx.intern_table.intern(sp);
+            for (mut i: i64 = 0; i < this.mac_names.length; i++) {
+                if (!this.mac_names[i].equals(tsym)) { continue; }
+                mut v: f64 = 0.0;
+                intrinsics::sscanf(Importer::strip_float_suffix(this.mac_texts[i]), "%lf", &v);
+                *out = v;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Strip a trailing C numeric suffix (`f`/`F`/`l`/`L`) from a float literal
+    /// spelling, since a Cryo float literal carries no suffix.  Other literals
+    /// pass through unchanged.
+    static strip_float_suffix(spell: string) -> string {
+        const sl: i64 = libc::strlen(spell) as i64;
+        if (sl <= 0) { return spell; }
+        const last: i8 = spell[sl - 1];
+        if (last == 'f' || last == 'F' || last == 'l' || last == 'L') {
+            return spell.substr(0, sl - 1);
+        }
+        return spell;
+    }
+
+    /// True if `text` already reads as a Cryo float literal (carries a decimal
+    /// point or an exponent), so it won't be re-lexed as an integer.
+    static has_float_marker(text: string) -> boolean {
+        const n: i64 = libc::strlen(text) as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            const c: i8 = text[i];
+            if (c == '.' || c == 'e' || c == 'E') { return true; }
+        }
+        return false;
     }
 
     /// Lower a string- or char-literal `#define` to an alias-namespaced const.
@@ -868,6 +1242,16 @@ type struct Importer {
         mut imp: Importer = Importer::new(extern_node, ctx, tu);
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
+        // W1 two-pass macro emission (deferred from the decl walk): bind the
+        // simple literal consts first so the macro-const table is complete, then
+        // resolve the alias/compound/arithmetic macros against the full set of
+        // bound types, enum constants, functions, and consts.
+        for (mut mi: i64 = 0; mi < imp.macro_cursors.length; mi++) {
+            imp.emit_macro(imp.macro_cursors[mi]);
+        }
+        for (mut mi: i64 = 0; mi < imp.macro_cursors.length; mi++) {
+            imp.emit_macro_complex(imp.macro_cursors[mi]);
+        }
         if (out_report != null) { imp.report.merge_into(out_report); }
         else                    { imp.report.summary(label); }
 

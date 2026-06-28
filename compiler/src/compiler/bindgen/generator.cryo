@@ -47,7 +47,7 @@ import std::collections::str;
 /// different type mapping, …).  It participates in the Stage-3 cache key, so an
 /// increment invalidates every previously cached binding after a compiler
 /// upgrade — old caches no longer match and regenerate on next `cryo vendor`.
-const GENERATOR_VERSION: i64 = 1;
+const GENERATOR_VERSION: i64 = 2;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -173,7 +173,15 @@ type struct BindingSerializer {
     render_const(mut &this, node: VarDeclNode*) -> void {
         const ty: string = this.render_type(node.type_annotation);
         const init: ExpressionNode* = node.initializer;
-        if (init == null || init.kind != NodeKind::Literal) { return; }
+        if (init == null) { return; }
+        // A struct-literal initializer (a C compound-literal macro the importer
+        // lowered, e.g. `#define RAYWHITE CLITERAL(Color){…}`): render
+        // `const NAME: Type = Type { field: value, … };`.
+        if (init.kind == NodeKind::StructLiteral) {
+            this.render_struct_const(node, ty, init as StructLiteralNode*);
+            return;
+        }
+        if (init.kind != NodeKind::Literal) { return; }
         const lit: LiteralNode* = init as LiteralNode*;
         mut val: string = "";
         if (lit.literal_kind == LiteralKind::String) {
@@ -189,6 +197,31 @@ type struct BindingSerializer {
         }
         this.out.push_cstr(format("const %s: %s = %s;\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, val));
+    }
+
+    /// Render a struct-literal global const (`const NAME: Type = Type { … };`).
+    /// Field initializers are numeric literals in struct-declaration order (the
+    /// importer emits them that way); names are keyword-escaped like every other
+    /// emitted identifier.
+    render_struct_const(mut &this, node: VarDeclNode*, ty: string, sl: StructLiteralNode*) -> void {
+        mut s: string = format("const %s: %s = %s {",
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, ty);
+        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+            const fi: FieldInit = sl.field_inits[i];
+            if (i > 0) { s = s + ","; }
+            const fname: string = BindingSerializer::ident(this.ctx.intern_table.resolve(fi.field_name));
+            s = s + format(" %s: %s", fname, BindingSerializer::render_const_scalar(fi.value));
+        }
+        this.out.push_cstr(s + " };\n\n");
+    }
+
+    /// Render a numeric-literal field/operand value to Cryo source (the bare
+    /// literal text; non-literals fall back to `0`, which the importer never
+    /// emits here).
+    static render_const_scalar(expr: ExpressionNode*) -> string {
+        if (expr == null || expr.kind != NodeKind::Literal) { return "0"; }
+        const lit: LiteralNode* = expr as LiteralNode*;
+        return lit.value;
     }
 
     render_function(mut &this, node: FunctionDeclNode*) -> void {
