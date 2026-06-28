@@ -23,6 +23,9 @@ namespace Compiler::Bindgen::Generator;
 
 import ffi::libc;
 import Compiler::Bindgen::Importer;
+import Compiler::Bindgen::Clang;
+import Compiler::Bindgen::Clang::{ CXString };
+import Compiler::BuildManifest;
 import Compiler::CompilationContext;
 import Compiler::CompileMode;
 import Compiler::AST;
@@ -34,8 +37,15 @@ import Utils::Logger;
 import std::fs::metadata;
 import std::fs::path;
 import std::fmt;
+import std::core::primitives;
 import std::collections::string;
 import std::collections::str;
+
+/// Bump whenever the emitted binding format changes (a new field shape, a
+/// different type mapping, …).  It participates in the Stage-3 cache key, so an
+/// increment invalidates every previously cached binding after a compiler
+/// upgrade — old caches no longer match and regenerate on next `cryo vendor`.
+const GENERATOR_VERSION: i64 = 1;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -317,6 +327,50 @@ type struct VendorGenerator {
         if (parsed == 0) { return ""; }
 
         return BindingSerializer::render(&ctx, ns, root, extern_node);
+    }
+
+    /// The libclang version banner (e.g. "clang version 20.1.0"), or "" when
+    /// unavailable.  Folded into the provenance key so a toolchain upgrade
+    /// invalidates the cache.  The CXString's C buffer is interned (copied) so
+    /// the returned `string` outlives the disposed CXString.
+    static clang_version() -> string {
+        const s: CXString = Clang::clang_getClangVersion();
+        const cstr: u8* = Clang::clang_getCString(s);
+        mut out: string = "";
+        if (cstr != null) { out = String::from_cstr(cstr as string).into_raw(); }
+        Clang::clang_disposeString(s);
+        return out;
+    }
+
+    /// The Stage-3 cache provenance key: a hex FNV-1a digest folding the bytes
+    /// of every resolved entry header, the (already-normalized) target
+    /// `triple`, the libclang version, and `GENERATOR_VERSION`.  A change in
+    /// any of these regenerates; an unchanged set is a cache hit.  Reuses the
+    /// build manifest's FNV-1a folding so the whole compiler hashes one way.
+    ///
+    /// First cut: only the entry headers' own bytes are hashed.  A header
+    /// reached purely via a transitive `#include` is NOT yet part of the key
+    /// (libclang's `clang_getInclusions` would close that gap) — editing such a
+    /// header alone will not invalidate the cache.  Documented as a follow-up.
+    static provenance_key(source_path: string, headers: &string[],
+                          include_dirs: &string[], triple: string) -> string {
+        mut h: u64 = Manifest::fnv_seed();
+        for (mut i: i64 = 0; i < headers.length; i++) {
+            const hp: string = VendorGenerator::resolve_header(
+                source_path, include_dirs, headers[i]);
+            if (libc::strlen(hp) == 0) {
+                // A missing header still perturbs the key (distinct marker +
+                // the requested name) so it can't masquerade as unchanged.
+                h = Manifest::fnv_str(h, "<missing-header>");
+                h = Manifest::fnv_str(h, headers[i]);
+            } else {
+                h = Manifest::fnv_file(h, hp);
+            }
+        }
+        h = Manifest::fnv_str(h, triple);
+        h = Manifest::fnv_str(h, VendorGenerator::clang_version());
+        h = Manifest::fnv_u64(h, GENERATOR_VERSION as u64);
+        return h.to_hex_padded_str(16);
     }
 
     /// `<base>/<rel>` (or `rel` when already absolute-ish).
