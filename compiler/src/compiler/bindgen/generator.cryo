@@ -39,6 +39,7 @@ import Compiler::Diag::{ SourceSpan };
 import Utils::Logger;
 import std::fs::metadata;
 import std::fs::path;
+import std::fs::file;
 import std::fmt;
 import std::core::primitives;
 import std::collections::string;
@@ -48,7 +49,13 @@ import std::collections::str;
 /// different type mapping, …).  It participates in the Stage-3 cache key, so an
 /// increment invalidates every previously cached binding after a compiler
 /// upgrade — old caches no longer match and regenerate on next `cryo vendor`.
-const GENERATOR_VERSION: i64 = 5;
+///
+/// 5 -> 6: provenance now folds the full transitive `#include` graph (recorded
+/// in a `<bindings>.cryo.deps` sidecar) instead of the entry header alone.  The
+/// bump forces one regeneration per cached lib so every existing cache gains a
+/// depfile and the transitive-edit protection takes effect immediately rather
+/// than only after the next unrelated change.
+const GENERATOR_VERSION: i64 = 6;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -467,8 +474,15 @@ type struct VendorGenerator {
     /// each `headers` entry (resolved against `source_path` and `include_dirs`)
     /// with the manifest's include dirs and defines on the clang command line.
     /// Returns the source text, or "" if no header could be parsed.
+    ///
+    /// `out_inputs` (when non-null) is filled with the de-duplicated set of files
+    /// that fed the bindings — each resolved entry header plus every non-system
+    /// file reached transitively via `#include` — so the caller can write a
+    /// `<bindings>.cryo.deps` sidecar that `provenance_key` folds on the next
+    /// cache check (catching edits to transitively-included headers).
     static generate(ns: string, source_path: string, headers: &string[],
-                    include_dirs: &string[], defines: &string[]) -> string {
+                    include_dirs: &string[], defines: &string[],
+                    out_inputs: string[]*) -> string {
         mut ctx: CompilationContext = CompilationContext::new(
             CompileMode::SingleFile, "<vendor-bindgen>");
         // The importer pushes top-level type decls into the AST root; give it a
@@ -504,11 +518,16 @@ type struct VendorGenerator {
                     headers[i], source_path);
                 continue;
             }
+            // Always record the entry header itself (clang_getInclusions may or
+            // may not report the TU's main file); `collect_from_tu` then appends
+            // the transitive non-system includes.  Final de-dup happens below.
+            if (out_inputs != null) { out_inputs.push(hp); }
             Importer::collect_from_tu(hp as u8*, null, 0u32, &extra, hp,
-                                      extern_node, &ctx, &report);
+                                      extern_node, &ctx, &report, out_inputs);
             parsed = parsed + 1;
         }
         if (parsed == 0) { return ""; }
+        if (out_inputs != null) { VendorGenerator::dedup_in_place(out_inputs); }
 
         report.summary_stdout(ns);
         return BindingSerializer::render(&ctx, ns, root, extern_node);
@@ -528,34 +547,116 @@ type struct VendorGenerator {
     }
 
     /// The Stage-3 cache provenance key: a hex FNV-1a digest folding the bytes
-    /// of every resolved entry header, the (already-normalized) target
-    /// `triple`, the libclang version, and `GENERATOR_VERSION`.  A change in
-    /// any of these regenerates; an unchanged set is a cache hit.  Reuses the
-    /// build manifest's FNV-1a folding so the whole compiler hashes one way.
+    /// of the binding's input files, the (already-normalized) target `triple`,
+    /// the libclang version, and `GENERATOR_VERSION`.  A change in any of these
+    /// regenerates; an unchanged set is a cache hit.  Reuses the build manifest's
+    /// FNV-1a folding so the whole compiler hashes one way.
     ///
-    /// First cut: only the entry headers' own bytes are hashed.  A header
-    /// reached purely via a transitive `#include` is NOT yet part of the key
-    /// (libclang's `clang_getInclusions` would close that gap) — editing such a
-    /// header alone will not invalidate the cache.  Documented as a follow-up.
+    /// `cache_file` is the path of the PREVIOUSLY generated `.cryo` (or "" on a
+    /// fresh registration).  When its `<cache_file>.deps` include-graph sidecar
+    /// exists, the key folds every file listed there — the entry headers AND
+    /// their transitive `#include`s — so editing a deeply-included header
+    /// invalidates the cache.  When no sidecar exists yet (a fresh register, or a
+    /// cache written before this mechanism), it falls back to folding the entry
+    /// headers alone; that fallback is byte-identical to the pre-sidecar key, so
+    /// upgrading does not spuriously invalidate a cache whose `GENERATOR_VERSION`
+    /// already matched (the version bump to 6 is what forces the one-time
+    /// regeneration that installs the sidecar).
     static provenance_key(source_path: string, headers: &string[],
-                          include_dirs: &string[], triple: string) -> string {
+                          include_dirs: &string[], triple: string,
+                          cache_file: string) -> string {
         mut h: u64 = Manifest::fnv_seed();
-        for (mut i: i64 = 0; i < headers.length; i++) {
-            const hp: string = VendorGenerator::resolve_header(
-                source_path, include_dirs, headers[i]);
-            if (libc::strlen(hp) == 0) {
-                // A missing header still perturbs the key (distinct marker +
-                // the requested name) so it can't masquerade as unchanged.
-                h = Manifest::fnv_str(h, "<missing-header>");
-                h = Manifest::fnv_str(h, headers[i]);
-            } else {
-                h = Manifest::fnv_file(h, hp);
+        const depfile: string = if (libc::strlen(cache_file) > 0) {
+            format("%s.deps", cache_file)
+        } else {
+            ""
+        };
+        if (libc::strlen(depfile) > 0
+                && metadata::exists(Path::from_cstr(depfile))) {
+            h = VendorGenerator::fold_depfile(h, depfile);
+        } else {
+            // Fallback (fresh register / pre-sidecar cache): entry headers only.
+            for (mut i: i64 = 0; i < headers.length; i++) {
+                const hp: string = VendorGenerator::resolve_header(
+                    source_path, include_dirs, headers[i]);
+                if (libc::strlen(hp) == 0) {
+                    // A missing header still perturbs the key (distinct marker +
+                    // the requested name) so it can't masquerade as unchanged.
+                    h = Manifest::fnv_str(h, "<missing-header>");
+                    h = Manifest::fnv_str(h, headers[i]);
+                } else {
+                    h = Manifest::fnv_file(h, hp);
+                }
             }
         }
         h = Manifest::fnv_str(h, triple);
         h = Manifest::fnv_str(h, VendorGenerator::clang_version());
         h = Manifest::fnv_u64(h, GENERATOR_VERSION as u64);
         return h.to_hex_padded_str(16);
+    }
+
+    /// Fold the bytes of every file listed in an include-graph depfile (one path
+    /// per line, written by `write_depfile`) into the running hash `seed`.  A
+    /// listed file that has since been deleted perturbs the key with a distinct
+    /// marker (so it can't masquerade as unchanged → forces a regeneration that
+    /// rebuilds the graph).  Blank lines are skipped.  Returns the updated hash.
+    static fold_depfile(seed: u64, depfile: string) -> u64 {
+        mut h: u64 = seed;
+        mut content: string = "";
+        match (file::read_to_string(Path::from_cstr(depfile))) {
+            Result::Ok(s)  => { content = s.into_raw(); }
+            Result::Err(_) => { return h; }
+        }
+        const len: i64 = libc::strlen(content) as i64;
+        mut i: i64 = 0;
+        while (i < len) {
+            const start: i64 = i;
+            while (i < len && content[i] != 10) { i += 1; }   // 10 = '\n'
+            mut end: i64 = i;
+            // Trim a trailing '\r' (depfiles written on Windows / read on Unix).
+            if (end > start && content[end - 1] == 13) { end -= 1; }   // 13 = '\r'
+            if (end > start) {
+                const path: string = content.substr(start, end - start);
+                if (metadata::exists(Path::from_cstr(path))) {
+                    h = Manifest::fnv_file(h, path);
+                } else {
+                    h = Manifest::fnv_str(h, "<missing-include>");
+                    h = Manifest::fnv_str(h, path);
+                }
+            }
+            if (i < len) { i += 1; }   // skip '\n'
+        }
+        return h;
+    }
+
+    /// Write the include-graph sidecar `<cryo_path>.deps`: one input file path
+    /// per line, in the order `generate` accumulated them.  Best-effort — a
+    /// write failure just means the next cache check falls back to the
+    /// entry-header key (a possible spurious regeneration, never a stale cache).
+    static write_depfile(cryo_path: string, inputs: &string[]) -> void {
+        const dpath: string = format("%s.deps", cryo_path);
+        const f: void* = libc::fopen(dpath, "w");
+        if (f == null) { return; }
+        for (mut i: i64 = 0; i < inputs.length; i++) {
+            libc::fputs(inputs[i], f);
+            libc::fputs("\n", f);
+        }
+        libc::fclose(f);
+    }
+
+    /// De-duplicate a path list in place, preserving first-seen order (so the
+    /// depfile and thus the fold order are stable across regenerations).
+    static dedup_in_place(arr: string[]*) -> void {
+        mut out: string[] = [];
+        for (mut i: i64 = 0; i < (*arr).length; i++) {
+            const item: string = (*arr)[i];
+            mut dup: boolean = false;
+            for (mut j: i64 = 0; j < out.length; j++) {
+                if (libc::strcmp(item, out[j]) == 0) { dup = true; break; }
+            }
+            if (!dup) { out.push(item); }
+        }
+        *arr = out;
     }
 
     /// `<base>/<rel>` (or `rel` when already absolute-ish).

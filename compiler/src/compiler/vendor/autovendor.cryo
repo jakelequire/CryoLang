@@ -90,7 +90,7 @@ type struct AutoVendor {
         // normal up-to-date build stays cheap.
         const prov_key: string = VendorGenerator::provenance_key(
             reg.entries[idx].source_path, &reg.entries[idx].headers,
-            &reg.entries[idx].include_dirs, norm);
+            &reg.entries[idx].include_dirs, norm, have_file);
         const hit: boolean = strlen(have_key) > 0
             && strcmp(have_key, prov_key) == 0
             && strlen(have_file) > 0
@@ -103,10 +103,11 @@ type struct AutoVendor {
         const cache_dir: string =
             VendorRegistry::cache_dir_for(reg.entries[idx].key, triple);
         const dest: string = format("%s/%s.cryo", cache_dir, reg.entries[idx].name);
+        mut inputs: string[] = [];
         const src_text: string = VendorGenerator::generate(
             reg.entries[idx].name, reg.entries[idx].source_path,
             &reg.entries[idx].headers, &reg.entries[idx].include_dirs,
-            &reg.entries[idx].defines);
+            &reg.entries[idx].defines, &inputs);
         if (strlen(src_text) == 0) {
             fmt::eprintf("warning: auto-vendor for '%s' produced no output (no header parsed); the pin is ignored.\n",
                 reg.entries[idx].name);
@@ -119,7 +120,15 @@ type struct AutoVendor {
         }
         fputs(src_text, gf);
         fclose(gf);
-        reg.entries[idx].set_cache(norm, dest, prov_key);
+        // Sidecar the include graph so the next build's provenance check folds
+        // transitive headers (matches the `cryo vendor` path).
+        VendorGenerator::write_depfile(dest, &inputs);
+        // Store the key folded FROM the just-written depfile so the next
+        // unchanged build hits without a spurious one-time regeneration.
+        const store_key: string = VendorGenerator::provenance_key(
+            reg.entries[idx].source_path, &reg.entries[idx].headers,
+            &reg.entries[idx].include_dirs, norm, dest);
+        reg.entries[idx].set_cache(norm, dest, store_key);
         return true;
     }
 }

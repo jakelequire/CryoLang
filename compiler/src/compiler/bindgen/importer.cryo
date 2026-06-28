@@ -29,7 +29,7 @@ namespace Compiler::Bindgen::Importer;
 
 import ffi::libc;
 import Compiler::Bindgen::Clang;
-import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken };
+import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken, CXString, CXSourceLocation };
 import Compiler::Bindgen::TypeMap;
 import Compiler::Bindgen::TypeMap::{ CTypeMapper };
 import Compiler::Lex::Lexer;
@@ -47,6 +47,7 @@ import Compiler::Resolver::{ SymbolStr, InternTable };
 import Utils;
 import Utils::Logger;
 import std::fmt;
+import std::collections::string;
 
 /// A structured account of what a single translation unit's import could NOT
 /// translate faithfully — the honesty channel PLAN.md §3 requires.  Two buckets:
@@ -210,6 +211,13 @@ type struct Importer {
     /// `binding_namespace`, so they are emitted ONLY on the vendor path (where
     /// the file's `namespace` qualifies them); the inline path reports them.
     is_vendor:      boolean;
+    /// Vendor-path only: resolved paths of every non-system file this TU pulled
+    /// in (entry header + transitive `#include`s), collected via
+    /// `clang_getInclusions` after the decl walk.  `collect_from_tu` threads
+    /// these out so the generator can write an include-graph `.deps` sidecar for
+    /// cache provenance.  Stays empty on the inline `#include` path (which never
+    /// calls `clang_getInclusions`).
+    inputs:         string[];
 
     /// Build a per-TU importer.  Alias and `functions_only` are derived from the
     /// extern block; the type mapper is wired with the same (ctx, alias).
@@ -241,6 +249,7 @@ type struct Importer {
             mac_floats:     [],
             type_names:     [],
             is_vendor:      false,
+            inputs:         [],
         };
     }
 
@@ -1485,7 +1494,7 @@ type struct Importer {
                                ctx: CompilationContext*) -> i32 {
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0u32,
-                                         &no_extra, resolved_path, extern_node, ctx, null);
+                                         &no_extra, resolved_path, extern_node, ctx, null, null);
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
@@ -1509,7 +1518,34 @@ type struct Importer {
         };
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1u32,
-                                         &no_extra, header, extern_node, ctx, null);
+                                         &no_extra, header, extern_node, ctx, null, null);
+    }
+
+    /// `clang_getInclusions` trampoline: records each non-system file the TU
+    /// pulled in (entry header + transitive `#include`s) into `imp.inputs`, for
+    /// the include-graph `.deps` sidecar.  System headers are dropped — they are
+    /// already covered by the libclang-version fold in the provenance key, and
+    /// hashing glibc/CRT headers on every cache check would be wasteful.  Matches
+    /// the C `CXInclusionVisitor` signature `(CXFile, CXSourceLocation*, unsigned,
+    /// CXClientData) -> void`; `inclusion_stack`/`include_len` are unused (the
+    /// file's own location, via `clang_getLocationForOffset`, drives the filter).
+    static visit_inclusion(included_file: void*, inclusion_stack: CXSourceLocation*,
+                           include_len: u32, client: void*) -> void {
+        const imp: Importer* = client as Importer*;
+        // Recover the path FIRST, before any other libclang call on this cursor:
+        // a later by-value (24-byte, sret) `CXSourceLocation` return can disturb
+        // the `included_file` argument, so reading the name up front keeps it.
+        const fname: CXString = Clang::clang_getFileName(included_file);
+        const cstr: u8* = Clang::clang_getCString(fname);
+        mut path: string = "";
+        if (cstr != null) { path = String::from_cstr(cstr as string).into_raw(); }
+        Clang::clang_disposeString(fname);
+        if (libc::strlen(path) == 0) { return; }
+        // Drop system headers (already covered by the libclang-version fold).
+        const loc: CXSourceLocation =
+            Clang::clang_getLocationForOffset(imp.tu, included_file, 0u32);
+        if (Clang::clang_Location_isInSystemHeader(loc) != 0) { return; }
+        imp.inputs.push(path);
     }
 
     /// Build a libclang TU (forcing C with `-x c`, matching the old
@@ -1519,10 +1555,14 @@ type struct Importer {
     /// `out_report` (when non-null) accumulates this TU's skipped/approximated
     /// constructs for the caller's consolidated report (the `cryo vendor`
     /// path); when null, the report rides the `--debug`-only `cdebug` summary
-    /// (the inline `#include` path).
+    /// (the inline `#include` path).  `out_inputs` (when non-null) is appended
+    /// with every non-system file the TU included (via `clang_getInclusions`),
+    /// for the generator's include-graph `.deps` sidecar; null on the inline
+    /// path skips the inclusion walk entirely.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
                            extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
-                           ctx: CompilationContext*, out_report: ImportReport*) -> i32 {
+                           ctx: CompilationContext*, out_report: ImportReport*,
+                           out_inputs: string[]*) -> i32 {
         const index: void* = Clang::clang_createIndex(0, 0);
         // Force C (matches the old `-x c` preprocess).  `CRYO_CLANG_RESOURCE_DIR`,
         // when set, adds `-resource-dir <dir>` so libclang finds its builtin
@@ -1573,6 +1613,17 @@ type struct Importer {
         }
         if (out_report != null) { imp.report.merge_into(out_report); }
         else                    { imp.report.summary(label); }
+
+        // Vendor path only: enumerate the TU's inclusion set (entry header +
+        // transitive `#include`s) for the include-graph provenance sidecar.  The
+        // TU is still live here; the visitor appends non-system paths to
+        // `imp.inputs`, which we thread out to the caller's accumulator.
+        if (out_inputs != null) {
+            Clang::clang_getInclusions(tu, Importer::visit_inclusion, (&imp) as void*);
+            for (mut ii: i64 = 0; ii < imp.inputs.length; ii++) {
+                out_inputs.push(imp.inputs[ii]);
+            }
+        }
 
         Clang::clang_disposeTranslationUnit(tu);
         Clang::clang_disposeIndex(index);
