@@ -48,7 +48,7 @@ import std::collections::str;
 /// different type mapping, …).  It participates in the Stage-3 cache key, so an
 /// increment invalidates every previously cached binding after a compiler
 /// upgrade — old caches no longer match and regenerate on next `cryo vendor`.
-const GENERATOR_VERSION: i64 = 3;
+const GENERATOR_VERSION: i64 = 5;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -148,7 +148,93 @@ type struct BindingSerializer {
                 BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
                 this.render_type(f.type_annotation)));
         }
+        // Synthesized blob accessors (union reinterpret / bitfield shift-mask)
+        // restore the field access the opaque-blob lowering drops.
+        for (mut i: i64 = 0; i < node.binding_accessors.length; i++) {
+            this.render_accessor(node.binding_accessors[i]);
+        }
         this.out.push_cstr("}\n\n");
+    }
+
+    /// Render one synthesized blob accessor method.  Union accessors reinterpret
+    /// the blob's address as the member type; bitfield accessors shift/mask over
+    /// the blob's backing integer.  Bit offsets/masks/shifts carry the backing
+    /// suffix so the literals type-check against the reinterpreted integer.
+    render_accessor(mut &this, acc: BindingAccessor) -> void {
+        const name: string = BindingSerializer::ident(this.ctx.intern_table.resolve(acc.name));
+        const blob: string = BindingSerializer::ident(this.ctx.intern_table.resolve(acc.blob_field));
+        const vt: string = this.render_type(acc.value_type);
+        const k: i32 = acc.kind;
+
+        if (k == BindingAccessor::KIND_UNION_GET()) {
+            // The reinterpreted lvalue: at offset 0 a direct cast of the blob's
+            // address; at a non-zero (anon-struct) offset, a byte-pointer add.
+            const lv: string = if (acc.byte_offset == 0) {
+                format("*((&this.%s) as %s*)", blob, vt)
+            } else {
+                format("*((((&this.%s) as u8*) + %lld) as %s*)", blob, acc.byte_offset, vt)
+            };
+            this.out.push_cstr(format("    %s(&this) -> %s { return %s; }\n", name, vt, lv));
+        } else if (k == BindingAccessor::KIND_UNION_SET()) {
+            const lv: string = if (acc.byte_offset == 0) {
+                format("*((&this.%s) as %s*)", blob, vt)
+            } else {
+                format("*((((&this.%s) as u8*) + %lld) as %s*)", blob, acc.byte_offset, vt)
+            };
+            this.out.push_cstr(format(
+                "    %s(mut &this, v: %s) -> void { %s = v; }\n", name, vt, lv));
+        } else if (k == BindingAccessor::KIND_BITFIELD_GET()) {
+            const b: string = acc.backing;
+            // The backing-typed read of the blob.
+            const rd: string = format("*((&this.%s) as %s*)", blob, b);
+            if (acc.is_signed) {
+                // Sign-extend via shifts: move the field's MSB to the backing's
+                // top bit, then arithmetic-right-shift back down.
+                const sb: string = BindingSerializer::signed_backing(b);
+                const nbits: i64 = BindingSerializer::backing_bits(b);
+                const left: i64 = nbits - acc.bit_offset - acc.bit_width;
+                const right: i64 = nbits - acc.bit_width;
+                this.out.push_cstr(format(
+                    "    %s(&this) -> %s { return (((%s as %s) << %lld%s) >> %lld%s) as %s; }\n",
+                    name, vt, rd, sb, left, b, right, b, vt));
+            } else {
+                const mask: u64 = BindingSerializer::bit_mask(acc.bit_width);
+                this.out.push_cstr(format(
+                    "    %s(&this) -> %s { return ((%s >> %lld%s) & %llu%s) as %s; }\n",
+                    name, vt, rd, acc.bit_offset, b, mask, b, vt));
+            }
+        } else if (k == BindingAccessor::KIND_BITFIELD_SET()) {
+            const b: string = acc.backing;
+            const mask: u64 = BindingSerializer::bit_mask(acc.bit_width);
+            // *ptr = (*ptr & ~(mask << off)) | ((v as B & mask) << off)
+            this.out.push_cstr(format(
+                "    %s(mut &this, v: %s) -> void { mut p: %s* = (&this.%s) as %s*; *p = (*p & ~(%llu%s << %lld%s)) | (((v as %s) & %llu%s) << %lld%s); }\n",
+                name, vt, b, blob, b, mask, b, acc.bit_offset, b, b, mask, b, acc.bit_offset, b));
+        }
+    }
+
+    /// `(1 << width) - 1` as a u64 mask (width is 1..64; clamps a full-width
+    /// 64-bit field to avoid an undefined `1 << 64`).
+    static bit_mask(width: i64) -> u64 {
+        if (width >= 64) { return 0xFFFFFFFFFFFFFFFFu64; }
+        return (1u64 << (width as u64)) - 1u64;
+    }
+
+    /// The signed sibling of an unsigned backing type name (`u32` -> `i32`),
+    /// for the signed-bitfield sign-extension read.
+    static signed_backing(b: string) -> string {
+        if (b.eq("u8"))  { return "i8"; }
+        if (b.eq("u16")) { return "i16"; }
+        if (b.eq("u32")) { return "i32"; }
+        return "i64";
+    }
+
+    /// The bit width of a backing type name (`u32` -> 32).
+    static backing_bits(b: string) -> i64 {
+        if (b.eq("u8"))  { return 8; }
+        if (b.eq("u16")) { return 16; }
+        if (b.eq("u32")) { return 32; }
+        return 64;
     }
 
     render_enum(mut &this, node: EnumDeclNode*) -> void {

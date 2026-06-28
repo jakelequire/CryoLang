@@ -175,6 +175,11 @@ type struct Importer {
     /// processed with look-ahead so a run of bitfields can be spanned by one
     /// storage blob.  Reset at the start of each record.
     field_cursors:  CXCursor[];
+    /// Transient: a union/anon-record member's FieldDecl cursors, collected by
+    /// `visit_collect_acc_member` to build reinterpret accessors.  Kept separate
+    /// from `field_cursors` so an anon-member walk can run mid-iteration of the
+    /// parent record's `field_cursors` without clobbering it.
+    acc_members:    CXCursor[];
     /// Honesty channel: every construct this import skipped or approximated.
     report:         ImportReport;
     /// W1: macro-definition cursors deferred from the decl walk so they emit
@@ -224,6 +229,7 @@ type struct Importer {
             cur_enum:       null,
             cur_enum_int:   null,
             field_cursors:  [],
+            acc_members:    [],
             report:         ImportReport::new(),
             macro_cursors:  [],
             ec_names:       [],
@@ -300,6 +306,17 @@ type struct Importer {
         } else if ((k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL)
                    && cursor.is_anonymous_record_decl()) {
             imp.field_cursors.push(cursor);
+        }
+        return Clang::VISIT_CONTINUE;
+    }
+
+    /// Nested visitor: collect a union/anon-record's FieldDecl members into
+    /// `acc_members` (for reinterpret-accessor generation).  Anonymous
+    /// sub-records are ignored here — accessors only cover named members.
+    static visit_collect_acc_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+        if (Clang::clang_getCursorKind(cursor) == Clang::CURSOR_FIELD_DECL) {
+            const imp: Importer* = client as Importer*;
+            imp.acc_members.push(cursor);
         }
         return Clang::VISIT_CONTINUE;
     }
@@ -414,15 +431,23 @@ type struct Importer {
             unode.binding_namespace = this.alias;
             unode.repr_c = true;
             if (align > 0) { unode.min_alignment = align as u64; }
-            mut storage: FieldDeclNode* =
-                new FieldDeclNode(this.ctx.intern_table.intern("_storage"), SourceSpan::none());
+            const blob_sym: SymbolStr = this.ctx.intern_table.intern("_storage");
+            mut storage: FieldDeclNode* = new FieldDeclNode(blob_sym, SourceSpan::none());
             storage.type_annotation = this.types.array(this.types.prim("u8"), size);
             unode.add_field(storage);
+            // Restore field access: a reinterpret get/set pair per named member.
+            const nacc: i32 = this.add_reinterpret_accessors(unode, blob_sym, cursor);
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
             this.emit_top_level(unode as ASTNode*);
-            this.report.approx(format("union '%s' -> %lld-byte opaque storage (round-trips by value; no field access)",
-                                      this.ctx.intern_table.resolve(name_sym), size));
+            const uname: string = this.ctx.intern_table.resolve(name_sym);
+            if (nacc > 0) {
+                this.report.approx(format("union '%s' -> %lld-byte storage + %d get/set accessors (method access, not native union)",
+                                          uname, size, nacc));
+            } else {
+                this.report.approx(format("union '%s' -> %lld-byte opaque storage (round-trips by value; no field access)",
+                                          uname, size));
+            }
             return;
         }
 
@@ -483,8 +508,19 @@ type struct Importer {
                 mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
                 fnode.type_annotation = this.types.aligned_blob(sz, al);
                 node.add_field(fnode);
-                this.report.approx(format("anonymous member in struct '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
-                                          sname, anon_n, sz));
+                // Both an anonymous union (members overlay at offset 0) and an
+                // anonymous struct (members at their byte offsets) get reinterpret
+                // accessors over the blob — `add_reinterpret_accessors` reads each
+                // member's offset, so the same path covers both.
+                const kindword: string = if (k == Clang::CURSOR_UNION_DECL) { "union" } else { "struct" };
+                const nacc: i32 = this.add_reinterpret_accessors(node, fname, cur);
+                if (nacc > 0) {
+                    this.report.approx(format("anonymous %s in struct '%s' -> field '_anon%d' (%lld-byte) + %d get/set accessors",
+                                              kindword, sname, anon_n, sz, nacc));
+                } else {
+                    this.report.approx(format("anonymous member in struct '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
+                                              sname, anon_n, sz));
+                }
                 anon_n = anon_n + 1;
                 approximated = true;
                 i = i + 1;
@@ -522,8 +558,17 @@ type struct Importer {
                 mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
                 fnode.type_annotation = this.types.array(this.types.prim("u8"), span);
                 node.add_field(fnode);
-                this.report.approx(format("bitfield run in struct '%s' -> field '_bitfield%d': %lld-byte opaque storage (no field access)",
-                                          sname, bits_n, span));
+                // Restore field access: a shift/mask get/set per UNSIGNED bitfield
+                // in the run (only when the blob has a native backing integer
+                // width — 1/2/4/8 bytes; signed bitfields stay opaque).
+                const nacc: i32 = this.emit_bitfield_accessors(node, fname, span, start_byte, i, j);
+                if (nacc > 0) {
+                    this.report.approx(format("bitfield run in struct '%s' -> field '_bitfield%d' (%lld-byte) + %d get/set accessors",
+                                              sname, bits_n, span, nacc));
+                } else {
+                    this.report.approx(format("bitfield run in struct '%s' -> field '_bitfield%d': %lld-byte opaque storage (no field access)",
+                                              sname, bits_n, span));
+                }
                 bits_n = bits_n + 1;
                 approximated = true;
 
@@ -551,6 +596,106 @@ type struct Importer {
             const al: i64 = Clang::clang_Type_getAlignOf(rec_type);
             if (al > 0) { node.min_alignment = al as u64; }
         }
+    }
+
+    /// Add a reinterpret get/set accessor pair for each named member of a record
+    /// `record_cursor` (a union, an anonymous-union member, or an anonymous-struct
+    /// member), reading/writing `blob_field` reinterpreted as the member's type at
+    /// the member's byte offset (0 for every union member; the field offset for an
+    /// anon-struct member).  A member of bitfield/anonymous type is skipped (no
+    /// faithful scalar reinterpret).  Returns the member count covered.
+    add_reinterpret_accessors(mut &this, node: StructDeclNode*, blob_field: SymbolStr,
+                              record_cursor: CXCursor) -> i32 {
+        this.acc_members = [];
+        Clang::clang_visitChildren(record_cursor, Importer::visit_collect_acc_member, this as void*);
+        mut n: i32 = 0;
+        for (mut i: i64 = 0; i < this.acc_members.length; i++) {
+            const m: CXCursor = this.acc_members[i];
+            if (m.is_bitfield()) { continue; }
+            const mname: SymbolStr = m.intern_spelling(this.ctx);
+            if (this.ctx.intern_table.resolve(mname).eq("")) { continue; }
+            const mt: CXType = Clang::clang_getCursorType(m);
+            if (mt.is_anonymous_record()) { continue; }
+            const off_bits: i64 = Clang::clang_Cursor_getOffsetOfField(m);
+            const off_bytes: i64 = if (off_bits >= 0) { off_bits / 8 } else { 0 };
+            const vt: TypeAnnotation* = this.types.map(mt);
+            const set_name: SymbolStr = this.ctx.intern_table.intern(
+                "set_" + this.ctx.intern_table.resolve(mname));
+            node.add_accessor(BindingAccessor {
+                kind: BindingAccessor::KIND_UNION_GET(), name: mname, blob_field: blob_field,
+                value_type: vt, byte_offset: off_bytes,
+                backing: "", bit_offset: 0, bit_width: 0, is_signed: false
+            });
+            node.add_accessor(BindingAccessor {
+                kind: BindingAccessor::KIND_UNION_SET(), name: set_name, blob_field: blob_field,
+                value_type: vt, byte_offset: off_bytes,
+                backing: "", bit_offset: 0, bit_width: 0, is_signed: false
+            });
+            n = n + 1;
+        }
+        return n;
+    }
+
+    /// Add a shift/mask get/set accessor pair for each UNSIGNED bitfield in a run
+    /// (`field_cursors[run_lo .. run_hi)`), reading/writing `blob_field`
+    /// reinterpreted as a native backing integer.  Returns 0 (no accessors) when
+    /// the blob has no native backing width (`span` not in {1,2,4,8}); signed
+    /// bitfields are skipped (left opaque) to avoid a sign-extension miscompile.
+    emit_bitfield_accessors(mut &this, node: StructDeclNode*, blob_field: SymbolStr,
+                            span: i64, start_byte: i64, run_lo: i64, run_hi: i64) -> i32 {
+        mut backing: string = "";
+        if      (span == 1) { backing = "u8"; }
+        else if (span == 2) { backing = "u16"; }
+        else if (span == 4) { backing = "u32"; }
+        else if (span == 8) { backing = "u64"; }
+        if (backing.eq("")) { return 0; }
+        const run_start_bit: i64 = start_byte * 8;
+        mut n: i32 = 0;
+        for (mut p: i64 = run_lo; p < run_hi; p++) {
+            const cur: CXCursor = this.field_cursors[p];
+            const ct: CXType = Clang::clang_getCursorType(cur);
+            // Only integer-typed bitfields (the universe in C); an unsigned field
+            // reads with a plain shift/mask, a signed one sign-extends.
+            if (!Importer::is_unsigned_int_type(ct) && !Importer::is_signed_int_type(ct)) { continue; }
+            const signed: boolean = Importer::is_signed_int_type(ct);
+            const off: i64 = Clang::clang_Cursor_getOffsetOfField(cur) - run_start_bit;
+            const width: i64 = Clang::clang_getFieldDeclBitWidth(cur) as i64;
+            if (off < 0 || width <= 0) { continue; }
+            const mname: SymbolStr = cur.intern_spelling(this.ctx);
+            if (this.ctx.intern_table.resolve(mname).eq("")) { continue; }
+            const vt: TypeAnnotation* = this.types.map(ct);
+            const set_name: SymbolStr = this.ctx.intern_table.intern(
+                "set_" + this.ctx.intern_table.resolve(mname));
+            node.add_accessor(BindingAccessor {
+                kind: BindingAccessor::KIND_BITFIELD_GET(), name: mname, blob_field: blob_field,
+                value_type: vt, byte_offset: 0,
+                backing: backing, bit_offset: off, bit_width: width, is_signed: signed
+            });
+            node.add_accessor(BindingAccessor {
+                kind: BindingAccessor::KIND_BITFIELD_SET(), name: set_name, blob_field: blob_field,
+                value_type: vt, byte_offset: 0,
+                backing: backing, bit_offset: off, bit_width: width, is_signed: signed
+            });
+            n = n + 1;
+        }
+        return n;
+    }
+
+    /// True if `t`'s canonical type is a signed integer (so a bitfield of this
+    /// type must sign-extend on read).
+    static is_signed_int_type(t: CXType) -> boolean {
+        const k: i32 = Clang::clang_getCanonicalType(t).kind;
+        return k == Clang::TK_Char_S || k == Clang::TK_SChar || k == Clang::TK_Short
+            || k == Clang::TK_Int || k == Clang::TK_Long || k == Clang::TK_LongLong;
+    }
+
+    /// True if `t`'s canonical type is an unsigned integer (so a bitfield of this
+    /// type needs no sign extension and a plain shift/mask accessor is correct).
+    static is_unsigned_int_type(t: CXType) -> boolean {
+        const k: i32 = Clang::clang_getCanonicalType(t).kind;
+        return k == Clang::TK_Bool || k == Clang::TK_Char_U || k == Clang::TK_UChar
+            || k == Clang::TK_UShort || k == Clang::TK_UInt
+            || k == Clang::TK_ULong || k == Clang::TK_ULongLong;
     }
 
     /// Emit a `type enum E : <int> { NAME = value; ... }` for a NAMED C enum.
@@ -1049,15 +1194,17 @@ type struct Importer {
         return true;
     }
 
-    /// W4: bind a constant-arithmetic macro `#define NAME (A op B)` where A and B
-    /// are numeric literals or already-bound macro consts and `op` is `+ - * /`.
-    /// The value is folded at import time to a single f64 literal const — which
-    /// sidesteps both the unsupported global const-references-const init and any
-    /// serializer change.  Returns false for any other shape.
+    /// W4: bind a constant-arithmetic macro whose replacement is a same-operator
+    /// chain over numeric literals / bound consts, e.g. `#define DEG2RAD (PI/180.0f)`
+    /// or a flag-combine `#define GN_FLAGS (1 | 2 | 4)`.  The value is folded at
+    /// import time to a single literal const — sidestepping both the unsupported
+    /// global const-references-const init and any serializer change.  An integer
+    /// fold is tried first (covers bitwise flag combines + enum-constant operands),
+    /// then a float fold.  Mixed operators (`a + b * c`) decline to avoid a
+    /// precedence bug; the chain must be a single repeated operator.
     try_emit_arith_macro(mut &this, name_sym: SymbolStr, name_str: string,
                          toks: CXToken*, ntok: u32) -> boolean {
-        // Gather replacement tokens (index 1..ntok-1), stripping balanced outer
-        // parens, into a small list of (kind, spelling).
+        // Strip balanced outer parens from the replacement (tokens 1..ntok-1).
         mut lo: i64 = 1;
         mut hi: i64 = (ntok as i64) - 1;
         while (lo < hi
@@ -1068,30 +1215,113 @@ type struct Importer {
             lo = lo + 1;
             hi = hi - 1;
         }
-        // Expect exactly three tokens: operand, operator, operand.
-        if (hi - lo != 2) { return false; }
-        mut a: f64 = 0.0;
-        mut b: f64 = 0.0;
-        if (!this.arith_operand(*(toks + lo), &a)) { return false; }
-        if (!this.arith_operand(*(toks + lo + 2), &b)) { return false; }
-        const opk: i32 = Clang::clang_getTokenKind(*(toks + lo + 1));
-        if (opk != Clang::TOKEN_PUNCTUATION) { return false; }
-        const op: string = (*(toks + lo + 1)).spelling(this.tu, this.ctx);
-        mut r: f64 = 0.0;
-        if      (op.eq("+")) { r = a + b; }
-        else if (op.eq("-")) { r = a - b; }
-        else if (op.eq("*")) { r = a * b; }
-        else if (op.eq("/")) { if (b == 0.0) { return false; } r = a / b; }
-        else { return false; }
+        // operand (op operand)* => an odd token count, with one repeated
+        // operator (so a left-assoc fold is exact).  A single operand is allowed
+        // (a parenthesized literal/const, e.g. `#define X (5)`).
+        const count: i64 = hi - lo + 1;
+        if (count < 1 || count % 2 == 0) { return false; }
+        mut op: string = "";
+        mut p: i64 = lo + 1;
+        while (p <= hi) {
+            if (Clang::clang_getTokenKind(*(toks + p)) != Clang::TOKEN_PUNCTUATION) { return false; }
+            const o: string = (*(toks + p)).spelling(this.tu, this.ctx);
+            if (op.eq("")) { op = o; } else if (!op.eq(o)) { return false; }
+            p = p + 2;
+        }
 
-        // Format with full double precision, ensuring a Cryo float literal (a
-        // decimal point or exponent) so it doesn't re-lex as an integer.
-        mut text: string = format("%.17g", r);
+        if (this.fold_int_chain(name_sym, toks, lo, hi, op)) { return true; }
+        if (this.fold_float_chain(name_sym, toks, lo, hi, op)) { return true; }
+        return false;
+    }
+
+    /// Fold an integer operand chain (all operands resolve to an i64 via int
+    /// literal / int macro const / enum constant) under a single bitwise or
+    /// arithmetic operator.  Emits a narrowest-fitting integer const.  Returns
+    /// false if any operand isn't integral or the operator isn't integer-valid.
+    fold_int_chain(mut &this, name_sym: SymbolStr, toks: CXToken*,
+                   lo: i64, hi: i64, op: string) -> boolean {
+        mut acc: i64 = 0;
+        mut first: boolean = true;
+        mut p: i64 = lo;
+        while (p <= hi) {
+            mut v: i64 = 0;
+            if (!this.arith_operand_int(*(toks + p), &v)) { return false; }
+            if (first) { acc = v; first = false; }
+            else if (op.eq("|"))  { acc = acc | v; }
+            else if (op.eq("&"))  { acc = acc & v; }
+            else if (op.eq("^"))  { acc = acc ^ v; }
+            else if (op.eq("+"))  { acc = acc + v; }
+            else if (op.eq("-"))  { acc = acc - v; }
+            else if (op.eq("*"))  { acc = acc * v; }
+            else if (op.eq("<<")) { acc = acc << v; }
+            else if (op.eq(">>")) { acc = acc >> v; }
+            else if (op.eq("/"))  { if (v == 0) { return false; } acc = acc / v; }
+            else if (op.eq("%"))  { if (v == 0) { return false; } acc = acc % v; }
+            else { return false; }
+            p = p + 2;
+        }
+        const type_name: string =
+            if (acc >= (0i64 - 2147483648i64) && acc <= 2147483647i64) { "i32" } else { "i64" };
+        const text: string = format("%llu", acc as u64);
+        mut ilit: LiteralNode* = new LiteralNode(text, LiteralKind::Integer, SourceSpan::none());
+        this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
+        this.record_macro_const(name_sym, type_name, text, false);
+        return true;
+    }
+
+    /// Fold a float operand chain (operands resolve to f64) under `+ - * /`.
+    /// Emits an f64 const.  Returns false if any operand isn't numeric or the
+    /// operator isn't float-valid.
+    fold_float_chain(mut &this, name_sym: SymbolStr, toks: CXToken*,
+                     lo: i64, hi: i64, op: string) -> boolean {
+        mut acc: f64 = 0.0;
+        mut first: boolean = true;
+        mut p: i64 = lo;
+        while (p <= hi) {
+            mut v: f64 = 0.0;
+            if (!this.arith_operand(*(toks + p), &v)) { return false; }
+            if (first) { acc = v; first = false; }
+            else if (op.eq("+")) { acc = acc + v; }
+            else if (op.eq("-")) { acc = acc - v; }
+            else if (op.eq("*")) { acc = acc * v; }
+            else if (op.eq("/")) { if (v == 0.0) { return false; } acc = acc / v; }
+            else { return false; }
+            p = p + 2;
+        }
+        // Full double precision, ensuring a Cryo float literal (a decimal point
+        // or exponent) so it doesn't re-lex as an integer.
+        mut text: string = format("%.17g", acc);
         if (!Importer::has_float_marker(text)) { text = text + ".0"; }
         mut flit: LiteralNode* = new LiteralNode(text, LiteralKind::Float, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
         this.record_macro_const(name_sym, "f64", text, true);
         return true;
+    }
+
+    /// Resolve a single operand token to an i64: an integer literal (base-0 C
+    /// lexing), a bound INT macro const, or an enum constant.  Returns false for
+    /// a float/text literal or a float macro const (the float path handles those).
+    arith_operand_int(&this, tok: CXToken, out: i64*) -> boolean {
+        const k: i32 = Clang::clang_getTokenKind(tok);
+        const sp: string = tok.spelling(this.tu, this.ctx);
+        if (k == Clang::TOKEN_LITERAL) {
+            if (sp.is_text_literal() || sp.is_float_literal()) { return false; }
+            *out = libc::strtoull(sp as u8*, null, 0) as i64;
+            return true;
+        }
+        if (k == Clang::TOKEN_IDENTIFIER) {
+            const tsym: SymbolStr = this.ctx.intern_table.intern(sp);
+            for (mut i: i64 = 0; i < this.ec_names.length; i++) {
+                if (this.ec_names[i].equals(tsym)) { *out = this.ec_values[i]; return true; }
+            }
+            for (mut i: i64 = 0; i < this.mac_names.length; i++) {
+                if (this.mac_names[i].equals(tsym) && !this.mac_floats[i]) {
+                    *out = libc::strtoull(this.mac_texts[i] as u8*, null, 0) as i64;
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// Resolve a single arithmetic operand token to an f64: a numeric literal

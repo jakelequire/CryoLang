@@ -536,12 +536,53 @@ public:
 }
 
 
+/// A synthesized field accessor for a C-imported struct whose layout has no
+/// first-class Cryo representation (a union or a bitfield run, lowered to an
+/// opaque storage blob).  The bindgen engine fills these so the vendor binding
+/// SERIALIZER can render shift/mask or reinterpret accessor methods over the
+/// blob — restoring field access that the opaque-blob lowering otherwise drops.
+/// A dedicated channel kept off the core method list (like binding_namespace,
+/// this is set ONLY by `Compiler::Bindgen`); the inline `extern module := "C"`
+/// path ignores it and keeps the blob opaque, so only the vendor path emits
+/// accessors.  Unused per-kind fields stay at their defaults.
+type struct BindingAccessor {
+    /// 0 = union-member get, 1 = union-member set, 2 = bitfield get,
+    /// 3 = bitfield set.  See `BindingAccessor::KIND_*`.
+    kind:       i32;
+    /// The accessor method's name (e.g. `i`, `set_i`, `a`, `set_a`).
+    name:       SymbolStr;
+    /// The blob field this accessor reads/writes (`_storage` / `_bitfield0`).
+    blob_field: SymbolStr;
+    /// The accessor's value type: a union member's type, or a bitfield's type.
+    value_type: TypeAnnotation*;
+    /// Union/field kinds: the member's BYTE offset within the blob (0 for a union
+    /// member or anon-union member; the field offset for an anon-struct member).
+    byte_offset: i64;
+    /// Bitfield only: the blob's backing unsigned-integer type name for the
+    /// reinterpret (`u8`/`u16`/`u32`/`u64`), the bit offset within the blob, the
+    /// bit width, and whether the field is signed (sign-extend on read).
+    /// Zero/empty for the union/field kinds.
+    backing:    string;
+    bit_offset: i64;
+    bit_width:  i64;
+    is_signed:  boolean;
+
+    static KIND_UNION_GET() -> i32 { return 0; }
+    static KIND_UNION_SET() -> i32 { return 1; }
+    static KIND_BITFIELD_GET() -> i32 { return 2; }
+    static KIND_BITFIELD_SET() -> i32 { return 3; }
+}
+
+
 type class StructDeclNode : DeclarationNode {
 public:
     name:           SymbolStr;
     generic_params: GenericParamNode*[];
     fields:         FieldDeclNode*[];
     methods:        MethodNode*[];
+    /// Synthesized field accessors for a C-imported union/bitfield blob (set
+    /// only by the bindgen engine; rendered only by the vendor serializer).
+    binding_accessors: BindingAccessor[];
     /// Layout attributes derived from `![repr(...)]` / `![align(N)]`
     /// directives.  Populated by the DirectiveProcessing pass before
     /// TypeResolution copies them onto the StructType so TypeLowering
@@ -573,12 +614,17 @@ public:
         this.generic_params    = [];
         this.fields            = [];
         this.methods           = [];
+        this.binding_accessors = [];
         this.repr_c            = false;
         this.repr_packed       = false;
         this.repr_transparent  = false;
         this.min_alignment     = 0;
         this.is_public         = true;
         this.binding_namespace = SymbolStr::empty();
+    }
+
+    add_accessor(acc: BindingAccessor) -> void {
+        this.binding_accessors.push(acc);
     }
 
     is_generic() -> boolean { return this.generic_params.length > 0; }
