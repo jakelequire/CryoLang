@@ -45,6 +45,7 @@ import Compiler::AST::Expression;
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Utils;
 import Utils::Logger;
+import std::fmt;
 
 /// A structured account of what a single translation unit's import could NOT
 /// translate faithfully — the honesty channel PLAN.md §3 requires.  Two buckets:
@@ -69,7 +70,9 @@ type struct ImportReport {
     approx(mut &this, line: string) -> void { this.approximated.push(line); }
 
     /// Emit a per-translation-unit summary (no-op when nothing was lost, and
-    /// silent unless `--debug` is set, since it rides `cdebug`).
+    /// silent unless `--debug` is set, since it rides `cdebug`).  Used by the
+    /// inline `#include` path, where the report is diagnostic noise during a
+    /// normal compile; the `cryo vendor` path uses `summary_stdout` instead.
     summary(&this, label: string) -> void {
         if (this.skipped.length == 0 && this.approximated.length == 0) { return; }
         cdebug("[Bindgen] '%s' translation report: %lld skipped, %lld approximated\n",
@@ -79,6 +82,34 @@ type struct ImportReport {
         }
         for (mut i: i64 = 0; i < this.approximated.length; i++) {
             cdebug("  [approx] %s\n", this.approximated[i]);
+        }
+    }
+
+    /// Append this report's entries into `dst` (the `cryo vendor` generator's
+    /// accumulator).  `string`s are non-owning pointers into leaked `format`
+    /// buffers, so copying them out survives this report's own array drop.
+    merge_into(&this, dst: ImportReport*) -> void {
+        for (mut i: i64 = 0; i < this.skipped.length; i++) {
+            dst.skipped.push(this.skipped[i]);
+        }
+        for (mut i: i64 = 0; i < this.approximated.length; i++) {
+            dst.approximated.push(this.approximated[i]);
+        }
+    }
+
+    /// Print the user-facing translation report to stdout at `cryo vendor`
+    /// time (the honesty channel PLAN.md §3 requires: every unbindable or
+    /// approximated construct is listed, never silently dropped).  No-op when
+    /// everything bound faithfully.
+    summary_stdout(&this, label: string) -> void {
+        if (this.skipped.length == 0 && this.approximated.length == 0) { return; }
+        fmt::printf("Translation report for '%s': %lld not bound, %lld approximated.\n",
+               label, this.skipped.length as i64, this.approximated.length as i64);
+        for (mut i: i64 = 0; i < this.skipped.length; i++) {
+            fmt::printf("  [skip]   %s\n", this.skipped[i]);
+        }
+        for (mut i: i64 = 0; i < this.approximated.length; i++) {
+            fmt::printf("  [approx] %s\n", this.approximated[i]);
         }
     }
 }
@@ -752,7 +783,7 @@ type struct Importer {
                                ctx: CompilationContext*) -> i32 {
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0u32,
-                                         &no_extra, resolved_path, extern_node, ctx);
+                                         &no_extra, resolved_path, extern_node, ctx, null);
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
@@ -776,16 +807,20 @@ type struct Importer {
         };
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1u32,
-                                         &no_extra, header, extern_node, ctx);
+                                         &no_extra, header, extern_node, ctx, null);
     }
 
     /// Build a libclang TU (forcing C with `-x c`, matching the old
     /// preprocess), walk its top-level cursors, and emit FunctionDeclNodes.
     /// `unsaved`/`num_unsaved` carry an in-memory buffer for system headers
     /// (null/0 for a real file).  Returns the number of functions emitted.
+    /// `out_report` (when non-null) accumulates this TU's skipped/approximated
+    /// constructs for the caller's consolidated report (the `cryo vendor`
+    /// path); when null, the report rides the `--debug`-only `cdebug` summary
+    /// (the inline `#include` path).
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
                            extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
-                           ctx: CompilationContext*) -> i32 {
+                           ctx: CompilationContext*, out_report: ImportReport*) -> i32 {
         const index: void* = Clang::clang_createIndex(0, 0);
         // Force C (matches the old `-x c` preprocess).  `CRYO_CLANG_RESOURCE_DIR`,
         // when set, adds `-resource-dir <dir>` so libclang finds its builtin
@@ -821,7 +856,8 @@ type struct Importer {
         mut imp: Importer = Importer::new(extern_node, ctx, tu);
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
-        imp.report.summary(label);
+        if (out_report != null) { imp.report.merge_into(out_report); }
+        else                    { imp.report.summary(label); }
 
         Clang::clang_disposeTranslationUnit(tu);
         Clang::clang_disposeIndex(index);
