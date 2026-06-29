@@ -1,0 +1,76 @@
+/// curl-demo — drives the generated `Curl` bindings against real libcurl,
+/// fetching a local file over the `file://` protocol (deterministic, headless,
+/// no network).  Showcases two things the SQLite demo didn't:
+///   * the VARIADIC `curl_easy_setopt(handle, option, ...)` — variadic FFI;
+///   * a Cryo function (`write_cb`) passed as curl's C write-callback fn pointer.
+namespace CurlDemo::Main;
+
+import Curl;
+import ffi::libc;
+import std::collections::str;
+import std::fmt;
+
+const INPUT_PATH: string = "/tmp/cryo_curl_demo_input.txt";
+const INPUT_TEXT: string = "Hello from libcurl, vendored into Cryo!\n";
+
+/// A fixed-capacity sink the write-callback appends fetched bytes into.  A
+/// pointer to it is handed to curl as CURLOPT_WRITEDATA and arrives back as the
+/// callback's `userdata`.
+type struct Sink {
+    data: u8[512];
+    len:  u64;
+}
+
+/// curl write-callback: `size_t cb(char *ptr, size_t size, size_t nmemb, void *ud)`.
+/// Copies the delivered chunk into the Sink and returns the bytes consumed
+/// (returning less than delivered tells curl to abort).
+function write_cb(ptr: i8*, size: u64, nmemb: u64, userdata: void*) -> u64 {
+    const n: u64 = size * nmemb;
+    mut sink: Sink* = userdata as Sink*;
+    mut i: u64 = 0;
+    while (i < n && sink.len < 512) {
+        sink.data[sink.len] = ptr[i] as u8;
+        sink.len = sink.len + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+function main() -> int {
+    // 1. Write the file curl will fetch (so the demo is self-contained).
+    const wf: void* = libc::fopen(INPUT_PATH, "w");
+    if (wf == null) { fmt::eprintf("error: cannot create %s\n", INPUT_PATH); return 1; }
+    libc::fputs(INPUT_TEXT, wf);
+    libc::fclose(wf);
+
+    // 2. Configure a curl easy handle entirely through the variadic setopt.
+    const easy: void* = Curl::curl_easy_init();
+    if (easy == null) { fmt::eprintf("error: curl_easy_init failed\n"); return 1; }
+
+    mut sink: Sink = Sink { data: [0; 512], len: 0 };
+
+    Curl::curl_easy_setopt(easy, Curl::CURLoption::CURLOPT_URL,
+        "file:///tmp/cryo_curl_demo_input.txt");
+    Curl::curl_easy_setopt(easy, Curl::CURLoption::CURLOPT_WRITEFUNCTION, write_cb);
+    Curl::curl_easy_setopt(easy, Curl::CURLoption::CURLOPT_WRITEDATA, &sink as void*);
+
+    // 3. Perform the transfer (curl invokes write_cb as bytes arrive).
+    const rc: CURLcode = Curl::curl_easy_perform(easy);
+    Curl::curl_easy_cleanup(easy);
+
+    if (rc != Curl::CURLcode::CURLE_OK) {
+        fmt::eprintf("error: curl_easy_perform failed (code %d)\n", rc as i32);
+        return 1;
+    }
+
+    // 4. Verify the callback received the whole file.
+    const got: Str = Str::from_raw(&sink.data[0], sink.len);
+    // The sink is zero-initialized, so the bytes form a NUL-terminated C string.
+    fmt::printf("libcurl %s fetched %llu bytes via file://:\n  %s",
+        Curl::curl_version(), sink.len, (&sink.data[0]) as string);
+
+    const want: Str = Str::new(INPUT_TEXT);
+    if (got.equals(&want)) { return 0; }
+    fmt::eprintf("error: fetched content did not match\n");
+    return 1;
+}

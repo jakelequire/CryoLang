@@ -1,0 +1,43 @@
+/// sqlite-demo — drives the generated `Sqlite` bindings against a real in-memory
+/// SQLite database, headless and deterministic.
+///
+/// Everything under `Sqlite::` (the opaque `sqlite3*` / `sqlite3_stmt*` handles,
+/// the `SQLITE_*` result-code consts, and the functions) comes from
+/// `bindings/Sqlite.cryo`, which the binding generator produced from
+/// `sqlite3.h` — no hand-written FFI.
+namespace SqliteDemo::Main;
+
+import Sqlite;
+import std::fmt;
+
+function main() -> int {
+    // Open an in-memory database (no file, no display, fully deterministic).
+    mut db: Sqlite::sqlite3* = null;
+    if (Sqlite::sqlite3_open(":memory:", &db) != Sqlite::SQLITE_OK) {
+        fmt::eprintf("error: sqlite3_open failed\n");
+        return 1;
+    }
+
+    // Create a table and insert a few rows. `sqlite3_exec`'s 3rd parameter is a
+    // function-pointer callback the generator bound as `(void*, i32, i8**, i8**)
+    // -> i32`; we pass `null` since this is a non-query statement.
+    Sqlite::sqlite3_exec(db, "CREATE TABLE t(n INTEGER);", null, null, null);
+    Sqlite::sqlite3_exec(db, "INSERT INTO t VALUES (40),(2),(100),(900);", null, null, null);
+
+    // Run an aggregate query through a prepared statement.
+    mut stmt: Sqlite::sqlite3_stmt* = null;
+    Sqlite::sqlite3_prepare_v2(db, "SELECT count(*), sum(n) FROM t;", -1, &stmt, null);
+    mut rows:  i32 = 0;
+    mut total: i32 = 0;
+    if (Sqlite::sqlite3_step(stmt) == Sqlite::SQLITE_ROW) {
+        rows  = Sqlite::sqlite3_column_int(stmt, 0);
+        total = Sqlite::sqlite3_column_int(stmt, 1);
+    }
+    Sqlite::sqlite3_finalize(stmt);
+    Sqlite::sqlite3_close(db);
+
+    // `sqlite3_libversion()` returns a C string (`u8*`/`i8*`) — printed directly.
+    fmt::printf("SQLite %s via generated Cryo bindings: %d rows, sum = %d\n",
+        Sqlite::sqlite3_libversion(), rows, total);
+    return total - 1042;   // 0 on success (40+2+100+900 == 1042)
+}
