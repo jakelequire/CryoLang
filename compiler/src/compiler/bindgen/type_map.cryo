@@ -160,8 +160,37 @@ type struct CTypeMapper {
         return this.ctx.intern_table.intern(ns + "::" + bare);
     }
 
+    /// True when `t` is a C `va_list`.  Checks the declared spelling (the
+    /// typedef `va_list` / `__builtin_va_list`) and the canonical spelling
+    /// (which on x86-64 / aarch64 expands to `struct __va_list_tag [1]`), so it
+    /// catches va_list however a platform's headers spell it.
+    static type_is_va_list(t: CXType) -> boolean {
+        if (CTypeMapper::type_spelling_contains(t, "va_list")) { return true; }
+        const canon: CXType = Clang::clang_getCanonicalType(t);
+        return CTypeMapper::type_spelling_contains(canon, "__va_list_tag");
+    }
+
+    /// True when the libclang spelling of `t` contains `needle`.
+    static type_spelling_contains(t: CXType, needle: string) -> boolean {
+        const s: CXString = Clang::clang_getTypeSpelling(t);
+        const cstr: u8* = Clang::clang_getCString(s);
+        mut found: boolean = false;
+        if (cstr != null) {
+            found = (libc::strstr(cstr as string, needle) as void*) != null;
+        }
+        Clang::clang_disposeString(s);
+        return found;
+    }
+
     /// Map a libclang type to a Cryo TypeAnnotation.
     map(&this, t: CXType) -> TypeAnnotation* {
+        // C `va_list` (canonicalizes to the unnameable platform
+        // `__va_list_tag[1]`) maps to the first-class `va_list` type — checked
+        // BEFORE canonicalization, which would otherwise lose the va_list
+        // identity and emit a dangling `__va_list_tag` array.
+        if (CTypeMapper::type_is_va_list(t)) {
+            return this.prim("va_list");
+        }
         const c: CXType = Clang::clang_getCanonicalType(t);
         const k: i32 = c.kind;
 
