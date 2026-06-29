@@ -171,6 +171,19 @@ type struct Importer {
     /// points at a stack-local CXType live for the duration of the walk.
     cur_enum:       EnumDeclNode*;
     cur_enum_int:   CXType*;
+    /// Transient per-NAMED-enum dup-value tracking.  C enums permit several
+    /// constants to share a value (deliberate aliases — e.g. SDL's
+    /// `KMOD_RESERVED == KMOD_SCROLL`, `SDL_PIXELFORMAT_RGBA32 == ..._ABGR8888`),
+    /// but a Cryo `type enum` requires unique discriminants.  The first constant
+    /// for each value becomes the enum variant; a later same-valued constant is
+    /// diverted to a namespaced alias `const` (emitted AFTER the enum decl so the
+    /// type is in scope).  `cur_enum_values`/`cur_enum_value_names` are the
+    /// per-enum seen set; `cur_enum_dup_*` queue the pending alias consts.
+    cur_enum_values:      i64[];
+    cur_enum_value_names: SymbolStr[];
+    cur_enum_dup_names:   SymbolStr[];
+    cur_enum_dup_values:  i64[];
+    cur_enum_dup_firsts:  SymbolStr[];
     /// Transient: a record's child member cursors (plain fields AND anonymous
     /// struct/union members), collected by `visit_collect_member` and then
     /// processed with look-ahead so a run of bitfields can be spanned by one
@@ -236,6 +249,11 @@ type struct Importer {
             types:          CTypeMapper::new(ctx, alias),
             cur_enum:       null,
             cur_enum_int:   null,
+            cur_enum_values:      [],
+            cur_enum_value_names: [],
+            cur_enum_dup_names:   [],
+            cur_enum_dup_values:  [],
+            cur_enum_dup_firsts:  [],
             field_cursors:  [],
             acc_members:    [],
             report:         ImportReport::new(),
@@ -731,11 +749,41 @@ type struct Importer {
             this.types.map(Clang::clang_getEnumDeclIntegerType(cursor));
 
         this.cur_enum = enode;
+        this.cur_enum_values      = [];
+        this.cur_enum_value_names = [];
+        this.cur_enum_dup_names   = [];
+        this.cur_enum_dup_values  = [];
+        this.cur_enum_dup_firsts  = [];
         Clang::clang_visitChildren(cursor, Importer::visit_enum_const, this as void*);
 
         this.seen_names.push(name_sym);
         this.type_names.push(name_sym);
         this.emit_top_level(enode as ASTNode*);
+
+        // Duplicate-valued constants (C enum aliases) can't be enum variants in
+        // Cryo (unique discriminants required), so emit each as a namespaced
+        // alias `const NAME: <Enum> = <value>` AFTER the enum decl above — the
+        // type is now in scope, and a bare `Lib::NAME` matches how C uses enum
+        // constants anyway.  Registered in `ec_*` so an identifier-alias macro
+        // can still resolve to it.
+        const ename: string = this.ctx.intern_table.resolve(name_sym);
+        for (mut i: i64 = 0; i < this.cur_enum_dup_names.length; i++) {
+            const dname: SymbolStr = this.cur_enum_dup_names[i];
+            const dval:  i64       = this.cur_enum_dup_values[i];
+            const ty: TypeAnnotation* =
+                this.types.named(this.types.qualify_under_alias(name_sym));
+            mut lit: LiteralNode* = new LiteralNode(
+                format("%llu", dval as u64), LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(dname, ty, lit as ExpressionNode*);
+            this.ec_names.push(dname);
+            this.ec_values.push(dval);
+            this.ec_enum_tags.push(name_sym);
+            this.report.approx(format(
+                "enum '%s': constant '%s' = %lld duplicates '%s' -> alias const (bare `%s`, not an enum variant)",
+                ename, this.ctx.intern_table.resolve(dname), dval,
+                this.ctx.intern_table.resolve(this.cur_enum_dup_firsts[i]),
+                this.ctx.intern_table.resolve(dname)));
+        }
     }
 
     /// Nested-walk body: append one EnumVariantNode (from an EnumConstantDecl
@@ -743,9 +791,22 @@ type struct Importer {
     add_enum_const_from(mut &this, cursor: CXCursor) -> void {
         const cname: SymbolStr = cursor.intern_spelling(this.ctx);
         const value: i64 = Clang::clang_getEnumConstantDeclValue(cursor);
+        // A later constant repeating an earlier value is a C enum alias; it
+        // can't be a second variant with the same discriminant, so queue it for
+        // an alias `const` emitted after the enum (see `emit_enum`).
+        for (mut i: i64 = 0; i < this.cur_enum_values.length; i++) {
+            if (this.cur_enum_values[i] == value) {
+                this.cur_enum_dup_names.push(cname);
+                this.cur_enum_dup_values.push(value);
+                this.cur_enum_dup_firsts.push(this.cur_enum_value_names[i]);
+                return;
+            }
+        }
         mut vnode: EnumVariantNode* = new EnumVariantNode(cname, SourceSpan::none());
         vnode.set_explicit_value(value);
         this.cur_enum.add_variant(vnode);
+        this.cur_enum_values.push(value);
+        this.cur_enum_value_names.push(cname);
         // W2: record so an identifier-alias `#define` can resolve to this
         // constant.  The owning enum's tag types the emitted alias const.
         this.ec_names.push(cname);
