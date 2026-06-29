@@ -55,6 +55,19 @@ type struct CXCursor {
         return clang_Cursor_isAnonymous(this) != 0u32;
     }
 
+    /// True when this record decl is written NESTED inside another struct/union
+    /// (its LEXICAL parent is a record decl), e.g. sqlite3's `sqlite3_index_info`
+    /// inner `sqlite3_index_constraint`/`_usage` structs.  The top-level visitor
+    /// emits only records lexically at file scope and never recurses into a
+    /// struct body, so a reference to a nested record would dangle — the type
+    /// mapper falls back to opaque.  (Semantic parent is wrong here: in C the
+    /// tag is hoisted to file scope, so its semantic parent is the TU.)
+    is_nested_in_record(this) -> boolean {
+        const parent: CXCursor = clang_getCursorLexicalParent(this);
+        const pk: i32 = clang_getCursorKind(parent);
+        return pk == CURSOR_STRUCT_DECL || pk == CURSOR_UNION_DECL;
+    }
+
     /// True when this cursor was declared in a system header (`<stddef.h>` & co.).
     /// THE Phase-2 filter: libclang exposes every transitively-included header's
     /// top-level decls, so type emission must drop the system-header ones (their
@@ -236,6 +249,13 @@ extern "C" {
     function clang_visitChildren(parent: CXCursor,
         visitor: (CXCursor, CXCursor, void*) -> i32, client: void*) -> u32;
     function clang_getCursorKind(c: CXCursor) -> i32;
+    /// The LEXICAL parent of a declaration (where it is written, vs. the
+    /// semantic parent that governs name lookup).  Used to detect a record
+    /// written NESTED inside another record: in C such a tag is hoisted to file
+    /// scope semantically (semantic parent = the TU), but it is lexically a
+    /// child of the enclosing struct and the top-level visitor never recurses
+    /// into structs to emit it — so a reference to it must fall back to opaque.
+    function clang_getCursorLexicalParent(c: CXCursor) -> CXCursor;
     function clang_getCursorSpelling(c: CXCursor) -> CXString;
     /// True for an anonymous tag (`struct {...}`, `enum {...}`).  Needed
     /// because libclang gives such a cursor a SYNTHETIC spelling
