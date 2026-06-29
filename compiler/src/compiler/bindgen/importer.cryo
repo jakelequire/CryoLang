@@ -1532,20 +1532,18 @@ type struct Importer {
     static visit_inclusion(included_file: void*, inclusion_stack: CXSourceLocation*,
                            include_len: u32, client: void*) -> void {
         const imp: Importer* = client as Importer*;
-        // Recover the path FIRST, before any other libclang call on this cursor:
-        // a later by-value (24-byte, sret) `CXSourceLocation` return can disturb
-        // the `included_file` argument, so reading the name up front keeps it.
-        const fname: CXString = Clang::clang_getFileName(included_file);
-        const cstr: u8* = Clang::clang_getCString(fname);
-        mut path: string = "";
-        if (cstr != null) { path = String::from_cstr(cstr as string).into_raw(); }
-        Clang::clang_disposeString(fname);
-        if (libc::strlen(path) == 0) { return; }
-        // Drop system headers (already covered by the libclang-version fold).
+        // Drop system headers first (already covered by the libclang-version
+        // fold); this also avoids allocating a path string for files we discard.
         const loc: CXSourceLocation =
             Clang::clang_getLocationForOffset(imp.tu, included_file, 0u32);
         if (Clang::clang_Location_isInSystemHeader(loc) != 0) { return; }
-        imp.inputs.push(path);
+        const fname: CXString = Clang::clang_getFileName(included_file);
+        const cstr: u8* = Clang::clang_getCString(fname);
+        if (cstr != null && libc::strlen(cstr as string) > 0) {
+            mut owned: String = String::from_cstr(cstr as string);
+            imp.inputs.push(owned.into_raw());
+        }
+        Clang::clang_disposeString(fname);
     }
 
     /// Build a libclang TU (forcing C with `-x c`, matching the old
