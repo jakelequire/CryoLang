@@ -180,6 +180,16 @@ type struct CTypeMapper {
                 return this.fnptr(params, ret);
             }
             const is_const: boolean = Clang::clang_isConstQualifiedType(pointee) != 0u32;
+            // A pointer to a system-header record (e.g. `FILE` == `struct _iobuf`
+            // on mingw) -> opaque `void*`.  That record is filtered out of the
+            // bindings, so a named `_iobuf*` reference would dangle (E0203);
+            // `void*` is also the usable shape for an opaque C handle.
+            if (pc.kind == Clang::TK_Record) {
+                const pdecl: CXCursor = Clang::clang_getTypeDeclaration(pc);
+                if (pdecl.is_in_system_header()) {
+                    return this.ptr(this.prim("void"), is_const);
+                }
+            }
             const inner: TypeAnnotation* = this.map(pointee);
             return this.ptr(inner, is_const);
         }
@@ -198,6 +208,18 @@ type struct CTypeMapper {
             // an emptiness test would miss it.  An incomplete record (size
             // unknown) keeps the opaque-pointer fallback.
             if (c.is_anonymous_record()) {
+                const sz: i64 = Clang::clang_Type_getSizeOf(c);
+                const al: i64 = Clang::clang_Type_getAlignOf(c);
+                if (sz > 0) { return this.aligned_blob(sz, al); }
+                return this.ptr(this.prim("void"), false);
+            }
+            // A named record declared in a system header is filtered out of the
+            // bindings (like `FILE`), so a named reference would dangle.  Treat
+            // it as opaque: a layout-faithful blob when sized (keeps an enclosing
+            // struct's size right), else an opaque pointer.  (The common
+            // pointer-to-system-record case is handled as `void*` above.)
+            const rdecl: CXCursor = Clang::clang_getTypeDeclaration(c);
+            if (rdecl.is_in_system_header()) {
                 const sz: i64 = Clang::clang_Type_getSizeOf(c);
                 const al: i64 = Clang::clang_Type_getAlignOf(c);
                 if (sz > 0) { return this.aligned_blob(sz, al); }
