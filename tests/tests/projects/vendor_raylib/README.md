@@ -5,18 +5,21 @@ The headline acceptance project for the **vendor library system**
 native link flags are produced entirely by `cryo vendor` — no hand-written FFI,
 no manual `[link]` entries.
 
-It is **ignored** by the test suite (`test.json` → `"ignore": true`) and will
-stay ignored until all of the following hold, at which point flipping the flag
-turns it into a real integration test:
+It is a **live integration test** (`test.json` → `"ignore": false`), but it is
+**environment-gated** via `test.json` → `"requires": ["vendor:RayLib", "display"]`.
+The project runner *runs* it only when both prerequisites hold and otherwise
+**skips it with a reason** (it is never counted as a failure), so a portable
+`make test` on a headless machine without raylib stays green:
 
-1. **Stage 2** of the vendor feature lands — libclang binding *generation* from
-   C headers (today `cryo vendor` only copies a hand-written `bindings_file`;
-   `binding_source: "headers"` here asks for real generation).
-2. **raylib is installed/built** on the machine and registered once (below).
-3. A **display** is available (the demo opens a real window; it cannot run on a
-   headless CI runner as-is).
+1. **`vendor:RayLib`** — raylib has been installed/built and registered once
+   with `cryo vendor` (below), so host bindings exist in the registry.
+2. **`display`** — an X11 (`$DISPLAY`) or Wayland (`$WAYLAND_DISPLAY`) display is
+   available (the demo opens a real window; a headless runner skips it).
 
-## Running it by hand (once Stage 2 is in)
+Binding *generation* from C headers (`binding_source: "headers"`, libclang) has
+landed, so registration produces real bindings — no hand-written `bindings_file`.
+
+## Running it by hand
 
 ```sh
 # 1. Drop the manifest into your raylib checkout and register it. The

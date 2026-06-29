@@ -79,7 +79,7 @@ type struct VendorEntry {
     key:            string;   // registry key (the source dir basename, lowercased)
     name:           string;   // import namespace, e.g. "RayLib"
     source_path:    string;   // absolute path to the vendored C project
-    binding_source: string;   // "headers" (libclang) | "manual" (pre-written) | "cxx-shim"
+    binding_source: string;   // "headers" (libclang) | "manual" (pre-written) | "cxx-shim" (reserved, unimplemented)
     headers:        string[];
     include_dirs:   string[];
     defines:        string[];
@@ -239,6 +239,14 @@ type struct VendorRegistry {
 
     /// Serialize and write the registry to its global path.  Returns false on
     /// an I/O failure (reported by the caller).
+    ///
+    /// The write is ATOMIC: the JSON is written to a pid-unique temp file and
+    /// then `rename`d over the real path.  rename() is atomic within a
+    /// filesystem, so a concurrent reader (or a crash mid-write) never observes
+    /// a half-written registry — it sees either the complete old file or the
+    /// complete new one.  This is what keeps `load_global`'s "malformed →
+    /// empty" fallback from being triggered by an interrupted writer, which
+    /// would otherwise silently drop every registered library.
     save_global(&this) -> boolean {
         const path: string = VendorRegistry::registry_path();
         mut root: JsonObject = JsonObject::new();
@@ -254,7 +262,8 @@ type struct VendorRegistry {
         mut text: String = serializer::stringify_pretty(&doc);
         doc.drop();
 
-        const f: void* = libc::fopen(path, "w");
+        const tmp: string = format("%s.tmp.%d", path, libc::getpid());
+        const f: void* = libc::fopen(tmp, "w");
         if (f == null) {
             text.drop();
             return false;
@@ -263,6 +272,10 @@ type struct VendorRegistry {
         libc::fputs("\n", f);
         libc::fclose(f);
         text.drop();
+        if (libc::rename(tmp, path) != 0) {
+            libc::unlink(tmp);   // leave no stray temp file on a failed swap
+            return false;
+        }
         return true;
     }
 
@@ -447,5 +460,67 @@ type struct VendorRegistry {
         obj.put("cache", JsonValue::Array(cache));
 
         return JsonValue::Object(obj);
+    }
+}
+
+/// A best-effort advisory lock over the global registry so that concurrent
+/// `cryo vendor` invocations and parallel auto-vendoring builds serialize their
+/// load -> mutate -> save instead of racing (the lost-update case: two writers
+/// each load the old registry, add a different library, and the second save
+/// drops the first's entry).
+///
+/// It is a plain `O_EXCL` lock file at `<vendor_root>/registry.lock`.  By
+/// design it never WEDGES a build: `acquire` spins for a few seconds and, if
+/// the lock is still held (a genuinely concurrent writer, or a stale file left
+/// by a crashed process), gives up and proceeds UNLOCKED with a warning.  That
+/// degraded window is still corruption-safe because `save_global` writes
+/// atomically — the worst case is a rare lost update, recovered by re-running.
+///
+/// No `Drop` impl on purpose (the compiler defines none anywhere, and a
+/// stack-scoped destructor across this subsystem's many early-return paths is
+/// exactly the move-checker hazard to avoid): callers `acquire` then `release`
+/// explicitly, and `release` is idempotent / a no-op on a non-holding handle.
+type struct VendorLock {
+    path: string;
+    held: boolean;
+
+    /// Take the registry lock, spinning up to ~5s (50 * 100ms).  Always returns
+    /// a handle; the caller does not branch on success — it just calls `release`
+    /// when the critical section ends (a no-op if the lock was not acquired).
+    static acquire() -> VendorLock {
+        const lpath: string = format("%s/registry.lock", VendorRegistry::vendor_root());
+        // `create_new` => O_CREAT|O_EXCL: the open succeeds for exactly one
+        // racer (the file's creator) and fails with EEXIST for the rest.  Going
+        // through `std::fs::file` keeps the flag values correct on Windows too
+        // (the raw `libc::O_*` constants are Linux-only).
+        mut opts: OpenOptions = OpenOptions::new();
+        opts = opts.write(true).create_new(true);
+        for (mut tries: i32 = 0; tries < 50; tries++) {
+            match (File::open_with(Path::from_cstr(lpath), &opts)) {
+                Result::Ok(mut fh) => {
+                    // The lock token is the file's existence; we don't write to
+                    // it.  Close the fd now (the file stays until `release`).
+                    fh.drop();
+                    return VendorLock { path: lpath, held: true };
+                }
+                Result::Err(_) => {
+                    // EEXIST (held by another racer) or a transient error: back
+                    // off and retry.
+                }
+            }
+            libc::usleep(100000 as u32);   // 100ms
+        }
+        fmt::eprintf("warning: vendor registry lock is held (%s); proceeding without it.\n         If no other `cryo` is running, this is a stale lock — delete that file.\n",
+            lpath);
+        return VendorLock { path: lpath, held: false };
+    }
+
+    /// Release the lock if this handle holds it.  Idempotent and safe to call
+    /// on a handle returned from a timed-out `acquire`.
+    release(mut &this) -> void {
+        if (this.held) {
+            libc::unlink(this.path);
+            this.held = false;
+        }
     }
 }
