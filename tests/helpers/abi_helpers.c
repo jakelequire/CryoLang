@@ -11,6 +11,8 @@
 // only run on Linux x86-64 anyway, which is what we target.
 
 #include <stdint.h>
+#include <stdarg.h>   // for the bindgen_probe_v* va_list probes (see end of file)
+#include <stdio.h>    // for vsnprintf, forwarded into by bindgen_probe_vfmt
 
 
 // ----- §3.1 DirectPair returns (9–16 byte aggregates) ----------------------
@@ -132,4 +134,47 @@ float abi_sum_arr_f2(ArrF2 s) {
 // IR byte-identity over llvm_bindings.h but never runs an imported function.)
 int bindgen_probe_add3(int a, int b, int c) {
     return a + b + c;
+}
+
+// va_list probe: consumes `n` integer varargs through a `va_list`.  The Cryo
+// test imports this prototype (its `va_list` param maps to the first-class
+// `va_list` type) and calls it by forwarding a variadic function's `args`,
+// validating va_list parse -> emit -> resolve -> ABI -> link -> run.
+int bindgen_probe_vsum(int n, va_list ap) {
+    int s = 0;
+    for (int i = 0; i < n; i++) s += va_arg(ap, int);
+    return s;
+}
+
+// Sum of `n` double varargs (SSE class / the va_list fp_offset path).
+double bindgen_probe_vsum_d(int n, va_list ap) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) s += va_arg(ap, double);
+    return s;
+}
+
+// `ni` int varargs followed by `nd` double varargs: both the integer and the
+// SSE sides of the va_list must advance independently.
+double bindgen_probe_vmix(int ni, int nd, va_list ap) {
+    double s = 0.0;
+    for (int i = 0; i < ni; i++) s += va_arg(ap, int);
+    for (int i = 0; i < nd; i++) s += va_arg(ap, double);
+    return s;
+}
+
+// Sum of the lengths of `n` C-string varargs (pointer class through va_list).
+int bindgen_probe_vstrlen(int n, va_list ap) {
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        const char *p = va_arg(ap, const char *);
+        while (*p) { total++; p++; }
+    }
+    return total;
+}
+
+// Forward the SAME va_list a second time, into real libc `vsnprintf` — proves a
+// va_list survives a double hand-off (Cryo args -> this C fn -> libc) and that
+// format-string processing reads the forwarded list correctly.
+int bindgen_probe_vfmt(char *buf, unsigned long size, const char *fmt, va_list ap) {
+    return vsnprintf(buf, size, fmt, ap);
 }

@@ -12,6 +12,8 @@
 namespace CryoTests::Tests::Lang::CImportLibclang;
 
 import std::core::result;
+import std::core::varargs;
+import std::collections::str;
 import std::test::error;
 import std::test::assert;
 
@@ -24,4 +26,110 @@ extern module probe := "C" {
 ![test]
 function c_import_local_header_call() -> Result<(), TestError> {
     return expect_eq(probe::bindgen_probe_add3(10 as i32, 20 as i32, 12 as i32), 42 as i32);
+}
+
+// Forward a Cryo variadic function's argument list into the imported C
+// `va_list` consumer.  `bindgen_probe_vsum(int, va_list)` maps its parameter to
+// the first-class `va_list` type; `VaArgs::as_ptr()` yields the raw va_list
+// pointer the C function reads with `va_arg`.
+function probe_vsum_forward(n: i32, args...) -> i32 {
+    mut va: VaArgs = VaArgs::new(args);
+    return probe::bindgen_probe_vsum(n, va.as_ptr());
+}
+
+// Exercises the whole va_list path: an imported C function taking `va_list`,
+// called by forwarding a Cryo variadic arg list; 10+20+30 == 60.
+![test]
+function c_import_va_list_forward() -> Result<(), TestError> {
+    return expect_eq(probe_vsum_forward(3 as i32, 10 as i32, 20 as i32, 30 as i32), 60 as i32);
+}
+
+// Ten integer varargs: on SysV only the first few land in registers, so this
+// forces the rest through the va_list overflow_arg_area (stack) — 1..10 == 55.
+![test]
+function c_import_va_list_many_ints() -> Result<(), TestError> {
+    return expect_eq(
+        probe_vsum_forward(10 as i32,
+            1 as i32, 2 as i32, 3 as i32, 4 as i32, 5 as i32,
+            6 as i32, 7 as i32, 8 as i32, 9 as i32, 10 as i32),
+        55 as i32);
+}
+
+// Zero variadic arguments: `va_start`/`va_end` run but `va_arg` is never
+// reached.  The empty-list edge must still link and return 0.
+![test]
+function c_import_va_list_zero_args() -> Result<(), TestError> {
+    return expect_eq(probe_vsum_forward(0 as i32), 0 as i32);
+}
+
+// Two independent forwards from the same wrapper: each call must build a fresh
+// va_list (a stale/shared one would leak the first call's args into the second).
+![test]
+function c_import_va_list_repeated() -> Result<(), TestError> {
+    const a: i32 = probe_vsum_forward(2 as i32, 5 as i32, 6 as i32);          // 11
+    const b: i32 = probe_vsum_forward(3 as i32, 1 as i32, 1 as i32, 1 as i32); // 3
+    match (expect_eq(a, 11 as i32)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(b, 3 as i32);
+}
+
+// Double varargs (SSE class / the va_list fp_offset path).  Values chosen to
+// sum exactly in binary floating point: 1.5 + 2.5 + 4.0 == 8.0.
+function probe_vsumd_forward(n: i32, args...) -> f64 {
+    mut va: VaArgs = VaArgs::new(args);
+    return probe::bindgen_probe_vsum_d(n, va.as_ptr());
+}
+
+![test]
+function c_import_va_list_doubles() -> Result<(), TestError> {
+    return expect_close_f64(
+        probe_vsumd_forward(3 as i32, 1.5, 2.5, 4.0), 8.0, 0.0001);
+}
+
+// Mixed: two int varargs then two double varargs.  The C side reads the ints
+// and doubles from the two separate va_list register areas; 3 + 4 + 1.5 + 2.5.
+function probe_vmix_forward(ni: i32, nd: i32, args...) -> f64 {
+    mut va: VaArgs = VaArgs::new(args);
+    return probe::bindgen_probe_vmix(ni, nd, va.as_ptr());
+}
+
+![test]
+function c_import_va_list_mixed() -> Result<(), TestError> {
+    return expect_close_f64(
+        probe_vmix_forward(2 as i32, 2 as i32, 3 as i32, 4 as i32, 1.5, 2.5),
+        11.0, 0.0001);
+}
+
+// Pointer-class varargs: C-string arguments read through the va_list, summing
+// their lengths; 2 + 3 + 1 == 6.
+function probe_vstrlen_forward(n: i32, args...) -> i32 {
+    mut va: VaArgs = VaArgs::new(args);
+    return probe::bindgen_probe_vstrlen(n, va.as_ptr());
+}
+
+![test]
+function c_import_va_list_strings() -> Result<(), TestError> {
+    return expect_eq(
+        probe_vstrlen_forward(3 as i32, "ab", "cde", "f"), 6 as i32);
+}
+
+// Double hand-off: Cryo args -> a vendored C fn -> real libc `vsnprintf`.  The
+// forwarded va_list must survive being passed through a second C call and drive
+// format-string processing.  "x=%d sum=%d" with 7, 42 -> "x=7 sum=42".
+function probe_vfmt_forward(buf: i8*, size: u64, fmt: i8*, args...) -> i32 {
+    mut va: VaArgs = VaArgs::new(args);
+    return probe::bindgen_probe_vfmt(buf, size, fmt, va.as_ptr());
+}
+
+![test]
+function c_import_va_list_vsnprintf() -> Result<(), TestError> {
+    mut buf: u8[64];
+    const n: i32 = probe_vfmt_forward(
+        &buf[0] as i8*, 64 as u64, "x=%d sum=%d", 7 as i32, 42 as i32);
+    const view: Str = Str::from_raw(&buf[0], n as u64);
+    const want: Str = Str::new("x=7 sum=42");
+    return expect(view.equals(&want),
+        Str::new("vsnprintf via double va_list forward should be 'x=7 sum=42'"));
 }

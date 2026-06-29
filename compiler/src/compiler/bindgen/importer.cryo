@@ -412,22 +412,6 @@ type struct Importer {
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const nargs: i32 = Clang::clang_Cursor_getNumArguments(cursor);
 
-        // A `va_list` parameter (libclang canonicalizes it to the platform
-        // `__va_list_tag[1]`, a compiler builtin Cryo can neither name nor
-        // construct) makes the whole function uncallable from Cryo — e.g.
-        // sqlite3's `*_vappendf`/`*_vmprintf`.  Drop it with a report entry
-        // rather than emit a binding that references an undeclared type and
-        // breaks compilation of the entire generated module.  Variadic `...`
-        // is fine and handled below; only an explicit `va_list` arg is fatal.
-        for (mut vi: i32 = 0; vi < nargs; vi++) {
-            const varg: CXCursor = Clang::clang_Cursor_getArgument(cursor, vi as u32);
-            if (Importer::type_is_va_list(Clang::clang_getCursorType(varg))) {
-                this.report.skip(format("function '%s' (takes a C va_list; not callable from Cryo)",
-                    this.ctx.intern_table.resolve(name_sym)));
-                return;
-            }
-        }
-
         mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
         func.return_type_annotation = this.types.map(Clang::clang_getCursorResultType(cursor));
 
@@ -446,29 +430,6 @@ type struct Importer {
 
         this.extern_node.add_function(func);
         this.count = this.count + 1;
-    }
-
-    /// True when `t` is a C `va_list`.  Checks the declared spelling (the typedef
-    /// `va_list` / `__builtin_va_list`) and the canonical spelling (which on
-    /// x86-64 / aarch64 expands to `struct __va_list_tag [1]`), so it catches
-    /// va_list however a given platform's headers spell it.
-    static type_is_va_list(t: CXType) -> boolean {
-        if (Importer::type_spelling_contains(t, "va_list")) { return true; }
-        const canon: CXType = Clang::clang_getCanonicalType(t);
-        return Importer::type_spelling_contains(canon, "__va_list_tag");
-    }
-
-    /// True when the libclang spelling of `t` contains `needle`.  Reads and
-    /// disposes the CXString the same way `CTypeMapper::tag_name` does.
-    static type_spelling_contains(t: CXType, needle: string) -> boolean {
-        const s: CXString = Clang::clang_getTypeSpelling(t);
-        const cstr: u8* = Clang::clang_getCString(s);
-        mut found: boolean = false;
-        if (cstr != null) {
-            found = (libc::strstr(cstr as string, needle) as void*) != null;
-        }
-        Clang::clang_disposeString(s);
-        return found;
     }
 
     /// Emit a `type struct` for a struct (or a layout-faithful opaque blob for a
