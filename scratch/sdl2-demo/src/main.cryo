@@ -1,6 +1,6 @@
 // SDL2 stress-test demo for the Cryo vendor binding system.
 //   - 850 vendored SDL functions, structs/enums/fn-pointers
-//   - exercises the SDL_Event UNION via generated get/set accessors
+//   - exercises the SDL_Event UNION via native `type union` field access
 //   - auto-terminates (~2.5s) so it never hangs a headless run
 import vendor::SDL2;
 import std::fmt;
@@ -34,14 +34,14 @@ function main() -> i32 {
     const USEREV:  u32 = SDL2::SDL_EventType::SDL_USEREVENT as u32;
 
     // Round-trip a synthetic event THROUGH the SDL_Event union to prove the
-    // generated reinterpret accessors carry real overlaid data: write the
-    // user-event view with `set_user`, push it onto SDL's queue, then read it
-    // back below via `user()`.  Works headless (no window focus needed).
-    mut seed: SDL2::SDL_Event = SDL2::SDL_Event { _storage: [0u8; 56] };
-    seed.set_user(SDL2::SDL_UserEvent {
+    // native union fields carry real overlaid data: write the user-event view
+    // via `seed.user`, push it onto SDL's queue, then read it back below via
+    // `e.user`.  Works headless (no window focus needed).
+    mut seed: SDL2::SDL_Event = SDL2::SDL_Event { type_: USEREV };
+    seed.user = SDL2::SDL_UserEvent {
         type_: USEREV, timestamp: 0u32, windowID: 0u32,
-        code: 12345, data1: null, data2: null });
-    fmt::println(f"union write: set_user(code=12345) -> e.type_()={seed.type_()} (want {USEREV})");
+        code: 12345, data1: null, data2: null };
+    fmt::println(f"union write: seed.user(code=12345) -> e.type_={seed.type_} (want {USEREV})");
     SDL2::SDL_PushEvent(&seed);
 
     const start: u32 = SDL2::SDL_GetTicks();
@@ -52,17 +52,17 @@ function main() -> i32 {
     mut roundtrip_code: i32 = -1;
 
     while (running) {
-        mut e: SDL2::SDL_Event = SDL2::SDL_Event { _storage: [0u8; 56] };
+        mut e: SDL2::SDL_Event = SDL2::SDL_Event { type_: 0u32 };
         while (SDL2::SDL_PollEvent(&e) != 0) {
-            const et: u32 = e.type_();                 // <-- union accessor (the type tag)
+            const et: u32 = e.type_;                   // <-- union field (the type tag)
             if (et == QUIT) {
                 running = false;
             } else if (et == USEREV) {
-                const ue: SDL2::SDL_UserEvent = e.user();   // <-- union reinterpret read
+                const ue: SDL2::SDL_UserEvent = e.user;      // <-- union field read
                 roundtrip_code = ue.code;
             } else if (et == KEYDOWN) {
                 keydowns += 1;
-                const ke: SDL2::SDL_KeyboardEvent = e.key();   // <-- union reinterpret accessor
+                const ke: SDL2::SDL_KeyboardEvent = e.key;      // <-- union field read
                 const sym: i32 = ke.keysym.sym;
                 fmt::println(f"  keydown: sym={sym} ({SDL2::SDL_GetKeyName(sym) as string})");
                 if (sym == 27) { running = false; }            // ESC
@@ -82,7 +82,7 @@ function main() -> i32 {
     }
 
     const rt_ok: string = if (roundtrip_code == 12345) { "OK" } else { "FAIL" };
-    fmt::println(f"union read : e.user().code={roundtrip_code} (want 12345) -> {rt_ok}");
+    fmt::println(f"union read : e.user.code={roundtrip_code} (want 12345) -> {rt_ok}");
     fmt::println(f"done: {frames} frames, {keydowns} keydowns, {mousemoves} mouse-moves");
     SDL2::SDL_DestroyRenderer(ren);
     SDL2::SDL_DestroyWindow(win);

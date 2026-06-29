@@ -34,3 +34,8 @@ struct Tagged { int tag; union { int i; float f; }; };
 /* A named field of anonymous struct type: mapped to a layout-faithful blob, not
  * void*.  sizeof == 12 (kind + an 8-byte {x,y}). */
 struct Named { int kind; struct { int x; int y; } pt; };
+
+/* A top-level named union -> a native Cryo `type union` (one field per member,
+ * direct `v.i`/`v.f` access; a literal initializes exactly one member).  Members
+ * overlay at offset 0, so sizeof == 4 (the largest member). */
+union Value { int i; float f; };
