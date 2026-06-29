@@ -1074,9 +1074,19 @@ type struct TypeChecker {
             return TypeCheckResult::fail("Array index must be an integer");
         }
 
-        // Pointer indexing: T*[i] -> T (pointer arithmetic)
+        // Pointer indexing.  A raw pointer `T*` indexes as C pointer arithmetic
+        // (`*(ptr + i)` -> T).  A pointer-to-array `T[]*`, however, auto-derefs
+        // and indexes the pointed-to array (-> its element type), mirroring the
+        // reference case below: pointer arithmetic over a fat-array header is
+        // never meaningful (the pointee is a single `{data, len}` struct), so the
+        // convenient reading is the only useful one, and `arr[i]` now matches the
+        // `(*arr)[i]` people had to write before.
         if (base_type.kind == TypeKind::Pointer) {
             const ptr_type: PointerType* = base_type as PointerType*;
+            const pointee_t: Type* = this.arena.lookup(ptr_type.pointee.id);
+            if (pointee_t != null && pointee_t.kind == TypeKind::Array) {
+                return this.check_index_access(ptr_type.pointee, index);
+            }
             return TypeCheckResult::ok(ptr_type.pointee);
         }
 
@@ -1087,8 +1097,8 @@ type struct TypeChecker {
 
         // Reference indexing: auto-deref `&T` and index the referent, so
         // `foo[i]` works on a `&T[]` the same way `foo.length` already does
-        // (member access auto-derefs references too).  Deliberately NOT done
-        // for `Pointer` — those index as C pointer arithmetic above.
+        // (member access auto-derefs references too).  Raw pointers `T*` index
+        // as C pointer arithmetic above; only pointer-TO-ARRAY auto-derefs there.
         if (base_type.kind == TypeKind::Reference) {
             const rt: ReferenceType* = base_type as ReferenceType*;
             return this.check_index_access(rt.referent, index);
