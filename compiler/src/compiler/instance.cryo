@@ -26,6 +26,7 @@ import Compiler::Resolver::{
 };
 import Compiler::AST::{ Node, Dumper };
 import Compiler::Deps::DepResolver;
+import Compiler::Deps::Lockfile;
 import Compiler::Vendor::AutoVendor;
 import Compiler::Diag::Diagnostic;
 import Compiler::Lex::Lexer;
@@ -114,6 +115,11 @@ type struct CompilerConfig {
     /// force a freestanding build on, never off); for single-file builds
     /// it is the only way to opt out of the auto-imported stdlib.
     no_std:              boolean;
+    /// `--locked`: verify the `cryoconfig.lock` vendor section instead of
+    /// updating it — the build FAILS if a resolved vendor binding's content
+    /// hash drifts from the lock (or has no lock entry).  The reproducibility
+    /// CI gate.  Off => a normal build records/updates the lock in place.
+    locked:              boolean;
 
     static default() -> CompilerConfig {
         return CompilerConfig {
@@ -133,6 +139,7 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             no_std:              false,
+            locked:              false,
         };
     }
 
@@ -154,6 +161,7 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             no_std:              false,
+            locked:              false,
         };
     }
 }
@@ -1003,6 +1011,20 @@ type struct CompilerInstance {
         // binary links against them with no hand-written `[link]` flags.
         if (ctx.project_config != null) {
             loader.merge_vendor_links(ctx.project_config);
+        }
+
+        // Vendor reproducibility lock: record (or, under `--locked`, verify) the
+        // content hash of every vendored binding this build resolved against, in
+        // the `cryoconfig.lock` vendor section.  A normal build pins/updates it;
+        // `--locked` instead FAILS when a binding drifts from the lock (e.g. a
+        // system header or libclang upgrade silently changed the bound API).
+        const used_locks: LockedVendor[] = loader.collect_vendor_locks();
+        if (used_locks.length > 0) {
+            if (!CompilerInstance::sync_vendor_lock(lock_path, &used_locks, this.config.locked)) {
+                // Only `--locked` returns false (a drift/missing-entry gate
+                // failure); the diagnostic was already printed.
+                return CompilationResult::failed(1, 0);
+            }
         }
 
         // Discover the prelude and its submodules (primitives, etc.) when
@@ -2346,6 +2368,65 @@ type struct CompilerInstance {
             return "cryoconfig.lock";
         }
         return format("%s/cryoconfig.lock", consumer_root);
+    }
+
+    /// Reconcile `used` (the vendor bindings this build resolved) with the
+    /// `cryoconfig.lock` vendor section.
+    ///   • `locked == false`: pin missing entries and update changed ones,
+    ///     writing the lock only when something changed.  Always returns true.
+    ///   • `locked == true`:  VERIFY only — never writes; prints a diagnostic
+    ///     and returns false if any used binding is absent from the lock or its
+    ///     content hash drifted.  Returns true when every binding matches.
+    /// The packages section is preserved because `read` loads it and `write`
+    /// emits it back untouched.
+    static sync_vendor_lock(lock_path: string, used: &LockedVendor[], locked: boolean) -> boolean {
+        mut lock: Lockfile = Lockfile::read(lock_path);
+        mut changed: boolean = false;
+        mut drift:   boolean = false;
+        for (mut i: i64 = 0; i < used.length; i++) {
+            mut found: i64 = -1;
+            for (mut j: i64 = 0; j < lock.vendor.length; j++) {
+                if (lock.vendor[j].name.eq(used[i].name)
+                        && lock.vendor[j].triple.eq(used[i].triple)) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found < 0) {
+                if (locked) {
+                    fmt::eprintf("error: --locked: vendor '%s' (triple '%s') has no entry in %s.\n        Run a normal build to record it, then commit the lockfile.\n",
+                        used[i].name, used[i].triple, lock_path);
+                    drift = true;
+                } else {
+                    lock.vendor.push(LockedVendor {
+                        name:        used[i].name,
+                        triple:      used[i].triple,
+                        binding_sha: used[i].binding_sha,
+                    });
+                    changed = true;
+                }
+            } else if (!lock.vendor[found].binding_sha.eq(used[i].binding_sha)) {
+                if (locked) {
+                    fmt::eprintf("error: --locked: vendor '%s' (triple '%s') bindings drifted from %s.\n        locked %s, built %s. Run `cryo vendor rebuild %s` and re-lock, or restore the toolchain.\n",
+                        used[i].name, used[i].triple, lock_path,
+                        lock.vendor[found].binding_sha, used[i].binding_sha, used[i].name);
+                    drift = true;
+                } else {
+                    fmt::eprintf("note: vendor '%s' (triple '%s') bindings changed; updating %s (%s -> %s).\n",
+                        used[i].name, used[i].triple, lock_path,
+                        lock.vendor[found].binding_sha, used[i].binding_sha);
+                    lock.vendor[found].binding_sha = used[i].binding_sha;
+                    changed = true;
+                }
+            }
+        }
+        if (locked) {
+            return !drift;
+        }
+        if (changed && !Lockfile::write(lock_path, &lock)) {
+            fmt::eprintf("warning: could not write vendor pins to %s\n", lock_path);
+        }
+        return true;
     }
 
     /// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
