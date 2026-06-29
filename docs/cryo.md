@@ -79,7 +79,7 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | `loop`       | `import`     |             | `inline`    |                   |                |                         |
 | `do`         | `export`     |             | `unsafe`    |                   |                |                         |
 | `break`      | `static_assert` |          | `move`      |                   |                |                         |
-| `continue`   |              |             |             |                   |                |                         |
+| `continue`   | `union`      |             |             |                   |                |                         |
 | `return`     |              |             |             |                   |                |                         |
 
 `move` marks a closure that captures its environment by move (see [§ 16.3](#163-move-checking)).
@@ -1210,6 +1210,64 @@ const strs: Pair<string> = Pair<string>::new("hello", "world");
 ```
 
 `Pair<int>` and `Pair<string>` are independent types. See [§ 12.6](#126-monomorphisation).
+
+### 8.7 Unions
+
+A `type union` is an untagged, C-style union: all fields occupy the **same** storage, overlapping at offset 0. The union's size is that of its largest member and its alignment that of its most-aligned member.
+
+```cryo
+type union Value {
+    i: i64;
+    f: f64;
+    bytes: u8;
+}
+```
+
+Here `sizeof(Value) == 8` — the size of the largest member (`i64`/`f64`), not their sum. Writing one member and reading another *reinterprets* the shared bytes:
+
+```cryo
+mut v: Value = Value { i: 0 };
+v.f = 1.5;          // writes the 8-byte storage as an f64
+const bits: i64 = v.i;   // reads the same bytes back as an i64
+```
+
+A union is **untagged**: it carries no discriminant recording which member is active, so reading a member other than the one last written is the programmer's responsibility (the reinterpretation is well-defined; whether it's *meaningful* is not checked). When you want a tagged, exhaustively-checked sum type, use [`type enum`](#10-enums) instead.
+
+**Literals.** A union literal initialises **exactly one** field; naming zero or more than one is a compile error (`E0363`):
+
+```cryo
+const ok:  Value = Value { i: 42 };       // OK
+// const bad: Value = Value { i: 1, f: 2.0 };  // error E0363: exactly one field
+```
+
+**Methods.** Like structs, unions may declare methods inline (instance and `static`), or in an [`implement` block](#13-implement-blocks):
+
+```cryo
+type union Tagged {
+    raw: i64;
+    handle: i64;
+
+    static from_raw(n: i64) -> Tagged { return Tagged { raw: n }; }
+    get(&this) -> i64 { return this.raw; }
+}
+```
+
+**Generics.** Unions may be parameterised:
+
+```cryo
+type union Either<A, B> {
+    a: A;
+    b: B;
+}
+
+const e: Either<i64, f64> = Either<i64, f64> { a: 100 };
+```
+
+**Layout control.** `![repr(c)]` and `![align(N)]` apply to unions exactly as they do to structs (see [§ 17](#17-directives-and-attributes)).
+
+**Matching.** A union value is not matched variant-wise the way an enum is (there is no discriminant). You `match` on a *member's value* — e.g. `match (v.i) { 0 => ..., _ => ... }` — and `static match (T)` works inside a generic union's methods.
+
+**Ownership.** A union is treated as a plain-data (`Copy`) value: its members are never auto-dropped, since the active member is unknown. If a union owns a resource, give it an explicit `drop` method and that is honoured.
 
 ---
 

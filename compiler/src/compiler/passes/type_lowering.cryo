@@ -449,6 +449,32 @@ type struct TypeLoweringPasses {
             return true;
         }
 
+        // Union layout: every field overlaps at offset 0; the union's size is
+        // its largest field (padded up to its alignment) and its alignment is
+        // the largest field alignment (or `![align(N)]`, whichever is larger).
+        // `repr(packed)` on a union just floors the alignment at 1.
+        if (st.is_union) {
+            mut u_size:  u64 = 0;
+            mut u_align: u64 = 1;
+            if (!st.repr_packed && st.min_alignment > u_align) { u_align = st.min_alignment; }
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                const field_ty: Type* = arena.lookup(st.fields[i].field_type.id);
+                if (field_ty == null) { continue; }
+                const f_size:  u64 = field_ty.size_bytes();
+                const f_align: u64 = field_ty.alignment();
+                // Defer until every member type is laid out (mirror struct path).
+                if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty) && !TypeLoweringPasses::layout_settled(field_ty)) {
+                    return false;
+                }
+                st.set_field_offset(i, 0);
+                if (f_size > u_size) { u_size = f_size; }
+                if (!st.repr_packed && f_align > u_align) { u_align = f_align; }
+            }
+            const u_total: u64 = math::align_up(u_size, u_align);
+            st.set_layout(u_total, u_align);
+            return true;
+        }
+
         // `repr(packed)` skips all alignment-driven padding: every field
         // sits at the next available byte and the struct's alignment is 1.
         // `![align(N)]` raises the struct's minimum alignment.  Honoured

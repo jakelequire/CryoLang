@@ -376,6 +376,33 @@ type struct TypeMapper {
 
         const packed: boolean = t.repr_packed;
 
+        // Union: an untagged overlay.  Lower to a struct with ONE storage
+        // element `[K x iA]`, where iA is an integer of the union's alignment
+        // (1->i8, 2->i16, 4->i32, 8->i64, else i128) and K = size/align.
+        // TypeLowering guarantees `computed_size` is a multiple of
+        // `computed_align`, so this reproduces both the size and the alignment
+        // exactly.  Members are read/written via a bitcast at offset 0
+        // (place_emitter), so the element type only has to carry size+align.
+        if (t.is_union && t.fields.length > 0) {
+            mut u_align: u64 = t.computed_align;
+            if (u_align == 0) { u_align = 1; }
+            mut u_size: u64 = t.computed_size;
+            if (u_size < u_align) { u_size = u_align; }
+            mut elem: LType = LType::i128();
+            if (u_align == 1)      { elem = LType::i8();  }
+            else if (u_align == 2) { elem = LType::i16(); }
+            else if (u_align == 4) { elem = LType::i32(); }
+            else if (u_align == 8) { elem = LType::i64(); }
+            const count: u32 = (u_size / u_align) as u32;
+            const blob: LType = LType::array_of(elem, count);
+            const ubuf: void* = intrinsics::malloc(8);
+            const uslots: void** = ubuf as void**;
+            uslots[0] = blob.raw;
+            llvm_ty.set_struct_body(ubuf, 1, false);
+            intrinsics::free(ubuf);
+            return llvm_ty;
+        }
+
         // Build field type array.
         const n: u32 = t.fields.length as u32;
         if (n > 0) {

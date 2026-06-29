@@ -1039,6 +1039,21 @@ type struct TypeResolutionPasses {
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
             }
+            NodeKind::UnionDeclaration => {
+                const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                if (!ty.is_valid()) {
+                    ty = arena.lookup_by_name(node.name);
+                }
+                if (ty.is_valid()) {
+                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                }
+                if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
+                    ctx.decl_index.register_name_mapping(node.name, qualified_sym);
+                }
+                ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+            }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
                 const qualified_sym: SymbolStr = ctx.qualify_symbol_sym(node.name);
@@ -2061,6 +2076,16 @@ type struct TypeResolutionPasses {
                         ctx.qualify_symbol_sym(node.name));
                     sig_count += node.methods.length;
                 }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    mut union_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    const union_owner: TypeRef = ctx.decl_index.lookup_type(
+                        ctx.qualify_symbol_sym(node.name));
+                    runner.resolve_method_signatures(node.methods, &union_ctx, union_owner,
+                        ctx.qualify_symbol_sym(node.name));
+                    sig_count += node.methods.length;
+                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -2481,6 +2506,13 @@ type struct TypeResolutionPasses {
                     runner.resolve_fields(node.fields, &struct_ctx);
                     field_count += node.fields.length;
                 }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    mut union_ctx: ResolutionContext = runner.make_generic_context(
+                        node.generic_params, &runner.res_ctx);
+                    runner.resolve_fields(node.fields, &union_ctx);
+                    field_count += node.fields.length;
+                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
@@ -2546,6 +2578,21 @@ type struct TypeResolutionPasses {
                                 // the binding, the resolver returns invalid
                                 // and `emit_undefined_type` fires E0203 on a
                                 // perfectly legal generic param.
+                                mut m_ctx: ResolutionContext = runner.make_generic_context(
+                                    method.func.generic_params, &runner.res_ctx);
+                                runner.resolve_var_types_in_statement(
+                                    method.func.body as ASTNode*, &m_ctx);
+                                body_count++;
+                            }
+                        }
+                    }
+                }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (!node.is_generic()) {
+                        for (mut j: i64 = 0; j < node.methods.length; j++) {
+                            const method: MethodNode* = node.methods[j];
+                            if (method != null && method.func != null && method.func.body != null) {
                                 mut m_ctx: ResolutionContext = runner.make_generic_context(
                                     method.func.generic_params, &runner.res_ctx);
                                 runner.resolve_var_types_in_statement(
@@ -2648,6 +2695,17 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (!node.is_generic()) {
+                        for (mut j: i64 = 0; j < node.methods.length; j++) {
+                            const method: MethodNode* = node.methods[j];
+                            if (method != null && method.func != null && method.func.body != null) {
+                                runner.collect_generic_fn_calls_in_stmt(method.func.body as ASTNode*, &runner.res_ctx);
+                            }
+                        }
+                    }
+                }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (!node.is_generic()) {
@@ -2695,6 +2753,17 @@ type struct TypeResolutionPasses {
                     const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     // C-imported types stay out of the bare-keyed ModuleTypeRegistry
                     // (they're qualified-only, `cit::Vec2`).
+                    if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
+                        const vis: TypeVisibility = node.is_public ?
+                            TypeVisibility::Public : TypeVisibility::Private;
+                        module_registry.register_type(module_name, node.name, ty, vis);
+                    }
+                    if (ty.is_valid()) { reg_count++; }
+                }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
                         const vis: TypeVisibility = node.is_public ?
                             TypeVisibility::Public : TypeVisibility::Private;
@@ -2918,6 +2987,68 @@ type struct TypeResolutionPasses {
                             if (pp == null) { continue; }
                             if (pp.name.equals(st_this_amp)) { continue; }
                             if (pp.name.equals(st_this_val)) { continue; }
+                            ptypes.push(pp.resolved_type);
+                        }
+                        const fn_ty: TypeRef = arena.get_function(
+                            fn_node.resolved_return_type, ptypes, fn_node.is_variadic);
+                        const minfo: MethodInfo = MethodInfo {
+                            name:          fn_node.name,
+                            function_type: fn_ty,
+                            is_public:     mnode.visibility == Visibility::Public,
+                            is_protected:  mnode.visibility == Visibility::Protected,
+                            is_static:     mnode.is_static,
+                            is_virtual:    mnode.is_virtual,
+                            is_override:   mnode.is_override,
+                            param_types:   ptypes,
+                            ast_node:      mnode as void*,
+                        };
+                        st.add_method(minfo);
+                    }
+                    struct_count++;
+                }
+                NodeKind::UnionDeclaration => {
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (node.is_generic()) { continue; }
+
+                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
+                    if (!type_ref.is_valid()) { continue; }
+
+                    const base_type: Type* = arena.lookup(type_ref.id);
+                    // A union is a StructType (with is_union=true).
+                    if (base_type == null || base_type.kind != TypeKind::Struct) { continue; }
+
+                    mut st: StructType* = base_type as StructType*;
+                    mut field_infos: FieldInfo[] = [];
+                    for (mut j: i64 = 0; j < node.fields.length; j++) {
+                        const field: FieldDeclNode* = node.fields[j];
+                        if (field == null) { continue; }
+                        if (!field.resolved_type.is_valid()) {
+                            const fname: string = ctx.intern_table.resolve(field.name);
+                            const sname: string = ctx.intern_table.resolve(node.name);
+                            ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                                format("cannot resolve type for field `%s` of `%s`", fname, sname),
+                                field.span);
+                            continue;
+                        }
+                        const is_pub: boolean = field.visibility == Visibility::Public;
+                        const is_prot: boolean = field.visibility == Visibility::Protected;
+                        field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+                    }
+                    st.set_fields(field_infos);
+
+                    const u_this_amp: SymbolStr = ctx.intern_table.intern("&this");
+                    const u_this_val: SymbolStr = ctx.intern_table.intern("this");
+                    for (mut jm: i64 = 0; jm < node.methods.length; jm++) {
+                        const mnode: MethodNode* = node.methods[jm];
+                        if (mnode == null || mnode.func == null) { continue; }
+                        const fn_node: FunctionDeclNode* = mnode.func;
+                        mut ptypes: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                            const pp: VarDeclNode* = fn_node.parameters[pi];
+                            if (pp == null) { continue; }
+                            if (pp.name.equals(u_this_amp)) { continue; }
+                            if (pp.name.equals(u_this_val)) { continue; }
                             ptypes.push(pp.resolved_type);
                         }
                         const fn_ty: TypeRef = arena.get_function(

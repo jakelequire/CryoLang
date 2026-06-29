@@ -139,6 +139,7 @@ type enum DirectiveTarget {
     Function;
     Method;       // a method inside a struct/class body or impl block
     Struct;
+    Union;
     Class;
     Enum;
     Trait;
@@ -160,6 +161,7 @@ implement enum DirectiveTarget {
             NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
             NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
             NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
+            NodeKind::UnionDeclaration      => { DirectiveTarget::Union    }
             NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
             NodeKind::EnumDeclaration       => { DirectiveTarget::Enum     }
             NodeKind::TraitDeclaration      => { DirectiveTarget::Trait    }
@@ -180,6 +182,7 @@ implement enum DirectiveTarget {
             DirectiveTarget::Function  => { "function" }
             DirectiveTarget::Method    => { "method" }
             DirectiveTarget::Struct    => { "struct" }
+            DirectiveTarget::Union     => { "union" }
             DirectiveTarget::Class     => { "class" }
             DirectiveTarget::Enum      => { "enum" }
             DirectiveTarget::Trait     => { "trait" }
@@ -467,10 +470,11 @@ type struct DirectiveProcessingPasses {
                     return;
                 }
                 if (target != DirectiveTarget::Struct
+                    && target != DirectiveTarget::Union
                     && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum
                     && target != DirectiveTarget::Variable) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum/variable", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/union/class/enum/variable", target);
                 }
             }
 
@@ -503,9 +507,10 @@ type struct DirectiveProcessingPasses {
                     return;
                 }
                 if (target != DirectiveTarget::Struct
+                    && target != DirectiveTarget::Union
                     && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/union/class/enum", target);
                     return;
                 }
                 // Per-flavor placement.  `repr(packed)` and `repr(transparent)`
@@ -519,10 +524,11 @@ type struct DirectiveProcessingPasses {
                 const is_packed:      boolean = a.name == "packed";
                 const is_transparent: boolean = a.name == "transparent";
                 if ((is_packed || is_transparent)
-                        && target != DirectiveTarget::Struct) {
+                        && target != DirectiveTarget::Struct
+                        && target != DirectiveTarget::Union) {
                     const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
                     const msg: string = format(
-                        "directive `![repr(%s)]` only applies to structs",
+                        "directive `![repr(%s)]` only applies to structs or unions",
                         a.name);
                     mut diag: Diagnostic = Diagnostic::error(code, msg);
                     diag = diag.at(dir.span);
@@ -736,6 +742,49 @@ type struct DirectiveProcessingPasses {
         }
     }
 
+    static apply_layout_effects_union(ctx: CompilationContext*,
+                                        dir: DirectiveNode*,
+                                        ud: UnionDeclNode*,
+                                        name: string) -> void {
+        // Unions accept the same layout directives as structs: `repr(C)`,
+        // `repr(packed)` (floors alignment to 1), `repr(transparent)`, and
+        // `![align(N)]`.  Mirrors apply_layout_effects_struct exactly.
+        match (name) {
+            "repr" => {
+                if (dir.args.length != 1) { return; }
+                if (ud.repr_c || ud.repr_packed || ud.repr_transparent) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    return;
+                }
+                match (dir.args[0].name) {
+                    "C"           => { ud.repr_c = true; }
+                    "packed"      => {
+                        if (ud.min_alignment != 0) {
+                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                            return;
+                        }
+                        ud.repr_packed = true;
+                    }
+                    "transparent" => { ud.repr_transparent = true; }
+                    _             => { }
+                }
+            }
+            "align" => {
+                if (dir.args.length != 1) { return; }
+                if (ud.repr_packed) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                    return;
+                }
+                if (ud.min_alignment != 0) {
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    return;
+                }
+                ud.min_alignment = dir.args[0].int_value as u64;
+            }
+            _ => { }
+        }
+    }
+
     static apply_layout_effects_class(ctx: CompilationContext*,
                                         dir: DirectiveNode*,
                                         cd: ClassDeclNode*,
@@ -863,6 +912,11 @@ type struct DirectiveProcessingPasses {
         if (decl.kind == NodeKind::StructDeclaration) {
             const sd: StructDeclNode* = decl as StructDeclNode*;
             DirectiveProcessingPasses::apply_layout_effects_struct(ctx, dir, sd, name);
+            return;
+        }
+        if (decl.kind == NodeKind::UnionDeclaration) {
+            const ud: UnionDeclNode* = decl as UnionDeclNode*;
+            DirectiveProcessingPasses::apply_layout_effects_union(ctx, dir, ud, name);
             return;
         }
         if (decl.kind == NodeKind::ClassDeclaration) {
@@ -1116,6 +1170,9 @@ type struct DirectiveProcessingPasses {
             if (decl.kind == NodeKind::StructDeclaration) {
                 const sn: StructDeclNode* = decl as StructDeclNode*;
                 method_list = &sn.methods;
+            } else if (decl.kind == NodeKind::UnionDeclaration) {
+                const un: UnionDeclNode* = decl as UnionDeclNode*;
+                method_list = &un.methods;
             } else if (decl.kind == NodeKind::ClassDeclaration) {
                 const cn: ClassDeclNode* = decl as ClassDeclNode*;
                 method_list = &cn.methods;
@@ -1235,6 +1292,11 @@ type struct DirectiveProcessingPasses {
                     DirectiveProcessingPasses::register_converter_methods(ctx, sd.name, &sd.methods,
                         sd.generic_params.length > 0);
                 }
+                NodeKind::UnionDeclaration => {
+                    const ud: UnionDeclNode* = stmt as UnionDeclNode*;
+                    DirectiveProcessingPasses::register_converter_methods(ctx, ud.name, &ud.methods,
+                        ud.generic_params.length > 0);
+                }
                 NodeKind::ClassDeclaration => {
                     const cd: ClassDeclNode* = stmt as ClassDeclNode*;
                     DirectiveProcessingPasses::register_converter_methods(ctx, cd.name, &cd.methods,
@@ -1331,6 +1393,24 @@ type struct DirectiveProcessingPasses {
                         // template. Nothing to do for the template itself.
                         continue;
                     }
+                    if (!node.repr_c && !node.repr_packed
+                            && !node.repr_transparent && node.min_alignment == 0) {
+                        continue;
+                    }
+                    const qsym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
+                    if (!tref.is_valid()) { continue; }
+                    const ty: Type* = arena.lookup(tref.id);
+                    if (ty == null || ty.kind != TypeKind::Struct) { continue; }
+                    mut st: StructType* = ty as StructType*;
+                    st.set_repr(node.repr_c, node.repr_packed, node.repr_transparent);
+                    st.set_min_alignment(node.min_alignment);
+                }
+                NodeKind::UnionDeclaration => {
+                    // A union's Type is a StructType (with is_union set); the
+                    // repr/align propagation is identical to the struct path.
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (node.is_generic()) { continue; }
                     if (!node.repr_c && !node.repr_packed
                             && !node.repr_transparent && node.min_alignment == 0) {
                         continue;

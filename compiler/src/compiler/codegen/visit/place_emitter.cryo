@@ -197,6 +197,42 @@ type struct PlaceEmitter {
             return;
         }
 
+        // Union member access: every field overlaps at offset 0, so the
+        // member's lvalue is just the union's address reinterpreted as a
+        // pointer to the member's type (a bitcast), NOT a GEP into a slot of
+        // the storage blob.  A union returned by value (`f().x`) is first
+        // spilled to a temp alloca so we have an address to reinterpret.
+        if (tk == TypeKind::Struct) {
+            const ust: StructType* = t as StructType*;
+            if (ust.is_union) {
+                const fld_ty: TypeRef = ust.fields[field_idx].field_type;
+                const fld_lty: LType = this.cg.type_mapper.map_type(fld_ty);
+                if (!fld_lty.is_valid() || !obj_ptr.is_valid()) {
+                    this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                        "codegen: union member access: failed to map member type or null object",
+                        site_span);
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                mut uptr: LValue = obj_ptr;
+                const u_llvm: void* = llvm::LLVMTypeOf(obj_ptr.raw);
+                if (u_llvm != null && LType::kind_of(u_llvm) == LTypeKind::Struct) {
+                    const u_lty: LType = this.cg.type_mapper.map_type(obj_type);
+                    const bb: LBasicBlock = this.cg.builder.get_insert_block();
+                    const cur_fn: LValue = bb.get_parent();
+                    const tmp: LValue = this.cg.flow.create_entry_alloca(cur_fn, "unionval", u_lty);
+                    this.cg.builder.build_store(obj_ptr, tmp);
+                    uptr = tmp;
+                }
+                const cast: LValue = this.cg.builder.build_bitcast(
+                    uptr, LType::pointer_to(fld_lty), "unionfield");
+                this.state.last_value = cast;
+                this.state.last_is_lvalue = true;
+                return;
+            }
+        }
+
         const struct_ty: LType = this.cg.type_mapper.map_type(obj_type);
         if (!struct_ty.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,

@@ -110,6 +110,10 @@ type struct SpecInjector {
             const sn: StructDeclNode* = node as StructDeclNode*;
             ctx.decl_index.register_methods_with_module(
                 arena_qname, sn.methods, module_sym, ctx.intern_table, ctx.type_arena);
+        } else if (node.kind == NodeKind::UnionDeclaration) {
+            const un: UnionDeclNode* = node as UnionDeclNode*;
+            ctx.decl_index.register_methods_with_module(
+                arena_qname, un.methods, module_sym, ctx.intern_table, ctx.type_arena);
         } else if (node.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = node as ClassDeclNode*;
             ctx.decl_index.register_methods_with_module(
@@ -203,6 +207,21 @@ type struct SpecializationPasses {
                         // type rather than scope-qualified name; record the
                         // owner AST here so try_infer_method_call can find
                         // its `methods[]` from a receiver TypeRef.
+                        SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
+                    }
+                }
+                NodeKind::UnionDeclaration => {
+                    // Mirrors the struct arm: a union is a StructType-backed
+                    // owner, so generic unions register as templates and
+                    // non-generic ones expose static/instance method templates.
+                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (node.is_generic()) {
+                        SpecializationPasses::register_generic_template(node.name, node.generic_params,
+                            stmt, NodeKind::UnionDeclaration, true, registry, arena, ctx);
+                    }
+                    if (!node.is_generic()) {
+                        SpecializationPasses::register_static_method_templates(node.name, node.methods,
+                            registry, arena, ctx);
                         SpecializationPasses::register_inherent_owner(node.name, stmt, registry, ctx);
                     }
                 }
@@ -795,7 +814,8 @@ type struct SpecializationPasses {
         if (node == null) { return; }
         const k: NodeKind = node.kind;
         const is_decl: boolean =
-            k == NodeKind::StructDeclaration || k == NodeKind::ClassDeclaration
+            k == NodeKind::StructDeclaration || k == NodeKind::UnionDeclaration
+            || k == NodeKind::ClassDeclaration
             || k == NodeKind::EnumDeclaration || k == NodeKind::FunctionDeclaration
             || k == NodeKind::ImplementationBlock;
         if (!is_decl) { return; }

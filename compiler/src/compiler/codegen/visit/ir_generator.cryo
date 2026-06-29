@@ -234,6 +234,10 @@ public:
         this.decl_visit.emit_struct_decl(this, node);
     }
 
+    override visit(mut &this, node: UnionDeclNode*) -> void {
+        this.decl_visit.emit_union_decl(this, node);
+    }
+
     override visit(mut &this, node: ClassDeclNode*) -> void {
         this.decl_visit.emit_class_decl(this, node);
     }
@@ -805,6 +809,32 @@ public:
         }
 
         const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "structlit", ty);
+
+        // Union literal `MyUnion { x: v }`: sema guarantees exactly one field is
+        // initialized.  All members overlap at offset 0, so bitcast the alloca
+        // to the initialized member's type and store there (mirrors union member
+        // access).  Returns the alloca as an lvalue, like the struct path.
+        const ult: Type* = this.cg.lookup_type_by_id(struct_type.id);
+        if (ult != null && ult.kind == TypeKind::Struct) {
+            const ust: StructType* = ult as StructType*;
+            if (ust.is_union) {
+                if (field_names.length == 1) {
+                    const ufidx: i64 = ust.field_index(field_names[0]);
+                    if (ufidx >= 0) {
+                        const uft: TypeRef = ust.fields[ufidx].field_type;
+                        const uflty: LType = this.cg.type_mapper.map_type(uft);
+                        if (uflty.is_valid()) {
+                            const ucast: LValue = this.cg.builder.build_bitcast(
+                                alloca, LType::pointer_to(uflty), "unioninit");
+                            this.cg.builder.build_store(field_values[0], ucast);
+                        }
+                    }
+                }
+                this.state.last_value = alloca;
+                this.state.last_is_lvalue = true;
+                return;
+            }
+        }
 
         // Store each field value at its GEP index.  If a field expects a
         // dynamic-array fat pointer (`{T*, i64, i64}`) but the value is a

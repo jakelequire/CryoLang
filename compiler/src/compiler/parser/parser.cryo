@@ -415,6 +415,14 @@ public:
                 }
                 return sd;
             }
+            if (next.kind == TokenType::KwUnion) {
+                const ud: UnionDeclNode* = this.parse_union_declaration();
+                if (ud != null) {
+                    ud.set_public(is_public);
+                    if (doc != "") { ud.set_documentation(doc); }
+                }
+                return ud;
+            }
             if (next.kind == TokenType::KwClass) {
                 const cd: ClassDeclNode* = this.parse_class_declaration();
                 if (cd != null) {
@@ -864,7 +872,38 @@ public:
         }
 
         this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(node, null);
+        this.parse_type_body(node, null, null);
+        this.consume(TokenType::RBrace, "'}'");
+
+        this.current_type_name = "";
+        node.span = this.span_from(start);
+        return node;
+    }
+
+    /// Parse a union declaration: type union Name<T> { fields, methods }
+    /// Shares the struct member-grammar; an untagged C-style union where all
+    /// fields overlap at offset 0 (see UnionDeclNode).
+    parse_union_declaration() -> UnionDeclNode* {
+        LOG_DEBUG(LogComponent::Parser, "[Parser] parse_union_declaration()");
+        const start: Token = this.advance(); // consume 'type'
+        this.advance(); // consume 'union'
+
+        const name_tok: Token = this.consume(TokenType::Identifier, "union name");
+        const name: SymbolStr = this.intern_lexeme(name_tok);
+        mut node: UnionDeclNode* = new UnionDeclNode(name, this.span_from_token(start));
+        node.set_name_span(this.span_from_token(name_tok));
+        this.current_type_name = name_tok.lexeme;
+
+        // Optional generic parameters
+        if (this.check(TokenType::LAngle)) {
+            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            for (mut i: int = 0; i < gen_params.length; i++) {
+                node.add_generic_param(gen_params[i]);
+            }
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+        this.parse_type_body(null, null, node);
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
@@ -899,7 +938,7 @@ public:
         }
 
         this.consume(TokenType::LBrace, "'{'");
-        this.parse_type_body(null, node);
+        this.parse_type_body(null, node, null);
         this.consume(TokenType::RBrace, "'}'");
 
         this.current_type_name = "";
@@ -914,8 +953,11 @@ public:
     ///            are allowed but optional.  `protected:` is an error (no inheritance).
     ///   Class: no default visibility.  Every member MUST appear inside an explicit
     ///            `public:`, `private:`, or `protected:` block.
-    parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*) -> void {
-        const is_struct: boolean = (struct_node != null);
+    parse_type_body(struct_node: StructDeclNode*, class_node: ClassDeclNode*,
+                    union_node: UnionDeclNode*) -> void {
+        // Unions share the struct member-grammar (default-public, no
+        // `protected`); only their layout/codegen differ.
+        const is_struct: boolean = (struct_node != null) || (union_node != null);
 
         // Structs default to public; classes have no default (sentinel).
         mut current_visibility: Visibility = Visibility::Public;
@@ -1016,6 +1058,7 @@ public:
                     }
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
+                    if (union_node != null) { union_node.add_method(method); }
                 }
                 continue;
             }
@@ -1030,6 +1073,7 @@ public:
                     }
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
+                    if (union_node != null) { union_node.add_method(method); }
                 }
                 continue;
             }
@@ -1044,6 +1088,7 @@ public:
                     }
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
+                    if (union_node != null) { union_node.add_method(method); }
                 }
                 continue;
             }
@@ -1058,6 +1103,7 @@ public:
                     }
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
+                    if (union_node != null) { union_node.add_method(method); }
                 }
                 continue;
             }
@@ -1072,6 +1118,7 @@ public:
                     }
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
+                    if (union_node != null) { union_node.add_method(method); }
                 }
                 continue;
             }
@@ -1091,6 +1138,7 @@ public:
                         }
                         if (struct_node != null) { struct_node.add_method(method); }
                         if (class_node != null) { class_node.add_method(method); }
+                        if (union_node != null) { union_node.add_method(method); }
                     }
                 } else {
                     const field: FieldDeclNode* = this.parse_field_declaration();
@@ -1102,6 +1150,7 @@ public:
                         }
                         if (struct_node != null) { struct_node.add_field(field); }
                         if (class_node != null) { class_node.add_field(field); }
+                        if (union_node != null) { union_node.add_field(field); }
                     }
                 }
                 continue;
@@ -1728,6 +1777,7 @@ public:
         mut had_kind_tag: boolean = false;
         const first: TokenType = this.peek_at(0).kind;
         if (first == TokenType::KwStruct
+            || first == TokenType::KwUnion
             || first == TokenType::KwEnum
             || first == TokenType::KwClass) {
             had_kind_tag = true;
@@ -1832,9 +1882,9 @@ public:
             }
         }
 
-        // Optional type keyword (enum, struct, class)
+        // Optional type keyword (enum, struct, union, class)
         if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
-            || this.check(TokenType::KwClass)) {
+            || this.check(TokenType::KwUnion) || this.check(TokenType::KwClass)) {
             this.advance();
         }
 

@@ -47,6 +47,10 @@ type struct MonoTypePopulator {
                 this.populate_struct_fields(concrete_t as StructType*,
                     specialized_ast as StructDeclNode*);
             }
+            NodeKind::UnionDeclaration => {
+                this.populate_union_fields(concrete_t as StructType*,
+                    specialized_ast as UnionDeclNode*);
+            }
             NodeKind::ClassDeclaration => {
                 this.populate_class_fields(concrete_t as ClassType*,
                     specialized_ast as ClassDeclNode*);
@@ -82,6 +86,63 @@ type struct MonoTypePopulator {
         st.set_min_alignment(decl.min_alignment);
 
         this.populate_struct_methods(st, decl);
+    }
+
+    /// Union counterpart to populate_struct_fields.  The concrete StructType
+    /// already carries `is_union = true` (set by arena.create_union via
+    /// create_concrete_type); fields/repr/methods are populated identically to
+    /// a struct — the union divergence (overlapping layout) lives in
+    /// TypeLowering and codegen.
+    populate_union_fields(mut &this, st: StructType*, decl: UnionDeclNode*) -> void {
+        if (decl == null) { return; }
+
+        mut field_infos: FieldInfo[] = [];
+        for (mut i: i64 = 0; i < decl.fields.length; i++) {
+            const field: FieldDeclNode* = decl.fields[i];
+            if (field == null) { continue; }
+            const is_pub: boolean = field.visibility == Visibility::Public;
+            const is_prot: boolean = field.visibility == Visibility::Protected;
+            field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+        }
+        st.set_fields(field_infos);
+
+        st.set_repr(decl.repr_c, decl.repr_packed, decl.repr_transparent);
+        st.set_min_alignment(decl.min_alignment);
+
+        this.populate_union_methods(st, decl);
+    }
+
+    /// Union counterpart to populate_struct_methods.
+    populate_union_methods(mut &this, st: StructType*, decl: UnionDeclNode*) -> void {
+        if (st == null || decl == null) { return; }
+        const this_amp: SymbolStr = this.intern_table.intern("&this");
+        const this_val: SymbolStr = this.intern_table.intern("this");
+        for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
+            const m: MethodNode* = decl.methods[mi];
+            if (m == null || m.func == null) { continue; }
+            mut ptypes: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
+                const pp: VarDeclNode* = m.func.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.name.equals(this_amp)) { continue; }
+                if (pp.name.equals(this_val)) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            const fn_ty: TypeRef = this.arena.get_function(
+                m.func.resolved_return_type, ptypes, m.func.is_variadic);
+            const minfo: MethodInfo = MethodInfo {
+                name:          m.func.name,
+                function_type: fn_ty,
+                is_public:     m.visibility == Visibility::Public,
+                is_protected:  m.visibility == Visibility::Protected,
+                is_static:     m.is_static,
+                is_virtual:    m.is_virtual,
+                is_override:   m.is_override,
+                param_types:   ptypes,
+                ast_node:      m as void*,
+            };
+            st.add_method(minfo);
+        }
     }
 
     /// Populate a specialized ClassType's fields from the specialized AST.

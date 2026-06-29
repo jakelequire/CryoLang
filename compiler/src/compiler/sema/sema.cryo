@@ -219,6 +219,20 @@ public:
         this.visit_methods(node.methods, st_type);
     }
 
+    override visit(mut &this, node: UnionDeclNode*) -> void {
+        if (node.is_generic()) {
+            if (this.sema_symbolic_check_enabled()) {
+                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
+            }
+            return;
+        }
+        const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+        const un_type: TypeRef = this.ctx.decl_index.lookup_type(qualified_sym);
+        this.visit_methods(node.methods, un_type);
+    }
+
     override visit(mut &this, node: ClassDeclNode*) -> void {
         if (node.is_generic()) {
             if (this.sema_symbolic_check_enabled()) {
@@ -1477,6 +1491,27 @@ public:
             }
         }
         this.state.expected_type = saved_expected;
+
+        // Union literal: exactly one field may be initialized (an untagged
+        // union overlaps all fields, so a literal names the single active
+        // member).  The per-field type check above already validated that
+        // member's value; skip the struct "all fields required" (E0355) check.
+        mut is_union_lit: boolean = false;
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            is_union_lit = (struct_t as StructType*).is_union;
+        }
+        if (is_union_lit) {
+            if (lit.field_inits.length != 1) {
+                const un_name: string = this.intern.resolve(this.intern.intern(this.arena.format_display(struct_t)));
+                mut udiag: Diagnostic = Diagnostic::error(ErrorCode::E0363_UNION_LITERAL_ARITY,
+                    format("union literal of `%s` must initialize exactly one field, found %lld",
+                        un_name, lit.field_inits.length));
+                udiag = udiag.at_with_label(lit.span,
+                    if (lit.field_inits.length == 0) { "no field initialized" } else { "more than one field initialized" });
+                this.ctx.emit_diagnostic(udiag);
+            }
+            return struct_ref;
+        }
 
         if (struct_t != null && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
             const empty_fields: FieldInfo[] = [];
