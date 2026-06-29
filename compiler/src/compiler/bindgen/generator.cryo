@@ -580,10 +580,12 @@ type struct VendorGenerator {
     }
 
     /// The Stage-3 cache provenance key: a hex FNV-1a digest folding the bytes
-    /// of the binding's input files, the (already-normalized) target `triple`,
-    /// the libclang version, and `GENERATOR_VERSION`.  A change in any of these
-    /// regenerates; an unchanged set is a cache hit.  Reuses the build manifest's
-    /// FNV-1a folding so the whole compiler hashes one way.
+    /// of the binding's input files, the manifest's `include_dirs` and `defines`
+    /// (the `-I`/`-D` parse args — same headers under different args bind
+    /// differently), the (already-normalized) target `triple`, the libclang
+    /// version, and `GENERATOR_VERSION`.  A change in any of these regenerates;
+    /// an unchanged set is a cache hit.  Reuses the build manifest's FNV-1a
+    /// folding so the whole compiler hashes one way.
     ///
     /// `cache_file` is the path of the PREVIOUSLY generated `.cryo` (or "" on a
     /// fresh registration).  When its `<cache_file>.deps` include-graph sidecar
@@ -596,8 +598,8 @@ type struct VendorGenerator {
     /// already matched (the version bump to 6 is what forces the one-time
     /// regeneration that installs the sidecar).
     static provenance_key(source_path: string, headers: &string[],
-                          include_dirs: &string[], triple: string,
-                          cache_file: string) -> string {
+                          include_dirs: &string[], defines: &string[],
+                          triple: string, cache_file: string) -> string {
         mut h: u64 = Manifest::fnv_seed();
         const depfile: string = if (libc::strlen(cache_file) > 0) {
             format("%s.deps", cache_file)
@@ -621,6 +623,20 @@ type struct VendorGenerator {
                     h = Manifest::fnv_file(h, hp);
                 }
             }
+        }
+        // Fold the manifest's own knobs, not just header *bytes*: the same
+        // headers parsed under different `-I<dir>` / `-D<define>` args produce
+        // different bindings, so editing `include_dirs` or `defines` (without
+        // touching any header) MUST invalidate the cache.  Distinct markers
+        // keep the two lists from aliasing each other, and the per-element
+        // order is the manifest order (stable across regenerations).
+        h = Manifest::fnv_str(h, "<include_dirs>");
+        for (mut i: i64 = 0; i < include_dirs.length; i++) {
+            h = Manifest::fnv_str(h, include_dirs[i]);
+        }
+        h = Manifest::fnv_str(h, "<defines>");
+        for (mut i: i64 = 0; i < defines.length; i++) {
+            h = Manifest::fnv_str(h, defines[i]);
         }
         h = Manifest::fnv_str(h, triple);
         h = Manifest::fnv_str(h, VendorGenerator::clang_version());

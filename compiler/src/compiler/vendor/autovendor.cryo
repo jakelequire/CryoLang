@@ -38,6 +38,12 @@ type struct AutoVendor {
     /// the loader resolves them.  No-op when `pins` is empty.
     static ensure_pins(pins: &VendorPin[], default_triple: string) -> void {
         if (pins.length == 0) { return; }
+        // Serialize the whole load -> (maybe generate) -> save against other
+        // builds / `cryo vendor` runs sharing this machine's registry, so two
+        // parallel builds pinning different libs don't clobber each other's
+        // entry.  Best-effort: a timed-out lock proceeds unlocked (the atomic
+        // save still prevents a torn file).
+        mut lock: VendorLock = VendorLock::acquire();
         mut reg: VendorRegistry = VendorRegistry::load_global();
         mut changed: boolean = false;
         for (mut i: i64 = 0; i < pins.length; i++) {
@@ -54,6 +60,7 @@ type struct AutoVendor {
             fmt::eprintf("warning: could not persist auto-vendored bindings to %s\n",
                 VendorRegistry::registry_path());
         }
+        lock.release();
     }
 
     /// Ensure one library `lib` (matched by import namespace or registry key)
@@ -90,7 +97,8 @@ type struct AutoVendor {
         // normal up-to-date build stays cheap.
         const prov_key: string = VendorGenerator::provenance_key(
             reg.entries[idx].source_path, &reg.entries[idx].headers,
-            &reg.entries[idx].include_dirs, norm, have_file);
+            &reg.entries[idx].include_dirs, &reg.entries[idx].defines,
+            norm, have_file);
         const hit: boolean = strlen(have_key) > 0
             && strcmp(have_key, prov_key) == 0
             && strlen(have_file) > 0
@@ -127,7 +135,8 @@ type struct AutoVendor {
         // unchanged build hits without a spurious one-time regeneration.
         const store_key: string = VendorGenerator::provenance_key(
             reg.entries[idx].source_path, &reg.entries[idx].headers,
-            &reg.entries[idx].include_dirs, norm, dest);
+            &reg.entries[idx].include_dirs, &reg.entries[idx].defines,
+            norm, dest);
         reg.entries[idx].set_cache(norm, dest, store_key);
         return true;
     }

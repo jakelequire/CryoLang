@@ -50,6 +50,14 @@ type struct ProjSpec {
     exit_code:  i64;
     diagnostic: string;
     stdout_sub: string;
+    /// Environment prerequisites (test.json `requires`): the project runs only
+    /// where every token holds, and is otherwise SKIPPED with a reason (not a
+    /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
+    /// present) and `"vendor:<Name>"` (that vendor library is registered with
+    /// host bindings).  Lets a real integration test (e.g. the raylib window
+    /// demo) stay live without turning a portable `make test` red.  Empty = no
+    /// prerequisites (the common case).
+    requires:   string[];
 }
 
 /// Result of dispatching one project: did it meet its declared outcome, and
@@ -322,7 +330,8 @@ implement enum CommandKind {
                 fmt::printf("                            include_dirs, defines, link, bindings_file).\n");
                 fmt::printf("  cryo vendor list          List registered vendor libraries.\n");
                 fmt::printf("  cryo vendor remove <name> Unregister a library (by name or key).\n");
-                fmt::printf("  cryo vendor rebuild [name] Regenerate bindings (not yet implemented).\n\n");
+                fmt::printf("  cryo vendor rebuild [name] Regenerate bindings from a library's recorded\n");
+                fmt::printf("                            source (all libraries when no name is given).\n\n");
                 fmt::printf("The registry is global (per machine), stored under the cryo cache at\n");
                 fmt::printf("`<cache>/vendor/registry.json`; bindings are cached per target triple.\n\n");
                 fmt::printf("Flags:\n");
@@ -1594,6 +1603,42 @@ type struct Executor {
         return owned.into_raw();
     }
 
+    /// The first `requires` token NOT satisfied in this environment, or "" when
+    /// every prerequisite holds (so the project should run).  Recognized:
+    ///   - `"display"`        an X11 (`DISPLAY`) or Wayland (`WAYLAND_DISPLAY`)
+    ///                        display is available;
+    ///   - `"vendor:<Name>"`  the vendor library `<Name>` is registered and has
+    ///                        generated host bindings.
+    /// An unrecognized token is treated as SATISFIED so a newer test.json run
+    /// under an older compiler degrades to running, not spuriously skipping.
+    static proj_first_unmet_requirement(reqs: &string[]) -> string {
+        for (mut i: i64 = 0; i < reqs.length; i++) {
+            if (!Executor::proj_requirement_met(reqs[i])) { return reqs[i]; }
+        }
+        return "";
+    }
+
+    /// True when a single `requires` token holds (see `proj_first_unmet_requirement`).
+    static proj_requirement_met(req: string) -> boolean {
+        if (strcmp(req, "display") == 0) {
+            const d: i8* = getenv("DISPLAY") as i8*;
+            if (d != null && strlen(d as string) > 0) { return true; }
+            const w: i8* = getenv("WAYLAND_DISPLAY") as i8*;
+            return w != null && strlen(w as string) > 0;
+        }
+        if ((strstr(req, "vendor:") as void*) == (req as void*)) {
+            const lib: string = req + 7;   // strip "vendor:"
+            const reg: VendorRegistry = VendorRegistry::load_global();
+            const idx: i64 = reg.find_index(lib);
+            if (idx < 0) { return false; }
+            const f: string = reg.entries[idx].cache_file_for(
+                VendorRegistry::normalize_triple(""));
+            return strlen(f) > 0 && metadata::exists(Path::from_cstr(f));
+        }
+        // Unknown requirement: don't gate on something this compiler can't check.
+        return true;
+    }
+
     /// Parse a project's `test.json` into a `ProjSpec`. Returns `None` if the
     /// file is malformed (the caller reports that as a failing project).
     static parse_test_json(content: string) -> Option<ProjSpec> {
@@ -1602,7 +1647,8 @@ type struct Executor {
             Result::Err(mut e) => { e.drop(); return Option::None; }
         };
         mut spec: ProjSpec = ProjSpec {
-            outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: ""
+            outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: "",
+            requires: []
         };
 
         const cf_str:  Str = Str::new("compile_fail");
@@ -1624,6 +1670,23 @@ type struct Executor {
                 match (vp.as_bool()) {
                     Option::Some(b) => { spec.ignore = b; }
                     Option::None    => { }
+                }
+            }
+            Option::None => { }
+        }
+        match (root.get(Str::new("requires"))) {
+            Option::Some(rp) => {
+                const n: u64 = rp.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (rp.at(i)) {
+                        Option::Some(ep) => {
+                            match (ep.as_str()) {
+                                Option::Some(es) => { spec.requires.push(Executor::dup_cstr(es)); }
+                                Option::None     => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
                 }
             }
             Option::None => { }
@@ -1745,7 +1808,8 @@ type struct Executor {
 
             const content: string = Executor::read_file_or_empty(tj);
             mut spec: ProjSpec = ProjSpec {
-                outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: ""
+                outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: "",
+                requires: []
             };
             mut parsed_ok: boolean = false;
             match (Executor::parse_test_json(content)) {
@@ -1761,6 +1825,18 @@ type struct Executor {
                 if (is_compact) { fmt::printf("i"); }
                 else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
                 else { fmt::printf("ignored\n"); }
+                entry = readdir(dp); continue;
+            }
+
+            // Environment-gated skip: a project declaring `requires` runs only
+            // where every prerequisite holds (a display, a registered vendor
+            // lib, ...); elsewhere it is skipped WITH A REASON, never counted as
+            // a failure, so a portable `make test` stays green.
+            const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
+            if (strlen(unmet) > 0) {
+                if (is_compact) { fmt::printf("s"); }
+                else if (is_pretty) { fmt::printf("[SKIPPED: requires %s]\n", unmet); }
+                else { fmt::printf("skipped (requires %s)\n", unmet); }
                 entry = readdir(dp); continue;
             }
 
@@ -2343,6 +2419,13 @@ type struct Executor {
         const dest: string = format("%s/%s.cryo", cache_dir, name);
         mut produced: boolean = false;
 
+        // Serialize the load -> (maybe generate) -> save against any other
+        // `cryo vendor` / auto-vendoring build sharing this machine's registry,
+        // so a concurrent writer can't drop the entry this one adds.  Held
+        // across generation too (so two racers don't both run libclang for the
+        // same lib); best-effort, so it must be released on EVERY return below.
+        mut lock: VendorLock = VendorLock::acquire();
+
         // Load the on-disk registry up front: it carries any cache entries for
         // OTHER triples (so they coexist after this re-register) and the prior
         // provenance key for THIS triple (for the Stage-3 cache-hit check).
@@ -2372,10 +2455,12 @@ type struct Executor {
             // (No provenance key: a hand-supplied file is always re-copied.)
             const src: string = format("%s/%s", abs, bindings_file);
             if (!metadata::exists(Path::from_cstr(src))) {
+                lock.release();
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
                 return 1;
             }
             if (!Executor::copy_text_file(src, dest)) {
+                lock.release();
                 fmt::eprintf("Error: failed to copy bindings into the cache (%s -> %s).\n", src, dest);
                 return 1;
             }
@@ -2385,11 +2470,13 @@ type struct Executor {
             // Generate bindings from the manifest's C headers via libclang,
             // unless an unchanged provenance key makes this a cache hit.
             if (entry.headers.length == 0) {
+                lock.release();
                 fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
                 return 1;
             }
             const prov_key: string = VendorGenerator::provenance_key(
-                abs, &entry.headers, &entry.include_dirs, norm_triple, prev_file);
+                abs, &entry.headers, &entry.include_dirs, &entry.defines,
+                norm_triple, prev_file);
             const hit: boolean = !force
                 && strlen(prev_key) > 0 && strcmp(prev_key, prov_key) == 0
                 && strlen(prev_file) > 0 && metadata::exists(Path::from_cstr(prev_file));
@@ -2407,11 +2494,13 @@ type struct Executor {
                 const src_text: string = VendorGenerator::generate(
                     name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs);
                 if (strlen(src_text) == 0) {
+                    lock.release();
                     fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
                     return 1;
                 }
                 const gf: void* = fopen(dest, "w");
                 if (gf == null) {
+                    lock.release();
                     fmt::eprintf("Error: cannot write generated bindings to %s\n", dest);
                     return 1;
                 }
@@ -2426,14 +2515,27 @@ type struct Executor {
                 // the next unchanged check folds the same `dest.deps` and hits
                 // without a spurious one-time regeneration.
                 const store_key: string = VendorGenerator::provenance_key(
-                    abs, &entry.headers, &entry.include_dirs, norm_triple, dest);
+                    abs, &entry.headers, &entry.include_dirs, &entry.defines,
+                    norm_triple, dest);
                 entry.set_cache(norm_triple, dest, store_key);
                 produced = true;
             }
+        } else if (strcmp(entry.binding_source, "cxx-shim") == 0) {
+            // Reserved forward-compat seam (VENDOR_PLAN.md Stage 5): C++
+            // libraries would be bound through a generated extern-C shim keyed
+            // off `clang_Cursor_getMangling`.  That generator does not exist
+            // yet, so fail loudly rather than register an entry that can never
+            // resolve an `import vendor::Name`.
+            lock.release();
+            fmt::eprintf("Error: binding_source \"cxx-shim\" (C++ libraries) is not implemented yet.\n");
+            fmt::eprintf("       Use \"headers\" for a C library, or supply a \"bindings_file\".\n");
+            return 1;
         }
 
         reg.upsert(entry);
-        if (!reg.save_global()) {
+        const saved: boolean = reg.save_global();
+        lock.release();
+        if (!saved) {
             fmt::eprintf("Error: failed to write the vendor registry at %s\n",
                 VendorRegistry::registry_path());
             return 1;
@@ -2478,15 +2580,19 @@ type struct Executor {
             fmt::eprintf("Error: cryo vendor remove needs a library name.\n");
             return 1;
         }
+        mut lock: VendorLock = VendorLock::acquire();
         mut reg: VendorRegistry = VendorRegistry::load_global();
         if (!reg.remove(name)) {
+            lock.release();
             fmt::eprintf("No vendor library named '%s' is registered.\n", name);
             return 1;
         }
         if (!reg.save_global()) {
+            lock.release();
             fmt::eprintf("Error: failed to write the vendor registry.\n");
             return 1;
         }
+        lock.release();
         fmt::printf("Removed vendor library '%s'.\n", name);
         return 0;
     }
