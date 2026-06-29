@@ -16,6 +16,7 @@ import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Compiler::ProjectConfig;
 import Compiler::Vendor::Registry;
+import Compiler::Deps::Lockfile;
 import Utils::Logger;
 import std::fmt;
 import std::fs::file;
@@ -445,6 +446,28 @@ type struct ModuleLoader {
             if (idx < 0) { continue; }
             VendorRegistry::merge_entry_link(cfg, &this.vendor_registry.entries[idx]);
         }
+    }
+
+    /// The reproducibility identity of every vendor library this build resolved:
+    /// for each used lib, the (name, effective triple, content hash of the
+    /// generated `.cryo`).  Consumed by the `cryoconfig.lock` vendor section so a
+    /// later build can detect that a binding silently changed (or fail under
+    /// `--locked`).  Libs whose bindings can't be located/read are skipped.
+    collect_vendor_locks(&this) -> LockedVendor[] {
+        mut out: LockedVendor[] = [];
+        for (mut i: i64 = 0; i < this.used_vendor_keys.length; i++) {
+            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i]);
+            if (idx < 0) { continue; }
+            const name: string = this.vendor_registry.entries[idx].name;
+            const triple: string =
+                VendorRegistry::normalize_triple(this.triple_for_lib(name));
+            const file: string = this.vendor_registry.entries[idx].cache_file_for(triple);
+            if (strlen(file) == 0) { continue; }
+            const sha: string = LockedVendor::file_sha(file);
+            if (strlen(sha) == 0) { continue; }
+            out.push(LockedVendor { name: name, triple: triple, binding_sha: sha });
+        }
+        return out;
     }
 
 
