@@ -108,6 +108,13 @@ type struct OwnershipQuery {
             if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
                 return false;
             }
+            // A union is an untagged overlay: the active member is unknown, so
+            // its fields are never auto-dropped.  It is therefore Copy/POD
+            // regardless of member types (unless it declares its own `drop`,
+            // handled above) -- do NOT recurse into the fields.
+            if (st.is_union) {
+                return true;
+            }
             return OwnershipQuery::all_fields_copy(arena, registry, intern,
                                                     st.fields, depth + 1);
         }
@@ -404,6 +411,19 @@ type struct OwnershipQuery {
             }
             return true;
         }
+        if (tmpl.node_kind == NodeKind::UnionDeclaration && tmpl.ast_node != null) {
+            const un: UnionDeclNode* = tmpl.ast_node as UnionDeclNode*;
+            for (mut i: i64 = 0; i < un.fields.length; i++) {
+                const f: FieldDeclNode* = un.fields[i];
+                if (f == null || !f.resolved_type.is_valid()) { return false; }
+                const ft: TypeRef = subst.apply(f.resolved_type, arena);
+                if (!OwnershipQuery::is_thread_safe_at_depth(arena, registry, intern,
+                                                              ft, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         if (tmpl.node_kind == NodeKind::ClassDeclaration && tmpl.ast_node != null) {
             const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
             for (mut i: i64 = 0; i < cn.fields.length; i++) {
@@ -574,6 +594,12 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
+            // A union never auto-drops its members (untagged: the active member
+            // is unknown).  Any user-written `drop` was already handled above
+            // and returned true; here a union owns nothing droppable.
+            if (st.is_union) {
+                return false;
+            }
             return OwnershipQuery::any_field_needs_drop(arena, registry, intern,
                                                         st.fields, depth + 1);
         }
@@ -744,6 +770,15 @@ type struct OwnershipQuery {
         if (node == null) { return false; }
         if (kind == NodeKind::StructDeclaration) {
             const decl: StructDeclNode* = node as StructDeclNode*;
+            for (mut i: i64 = 0; i < decl.methods.length; i++) {
+                const m: MethodNode* = decl.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(drop_sym)) { return true; }
+            }
+            return false;
+        }
+        if (kind == NodeKind::UnionDeclaration) {
+            const decl: UnionDeclNode* = node as UnionDeclNode*;
             for (mut i: i64 = 0; i < decl.methods.length; i++) {
                 const m: MethodNode* = decl.methods[i];
                 if (m == null || m.func == null) { continue; }
@@ -950,6 +985,16 @@ type struct OwnershipQuery {
         if (node == null) { return false; }
         if (kind == NodeKind::StructDeclaration) {
             const decl: StructDeclNode* = node as StructDeclNode*;
+            for (mut i: i64 = 0; i < decl.methods.length; i++) {
+                const m: MethodNode* = decl.methods[i];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(method_name) &&
+                    OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
+            }
+            return false;
+        }
+        if (kind == NodeKind::UnionDeclaration) {
+            const decl: UnionDeclNode* = node as UnionDeclNode*;
             for (mut i: i64 = 0; i < decl.methods.length; i++) {
                 const m: MethodNode* = decl.methods[i];
                 if (m == null || m.func == null) { continue; }

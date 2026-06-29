@@ -1,0 +1,154 @@
+///! Unions - first-class untagged C-style unions (`type union`).
+///!
+///! Covers: field read/write, overlapping-storage reinterpret, size/layout
+///! (size = largest member), instance + static methods, generic unions, and
+///! `match` over unions (matching on a member's value, and `static match` on a
+///! generic union's type parameter).  A union has no discriminant, so it is not
+///! matched variant-wise like an `enum`; that is what `type enum` is for.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::Unions;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// A scalar union with both instance and static methods.
+// ---------------------------------------------------------------------------
+
+type union Value {
+    i: i64;
+    f: f64;
+    b: u8;
+
+    static from_int(n: i64) -> Value {
+        return Value { i: n };
+    }
+
+    get_i(&this) -> i64 {
+        return this.i;
+    }
+
+    set_f(mut &this, x: f64) -> void {
+        this.f = x;
+    }
+}
+
+// A generic union: members of different parameter types overlap.
+type union Either<A, B> {
+    a: A;
+    b: B;
+}
+
+// A generic union whose method uses `static match` on its type parameter.
+type union Holder<T> {
+    val: T;
+    raw: i64;
+
+    kind_code(&this) -> i32 {
+        static match (T) {
+            i64 => { return 1; }
+            f64 => { return 2; }
+            _   => { return 0; }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Field access + overlap.
+// ---------------------------------------------------------------------------
+
+![test]
+function field_roundtrip() -> Result<(), TestError> {
+    const v: Value = Value { i: 42 };
+    expect_eq(v.i, 42 as i64)?;
+    return Result::Ok(());
+}
+
+![test]
+function members_share_storage() -> Result<(), TestError> {
+    // Writing one member then reading it back round-trips through the shared
+    // storage blob.
+    mut v: Value = Value { i: 0 };
+    v.f = 1.5;
+    expect_eq(v.f, 1.5)?;
+    return Result::Ok(());
+}
+
+![test]
+function size_is_largest_member() -> Result<(), TestError> {
+    // i64/f64 are 8 bytes, u8 is 1: the union overlays to 8.
+    expect_eq(sizeof(Value) as i64, 8 as i64)?;
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// Methods.
+// ---------------------------------------------------------------------------
+
+![test]
+function instance_method() -> Result<(), TestError> {
+    const v: Value = Value { i: 7 };
+    expect_eq(v.get_i(), 7 as i64)?;
+    return Result::Ok(());
+}
+
+![test]
+function static_method() -> Result<(), TestError> {
+    const v: Value = Value::from_int(99);
+    expect_eq(v.i, 99 as i64)?;
+    return Result::Ok(());
+}
+
+![test]
+function mutating_method() -> Result<(), TestError> {
+    mut v: Value = Value { i: 0 };
+    v.set_f(2.25);
+    expect_eq(v.f, 2.25)?;
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// Generics.
+// ---------------------------------------------------------------------------
+
+![test]
+function generic_union() -> Result<(), TestError> {
+    const e: Either<i64, f64> = Either<i64, f64> { a: 100 };
+    expect_eq(e.a, 100 as i64)?;
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------------------
+// `match` over unions.
+// ---------------------------------------------------------------------------
+
+![test]
+function match_on_member_value() -> Result<(), TestError> {
+    mut v: Value = Value { i: 1 };
+    mut code: i32 = match (v.i) {
+        0 => { 100 }
+        1 => { 200 }
+        _ => { 999 }
+    };
+    expect_eq(code, 200)?;
+
+    v.i = 5;
+    code = match (v.i) {
+        0 => { 100 }
+        1 => { 200 }
+        _ => { 999 }
+    };
+    expect_eq(code, 999)?;
+    return Result::Ok(());
+}
+
+![test]
+function static_match_on_generic_param() -> Result<(), TestError> {
+    const hi: Holder<i64> = Holder<i64> { val: 1 };
+    const hf: Holder<f64> = Holder<f64> { val: 1.0 };
+    expect_eq(hi.kind_code(), 1)?;
+    expect_eq(hf.kind_code(), 2)?;
+    return Result::Ok(());
+}

@@ -138,6 +138,23 @@ EnumVariant        ::= Ident
                      | Ident "=" NumLit
                      | Ident "(" Type ("," Type)* ")"
 
+UnionDecl          ::= "type" "union" Ident Generics?
+                       "{" Member* "}"
+                       (* An untagged C-style union: every field overlaps at
+                          offset 0, so the union's size is its largest member
+                          and its alignment its most-aligned member.  Shares
+                          the aggregate Member grammar (fields + methods,
+                          including static methods).  Honours `![repr(c)]` /
+                          `![align(N)]`.  A union literal initialises EXACTLY
+                          one field (`Value { i: 1 }`); members are accessed as
+                          `u.field`.  There is no discriminant and it is not
+                          matched variant-wise — use `type enum` for a tagged
+                          (discriminated) union.  Reading a member other than
+                          the one last written is the programmer's
+                          responsibility.  Unlike `struct`/`class` there is no
+                          bare `union Foo` form; the leading `type` is
+                          required. *)
+
 TraitDecl          ::= "type" "trait" Ident Generics?
                        (":" TraitBound ("," TraitBound)*)?  (* super-traits *)
                        "{" TraitMember* "}"
@@ -160,7 +177,7 @@ TypeAlias          ::= "type" Ident Generics? "=" Type ";"
 
 ImplBlock          ::= "implement" Generics?
                        ( "trait" Type "for" )?
-                       ("enum" | "struct" | "class")?
+                       ("enum" | "struct" | "union" | "class")?
                        TargetType
                        "{" MethodImpl* "}"
 TargetType         ::= QualName GenericArgs?
@@ -372,6 +389,6 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  override   private    protected public    return     sizeof    *)
 (*  static     string     struct    switch    this       This      *)
 (*  trait      true       tuple     type      typeof     u8        *)
-(*  u16        u32        u64       u128      uint       unsafe    *)
-(*  unsigned   virtual    void      where     while      with      *)
-(*  yield                                                          *)
+(*  u16        u32        u64       u128      uint       union     *)
+(*  unsafe     unsigned   virtual   void      where      while     *)
+(*  with       yield                                               *)

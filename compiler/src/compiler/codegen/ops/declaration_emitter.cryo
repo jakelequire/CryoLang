@@ -180,6 +180,9 @@ type struct DeclarationEmitter {
                 NodeKind::StructDeclaration => {
                     this.declare_struct_type(stmt as StructDeclNode*);
                 }
+                NodeKind::UnionDeclaration => {
+                    this.declare_union_type(stmt as UnionDeclNode*);
+                }
                 NodeKind::ClassDeclaration => {
                     this.declare_class_type(stmt as ClassDeclNode*);
                 }
@@ -215,6 +218,20 @@ type struct DeclarationEmitter {
         }
 
         // Let the type mapper handle forward declaration + body fill.
+        this.type_mapper.map_type(type_ref);
+    }
+
+    /// Forward-declare a union type.  A union's arena type is a StructType
+    /// (with is_union set), so this mirrors declare_struct_type exactly: the
+    /// type mapper emits the union's storage-blob LLVM body.
+    declare_union_type(mut &this, node: UnionDeclNode*) -> void {
+        if (node.generic_params.length > 0) {
+            return;
+        }
+        const type_ref: TypeRef = this.ctx.decl_index.lookup_type(node.name);
+        if (type_ref.is_invalid()) {
+            return;
+        }
         this.type_mapper.map_type(type_ref);
     }
 
@@ -272,6 +289,9 @@ type struct DeclarationEmitter {
                 }
                 NodeKind::StructDeclaration => {
                     this.declare_struct_methods(stmt as StructDeclNode*);
+                }
+                NodeKind::UnionDeclaration => {
+                    this.declare_union_methods(stmt as UnionDeclNode*);
                 }
                 NodeKind::ClassDeclaration => {
                     this.declare_class_methods(stmt as ClassDeclNode*);
@@ -542,6 +562,35 @@ type struct DeclarationEmitter {
         mut qualified: SymbolStr = SymbolStr::empty();
         // Try both local-qualified and bare name in the DI, then get the
         // arena's canonical qualified name from the TypeRef.
+        const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        mut di_ref: TypeRef = di.lookup_type(local_sym);
+        if (!di_ref.is_valid()) {
+            di_ref = di.lookup_type(node.name);
+        }
+        if (di_ref.is_valid()) {
+            const arena: TypeArena* = this.get_arena();
+            qualified = arena.get_qualified_name(di_ref);
+        }
+        if (!qualified.is_valid()) {
+            qualified = local_sym;
+        }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.declare_method(node.methods[i], qualified);
+        }
+    }
+
+    /// Declare methods defined inline within a union declaration.  Mirrors
+    /// declare_struct_methods (a union's type is a StructType).
+    declare_union_methods(mut &this, node: UnionDeclNode*) -> void {
+        if (node.generic_params.length > 0) {
+            return;
+        }
+        if (node.methods.length == 0) {
+            return;
+        }
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        mut qualified: SymbolStr = SymbolStr::empty();
         const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
         mut di_ref: TypeRef = di.lookup_type(local_sym);
         if (!di_ref.is_valid()) {
