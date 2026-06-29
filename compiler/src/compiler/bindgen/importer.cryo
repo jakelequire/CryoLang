@@ -446,35 +446,28 @@ type struct Importer {
         }
 
         if (is_union) {
-            // No native union: emit a `![repr(c)]` struct holding one storage
-            // field sized/aligned to the union, so it round-trips by value over
-            // FFI (no field access — flagged limitation).
+            // Native `type union`: one field per member, all sharing storage at
+            // offset 0 (the first-class union feature, not the pre-union `_storage`
+            // blob).  By-value FFI ABI is unchanged — a union still lowers to the
+            // same sized/aligned blob — but members are accessed directly (`v.i`)
+            // instead of through synthesized reinterpret accessors.
             if (this.name_seen(name_sym)) { return; }
             const ct: CXType = Clang::clang_getCursorType(cursor);
             const size: i64 = Clang::clang_Type_getSizeOf(ct);
             const align: i64 = Clang::clang_Type_getAlignOf(ct);
             if (size <= 0) { return; }
-            mut unode: StructDeclNode* = new StructDeclNode(name_sym, SourceSpan::none());
+            mut unode: UnionDeclNode* = new UnionDeclNode(name_sym, SourceSpan::none());
             unode.binding_namespace = this.alias;
             unode.repr_c = true;
+            // Keep the C ABI alignment even when a member is approximated to a
+            // blob (which would otherwise be alignment 1) — mirrors the struct path.
             if (align > 0) { unode.min_alignment = align as u64; }
-            const blob_sym: SymbolStr = this.ctx.intern_table.intern("_storage");
-            mut storage: FieldDeclNode* = new FieldDeclNode(blob_sym, SourceSpan::none());
-            storage.type_annotation = this.types.array(this.types.prim("u8"), size);
-            unode.add_field(storage);
-            // Restore field access: a reinterpret get/set pair per named member.
-            const nacc: i32 = this.add_reinterpret_accessors(unode, blob_sym, cursor);
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
             this.emit_top_level(unode as ASTNode*);
-            const uname: string = this.ctx.intern_table.resolve(name_sym);
-            if (nacc > 0) {
-                this.report.approx(format("union '%s' -> %lld-byte storage + %d get/set accessors (method access, not native union)",
-                                          uname, size, nacc));
-            } else {
-                this.report.approx(format("union '%s' -> %lld-byte opaque storage (round-trips by value; no field access)",
-                                          uname, size));
-            }
+            this.field_cursors = [];
+            Clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
+            this.populate_union_fields(unode);
             return;
         }
 
@@ -622,6 +615,49 @@ type struct Importer {
         if (approximated && struct_size > 0) {
             const al: i64 = Clang::clang_Type_getAlignOf(rec_type);
             if (al > 0) { node.min_alignment = al as u64; }
+        }
+    }
+
+    /// Build a native `type union`'s fields from its collected member cursors
+    /// (`this.field_cursors`) — one Cryo field per C union member, all overlaid at
+    /// offset 0 by the union layout.  A named member maps by type (`CTypeMapper::map`,
+    /// which already lowers an anonymous-typed named field to an aligned blob); an
+    /// anonymous nested record *member* (a nameless `struct {…};`/`union {…};` with no
+    /// FieldDecl) has no name to bind, so it becomes an aligned opaque blob `_anonN`
+    /// (Cryo has no anonymous union fields).  Each lossy member is reported.
+    populate_union_fields(mut &this, node: UnionDeclNode*) -> void {
+        const uname: string = this.ctx.intern_table.resolve(node.name);
+        mut anon_n: i32 = 0;
+        for (mut i: i64 = 0; i < this.field_cursors.length; i++) {
+            const cur: CXCursor = this.field_cursors[i];
+            const k: i32 = Clang::clang_getCursorKind(cur);
+
+            // Anonymous struct/union member: an aligned opaque blob in place.
+            if (k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL) {
+                const ct: CXType = Clang::clang_getCursorType(cur);
+                const sz: i64 = Clang::clang_Type_getSizeOf(ct);
+                const al: i64 = Clang::clang_Type_getAlignOf(ct);
+                const fname: SymbolStr =
+                    this.ctx.intern_table.intern(format("_anon%d", anon_n));
+                mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
+                fnode.type_annotation = this.types.aligned_blob(sz, al);
+                node.add_field(fnode);
+                this.report.approx(format("anonymous member in union '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
+                                          uname, anon_n, sz));
+                anon_n = anon_n + 1;
+                continue;
+            }
+
+            // Named member: a native union field of the member's mapped type.
+            const ftype: CXType = Clang::clang_getCursorType(cur);
+            const fname: SymbolStr = cur.intern_spelling(this.ctx);
+            mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
+            fnode.type_annotation = this.types.map(ftype);
+            node.add_field(fnode);
+            if (ftype.is_anonymous_record()) {
+                this.report.approx(format("field '%s' of anonymous type in union '%s' -> opaque blob (no field access)",
+                                          this.ctx.intern_table.resolve(fname), uname));
+            }
         }
     }
 

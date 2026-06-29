@@ -61,7 +61,11 @@ import std::collections::str;
 /// `type enum` requires unique discriminants); (b) a pointer to a system-header
 /// record (e.g. `FILE` == `struct _iobuf`) maps to opaque `void*` instead of a
 /// dangling named reference to the filtered-out tag.
-const GENERATOR_VERSION: i64 = 7;
+/// 7 -> 8: a top-level named C `union` now emits a native `type union` (one field
+/// per member, direct `v.field` access) instead of a `![repr(C)]` struct with a
+/// `_storage` blob and synthesized reinterpret get/set accessors.  ABI is
+/// unchanged; the field-access surface changes, so cached bindings regenerate.
+const GENERATOR_VERSION: i64 = 8;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -119,6 +123,8 @@ type struct BindingSerializer {
         const k: NodeKind = node.kind;
         if (k == NodeKind::StructDeclaration) {
             return ctx.intern_table.resolve((node as StructDeclNode*).name);
+        } else if (k == NodeKind::UnionDeclaration) {
+            return ctx.intern_table.resolve((node as UnionDeclNode*).name);
         } else if (k == NodeKind::EnumDeclaration) {
             return ctx.intern_table.resolve((node as EnumDeclNode*).name);
         } else if (k == NodeKind::TypeAliasDeclaration) {
@@ -135,6 +141,8 @@ type struct BindingSerializer {
         const k: NodeKind = node.kind;
         if (k == NodeKind::StructDeclaration) {
             this.render_struct(node as StructDeclNode*);
+        } else if (k == NodeKind::UnionDeclaration) {
+            this.render_union(node as UnionDeclNode*);
         } else if (k == NodeKind::EnumDeclaration) {
             this.render_enum(node as EnumDeclNode*);
         } else if (k == NodeKind::TypeAliasDeclaration) {
@@ -165,6 +173,25 @@ type struct BindingSerializer {
         // restore the field access the opaque-blob lowering drops.
         for (mut i: i64 = 0; i < node.binding_accessors.length; i++) {
             this.render_accessor(node.binding_accessors[i]);
+        }
+        this.out.push_cstr("}\n\n");
+    }
+
+    /// Render a native `type union` (untagged C union): one field per member, all
+    /// overlaid at offset 0.  No synthesized accessors — members are accessed
+    /// directly (`v.field`); a literal initializes exactly one member.
+    render_union(mut &this, node: UnionDeclNode*) -> void {
+        if (node.repr_c) { this.out.push_cstr("![repr(C)]\n"); }
+        if (node.min_alignment > 0) {
+            this.out.push_cstr(format("![align(%llu)]\n", node.min_alignment));
+        }
+        this.out.push_cstr(format("type union %s {\n",
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.name))));
+        for (mut i: i64 = 0; i < node.fields.length; i++) {
+            const f: FieldDeclNode* = node.fields[i];
+            this.out.push_cstr(format("    %s: %s;\n",
+                BindingSerializer::ident(this.ctx.intern_table.resolve(f.name)),
+                this.render_type(f.type_annotation)));
         }
         this.out.push_cstr("}\n\n");
     }
