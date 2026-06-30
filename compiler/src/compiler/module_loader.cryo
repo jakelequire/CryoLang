@@ -76,6 +76,14 @@ type struct ModuleLoader {
     /// one library (project pin -> global), so a project can lock a lib to a
     /// specific triple's bindings.  Empty when the project pins nothing.
     vendor_pins:      VendorPin[];
+    /// Project build-folder umbrella for vendored libraries
+    /// (`<profile_dir>/vendor`, from `ProjectConfig::vendor_dir`).  When
+    /// non-empty, a resolved `vendor::Name` import is copied out of the global
+    /// cache into `<vendor_build_root>/<Name>/<Name>.cryo` and THAT path is
+    /// compiled, so the bindings (and their `deps/*.o`, `ir/*.ll`) are visible
+    /// in the project's build tree.  Empty in contexts with no build folder
+    /// (LSP, single-file), where resolution falls back to the cache path.
+    vendor_build_root: string;
 
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
@@ -95,6 +103,7 @@ type struct ModuleLoader {
             vendor_triple:    "",
             used_vendor_keys: [],
             vendor_pins:      [],
+            vendor_build_root: "",
         };
     }
 
@@ -104,10 +113,12 @@ type struct ModuleLoader {
     /// that override that triple per library.  Called once, before
     /// `discover_project`, on the project-build path — after the AutoVendor
     /// hook has generated any pinned bindings, so the load sees them.
-    set_vendor_context(mut &this, triple: string, pins: &VendorPin[]) -> void {
-        this.vendor_triple    = triple;
-        this.vendor_registry  = VendorRegistry::load_global();
-        this.vendor_pins      = [];
+    set_vendor_context(mut &this, triple: string, pins: &VendorPin[],
+                       build_root: string) -> void {
+        this.vendor_triple     = triple;
+        this.vendor_registry   = VendorRegistry::load_global();
+        this.vendor_build_root = build_root;
+        this.vendor_pins       = [];
         for (mut i: i64 = 0; i < pins.length; i++) {
             this.vendor_pins.push(pins[i]);
         }
@@ -363,6 +374,24 @@ type struct ModuleLoader {
                 VendorRegistry::normalize_triple(this.triple_for_lib(lib));
             const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
             if (strlen(f) > 0 && metadata::exists(Path::from_cstr(f))) {
+                // Surface the binding in the project build tree: copy the
+                // cache file into `<vendor_build_root>/<Name>/<Name>.cryo` and
+                // compile THAT, so the generated `.cryo` sits alongside its
+                // `deps/*.o` / `ir/*.ll` (origin Vendor) for inspection.  The
+                // global cache stays the regeneration cache; this is just the
+                // resolved copy for this build.  Copy every resolve so a cache
+                // regeneration this build is reflected; falls back to the
+                // cache path if there's no build folder or the copy fails.
+                if (strlen(this.vendor_build_root) > 0) {
+                    const name: string = this.vendor_registry.entries[idx].name;
+                    const dest: string = format("%s/%s/%s.cryo",
+                        this.vendor_build_root, name, name);
+                    ProjectConfig::mkdir_p(dest.parent_dir());
+                    match (file::copy(Path::from_cstr(f), Path::from_cstr(dest))) {
+                        Result::Ok(_)  => { return dest; }
+                        Result::Err(_) => { return f; }
+                    }
+                }
                 return f;
             }
             // Registered, but nothing generated for THIS triple (a cross-compile
