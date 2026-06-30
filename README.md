@@ -155,7 +155,7 @@ mut counter: int   = 0;        // mutable
 counter = counter + 1;
 ```
 
-Type annotations are required. Mutability is opt-in.
+Type annotations are optional when there's an initializer to infer from (`const name = "Cryo";` infers `string`); an explicit `: T` is needed only without an initializer, or to widen the declared type. Mutability is opt-in.
 
 ### Control flow
 

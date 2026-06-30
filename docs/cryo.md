@@ -743,7 +743,7 @@ Only `mut` bindings can be assigned to.
 | `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style).                                                                          |
 | `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
-> **Reserved.** `?.`, `..` (in expression position), and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax).
+> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered — see [§ 5.7](#57-operator-precedence).)
 
 **Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** - `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead - `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
 
