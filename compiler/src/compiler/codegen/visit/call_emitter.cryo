@@ -1043,6 +1043,14 @@ type struct CallEmitter {
             }
             args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
         }
+        // Win64: an argument bound to a `va_list` parameter must be passed BY
+        // VALUE (a `char*`), but the program holds the ADDRESS of the va_list
+        // storage (`VaArgs::as_ptr` / the `args` bucket lower to `char**`).  Load
+        // the stored `char*` out via the ABI seam for each such argument so an
+        // imported C `v*` consumer reads from the right slot instead of one
+        // indirection off.  `va_forward_fn_type` returns null on SysV-amd64 and
+        // for method calls, leaving the loop byte-identical there.
+        const va_ft: FunctionType* = this.va_forward_fn_type(node);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             mut arg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
             // Auto-ref: sema flagged this by-value argument as bound to a
@@ -1052,6 +1060,12 @@ type struct CallEmitter {
             // short, then dereferenced by the callee -> crash.
             if (node.arguments[i].autoref && arg.is_valid()) {
                 arg = this.address_of_value(arg);
+            }
+            if (va_ft != null && i < va_ft.param_types.length && arg.is_valid()) {
+                const pt: Type* = this.cg.lookup_type_by_id(va_ft.param_types[i].id);
+                if (pt != null && pt.kind == TypeKind::VaList) {
+                    arg = this.cg.abi.forward_va_list(&this.cg.builder, arg);
+                }
             }
             args.push(Pair<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
         }
@@ -1215,6 +1229,42 @@ type struct CallEmitter {
 
         this.state.last_value = result;
         this.state.last_is_lvalue = false;
+    }
+
+    /// The callee's Cryo `FunctionType` when an argument MIGHT need the Win64
+    /// `va_list` by-value forwarding load (see the argument loop), else null.
+    ///
+    /// Gated so the argument loop is byte-identical everywhere it does not
+    /// apply: returns null off Win64 (SysV passes the `__va_list_tag[1]` pointer
+    /// directly, which already IS the by-value form), and null for method calls
+    /// (a `MemberAccess` callee) — methods never take `va_list`, and skipping
+    /// them keeps `node.arguments[i]` aligned with `param_types[i]` without a
+    /// receiver offset.  `va_list` parameters therefore only arise on the
+    /// free/extern call paths handled here.
+    va_forward_fn_type(mut &this, node: CallExprNode*) -> FunctionType* {
+        if (!this.cg.abi.is_win64()) { return null; }
+        if (node.callee == null) { return null; }
+        // The callee's bare name keys its `FunctionType` in the DeclarationIndex.
+        // Only free / extern-"C" callees (bare identifier or `Scope::member`)
+        // carry a `va_list` parameter; methods (`MemberAccess`) never do, so we
+        // skip them — which also keeps `node.arguments[i]` aligned with
+        // `param_types[i]` (no receiver in the parameter list).
+        mut name: SymbolStr = SymbolStr::empty();
+        if (node.callee.kind == NodeKind::Identifier) {
+            name = (node.callee as IdentifierNode*).name;
+        } else if (node.callee.kind == NodeKind::ScopeResolution) {
+            name = (node.callee as ScopeResolutionNode*).member_name;
+        } else {
+            return null;
+        }
+        if (!name.is_valid()) { return null; }
+        const di: DeclarationIndex* = this.cg.get_decl_index();
+        if (di == null) { return null; }
+        const ft_ref: TypeRef = di.lookup_func_type(name);
+        if (!ft_ref.is_valid()) { return null; }
+        const ct: Type* = this.cg.lookup_type_by_id(ft_ref.id);
+        if (ct == null || ct.kind != TypeKind::Function) { return null; }
+        return ct as FunctionType*;
     }
 
     /// Drop-glue expansion for an aggregate with no user-written `drop`.
