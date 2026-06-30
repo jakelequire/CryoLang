@@ -960,7 +960,18 @@ type struct CompilerInstance {
         // sees freshly auto-vendored bindings — keyed on this build's effective
         // target triple, with the pins overriding it per library.
         AutoVendor::ensure_pins(&config.vendor_pins, config.target_triple);
-        loader.set_vendor_context(config.target_triple, &config.vendor_pins);
+        // Mirror resolved vendor bindings into the project build tree under
+        // `<profile_dir>/vendor/<Name>/` so the generated `.cryo` (and its
+        // object/IR output) is visible alongside std/local; empty when there's
+        // no build folder (e.g. LSP), where the loader falls back to the cache.
+        const vendor_build_root: string =
+            if (ctx.project_config != null) {
+                ctx.project_config.vendor_dir()
+            } else {
+                ""
+            };
+        loader.set_vendor_context(
+            config.target_triple, &config.vendor_pins, vendor_build_root);
 
         // LSP mode: feed the loader the editor buffer for the active
         // file so import-discovery sees the imports the user is typing
@@ -1111,9 +1122,24 @@ type struct CompilerInstance {
         // (prelude, test runner, fmt::interp) are tagged Stdlib too.  The
         // dep-root prefix mirrors ModuleLoader's scan-root form: relative
         // dep roots are prefixed with project_root before scanning.
+        const vendor_root: string =
+            if (ctx.project_config != null) {
+                ctx.project_config.vendor_dir()
+            } else {
+                ""
+            };
         for (mut mci: u32 = 0; mci < ctx.module_graph.modules.length; mci++) {
             const mci_info: ModuleInfo* = &ctx.module_graph.modules[mci];
             const fpath: string = mci_info.file_path;
+            // Vendored bindings the loader copied into `<profile_dir>/vendor/
+            // <Name>/<Name>.cryo`.  Checked first (most specific path); the
+            // library name is the immediate parent directory, carried in
+            // origin_name so output routes to `vendor/<Name>/{deps,ir}`.
+            if (libc::strlen(vendor_root) > 0 && fpath.is_under(vendor_root)) {
+                mci_info.origin = ModuleOrigin::Vendor;
+                mci_info.origin_name = fpath.parent_dir().basename();
+                continue;
+            }
             if (!config.no_std && libc::strlen(stdlib_root) > 0
                     && fpath.is_under(stdlib_root)) {
                 mci_info.origin = ModuleOrigin::Stdlib;
@@ -1888,12 +1914,14 @@ type struct CompilerInstance {
                 mut n_std: u32 = 0;
                 mut n_local: u32 = 0;
                 mut n_dep: u32 = 0;
+                mut n_vendor: u32 = 0;
                 for (mut si: u32 = 0; si < n; si++) {
                     const sinfo: ModuleInfo* = &ctx.module_graph.modules[order[si]];
                     match (sinfo.origin) {
                         ModuleOrigin::Stdlib => { n_std += 1; }
                         ModuleOrigin::Dep    => { n_dep += 1; }
                         ModuleOrigin::Local  => { n_local += 1; }
+                        ModuleOrigin::Vendor => { n_vendor += 1; }
                     }
                 }
                 fmt::printf(
@@ -1901,6 +1929,7 @@ type struct CompilerInstance {
                     config.project_name, config.profile, n_local);
                 if (n_std > 0) { fmt::printf(", %u std", n_std); }
                 if (n_dep > 0) { fmt::printf(", %u dep", n_dep); }
+                if (n_vendor > 0) { fmt::printf(", %u vendor", n_vendor); }
                 fmt::printf(" module(s)\n");
 
                 // Report how many modules' objects are being reused from the
