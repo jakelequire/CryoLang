@@ -194,6 +194,10 @@ type struct Importer {
     /// from `field_cursors` so an anon-member walk can run mid-iteration of the
     /// parent record's `field_cursors` without clobbering it.
     acc_members:    CXCursor[];
+    /// Transient (C++ only): a class/struct's member-function cursors, collected
+    /// by `visit_collect_cxx_method` and processed by `emit_cxx_methods` into a
+    /// body-less `implement` block.  Reset at the start of each class.
+    cxx_method_cursors: CXCursor[];
     /// Honesty channel: every construct this import skipped or approximated.
     report:         ImportReport;
     /// W1: macro-definition cursors deferred from the decl walk so they emit
@@ -224,6 +228,11 @@ type struct Importer {
     /// `binding_namespace`, so they are emitted ONLY on the vendor path (where
     /// the file's `namespace` qualifies them); the inline path reports them.
     is_vendor:      boolean;
+    /// True when the TU was parsed as C++ (`-x c++`).  Gates ALL C++-specific
+    /// emission (namespace recursion, class methods, mangled `![link]` names) so
+    /// the C path is byte-for-byte unchanged.  Set by `collect_from_tu` from the
+    /// language signal; the C path leaves it false.
+    is_cpp:         boolean;
     /// Vendor-path only: resolved paths of every non-system file this TU pulled
     /// in (entry header + transitive `#include`s), collected via
     /// `clang_getInclusions` after the decl walk.  `collect_from_tu` threads
@@ -256,6 +265,7 @@ type struct Importer {
             cur_enum_dup_firsts:  [],
             field_cursors:  [],
             acc_members:    [],
+            cxx_method_cursors: [],
             report:         ImportReport::new(),
             macro_cursors:  [],
             ec_names:       [],
@@ -267,6 +277,7 @@ type struct Importer {
             mac_floats:     [],
             type_names:     [],
             is_vendor:      false,
+            is_cpp:         false,
             inputs:         [],
         };
     }
@@ -296,11 +307,36 @@ type struct Importer {
             return Clang::VISIT_CONTINUE;
         }
 
+        // C++ (Strategy A): recurse into namespaces so a `namespace ns { ... }`
+        // contributes its functions/classes under the file's flat namespace, and
+        // bind a class/struct's non-virtual non-inline methods as real Cryo
+        // methods.  All gated on `is_cpp` so the C path is byte-for-byte unchanged
+        // (these cursor kinds never appear in a C TU anyway).
+        if (imp.is_cpp) {
+            if (k == Clang::CURSOR_NAMESPACE) {
+                Clang::clang_visitChildren(cursor, Importer::visit_decl, client);
+                return Clang::VISIT_CONTINUE;
+            }
+            if (k == Clang::CURSOR_CLASS_DECL) {
+                imp.emit_cxx_class(cursor);
+                return Clang::VISIT_CONTINUE;
+            }
+            if (k == Clang::CURSOR_FUNCTION_TEMPLATE) {
+                imp.report.skip(format("function template `%s` (no instantiated symbol)",
+                                imp.spelling_of(cursor)));
+                return Clang::VISIT_CONTINUE;
+            }
+        }
+
         if (imp.functions_only) {
             return Clang::VISIT_CONTINUE;
         }
 
-        if (k == Clang::CURSOR_TYPEDEF_DECL) {
+        if (imp.is_cpp && k == Clang::CURSOR_STRUCT_DECL) {
+            // A C++ `struct` can carry methods too (only its access default
+            // differs from `class`); bind it through the same class path.
+            imp.emit_cxx_class(cursor);
+        } else if (k == Clang::CURSOR_TYPEDEF_DECL) {
             imp.emit_typedef(cursor);
         } else if (k == Clang::CURSOR_STRUCT_DECL) {
             imp.emit_record(cursor, false);
@@ -428,8 +464,163 @@ type struct Importer {
         func.is_variadic =
             Clang::clang_isFunctionTypeVariadic(Clang::clang_getCursorType(cursor)) != 0u32;
 
+        // C++ free/namespace function: pin its mangled symbol via `![link]`.  A
+        // function with no emitted symbol (inline / template) yields an empty
+        // mangling — skip + report rather than emit an unresolvable extern.  The
+        // C path never enters this branch, so its output is byte-unchanged.
+        if (this.is_cpp) {
+            const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
+            if (!mangled.is_valid()) {
+                if (cursor.is_inlined()) {
+                    this.report.skip(format("inline function `%s` (no out-of-line symbol)",
+                        this.ctx.intern_table.resolve(name_sym)));
+                } else {
+                    this.report.skip(format("function `%s` (no mangled symbol)",
+                        this.ctx.intern_table.resolve(name_sym)));
+                }
+                return;
+            }
+            func.link_name = this.ctx.intern_table.resolve(mangled);
+            func.has_link_name = true;
+        }
+
         this.extern_node.add_function(func);
         this.count = this.count + 1;
+    }
+
+    /// This cursor's spelling resolved to a `string` (for report messages).
+    spelling_of(mut &this, cursor: CXCursor) -> string {
+        return this.ctx.intern_table.resolve(cursor.intern_spelling(this.ctx));
+    }
+
+    /// Nested visitor (C++): collect a class/struct's member-FUNCTION cursors
+    /// (methods, ctors, dtors, member templates) into `cxx_method_cursors`.  Data
+    /// members are handled by the layout walk (`visit_collect_member`); this walk
+    /// only gathers callables, which `emit_cxx_methods` then binds or reports.
+    static visit_collect_cxx_method(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+        const k: i32 = Clang::clang_getCursorKind(cursor);
+        const imp: Importer* = client as Importer*;
+        if (k == Clang::CURSOR_CXX_METHOD
+                || k == Clang::CURSOR_CONSTRUCTOR
+                || k == Clang::CURSOR_DESTRUCTOR
+                || k == Clang::CURSOR_FUNCTION_TEMPLATE) {
+            imp.cxx_method_cursors.push(cursor);
+        }
+        return Clang::VISIT_CONTINUE;
+    }
+
+    /// Emit a C++ class/struct: a layout-faithful `type struct` (reusing the C
+    /// record path for data members) plus an `implement` block binding its
+    /// public, non-virtual, non-inline methods to their mangled symbols.  Only
+    /// reached on the C++ path.
+    emit_cxx_class(mut &this, cursor: CXCursor) -> void {
+        if (cursor.is_anonymous()) { return; }
+        // Build the data-member struct (find-or-create + dedup live in emit_record).
+        this.emit_record(cursor, false);
+
+        // Collect this class's member functions (definition cursors carry them;
+        // a forward-declaration cursor has none, so it produces no impl block).
+        this.cxx_method_cursors = [];
+        Clang::clang_visitChildren(cursor, Importer::visit_collect_cxx_method, this as void*);
+        if (this.cxx_method_cursors.length == 0) { return; }
+
+        const owner_sym: SymbolStr = cursor.intern_spelling(this.ctx);
+        const owner_str: string = this.ctx.intern_table.resolve(owner_sym);
+        mut impl: ImplBlockNode* = new ImplBlockNode(owner_sym, SourceSpan::none());
+        mut bound: i64 = 0;
+        for (mut i: i64 = 0; i < this.cxx_method_cursors.length; i++) {
+            if (this.emit_cxx_method(impl, this.cxx_method_cursors[i], owner_str)) {
+                bound = bound + 1;
+            }
+        }
+        // Only emit the impl block if at least one method bound — an all-skipped
+        // class would otherwise render an empty `implement` block.
+        if (bound > 0) {
+            this.emit_top_level(impl as ASTNode*);
+        }
+    }
+
+    /// Bind one C++ member function into `impl` as a body-less `![link]` method,
+    /// or skip + report it.  Returns true when a method was added.
+    emit_cxx_method(mut &this, impl: ImplBlockNode*, cursor: CXCursor,
+                    owner_str: string) -> boolean {
+        const k: i32 = Clang::clang_getCursorKind(cursor);
+        const mname: string = this.spelling_of(cursor);
+
+        // Constructors / destructors are a Phase-2 lifecycle concern (allocate +
+        // call the mangled ctor, call dtor before free) — report for now.
+        if (k == Clang::CURSOR_CONSTRUCTOR) {
+            this.report.skip(format("%s constructor (lifecycle binding is Phase 2)", owner_str));
+            return false;
+        }
+        if (k == Clang::CURSOR_DESTRUCTOR) {
+            this.report.skip(format("%s destructor (lifecycle binding is Phase 2)", owner_str));
+            return false;
+        }
+        if (k == Clang::CURSOR_FUNCTION_TEMPLATE) {
+            this.report.skip(format("%s::%s (member template, no instantiated symbol)",
+                owner_str, mname));
+            return false;
+        }
+        if (!cursor.is_public_member()) {
+            this.report.skip(format("%s::%s (non-public member)", owner_str, mname));
+            return false;
+        }
+        if (cursor.is_virtual_method()) {
+            this.report.skip(format("%s::%s (virtual — dispatched via vtable; use the shim path)",
+                owner_str, mname));
+            return false;
+        }
+        if (cursor.is_inlined()) {
+            this.report.skip(format("%s::%s (inline — no out-of-line symbol)", owner_str, mname));
+            return false;
+        }
+        const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
+        if (!mangled.is_valid()) {
+            this.report.skip(format("%s::%s (no mangled symbol)", owner_str, mname));
+            return false;
+        }
+
+        const is_static: boolean = cursor.is_static_method();
+        mut func: FunctionDeclNode* = new FunctionDeclNode(
+            cursor.intern_spelling(this.ctx), SourceSpan::none());
+        func.return_type_annotation = this.types.map(Clang::clang_getCursorResultType(cursor));
+        func.is_public = true;
+        func.is_static = is_static;
+        func.link_name = this.ctx.intern_table.resolve(mangled);
+        func.has_link_name = true;
+
+        // Non-static methods take a leading `this` pointer (Itanium implicit
+        // `this`).  Encode it as a synthetic first parameter whose NAME carries
+        // the receiver token (`&this` for a const method, `mut &this` otherwise);
+        // the serializer renders that name verbatim.  A const method's `this` is
+        // `const T*`, so an immutable Cryo `&this` is the faithful receiver.
+        if (!is_static) {
+            const recv_tok: string = if (cursor.is_const_method()) { "&this" } else { "mut &this" };
+            mut recv: VarDeclNode* = new VarDeclNode(
+                this.ctx.intern_table.intern(recv_tok), SourceSpan::none());
+            recv.type_annotation = null;
+            func.parameters.push(recv);
+        }
+
+        const nargs: i32 = Clang::clang_Cursor_getNumArguments(cursor);
+        for (mut i: i32 = 0; i < nargs; i++) {
+            const arg: CXCursor = Clang::clang_Cursor_getArgument(cursor, i as u32);
+            const ptype: TypeAnnotation* = this.types.map(Clang::clang_getCursorType(arg));
+            const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
+            mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
+            pnode.type_annotation = ptype;
+            func.parameters.push(pnode);
+        }
+        func.is_variadic =
+            Clang::clang_isFunctionTypeVariadic(Clang::clang_getCursorType(cursor)) != 0u32;
+
+        mut method: MethodNode* = new MethodNode(func, SourceSpan::none());
+        method.set_visibility(Visibility::Public);
+        method.set_static(is_static);
+        impl.methods.push(method);
+        this.count = this.count + 1;
+        return true;
     }
 
     /// Emit a `type struct` for a struct (or a layout-faithful opaque blob for a
@@ -1592,7 +1783,8 @@ type struct Importer {
                                ctx: CompilationContext*) -> i32 {
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0u32,
-                                         &no_extra, resolved_path, extern_node, ctx, null, null);
+                                         &no_extra, resolved_path, extern_node, ctx, null, null,
+                                         "c", "");
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
@@ -1616,7 +1808,8 @@ type struct Importer {
         };
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1u32,
-                                         &no_extra, header, extern_node, ctx, null, null);
+                                         &no_extra, header, extern_node, ctx, null, null,
+                                         "c", "");
     }
 
     /// `clang_getInclusions` trampoline: records each non-system file the TU
@@ -1658,19 +1851,33 @@ type struct Importer {
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
                            extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
                            ctx: CompilationContext*, out_report: ImportReport*,
-                           out_inputs: string[]*) -> i32 {
+                           out_inputs: string[]*, lang: string, cpp_std: string) -> i32 {
         const index: void* = Clang::clang_createIndex(0, 0);
-        // Force C (matches the old `-x c` preprocess).  `CRYO_CLANG_RESOURCE_DIR`,
-        // when set, adds `-resource-dir <dir>` so libclang finds its builtin
-        // headers (stddef.h / stdint.h / …) — needed on Windows, where the
-        // bundled libclang.dll is staged next to cryo.exe and so cannot locate
-        // its resource dir by the default `<dll>/../lib/clang/<v>` walk.  Unset
-        // on a normal host install (the system libclang resolves its own), so
-        // this is a no-op there.  `extra_args` carries the vendor generator's
-        // `-I<dir>` / `-D<def>` flags (empty for the inline `#include` path).
+        // Force the source language.  C (`-x c`) is the default and reproduces the
+        // old preprocess byte-for-byte; C++ (`-x c++ -std=<cpp_std>`) drives the
+        // C++ binding generator (Strategy A: direct mangled-symbol binding).
+        // `CRYO_CLANG_RESOURCE_DIR`, when set, adds `-resource-dir <dir>` so
+        // libclang finds its builtin headers (stddef.h / stdint.h / …) — needed on
+        // Windows, where the bundled libclang.dll is staged next to cryo.exe and
+        // so cannot locate its resource dir by the default
+        // `<dll>/../lib/clang/<v>` walk.  Unset on a normal host install (the
+        // system libclang resolves its own), so this is a no-op there.
+        // `extra_args` carries the vendor generator's `-I<dir>` / `-D<def>` flags
+        // (empty for the inline `#include` path).
+        const is_cpp: boolean = libc::strcmp(lang as string, "c++") == 0;
         mut args: u8*[] = [];
         args.push("-x" as u8*);
-        args.push("c" as u8*);
+        if (is_cpp) {
+            args.push("c++" as u8*);
+            const std_flag: string = if (libc::strlen(cpp_std) > 0) {
+                format("-std=%s", cpp_std)
+            } else {
+                "-std=c++17"
+            };
+            args.push(std_flag as u8*);
+        } else {
+            args.push("c" as u8*);
+        }
         const res_dir: i8* = libc::getenv("CRYO_CLANG_RESOURCE_DIR") as i8*;
         if (res_dir != null && libc::strlen(res_dir as string) > 0) {
             args.push("-resource-dir" as u8*);
@@ -1695,6 +1902,7 @@ type struct Importer {
         // The vendor generator passes a non-null out_report; the inline
         // `#include` path passes null.  Function-alias wrappers ride this flag.
         imp.is_vendor = out_report != null;
+        imp.is_cpp = is_cpp;
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
         // W1 two-pass macro emission (deferred from the decl walk): bind the

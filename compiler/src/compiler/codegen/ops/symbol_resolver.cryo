@@ -246,6 +246,18 @@ type struct SymbolResolver {
     resolve_function_by_mangled(mut &this, pinned: SymbolStr) -> LValue {
         if (!pinned.is_valid()) { return LValue::null(); }
 
+        // Consult the in-module registry FIRST, keyed on the mangled symbol -
+        // exactly as `resolve_function` does for the by-name path.  For a normal
+        // in-module definition this returns the same `fn_val` that
+        // `get_named_function(pinned_str)` would (its LLVM symbol IS the mangled
+        // name), so IR is byte-unchanged.  It differs only for a method declared
+        // with `![link("sym")]` (the C++ binding generator): there the LLVM
+        // symbol is the C++ mangled name, but `declare_method` registered the
+        // fn_val under the Cryo mangled key, so the call correctly targets the
+        // overridden symbol instead of synthesizing a phantom Cryo-named extern.
+        const cached: LValue = this.functions.get(pinned);
+        if (cached.is_valid()) { return cached; }
+
         const intern: InternTable* = this.ctx.intern_table;
         const pinned_str: string = intern.resolve(pinned);
         mut v: LValue = this.llvm_module.get_named_function(pinned_str);

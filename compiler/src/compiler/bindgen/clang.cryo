@@ -99,6 +99,52 @@ type struct CXCursor {
         return sym;
     }
 
+    /// Intern this cursor's MANGLED symbol (the platform linker name).  Returns
+    /// an EMPTY SymbolStr when libclang reports no mangling (inline / abstract /
+    /// uninstantiated template) — the importer reads that as "no callable symbol,
+    /// skip + report".  Used by the C++ binding generator to pin a decl's
+    /// `![link("...")]` to its Itanium symbol.  The CXString is disposed here.
+    intern_mangling(this, ctx: CompilationContext*) -> SymbolStr {
+        const s: CXString = clang_Cursor_getMangling(this);
+        const cstr: u8* = clang_getCString(s);
+        if (cstr == null || libc::strlen(cstr as string) == 0) {
+            clang_disposeString(s);
+            return SymbolStr::empty();
+        }
+        const sym: SymbolStr = ctx.intern_table.intern(cstr as string);
+        clang_disposeString(s);
+        return sym;
+    }
+
+    /// True for a C++ `virtual` method (dispatched via vtable — no directly
+    /// callable symbol, so Strategy A skips it and defers to the shim path).
+    is_virtual_method(this) -> boolean {
+        return clang_CXXMethod_isVirtual(this) != 0u32;
+    }
+
+    /// True for a C++ `static` member function (no implicit `this` receiver).
+    is_static_method(this) -> boolean {
+        return clang_CXXMethod_isStatic(this) != 0u32;
+    }
+
+    /// True for a `const`-qualified C++ method (`int sum() const`); its `this`
+    /// is `const T*` and its mangling carries the `K` qualifier (`_ZNK...`).
+    is_const_method(this) -> boolean {
+        return clang_CXXMethod_isConst(this) != 0u32;
+    }
+
+    /// True when this function/method is `inline` (or otherwise emits no
+    /// out-of-line symbol unless ODR-used) — unbindable via direct mangling.
+    is_inlined(this) -> boolean {
+        return clang_Cursor_isFunctionInlined(this) != 0u32;
+    }
+
+    /// True when this member's C++ access specifier is `public`.  Only public
+    /// members are bindable from Cryo; protected/private are skipped + reported.
+    is_public_member(this) -> boolean {
+        return clang_getCXXAccessSpecifier(this) == CX_CXX_PUBLIC;
+    }
+
     /// Intern this parameter cursor's name.  An unnamed parameter (empty
     /// spelling) gets a synthesized `argN`, exactly as the hand-rolled scanner
     /// did, so a `void *` with no name still yields a first-class declaration.
@@ -188,13 +234,28 @@ type struct CXToken {
 // ---- CXCursorKind / CXChildVisitResult constants ----
 const CURSOR_STRUCT_DECL: i32        = 2;
 const CURSOR_UNION_DECL: i32         = 3;
+const CURSOR_CLASS_DECL: i32         = 4;
 const CURSOR_ENUM_DECL: i32          = 5;
 const CURSOR_FIELD_DECL: i32         = 6;
 const CURSOR_ENUM_CONSTANT_DECL: i32 = 7;
 const CURSOR_FUNCTION_DECL: i32      = 8;
 const CURSOR_TYPEDEF_DECL: i32       = 20;
+// C++ cursor kinds (Strategy A: direct mangled-symbol binding).
+const CURSOR_CXX_METHOD: i32         = 21;
+const CURSOR_NAMESPACE: i32          = 22;
+const CURSOR_CONSTRUCTOR: i32        = 24;
+const CURSOR_DESTRUCTOR: i32         = 25;
+const CURSOR_FUNCTION_TEMPLATE: i32  = 30;
+const CURSOR_CLASS_TEMPLATE: i32     = 31;
 const CURSOR_MACRO_DEFINITION: i32   = 501;
 const VISIT_CONTINUE: i32 = 1;
+
+// ---- CX_CXXAccessSpecifier constants ----
+// Only `public` members are bindable from Cryo; protected/private are skipped.
+const CX_CXX_INVALID_ACCESS: i32 = 0;
+const CX_CXX_PUBLIC: i32         = 1;
+const CX_CXX_PROTECTED: i32      = 2;
+const CX_CXX_PRIVATE: i32        = 3;
 
 // ---- CXTokenKind constants ----
 const TOKEN_PUNCTUATION: i32 = 0;
@@ -228,6 +289,8 @@ const TK_Float: i32      = 21;
 const TK_Double: i32     = 22;
 const TK_LongDouble: i32 = 23;
 const TK_Pointer: i32    = 101;
+const TK_LValueReference: i32 = 103;
+const TK_RValueReference: i32 = 104;
 const TK_Record: i32     = 105;
 const TK_Enum: i32       = 106;
 const TK_FunctionNoProto: i32 = 110;
@@ -269,6 +332,19 @@ extern "C" {
     function clang_Cursor_getNumArguments(c: CXCursor) -> i32;
     function clang_Cursor_getArgument(c: CXCursor, i: u32) -> CXCursor;
     function clang_isFunctionTypeVariadic(t: CXType) -> u32;
+
+    // C++ method / access introspection (Strategy A: direct mangled binding).
+    // `clang_Cursor_getMangling` is the LINCHPIN: it returns the platform
+    // mangled symbol (Itanium `_ZN4demo3addEii` on Linux) that the generated
+    // Cryo decl pins via `![link("...")]`; for an entity with no emitted symbol
+    // (inline / abstract / template-uninstantiated) it returns an empty string,
+    // which the importer treats as "skip + report".  Must be `clang_disposeString`'d.
+    function clang_Cursor_getMangling(c: CXCursor) -> CXString;
+    function clang_CXXMethod_isVirtual(c: CXCursor) -> u32;
+    function clang_CXXMethod_isStatic(c: CXCursor) -> u32;
+    function clang_CXXMethod_isConst(c: CXCursor) -> u32;
+    function clang_Cursor_isFunctionInlined(c: CXCursor) -> u32;
+    function clang_getCXXAccessSpecifier(c: CXCursor) -> i32;
 
     // Type introspection (drives the CXType -> Cryo annotation mapper).
     function clang_getCanonicalType(t: CXType) -> CXType;

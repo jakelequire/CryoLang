@@ -76,7 +76,7 @@ import std::collections::str;
 /// (which lowers to a pointer) instead of being skipped — so `*_vappendf`-style
 /// functions BIND and are callable by forwarding a Cryo variadic function's
 /// `args`.  The earlier skip+report is gone.
-const GENERATOR_VERSION: i64 = 10;
+const GENERATOR_VERSION: i64 = 11;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -144,6 +144,11 @@ type struct BindingSerializer {
             return ctx.intern_table.resolve((node as VarDeclNode*).name);
         } else if (k == NodeKind::FunctionDeclaration) {
             return ctx.intern_table.resolve((node as FunctionDeclNode*).name);
+        } else if (k == NodeKind::ImplementationBlock) {
+            // A synthetic key so an impl block isn't dropped by the empty-name
+            // skip, and so a class re-visited across headers dedups by target.
+            return format("impl:%s",
+                ctx.intern_table.resolve((node as ImplBlockNode*).target_type));
         }
         return "";
     }
@@ -164,6 +169,9 @@ type struct BindingSerializer {
             // A bodied top-level function in `root.statements` is a function-alias
             // forwarding wrapper (the extern prototypes live in `extern_node`).
             this.render_wrapper_function(node as FunctionDeclNode*);
+        } else if (k == NodeKind::ImplementationBlock) {
+            // A C++ class's bound methods (direct mangled binding).
+            this.render_impl(node as ImplBlockNode*);
         }
     }
 
@@ -369,6 +377,11 @@ type struct BindingSerializer {
     }
 
     render_function(mut &this, node: FunctionDeclNode*) -> void {
+        // C++ free/namespace function: pin its mangled linker symbol.  C
+        // functions have no link override, so this line is absent for them.
+        if (node.has_link_name) {
+            this.out.push_cstr(format("    ![link(\"%s\")]\n", node.link_name));
+        }
         this.out.push_cstr(format("    function %s(",
             this.ctx.intern_table.resolve(node.name)));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
@@ -421,6 +434,53 @@ type struct BindingSerializer {
             s = s + BindingSerializer::ident(this.ctx.intern_table.resolve(node.parameters[i].name));
         }
         s = s + ");\n}\n\n";
+        this.out.push_cstr(s);
+    }
+
+    /// Render a C++ class's `implement` block: each bound method as a body-less
+    /// declaration pinned to its mangled symbol with `![link]`.  The receiver
+    /// (`&this` / `mut &this`) is the method's first parameter for an instance
+    /// method (encoded by the importer); a static method has none.
+    render_impl(mut &this, node: ImplBlockNode*) -> void {
+        this.out.push_cstr(format("implement %s {\n",
+            BindingSerializer::ident(this.ctx.intern_table.resolve(node.target_type))));
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            this.render_method(node.methods[i]);
+        }
+        this.out.push_cstr("}\n\n");
+    }
+
+    /// Render one bound C++ method: `![link("sym")] public [static] name(recv, params) -> Ret;`.
+    render_method(mut &this, m: MethodNode*) -> void {
+        const func: FunctionDeclNode* = m.func;
+        if (func.has_link_name) {
+            this.out.push_cstr(format("    ![link(\"%s\")]\n", func.link_name));
+        }
+        mut s: string = "    public ";
+        if (m.is_static) { s = s + "static "; }
+        s = s + format("%s(", BindingSerializer::ident(this.ctx.intern_table.resolve(func.name)));
+        // For an instance method the first parameter is the synthetic receiver
+        // (its NAME is the literal `&this`/`mut &this` token, type_annotation
+        // null) — rendered verbatim, not as `name: type`.
+        mut first: boolean = true;
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (!first) { s = s + ", "; }
+            first = false;
+            if (i == 0 && !m.is_static && p.type_annotation == null) {
+                s = s + this.ctx.intern_table.resolve(p.name);   // `&this` / `mut &this`
+            } else {
+                mut pn: string = this.ctx.intern_table.resolve(p.name);
+                if (libc::strlen(pn) == 0) { pn = format("arg%lld", i); }
+                else                       { pn = BindingSerializer::ident(pn); }
+                s = s + format("%s: %s", pn, this.render_type(p.type_annotation));
+            }
+        }
+        if (func.is_variadic) {
+            if (!first) { s = s + ", "; }
+            s = s + "...";
+        }
+        s = s + format(") -> %s;\n", this.render_type(func.return_type_annotation));
         this.out.push_cstr(s);
     }
 
@@ -526,7 +586,7 @@ type struct VendorGenerator {
     /// cache check (catching edits to transitively-included headers).
     static generate(ns: string, source_path: string, headers: &string[],
                     include_dirs: &string[], defines: &string[],
-                    out_inputs: string[]*) -> string {
+                    out_inputs: string[]*, language: string, cpp_std: string) -> string {
         mut ctx: CompilationContext = CompilationContext::new(
             CompileMode::SingleFile, "<vendor-bindgen>");
         // The importer pushes top-level type decls into the AST root; give it a
@@ -567,7 +627,8 @@ type struct VendorGenerator {
             // the transitive non-system includes.  Final de-dup happens below.
             if (out_inputs != null) { out_inputs.push(hp); }
             Importer::collect_from_tu(hp as u8*, null, 0u32, &extra, hp,
-                                      extern_node, &ctx, &report, out_inputs);
+                                      extern_node, &ctx, &report, out_inputs,
+                                      language, cpp_std);
             parsed = parsed + 1;
         }
         if (parsed == 0) { return ""; }
@@ -610,7 +671,7 @@ type struct VendorGenerator {
     /// regeneration that installs the sidecar).
     static provenance_key(source_path: string, headers: &string[],
                           include_dirs: &string[], defines: &string[],
-                          triple: string, cache_file: string) -> string {
+                          triple: string, cache_file: string, lang: string) -> string {
         mut h: u64 = Manifest::fnv_seed();
         const depfile: string = if (libc::strlen(cache_file) > 0) {
             format("%s.deps", cache_file)
@@ -649,6 +710,12 @@ type struct VendorGenerator {
         for (mut i: i64 = 0; i < defines.length; i++) {
             h = Manifest::fnv_str(h, defines[i]);
         }
+        // The source language ("c" vs "c++") changes what libclang parses and
+        // what the generator emits, so flipping it (without touching headers)
+        // MUST invalidate the cache.  An empty/"c" lang folds the same marker so
+        // existing C entries keep a stable key relative to each other.
+        h = Manifest::fnv_str(h, "<lang>");
+        h = Manifest::fnv_str(h, if (libc::strcmp(lang as string, "c++") == 0) { "c++" } else { "c" });
         h = Manifest::fnv_str(h, triple);
         h = Manifest::fnv_str(h, VendorGenerator::clang_version());
         h = Manifest::fnv_u64(h, GENERATOR_VERSION as u64);

@@ -1512,6 +1512,15 @@ type struct CallResolver {
         if (!fn_node.resolved_return_type.is_valid()) { return; }
         // GATED (R2): never stomp mono's exact-spec pin with a generic template mangle.
         if (fn_node.generic_params.length > 0 && call.resolved_callee.is_valid()) { return; }
+        // A method bound with `![link("sym")]` (C++ binding generator) resolves to
+        // the foreign mangled symbol; pin THAT so the call — in any module — targets
+        // it, matching the DI registration (decl_index `eff_mangled`).  Read from
+        // the parsed directive on the MethodNode (set before this pass runs).
+        const link_str: string = mn.link_directive_symbol();
+        if (strlen(link_str) > 0) {
+            call.set_resolved_callee(this.intern.intern(link_str));
+            return;
+        }
         const type_qn: QualifiedName = QualifiedName::single(this.intern, owner_qname_str);
         const recv_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(fn_node, is_static, this.intern);
         const param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(fn_node, this.intern);
@@ -2189,6 +2198,27 @@ type struct CallResolver {
         if (strlen(scope_str) == 0 || strlen(member_str) == 0) { return; }
         const sym: SymbolStr = this.intern.intern(format("%s::%s", scope_str, member_str));
         if (this.try_pin_static_method_overload(call, sym)) { return; }
+        // Single-overload static method: pin the MANGLED symbol, consistent with
+        // instance methods (`pin_method_resolved_callee`) and the multi-overload
+        // static path above.  The bare combined name is neither a codegen
+        // function-registry key nor an LLVM symbol, so codegen's
+        // `resolve_function_by_mangled` would synthesize a phantom extern named
+        // with the Cryo mangled symbol - which links fine for an ordinary method
+        // (its definition shares that name) but NOT for a `![link("...")]`-bound
+        // method (the C++ binding generator), whose definition carries the
+        // foreign mangled symbol instead.  Pinning the mangled name routes the
+        // call through the registry to the real definition.  Falls back to the
+        // bare combined when the overload isn't registered/mangled yet.
+        if (this.ctx.decl_index != null) {
+            const ovs: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(sym);
+            if (ovs.length == 1) {
+                const mg: SymbolStr = this.ctx.decl_index.lookup_overload_mangled(sym, ovs[0]);
+                if (mg.is_valid()) {
+                    call.set_resolved_callee(mg);
+                    return;
+                }
+            }
+        }
         call.set_resolved_callee(sym);
     }
 
